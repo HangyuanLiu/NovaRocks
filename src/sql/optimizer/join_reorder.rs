@@ -5,7 +5,7 @@
 //! 1. **DP (<=12 tables)** — Exhaustive dynamic programming over all join
 //!    orderings. Optimal but exponential in the number of relations.
 //!
-//! 2. **Greedy (<=20 tables)** — Level-by-level join building: at each level,
+//! 2. **Greedy (<=16 tables)** — Level-by-level join building: at each level,
 //!    tries all (prev_level_group, atom) pairs and keeps the best plan per
 //!    table subset. Polynomial time with good results.
 //!
@@ -39,6 +39,32 @@ fn count_conjuncts(expr: &TypedExpr) -> usize {
             right,
         } => count_conjuncts(left) + count_conjuncts(right),
         _ => 1,
+    }
+}
+
+/// Returns true if the expression contains at least one top-level AND-connected
+/// `col = col` equality predicate (equijoin key).
+///
+/// Used in the cost model: if a join condition has no equijoin key it will be
+/// implemented as a NEST LOOP JOIN, not a hash join, and should use the
+/// O(left × right) cost model rather than the O(left + right) hash join model.
+fn has_equijoin_predicate(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Nested(inner) => has_equijoin_predicate(inner),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => has_equijoin_predicate(left) || has_equijoin_predicate(right),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            matches!(left.kind, ExprKind::ColumnRef { .. })
+                && matches!(right.kind, ExprKind::ColumnRef { .. })
+        }
+        _ => false,
     }
 }
 
@@ -239,11 +265,13 @@ struct DpEntry {
 }
 
 /// The join graph: a set of base relations and predicates that connect them.
+#[derive(Clone)]
 struct JoinGraph {
     /// Leaf plans (the base relations of the join graph).
     relations: Vec<LogicalPlan>,
     /// Each predicate: (condition expr, bitmask of relations it references).
-    predicates: Vec<(TypedExpr, u16)>,
+    /// Uses u32 to support up to 32 relations.
+    predicates: Vec<(TypedExpr, u32)>,
 }
 
 /// CBO join reorder: walks the plan tree and applies join enumeration to
@@ -281,13 +309,20 @@ pub(crate) fn reorder_joins_cbo(
                     };
 
                     // Adaptive algorithm selection:
-                    // DP (<=12) -> Greedy (<=20) -> LeftDeep (any)
+                    // DP (<=12) -> Greedy (13-16) -> LeftDeep (any)
                     let result = if n <= 12 {
                         tracing::debug!(n, "join_reorder: using DP algorithm");
                         dp_join_reorder(optimized_graph, table_stats)
-                    } else if n <= 20 {
+                    } else if n <= 16 {
                         tracing::debug!(n, "join_reorder: using Greedy algorithm");
-                        greedy_join_reorder(optimized_graph, table_stats)
+                        greedy_join_reorder(optimized_graph.clone(), table_stats)
+                            .or_else(|| {
+                                tracing::debug!(
+                                    n,
+                                    "join_reorder: Greedy failed, falling back to LeftDeep"
+                                );
+                                left_deep_join_reorder(optimized_graph, table_stats)
+                            })
                     } else {
                         tracing::debug!(n, "join_reorder: using LeftDeep algorithm");
                         left_deep_join_reorder(optimized_graph, table_stats)
@@ -369,7 +404,16 @@ pub(crate) fn reorder_joins_cbo(
             r.input = Box::new(reorder_joins_cbo(*r.input, table_stats));
             LogicalPlan::Repeat(r)
         }
-        LogicalPlan::CTEAnchor(_) | LogicalPlan::CTEProduce(_) | LogicalPlan::CTEConsume(_) => plan,
+        LogicalPlan::CTEAnchor(mut n) => {
+            n.produce = Box::new(reorder_joins_cbo(*n.produce, table_stats));
+            n.consumer = Box::new(reorder_joins_cbo(*n.consumer, table_stats));
+            LogicalPlan::CTEAnchor(n)
+        }
+        LogicalPlan::CTEProduce(mut n) => {
+            n.input = Box::new(reorder_joins_cbo(*n.input, table_stats));
+            LogicalPlan::CTEProduce(n)
+        }
+        LogicalPlan::CTEConsume(_) => plan,
         other => other,
     }
 }
@@ -420,11 +464,11 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     let mut predicates = Vec::new();
     for pred in expanded_predicates {
         let refs = crate::sql::optimizer::expr_utils::collect_qualified_column_refs(&pred);
-        let mut mask: u16 = 0;
+        let mut mask: u32 = 0;
         for qref in &refs {
             for (i, rel_cols) in relation_columns.iter().enumerate() {
                 if rel_cols.contains(qref) {
-                    mask |= 1u16 << i;
+                    mask |= 1u32 << i;
                 }
             }
         }
@@ -473,21 +517,22 @@ fn flatten_inner_joins(
 }
 
 /// DP join reorder: enumerate all subsets of relations and find the cheapest
-/// join order.  Uses a u16 bitmask (supports up to 16 relations).
+/// join order.  Uses a u32 bitmask (DP is still limited to <=12 relations
+/// to keep the 2^n subset enumeration tractable).
 fn dp_join_reorder(
     graph: JoinGraph,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<LogicalPlan> {
     let n = graph.relations.len();
-    if n > 16 {
+    if n > 12 {
         return None;
     }
 
-    let mut memo: HashMap<u16, DpEntry> = HashMap::new();
+    let mut memo: HashMap<u32, DpEntry> = HashMap::new();
 
     // Phase 1: Initialize single-relation entries.
     for (i, rel) in graph.relations.iter().enumerate() {
-        let mask = 1u16 << i;
+        let mask = 1u32 << i;
         let stats = cardinality::estimate_statistics(rel, table_stats);
         let self_cost = cost::estimate_operator_cost(rel, &stats, &[]);
         memo.insert(
@@ -501,7 +546,7 @@ fn dp_join_reorder(
     }
 
     // Phase 2: Enumerate subsets of increasing size.
-    let full_mask = (1u16 << n) - 1;
+    let full_mask = (1u32 << n) - 1;
     for size in 2..=n {
         for subset in SubsetIter::new(full_mask, size as u32) {
             // Try all bipartitions of `subset` into (left, right).
@@ -529,6 +574,21 @@ fn dp_join_reorder(
                 }
 
                 let condition = combine_and(connecting_preds);
+
+                // Require at least one equijoin (col = col) predicate to form
+                // this join.  A bipartition where ALL connecting predicates are
+                // non-equijoin (e.g. `d3.d_date > d1.d_date + 5`) would force
+                // a NEST LOOP JOIN on potentially large relations, exploding
+                // cardinality estimates and corrupting subsequent cost choices.
+                // Skip it: the non-equijoin predicate will be included as an
+                // "other condition" in whichever equijoin bipartition covers
+                // the same table set (e.g. cs JOIN d3 via equijoin, where
+                // d3.d_date > d1.d_date + 5 is pushed into that join's
+                // condition automatically).
+                if !has_equijoin_predicate(&condition) {
+                    left = (left - 1) & subset;
+                    continue;
+                }
 
                 // We only need left and right entries, which should exist
                 // from previous iterations.
@@ -558,6 +618,7 @@ fn dp_join_reorder(
                         table_stats,
                         &mut best,
                     );
+
                 }
 
                 left = (left - 1) & subset;
@@ -585,6 +646,17 @@ fn try_join_orientation(
     table_stats: &HashMap<String, TableStatistics>,
     best: &mut Option<DpEntry>,
 ) {
+    // If the condition has no equijoin predicates (col = col), this join cannot
+    // be implemented as a hash join — it will use a NEST LOOP JOIN at execution
+    // time (O(left × right)).  Use the Cross join cost model so the DP
+    // correctly accounts for the quadratic cost and avoids choosing direct
+    // non-equi joins between large relations when equijoin paths exist.
+    let join_type_for_cost = if has_equijoin_predicate(condition) {
+        JoinKind::Inner
+    } else {
+        JoinKind::Cross
+    };
+
     let join_plan = LogicalPlan::Join(JoinNode {
         left: Box::new(left_plan.clone()),
         right: Box::new(right_plan.clone()),
@@ -593,8 +665,16 @@ fn try_join_orientation(
     });
 
     let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
+
+    // Build a cost-estimation plan with the effective join type.
+    let cost_plan = LogicalPlan::Join(JoinNode {
+        left: Box::new(left_plan.clone()),
+        right: Box::new(right_plan.clone()),
+        join_type: join_type_for_cost,
+        condition: Some(condition.clone()),
+    });
     let join_self_cost =
-        cost::estimate_operator_cost(&join_plan, &join_stats, &[left_stats, right_stats]);
+        cost::estimate_operator_cost(&cost_plan, &join_stats, &[left_stats, right_stats]);
 
     let total_cost = left_cumulative + right_cumulative + join_self_cost.total_cost();
 
@@ -612,9 +692,9 @@ fn try_join_orientation(
 
 /// Find all predicates that connect two subsets (reference columns from both).
 fn find_connecting_predicates(
-    predicates: &[(TypedExpr, u16)],
-    left_mask: u16,
-    right_mask: u16,
+    predicates: &[(TypedExpr, u32)],
+    left_mask: u32,
+    right_mask: u32,
 ) -> Vec<TypedExpr> {
     let combined = left_mask | right_mask;
     predicates
@@ -639,9 +719,9 @@ fn find_connecting_predicates(
 /// join predicates between two table sets.
 fn collect_join_predicates(
     graph: &JoinGraph,
-    left_mask: u16,
-    right_mask: u16,
-) -> Vec<(TypedExpr, u16)> {
+    left_mask: u32,
+    right_mask: u32,
+) -> Vec<(TypedExpr, u32)> {
     let combined = left_mask | right_mask;
     graph
         .predicates
@@ -675,11 +755,11 @@ fn greedy_join_reorder(
         return None;
     }
 
-    let mut memo: HashMap<u16, DpEntry> = HashMap::new();
+    let mut memo: HashMap<u32, DpEntry> = HashMap::new();
 
     // Phase 1: Initialize single-relation entries.
     for (i, rel) in graph.relations.iter().enumerate() {
-        let mask = 1u16 << i;
+        let mask = 1u32 << i;
         let stats = cardinality::estimate_statistics(rel, table_stats);
         let self_cost = cost::estimate_operator_cost(rel, &stats, &[]);
         memo.insert(
@@ -695,14 +775,14 @@ fn greedy_join_reorder(
     // Phase 2: Level-by-level construction.
     // `prev_level` holds the masks from the previous level; at level 2 we
     // combine single atoms to form pairs, at level 3 pairs+atom -> triples, etc.
-    let mut prev_level: Vec<u16> = (0..n).map(|i| 1u16 << i).collect();
+    let mut prev_level: Vec<u32> = (0..n).map(|i| 1u32 << i).collect();
 
     for _level in 2..=n {
-        let mut next_level: Vec<u16> = Vec::new();
+        let mut next_level: Vec<u32> = Vec::new();
 
         for &group_mask in &prev_level {
             for i in 0..n {
-                let atom_mask = 1u16 << i;
+                let atom_mask = 1u32 << i;
                 // Skip if atom already part of this group.
                 if (group_mask & atom_mask) != 0 {
                     continue;
@@ -719,6 +799,15 @@ fn greedy_join_reorder(
                     let preds: Vec<TypedExpr> = connecting.into_iter().map(|(e, _)| e).collect();
                     Some(combine_and(preds))
                 };
+
+                // A join is effectively a NEST LOOP (quadratic cost) when:
+                // (a) there are no connecting predicates at all (cross join), OR
+                // (b) all connecting predicates are non-equijoin conditions — the
+                //     join cannot use hashing and will fall back to NEST LOOP.
+                let is_nest_loop = is_cross
+                    || condition
+                        .as_ref()
+                        .is_some_and(|c| !has_equijoin_predicate(c));
 
                 let (group_entry, atom_entry) = match (memo.get(&group_mask), memo.get(&atom_mask))
                 {
@@ -752,19 +841,33 @@ fn greedy_join_reorder(
                     left: Box::new(left_plan.clone()),
                     right: Box::new(right_plan.clone()),
                     join_type: JoinKind::Inner,
-                    condition,
+                    condition: condition.clone(),
                 });
 
                 let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
+
+                // Use Cross join type for cost estimation when no equijoin key
+                // exists, so the O(left × right) NEST LOOP cost is reflected.
+                let join_type_for_cost = if is_nest_loop {
+                    JoinKind::Cross
+                } else {
+                    JoinKind::Inner
+                };
+                let cost_plan = LogicalPlan::Join(JoinNode {
+                    left: Box::new(left_plan.clone()),
+                    right: Box::new(right_plan.clone()),
+                    join_type: join_type_for_cost,
+                    condition: condition.clone(),
+                });
                 let join_self_cost = cost::estimate_operator_cost(
-                    &join_plan,
+                    &cost_plan,
                     &join_stats,
                     &[left_stats, right_stats],
                 );
 
                 let mut total_cost = left_cost + right_cost + join_self_cost.total_cost();
 
-                // Cross join penalty.
+                // Additional cross join penalty for completely unconnected tables.
                 if is_cross {
                     total_cost *= 10.0;
                 }
@@ -794,7 +897,7 @@ fn greedy_join_reorder(
         prev_level = next_level;
     }
 
-    let full_mask = (1u16 << n) - 1;
+    let full_mask = (1u32 << n) - 1;
     memo.remove(&full_mask).map(|e| e.plan)
 }
 
@@ -815,7 +918,7 @@ fn left_deep_join_reorder(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<LogicalPlan> {
     let n = graph.relations.len();
-    if !(2..=16).contains(&n) {
+    if !(2..=32).contains(&n) {
         return None;
     }
 
@@ -827,7 +930,7 @@ fn left_deep_join_reorder(
         .collect();
 
     // Start with the largest table (highest row_count) as the initial left side.
-    let mut used_mask: u16 = 0;
+    let mut used_mask: u32 = 0;
     let start_idx = (0..n)
         .max_by(|&a, &b| {
             rel_stats[a]
@@ -838,7 +941,7 @@ fn left_deep_join_reorder(
         .unwrap_or(0);
 
     let mut current_plan = graph.relations[start_idx].clone();
-    let mut current_mask = 1u16 << start_idx;
+    let mut current_mask = 1u32 << start_idx;
     used_mask |= current_mask;
 
     for _ in 1..n {
@@ -848,7 +951,7 @@ fn left_deep_join_reorder(
         let mut best_row_count = u64::MAX;
 
         for (i, rs) in rel_stats.iter().enumerate() {
-            let atom_mask = 1u16 << i;
+            let atom_mask = 1u32 << i;
             if (used_mask & atom_mask) != 0 {
                 continue;
             }
@@ -873,7 +976,7 @@ fn left_deep_join_reorder(
         }
 
         let next_idx = best_idx?;
-        let next_mask = 1u16 << next_idx;
+        let next_mask = 1u32 << next_idx;
 
         let connecting = collect_join_predicates(&graph, current_mask, next_mask);
         let condition = if connecting.is_empty() {
@@ -901,14 +1004,15 @@ fn left_deep_join_reorder(
 }
 
 /// Iterator over all subsets of `universe` with exactly `k` bits set.
+/// Uses u32 to support join graphs with up to 32 relations.
 struct SubsetIter {
-    universe: u16,
+    universe: u32,
     k: u32,
-    current: Option<u16>,
+    current: Option<u32>,
 }
 
 impl SubsetIter {
-    fn new(universe: u16, k: u32) -> Self {
+    fn new(universe: u32, k: u32) -> Self {
         if k == 0 || k > universe.count_ones() {
             return Self {
                 universe,
@@ -927,9 +1031,9 @@ impl SubsetIter {
 }
 
 impl Iterator for SubsetIter {
-    type Item = u16;
+    type Item = u32;
 
-    fn next(&mut self) -> Option<u16> {
+    fn next(&mut self) -> Option<u32> {
         let val = self.current?;
         // Find next subset of universe with k bits.
         self.current = next_k_subset(val, self.universe);
@@ -938,15 +1042,15 @@ impl Iterator for SubsetIter {
 }
 
 /// Find the smallest subset of `universe` with exactly `k` bits set.
-fn smallest_k_subset(universe: u16, k: u32) -> Option<u16> {
+fn smallest_k_subset(universe: u32, k: u32) -> Option<u32> {
     if k == 0 {
         return Some(0);
     }
-    let bits: Vec<u16> = (0..16).filter(|&i| (universe >> i) & 1 == 1).collect();
+    let bits: Vec<u32> = (0..32).filter(|&i| (universe >> i) & 1 == 1).collect();
     if (k as usize) > bits.len() {
         return None;
     }
-    let mut result = 0u16;
+    let mut result = 0u32;
     for &bit in bits.iter().take(k as usize) {
         result |= 1 << bit;
     }
@@ -955,9 +1059,9 @@ fn smallest_k_subset(universe: u16, k: u32) -> Option<u16> {
 
 /// Given a k-subset `current` of `universe`, find the lexicographically next
 /// k-subset, or None if `current` is the last.
-fn next_k_subset(current: u16, universe: u16) -> Option<u16> {
+fn next_k_subset(current: u32, universe: u32) -> Option<u32> {
     // Gosper's hack adapted for a constrained universe.
-    let bits: Vec<u16> = (0..16).filter(|&i| (universe >> i) & 1 == 1).collect();
+    let bits: Vec<u32> = (0..32).filter(|&i| (universe >> i) & 1 == 1).collect();
     let k = current.count_ones() as usize;
 
     // Map current to indices within `bits`.
@@ -987,7 +1091,7 @@ fn next_k_subset(current: u16, universe: u16) -> Option<u16> {
         indices[j] = indices[j - 1] + 1;
     }
 
-    let mut result = 0u16;
+    let mut result = 0u32;
     for &idx in &indices {
         result |= 1 << bits[idx];
     }
@@ -1556,8 +1660,8 @@ mod tests {
     #[test]
     fn cbo_subset_iter_enumerates_correctly() {
         // Test that SubsetIter produces all C(4,2) = 6 subsets.
-        let universe = 0b1111u16; // 4 bits
-        let subsets: Vec<u16> = SubsetIter::new(universe, 2).collect();
+        let universe = 0b1111u32; // 4 bits
+        let subsets: Vec<u32> = SubsetIter::new(universe, 2).collect();
         assert_eq!(subsets.len(), 6, "C(4,2) should be 6, got {:?}", subsets);
         for s in &subsets {
             assert_eq!(s.count_ones(), 2);
@@ -1567,8 +1671,8 @@ mod tests {
 
     #[test]
     fn cbo_subset_iter_size_3() {
-        let universe = 0b1111u16;
-        let subsets: Vec<u16> = SubsetIter::new(universe, 3).collect();
+        let universe = 0b1111u32;
+        let subsets: Vec<u32> = SubsetIter::new(universe, 3).collect();
         assert_eq!(subsets.len(), 4, "C(4,3) should be 4, got {:?}", subsets);
     }
 
@@ -1576,7 +1680,7 @@ mod tests {
     fn cbo_find_connecting_predicates() {
         // Predicate referencing relation 0 and 1 should connect masks 0b01 and 0b10.
         let pred = qualified_eq("a", "b");
-        let predicates = vec![(pred.clone(), 0b11u16)];
+        let predicates = vec![(pred.clone(), 0b11u32)];
 
         let result = find_connecting_predicates(&predicates, 0b01, 0b10);
         assert_eq!(result.len(), 1);
