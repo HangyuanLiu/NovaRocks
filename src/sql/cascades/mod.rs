@@ -120,6 +120,12 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
         let mut changed = false;
         let num_groups = memo.groups.len();
         for group_id in 0..num_groups {
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "optimizer timeout: exceeded {}s budget",
+                    OPTIMIZE_TIMEOUT.as_secs()
+                ));
+            }
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {

@@ -755,6 +755,13 @@ fn greedy_join_reorder(
         return None;
     }
 
+    // Fast path: if no predicates connect any relations (all CROSS JOINs),
+    // greedy enumeration is O(n × 2^n) with no benefit over left_deep O(n²).
+    // Skip and let the caller fall back to left_deep.
+    if graph.predicates.is_empty() {
+        return None;
+    }
+
     let mut memo: HashMap<u32, DpEntry> = HashMap::new();
 
     // Phase 1: Initialize single-relation entries.
@@ -778,7 +785,7 @@ fn greedy_join_reorder(
     let mut prev_level: Vec<u32> = (0..n).map(|i| 1u32 << i).collect();
 
     for _level in 2..=n {
-        let mut next_level: Vec<u32> = Vec::new();
+        let mut next_level_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for &group_mask in &prev_level {
             for i in 0..n {
@@ -837,10 +844,15 @@ fn greedy_join_reorder(
                         )
                     };
 
+                let join_type = if condition.is_some() {
+                    JoinKind::Inner
+                } else {
+                    JoinKind::Cross
+                };
                 let join_plan = LogicalPlan::Join(JoinNode {
                     left: Box::new(left_plan.clone()),
                     right: Box::new(right_plan.clone()),
-                    join_type: JoinKind::Inner,
+                    join_type,
                     condition: condition.clone(),
                 });
 
@@ -884,17 +896,15 @@ fn greedy_join_reorder(
                             cumulative_cost: total_cost,
                         },
                     );
-                    if !next_level.contains(&combined) {
-                        next_level.push(combined);
-                    }
+                    next_level_set.insert(combined);
                 }
             }
         }
 
-        if next_level.is_empty() {
+        if next_level_set.is_empty() {
             break;
         }
-        prev_level = next_level;
+        prev_level = next_level_set.into_iter().collect();
     }
 
     let full_mask = (1u32 << n) - 1;
@@ -989,10 +999,20 @@ fn left_deep_join_reorder(
         // Build side (right) should be the smaller relation; in left-deep the
         // new table is always on the right (build) side, so we rely on the
         // selection logic above to pick small tables.
+        //
+        // Use Cross when there is no join condition.  This preserves correct
+        // semantics and, critically, prevents the Cascades JoinAssociativity
+        // rule from exploding on long chains of conditionless joins (e.g.
+        // q9 with 15 scalar-subquery CROSS JOINs).
+        let join_type = if condition.is_some() {
+            JoinKind::Inner
+        } else {
+            JoinKind::Cross
+        };
         current_plan = LogicalPlan::Join(JoinNode {
             left: Box::new(current_plan),
             right: Box::new(graph.relations[next_idx].clone()),
-            join_type: JoinKind::Inner,
+            join_type,
             condition,
         });
 

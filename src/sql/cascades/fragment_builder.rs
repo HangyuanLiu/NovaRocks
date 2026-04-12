@@ -558,24 +558,31 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
         for (expr_a, expr_b) in &op.eq_conditions {
             let result = {
-                let try_left_a = ExprCompiler::new(&left.scope).compile_typed(expr_a);
-                if let Ok(lt) = try_left_a {
-                    ExprCompiler::new(&right.scope)
-                        .compile_typed(expr_b)
-                        .map(|rt| (lt, rt))
-                        .ok()
-                } else {
-                    // Swap: expr_a might be from the right child, expr_b from the left.
-                    let try_left_b = ExprCompiler::new(&left.scope).compile_typed(expr_b);
-                    if let Ok(lt) = try_left_b {
+                // Try natural order: expr_a on left, expr_b on right.
+                let natural = ExprCompiler::new(&left.scope)
+                    .compile_typed(expr_a)
+                    .ok()
+                    .and_then(|lt| {
                         ExprCompiler::new(&right.scope)
-                            .compile_typed(expr_a)
-                            .map(|rt| (lt, rt))
+                            .compile_typed(expr_b)
                             .ok()
-                    } else {
-                        None
-                    }
-                }
+                            .map(|rt| (lt, rt))
+                    });
+                // Try swapped: expr_b on left, expr_a on right.
+                // This is needed when JoinCommutativity swapped children
+                // but the eq_condition columns still reference the original
+                // left/right order.
+                natural.or_else(|| {
+                    ExprCompiler::new(&left.scope)
+                        .compile_typed(expr_b)
+                        .ok()
+                        .and_then(|lt| {
+                            ExprCompiler::new(&right.scope)
+                                .compile_typed(expr_a)
+                                .ok()
+                                .map(|rt| (lt, rt))
+                        })
+                })
             };
             if let Some((lt, rt)) = result {
                 eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
