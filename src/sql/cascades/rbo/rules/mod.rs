@@ -2,6 +2,8 @@
 //! migrated rules here; Phase 1 ships an empty registry so the framework
 //! is wired end-to-end with no behavior change.
 
+pub(crate) mod column_pruning;
+
 use super::rule::RewriteRule;
 
 /// All RBO rules in canonical application order. Returns an empty vec
