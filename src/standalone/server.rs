@@ -323,6 +323,9 @@ struct NovaRocksMysqlShim {
     connection_id: u32,
     current_catalog: Option<String>,
     current_db: String,
+    /// Per-session query timeout (in seconds). `None` means no timeout.
+    /// Set via `SET query_timeout = N`. `N == 0` clears the timeout.
+    query_timeout_secs: Option<u64>,
 }
 
 impl NovaRocksMysqlShim {
@@ -333,6 +336,7 @@ impl NovaRocksMysqlShim {
             connection_id,
             current_catalog: None,
             current_db: DEFAULT_DATABASE.to_string(),
+            query_timeout_secs: None,
         }
     }
 }
@@ -552,6 +556,30 @@ fn parse_set_catalog_query(query: &str) -> Option<&str> {
     Some(value)
 }
 
+/// Parse `SET query_timeout = N` and `SET query_timeout=N`. Returns the
+/// integer seconds value if the statement matches that shape. The optional
+/// `=` separator may have spaces around it or be glued to the keyword/value.
+/// `N` must be a non-negative integer; `N == 0` clears the session timeout.
+fn parse_set_query_timeout(query: &str) -> Option<u64> {
+    // Normalize: collapse whitespace around `=` so we can split simply.
+    let normalized = query.replace('=', " = ");
+    let mut parts = normalized.split_whitespace();
+    let head = parts.next()?;
+    if !head.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let keyword = parts.next()?;
+    if !keyword.eq_ignore_ascii_case("query_timeout") {
+        return None;
+    }
+    let next = parts.next()?;
+    let value_str = if next == "=" { parts.next()? } else { next };
+    if parts.next().is_some() {
+        return None;
+    }
+    value_str.parse::<u64>().ok()
+}
+
 fn is_supported_embedded_statement(query: &str) -> bool {
     // Skip leading SQL line comments (-- ...)
     let trimmed = query
@@ -629,6 +657,11 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some(secs) = parse_set_query_timeout(trimmed) {
+        shim.query_timeout_secs = if secs == 0 { None } else { Some(secs) };
+        return Ok(StatementResult::Ok);
+    }
+
     if is_session_noop(trimmed) {
         return Ok(StatementResult::Ok);
     }
@@ -657,11 +690,32 @@ async fn execute_statement_text(
     let sql = trimmed.to_string();
     let current_catalog = shim.current_catalog.clone();
     let current_db = shim.current_db.clone();
-    match task::spawn_blocking(move || {
+    let query_timeout = shim.query_timeout_secs;
+
+    let join_handle = task::spawn_blocking(move || {
         session.execute_in_context(&sql, current_catalog.as_deref(), &current_db)
-    })
-    .await
-    {
+    });
+
+    let result = match query_timeout {
+        Some(secs) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
+                Ok(join_result) => join_result,
+                Err(_elapsed) => {
+                    // The blocking task continues to run in the background
+                    // (tokio cannot cancel spawn_blocking work). The client
+                    // sees an error and may disconnect; the worker thread
+                    // will finish on its own and its result is discarded.
+                    return Err((
+                        ErrorKind::ER_QUERY_INTERRUPTED,
+                        format!("Query exceeded timeout of {secs}s"),
+                    ));
+                }
+            }
+        }
+        None => join_handle.await,
+    };
+
+    match result {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => {
             let kind = classify_query_error(&err);
@@ -1201,6 +1255,26 @@ mod tests {
     use arrow::array::TimestampMicrosecondArray;
 
     use super::*;
+
+    #[test]
+    fn parse_set_query_timeout_accepts_common_forms() {
+        assert_eq!(parse_set_query_timeout("SET query_timeout = 60"), Some(60));
+        assert_eq!(parse_set_query_timeout("set query_timeout=30"), Some(30));
+        assert_eq!(parse_set_query_timeout("SET QUERY_TIMEOUT = 0"), Some(0));
+        assert_eq!(
+            parse_set_query_timeout("SET    query_timeout    =    120"),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn parse_set_query_timeout_rejects_unrelated_set_statements() {
+        assert_eq!(parse_set_query_timeout("SET catalog = foo"), None);
+        assert_eq!(parse_set_query_timeout("SELECT 1"), None);
+        assert_eq!(parse_set_query_timeout("SET query_timeout = abc"), None);
+        assert_eq!(parse_set_query_timeout("SET query_timeout"), None);
+        assert_eq!(parse_set_query_timeout("SET query_timeout = 60 extra"), None);
+    }
 
     #[test]
     fn declared_date_timestamp_value_serializes_without_time_component() {
