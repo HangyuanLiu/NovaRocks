@@ -22,6 +22,7 @@ use crate::sql::cascades::operator::{
     PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
     PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp,
     PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalSubqueryAliasOp,
+    PhysicalTopNOp,
     PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::cascades::physical_plan::PhysicalPlanNode;
@@ -268,6 +269,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalNestLoopJoin(op) => self.visit_nest_loop_join(op, node),
             Operator::PhysicalHashAggregate(op) => self.visit_hash_aggregate(op, node),
             Operator::PhysicalSort(op) => self.visit_sort(op, node),
+            Operator::PhysicalTopN(op) => self.visit_physical_top_n(op, node),
             Operator::PhysicalLimit(op) => self.visit_limit(op, node),
             Operator::PhysicalWindow(op) => self.visit_window(op, node),
             Operator::PhysicalValues(op) => self.visit_values(op, node),
@@ -949,6 +951,87 @@ impl<'a> PlanFragmentBuilder<'a> {
         });
 
         // Pre-order: sort first, then child
+        let mut plan_nodes = vec![sort_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+
+        Ok(VisitResult {
+            plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // visit_physical_top_n — Sort + Limit as a single operator
+    // -------------------------------------------------------------------
+
+    fn visit_physical_top_n(
+        &mut self,
+        op: &PhysicalTopNOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        let child = self.visit(&node.children[0])?;
+
+        let sort_node_id = self.alloc_node();
+        let sort_tuple_id = *child.tuple_ids.last().unwrap();
+
+        let mut ordering_exprs = Vec::new();
+        let mut is_asc = Vec::new();
+        let mut nulls_first_list = Vec::new();
+
+        for item in &op.items {
+            let mut compiler = ExprCompiler::new(&child.scope);
+            let texpr = compiler.compile_typed(&item.expr)?;
+            ordering_exprs.push(texpr);
+            is_asc.push(item.asc);
+            nulls_first_list.push(item.nulls_first);
+        }
+
+        let sort_info = plan_nodes::TSortInfo::new(
+            ordering_exprs,
+            is_asc,
+            nulls_first_list,
+            None::<Vec<exprs::TExpr>>,
+        );
+
+        let mut sort_plan_node = nodes::default_plan_node();
+        sort_plan_node.node_id = sort_node_id;
+        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+        sort_plan_node.num_children = 1;
+        sort_plan_node.limit = op.limit.unwrap_or(-1);
+        sort_plan_node.row_tuples = vec![sort_tuple_id];
+        sort_plan_node.nullable_tuples = vec![];
+        sort_plan_node.compact_data = true;
+        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
+            sort_info,
+            use_top_n: true,
+            offset: op.offset,
+            ordering_exprs: None,
+            is_asc_order: None,
+            is_default_limit: None,
+            nulls_first: None,
+            sort_tuple_slot_exprs: None,
+            has_outer_join_child: None,
+            sql_sort_keys: None,
+            analytic_partition_exprs: None,
+            partition_exprs: None,
+            partition_limit: None,
+            topn_type: None,
+            build_runtime_filters: None,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            late_materialization: None,
+            enable_parallel_merge: None,
+            analytic_partition_skewed: None,
+            pre_agg_exprs: None,
+            pre_agg_output_slot_id: None,
+            pre_agg_insert_local_shuffle: None,
+            parallel_merge_late_materialize_mode: None,
+            per_pipeline: None,
+        });
+
+        // Pre-order: top-n first, then child
         let mut plan_nodes = vec![sort_plan_node];
         plan_nodes.extend(child.plan_nodes);
 
