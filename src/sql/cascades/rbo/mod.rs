@@ -6,4 +6,5 @@
 //! `RuleSet`. Rules are pure local rewrites; the driver owns traversal
 //! and iteration.
 
+pub(crate) mod driver;
 pub(crate) mod rule;
