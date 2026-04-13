@@ -404,6 +404,8 @@ Legacy column_pruning is a single top-down pass that collects required columns. 
 
 **Commit:** `Phase 2: migrate column_pruning to RBO rules`
 
+**Phase 2 landed.** Date: 2026-04-13. HEAD at landing: cdb17d537882e48cca74888381797ef5fa9c1570. column_pruning migrated to the PruneColumns RBO rule. Legacy src/sql/optimizer/column_pruning.rs (231 lines) deleted along with its rewriter::rewrite call site (Task 3) AND the dead optimizer::optimize()/optimize_query_plan() function plus its 3 tests (Task 4). Net -453 lines of legacy code removed. All 99 TPC-DS standalone EXPLAIN snapshots are byte-identical to Phase 1 (column pruning is a scan-metadata concern and does not affect EXPLAIN output). Unit tests: 910 passed / 19 failed (no new failures vs post-Phase-1 baseline). Phase 3 (predicate_pushdown migration) is unblocked.
+
 ### 4.3 Phase 3 — Migrate predicate_pushdown
 
 **Files:**
