@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use super::super::super::rule::RewriteRule;
 use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
-use crate::sql::optimizer::expr_utils::{
+use crate::sql::cascades::rbo::utils::{
     collect_column_refs, collect_output_columns, collect_qualified_column_refs,
     collect_qualified_output_columns, combine_and, split_and, wrap_remaining_filter,
 };

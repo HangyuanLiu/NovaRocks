@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use super::super::rule::RewriteRule;
-use crate::sql::optimizer::expr_utils::{collect_column_refs, merge_needed};
+use crate::sql::cascades::rbo::utils::{collect_column_refs, merge_needed};
 use crate::sql::plan::*;
 
 /// Single top-down column-pruning rule.

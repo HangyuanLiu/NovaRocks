@@ -255,7 +255,7 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
 // CBO: DP-based join reorder
 // ===========================================================================
 
-use crate::sql::optimizer::expr_utils::{
+use crate::sql::cascades::rbo::utils::{
     QualifiedRef, collect_qualified_output_columns, combine_and, split_and,
 };
 
@@ -465,7 +465,7 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     // Classify each predicate by which relations it touches.
     let mut predicates = Vec::new();
     for pred in expanded_predicates {
-        let refs = crate::sql::optimizer::expr_utils::collect_qualified_column_refs(&pred);
+        let refs = crate::sql::cascades::rbo::utils::collect_qualified_column_refs(&pred);
         let mut mask: u32 = 0;
         for qref in &refs {
             for (i, rel_cols) in relation_columns.iter().enumerate() {
