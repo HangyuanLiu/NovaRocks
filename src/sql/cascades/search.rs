@@ -5,7 +5,7 @@
 //! physical properties, recursively optimizing children and inserting enforcers
 //! (PhysicalDistribution, PhysicalSort) when needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::cost::compute_cost;
 use super::memo::{Cost, GroupId, MExpr, Memo};
@@ -62,6 +62,11 @@ pub(crate) struct SearchContext {
     /// (GroupId, PhysicalPropertySet) -> Winner
     pub(crate) winners: HashMap<(GroupId, PhysicalPropertySet), Winner>,
     pub(crate) table_stats: HashMap<String, TableStatistics>,
+    /// Set of (GroupId, PhysicalPropertySet) pairs currently being computed.
+    /// Used to break mutual enforcer cycles: when group A's enforcer path
+    /// recurses back into the same (group, props) that is already on the
+    /// call stack, we return INFINITY instead of recursing infinitely.
+    in_progress: HashSet<(GroupId, PhysicalPropertySet)>,
 }
 
 impl SearchContext {
@@ -69,6 +74,7 @@ impl SearchContext {
         Self {
             winners: HashMap::new(),
             table_stats,
+            in_progress: HashSet::new(),
         }
     }
 
@@ -85,17 +91,27 @@ impl SearchContext {
         group_id: GroupId,
         required: &PhysicalPropertySet,
     ) -> Result<Cost, String> {
-        // 1. Check winner cache.
         let cache_key = (group_id, required.clone());
+
+        // 1. Check winner cache.
         if let Some(winner) = self.winners.get(&cache_key) {
             return Ok(winner.cost);
         }
+
+        // 2. Cycle guard: if this (group, props) is already being computed on
+        //    the call stack, we have a mutual enforcer cycle.  Return INFINITY
+        //    so the caller treats this path as infeasible and picks another.
+        if self.in_progress.contains(&cache_key) {
+            return Ok(f64::INFINITY);
+        }
+        self.in_progress.insert(cache_key.clone());
 
         let group = &memo.groups[group_id];
         let num_physical = group.physical_exprs.len();
 
         // Groups with no physical exprs: return infinity (not an error).
         if num_physical == 0 {
+            self.in_progress.remove(&cache_key);
             return Ok(f64::INFINITY);
         }
 
@@ -219,6 +235,10 @@ impl SearchContext {
                 }
             }
         }
+
+        // Remove from in-progress before caching, so re-entrant calls after
+        // this point (e.g. from a sibling in a parent loop) see the cache hit.
+        self.in_progress.remove(&cache_key);
 
         // Cache the result even if best_cost is INFINITY (avoids recomputation).
         let winner = Winner {

@@ -126,10 +126,17 @@ fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
 
 /// Orient an eq pair so that the first element references the left child's
 /// columns and the second references the right. Returns:
-///   - `Some((a, b))` if natural order works (a from left, b from right).
-///   - `Some((b, a))` if swapping works.
-///   - `None` if both sides reference the same child (caller should demote
-///     the pair into the residual "other" predicate).
+///   - `Some((a, b))` if natural order is confirmed or plausible.
+///   - `Some((b, a))` if swapping is unambiguously correct.
+///   - `None` only when we are certain BOTH sides reference the same single
+///     child (e.g. `t.a = t.b` where both come exclusively from left).
+///     The caller demotes such pairs into the residual "other" predicate.
+///
+/// This is a best-effort heuristic used to set `output_properties` correctly
+/// for the CBO search.  The fragment builder has a try-natural-then-swap
+/// fallback that handles any cases where this function's guess is wrong
+/// (e.g. self-joins where the same column name appears in both children, or
+/// when logical_props is missing for a child group).
 fn orient_eq_pair(
     pair: (TypedExpr, TypedExpr),
     left_cols: &HashSet<String>,
@@ -144,13 +151,24 @@ fn orient_eq_pair(
     let b_in_left = !b_cols.is_empty() && b_cols.iter().all(|c| left_cols.contains(c));
     let b_in_right = !b_cols.is_empty() && b_cols.iter().all(|c| right_cols.contains(c));
 
-    if a_in_left && b_in_right {
-        Some((a, b))
-    } else if a_in_right && b_in_left {
-        Some((b, a))
-    } else {
-        None
+    // Unambiguous exclusive assignment: a from left only, b from right only.
+    if a_in_left && !a_in_right && b_in_right && !b_in_left {
+        return Some((a, b));
     }
+    // Unambiguous exclusive swap: a from right only, b from left only.
+    if a_in_right && !a_in_left && b_in_left && !b_in_right {
+        return Some((b, a));
+    }
+    // Ambiguous or unknown: preserve natural order.  The fragment builder's
+    // try-swap fallback will handle any incorrect orientation at compile time.
+    // We only demote to None when BOTH sides are exclusively from the same
+    // child (proven intra-child predicate, never a valid equi-join key).
+    let both_exclusively_left = a_in_left && !a_in_right && b_in_left && !b_in_right;
+    let both_exclusively_right = a_in_right && !a_in_left && b_in_right && !b_in_left;
+    if both_exclusively_left || both_exclusively_right {
+        return None;
+    }
+    Some((a, b))
 }
 
 // ---------------------------------------------------------------------------
@@ -785,7 +803,7 @@ impl Rule for WindowToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalWindow(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalWindow(op) = &expr.op else {
             return vec![];
         };
@@ -794,69 +812,21 @@ impl Rule for WindowToPhysical {
         }
         let child_group = expr.children[0];
 
-        let groups = split_window_exprs_by_signature(&op.window_exprs);
-        if groups.len() <= 1 {
-            // Single-group window — one-shot translation.
-            return vec![NewExpr {
-                op: Operator::PhysicalWindow(PhysicalWindowOp {
-                    window_exprs: op.window_exprs.clone(),
-                    output_columns: op.output_columns.clone(),
-                }),
-                children: vec![child_group],
-            }];
-        }
-
-        // Multi-group: build chain bottom-up.
-        //   child_group
-        //   -> [PhysicalSort(group[0].sort_keys)]
-        //   -> PhysicalWindow(group[0])
-        //   -> [PhysicalSort(group[1].sort_keys)]
-        //   -> PhysicalWindow(group[1])
-        //   ...
-        //   (top PhysicalWindow becomes the rule's NewExpr)
-        let mut current_group = child_group;
-        let num_groups = groups.len();
-        for (idx, group_exprs) in groups.iter().enumerate() {
-            let first = &group_exprs[0];
-
-            // Insert a PhysicalSort if this group has any partition_by or order_by.
-            let sort_items = sort_items_for_window(first);
-            if !sort_items.is_empty() {
-                let sort_mexpr = MExpr {
-                    id: memo.next_expr_id(),
-                    op: Operator::PhysicalSort(PhysicalSortOp {
-                        items: sort_items,
-                    }),
-                    children: vec![current_group],
-                };
-                current_group = memo.new_group(sort_mexpr);
-            }
-
-            if idx == num_groups - 1 {
-                // Terminal group — return as NewExpr with full output_columns.
-                return vec![NewExpr {
-                    op: Operator::PhysicalWindow(PhysicalWindowOp {
-                        window_exprs: group_exprs.clone(),
-                        output_columns: op.output_columns.clone(),
-                    }),
-                    children: vec![current_group],
-                }];
-            } else {
-                // Intermediate group — allocate a memo group for it.
-                let win_mexpr = MExpr {
-                    id: memo.next_expr_id(),
-                    op: Operator::PhysicalWindow(PhysicalWindowOp {
-                        window_exprs: group_exprs.clone(),
-                        output_columns: op.output_columns.clone(),
-                    }),
-                    children: vec![current_group],
-                };
-                current_group = memo.new_group(win_mexpr);
-            }
-        }
-
-        // Unreachable: the loop always returns when idx == num_groups - 1.
-        vec![]
+        // Emit a single PhysicalWindow with all window expressions.
+        // The fragment builder groups expressions by (partition_by, order_by)
+        // signature internally and emits one Sort+Analytic node per group —
+        // all within the same fragment, without cross-group exchanges.
+        // Cascades-level splitting (one PhysicalWindow per signature group)
+        // would cause the CBO to insert distribution enforcers (HASH EXCHANGE)
+        // between window nodes when their partition key sets differ, which
+        // breaks pipelined analytic execution.
+        vec![NewExpr {
+            op: Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: op.window_exprs.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: vec![child_group],
+        }]
     }
 }
 
