@@ -440,6 +440,8 @@ Each rule above is a bottom-up local rewrite that fires only at one shape (`Logi
 
 **Commit:** `Phase 3: migrate predicate_pushdown to RBO rules`
 
+**Phase 3 landed.** Date: 2026-04-13. HEAD at landing: c9d3775172b96cfe644d768b3446d9b6f232f5ec. predicate_pushdown migrated to five shape-specific RBO rules — PushDownPredicateScan, PushDownPredicateProject, PushDownPredicateAggregate, PushDownPredicateJoin (with OR factoring), PushSemiAntiRightOnlyCondition. Legacy src/sql/optimizer/predicate_pushdown.rs (747 lines) deleted; its one helper consumed by join_reorder (factor_common_eq_from_or_for_reorder plus the private helpers factor_common_eq_from_or_any_side, is_any_eq, split_or_branches, split_and_refs, expr_eq) moved into join_reorder.rs. rewriter::rewrite now contains only reorder_joins_cbo. RBO driver runs twice around rewriter::rewrite to preserve legacy "push before and after reorder" semantics. Unit tests: 928 passed / 19 failed (+18 new rule tests vs post-Phase-2 baseline of 910 / 19; failed count unchanged — zero new regressions). TPC-DS standalone EXPLAIN snapshots: not captured — the pre-Phase-3 snapshot baseline at /tmp/novarocks-plan-compare/standalone-phase2 was cleared, and end-to-end TPC-DS suite-verify is currently blocked by an environmental issue (CREATE EXTERNAL CATALOG against the local Iceberg/MinIO setup appears to succeed silently but USE catalog.db fails — reproduced identically on both the Phase 3 HEAD and the pre-Phase-3 baseline at 3e18b59, confirming it is not a Phase 3 regression). Phase 4 (move utils + selectivity) is unblocked.
+
 ### 4.4 Phase 4 — Move utils + selectivity (no behavior change)
 
 **Files:**
