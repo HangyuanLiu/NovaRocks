@@ -44,7 +44,7 @@ pub(super) fn combine_and(mut exprs: Vec<TypedExpr>) -> TypedExpr {
 }
 
 /// Collect all column names referenced in an expression (unqualified, lowercase).
-pub(super) fn collect_column_refs(expr: &TypedExpr) -> Vec<&str> {
+pub(crate) fn collect_column_refs(expr: &TypedExpr) -> Vec<&str> {
     let mut out = Vec::new();
     collect_column_refs_inner(expr, &mut out);
     out
@@ -217,7 +217,7 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
 }
 
 /// Merge a parent's needed columns with additional column names.
-pub(super) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> HashSet<String> {
+pub(crate) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> HashSet<String> {
     let mut result = parent.cloned().unwrap_or_default();
     for col in extra {
         result.insert(col.to_lowercase());
