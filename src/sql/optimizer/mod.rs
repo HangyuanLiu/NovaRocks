@@ -9,7 +9,6 @@ pub(crate) mod cardinality;
 pub(crate) mod cost;
 pub(crate) mod expr_utils;
 pub(crate) mod join_reorder;
-pub(crate) mod predicate_pushdown;
 
 use crate::sql::plan::*;
 
