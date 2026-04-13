@@ -1156,3 +1156,175 @@ mod eq_pair_tests {
         assert!(orient_eq_pair(pair, &left, &right).is_none());
     }
 }
+
+#[cfg(test)]
+mod join_demotion_tests {
+    use super::*;
+    use crate::sql::cascades::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::ir::OutputColumn;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    /// Create a scan group whose logical_props report the given output columns.
+    fn mk_scan_group(memo: &mut Memo, col_names: &[&str]) -> usize {
+        let output_columns: Vec<OutputColumn> = col_names
+            .iter()
+            .map(|name| OutputColumn {
+                name: (*name).into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            })
+            .collect();
+        let scan_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalScan(LogicalScanOp {
+                database: "db".into(),
+                table: TableDef {
+                    name: "t".into(),
+                    columns: vec![],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/t.parquet"),
+                    },
+                },
+                alias: None,
+                columns: output_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+        };
+        let gid = memo.new_group(scan_mexpr);
+        // Inject logical_props so get_group_column_names returns the column names.
+        memo.groups[gid].logical_props = Some(LogicalProperties {
+            output_columns,
+            row_count: 100.0,
+        });
+        gid
+    }
+
+    /// Build `left op right` as a TypedExpr.
+    fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    /// The full demotion path: a same-side eq pair must land in other_condition
+    /// while an orientable pair lands (correctly oriented) in eq_conditions.
+    #[test]
+    fn demoted_single_side_pair_ends_in_other_condition() {
+        let mut memo = Memo::new();
+
+        // Left side: columns [a_id, a_name].  Right side: column [b_id].
+        let left_group = mk_scan_group(&mut memo, &["a_id", "a_name"]);
+        let right_group = mk_scan_group(&mut memo, &["b_id"]);
+
+        // Condition: (a_id = b_id) AND (a_id = a_name)
+        //   • First pair  (a_id, b_id)  — orientable (a_id left, b_id right).
+        //   • Second pair (a_id, a_name) — same-side (both left) → must demote.
+        let first_eq = bin(col("a_id"), BinOp::Eq, col("b_id"));
+        let second_eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
+        let condition = bin(first_eq, BinOp::And, second_eq);
+
+        let join_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let rule = JoinToHashJoin;
+        let alternatives = rule.apply(&join_mexpr, &mut memo);
+
+        // Expect two alternatives (Shuffle + Broadcast).
+        assert!(
+            !alternatives.is_empty(),
+            "expected at least one alternative from JoinToHashJoin"
+        );
+
+        // Both alternatives must have the same eq_conditions / other_condition shape;
+        // spot-check the first one.
+        let alt = &alternatives[0];
+        let Operator::PhysicalHashJoin(phys) = &alt.op else {
+            panic!("expected PhysicalHashJoin, got {:?}", alt.op);
+        };
+
+        // ── eq_conditions: exactly one pair, (a_id, b_id) ──────────────────
+        assert_eq!(
+            phys.eq_conditions.len(),
+            1,
+            "expected 1 eq pair in eq_conditions, got {:?}",
+            phys.eq_conditions
+        );
+        let (lhs, rhs) = &phys.eq_conditions[0];
+        match &lhs.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(
+                column, "a_id",
+                "left side of eq_condition should be a_id"
+            ),
+            other => panic!("expected ColumnRef on left of eq pair, got {:?}", other),
+        }
+        match &rhs.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(
+                column, "b_id",
+                "right side of eq_condition should be b_id"
+            ),
+            other => panic!("expected ColumnRef on right of eq pair, got {:?}", other),
+        }
+
+        // ── other_condition: the demoted (a_id = a_name) pair ───────────────
+        let other = phys
+            .other_condition
+            .as_ref()
+            .expect("demoted same-side pair must appear in other_condition");
+        match &other.kind {
+            ExprKind::BinaryOp { left, op, right } => {
+                assert!(
+                    matches!(op, BinOp::Eq),
+                    "demoted condition should be BinaryOp::Eq, got {:?}",
+                    op
+                );
+                match (&left.kind, &right.kind) {
+                    (
+                        ExprKind::ColumnRef { column: l, .. },
+                        ExprKind::ColumnRef { column: r, .. },
+                    ) => {
+                        assert!(
+                            (l == "a_id" && r == "a_name") || (l == "a_name" && r == "a_id"),
+                            "expected (a_id, a_name) in demoted eq, got ({}, {})",
+                            l,
+                            r
+                        );
+                    }
+                    other => panic!(
+                        "expected two ColumnRef nodes inside demoted eq, got {:?}",
+                        other
+                    ),
+                }
+            }
+            other => panic!(
+                "expected BinaryOp::Eq in other_condition, got {:?}",
+                other
+            ),
+        }
+    }
+}
