@@ -50,45 +50,57 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
-    // 1. RBO rewrite (predicate pushdown + join reorder + column pruning).
+    // 1. RBO rewrite (legacy; will be progressively migrated to RBO rules below).
     let rewritten = rewriter::rewrite(plan, table_stats);
-    // This is an intentional pre-Memo structural rewrite for CTE shape cleanup,
-    // not a second full logical optimization pass.
+
+    // 1b. RBO rule-based rewriter (Phase 1: empty rule list = no-op;
+    //     subsequent phases migrate predicate pushdown, column pruning, etc.
+    //     from the legacy rewriter above into rules invoked here).
+    let options = options::OptimizerOptions::default_settings();
+    let rewritten = rbo::driver::rewrite_to_fixed_point(
+        rewritten,
+        &rbo::rules::all_rbo_rules(),
+        &options,
+        deadline,
+    )?;
+
+    // 2. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
+    //    cleanup, not a second full logical optimization pass.
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
     let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 
-    // 2. Convert to Memo.
+    // 3. Convert to Memo.
     let mut memo = Memo::new();
     let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
 
-    // 3. Derive initial statistics.
+    // 4. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
 
     check_deadline(deadline)?;
 
-    // 4. Explore: apply transformation rules (logical -> logical).
+    // 5. Explore: apply transformation rules (logical -> logical).
     let transform_rules = rules::all_transformation_rules();
     explore(&mut memo, &transform_rules, deadline)?;
 
     check_deadline(deadline)?;
 
-    // 5. Implement: apply implementation rules (logical -> physical).
+    // 6. Implement: apply implementation rules (logical -> physical).
     let impl_rules = rules::all_implementation_rules();
     implement(&mut memo, &impl_rules);
 
-    // 6. Re-derive statistics for any newly created groups (e.g. from AggSplit).
+    // 7. Re-derive statistics for any newly created groups (e.g. from AggSplit).
     stats::derive_group_statistics(&mut memo, table_stats);
 
     check_deadline(deadline)?;
 
-    // 7. Top-down search with property enforcement.
+    // 8. Top-down search with property enforcement.
     let root_required = PhysicalPropertySet::gather();
     let mut ctx = search::SearchContext::new(table_stats.clone());
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
     check_deadline(deadline)?;
 
-    // 8. Extract best plan.
+    // 9. Extract best plan.
     extract::extract_best(&memo, root_group, &root_required, &ctx.winners)
 }
 
