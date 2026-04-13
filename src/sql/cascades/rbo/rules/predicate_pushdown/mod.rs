@@ -14,6 +14,7 @@
 //! SEMI/ANTI/OUTER null-preservation constraints.
 
 pub(crate) mod push_through_project;
+pub(crate) mod push_to_aggregate;
 pub(crate) mod push_to_scan;
 
 use super::super::rule::RewriteRule;
@@ -23,5 +24,6 @@ pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![
         Box::new(push_to_scan::PushDownPredicateScan),
         Box::new(push_through_project::PushDownPredicateProject),
+        Box::new(push_to_aggregate::PushDownPredicateAggregate),
     ]
 }
