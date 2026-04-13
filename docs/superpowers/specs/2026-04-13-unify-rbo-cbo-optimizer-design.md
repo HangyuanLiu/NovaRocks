@@ -463,6 +463,8 @@ Each rule above is a bottom-up local rewrite that fires only at one shape (`Logi
 
 **Commit:** `Phase 4: move shared utilities and selectivity into cascades`
 
+**Phase 4 landed.** Date: 2026-04-13. HEAD at landing: 3f2bba54efa1963294423c60d4b6835405bf9caf. Pure file move, no behavior change. Relocated `src/sql/optimizer/expr_utils.rs` → `src/sql/cascades/rbo/utils.rs` (legacy deleted, 7 importers rewired). Relocated `estimate_selectivity` + 4 private helpers from `src/sql/optimizer/cardinality.rs` → `src/sql/cascades/stats.rs`; `cardinality.rs` imports `estimate_selectivity` and `extract_column_name` back (remains in place for legacy `join_reorder` until Phase 5). Incidental cleanup: `stats.rs` already carried a private mirror of `extract_column_name`; that copy was promoted in place rather than duplicated. Unit tests: 928 passed / 19 failed — identical to Phase 3 baseline, zero new failures. Phase 5 (wrap join_reorder as a cascades Rule) is unblocked.
+
 ### 4.5 Phase 5 — Wrap join_reorder as a cascades Rule
 
 The largest and highest-risk phase. DP / Greedy / LeftDeep algorithms remain intact; only their interface changes from "legacy function returning one LogicalPlan" to "cascades Rule emitting multiple memo group expressions."
