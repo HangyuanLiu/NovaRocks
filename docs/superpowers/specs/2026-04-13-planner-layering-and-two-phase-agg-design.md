@@ -101,6 +101,11 @@ Establish the "move optimization from fragment_builder to cascades" pattern with
 
 **Validation:** `cargo test`; diff EXPLAIN snapshots; run a handful of LIMIT queries (q3, q7, q22) end-to-end and confirm results match.
 
+**Phase 1 landed.** Date: 2026-04-13. HEAD at landing: 502e4cc7f7237b55825c031440e7ed908abef9e6. Observed:
+- 65 of 99 TPC-DS queries switched from LIMIT+SORT to TOP-N (Phase-0 LIMIT+SORT count: 84; Phase-1 TOP-N count: 65; delta explained by queries where LIMIT is above a non-SORT node, e.g. subquery LIMIT, which correctly remain as LIMIT nodes).
+- Non-Sort/Limit/TopN plan lines are identical between Phase-0 and Phase-1 across all 10 representative queries — the 8 apparent diffs are purely structural: TOP-N collapses the old `outer GATHER EXCHANGE -> LIMIT -> SORT BY -> inner GATHER EXCHANGE` sequence into `TOP-N -> GATHER EXCHANGE`, removing exactly one `GATHER EXCHANGE` level; join/scan/aggregate shapes are unchanged.
+- TPC-DS verify suite: 85 of 99 queries pass (14 fail: q6, q7, q17, q18, q25, q26, q29, q45, q54, q61, q72, q80, q85, q95). These failures are pre-existing (present at Phase-0 baseline 5473b31); no new failures introduced by Phase 1.
+
 ### 4.2 Phase 2 — Remaining fragment_builder Cleanups
 
 Apply the Phase 1 pattern to the other `fragment_builder.rs` layer violations. Each sub-item is an independent commit.
