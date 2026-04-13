@@ -4,7 +4,7 @@ use crate::sql::ir::{BinOp, ExprKind, TypedExpr};
 use crate::sql::plan::*;
 
 /// Split an expression on AND into a flat list of conjuncts.
-pub(super) fn split_and(expr: TypedExpr) -> Vec<TypedExpr> {
+pub(crate) fn split_and(expr: TypedExpr) -> Vec<TypedExpr> {
     let mut out = Vec::new();
     split_and_inner(expr, &mut out);
     out
@@ -26,7 +26,7 @@ fn split_and_inner(expr: TypedExpr, out: &mut Vec<TypedExpr>) {
 
 /// Combine a list of conjuncts back into a single AND expression.
 /// Panics if `exprs` is empty.
-pub(super) fn combine_and(mut exprs: Vec<TypedExpr>) -> TypedExpr {
+pub(crate) fn combine_and(mut exprs: Vec<TypedExpr>) -> TypedExpr {
     assert!(!exprs.is_empty());
     let mut result = exprs.pop().unwrap();
     while let Some(left) = exprs.pop() {
@@ -132,7 +132,7 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
 ///
 /// This is used by predicate pushdown to determine which side of a join a
 /// predicate references.
-pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
+pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
     match plan {
         LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
         LogicalPlan::Filter(f) => collect_output_columns(&f.input),
@@ -226,7 +226,7 @@ pub(crate) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> 
 }
 
 /// Wrap a plan in a Filter if there are remaining (un-pushed) predicates.
-pub(super) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>) -> LogicalPlan {
+pub(crate) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>) -> LogicalPlan {
     if remaining.is_empty() {
         plan
     } else {
@@ -238,14 +238,14 @@ pub(super) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>
 }
 
 /// Qualified column reference: (qualifier, column), both lowercase.
-pub(super) type QualifiedRef = (Option<String>, String);
+pub(crate) type QualifiedRef = (Option<String>, String);
 
 /// Collect all column references in an expression, preserving qualifiers.
 ///
 /// Unlike [`collect_column_refs`] which returns bare column names, this
 /// function returns `(qualifier, column)` pairs so that self-join predicates
 /// (where both sides have the same column names) can be properly classified.
-pub(super) fn collect_qualified_column_refs(expr: &TypedExpr) -> Vec<QualifiedRef> {
+pub(crate) fn collect_qualified_column_refs(expr: &TypedExpr) -> Vec<QualifiedRef> {
     let mut out = Vec::new();
     collect_qualified_column_refs_inner(expr, &mut out);
     out
@@ -337,7 +337,7 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
 /// Returns `(qualifier, column_name)` pairs where `qualifier` is the table
 /// alias (for Scan nodes with an alias) or `None`.  Each column also yields a
 /// bare `(None, column_name)` entry so that unqualified references still match.
-pub(super) fn collect_qualified_output_columns(plan: &LogicalPlan) -> HashSet<QualifiedRef> {
+pub(crate) fn collect_qualified_output_columns(plan: &LogicalPlan) -> HashSet<QualifiedRef> {
     let mut out = HashSet::new();
     collect_qualified_output_columns_inner(plan, &mut out);
     out
