@@ -595,6 +595,37 @@ impl Rule for LimitToPhysical {
 }
 
 // ---------------------------------------------------------------------------
+// 8b. TopNToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct TopNToPhysical;
+
+impl Rule for TopNToPhysical {
+    fn name(&self) -> &str {
+        "TopNToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalTopN(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalTopN(PhysicalTopNOp {
+                items: op.items.clone(),
+                limit: op.limit,
+                offset: op.offset,
+            }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 9. WindowToPhysical
 // ---------------------------------------------------------------------------
 
@@ -909,5 +940,47 @@ impl Rule for SubqueryAliasToPhysical {
             }),
             children: expr.children.clone(),
         }]
+    }
+}
+
+#[cfg(test)]
+mod top_n_tests {
+    use super::*;
+    use crate::sql::cascades::memo::{MExpr, Memo};
+    use crate::sql::cascades::operator::LogicalTopNOp;
+
+    #[test]
+    fn top_n_to_physical_produces_physical_top_n() {
+        let mut memo = Memo::new();
+        let values_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let dummy_child = memo.new_group(values_mexpr);
+
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTopN(LogicalTopNOp {
+                items: vec![],
+                limit: Some(50),
+                offset: Some(10),
+            }),
+            children: vec![dummy_child],
+        };
+        let rule = TopNToPhysical;
+        let out = rule.apply(&expr, &mut memo);
+        assert_eq!(out.len(), 1);
+        match &out[0].op {
+            Operator::PhysicalTopN(p) => {
+                assert_eq!(p.limit, Some(50));
+                assert_eq!(p.offset, Some(10));
+            }
+            other => panic!("expected PhysicalTopN, got {:?}", other),
+        }
+        assert_eq!(out[0].children, vec![dummy_child]);
     }
 }
