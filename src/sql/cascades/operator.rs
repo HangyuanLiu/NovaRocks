@@ -78,6 +78,13 @@ pub(crate) struct LogicalLimitOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LogicalTopNOp {
+    pub items: Vec<SortItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogicalWindowOp {
     pub window_exprs: Vec<WindowExpr>,
     pub output_columns: Vec<OutputColumn>,
@@ -199,6 +206,13 @@ pub(crate) struct PhysicalLimitOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PhysicalTopNOp {
+    pub items: Vec<SortItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PhysicalWindowOp {
     pub window_exprs: Vec<WindowExpr>,
     pub output_columns: Vec<OutputColumn>,
@@ -282,6 +296,7 @@ pub(crate) enum Operator {
     LogicalJoin(LogicalJoinOp),
     LogicalSort(LogicalSortOp),
     LogicalLimit(LogicalLimitOp),
+    LogicalTopN(LogicalTopNOp),
     LogicalWindow(LogicalWindowOp),
     LogicalUnion(LogicalUnionOp),
     LogicalIntersect(LogicalIntersectOp),
@@ -303,6 +318,7 @@ pub(crate) enum Operator {
     PhysicalHashAggregate(PhysicalHashAggregateOp),
     PhysicalSort(PhysicalSortOp),
     PhysicalLimit(PhysicalLimitOp),
+    PhysicalTopN(PhysicalTopNOp),
     PhysicalWindow(PhysicalWindowOp),
     PhysicalDistribution(PhysicalDistributionOp),
     PhysicalCTEAnchor(PhysicalCTEAnchorOp),
@@ -328,6 +344,7 @@ impl Operator {
                 | Operator::LogicalJoin(_)
                 | Operator::LogicalSort(_)
                 | Operator::LogicalLimit(_)
+                | Operator::LogicalTopN(_)
                 | Operator::LogicalWindow(_)
                 | Operator::LogicalUnion(_)
                 | Operator::LogicalIntersect(_)
