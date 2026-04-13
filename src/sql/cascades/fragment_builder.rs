@@ -585,45 +585,30 @@ impl<'a> PlanFragmentBuilder<'a> {
             other_join_conjuncts,
         );
 
-        // Widen nullable flags on the side(s) that the cascades layer has
-        // marked nullable in node.output_columns. The cascades derivation
-        // in stats::derive_output_columns now owns this decision; fragment
-        // builder just reads it.
-        let left_col_count = left.scope.iter_columns().count();
-        let any_left_nullable = node
-            .output_columns
-            .iter()
-            .take(left_col_count)
-            .any(|c| c.nullable);
-        let any_right_nullable = node
-            .output_columns
-            .iter()
-            .skip(left_col_count)
-            .any(|c| c.nullable);
-
-        if any_left_nullable {
-            for &tid in &left.tuple_ids {
-                self.desc_builder.widen_tuple_nullable(tid);
-            }
-        }
-        if any_right_nullable {
-            for &tid in &right.tuple_ids {
-                self.desc_builder.widen_tuple_nullable(tid);
-            }
-        }
-
-        // SEMI/ANTI: runtime still emits null-padded pruned-side columns
-        // (extend_with_null_build_columns / extend_with_null_probe_columns),
-        // and downstream operators reference those slots. Widen the pruned
-        // side explicitly even though output_columns doesn't include it.
+        // Widen nullable flags on the join's null-producing side(s). Note: this
+        // is the tuple-level widening needed by the descriptor table and the
+        // runtime's null-padding for SEMI/ANTI pruned columns. The authoritative
+        // source of column-level nullability is `node.output_columns`, populated
+        // by stats::derive_output_columns via widen_for_join_kind. This match
+        // intentionally mirrors that widening at the tuple level — a per-slot
+        // nullability mechanism would let us drive both from output_columns,
+        // but is out of scope here.
         match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => {
+            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
                 for &tid in &right.tuple_ids {
                     self.desc_builder.widen_tuple_nullable(tid);
                 }
             }
-            JoinKind::RightSemi | JoinKind::RightAnti => {
+            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
                 for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+                for &tid in &right.tuple_ids {
                     self.desc_builder.widen_tuple_nullable(tid);
                 }
             }

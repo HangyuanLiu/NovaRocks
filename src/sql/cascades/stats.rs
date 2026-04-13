@@ -1612,4 +1612,19 @@ mod join_widening_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "b");
     }
+
+    #[test]
+    fn inner_with_nullable_source_column_preserves_flags() {
+        // Inner join does not widen. If the source column was nullable, it stays nullable.
+        // If not, it stays non-nullable. The Inner arm is a pure concatenation.
+        let out = widen_for_join_kind(
+            JoinKind::Inner,
+            vec![c("a", true), c("a2", false)],
+            vec![c("b", false)],
+        );
+        assert_eq!(out.len(), 3);
+        assert!(out[0].nullable, "nullable source stays nullable");
+        assert!(!out[1].nullable, "non-nullable source stays non-nullable");
+        assert!(!out[2].nullable, "non-nullable source on right stays non-nullable");
+    }
 }
