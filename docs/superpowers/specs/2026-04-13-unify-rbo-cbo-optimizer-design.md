@@ -367,6 +367,8 @@ Build the framework end-to-end with empty rule list. Pipeline still calls legacy
 
 **Commit:** `Phase 1: introduce RBO framework skeleton (no rules)`
 
+**Phase 1 landed.** Date: 2026-04-13. HEAD at landing: 6563b500339fee9941c3a2c66395bc65b41c8c35. RBO framework (RewriteRule trait, OptimizerOptions, fixed-point driver, empty rule registry) is wired into cascades::optimize as a no-op pass. All 99 TPC-DS standalone EXPLAIN snapshots are byte-identical to the pre-Phase-1 baseline. Unit tests: 909 passed / 19 failed (no new failures vs the pre-Phase-1 baseline of 910 / 18). Phase 2 (column_pruning migration) is unblocked.
+
 ### 4.2 Phase 2 — Migrate column_pruning
 
 Pilot RBO rule migration with the simplest legacy pass.
