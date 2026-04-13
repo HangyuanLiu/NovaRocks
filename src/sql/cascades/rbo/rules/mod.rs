@@ -5,6 +5,7 @@
 use super::rule::RewriteRule;
 
 pub(crate) mod column_pruning;
+pub(crate) mod predicate_pushdown;
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
     // Column pruning is fundamentally a top-down concern; expressed as a
@@ -17,6 +18,7 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
 pub(crate) fn all_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
     let mut all = Vec::new();
     all.extend(column_pruning_rules());
+    all.extend(predicate_pushdown::predicate_pushdown_rules());
     all
 }
 
