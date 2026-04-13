@@ -549,64 +549,22 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.join_distributions
             .insert(join_node_id, op.distribution.clone());
 
-        // Compile eq conditions.  The eq_conditions pairs come from the SQL
-        // text order (e.g. `l_orderkey = o_orderkey`), which may not match the
-        // join's left/right child assignment.  Try the natural order first; if
-        // the left expr fails against the left scope, swap sides.
-        // If BOTH sides fail against the left scope, the pair belongs to a
-        // single side (e.g. inner predicates in a SEMI JOIN condition) and is
-        // demoted to other_join_conjuncts.
+        // Compile eq conditions. Pairs are pre-oriented by JoinToHashJoin so
+        // that pair.0 references the left child and pair.1 references the right.
+        // Any pair that could not be oriented has been folded into op.other_condition
+        // by the cascades rule.
         let mut eq_join_conjuncts = Vec::new();
-        let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
-        for (expr_a, expr_b) in &op.eq_conditions {
-            let result = {
-                // Try natural order: expr_a on left, expr_b on right.
-                let natural = ExprCompiler::new(&left.scope)
-                    .compile_typed(expr_a)
-                    .ok()
-                    .and_then(|lt| {
-                        ExprCompiler::new(&right.scope)
-                            .compile_typed(expr_b)
-                            .ok()
-                            .map(|rt| (lt, rt))
-                    });
-                // Try swapped: expr_b on left, expr_a on right.
-                // This is needed when JoinCommutativity swapped children
-                // but the eq_condition columns still reference the original
-                // left/right order.
-                natural.or_else(|| {
-                    ExprCompiler::new(&left.scope)
-                        .compile_typed(expr_b)
-                        .ok()
-                        .and_then(|lt| {
-                            ExprCompiler::new(&right.scope)
-                                .compile_typed(expr_a)
-                                .ok()
-                                .map(|rt| (lt, rt))
-                        })
-                })
-            };
-            if let Some((lt, rt)) = result {
-                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
-                    left: lt,
-                    right: rt,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
-                });
-            } else {
-                // Both sides from the same input — demote to other_condition.
-                demoted_eq_exprs.push(TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(expr_a.clone()),
-                        op: crate::sql::ir::BinOp::Eq,
-                        right: Box::new(expr_b.clone()),
-                    },
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                });
-            }
+        for (lhs_expr, rhs_expr) in &op.eq_conditions {
+            let lt = ExprCompiler::new(&left.scope).compile_typed(lhs_expr)?;
+            let rt = ExprCompiler::new(&right.scope).compile_typed(rhs_expr)?;
+            eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
+                left: lt,
+                right: rt,
+                opcode: Some(crate::opcodes::TExprOpcode::EQ),
+            });
         }
 
-        // Compile other conditions (including demoted eq pairs).
+        // Compile other conditions.
         let mut other_join_conjuncts = Vec::new();
         {
             let mut merged = ExprScope::new();
@@ -615,9 +573,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             let mut compiler = ExprCompiler::new(&merged);
             if let Some(ref cond) = op.other_condition {
                 other_join_conjuncts.push(compiler.compile_typed(cond)?);
-            }
-            for demoted in &demoted_eq_exprs {
-                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
             }
         }
 

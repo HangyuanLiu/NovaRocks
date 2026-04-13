@@ -27,11 +27,129 @@ fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// Extract column name from a TypedExpr (if it's a ColumnRef).
-fn extract_column_name(expr: &TypedExpr) -> Option<String> {
+/// Walk a TypedExpr and return the set of lowercase column names it references.
+fn collect_column_refs_lowercase(expr: &TypedExpr) -> HashSet<String> {
+    let mut out = HashSet::new();
+    walk_column_refs(expr, &mut out);
+    out
+}
+
+fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
     match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
-        _ => None,
+        ExprKind::ColumnRef { column, .. } => {
+            out.insert(column.to_lowercase());
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            walk_column_refs(left, out);
+            walk_column_refs(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. } => {
+            walk_column_refs(expr, out);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for a in args {
+                walk_column_refs(a, out);
+            }
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for a in args {
+                walk_column_refs(a, out);
+            }
+            for item in order_by {
+                walk_column_refs(&item.expr, out);
+            }
+        }
+        ExprKind::Cast { expr, .. } => {
+            walk_column_refs(expr, out);
+        }
+        ExprKind::IsNull { expr, .. } => {
+            walk_column_refs(expr, out);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            walk_column_refs(expr, out);
+            for item in list {
+                walk_column_refs(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            walk_column_refs(expr, out);
+            walk_column_refs(low, out);
+            walk_column_refs(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            walk_column_refs(expr, out);
+            walk_column_refs(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                walk_column_refs(op, out);
+            }
+            for (cond, val) in when_then {
+                walk_column_refs(cond, out);
+                walk_column_refs(val, out);
+            }
+            if let Some(e) = else_expr {
+                walk_column_refs(e, out);
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } => {
+            walk_column_refs(expr, out);
+        }
+        ExprKind::Nested(inner) => {
+            walk_column_refs(inner, out);
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                walk_column_refs(a, out);
+            }
+            for p in partition_by {
+                walk_column_refs(p, out);
+            }
+            for item in order_by {
+                walk_column_refs(&item.expr, out);
+            }
+        }
+        ExprKind::Literal(_) | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+/// Orient an eq pair so that the first element references the left child's
+/// columns and the second references the right. Returns:
+///   - `Some((a, b))` if natural order works (a from left, b from right).
+///   - `Some((b, a))` if swapping works.
+///   - `None` if both sides reference the same child (caller should demote
+///     the pair into the residual "other" predicate).
+fn orient_eq_pair(
+    pair: (TypedExpr, TypedExpr),
+    left_cols: &HashSet<String>,
+    right_cols: &HashSet<String>,
+) -> Option<(TypedExpr, TypedExpr)> {
+    let (a, b) = pair;
+    let a_cols = collect_column_refs_lowercase(&a);
+    let b_cols = collect_column_refs_lowercase(&b);
+
+    let a_in_left = !a_cols.is_empty() && a_cols.iter().all(|c| left_cols.contains(c));
+    let a_in_right = !a_cols.is_empty() && a_cols.iter().all(|c| right_cols.contains(c));
+    let b_in_left = !b_cols.is_empty() && b_cols.iter().all(|c| left_cols.contains(c));
+    let b_in_right = !b_cols.is_empty() && b_cols.iter().all(|c| right_cols.contains(c));
+
+    if a_in_left && b_in_right {
+        Some((a, b))
+    } else if a_in_right && b_in_left {
+        Some((b, a))
+    } else {
+        None
     }
 }
 
@@ -382,54 +500,47 @@ impl Rule for JoinToHashJoin {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
-        let (mut eq_conds, mut other) = extract_eq_conditions(&op.condition, &op.join_type);
+        let (raw_eq_conds, mut other) = extract_eq_conditions(&op.condition, &op.join_type);
 
-        // Filter eq_conditions: only keep pairs where one column is from the
-        // left child and the other from the right child.  This prevents inner
-        // predicates (e.g., ss_sold_date_sk = d_date_sk within a SEMI JOIN's
-        // right side) from being treated as equi-join keys.
+        // Orient eq_conditions so that pair.0 references the left child's
+        // columns and pair.1 references the right child's columns.  Pairs
+        // that reference only one side (e.g., inner predicates in a SEMI
+        // JOIN condition) are demoted into other_condition.
+        let mut eq_conds = Vec::new();
         if expr.children.len() == 2 {
             let left_cols = get_group_column_names(memo, expr.children[0]);
             let right_cols = get_group_column_names(memo, expr.children[1]);
-            let mut real_eq = Vec::new();
-            for (l, r) in eq_conds.drain(..) {
-                let l_name = extract_column_name(&l);
-                let r_name = extract_column_name(&r);
-                let is_cross_side = match (&l_name, &r_name) {
-                    (Some(ln), Some(rn)) => {
-                        (left_cols.contains(ln) && right_cols.contains(rn))
-                            || (left_cols.contains(rn) && right_cols.contains(ln))
-                    }
-                    _ => true, // can't determine, keep as eq
-                };
-                if is_cross_side {
-                    real_eq.push((l, r));
-                } else {
-                    // Demote to other_condition
-                    let demoted = TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(l),
-                            op: BinOp::Eq,
-                            right: Box::new(r),
-                        },
-                    };
-                    other = Some(match other {
-                        Some(existing) => TypedExpr {
+            for pair in raw_eq_conds {
+                let (a, b) = pair.clone();
+                match orient_eq_pair(pair, &left_cols, &right_cols) {
+                    Some(oriented) => eq_conds.push(oriented),
+                    None => {
+                        let demoted = TypedExpr {
                             data_type: DataType::Boolean,
                             nullable: false,
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(existing),
-                                op: BinOp::And,
-                                right: Box::new(demoted),
+                                left: Box::new(a),
+                                op: BinOp::Eq,
+                                right: Box::new(b),
                             },
-                        },
-                        None => demoted,
-                    });
+                        };
+                        other = Some(match other {
+                            Some(existing) => TypedExpr {
+                                data_type: DataType::Boolean,
+                                nullable: false,
+                                kind: ExprKind::BinaryOp {
+                                    left: Box::new(existing),
+                                    op: BinOp::And,
+                                    right: Box::new(demoted),
+                                },
+                            },
+                            None => demoted,
+                        });
+                    }
                 }
             }
-            eq_conds = real_eq;
+        } else {
+            eq_conds = raw_eq_conds;
         }
 
         if eq_conds.is_empty() {
@@ -982,5 +1093,66 @@ mod top_n_tests {
             other => panic!("expected PhysicalTopN, got {:?}", other),
         }
         assert_eq!(out[0].children, vec![dummy_child]);
+    }
+}
+
+#[cfg(test)]
+mod eq_pair_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    fn cols(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_lowercase()).collect()
+    }
+
+    #[test]
+    fn orient_natural_order_keeps_order() {
+        let left = cols(&["a_id"]);
+        let right = cols(&["b_id"]);
+        let pair = (col("a_id"), col("b_id"));
+        let out = orient_eq_pair(pair, &left, &right).expect("should orient");
+        match &out.0.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
+            _ => panic!("expected ColumnRef"),
+        }
+        match &out.1.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
+            _ => panic!("expected ColumnRef"),
+        }
+    }
+
+    #[test]
+    fn orient_swapped_pair_returns_swapped() {
+        let left = cols(&["a_id"]);
+        let right = cols(&["b_id"]);
+        let pair = (col("b_id"), col("a_id"));
+        let out = orient_eq_pair(pair, &left, &right).expect("should orient");
+        match &out.0.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
+            _ => panic!("expected ColumnRef"),
+        }
+        match &out.1.kind {
+            ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
+            _ => panic!("expected ColumnRef"),
+        }
+    }
+
+    #[test]
+    fn orient_single_side_pair_returns_none() {
+        let left = cols(&["a_id", "a_name"]);
+        let right = cols(&["b_id"]);
+        let pair = (col("a_id"), col("a_name"));
+        assert!(orient_eq_pair(pair, &left, &right).is_none());
     }
 }
