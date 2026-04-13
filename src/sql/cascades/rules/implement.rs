@@ -740,6 +740,39 @@ impl Rule for TopNToPhysical {
 // 9. WindowToPhysical
 // ---------------------------------------------------------------------------
 
+/// Split a LogicalWindow's expressions into groups sharing the same
+/// (partition_by, order_by) signature. Preserves first-seen order.
+fn split_window_exprs_by_signature(
+    exprs: &[crate::sql::plan::WindowExpr],
+) -> Vec<Vec<crate::sql::plan::WindowExpr>> {
+    let index_groups =
+        crate::sql::physical::emitter::emit_window::group_win_exprs_by_sig(exprs);
+    index_groups
+        .into_iter()
+        .map(|idxs| idxs.into_iter().map(|i| exprs[i].clone()).collect())
+        .collect()
+}
+
+/// Derive sort items for a window's partition_by + order_by.
+/// Window sort ordering is: partition_by columns first (ASC, NULLS FIRST),
+/// then order_by columns with their own direction.
+fn sort_items_for_window(
+    win: &crate::sql::plan::WindowExpr,
+) -> Vec<crate::sql::ir::SortItem> {
+    let mut items = Vec::new();
+    for expr in &win.partition_by {
+        items.push(crate::sql::ir::SortItem {
+            expr: expr.clone(),
+            asc: true,
+            nulls_first: true,
+        });
+    }
+    for item in &win.order_by {
+        items.push(item.clone());
+    }
+    items
+}
+
 pub(crate) struct WindowToPhysical;
 
 impl Rule for WindowToPhysical {
@@ -752,17 +785,78 @@ impl Rule for WindowToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalWindow(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalWindow(op) = &expr.op else {
             return vec![];
         };
-        vec![NewExpr {
-            op: Operator::PhysicalWindow(PhysicalWindowOp {
-                window_exprs: op.window_exprs.clone(),
-                output_columns: op.output_columns.clone(),
-            }),
-            children: expr.children.clone(),
-        }]
+        if expr.children.len() != 1 {
+            return vec![];
+        }
+        let child_group = expr.children[0];
+
+        let groups = split_window_exprs_by_signature(&op.window_exprs);
+        if groups.len() <= 1 {
+            // Single-group window — one-shot translation.
+            return vec![NewExpr {
+                op: Operator::PhysicalWindow(PhysicalWindowOp {
+                    window_exprs: op.window_exprs.clone(),
+                    output_columns: op.output_columns.clone(),
+                }),
+                children: vec![child_group],
+            }];
+        }
+
+        // Multi-group: build chain bottom-up.
+        //   child_group
+        //   -> [PhysicalSort(group[0].sort_keys)]
+        //   -> PhysicalWindow(group[0])
+        //   -> [PhysicalSort(group[1].sort_keys)]
+        //   -> PhysicalWindow(group[1])
+        //   ...
+        //   (top PhysicalWindow becomes the rule's NewExpr)
+        let mut current_group = child_group;
+        let num_groups = groups.len();
+        for (idx, group_exprs) in groups.iter().enumerate() {
+            let first = &group_exprs[0];
+
+            // Insert a PhysicalSort if this group has any partition_by or order_by.
+            let sort_items = sort_items_for_window(first);
+            if !sort_items.is_empty() {
+                let sort_mexpr = MExpr {
+                    id: memo.next_expr_id(),
+                    op: Operator::PhysicalSort(PhysicalSortOp {
+                        items: sort_items,
+                    }),
+                    children: vec![current_group],
+                };
+                current_group = memo.new_group(sort_mexpr);
+            }
+
+            if idx == num_groups - 1 {
+                // Terminal group — return as NewExpr with full output_columns.
+                return vec![NewExpr {
+                    op: Operator::PhysicalWindow(PhysicalWindowOp {
+                        window_exprs: group_exprs.clone(),
+                        output_columns: op.output_columns.clone(),
+                    }),
+                    children: vec![current_group],
+                }];
+            } else {
+                // Intermediate group — allocate a memo group for it.
+                let win_mexpr = MExpr {
+                    id: memo.next_expr_id(),
+                    op: Operator::PhysicalWindow(PhysicalWindowOp {
+                        window_exprs: group_exprs.clone(),
+                        output_columns: op.output_columns.clone(),
+                    }),
+                    children: vec![current_group],
+                };
+                current_group = memo.new_group(win_mexpr);
+            }
+        }
+
+        // Unreachable: the loop always returns when idx == num_groups - 1.
+        vec![]
     }
 }
 
@@ -1326,5 +1420,92 @@ mod join_demotion_tests {
                 other
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod window_split_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use crate::sql::plan::WindowExpr;
+
+    fn mk_window_expr(name: &str, partition: Vec<TypedExpr>) -> WindowExpr {
+        WindowExpr {
+            name: name.into(),
+            args: vec![],
+            distinct: false,
+            partition_by: partition,
+            order_by: vec![],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: name.into(),
+        }
+    }
+
+    fn col(name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn split_groups_same_signature_together() {
+        let exprs = vec![
+            mk_window_expr("w1", vec![col("a")]),
+            mk_window_expr("w2", vec![col("a")]),
+        ];
+        let groups = split_window_exprs_by_signature(&exprs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn split_separates_different_signatures() {
+        let exprs = vec![
+            mk_window_expr("w1", vec![col("a")]),
+            mk_window_expr("w2", vec![col("b")]),
+            mk_window_expr("w3", vec![col("a")]),
+        ];
+        let groups = split_window_exprs_by_signature(&exprs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].name, "w1");
+        assert_eq!(groups[0][1].name, "w3");
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[1][0].name, "w2");
+    }
+
+    #[test]
+    fn sort_items_for_window_combines_partition_and_order() {
+        use crate::sql::ir::SortItem;
+        let win = WindowExpr {
+            name: "w".into(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![col("a"), col("b")],
+            order_by: vec![SortItem {
+                expr: col("c"),
+                asc: false,
+                nulls_first: false,
+            }],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: "w".into(),
+        };
+        let items = sort_items_for_window(&win);
+        assert_eq!(items.len(), 3);
+        // partition_by items are ASC NULLS FIRST
+        assert!(items[0].asc);
+        assert!(items[0].nulls_first);
+        assert!(items[1].asc);
+        assert!(items[1].nulls_first);
+        // order_by item preserves its own direction
+        assert!(!items[2].asc);
+        assert!(!items[2].nulls_first);
     }
 }
