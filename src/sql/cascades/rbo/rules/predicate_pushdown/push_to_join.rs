@@ -44,39 +44,20 @@ impl RewriteRule for PushDownPredicateJoin {
         let LogicalPlan::Join(join) = *filter.input else {
             return None;
         };
-        let before_join = join.clone();
-        let before_pred = filter.predicate.clone();
-        let rewritten = push_predicates_through_join(filter.predicate, join);
-        // If the rewrite yields exactly Filter(Join{ == before_join }) with
-        // the original predicate re-attached, nothing changed — return None
-        // so the driver's fixed-point terminates.
-        if is_unchanged(&rewritten, &before_join, &before_pred) {
-            None
-        } else {
+        let (rewritten, pushed_any) = push_predicates_through_join(filter.predicate, join);
+        if pushed_any {
             Some(rewritten)
+        } else {
+            None
         }
     }
-}
-
-/// Detect "apply was a no-op": the output is literally Filter(Join(same))
-/// with the same predicate. Covers the case where every conjunct landed in
-/// `remaining` because none were classifiable.
-fn is_unchanged(out: &LogicalPlan, before_join: &JoinNode, before_pred: &TypedExpr) -> bool {
-    let LogicalPlan::Filter(f) = out else {
-        return false;
-    };
-    let LogicalPlan::Join(j) = &*f.input else {
-        return false;
-    };
-    format!("{:?}", j) == format!("{:?}", before_join)
-        && format!("{:?}", f.predicate) == format!("{:?}", before_pred)
 }
 
 // ============================================================
 // Port of legacy helpers from src/sql/optimizer/predicate_pushdown.rs
 // ============================================================
 
-fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> LogicalPlan {
+fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (LogicalPlan, bool) {
     let conjuncts = split_and(predicate);
     let left_cols = collect_output_columns(&join.left);
     let right_cols = collect_output_columns(&join.right);
@@ -245,6 +226,9 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
         remaining.extend(right_preds.drain(..));
     }
 
+    // Determine whether anything was actually pushed (after outer-join drain-back).
+    let pushed_any = !left_preds.is_empty() || !right_preds.is_empty() || !join_preds.is_empty();
+
     // Build the new left child, applying pushed predicates then wrapping in
     // a Filter. The RBO driver's fixed-point handles continued pushdown on
     // subsequent iterations.
@@ -287,7 +271,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
         condition: new_condition,
     });
 
-    wrap_remaining_filter(new_join, remaining)
+    (wrap_remaining_filter(new_join, remaining), pushed_any)
 }
 
 /// Extract common equi-join conditions from all branches of an OR predicate.
