@@ -171,4 +171,39 @@ mod tests {
         let rule = PushDownPredicateScan;
         assert!(rule.apply(filter).is_none());
     }
+
+    fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::And,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    #[test]
+    fn partial_pushdown_leaves_residual_filter() {
+        // a=1 AND zz=2: only a=1 is pushable because `zz` is not in the
+        // scan's output columns. Expect Filter(Scan) with one predicate
+        // on the scan and the residual conjunct above.
+        let scan = scan_with_cols(&["a"]);
+        let pred = and(eq(col("a"), int_lit(1)), eq(col("zz"), int_lit(2)));
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: pred,
+        });
+        let out = PushDownPredicateScan
+            .apply(filter)
+            .expect("should rewrite");
+        match out {
+            LogicalPlan::Filter(f) => match *f.input {
+                LogicalPlan::Scan(s) => assert_eq!(s.predicates.len(), 1),
+                other => panic!("expected Scan under residual Filter, got {:?}", other),
+            },
+            other => panic!("expected Filter(Scan) for partial pushdown, got {:?}", other),
+        }
+    }
 }
