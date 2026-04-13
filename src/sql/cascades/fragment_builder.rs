@@ -1054,21 +1054,26 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let mut child = self.visit(&node.children[0])?;
 
-        // Apply limit/offset to the top-most sort node if present,
-        // or to the top-most node otherwise.
-        if let Some(top) = child.plan_nodes.first_mut() {
-            if top.node_type == plan_nodes::TPlanNodeType::SORT_NODE {
-                if let Some(limit) = op.limit {
-                    top.limit = limit;
-                    if let Some(ref mut sn) = top.sort_node {
-                        sn.use_top_n = true;
-                        sn.offset = op.offset;
-                    }
-                }
-            } else if let Some(limit) = op.limit {
+        // Limit on a Sort should have been rewritten to TopN at the cascades
+        // level by SortLimitToTopN. Here we only apply the limit value to the
+        // child's top node when it is not a SORT_NODE (e.g., Limit on a Scan
+        // or Filter).
+        if let Some(limit) = op.limit {
+            if let Some(top) = child.plan_nodes.first_mut() {
+                debug_assert!(
+                    top.node_type != plan_nodes::TPlanNodeType::SORT_NODE,
+                    "Limit on Sort should have been rewritten to TopN; found SORT_NODE under Limit"
+                );
                 top.limit = limit;
             }
         }
+        // Offset on a plain Limit has no direct execution slot outside of
+        // SORT_NODE; it is expected to be folded into a TopN at the cascades
+        // level. Warn via debug_assert if offset is set here.
+        debug_assert!(
+            op.offset.is_none(),
+            "Limit offset without a Sort child is not supported; cascades should have folded into TopN"
+        );
 
         Ok(child)
     }
