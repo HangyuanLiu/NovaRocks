@@ -45,6 +45,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalJoin(_)
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
+        | Operator::LogicalTopN(_)
         | Operator::LogicalWindow(_)
         | Operator::LogicalUnion(_)
         | Operator::LogicalIntersect(_)
@@ -118,6 +119,24 @@ pub(crate) fn compute_cost(
         Operator::PhysicalSort(_) => {
             let n = own_stats.output_row_count.max(1.0);
             n * n.log2()
+        }
+
+        Operator::PhysicalTopN(t) => {
+            // Physical model: TopN scans all input rows (size = child's output row count)
+            // and maintains a heap of size k = min(input_rows, limit + offset).
+            // Total cost: input_rows * log2(k).
+            let input_rows = child_stats
+                .first()
+                .map(|s| s.output_row_count)
+                .unwrap_or(own_stats.output_row_count)
+                .max(1.0);
+            let k = match (t.limit, t.offset) {
+                (Some(l), Some(o)) => ((l as f64) + (o as f64)).min(input_rows).max(1.0),
+                (Some(l), None) => (l as f64).min(input_rows).max(1.0),
+                _ => input_rows,
+            };
+            // Guard against log2(1)=0 when limit=1: lower-bound the per-row work at 1.0.
+            input_rows * k.log2().max(1.0)
         }
 
         Operator::PhysicalDistribution(_) => own_stats.compute_size() * NETWORK_COST,
@@ -282,5 +301,58 @@ mod tests {
         let cost = compute_cost(&op, &s, &[]);
         // 1000 * 100 * 1.5 = 150_000
         assert!((cost - 150_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn top_n_cheaper_than_sort_for_small_limit() {
+        // Input of 10M rows; TopN's own_stats is the limited output (k=100 rows),
+        // while its child's output (the scan) has 10M rows.
+        let input = stats(10_000_000.0, 50.0);
+        let own = stats(100.0, 50.0);
+        let sort = Operator::PhysicalSort(PhysicalSortOp { items: vec![] });
+        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+        });
+        let cost_sort = compute_cost(&sort, &input, &[]);
+        let cost_top_n = compute_cost(&top_n, &own, &[&input]);
+        // Expected ratio ~ log2(100)/log2(10M) ≈ 0.286.
+        assert!(cost_top_n < cost_sort * 0.5,
+            "expected TOP-N strictly cheaper than Sort; got top_n={} sort={}",
+            cost_top_n, cost_sort);
+    }
+
+    #[test]
+    fn top_n_falls_back_to_sort_cost_when_limit_exceeds_rows() {
+        // When limit >> input rows, TopN's k clamps to input rows, and cost
+        // equals Sort's cost (both are n * log2(n)).
+        let input = stats(100.0, 10.0);
+        let own = stats(100.0, 10.0); // unlimited output (limit exceeds input)
+        let sort = Operator::PhysicalSort(PhysicalSortOp { items: vec![] });
+        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(10_000),
+            offset: None,
+        });
+        let cost_sort = compute_cost(&sort, &input, &[]);
+        let cost_top_n = compute_cost(&top_n, &own, &[&input]);
+        assert!((cost_top_n - cost_sort).abs() < 1.0);
+    }
+
+    #[test]
+    fn top_n_with_offset_and_limit_sums_both() {
+        // limit=50 + offset=50 => k=100. Same cost as limit=100, offset=None.
+        let input = stats(10_000.0, 10.0);
+        let own = stats(100.0, 10.0);
+        let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(50),
+            offset: Some(50),
+        });
+        let cost = compute_cost(&top_n, &own, &[&input]);
+        // input_rows=10_000, k=100, cost = 10_000 * log2(100) ≈ 66_438.56
+        let expected = 10_000.0 * (100f64).log2();
+        assert!((cost - expected).abs() < 1.0, "got {}, expected {}", cost, expected);
     }
 }

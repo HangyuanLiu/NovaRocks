@@ -129,6 +129,20 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
+        Operator::LogicalTopN(topn) => {
+            // TopN limits output rows to at most limit+offset.
+            let child_stats = child_statistics(memo, &expr.children, 0);
+            let limit_rows = match (topn.limit, topn.offset) {
+                (Some(l), Some(o)) => ((l as f64) + (o as f64)).min(child_stats.output_row_count),
+                (Some(l), None) => (l as f64).min(child_stats.output_row_count),
+                _ => child_stats.output_row_count,
+            };
+            Statistics {
+                output_row_count: limit_rows.max(0.0),
+                column_statistics: child_stats.column_statistics,
+            }
+        }
+
         Operator::LogicalLimit(limit) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
             let output_rows = if let Some(lim) = limit.limit {
@@ -439,6 +453,20 @@ pub(crate) fn derive_statistics(
         }
 
         Operator::PhysicalSort(_) => child_statistics(memo, &expr.children, 0),
+
+        Operator::PhysicalTopN(topn) => {
+            // TopN limits output rows to at most limit+offset.
+            let child_stats = child_statistics(memo, &expr.children, 0);
+            let limit_rows = match (topn.limit, topn.offset) {
+                (Some(l), Some(o)) => ((l as f64) + (o as f64)).min(child_stats.output_row_count),
+                (Some(l), None) => (l as f64).min(child_stats.output_row_count),
+                _ => child_stats.output_row_count,
+            };
+            Statistics {
+                output_row_count: limit_rows.max(0.0),
+                column_statistics: child_stats.column_statistics,
+            }
+        }
 
         Operator::PhysicalLimit(limit) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
@@ -909,6 +937,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::O
         Operator::LogicalFilter(_)
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
+        | Operator::LogicalTopN(_)
         | Operator::LogicalRepeat(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
@@ -993,6 +1022,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::O
         Operator::PhysicalFilter(_)
         | Operator::PhysicalSort(_)
         | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTopN(_)
         | Operator::PhysicalDistribution(_)
         | Operator::PhysicalRepeat(_) => {
             if let Some(&child_id) = expr.children.first() {
