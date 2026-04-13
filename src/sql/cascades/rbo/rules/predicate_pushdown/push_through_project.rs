@@ -58,10 +58,9 @@ impl RewriteRule for PushDownPredicateProject {
         let mut remaining = Vec::new();
         for conj in conjuncts {
             let refs = collect_column_refs(&conj);
-            if !refs.is_empty()
-                && refs
-                    .iter()
-                    .all(|r| passthrough_columns.contains(&r.to_lowercase()))
+            if refs
+                .iter()
+                .all(|r| passthrough_columns.contains(&r.to_lowercase()))
             {
                 pushable.push(conj);
             } else {
@@ -245,6 +244,31 @@ mod tests {
             rule.apply(filter).is_none(),
             "should not push through a computed projection"
         );
+    }
+
+    // Test 4: WHERE 1=1 (constant predicate, no column refs).
+    // Legacy push_filter_into Project arm pushes it via vacuous-truth of all()
+    // on an empty iterator. The new rule must match exactly.
+    // Expected shape: Project(Filter(Scan))
+    #[test]
+    fn pushes_constant_predicate_through_project() {
+        // WHERE 1=1 (no column refs): legacy behavior is to push vacuously;
+        // new rule must match exactly.
+        let scan = scan_with_cols(&["a"]);
+        let project = passthrough_project(&["a"], scan);
+        let one_eq_one = eq(int_lit(1), int_lit(1));
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(project),
+            predicate: one_eq_one,
+        });
+        let rule = PushDownPredicateProject;
+        let out = rule.apply(filter).expect("should push vacuous constant");
+        match out {
+            LogicalPlan::Project(p) => {
+                assert!(matches!(*p.input, LogicalPlan::Filter(_)));
+            }
+            other => panic!("expected Project(Filter(Scan)) for pushed constant, got {:?}", other),
+        }
     }
 
     // Test 3: AND of a pass-through ref (a = 1) and a computed-expr ref (x = 5)
