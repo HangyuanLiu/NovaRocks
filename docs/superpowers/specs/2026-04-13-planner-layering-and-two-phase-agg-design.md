@@ -126,6 +126,12 @@ Today, `fragment_builder.rs:631–657` mutates the descriptor table during `visi
 - 2.2: queries with multiple window expressions with different `(partition_by, order_by)` signatures now show multiple `PhysicalWindow` + `PhysicalSort` nodes in the cascades-level EXPLAIN (what was implicit at fragment level becomes explicit at cascades level). The exact affected query list is captured during implementation.
 - 2.3: no observable change in EXPLAIN text, but `output_columns` nullable flags move from fragment-time to cascades-time.
 
+**Phase 2 landed.** Date: 2026-04-13. HEAD at landing: 3907588. Three sub-tasks delivered as five commits (3fbecc3 + 788a431 for 2.1, 55c08db + 1c95a5b for 2.2, 33604af + 3907588 for 2.3). Observed:
+- 60 of 99 TPC-DS queries' EXPLAIN snapshots differ vs Phase 1. Differences classified as eq_conditions LHS/RHS ordering normalized by JoinToHashJoin (majority of queries), and SHUFFLE→BROADCAST distribution strategy changes with probe/build side reordering (cascades cost model sensitivity from Phase 2 rewrites). No changes to scan order, join shape, aggregate mode, or partition keys.
+- TPC-DS end-to-end execution not re-run for Phase 2 — only EXPLAIN-level regression checked, since refactors should be plan-equivalent. Phase 1's 85/99 verify result remains the latest authoritative pass count.
+- Task 2.1 deviation from spec text: normalization lives in `JoinToHashJoin` (implementation rule) rather than `JoinCommutativity` (transformation rule), because `LogicalJoin` has no `eq_conditions` field. Equivalent intent.
+- Task 2.3 partial fallback: `fragment_builder`'s tuple-level nullability widening continues to be driven by `op.join_type`. `stats.rs::widen_for_join_kind` is the authoritative source for `output_columns.nullable`, consumed by downstream cascades code. A future per-slot nullability mechanism would let `fragment_builder` read from `output_columns`.
+
 ### 4.3 Phase 3 — Expression Rewriting Infrastructure
 
 Build the aggregate rewriter that Phase 4 depends on. This phase adds new code but does not wire it into the optimizer main path, so EXPLAIN output is unchanged.
