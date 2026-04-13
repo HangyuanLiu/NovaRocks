@@ -29,9 +29,12 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_rbo_rules();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
-        assert_eq!(names, vec!["PruneColumns", "PushDownPredicateScan"]);
+        assert_eq!(
+            names,
+            vec!["PruneColumns", "PushDownPredicateProject", "PushDownPredicateScan"]
+        );
     }
 }
