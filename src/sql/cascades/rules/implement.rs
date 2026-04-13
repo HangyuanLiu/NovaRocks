@@ -13,7 +13,7 @@ use crate::sql::cascades::rule::{NewExpr, Rule, RuleType};
 use crate::sql::ir::{BinOp, ExprKind, JoinKind, TypedExpr};
 
 /// Get lowercase column names from a memo group's output columns.
-fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
+pub(super) fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
     memo.groups
         .get(group_id)
         .and_then(|g| g.logical_props.as_ref())
@@ -28,7 +28,7 @@ fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
 }
 
 /// Walk a TypedExpr and return the set of lowercase column names it references.
-fn collect_column_refs_lowercase(expr: &TypedExpr) -> HashSet<String> {
+pub(super) fn collect_column_refs_lowercase(expr: &TypedExpr) -> HashSet<String> {
     let mut out = HashSet::new();
     walk_column_refs(expr, &mut out);
     out

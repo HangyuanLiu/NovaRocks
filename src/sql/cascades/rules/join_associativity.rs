@@ -2,14 +2,20 @@
 //!
 //! Re-associates inner joins: `(A JOIN B) JOIN C` -> `A JOIN (B JOIN C)`.
 //!
-//! Only applies when both the outer and inner joins are INNER joins.
-//! In Phase 2+3 the conditions are kept on the outer join without
-//! redistribution; full predicate re-association is a future optimization.
+//! Only applies when both the outer and inner joins are INNER joins, AND
+//! when reusing the original conditions in their new positions is sound:
+//! the inner_op.condition (originally over A∪B) must reference only
+//! columns from B in its new position over (B JOIN C). If it references
+//! any column from A, we cannot reuse it without redistribution and the
+//! rewrite is skipped. Full predicate re-association across the rewrite
+//! is a future improvement.
 
 use crate::sql::cascades::memo::{MExpr, Memo};
 use crate::sql::cascades::operator::{LogicalJoinOp, Operator};
 use crate::sql::cascades::rule::{NewExpr, Rule, RuleType};
 use crate::sql::ir::JoinKind;
+
+use super::implement::{collect_column_refs_lowercase, get_group_column_names};
 
 pub(crate) struct JoinAssociativity;
 
@@ -79,12 +85,39 @@ impl Rule for JoinAssociativity {
             _ => return vec![],
         };
 
+        // Soundness gate: the new inner join (B JOIN C) reuses inner_op.condition
+        // verbatim, so that condition must reference only columns available in
+        // (B ∪ C). Originally inner_op.condition was over (A ∪ B); if it
+        // references any column from A, A is no longer in the inner join's
+        // scope after re-association, and reusing the condition would either
+        // panic the fragment builder (column-not-resolvable) or silently
+        // produce wrong rows. Skip the rewrite in that case rather than emit
+        // an unsound plan. A future improvement would split the condition by
+        // conjunct and re-distribute across the new structure.
+        if let Some(ref cond) = inner_op.condition {
+            let cond_cols = collect_column_refs_lowercase(cond);
+            let a_cols = get_group_column_names(memo, a_group);
+            let b_cols = get_group_column_names(memo, b_group);
+            let c_cols = get_group_column_names(memo, c_group);
+            let bc_cols: std::collections::HashSet<String> =
+                b_cols.union(&c_cols).cloned().collect();
+            // Only fire if every column the condition references is available
+            // in B ∪ C, and at least one column also lies in B (otherwise the
+            // condition is purely over A, which is even more clearly wrong).
+            let refs_only_bc = cond_cols.iter().all(|c| bc_cols.contains(c));
+            let refs_any_a = cond_cols.iter().any(|c| a_cols.contains(c) && !bc_cols.contains(c));
+            if !refs_only_bc || refs_any_a {
+                return vec![];
+            }
+        }
+
         // Produce: A JOIN_outer (B JOIN_inner C)
         //
-        // Phase 2+3 simplification: the inner join's condition moves to the new
-        // inner join (B JOIN C), and the outer join's condition stays on the
-        // outer join (A JOIN ...).  Full condition re-distribution across the
-        // new structure is a future improvement.
+        // The outer join's condition (originally over (A∪B)∪C) is reused on
+        // the new outer (A JOIN BC), which has the same combined scope; that
+        // is always safe.
+        // The inner join's condition is reused on the new inner (B JOIN C);
+        // soundness was checked above.
 
         // Create the new inner join group: B JOIN C
         let new_inner_join = MExpr {
