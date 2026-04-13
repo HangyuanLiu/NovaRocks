@@ -9,6 +9,7 @@ pub(crate) mod memo;
 pub(crate) mod operator;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
+pub(crate) mod rbo;
 pub(crate) mod property;
 pub(crate) mod rewriter;
 pub(crate) mod rule;
