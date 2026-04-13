@@ -709,10 +709,31 @@ impl Rule for LimitToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalLimit(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalLimit(op) = &expr.op else {
             return vec![];
         };
+
+        // If the Limit has a Sort directly underneath, SortLimitToTopN has
+        // already added an equivalent LogicalTopN to this same group; defer
+        // exclusively to that path. Producing both PhysicalLimit (here) and
+        // PhysicalTopN (via TopNToPhysical) is unsafe at large cost scales:
+        // the underlying join/agg cost dominates and f64 precision collapses
+        // the difference, so the search arbitrarily picks whichever
+        // alternative was inserted first. Fragment builder also asserts that
+        // PhysicalLimit never sits directly on a SORT_NODE; this skip keeps
+        // the assertion satisfied.
+        if op.limit.is_some() && expr.children.len() == 1 {
+            let child_group = &memo.groups[expr.children[0]];
+            let child_has_sort = child_group
+                .logical_exprs
+                .iter()
+                .any(|m| matches!(m.op, Operator::LogicalSort(_)));
+            if child_has_sort {
+                return vec![];
+            }
+        }
+
         vec![NewExpr {
             op: Operator::PhysicalLimit(PhysicalLimitOp {
                 limit: op.limit,

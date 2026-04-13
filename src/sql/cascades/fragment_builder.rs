@@ -1055,9 +1055,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut child = self.visit(&node.children[0])?;
 
         // Limit on a Sort should have been rewritten to TopN at the cascades
-        // level by SortLimitToTopN. Here we only apply the limit value to the
-        // child's top node when it is not a SORT_NODE (e.g., Limit on a Scan
-        // or Filter).
+        // level: SortLimitToTopN inserts an equivalent LogicalTopN into the
+        // Limit's group, and LimitToPhysical refuses to produce PhysicalLimit
+        // when its child has a LogicalSort. Here we only apply the limit
+        // value to the child's top node when it is not a SORT_NODE (e.g.,
+        // Limit on a Scan or Filter).
         if let Some(limit) = op.limit {
             if let Some(top) = child.plan_nodes.first_mut() {
                 debug_assert!(
