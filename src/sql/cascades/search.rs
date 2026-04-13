@@ -864,19 +864,49 @@ mod tests {
         });
         let reqs = required_input_properties(&op, &PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
-        match &reqs[0].distribution {
-            DistributionSpec::HashPartitioned(cols) => {
-                assert_eq!(cols[0].qualifier.as_deref(), Some("a"));
-                assert_eq!(cols[0].column, "id");
+
+        // Design note (mirrors the production code path in this file): a
+        // shuffle join's required_input_properties provides ALL eq column
+        // refs (from both sides) to each child. Fragment builder resolves
+        // only those that exist in each child's scope. This gives the
+        // optimizer freedom when JoinCommutativity swaps children and the
+        // eq_condition pair order becomes ambiguous. We therefore check
+        // that both "a.id" and "b.id" appear on each side, regardless of
+        // index order.
+        for (side_label, req) in [("left", &reqs[0]), ("right", &reqs[1])] {
+            match &req.distribution {
+                DistributionSpec::HashPartitioned(cols) => {
+                    assert_eq!(
+                        cols.len(),
+                        2,
+                        "{} side should receive both eq column refs",
+                        side_label
+                    );
+                    let qualifiers: std::collections::HashSet<&str> = cols
+                        .iter()
+                        .filter_map(|c| c.qualifier.as_deref())
+                        .collect();
+                    assert!(
+                        qualifiers.contains("a"),
+                        "{} side missing a.id, got qualifiers {:?}",
+                        side_label,
+                        qualifiers
+                    );
+                    assert!(
+                        qualifiers.contains("b"),
+                        "{} side missing b.id, got qualifiers {:?}",
+                        side_label,
+                        qualifiers
+                    );
+                    for c in cols {
+                        assert_eq!(c.column, "id");
+                    }
+                }
+                other => panic!(
+                    "expected HashPartitioned for {} side, got {:?}",
+                    side_label, other
+                ),
             }
-            other => panic!("expected HashPartitioned for left, got {:?}", other),
-        }
-        match &reqs[1].distribution {
-            DistributionSpec::HashPartitioned(cols) => {
-                assert_eq!(cols[0].qualifier.as_deref(), Some("b"));
-                assert_eq!(cols[0].column, "id");
-            }
-            other => panic!("expected HashPartitioned for right, got {:?}", other),
         }
     }
 

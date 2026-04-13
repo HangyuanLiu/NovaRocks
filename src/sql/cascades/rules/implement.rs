@@ -1501,127 +1501,19 @@ mod window_split_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Integration tests: WindowToPhysical.apply end-to-end chain construction
+    // Integration tests: WindowToPhysical.apply
     // -----------------------------------------------------------------------
-
-    /// Build a Memo with a LogicalWindow containing 3 window exprs:
-    ///   - w1: partition_by [a]   (sig A)
-    ///   - w2: partition_by [b]   (sig B)
-    ///   - w3: partition_by [a]   (sig A again, groups with w1)
-    ///
-    /// After signature grouping: [[w1, w3], [w2]] → 2 groups → chain expected.
-    ///
-    /// Expected bottom-up chain:
-    ///   child_group
-    ///   -> memo group PhysicalSort([a ASC NULLS FIRST])
-    ///   -> memo group PhysicalWindow([w1, w3])
-    ///   -> memo group PhysicalSort([b ASC NULLS FIRST])
-    ///   -> NewExpr    PhysicalWindow([w2])   <- returned by rule
-    #[test]
-    fn window_to_physical_builds_chain_for_multi_group() {
-        let mut memo = Memo::new();
-
-        // Leaf: LogicalValues (simplest leaf — no children).
-        let values_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalValues(LogicalValuesOp {
-                rows: vec![],
-                columns: vec![],
-            }),
-            children: vec![],
-        };
-        let child_group = memo.new_group(values_mexpr);
-
-        let window_exprs = vec![
-            mk_window_expr("w1", vec![col("a")]),
-            mk_window_expr("w2", vec![col("b")]),
-            mk_window_expr("w3", vec![col("a")]),
-        ];
-
-        let logical_window_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalWindow(LogicalWindowOp {
-                window_exprs,
-                output_columns: vec![],
-            }),
-            children: vec![child_group],
-        };
-
-        let rule = WindowToPhysical;
-        let out = rule.apply(&logical_window_mexpr, &mut memo);
-
-        assert_eq!(out.len(), 1, "expected exactly one NewExpr from the rule");
-
-        // The returned NewExpr is the terminal PhysicalWindow([w2]).
-        let terminal = &out[0];
-        match &terminal.op {
-            Operator::PhysicalWindow(p) => {
-                assert_eq!(p.window_exprs.len(), 1, "terminal group should contain w2 only");
-                assert_eq!(p.window_exprs[0].name, "w2");
-            }
-            other => panic!("expected PhysicalWindow for terminal, got {:?}", other),
-        }
-        assert_eq!(terminal.children.len(), 1);
-
-        // The terminal PhysicalWindow's child group must contain a PhysicalSort
-        // (for sig B's partition_by [b]).
-        let sort_b_group = terminal.children[0];
-        let sort_b_mexpr = memo.groups[sort_b_group]
-            .physical_exprs
-            .first()
-            .expect("sort group should have physical_exprs");
-        match &sort_b_mexpr.op {
-            Operator::PhysicalSort(s) => {
-                assert_eq!(s.items.len(), 1, "expected one sort item for [b]");
-                match &s.items[0].expr.kind {
-                    ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b"),
-                    other => panic!("expected ColumnRef(b) in sort item, got {:?}", other),
-                }
-                assert!(s.items[0].asc, "partition sort should be ASC");
-                assert!(s.items[0].nulls_first, "partition sort should be NULLS FIRST");
-            }
-            other => panic!("expected PhysicalSort for sig B, got {:?}", other),
-        }
-        assert_eq!(sort_b_mexpr.children.len(), 1);
-
-        // That Sort's child must be a PhysicalWindow([w1, w3]) (the first group).
-        let win_a_group = sort_b_mexpr.children[0];
-        let win_a_mexpr = memo.groups[win_a_group]
-            .physical_exprs
-            .first()
-            .expect("window group should have physical_exprs");
-        match &win_a_mexpr.op {
-            Operator::PhysicalWindow(p) => {
-                assert_eq!(p.window_exprs.len(), 2, "first group should contain w1 and w3");
-                assert_eq!(p.window_exprs[0].name, "w1");
-                assert_eq!(p.window_exprs[1].name, "w3");
-            }
-            other => panic!("expected PhysicalWindow for first group, got {:?}", other),
-        }
-        assert_eq!(win_a_mexpr.children.len(), 1);
-
-        // That PhysicalWindow's child must be a PhysicalSort (for sig A's partition_by [a]).
-        let sort_a_group = win_a_mexpr.children[0];
-        let sort_a_mexpr = memo.groups[sort_a_group]
-            .physical_exprs
-            .first()
-            .expect("sort group for sig A should have physical_exprs");
-        match &sort_a_mexpr.op {
-            Operator::PhysicalSort(s) => {
-                assert_eq!(s.items.len(), 1);
-                match &s.items[0].expr.kind {
-                    ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a"),
-                    other => panic!("expected ColumnRef(a) in first sort item, got {:?}", other),
-                }
-                assert!(s.items[0].asc, "partition sort should be ASC");
-                assert!(s.items[0].nulls_first, "partition sort should be NULLS FIRST");
-            }
-            other => panic!("expected PhysicalSort for sig A, got {:?}", other),
-        }
-
-        // The bottom sort's child must be the original child_group.
-        assert_eq!(sort_a_mexpr.children, vec![child_group]);
-    }
+    //
+    // Note: a previous revision of this module decomposed multi-signature
+    // LogicalWindow operators into a chain of single-signature PhysicalWindow
+    // nodes separated by PhysicalSort. That feature was reverted in the Phase
+    // 2 hardening commit because the chain triggered cascades search
+    // recursion into newly-allocated groups whose physical_exprs were not yet
+    // implemented. The deleted test
+    // `window_to_physical_builds_chain_for_multi_group` asserted chain shape
+    // and is therefore obsolete. Multi-group decomposition still happens, but
+    // at the fragment_builder level (visit_window_multi_group) rather than at
+    // the cascades rule level.
 
     /// Single window expression with empty partition_by and empty order_by.
     /// The signature is empty → single group → no PhysicalSort inserted.
