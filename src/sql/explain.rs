@@ -414,6 +414,28 @@ fn format_physical_node(
                 format_physical_node(child, level, indent + 1, out);
             }
         }
+        Operator::PhysicalTopN(op) => {
+            let items: Vec<String> = op
+                .items
+                .iter()
+                .map(|s| {
+                    let dir = if s.asc { "ASC" } else { "DESC" };
+                    let nulls = if s.nulls_first { " NULLS FIRST" } else { " NULLS LAST" };
+                    format!("{} {dir}{nulls}", format_expr(&s.expr))
+                })
+                .collect();
+            let mut parts = Vec::new();
+            if let Some(l) = op.limit { parts.push(format!("limit={l}")); }
+            if let Some(o) = op.offset { parts.push(format!("offset={o}")); }
+            out.push(format!(
+                "{pad}TOP-N ({}) [{}]{costs_suffix}",
+                parts.join(", "),
+                items.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
         Operator::PhysicalLimit(op) => {
             let mut parts = Vec::new();
             if let Some(limit) = op.limit {
