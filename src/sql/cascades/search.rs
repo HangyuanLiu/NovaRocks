@@ -326,6 +326,29 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
             }
         }
 
+        // TopN: Gather distribution + Ordered (same contract as Sort).
+        Operator::PhysicalTopN(t) => {
+            let sort_keys: Vec<SortKey> = t
+                .items
+                .iter()
+                .filter_map(|item| {
+                    typed_expr_to_column_ref(&item.expr).map(|col| SortKey {
+                        column: col,
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                })
+                .collect();
+            PhysicalPropertySet {
+                distribution: DistributionSpec::Gather,
+                ordering: if sort_keys.is_empty() {
+                    OrderingSpec::Any
+                } else {
+                    OrderingSpec::Required(sort_keys)
+                },
+            }
+        }
+
         // Distribution enforcer: outputs whatever its spec says.
         Operator::PhysicalDistribution(d) => PhysicalPropertySet {
             distribution: d.spec.clone(),
@@ -447,6 +470,9 @@ pub(super) fn required_input_properties(
 
         // Sort: child must be Gather.
         Operator::PhysicalSort(_) => vec![PhysicalPropertySet::gather()],
+
+        // TopN: child must be Gather (same as Sort).
+        Operator::PhysicalTopN(_) => vec![PhysicalPropertySet::gather()],
 
         // Filter, Project, Limit: passthrough parent requirement.
         Operator::PhysicalFilter(_) | Operator::PhysicalProject(_) | Operator::PhysicalLimit(_) => {
@@ -877,5 +903,36 @@ mod tests {
         assert_eq!(child_reqs.len(), 2);
         assert_eq!(child_reqs[0], PhysicalPropertySet::any());
         assert_eq!(child_reqs[1], PhysicalPropertySet::any());
+    }
+}
+
+#[cfg(test)]
+mod top_n_property_tests {
+    use super::*;
+    use crate::sql::cascades::operator::PhysicalTopNOp;
+
+    #[test]
+    fn top_n_output_is_gather_when_sort_keys_resolve() {
+        let op = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+        });
+        let out = output_properties(&op);
+        // With no sort keys, ordering is Any but distribution should still be Gather
+        // because TopN produces a globally-ordered single-partition output.
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+    }
+
+    #[test]
+    fn top_n_requires_gather_input() {
+        let op = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+        });
+        let req = required_input_properties(&op, &PhysicalPropertySet::gather(), 1);
+        assert_eq!(req.len(), 1);
+        assert!(matches!(req[0].distribution, DistributionSpec::Gather));
     }
 }
