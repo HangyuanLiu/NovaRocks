@@ -27,9 +27,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_prune_columns() {
+    fn registry_contains_expected_rules() {
         let rules = all_rbo_rules();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].name(), "PruneColumns");
+        assert_eq!(rules.len(), 2);
+        let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
+        names.sort();
+        assert_eq!(names, vec!["PruneColumns", "PushDownPredicateScan"]);
     }
 }
