@@ -898,6 +898,55 @@ fn derive_join(
     }
 }
 
+/// Widen the nullable flags of `left_cols` and `right_cols` according to the
+/// join's outer-join semantics and return the concatenated result.
+///
+///  - Inner, Cross:        no widening
+///  - LeftOuter:           widen right columns to nullable
+///  - RightOuter:          widen left columns to nullable
+///  - FullOuter:           widen both sides to nullable
+///  - LeftSemi, LeftAnti:  only left columns survive; no widening needed
+///  - RightSemi, RightAnti: only right columns survive; no widening needed
+fn widen_for_join_kind(
+    join_type: crate::sql::ir::JoinKind,
+    left_cols: Vec<crate::sql::ir::OutputColumn>,
+    right_cols: Vec<crate::sql::ir::OutputColumn>,
+) -> Vec<crate::sql::ir::OutputColumn> {
+    use crate::sql::ir::JoinKind::*;
+    fn widen(cols: Vec<crate::sql::ir::OutputColumn>) -> Vec<crate::sql::ir::OutputColumn> {
+        cols.into_iter()
+            .map(|mut c| {
+                c.nullable = true;
+                c
+            })
+            .collect()
+    }
+    match join_type {
+        Inner | Cross => {
+            let mut out = left_cols;
+            out.extend(right_cols);
+            out
+        }
+        LeftOuter => {
+            let mut out = left_cols;
+            out.extend(widen(right_cols));
+            out
+        }
+        RightOuter => {
+            let mut out = widen(left_cols);
+            out.extend(right_cols);
+            out
+        }
+        FullOuter => {
+            let mut out = widen(left_cols);
+            out.extend(widen(right_cols));
+            out
+        }
+        LeftSemi | LeftAnti => left_cols,
+        RightSemi | RightAnti => right_cols,
+    }
+}
+
 /// Derive output columns for a group from its first expression.
 fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::OutputColumn> {
     let group = &memo.groups[group_idx];
@@ -950,35 +999,22 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::O
             }
         }
 
-        // Join: concatenate both sides' output columns.
-        // SEMI/ANTI joins only produce the left side.
+        // Join: derive output columns with nullable widening per join kind.
+        // SEMI/ANTI return only the surviving side; OUTER widens the null-producing side.
         Operator::LogicalJoin(j) => {
-            let left_only = matches!(
-                j.join_type,
-                crate::sql::ir::JoinKind::LeftSemi
-                    | crate::sql::ir::JoinKind::LeftAnti
-                    | crate::sql::ir::JoinKind::RightSemi
-                    | crate::sql::ir::JoinKind::RightAnti
-            );
-            if left_only {
-                if let Some(&child_id) = expr.children.first() {
-                    memo.groups[child_id]
-                        .logical_props
-                        .as_ref()
-                        .map(|p| p.output_columns.clone())
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                }
-            } else {
-                let mut cols = vec![];
-                for &child_id in &expr.children {
-                    if let Some(ref props) = memo.groups[child_id].logical_props {
-                        cols.extend(props.output_columns.clone());
-                    }
-                }
-                cols
-            }
+            let left_cols = expr
+                .children
+                .get(0)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            let right_cols = expr
+                .children
+                .get(1)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
 
         // Union/Intersect/Except: use first child's output columns.
@@ -1035,14 +1071,35 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::O
                 vec![]
             }
         }
-        Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
-            let mut cols = vec![];
-            for &child_id in &expr.children {
-                if let Some(ref props) = memo.groups[child_id].logical_props {
-                    cols.extend(props.output_columns.clone());
-                }
-            }
-            cols
+        Operator::PhysicalHashJoin(j) => {
+            let left_cols = expr
+                .children
+                .get(0)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            let right_cols = expr
+                .children
+                .get(1)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            widen_for_join_kind(j.join_type, left_cols, right_cols)
+        }
+        Operator::PhysicalNestLoopJoin(j) => {
+            let left_cols = expr
+                .children
+                .get(0)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            let right_cols = expr
+                .children
+                .get(1)
+                .and_then(|&id| memo.groups[id].logical_props.as_ref())
+                .map(|p| p.output_columns.clone())
+                .unwrap_or_default();
+            widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
         Operator::PhysicalUnion(_)
         | Operator::PhysicalIntersect(_)
@@ -1471,5 +1528,88 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
         assert_eq!(props.output_columns.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod join_widening_tests {
+    use super::*;
+    use crate::sql::ir::{JoinKind, OutputColumn};
+    use arrow::datatypes::DataType;
+
+    fn c(name: &str, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            name: name.into(),
+            data_type: DataType::Int32,
+            nullable,
+        }
+    }
+
+    #[test]
+    fn inner_preserves_nullability() {
+        let out = widen_for_join_kind(
+            JoinKind::Inner,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].nullable);
+        assert!(!out[1].nullable);
+    }
+
+    #[test]
+    fn left_outer_widens_right() {
+        let out = widen_for_join_kind(
+            JoinKind::LeftOuter,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert!(!out[0].nullable, "left side preserved");
+        assert!(out[1].nullable, "right side widened");
+    }
+
+    #[test]
+    fn right_outer_widens_left() {
+        let out = widen_for_join_kind(
+            JoinKind::RightOuter,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert!(out[0].nullable, "left side widened");
+        assert!(!out[1].nullable, "right side preserved");
+    }
+
+    #[test]
+    fn full_outer_widens_both() {
+        let out = widen_for_join_kind(
+            JoinKind::FullOuter,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert!(out[0].nullable);
+        assert!(out[1].nullable);
+    }
+
+    #[test]
+    fn left_semi_returns_left_only() {
+        let out = widen_for_join_kind(
+            JoinKind::LeftSemi,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "a");
+        assert!(!out[0].nullable);
+    }
+
+    #[test]
+    fn right_anti_returns_right_only() {
+        let out = widen_for_join_kind(
+            JoinKind::RightAnti,
+            vec![c("a", false)],
+            vec![c("b", false)],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "b");
     }
 }
