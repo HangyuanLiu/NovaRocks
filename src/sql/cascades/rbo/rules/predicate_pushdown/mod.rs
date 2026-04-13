@@ -13,10 +13,11 @@
 //! lands as close to the Scan as safely possible, respecting
 //! SEMI/ANTI/OUTER null-preservation constraints.
 
+pub(crate) mod push_to_scan;
+
 use super::super::rule::RewriteRule;
 
 /// Every predicate-pushdown rule in canonical application order.
 pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn RewriteRule>> {
-    // Tasks 3–7 add each rule in sequence.
-    Vec::new()
+    vec![Box::new(push_to_scan::PushDownPredicateScan)]
 }
