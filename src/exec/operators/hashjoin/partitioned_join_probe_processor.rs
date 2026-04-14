@@ -610,7 +610,11 @@ mod tests {
     }
 
     fn append_pairs(chunk: Chunk, out: &mut Vec<(i32, i32)>) {
-        assert_eq!(chunk.columns().len(), 2);
+        // SEMI/ANTI joins now extend probe-only output with null-filled
+        // build-side columns (via extend_with_null_build_columns) so the
+        // chunk may have more than 2 columns; we only care about the
+        // first two (probe-side) columns.
+        assert!(chunk.columns().len() >= 2);
         let c0 = chunk
             .columns()
             .get(0)
