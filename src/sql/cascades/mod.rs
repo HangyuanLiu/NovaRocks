@@ -49,12 +49,13 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
-    // 1. RBO rewriter — structural rules first (predicate pushdown + column
-    //    pruning), then a second pass with ALL rules including join reorder.
-    //    The first pass ensures filter predicates are attached to scans before
-    //    join reorder evaluates cardinality; the second pass catches new
-    //    predicate-push opportunities exposed by join reorder (mirrors the
-    //    legacy "push, reorder, push" pattern).
+    // 1. RBO three-pass pattern: push → reorder → push.
+    //    Pass 1: structural rules (predicate pushdown + column pruning) to
+    //            fixed-point, so join reorder sees scans with predicates.
+    //    Pass 2: join reorder ONLY (single pass, NOT in a fixed-point with
+    //            structural rules — mixing them causes oscillation/timeout).
+    //    Pass 3: structural rules again to catch new predicate opportunities
+    //            exposed by the changed join order.
     let options = options::OptimizerOptions::default_settings();
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
@@ -64,7 +65,13 @@ pub(crate) fn optimize(
     )?;
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         rewritten,
-        &rbo::rules::all_rbo_rules(table_stats),
+        &rbo::rules::join_reorder_rules(table_stats),
+        &options,
+        deadline,
+    )?;
+    let rewritten = rbo::driver::rewrite_to_fixed_point(
+        rewritten,
+        &rbo::rules::structural_rbo_rules(),
         &options,
         deadline,
     )?;

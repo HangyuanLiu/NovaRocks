@@ -23,15 +23,26 @@ pub(crate) fn structural_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
     all
 }
 
-/// All RBO rules including join reorder. Requires table_stats for the
-/// JoinReorderRule's CBO algorithm.
+/// Join reorder rule only. Called as a SEPARATE pass between two
+/// structural_rbo_rules passes (the "push, reorder, push" pattern).
+/// Do NOT mix with structural rules in a single fixed-point — pushdown
+/// and reorder oscillate and either time out or produce column-scope errors.
+pub(crate) fn join_reorder_rules(
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Vec<Box<dyn RewriteRule>> {
+    vec![Box::new(join_reorder::JoinReorderRule::new(
+        Arc::new(table_stats.clone()),
+    ))]
+}
+
+/// All RBO rules including join reorder. For registry test only;
+/// production code calls structural_rbo_rules() and join_reorder_rules()
+/// separately per the three-pass pattern.
 pub(crate) fn all_rbo_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn RewriteRule>> {
     let mut all = structural_rbo_rules();
-    all.push(Box::new(join_reorder::JoinReorderRule::new(
-        Arc::new(table_stats.clone()),
-    )));
+    all.extend(join_reorder_rules(table_stats));
     all
 }
 
