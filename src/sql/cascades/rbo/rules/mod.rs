@@ -14,13 +14,16 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
     vec![Box::new(column_pruning::PruneColumns)]
 }
 
-/// Structural RBO rules: predicate pushdown + column pruning.
-/// These run both before and after join reorder to catch new opportunities.
-pub(crate) fn structural_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
-    let mut all = Vec::new();
-    all.extend(column_pruning_rules());
-    all.extend(predicate_pushdown::predicate_pushdown_rules());
-    all
+/// Predicate pushdown rules only (no column pruning). Used in the
+/// push → reorder → push pattern. Column pruning runs as a separate
+/// final pass AFTER all pushdown and reorder passes are complete —
+/// matching the legacy pipeline where prune_columns was always last.
+/// Mixing PruneColumns with PushDownPredicate in a fixed-point loop
+/// causes the needed-column set to shrink across iterations as
+/// predicates get reshuffled, incorrectly dropping join-key or
+/// select-list columns from scan required_columns.
+pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
+    predicate_pushdown::predicate_pushdown_rules()
 }
 
 /// Join reorder rule only. Called as a SEPARATE pass between two
@@ -36,12 +39,14 @@ pub(crate) fn join_reorder_rules(
 }
 
 /// All RBO rules including join reorder. For registry test only;
-/// production code calls structural_rbo_rules() and join_reorder_rules()
-/// separately per the three-pass pattern.
+/// production code calls predicate_pushdown_rbo_rules(), join_reorder,
+/// and column_pruning_rules() separately per the four-pass pattern.
 pub(crate) fn all_rbo_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn RewriteRule>> {
-    let mut all = structural_rbo_rules();
+    let mut all = Vec::new();
+    all.extend(predicate_pushdown_rbo_rules());
+    all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
     all
 }

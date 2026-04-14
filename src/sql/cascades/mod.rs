@@ -49,29 +49,36 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
-    // 1. RBO three-pass pattern: push → reorder → push.
-    //    Pass 1: structural rules (predicate pushdown + column pruning) to
-    //            fixed-point, so join reorder sees scans with predicates.
-    //    Pass 2: join reorder ONLY (single pass, NOT in a fixed-point with
-    //            structural rules — mixing them causes oscillation/timeout).
-    //    Pass 3: structural rules again to catch new predicate opportunities
-    //            exposed by the changed join order.
+    // 1. RBO four-pass pattern: push → reorder → push → prune.
+    //    Matches the legacy pipeline exactly:
+    //    - push_down_predicates
+    //    - reorder_joins_cbo
+    //    - push_down_predicates (again, catches post-reorder opportunities)
+    //    - prune_columns (LAST — sees the final stable plan)
+    //
+    //    Column pruning MUST run after all pushdown + reorder passes are
+    //    complete. Mixing PruneColumns with PushDownPredicate in a fixed-
+    //    point loop causes the needed-column set to shrink across iterations
+    //    (predicates get reshuffled between join conditions), incorrectly
+    //    dropping join-key or select-list columns from scan required_columns.
     let options = options::OptimizerOptions::default_settings();
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
-        &rbo::rules::structural_rbo_rules(),
+        &rbo::rules::predicate_pushdown_rbo_rules(),
+        &options,
+        deadline,
+    )?;
+    let rewritten =
+        rbo::rules::join_reorder::reorder_joins_cbo(rewritten, table_stats);
+    let rewritten = rbo::driver::rewrite_to_fixed_point(
+        rewritten,
+        &rbo::rules::predicate_pushdown_rbo_rules(),
         &options,
         deadline,
     )?;
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         rewritten,
-        &rbo::rules::join_reorder_rules(table_stats),
-        &options,
-        deadline,
-    )?;
-    let rewritten = rbo::driver::rewrite_to_fixed_point(
-        rewritten,
-        &rbo::rules::structural_rbo_rules(),
+        &rbo::rules::column_pruning_rules(),
         &options,
         deadline,
     )?;
