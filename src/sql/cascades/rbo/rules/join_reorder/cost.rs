@@ -108,7 +108,7 @@ fn estimate_join_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ir::{JoinKind, OutputColumn};
+    use crate::sql::ir::JoinKind;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn scan_cost_proportional_to_data_size() {
         let stats = simple_stats(1_000.0, 100.0);
-        let plan = dummy_values(); // Type is checked in match, falls through to default.
+        let _plan = dummy_values(); // Type is checked in match, falls through to default.
         // Use Scan directly.
         let scan_plan = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),

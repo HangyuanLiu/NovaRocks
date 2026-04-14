@@ -1125,7 +1125,7 @@ fn next_k_subset(current: u32, universe: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
-    use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::ir::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
     use arrow::datatypes::DataType;
 
     /// Helper: build a `TableDef` backed by S3 parquet files with the given
@@ -1574,7 +1574,7 @@ mod tests {
         let reordered = reorder_joins_cbo(plan, &table_stats);
 
         match &reordered {
-            LogicalPlan::Join(j) => {
+            LogicalPlan::Join(_) => {
                 let names = collect_table_names(&reordered);
                 // The larger table (fact) should be on the left (probe),
                 // the smaller (dim) on the right (build).

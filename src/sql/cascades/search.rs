@@ -676,7 +676,6 @@ fn typed_exprs_to_column_refs(exprs: &[crate::sql::ir::TypedExpr]) -> Vec<Column
 mod tests {
     use super::*;
     use crate::sql::cascades::memo::MExpr;
-    use crate::sql::statistics::{ColumnStatistic, Statistics};
 
     /// Build a simple memo with a single PhysicalScan group.
     fn single_scan_memo() -> (Memo, GroupId) {
