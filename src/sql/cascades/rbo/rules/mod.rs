@@ -1,25 +1,37 @@
-//! RBO rule registry. Phases 2-5 of the unification spec land their
-//! migrated rules here; Phase 1 ships an empty registry so the framework
-//! is wired end-to-end with no behavior change.
+//! RBO rule registry.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::rule::RewriteRule;
+use crate::sql::statistics::TableStatistics;
 
 pub(crate) mod column_pruning;
 pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
-    // Column pruning is fundamentally a top-down concern; expressed as a
-    // single rule that recurses internally (documented exception to the
-    // "rules don't recurse" convention — see column_pruning.rs module docs).
     vec![Box::new(column_pruning::PruneColumns)]
 }
 
-/// All RBO rules in canonical application order.
-pub(crate) fn all_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
+/// Structural RBO rules: predicate pushdown + column pruning.
+/// These run both before and after join reorder to catch new opportunities.
+pub(crate) fn structural_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
     let mut all = Vec::new();
     all.extend(column_pruning_rules());
     all.extend(predicate_pushdown::predicate_pushdown_rules());
+    all
+}
+
+/// All RBO rules including join reorder. Requires table_stats for the
+/// JoinReorderRule's CBO algorithm.
+pub(crate) fn all_rbo_rules(
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Vec<Box<dyn RewriteRule>> {
+    let mut all = structural_rbo_rules();
+    all.push(Box::new(join_reorder::JoinReorderRule::new(
+        Arc::new(table_stats.clone()),
+    )));
     all
 }
 
@@ -29,13 +41,14 @@ mod tests {
 
     #[test]
     fn registry_contains_expected_rules() {
-        let rules = all_rbo_rules();
-        assert_eq!(rules.len(), 6);
+        let rules = all_rbo_rules(&HashMap::new());
+        assert_eq!(rules.len(), 7);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
             names,
             vec![
+                "JoinReorder",
                 "PruneColumns",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateJoin",
