@@ -7,6 +7,8 @@
 pub(crate) mod cardinality;
 pub(crate) mod cost;
 pub(crate) mod reorder;
+pub(crate) mod rule;
 
-// Re-export the main entry point for convenience.
+// Re-export the main entry points for convenience.
 pub(crate) use reorder::reorder_joins_cbo;
+pub(crate) use rule::JoinReorderRule;
