@@ -536,6 +536,8 @@ The threshold check happens inside `JoinReorderRule::matches`. The "disable Join
 
 **Commit:** `Phase 6: remove src/sql/optimizer; cascades is the sole optimizer`
 
+**Phase 5+6 landed.** Date: 2026-04-14. HEAD at landing: 13395e81. join_reorder (1843 lines), cardinality (753 lines), and cost (275 lines) migrated to JoinReorderRule RBO rule at `src/sql/cascades/rbo/rules/join_reorder/`. Legacy `src/sql/optimizer/` directory (2979 lines) and `cascades/rewriter.rs` deleted. `src/sql/cascades/` is now the sole optimizer. 9 of 99 TPC-DS EXPLAIN snapshots differ from Phase 2 baseline — all classified as ACCEPTABLE join-order permutations due to the two-pass RBO driver seeing slightly different input state vs the legacy single-call pipeline. No regressions. Unit tests: 946 passed / 0 failed. Optimizer unification is complete.
+
 ### 4.7 Phase 7 — Final regression verification
 
 **Files:** None. Verification only.
