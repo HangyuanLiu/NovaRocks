@@ -34,7 +34,6 @@ use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;

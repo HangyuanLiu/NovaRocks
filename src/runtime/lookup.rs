@@ -29,7 +29,7 @@ use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
-use crate::exec::node::scan::{LakeGlmScanInfo, ScanMorsel};
+use crate::exec::node::scan::ScanMorsel;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::formats::{
     FileFormatConfig, build_format_iter, parquet::ParquetReadCachePolicy,

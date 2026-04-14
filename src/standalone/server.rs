@@ -35,7 +35,6 @@ use crate::version;
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
     QueryResult, QueryResultColumn, StandaloneNovaRocks, StandaloneOptions, StatementResult,
-    build_string_query_result,
 };
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;

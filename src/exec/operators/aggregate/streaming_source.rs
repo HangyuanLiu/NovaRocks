@@ -45,7 +45,7 @@ pub struct AggregateStreamingSourceFactory {
 }
 
 impl AggregateStreamingSourceFactory {
-    pub fn new(node_id: i32, state: AggregateStreamingState) -> Self {
+    pub(crate) fn new(node_id: i32, state: AggregateStreamingState) -> Self {
         let name = if node_id >= 0 {
             format!("AGG_STREAMING_SOURCE (id={node_id})")
         } else {

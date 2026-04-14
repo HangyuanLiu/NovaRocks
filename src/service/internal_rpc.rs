@@ -38,6 +38,8 @@ fn error_status(message: impl Into<String>) -> proto::starrocks::StatusPb {
     }
 }
 
+// Used by engine_ffi.rs when feature = "compat" is enabled.
+#[allow(dead_code)]
 pub(crate) fn handle_update_fail_point_status(
     request: proto::starrocks::PUpdateFailPointStatusRequest,
 ) -> proto::starrocks::PUpdateFailPointStatusResponse {

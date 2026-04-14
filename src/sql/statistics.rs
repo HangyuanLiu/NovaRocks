@@ -61,6 +61,7 @@ impl CostEstimate {
         self.cpu_cost * 0.5 + self.memory_cost * 2.0 + self.network_cost * 1.5
     }
 
+    #[allow(dead_code)] // used by cost model tests
     pub fn add(&self, other: &CostEstimate) -> CostEstimate {
         CostEstimate {
             cpu_cost: self.cpu_cost + other.cpu_cost,

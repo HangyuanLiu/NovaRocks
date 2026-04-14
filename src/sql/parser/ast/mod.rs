@@ -102,7 +102,7 @@ pub(crate) enum ColumnAggregation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SqlType {
+pub enum SqlType {
     TinyInt,
     SmallInt,
     Int,

@@ -19,9 +19,8 @@ use crate::internal_service;
 use crate::partitions;
 use crate::plan_nodes;
 
-use super::catalog::CatalogProvider;
 use super::cte::CteId;
-use super::fragment::{FragmentId, FragmentPlan};
+use super::fragment::FragmentId;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -51,6 +50,7 @@ pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,
+    #[allow(dead_code)] // populated by fragment builder, will be read when partition-aware exchange is enabled
     pub output_partition: partitions::TDataPartition,
     pub edge_kind: FragmentEdgeKind,
 }
@@ -72,6 +72,7 @@ pub(crate) struct FragmentBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
+    #[allow(dead_code)] // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
     pub output_columns: Vec<OutputColumn>,
     /// CTE ID if this is a multicast fragment.
@@ -79,29 +80,6 @@ pub(crate) struct FragmentBuildResult {
     /// Exchange node IDs in this fragment that consume from CTE fragments:
     /// `(cte_id, exchange_node_id)`.
     pub cte_exchange_nodes: Vec<(CteId, i32)>,
-}
-
-// ---------------------------------------------------------------------------
-// Public entry
-// ---------------------------------------------------------------------------
-
-/// Emit a physical Thrift plan from an optimized logical plan.
-pub(crate) fn emit(
-    plan: super::plan::LogicalPlan,
-    output_columns: &[super::ir::OutputColumn],
-    catalog: &dyn CatalogProvider,
-    current_database: &str,
-) -> Result<PlanBuildResult, String> {
-    emitter::emit(plan, output_columns, catalog, current_database)
-}
-
-/// Emit a multi-fragment physical plan from a FragmentPlan.
-pub(crate) fn emit_multi_fragment(
-    fragment_plan: FragmentPlan,
-    catalog: &dyn CatalogProvider,
-    current_database: &str,
-) -> Result<MultiFragmentBuildResult, String> {
-    emitter::emit_multi_fragment(fragment_plan, catalog, current_database)
 }
 
 // ---------------------------------------------------------------------------

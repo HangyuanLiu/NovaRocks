@@ -36,6 +36,7 @@ pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op:
 }
 
 /// Determine the result type for binary arithmetic operations (default: add/sub rules).
+#[allow(dead_code)] // used by legacy ExprCompiler methods, keeping for type-system completeness
 pub(crate) fn arithmetic_result_type(left: &DataType, right: &DataType) -> DataType {
     arithmetic_result_type_with_op(left, right, "add")
 }

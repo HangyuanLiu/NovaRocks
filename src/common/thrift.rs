@@ -81,6 +81,8 @@ pub(crate) fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec
     }
 }
 
+// Used by engine_ffi.rs when feature = "compat" is enabled.
+#[allow(dead_code)]
 pub(crate) fn thrift_serialize_result_batch(batch: &data::TResultBatch) -> Vec<u8> {
     let capacity = estimate_result_batch_bytes(batch);
     let channel = TBufferChannel::with_capacity(0, capacity);
@@ -118,6 +120,7 @@ pub(crate) fn thrift_compact_serialize<T: TSerializable>(value: &T) -> Result<Ve
     }
 }
 
+#[allow(dead_code)] // helper for thrift_serialize_result_batch
 fn estimate_result_batch_bytes(batch: &data::TResultBatch) -> usize {
     let mut rows_bytes = 0usize;
     for row in &batch.rows {

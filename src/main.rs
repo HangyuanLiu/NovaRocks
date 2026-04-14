@@ -679,7 +679,7 @@ fn main() {
                 );
             }
 
-            let log_level_num = match cfg.log_level.as_str() {
+            let _log_level_num = match cfg.log_level.as_str() {
                 "trace" | "debug" => 0,
                 "info" => 0,
                 "warn" => 1,

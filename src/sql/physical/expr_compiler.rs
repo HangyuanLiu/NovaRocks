@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use sqlparser::ast as sqlast;
 
 use crate::exprs;
 use crate::lower::thrift::type_lowering::scalar_type_desc;
@@ -9,9 +8,7 @@ use crate::opcodes;
 use crate::types;
 
 use super::resolve::ExprScope;
-use super::type_infer::{
-    arithmetic_result_type, arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type,
-};
+use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type};
 use crate::sql::ir::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::plan::AggregateCall;
 
@@ -31,21 +28,6 @@ impl<'a> ExprCompiler<'a> {
             last_type: DataType::Null,
             last_nullable: true,
         }
-    }
-
-    pub fn last_type(&self) -> &DataType {
-        &self.last_type
-    }
-
-    pub fn last_nullable(&self) -> bool {
-        self.last_nullable
-    }
-
-    /// Compile an expression and return the complete TExpr.
-    pub fn compile(&mut self, expr: &sqlast::Expr) -> Result<exprs::TExpr, String> {
-        self.nodes.clear();
-        self.compile_expr(expr)?;
-        Ok(exprs::TExpr::new(std::mem::take(&mut self.nodes)))
     }
 
     /// Compile a TypedExpr (from the analyzer/planner IR) into a TExpr.
@@ -571,7 +553,7 @@ impl<'a> ExprCompiler<'a> {
                 }
             }
             ExprKind::Nested(inner) => self.compile_typed_inner(inner),
-            ExprKind::WindowCall { name, args, .. } => {
+            ExprKind::WindowCall { name, args: _, .. } => {
                 // Window calls should not appear here — they are compiled
                 // separately via compile_aggregate_call_typed in emit_window.
                 Err(format!(
@@ -926,756 +908,12 @@ impl<'a> ExprCompiler<'a> {
         self.last_nullable = true;
         Ok(return_type)
     }
-
-    fn compile_expr(&mut self, expr: &sqlast::Expr) -> Result<DataType, String> {
-        match expr {
-            // Column reference: simple identifier
-            sqlast::Expr::Identifier(ident) => {
-                let binding = self.scope.resolve_column(None, &ident.value)?;
-                let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
-                self.nodes
-                    .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
-                self.last_type = binding.data_type.clone();
-                self.last_nullable = binding.nullable;
-                Ok(binding.data_type.clone())
-            }
-
-            // Qualified column reference: table.column
-            sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let qualifier = &parts[0].value;
-                let col_name = &parts[1].value;
-                let binding = self.scope.resolve_column(Some(qualifier), col_name)?;
-                let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
-                self.nodes
-                    .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
-                self.last_type = binding.data_type.clone();
-                self.last_nullable = binding.nullable;
-                Ok(binding.data_type.clone())
-            }
-
-            // Literals
-            sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => self.compile_value(value),
-
-            // Unary NOT
-            sqlast::Expr::UnaryOp {
-                op: sqlast::UnaryOperator::Not,
-                expr: inner,
-            } => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                let placeholder_idx = self.nodes.len();
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_NOT),
-                    num_children: 1,
-                    ..default_expr_node()
-                });
-                self.compile_expr(inner)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // Unary minus
-            sqlast::Expr::UnaryOp {
-                op: sqlast::UnaryOperator::Minus,
-                expr: inner,
-            } => {
-                let inner_type = self.peek_type(inner)?;
-                let result_type = inner_type.clone();
-                let type_desc = arrow_type_to_type_desc(&result_type)?;
-                let placeholder_idx = self.nodes.len();
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::MULTIPLY),
-                    num_children: 2,
-                    ..default_expr_node()
-                });
-                // emit -1 * expr
-                self.nodes.push(int_literal_node(-1));
-                self.compile_expr(inner)?;
-                self.last_type = result_type.clone();
-                Ok(result_type)
-            }
-
-            // Binary operations
-            sqlast::Expr::BinaryOp { left, op, right } => self.compile_binary_op(left, op, right),
-
-            // IS NULL / IS NOT NULL
-            sqlast::Expr::IsNull(inner) => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::IS_NULL_PRED,
-                    type_: type_desc,
-                    num_children: 1,
-                    is_null_pred: Some(exprs::TIsNullPredicate { is_not_null: false }),
-                    ..default_expr_node()
-                });
-                self.compile_expr(inner)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-            sqlast::Expr::IsNotNull(inner) => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::IS_NULL_PRED,
-                    type_: type_desc,
-                    num_children: 1,
-                    is_null_pred: Some(exprs::TIsNullPredicate { is_not_null: true }),
-                    ..default_expr_node()
-                });
-                self.compile_expr(inner)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // IN list
-            sqlast::Expr::InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::IN_PRED,
-                    type_: type_desc,
-                    num_children: (1 + list.len()) as i32,
-                    in_predicate: Some(exprs::TInPredicate {
-                        is_not_in: *negated,
-                    }),
-                    ..default_expr_node()
-                });
-                self.compile_expr(expr)?;
-                for item in list {
-                    self.compile_expr(item)?;
-                }
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // BETWEEN
-            sqlast::Expr::Between {
-                expr,
-                negated,
-                low,
-                high,
-            } => {
-                // Desugar: expr BETWEEN low AND high => (expr >= low) AND (expr <= high)
-                // NOT BETWEEN => (expr < low) OR (expr > high)
-                if *negated {
-                    let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                        type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::COMPOUND_OR),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    // expr < low
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::BINARY_PRED,
-                        type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::LT),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    self.compile_expr(expr)?;
-                    self.compile_expr(low)?;
-                    // expr > high
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::BINARY_PRED,
-                        type_: type_desc,
-                        opcode: Some(opcodes::TExprOpcode::GT),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    self.compile_expr(expr)?;
-                    self.compile_expr(high)?;
-                } else {
-                    let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                        type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::COMPOUND_AND),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    // expr >= low
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::BINARY_PRED,
-                        type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::GE),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    self.compile_expr(expr)?;
-                    self.compile_expr(low)?;
-                    // expr <= high
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::BINARY_PRED,
-                        type_: type_desc,
-                        opcode: Some(opcodes::TExprOpcode::LE),
-                        num_children: 2,
-                        ..default_expr_node()
-                    });
-                    self.compile_expr(expr)?;
-                    self.compile_expr(high)?;
-                }
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // LIKE
-            sqlast::Expr::Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-                ..
-            } => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                let esc = escape_char
-                    .as_ref()
-                    .map(|v| format!("{v}"))
-                    .unwrap_or_else(|| "\\".to_string());
-                // For NOT LIKE, wrap the LIKE_PRED in a COMPOUND_NOT node
-                if *negated {
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                        type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::COMPOUND_NOT),
-                        num_children: 1,
-                        ..default_expr_node()
-                    });
-                }
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::LIKE_PRED,
-                    type_: type_desc,
-                    opcode: None,
-                    num_children: 2,
-                    like_pred: Some(exprs::TLikePredicate { escape_char: esc }),
-                    ..default_expr_node()
-                });
-                self.compile_expr(expr)?;
-                self.compile_expr(pattern)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // CAST
-            sqlast::Expr::Cast {
-                expr,
-                data_type: target_sql_type,
-                ..
-            } => {
-                let target = sql_type_to_arrow(target_sql_type)?;
-                let type_desc = arrow_type_to_type_desc(&target)?;
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::CAST_EXPR,
-                    type_: type_desc,
-                    num_children: 1,
-                    ..default_expr_node()
-                });
-                self.compile_expr(expr)?;
-                self.last_type = target.clone();
-                Ok(target)
-            }
-
-            // CASE WHEN
-            sqlast::Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => self.compile_case(operand.as_deref(), conditions, else_result.as_deref()),
-
-            // Function call
-            sqlast::Expr::Function(func) => self.compile_function(func),
-
-            // Nested (parenthesized)
-            sqlast::Expr::Nested(inner) => self.compile_expr(inner),
-
-            // Boolean literals
-            sqlast::Expr::IsTrue(inner) => self.compile_expr(inner),
-            sqlast::Expr::IsFalse(inner) => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_NOT),
-                    num_children: 1,
-                    ..default_expr_node()
-                });
-                self.compile_expr(inner)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            other => Err(format!(
-                "ThriftPlanBuilder: unsupported expression: {}",
-                other
-            )),
-        }
-    }
-
-    fn compile_value(&mut self, value: &sqlast::Value) -> Result<DataType, String> {
-        match value {
-            sqlast::Value::Number(n, _) => {
-                if let Ok(v) = n.parse::<i64>() {
-                    self.nodes.push(int_literal_node(v));
-                    self.last_type = DataType::Int64;
-                    self.last_nullable = false;
-                    Ok(DataType::Int64)
-                } else if let Ok(v) = n.parse::<f64>() {
-                    let type_desc = scalar_type_desc(types::TPrimitiveType::DOUBLE);
-                    self.nodes.push(exprs::TExprNode {
-                        node_type: exprs::TExprNodeType::FLOAT_LITERAL,
-                        type_: type_desc,
-                        num_children: 0,
-                        float_literal: Some(exprs::TFloatLiteral {
-                            value: thrift::OrderedFloat(v),
-                        }),
-                        ..default_expr_node()
-                    });
-                    self.last_type = DataType::Float64;
-                    self.last_nullable = false;
-                    Ok(DataType::Float64)
-                } else {
-                    Err(format!("invalid numeric literal: {n}"))
-                }
-            }
-            sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::VARCHAR);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::STRING_LITERAL,
-                    type_: type_desc,
-                    num_children: 0,
-                    string_literal: Some(exprs::TStringLiteral { value: s.clone() }),
-                    ..default_expr_node()
-                });
-                self.last_type = DataType::Utf8;
-                self.last_nullable = false;
-                Ok(DataType::Utf8)
-            }
-            sqlast::Value::Boolean(b) => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::BOOL_LITERAL,
-                    type_: type_desc,
-                    num_children: 0,
-                    bool_literal: Some(exprs::TBoolLiteral { value: *b }),
-                    ..default_expr_node()
-                });
-                self.last_type = DataType::Boolean;
-                self.last_nullable = false;
-                Ok(DataType::Boolean)
-            }
-            sqlast::Value::Null => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::NULL_TYPE);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::NULL_LITERAL,
-                    type_: type_desc,
-                    num_children: 0,
-                    ..default_expr_node()
-                });
-                self.last_type = DataType::Null;
-                self.last_nullable = true;
-                Ok(DataType::Null)
-            }
-            other => Err(format!("unsupported literal value: {:?}", other)),
-        }
-    }
-
-    fn compile_binary_op(
-        &mut self,
-        left: &sqlast::Expr,
-        op: &sqlast::BinaryOperator,
-        right: &sqlast::Expr,
-    ) -> Result<DataType, String> {
-        match op {
-            // Comparison operators
-            sqlast::BinaryOperator::Eq
-            | sqlast::BinaryOperator::NotEq
-            | sqlast::BinaryOperator::Lt
-            | sqlast::BinaryOperator::LtEq
-            | sqlast::BinaryOperator::Gt
-            | sqlast::BinaryOperator::GtEq
-            | sqlast::BinaryOperator::Spaceship => {
-                let opcode = match op {
-                    sqlast::BinaryOperator::Eq => opcodes::TExprOpcode::EQ,
-                    sqlast::BinaryOperator::NotEq => opcodes::TExprOpcode::NE,
-                    sqlast::BinaryOperator::Lt => opcodes::TExprOpcode::LT,
-                    sqlast::BinaryOperator::LtEq => opcodes::TExprOpcode::LE,
-                    sqlast::BinaryOperator::Gt => opcodes::TExprOpcode::GT,
-                    sqlast::BinaryOperator::GtEq => opcodes::TExprOpcode::GE,
-                    sqlast::BinaryOperator::Spaceship => opcodes::TExprOpcode::EQ_FOR_NULL,
-                    _ => unreachable!(),
-                };
-                let parent_idx = self.nodes.len();
-                self.nodes.push(default_expr_node()); // placeholder
-                let left_type = self.compile_expr(left)?;
-                let right_type = self.compile_expr(right)?;
-                // Determine the comparison type (wider of both sides)
-                let compare_type = super::type_infer::wider_type(&left_type, &right_type);
-                let child_type_desc = arrow_type_to_type_desc(&compare_type).ok();
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes[parent_idx] = exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::BINARY_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcode),
-                    num_children: 2,
-                    child_type_desc: child_type_desc,
-                    ..default_expr_node()
-                };
-                self.last_type = DataType::Boolean;
-                self.last_nullable = false;
-                Ok(DataType::Boolean)
-            }
-
-            // Logical operators
-            sqlast::BinaryOperator::And => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_AND),
-                    num_children: 2,
-                    ..default_expr_node()
-                });
-                self.compile_expr(left)?;
-                self.compile_expr(right)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-            sqlast::BinaryOperator::Or => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                self.nodes.push(exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::COMPOUND_PRED,
-                    type_: type_desc,
-                    opcode: Some(opcodes::TExprOpcode::COMPOUND_OR),
-                    num_children: 2,
-                    ..default_expr_node()
-                });
-                self.compile_expr(left)?;
-                self.compile_expr(right)?;
-                self.last_type = DataType::Boolean;
-                Ok(DataType::Boolean)
-            }
-
-            // Arithmetic operators
-            sqlast::BinaryOperator::Plus
-            | sqlast::BinaryOperator::Minus
-            | sqlast::BinaryOperator::Multiply
-            | sqlast::BinaryOperator::Divide
-            | sqlast::BinaryOperator::Modulo => {
-                let opcode = match op {
-                    sqlast::BinaryOperator::Plus => opcodes::TExprOpcode::ADD,
-                    sqlast::BinaryOperator::Minus => opcodes::TExprOpcode::SUBTRACT,
-                    sqlast::BinaryOperator::Multiply => opcodes::TExprOpcode::MULTIPLY,
-                    sqlast::BinaryOperator::Divide => opcodes::TExprOpcode::DIVIDE,
-                    sqlast::BinaryOperator::Modulo => opcodes::TExprOpcode::MOD,
-                    _ => unreachable!(),
-                };
-                // Reserve position for the parent node, we'll fill in after children
-                let parent_idx = self.nodes.len();
-                self.nodes.push(default_expr_node()); // placeholder
-                let left_type = self.compile_expr(left)?;
-                let right_type = self.compile_expr(right)?;
-                let result_type = arithmetic_result_type(&left_type, &right_type);
-                let type_desc = arrow_type_to_type_desc(&result_type)?;
-                self.nodes[parent_idx] = exprs::TExprNode {
-                    node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
-                    type_: type_desc,
-                    opcode: Some(opcode),
-                    num_children: 2,
-                    ..default_expr_node()
-                };
-                self.last_type = result_type.clone();
-                Ok(result_type)
-            }
-
-            // String concatenation ||
-            sqlast::BinaryOperator::StringConcat => {
-                self.compile_function_call("concat", &[left.clone(), right.clone()])
-            }
-
-            other => Err(format!("unsupported binary operator: {:?}", other)),
-        }
-    }
-
-    fn compile_case(
-        &mut self,
-        operand: Option<&sqlast::Expr>,
-        conditions: &[sqlast::CaseWhen],
-        else_result: Option<&sqlast::Expr>,
-    ) -> Result<DataType, String> {
-        // CASE has children: [operand?] [when1, then1, when2, then2, ...] [else?]
-        let has_operand = operand.is_some();
-        let has_else = else_result.is_some();
-        let num_children =
-            if has_operand { 1 } else { 0 } + conditions.len() * 2 + if has_else { 1 } else { 0 };
-
-        let parent_idx = self.nodes.len();
-        self.nodes.push(default_expr_node()); // placeholder
-
-        if let Some(op) = operand {
-            self.compile_expr(op)?;
-        }
-
-        let mut result_type = DataType::Null;
-        for case_when in conditions {
-            self.compile_expr(&case_when.condition)?;
-            let t = self.compile_expr(&case_when.result)?;
-            if result_type == DataType::Null {
-                result_type = t;
-            }
-        }
-        if let Some(el) = else_result {
-            let t = self.compile_expr(el)?;
-            if result_type == DataType::Null {
-                result_type = t;
-            }
-        }
-        if result_type == DataType::Null {
-            result_type = DataType::Utf8; // fallback
-        }
-
-        let type_desc = arrow_type_to_type_desc(&result_type)?;
-        self.nodes[parent_idx] = exprs::TExprNode {
-            node_type: exprs::TExprNodeType::CASE_EXPR,
-            type_: type_desc,
-            num_children: num_children as i32,
-            case_expr: Some(exprs::TCaseExpr {
-                has_case_expr: has_operand,
-                has_else_expr: has_else,
-            }),
-            ..default_expr_node()
-        };
-        self.last_type = result_type.clone();
-        self.last_nullable = true;
-        Ok(result_type)
-    }
-
-    fn compile_function(&mut self, func: &sqlast::Function) -> Result<DataType, String> {
-        let name = func.name.to_string().to_lowercase();
-
-        // Extract arguments
-        let args = match &func.args {
-            sqlast::FunctionArguments::List(list) => {
-                let mut arg_exprs = Vec::new();
-                for arg in &list.args {
-                    match arg {
-                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                            arg_exprs.push(e.clone());
-                        }
-                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Wildcard) => {
-                            // e.g. count(*) - handled specially
-                        }
-                        other => {
-                            return Err(format!("unsupported function argument: {:?}", other));
-                        }
-                    }
-                }
-                arg_exprs
-            }
-            sqlast::FunctionArguments::None => vec![],
-            other => return Err(format!("unsupported function arguments style: {:?}", other)),
-        };
-
-        self.compile_function_call(&name, &args)
-    }
-
-    fn compile_function_call(
-        &mut self,
-        name: &str,
-        args: &[sqlast::Expr],
-    ) -> Result<DataType, String> {
-        let parent_idx = self.nodes.len();
-        self.nodes.push(default_expr_node()); // placeholder
-
-        let mut arg_types = Vec::new();
-        for arg in args {
-            let t = self.compile_expr(arg)?;
-            arg_types.push(t);
-        }
-
-        let return_type = infer_scalar_function_return_type(name, &arg_types)?;
-        let type_desc = arrow_type_to_type_desc(&return_type)?;
-        let ret_type_desc = type_desc.clone();
-
-        let fn_arg_types: Vec<types::TTypeDesc> = arg_types
-            .iter()
-            .map(|t| arrow_type_to_type_desc(t))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        self.nodes[parent_idx] = exprs::TExprNode {
-            node_type: exprs::TExprNodeType::FUNCTION_CALL,
-            type_: type_desc,
-            num_children: args.len() as i32,
-            fn_: Some(types::TFunction {
-                name: types::TFunctionName {
-                    db_name: None,
-                    function_name: name.to_string(),
-                },
-                binary_type: types::TFunctionBinaryType::BUILTIN,
-                arg_types: fn_arg_types,
-                ret_type: ret_type_desc,
-                has_var_args: false,
-                comment: None,
-                signature: None,
-                hdfs_location: None,
-                scalar_fn: None,
-                aggregate_fn: None,
-                id: None,
-                checksum: None,
-                agg_state_desc: None,
-                fid: None,
-                table_fn: None,
-                could_apply_dict_optimize: None,
-                ignore_nulls: None,
-                isolated: None,
-                input_type: None,
-                content: None,
-            }),
-            ..default_expr_node()
-        };
-        self.last_type = return_type.clone();
-        self.last_nullable = true;
-        Ok(return_type)
-    }
-
-    /// Compile an aggregate function call into a TExpr suitable for TAggregationNode.aggregate_functions.
-    /// The root node uses FUNCTION_CALL with agg_expr and aggregate_fn set.
-    pub fn compile_aggregate_function(
-        &mut self,
-        func: &sqlast::Function,
-    ) -> Result<exprs::TExpr, String> {
-        self.nodes.clear();
-        let name = func.name.to_string().to_lowercase();
-
-        let is_distinct = matches!(
-            &func.args,
-            sqlast::FunctionArguments::List(list) if list.duplicate_treatment == Some(sqlast::DuplicateTreatment::Distinct)
-        );
-        let is_count_star = matches!(
-            &func.args,
-            sqlast::FunctionArguments::List(list) if list.args.len() == 1
-                && matches!(&list.args[0], sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Wildcard))
-        );
-
-        // Extract argument expressions
-        let args: Vec<sqlast::Expr> = match &func.args {
-            sqlast::FunctionArguments::List(list) => list
-                .args
-                .iter()
-                .filter_map(|arg| match arg {
-                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                        Some(e.clone())
-                    }
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![],
-        };
-
-        let parent_idx = self.nodes.len();
-        self.nodes.push(default_expr_node()); // placeholder
-
-        let mut arg_types = Vec::new();
-        for arg in &args {
-            let t = self.compile_expr(arg)?;
-            arg_types.push(t);
-        }
-
-        let (return_type, intermediate_type) =
-            infer_agg_function_types(&name, &arg_types, is_distinct)?;
-        let type_desc = arrow_type_to_type_desc(&return_type)?;
-        // For group_concat/string_agg, use an empty intermediate type descriptor
-        // so the execution layer falls back to its default STRUCT intermediate type.
-        let intermediate_type_desc = match &intermediate_type {
-            Some(it) => arrow_type_to_type_desc(it)?,
-            None => types::TTypeDesc { types: None },
-        };
-
-        let fn_arg_types: Vec<types::TTypeDesc> = arg_types
-            .iter()
-            .map(|t| arrow_type_to_type_desc(t))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        self.nodes[parent_idx] = exprs::TExprNode {
-            node_type: exprs::TExprNodeType::FUNCTION_CALL,
-            type_: type_desc.clone(),
-            num_children: args.len() as i32,
-            agg_expr: Some(exprs::TAggregateExpr {
-                is_merge_agg: false,
-            }),
-            fn_: Some(types::TFunction {
-                name: types::TFunctionName {
-                    db_name: None,
-                    function_name: name.clone(),
-                },
-                binary_type: types::TFunctionBinaryType::BUILTIN,
-                arg_types: fn_arg_types,
-                ret_type: type_desc,
-                has_var_args: false,
-                comment: None,
-                signature: None,
-                hdfs_location: None,
-                scalar_fn: None,
-                aggregate_fn: Some(types::TAggregateFunction {
-                    intermediate_type: intermediate_type_desc,
-                    update_fn_symbol: None,
-                    init_fn_symbol: None,
-                    serialize_fn_symbol: None,
-                    merge_fn_symbol: None,
-                    finalize_fn_symbol: None,
-                    get_value_fn_symbol: None,
-                    remove_fn_symbol: None,
-                    is_analytic_only_fn: None,
-                    symbol: None,
-                    is_asc_order: None,
-                    nulls_first: None,
-                    is_distinct: if is_distinct { Some(true) } else { None },
-                }),
-                id: None,
-                checksum: None,
-                agg_state_desc: None,
-                fid: None,
-                table_fn: None,
-                could_apply_dict_optimize: None,
-                ignore_nulls: None,
-                isolated: None,
-                input_type: None,
-                content: None,
-            }),
-            ..default_expr_node()
-        };
-        self.last_type = return_type;
-        self.last_nullable = true;
-        Ok(exprs::TExpr::new(std::mem::take(&mut self.nodes)))
-    }
-
-    /// Peek the type of an expression without actually emitting nodes.
-    fn peek_type(&self, expr: &sqlast::Expr) -> Result<DataType, String> {
-        match expr {
-            sqlast::Expr::Identifier(ident) => {
-                let binding = self.scope.resolve_column(None, &ident.value)?;
-                Ok(binding.data_type.clone())
-            }
-            sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::Number(n, _),
-                ..
-            }) => {
-                if n.parse::<i64>().is_ok() {
-                    Ok(DataType::Int64)
-                } else {
-                    Ok(DataType::Float64)
-                }
-            }
-            _ => Ok(DataType::Float64), // conservative default
-        }
-    }
 }
+
+// Legacy ExprCompiler methods (compile_expr, compile_value, compile_binary_op,
+// compile_case, compile_function, compile_function_call, compile_aggregate_function,
+// peek_type) have been deleted — they were the pre-cascades SQL-to-Thrift path,
+// fully replaced by compile_typed / compile_typed_inner / compile_aggregate_call_typed.
 
 // ---------------------------------------------------------------------------
 // Node construction helpers
@@ -1802,59 +1040,6 @@ fn needs_arithmetic_cast(source: &DataType, target: &DataType) -> bool {
             ) | (DataType::Decimal128(_, _), DataType::Float64)
         )
 }
-
-// ---------------------------------------------------------------------------
-// SQL type conversion
-// ---------------------------------------------------------------------------
-
-fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
-    match sql_type {
-        sqlast::DataType::TinyInt(_) => Ok(DataType::Int8),
-        sqlast::DataType::SmallInt(_) => Ok(DataType::Int16),
-        sqlast::DataType::Int(_) | sqlast::DataType::Integer(_) => Ok(DataType::Int32),
-        sqlast::DataType::BigInt(_) => Ok(DataType::Int64),
-        sqlast::DataType::Float(_) => Ok(DataType::Float32),
-        sqlast::DataType::Double(_) | sqlast::DataType::DoublePrecision => Ok(DataType::Float64),
-        sqlast::DataType::Boolean => Ok(DataType::Boolean),
-        sqlast::DataType::Varchar(_)
-        | sqlast::DataType::CharVarying(_)
-        | sqlast::DataType::Text => Ok(DataType::Utf8),
-        sqlast::DataType::Char(_)
-        | sqlast::DataType::Character(_)
-        | sqlast::DataType::String(_) => Ok(DataType::Utf8),
-        sqlast::DataType::Date => Ok(DataType::Date32),
-        sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        ),
-        sqlast::DataType::Time(_, _) => {
-            Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
-        }
-        sqlast::DataType::Decimal(info)
-        | sqlast::DataType::Dec(info)
-        | sqlast::DataType::Numeric(info) => match info {
-            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                Ok(DataType::Decimal128(*p as u8, *s as i8))
-            }
-            sqlast::ExactNumberInfo::Precision(p) => Ok(DataType::Decimal128(*p as u8, 0)),
-            sqlast::ExactNumberInfo::None => Ok(DataType::Decimal128(38, 0)),
-        },
-        // StarRocks STRING type often parsed as Custom
-        sqlast::DataType::Custom(name, _) => {
-            let type_name = name.to_string().to_lowercase();
-            match type_name.as_str() {
-                "string" => Ok(DataType::Utf8),
-                "largeint" => Ok(DataType::Int64), // approximate
-                "json" | "jsonb" => Ok(DataType::Utf8),
-                _ => Err(format!("unsupported SQL type: {}", name)),
-            }
-        }
-        other => Err(format!("unsupported CAST target type: {:?}", other)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar function return type inference
-// ---------------------------------------------------------------------------
 
 fn infer_scalar_function_return_type(
     name: &str,
@@ -1989,7 +1174,10 @@ fn infer_scalar_function_return_type(
         ),
         "date_format" | "from_unixtime" | "time_format" => Ok(DataType::Utf8),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
-        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" => {
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" | "date_trunc"
+        | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
+        | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
+        | "microseconds_sub" => {
             let input_type = arg_types.first().cloned().unwrap_or(DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Microsecond,
                 None,
@@ -2010,13 +1198,6 @@ fn infer_scalar_function_return_type(
         "to_date" | "str_to_date" | "from_days" | "makedate" | "last_day" | "next_day" => {
             Ok(DataType::Date32)
         }
-        "days_add" | "days_sub" | "date_trunc" | "timestampadd" | "sec_to_time" | "months_add"
-        | "months_sub" | "years_add" | "years_sub" | "hours_add" | "hours_sub" | "minutes_add"
-        | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
-        | "microseconds_sub" | "weeks_add" | "weeks_sub" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Date32))
-        }
-
         // Type
         "cast" => arg_types
             .first()
@@ -2067,7 +1248,7 @@ fn infer_scalar_function_return_type(
             arrow::datatypes::TimeUnit::Microsecond,
             None,
         )),
-        "date" | "to_date" => Ok(DataType::Date32),
+        "date" => Ok(DataType::Date32),
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" => Ok(DataType::Int32),
         "array_contains" | "array_distinct" => {
@@ -2092,6 +1273,9 @@ fn infer_scalar_function_return_type(
 }
 
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
 // Aggregate function type inference
 // ---------------------------------------------------------------------------
 
@@ -2100,7 +1284,7 @@ fn infer_scalar_function_return_type(
 fn infer_agg_function_types(
     name: &str,
     arg_types: &[DataType],
-    is_distinct: bool,
+    _is_distinct: bool,
 ) -> Result<(DataType, Option<DataType>), String> {
     let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
     match name {
@@ -2187,54 +1371,6 @@ fn infer_agg_function_types(
             };
             Ok((out.clone(), Some(out)))
         }
-    }
-}
 
-/// Check if a function name is a known aggregate function.
-pub(crate) fn is_aggregate_function(name: &str) -> bool {
-    matches!(
-        name,
-        "count"
-            | "sum"
-            | "avg"
-            | "min"
-            | "max"
-            | "any_value"
-            | "group_concat"
-            | "string_agg"
-            | "count_if"
-            | "bool_or"
-            | "bool_and"
-            | "array_agg"
-            | "array_unique_agg"
-            | "bitmap_union_count"
-            | "bitmap_union_int"
-            | "approx_count_distinct"
-            | "ndv"
-            | "hll_union_agg"
-            | "hll_raw_agg"
-            | "hll_cardinality"
-            | "multi_distinct_count"
-            | "covar_pop"
-            | "covar_samp"
-            | "corr"
-            | "variance"
-            | "var_pop"
-            | "var_samp"
-            | "stddev"
-            | "stddev_pop"
-            | "stddev_samp"
-            | "dict_merge"
-            | "max_by"
-            | "min_by"
-            | "percentile_cont"
-            | "percentile_disc"
-            | "percentile_disc_lc"
-            | "percentile_approx"
-            | "percentile_approx_weighted"
-            | "approx_top_k"
-            | "min_n"
-            | "max_n"
-            | "percentile_union"
-    )
+    }
 }

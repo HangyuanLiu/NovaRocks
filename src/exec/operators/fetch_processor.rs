@@ -266,6 +266,7 @@ impl FetchProcessor {
         request_columns: &HashMap<SlotId, ArrayRef>,
         backend_id: i32,
     ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+        #[allow(unused_variables)] // used when feature = "compat" is enabled
         let node_info = self
             .nodes_info
             .as_ref()
@@ -300,6 +301,7 @@ impl FetchProcessor {
         )?;
 
         #[cfg(not(feature = "compat"))]
+        #[allow(unreachable_code)]
         let resp: internal_proto::starrocks::PLookUpResponse = unreachable!();
         if let Some(status) = resp.status.as_ref() {
             if status.status_code != 0 {

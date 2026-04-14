@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 
-use sqlparser::ast as sqlast;
-
 use crate::descriptors;
 use crate::exprs;
 use crate::internal_service;
@@ -9,10 +7,9 @@ use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
 
-use super::expr_compiler::ExprCompiler;
-use super::resolve::{ExprScope, ResolvedTable};
+use super::resolve::ResolvedTable;
 
-use crate::sql::catalog::{TableDef, TableStorage};
+use crate::sql::catalog::TableStorage;
 
 // ---------------------------------------------------------------------------
 // Scan node
@@ -298,77 +295,6 @@ pub(crate) fn build_aggregation_node(
 // Sort node
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_sort_node(
-    node_id: i32,
-    tuple_id: i32,
-    order_by: &[sqlast::OrderByExpr],
-    scope: &ExprScope,
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<plan_nodes::TPlanNode, String> {
-    let mut ordering_exprs = Vec::new();
-    let mut is_asc = Vec::new();
-    let mut nulls_first = Vec::new();
-
-    for item in order_by {
-        let mut compiler = ExprCompiler::new(scope);
-        let texpr = compiler.compile(&item.expr)?;
-        ordering_exprs.push(texpr);
-        let asc = item.options.asc.unwrap_or(true);
-        is_asc.push(asc);
-        nulls_first.push(item.options.nulls_first.unwrap_or(asc));
-    }
-
-    let use_top_n = limit.is_some() && !ordering_exprs.is_empty();
-    let node_limit = limit.unwrap_or(-1);
-
-    let sort_info = plan_nodes::TSortInfo::new(
-        ordering_exprs,
-        is_asc,
-        nulls_first,
-        None::<Vec<exprs::TExpr>>,
-    );
-
-    let mut node = default_plan_node();
-    node.node_id = node_id;
-    node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
-    node.num_children = 1;
-    node.limit = node_limit;
-    node.row_tuples = vec![tuple_id];
-    node.nullable_tuples = vec![];
-    node.compact_data = true;
-
-    node.sort_node = Some(plan_nodes::TSortNode {
-        sort_info,
-        use_top_n,
-        offset,
-        ordering_exprs: None,
-        is_asc_order: None,
-        is_default_limit: None,
-        nulls_first: None,
-        sort_tuple_slot_exprs: None,
-        has_outer_join_child: None,
-        sql_sort_keys: None,
-        analytic_partition_exprs: None,
-        partition_exprs: None,
-        partition_limit: None,
-        topn_type: None,
-        build_runtime_filters: None,
-        max_buffered_rows: None,
-        max_buffered_bytes: None,
-        late_materialization: None,
-        enable_parallel_merge: None,
-        analytic_partition_skewed: None,
-        pre_agg_exprs: None,
-        pre_agg_output_slot_id: None,
-        pre_agg_insert_local_shuffle: None,
-        parallel_merge_late_materialize_mode: None,
-        per_pipeline: None,
-    });
-
-    Ok(node)
-}
-
 /// Build a sort node from pre-compiled expressions (for use in window
 /// function multi-group emission).
 pub(crate) fn build_sort_node_raw(
@@ -428,48 +354,6 @@ pub(crate) fn build_sort_node_raw(
 // ---------------------------------------------------------------------------
 // Exec params (scan ranges)
 // ---------------------------------------------------------------------------
-
-pub(super) fn build_exec_params(
-    table: &TableDef,
-    scan_node_id: i32,
-) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    let scan_ranges = match &table.storage {
-        TableStorage::LocalParquetFile { path } => {
-            let metadata =
-                std::fs::metadata(path).map_err(|e| format!("stat parquet file failed: {e}"))?;
-            let file_len = i64::try_from(metadata.len())
-                .map_err(|_| "parquet file is too large".to_string())?;
-            vec![build_hdfs_scan_range_params(
-                &path.display().to_string(),
-                file_len,
-            )]
-        }
-        TableStorage::S3ParquetFiles { files, .. } => files
-            .iter()
-            .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
-            .collect(),
-    };
-
-    Ok(internal_service::TPlanFragmentExecParams::new(
-        types::TUniqueId::new(1, 1),
-        types::TUniqueId::new(2, 2),
-        BTreeMap::from([(scan_node_id, scan_ranges)]),
-        BTreeMap::new(),
-        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
-        None::<i32>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<crate::runtime_filter::TRuntimeFilterParams>,
-        None::<i32>,
-        None::<bool>,
-        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<Vec<internal_service::TExecDebugOption>>,
-    ))
-}
 
 /// Build exec params for multiple scan nodes (used in JOIN queries).
 pub(crate) fn build_exec_params_multi(

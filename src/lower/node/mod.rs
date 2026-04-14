@@ -954,22 +954,6 @@ fn find_first_slot_id(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
     None
 }
 
-fn attach_probe_runtime_filter_specs_to_exchange(
-    node: &mut ExecNode,
-    specs: &[RuntimeFilterProbeSpec],
-) {
-    if specs.is_empty() {
-        return;
-    }
-    match &mut node.kind {
-        ExecNodeKind::ExchangeSource(exchange) => exchange.add_runtime_filter_specs(specs),
-        ExecNodeKind::Sort(sort) => {
-            attach_probe_runtime_filter_specs_to_exchange(&mut sort.input, specs)
-        }
-        _ => {}
-    }
-}
-
 fn attach_probe_runtime_filter_specs_to_scan(
     node: &mut ExecNode,
     specs: &[RuntimeFilterProbeSpec],

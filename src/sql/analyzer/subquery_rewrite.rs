@@ -73,7 +73,7 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: SubqueryInfo,
         negated: bool,
     ) -> Result<(), String> {
-        let (mut resolved, inner_scope) =
+        let (resolved, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         let join_type = if negated {
@@ -851,7 +851,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         resolved: ResolvedQuery,
         _outer_scope: &AnalyzerScope,
-        sq_alias: &str,
+        _sq_alias: &str,
         correlated_cols: &[CorrelationPred],
     ) -> Result<(ResolvedQuery, Option<TypedExpr>), String> {
         let mut join_conds: Vec<TypedExpr> = Vec::new();

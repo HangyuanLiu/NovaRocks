@@ -2770,14 +2770,15 @@ fn literal_from_batch(column: &ArrayRef, row_idx: usize) -> Result<Literal, Stri
             Ok(Literal::Date(formatted))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            use chrono::NaiveDateTime;
+            use chrono::DateTime;
             let arr = column
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or("downcast TimestampMicrosecondArray")?;
             let micros = arr.value(row_idx);
-            let formatted = NaiveDateTime::from_timestamp_micros(micros)
+            let formatted = DateTime::from_timestamp_micros(micros)
                 .expect("timestamp micros should be valid")
+                .naive_utc()
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
             Ok(Literal::String(formatted))

@@ -31,6 +31,7 @@ struct BufferState {
 pub(crate) struct AggregateStreamingState {
     inner: Arc<Mutex<BufferState>>,
     observable: Arc<Observable>,
+    #[allow(dead_code)] // backpressure limit, will be used when sink-side flow control is added
     buffer_limit: usize,
 }
 
@@ -90,6 +91,7 @@ impl AggregateStreamingState {
     }
 
     /// Returns true if the buffer is full (at or above the limit).
+    #[allow(dead_code)] // backpressure check, will be used when sink-side flow control is added
     pub(crate) fn is_buffer_full(&self) -> bool {
         let guard = self.inner.lock().expect("streaming state lock");
         guard.chunks.len() >= self.buffer_limit

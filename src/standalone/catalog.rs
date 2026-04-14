@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
-
-use arrow::datatypes::DataType;
+use std::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // Re-export from sql::catalog so existing `crate::standalone::catalog::*` paths continue to work.

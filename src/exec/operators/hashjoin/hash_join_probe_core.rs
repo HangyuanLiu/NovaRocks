@@ -125,6 +125,7 @@ impl HashJoinProbeCore {
         self.join_type
     }
 
+    #[allow(dead_code)] // used by planned right-semi/anti join paths
     pub(crate) fn probe_chunk_schema(&self) -> &ChunkSchemaRef {
         if self.probe_is_left {
             &self.left_chunk_schema
@@ -283,6 +284,7 @@ impl HashJoinProbeCore {
 
     /// Extend a build-only batch with NULL-filled probe-side columns.
     /// Mirror of `extend_with_null_build_columns` for RIGHT SEMI/ANTI.
+    #[allow(dead_code)] // used by planned right-semi/anti join paths
     fn extend_with_null_probe_columns(&self, build_batch: RecordBatch) -> Result<Chunk, String> {
         use crate::exec::chunk::ChunkSchema;
         use arrow::array::new_null_array;
@@ -406,6 +408,7 @@ impl HashJoinProbeCore {
         Ok(Some(batch))
     }
 
+    #[allow(dead_code)] // used by planned right-semi join output
     fn build_right_semi_output_from_indices(
         &self,
         indices_by_batch: &[Vec<u32>],

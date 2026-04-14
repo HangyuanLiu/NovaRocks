@@ -67,7 +67,7 @@ pub struct AggregateStreamingSinkFactory {
 }
 
 impl AggregateStreamingSinkFactory {
-    pub fn new(
+    pub(crate) fn new(
         node_id: i32,
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,

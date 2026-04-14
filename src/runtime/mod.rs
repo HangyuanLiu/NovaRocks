@@ -25,6 +25,8 @@ pub mod lookup;
 pub mod mem_tracker;
 pub mod profile;
 pub mod query_context;
+// Result buffer fetch infrastructure is accessed from C++ shim FFI path.
+#[allow(dead_code)]
 pub mod result_buffer;
 pub mod runtime_filter_hub;
 pub mod runtime_filter_worker;

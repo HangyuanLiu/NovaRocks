@@ -49,6 +49,7 @@ impl CTERegistry {
 #[derive(Clone, Debug)]
 pub(crate) struct CTEEntry {
     pub id: CteId,
+    #[allow(dead_code)] // kept for debugging and plan display
     pub name: String,
     pub resolved_query: ResolvedQuery,
     pub output_columns: Vec<OutputColumn>,
