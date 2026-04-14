@@ -5,6 +5,7 @@
 use super::rule::RewriteRule;
 
 pub(crate) mod column_pruning;
+pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
