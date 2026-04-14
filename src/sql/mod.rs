@@ -12,7 +12,6 @@ pub(crate) mod cascades;
 
 pub(crate) mod analyzer;
 pub(crate) mod explain;
-pub(crate) mod optimizer;
 pub(crate) mod physical;
 pub(crate) mod planner;
 
