@@ -11,6 +11,7 @@ use super::operator::Operator;
 // Rule types
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub(crate) enum RuleType {
     Transformation,
     Implementation,
@@ -28,6 +29,7 @@ pub(crate) struct NewExpr {
 
 pub(crate) trait Rule: Send + Sync {
     fn name(&self) -> &str;
+    #[allow(dead_code)]
     fn rule_type(&self) -> RuleType;
     /// Returns true if this rule can apply to the given operator.
     fn matches(&self, op: &Operator) -> bool;

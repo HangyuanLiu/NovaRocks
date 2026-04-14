@@ -445,7 +445,7 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     // e.g. (cd_demo_sk=ss_cdemo_sk AND ... OR cd_demo_sk=ss_cdemo_sk AND ...)
     // → cd_demo_sk=ss_cdemo_sk (factored) + remaining OR
     let mut expanded_predicates: Vec<TypedExpr> = Vec::new();
-    let all_cols: std::collections::HashSet<String> = relation_columns
+    let _all_cols: std::collections::HashSet<String> = relation_columns
         .iter()
         .flat_map(|s| s.iter().map(|r| r.1.clone()))
         .collect();
@@ -1029,6 +1029,7 @@ fn left_deep_join_reorder(
 /// Uses u32 to support join graphs with up to 32 relations.
 struct SubsetIter {
     universe: u32,
+    #[allow(dead_code)]
     k: u32,
     current: Option<u32>,
 }

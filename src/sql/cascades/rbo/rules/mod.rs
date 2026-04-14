@@ -30,6 +30,7 @@ pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
 /// structural_rbo_rules passes (the "push, reorder, push" pattern).
 /// Do NOT mix with structural rules in a single fixed-point — pushdown
 /// and reorder oscillate and either time out or produce column-scope errors.
+#[allow(dead_code)]
 pub(crate) fn join_reorder_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn RewriteRule>> {
@@ -41,6 +42,7 @@ pub(crate) fn join_reorder_rules(
 /// All RBO rules including join reorder. For registry test only;
 /// production code calls predicate_pushdown_rbo_rules(), join_reorder,
 /// and column_pruning_rules() separately per the four-pass pattern.
+#[allow(dead_code)]
 pub(crate) fn all_rbo_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn RewriteRule>> {

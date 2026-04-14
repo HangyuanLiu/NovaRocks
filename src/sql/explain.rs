@@ -9,6 +9,7 @@ use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::plan::{LogicalPlan, QueryPlan};
 
 /// Detail level for EXPLAIN output.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExplainLevel {
     Normal,
@@ -17,6 +18,7 @@ pub(crate) enum ExplainLevel {
 }
 
 /// Format a QueryPlan (with optional CTE fragments) as EXPLAIN text lines.
+#[allow(dead_code)]
 pub(crate) fn explain_query_plan(plan: &QueryPlan, level: ExplainLevel) -> Vec<String> {
     let mut lines = Vec::new();
     if !plan.cte_plans.is_empty() {
@@ -35,12 +37,14 @@ pub(crate) fn explain_query_plan(plan: &QueryPlan, level: ExplainLevel) -> Vec<S
 }
 
 /// Format a single LogicalPlan tree as EXPLAIN text lines.
+#[allow(dead_code)]
 pub(crate) fn explain_plan(plan: &LogicalPlan, level: ExplainLevel) -> Vec<String> {
     let mut out = Vec::new();
     format_node(plan, level, 0, &mut out);
     out
 }
 
+#[allow(dead_code)]
 fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(indent);
     match plan {

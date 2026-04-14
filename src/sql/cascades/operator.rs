@@ -4,17 +4,16 @@
 //! (children are represented as `GroupId`s in `MExpr`).
 //! Physical operators add physical execution decisions (distribution, agg mode).
 
-use arrow::datatypes::DataType;
-
 use crate::sql::catalog::TableDef;
 use crate::sql::cte::CteId;
-use crate::sql::ir::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr, WindowFrame};
+use crate::sql::ir::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::plan::{AggregateCall, WindowExpr};
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum JoinDistribution {
     Shuffle,
@@ -22,6 +21,7 @@ pub(crate) enum JoinDistribution {
     Colocate,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum AggMode {
     Single,

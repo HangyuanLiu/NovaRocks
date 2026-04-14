@@ -14,6 +14,7 @@ pub(crate) struct OptimizerOptions {
     /// Hard cap on the RBO driver's tree-level fixed-point loop.
     pub rbo_max_iterations: usize,
     /// Hard cap on the CBO Memo group count (existing constant; documented here).
+    #[allow(dead_code)]
     pub cbo_max_groups: usize,
     /// Wall-clock budget for the entire `optimize()` call (existing constant; documented here).
     pub optimize_timeout: Duration,
@@ -33,6 +34,7 @@ impl OptimizerOptions {
         !self.disabled_rules.contains(rule_name)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn disable(&mut self, rule_name: &str) {
         self.disabled_rules.insert(rule_name.to_string());
     }

@@ -640,7 +640,7 @@ impl Rule for AggToHashAgg {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalAggregate(op) = &expr.op else {
             return vec![];
         };
@@ -781,6 +781,7 @@ impl Rule for TopNToPhysical {
 
 /// Split a LogicalWindow's expressions into groups sharing the same
 /// (partition_by, order_by) signature. Preserves first-seen order.
+#[allow(dead_code)]
 fn split_window_exprs_by_signature(
     exprs: &[crate::sql::plan::WindowExpr],
 ) -> Vec<Vec<crate::sql::plan::WindowExpr>> {
@@ -795,6 +796,7 @@ fn split_window_exprs_by_signature(
 /// Derive sort items for a window's partition_by + order_by.
 /// Window sort ordering is: partition_by columns first (ASC, NULLS FIRST),
 /// then order_by columns with their own direction.
+#[allow(dead_code)]
 fn sort_items_for_window(
     win: &crate::sql::plan::WindowExpr,
 ) -> Vec<crate::sql::ir::SortItem> {

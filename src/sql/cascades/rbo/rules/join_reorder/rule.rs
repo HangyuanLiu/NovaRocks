@@ -17,11 +17,13 @@ use crate::sql::statistics::TableStatistics;
 ///
 /// Stores `table_stats` internally (set at construction time by
 /// `all_rbo_rules(table_stats)`).
+#[allow(dead_code)]
 pub(crate) struct JoinReorderRule {
     table_stats: Arc<HashMap<String, TableStatistics>>,
 }
 
 impl JoinReorderRule {
+    #[allow(dead_code)]
     pub(crate) fn new(table_stats: Arc<HashMap<String, TableStatistics>>) -> Self {
         Self { table_stats }
     }

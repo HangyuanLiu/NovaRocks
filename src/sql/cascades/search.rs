@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::cost::compute_cost;
-use super::memo::{Cost, GroupId, MExpr, Memo};
+use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
 use super::stats::derive_statistics;
@@ -30,6 +30,7 @@ const BROADCAST_ROW_COUNT_LIMIT: f64 = 500_000.0;
 /// Records the best physical expression found for a (group, required_props) pair.
 #[derive(Clone, Debug)]
 pub(crate) struct Winner {
+    #[allow(dead_code)]
     pub(crate) group_id: GroupId,
     /// Index into `group.physical_exprs`.
     pub(crate) expr_index: usize,
@@ -627,6 +628,7 @@ fn stats_for_group(
 // ---------------------------------------------------------------------------
 
 /// Which side of a join equi-condition to extract columns from.
+#[allow(dead_code)]
 enum Side {
     Left,
     Right,

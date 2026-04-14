@@ -6,8 +6,10 @@ use crate::sql::catalog::TableDef;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTable {
+    #[allow(dead_code)]
     pub database: String,
     pub table: TableDef,
+    #[allow(dead_code)]
     pub alias: Option<String>,
 }
 

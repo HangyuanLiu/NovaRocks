@@ -17,10 +17,10 @@ pub(crate) mod runtime_filter_planner;
 pub(crate) mod search;
 pub(crate) mod stats;
 
-pub(crate) use memo::{GroupId, MExprId, Memo};
+pub(crate) use memo::Memo;
 pub(crate) use operator::Operator;
 pub(crate) use physical_plan::PhysicalPlanNode;
-pub(crate) use property::{ColumnRef, DistributionSpec, OrderingSpec, PhysicalPropertySet};
+pub(crate) use property::PhysicalPropertySet;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

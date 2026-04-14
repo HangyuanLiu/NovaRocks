@@ -82,6 +82,7 @@ impl Memo {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Group {
+    #[allow(dead_code)]
     pub(crate) id: GroupId,
     pub(crate) logical_exprs: Vec<MExpr>,
     pub(crate) physical_exprs: Vec<MExpr>,
@@ -105,6 +106,7 @@ pub(crate) struct LogicalProperties {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MExpr {
+    #[allow(dead_code)]
     pub(crate) id: MExprId,
     pub(crate) op: Operator,
     pub(crate) children: Vec<GroupId>,

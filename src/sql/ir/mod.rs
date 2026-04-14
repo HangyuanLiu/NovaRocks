@@ -272,6 +272,7 @@ pub(crate) enum ExprKind {
     /// Placeholder for a subquery that will be rewritten into a JOIN.
     /// This is an intermediate representation created during expression analysis
     /// and consumed by the subquery rewriting pass before planning.
+    #[allow(dead_code)]
     SubqueryPlaceholder {
         id: usize,
         kind: SubqueryKind,
@@ -298,6 +299,7 @@ pub(crate) struct SubqueryInfo {
     pub kind: SubqueryKind,
     pub subquery: Box<sqlparser::ast::Query>,
     /// The resolved data type of the subquery result (scalar).
+    #[allow(dead_code)]
     pub data_type: DataType,
     /// For IN subquery: the left-hand expression from the outer query.
     pub in_expr: Option<Box<sqlparser::ast::Expr>>,
