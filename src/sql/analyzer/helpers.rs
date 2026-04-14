@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
-use crate::sql::ir::JoinKind;
+use crate::sql::analysis::JoinKind;
 
 // ---------------------------------------------------------------------------
 // SQL type -> Arrow type conversion

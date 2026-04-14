@@ -15,7 +15,7 @@ use sqlparser::ast as sqlast;
 
 use crate::sql::catalog::CatalogProvider;
 
-use crate::sql::ir::{
+use crate::sql::analysis::{
     ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
     ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
     SubqueryInfo, TypedExpr,
@@ -35,7 +35,7 @@ pub(crate) fn analyze(
     query: &sqlast::Query,
     catalog: &impl CatalogProvider,
     current_database: &str,
-) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
+) -> Result<(ResolvedQuery, crate::sql::analysis::cte::CTERegistry), String> {
     let ctx = AnalyzerContext {
         catalog,
         current_database,
@@ -43,7 +43,7 @@ pub(crate) fn analyze(
         pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
         collected_subqueries: std::cell::RefCell::new(Vec::new()),
-        cte_registry: std::cell::RefCell::new(crate::sql::cte::CTERegistry::new()),
+        cte_registry: std::cell::RefCell::new(crate::sql::analysis::cte::CTERegistry::new()),
     };
     let resolved = ctx.analyze_query(query)?;
     let registry = ctx.cte_registry.into_inner();
@@ -59,7 +59,7 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) current_database: &'a str,
     /// Currently visible CTE definitions from outer scopes or earlier entries
     /// in the same WITH clause, keyed by lowercase name.
-    pub(super) ctes: std::collections::HashMap<String, crate::sql::cte::CteId>,
+    pub(super) ctes: std::collections::HashMap<String, crate::sql::analysis::cte::CteId>,
     /// Names declared by the current WITH clause but not yet visible because
     /// their definitions have not been analyzed.
     pub(super) pending_ctes: std::collections::HashSet<String>,
@@ -69,7 +69,7 @@ pub(super) struct AnalyzerContext<'a> {
     /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
     pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
     /// Accumulated CTE registry for the current query analysis.
-    pub(super) cte_registry: std::cell::RefCell<crate::sql::cte::CTERegistry>,
+    pub(super) cte_registry: std::cell::RefCell<crate::sql::analysis::cte::CTERegistry>,
 }
 
 impl<'a> AnalyzerContext<'a> {
@@ -83,7 +83,7 @@ impl<'a> AnalyzerContext<'a> {
     fn build_with_clause_context(
         &self,
         with_clause: &sqlast::With,
-    ) -> Result<(AnalyzerContext<'a>, Vec<crate::sql::cte::CteId>), String> {
+    ) -> Result<(AnalyzerContext<'a>, Vec<crate::sql::analysis::cte::CteId>), String> {
         let mut pending_ctes = self.pending_ctes.clone();
         pending_ctes.extend(
             with_clause
@@ -677,7 +677,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &sqlast::Select,
         rollup_groups: &[Vec<sqlast::Expr>],
     ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
-        use crate::sql::ir::RepeatInfo;
+        use crate::sql::analysis::RepeatInfo;
 
         let n = rollup_groups.len();
 
@@ -1457,7 +1457,7 @@ fn replace_grouping_markers_in_typed_expr(
     grouping_fn_args: &[(String, Vec<String>)],
 ) -> TypedExpr {
     match &expr.kind {
-        ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) if *v <= -9000 => {
+        ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) if *v <= -9000 => {
             let idx = ((-9000i64) - v) as usize;
             if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
                 return TypedExpr {
@@ -1584,7 +1584,7 @@ fn replace_grouping_markers_in_typed_expr(
 mod tests {
     use super::*;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
-    use crate::sql::ir::{ExprKind, JoinKind, Relation};
+    use crate::sql::analysis::{ExprKind, JoinKind, Relation};
 
     struct TestCatalog;
     impl crate::sql::catalog::CatalogProvider for TestCatalog {
@@ -1816,7 +1816,7 @@ mod tests {
 
     fn parse_and_analyze_with_registry(
         sql: &str,
-    ) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
+    ) -> Result<(ResolvedQuery, crate::sql::analysis::cte::CTERegistry), String> {
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
         let mut ast =
             sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
@@ -2233,7 +2233,7 @@ mod tests {
             .expect("cte id should exist in registry");
         let inner_value = match &entry.resolved_query.body {
             QueryBody::Select(inner_sel) => match &inner_sel.projection[0].expr.kind {
-                ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) => Some(*v),
+                ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => Some(*v),
                 _ => None,
             },
             _ => None,
@@ -2264,7 +2264,7 @@ mod tests {
             .expect("cte id should exist in registry");
         let outer_value = match &entry.resolved_query.body {
             QueryBody::Select(inner_sel) => match &inner_sel.projection[0].expr.kind {
-                ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) => Some(*v),
+                ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => Some(*v),
                 _ => None,
             },
             _ => None,

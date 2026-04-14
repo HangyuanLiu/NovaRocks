@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
-use crate::sql::ir::*;
+use crate::sql::analysis::*;
 
 use super::helpers::eval_const_i64;
 use super::scope::AnalyzerScope;

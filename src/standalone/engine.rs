@@ -3658,7 +3658,7 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::physical::{FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult};
+use crate::sql::codegen::{FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult};
 
 enum StandaloneExecutionPlan {
     SingleFragment(PlanBuildResult),
@@ -3669,7 +3669,7 @@ enum StandaloneExecutionPlan {
 /// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
 fn top_level_stream_root_wrapper_child_id(
     br: &MultiFragmentBuildResult,
-) -> Option<crate::sql::fragment::FragmentId> {
+) -> Option<crate::sql::codegen::FragmentId> {
     use crate::plan_nodes::TPlanNodeType;
 
     let root = br
@@ -3787,7 +3787,7 @@ fn explain_query(
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -3809,14 +3809,11 @@ fn execute_query(
     current_database: &str,
     exchange_port: u16,
 ) -> Result<QueryResult, String> {
-    // All non-recursive queries, including CTE queries, now flow through
-    // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
-    // path remains only for compile-time compatibility and should not be used here.
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
-    let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         &physical,
         catalog,
         current_database,
@@ -3909,8 +3906,8 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 /// Walk the logical plan tree and collect table-level statistics for all scan
 /// nodes that reference S3ParquetFiles storage.
 fn build_table_stats_from_plan(
-    plan: &crate::sql::plan::LogicalPlan,
-) -> std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
+    plan: &crate::sql::planner::plan::LogicalPlan,
+) -> std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics> {
     let mut stats = std::collections::HashMap::new();
     collect_scan_stats(plan, &mut stats);
     stats
@@ -3918,17 +3915,17 @@ fn build_table_stats_from_plan(
 
 /// Recursively visit plan nodes and collect statistics from Scan leaves.
 fn collect_scan_stats(
-    plan: &crate::sql::plan::LogicalPlan,
-    out: &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
+    plan: &crate::sql::planner::plan::LogicalPlan,
+    out: &mut std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics>,
 ) {
-    use crate::sql::plan::LogicalPlan;
+    use crate::sql::planner::plan::LogicalPlan;
 
     match plan {
         LogicalPlan::Scan(s) => {
             if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
                 &s.table.storage
             {
-                if let Some(ts) = crate::sql::statistics::build_table_statistics(files) {
+                if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics(files) {
                     // Insert by table name (canonical key).
                     out.insert(s.table.name.clone(), ts.clone());
                     // Also insert by alias so that aliased scans can find their stats.
@@ -4084,7 +4081,7 @@ mod tests {
         file
     }
 
-    fn build_fragments_for_query(sql: &str) -> crate::sql::physical::MultiFragmentBuildResult {
+    fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         let parquet = write_parquet_file();
@@ -4109,8 +4106,8 @@ mod tests {
             crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
         let logical = crate::sql::planner::plan_query(resolved, cte_registry).expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical = crate::sql::cascades::optimize(logical, &table_stats).expect("optimize");
-        crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
+        let physical = crate::sql::optimizer::optimize(logical, &table_stats).expect("optimize");
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, "default",
         )
         .expect("build fragments")
@@ -4326,7 +4323,7 @@ mod tests {
         assert!(build.edges.iter().any(|edge| {
             matches!(
                 edge.edge_kind,
-                crate::sql::physical::FragmentEdgeKind::Stream
+                crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
     }

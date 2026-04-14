@@ -11,7 +11,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::ir::*;
+use crate::sql::analysis::*;
 
 use super::AnalyzerContext;
 use super::scope::AnalyzerScope;
@@ -1530,7 +1530,7 @@ fn factor_common_correlation_from_or(
             new_branches.push(TypedExpr {
                 data_type: DataType::Boolean,
                 nullable: false,
-                kind: ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)),
+                kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Bool(true)),
             });
         } else {
             new_branches.push(conjoin(remaining));

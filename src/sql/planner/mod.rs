@@ -4,9 +4,11 @@
 //! from the analyzed query IR.  A future optimizer would rewrite this tree
 //! before it reaches the Thrift emitter.
 
-use crate::sql::cte::CTERegistry;
-use crate::sql::ir::*;
-use crate::sql::plan::*;
+pub(crate) mod plan;
+
+use crate::sql::analysis::cte::CTERegistry;
+use crate::sql::analysis::*;
+use plan::*;
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -19,53 +21,6 @@ pub(crate) fn plan_query(
     cte_registry: CTERegistry,
 ) -> Result<LogicalPlan, String> {
     plan_scoped_query(resolved, &cte_registry)
-}
-
-pub(crate) fn plan_query_legacy(
-    resolved: ResolvedQuery,
-    cte_registry: CTERegistry,
-) -> Result<QueryPlan, String> {
-    let output_columns = resolved.output_columns.clone();
-    let main_plan = plan(resolved)?;
-
-    let cte_plans = cte_registry
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let cte_plan = plan(entry.resolved_query)?;
-            Ok(CTEProducePlan {
-                cte_id: entry.id,
-                plan: cte_plan,
-                output_columns: entry.output_columns,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    Ok(QueryPlan {
-        cte_plans,
-        main_plan,
-        output_columns,
-    })
-}
-
-/// Convert a fully-analyzed query into a logical plan tree.
-pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
-    let ResolvedQuery {
-        body,
-        order_by,
-        limit,
-        offset,
-        output_columns,
-        ..
-    } = resolved;
-    let body_plan = plan_body(body)?;
-    Ok(apply_query_modifiers(
-        body_plan,
-        order_by,
-        output_columns,
-        limit,
-        offset,
-    ))
 }
 
 fn plan_scoped_query(
@@ -267,14 +222,6 @@ fn collect_extra_inner(
 // Body planning
 // ---------------------------------------------------------------------------
 
-fn plan_body(body: QueryBody) -> Result<LogicalPlan, String> {
-    match body {
-        QueryBody::Select(select) => plan_select(select),
-        QueryBody::SetOperation(set_op) => plan_set_operation(set_op),
-        QueryBody::Values(values) => plan_values(values),
-    }
-}
-
 fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry) -> Result<LogicalPlan, String> {
     match body {
         QueryBody::Select(select) => plan_select_scoped(select, cte_registry),
@@ -286,87 +233,6 @@ fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry) -> Result<Logic
 // ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
-
-/// Produces:  Project( [Aggregate(] [Filter(] from_plan [)] [)] )
-fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
-    // 1. FROM clause → base plan
-    let mut current = match select.from {
-        Some(relation) => plan_relation(relation)?,
-        None => {
-            // SELECT without FROM — single-row values node
-            LogicalPlan::Values(ValuesNode {
-                rows: vec![vec![]],
-                columns: vec![],
-            })
-        }
-    };
-
-    // 2. WHERE → Filter
-    if let Some(predicate) = select.filter {
-        current = LogicalPlan::Filter(FilterNode {
-            input: Box::new(current),
-            predicate,
-        });
-    }
-
-    // 2.5: ROLLUP → Insert Repeat node between filter and aggregate
-    if let Some(repeat_info) = select.repeat.take() {
-        current = LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(current),
-            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
-            grouping_ids: repeat_info.grouping_ids,
-            all_rollup_columns: repeat_info.all_rollup_columns,
-            grouping_fn_args: repeat_info.grouping_fn_args,
-        });
-    }
-
-    // 3. GROUP BY / aggregation → Aggregate
-    if select.has_aggregation || !select.group_by.is_empty() {
-        // Collect non-aggregate column refs from HAVING that aren't already in
-        // GROUP BY. These come from scalar subquery CROSS JOINs and must pass
-        // through as extra group-by keys so they're available in the
-        // post-aggregate HAVING filter.
-        if let Some(ref having_expr) = select.having {
-            let mut extra_gb = Vec::new();
-            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
-            for col in extra_gb {
-                select.group_by.push(col);
-            }
-        }
-
-        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
-            &select.projection,
-            &select.group_by,
-            select.having.as_ref(),
-        );
-        current = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(current),
-            group_by: select.group_by,
-            aggregates: agg_calls,
-            output_columns,
-        });
-        // HAVING → Filter between Aggregate and Project
-        if let Some(having) = select.having {
-            current = LogicalPlan::Filter(FilterNode {
-                input: Box::new(current),
-                predicate: having,
-            });
-        }
-
-        // The projection after aggregation — may contain window functions
-        current = build_window_and_project(current, project_items, &select.projection)?;
-    } else {
-        // 4. No aggregation → check for window functions, then Project
-        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
-    }
-
-    // 5. SELECT DISTINCT → Aggregate on all output columns (deduplication)
-    if select.distinct {
-        current = build_distinct(current, &select.projection);
-    }
-
-    Ok(current)
-}
 
 fn plan_select_scoped(
     mut select: ResolvedSelect,
@@ -527,36 +393,6 @@ fn build_window_and_project(
     } else {
         Ok(input)
     }
-}
-
-/// Group window expressions by their (partition_by, order_by) signature.
-/// Returns vec of (indices, signature_key) where each group shares the same
-/// partition/order and can be processed by a single Sort + Window node.
-fn group_window_exprs_by_signature(exprs: &[WindowExpr]) -> Vec<(Vec<usize>, String)> {
-    let mut groups: Vec<(Vec<usize>, String)> = Vec::new();
-    for (i, expr) in exprs.iter().enumerate() {
-        let sig = window_signature(expr);
-        if let Some(group) = groups.iter_mut().find(|(_, s)| *s == sig) {
-            group.0.push(i);
-        } else {
-            groups.push((vec![i], sig));
-        }
-    }
-    groups
-}
-
-fn window_signature(expr: &WindowExpr) -> String {
-    format!(
-        "P:{:?}|O:{:?}",
-        expr.partition_by
-            .iter()
-            .map(|e| format!("{:?}", e.kind))
-            .collect::<Vec<_>>(),
-        expr.order_by
-            .iter()
-            .map(|e| format!("{:?}:{}", e.expr.kind, e.asc))
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn has_window_call(expr: &TypedExpr) -> bool {
@@ -916,68 +752,6 @@ fn collect_non_agg_column_refs_inner(
 // FROM clause planning
 // ---------------------------------------------------------------------------
 
-fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
-    match relation {
-        Relation::Scan(scan) => {
-            let columns = scan
-                .table
-                .columns
-                .iter()
-                .map(|c| OutputColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                    nullable: c.nullable,
-                })
-                .collect();
-            Ok(LogicalPlan::Scan(ScanNode {
-                database: scan.database,
-                table: scan.table,
-                alias: scan.alias,
-                columns,
-                predicates: vec![],
-                required_columns: None,
-            }))
-        }
-        Relation::Subquery { query, alias } => {
-            // Recursively plan the subquery, wrapping with alias metadata
-            // so the physical emitter can register qualified columns.
-            let output_columns = query.output_columns.clone();
-            let inner_plan = plan(*query)?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-                input: Box::new(inner_plan),
-                alias,
-                output_columns,
-            }))
-        }
-        Relation::Join(join_rel) => {
-            let left = plan_relation(join_rel.left)?;
-            let right = plan_relation(join_rel.right)?;
-            Ok(LogicalPlan::Join(JoinNode {
-                left: Box::new(left),
-                right: Box::new(right),
-                join_type: join_rel.join_type,
-                condition: join_rel.condition,
-            }))
-        }
-        Relation::GenerateSeries(gs) => Ok(LogicalPlan::GenerateSeries(GenerateSeriesNode {
-            start: gs.start,
-            end: gs.end,
-            step: gs.step,
-            column_name: gs.column_name,
-            alias: gs.alias,
-        })),
-        Relation::CTEConsume {
-            cte_id,
-            alias,
-            output_columns,
-        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias,
-            output_columns,
-        })),
-    }
-}
-
 fn plan_relation_scoped(
     relation: Relation,
     cte_registry: &CTERegistry,
@@ -1044,24 +818,6 @@ fn plan_relation_scoped(
 // ---------------------------------------------------------------------------
 // Set operation planning
 // ---------------------------------------------------------------------------
-
-fn plan_set_operation(set_op: ResolvedSetOp) -> Result<LogicalPlan, String> {
-    let left = plan(*set_op.left)?;
-    let right = plan(*set_op.right)?;
-
-    match set_op.kind {
-        SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
-            inputs: vec![left, right],
-            all: set_op.all,
-        })),
-        SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
-            inputs: vec![left, right],
-        })),
-        SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
-            inputs: vec![left, right],
-        })),
-    }
-}
 
 fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,

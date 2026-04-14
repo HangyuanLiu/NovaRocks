@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
-use crate::sql::ir::*;
+use crate::sql::analysis::*;
 use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
 
 use super::functions::*;

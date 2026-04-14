@@ -2,11 +2,11 @@
 
 use std::fmt::Write;
 
-use crate::sql::cascades::operator::{AggMode, JoinDistribution, Operator};
-use crate::sql::cascades::physical_plan::PhysicalPlanNode;
-use crate::sql::cascades::property::DistributionSpec;
-use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
-use crate::sql::plan::{LogicalPlan, QueryPlan};
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
+use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::property::DistributionSpec;
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::planner::plan::LogicalPlan;
 
 /// Detail level for EXPLAIN output.
 #[allow(dead_code)]
@@ -15,25 +15,6 @@ pub(crate) enum ExplainLevel {
     Normal,
     Verbose,
     Costs,
-}
-
-/// Format a QueryPlan (with optional CTE fragments) as EXPLAIN text lines.
-#[allow(dead_code)]
-pub(crate) fn explain_query_plan(plan: &QueryPlan, level: ExplainLevel) -> Vec<String> {
-    let mut lines = Vec::new();
-    if !plan.cte_plans.is_empty() {
-        for cte in &plan.cte_plans {
-            lines.push(format!("  CTE(cte_id={})", cte.cte_id));
-            let sub = explain_plan(&cte.plan, level);
-            for l in sub {
-                lines.push(format!("    {l}"));
-            }
-        }
-        lines.push(String::new());
-    }
-    let main_lines = explain_plan(&plan.main_plan, level);
-    lines.extend(main_lines);
-    lines
 }
 
 /// Format a single LogicalPlan tree as EXPLAIN text lines.
