@@ -341,7 +341,7 @@ impl AggregateFunction for HistogramAgg {
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const HistogramState) };
             if state.values.is_empty() {
-                builder.append_null();
+                builder.append_value("[]");
                 continue;
             }
             let bucket_num = state
