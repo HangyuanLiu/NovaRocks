@@ -252,6 +252,18 @@ impl StandaloneSession {
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
+            // Handle CREATE TABLE <name> PROPERTIES(...) (no column defs) for
+            // local-parquet tables whose schema is inferred from the file.
+            if let Some(local_parquet_stmt) =
+                try_parse_local_parquet_create_table(&normalized)?
+            {
+                return execute_create_table_statement(
+                    &self.inner,
+                    local_parquet_stmt,
+                    current_catalog,
+                    current_database,
+                );
+            }
             let result = crate::sql::parser::dialect::create_table::parse_create_table_statement(
                 &mut parser,
             )?;
@@ -320,6 +332,33 @@ impl StandaloneSession {
                 if let Some(cat_name) = current_catalog {
                     self.register_iceberg_tables_for_query(cat_name, current_database, query)?;
                 }
+
+                // Handle 3-part table names (catalog.database.table) when no
+                // current catalog context is set.  Clone the query, strip the
+                // catalog prefix so the analyzer sees 2-part names, and register
+                // the referenced Iceberg tables in the local catalog.
+                let three_parts = extract_three_part_table_refs(query);
+                if !three_parts.is_empty() && current_catalog.is_none() {
+                    for (cat, db, _tbl) in &three_parts {
+                        self.register_iceberg_tables_for_query(cat, db, query)?;
+                    }
+                    let mut rewritten = query.as_ref().clone();
+                    strip_catalog_from_three_part_names(&mut rewritten);
+                    let catalog = self
+                        .inner
+                        .catalog
+                        .read()
+                        .expect("standalone catalog read lock");
+                    let result = execute_query(
+                        &rewritten,
+                        &catalog,
+                        current_database,
+                        self.inner.exchange_port,
+                    )?;
+                    drop(catalog);
+                    return Ok(StatementResult::Query(result));
+                }
+
                 let catalog = self
                     .inner
                     .catalog
@@ -3355,6 +3394,221 @@ fn extract_table_names_from_expr(expr: &sqlparser::ast::Expr, names: &mut Vec<St
 
 fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut Vec<String>) {
     extract_table_names_from_set_expr(query.body.as_ref(), names);
+}
+
+// ---------------------------------------------------------------------------
+// Three-part table name helpers (catalog.database.table)
+// ---------------------------------------------------------------------------
+
+/// Extract `(catalog, database, table)` triples from 3-part table references
+/// in a query AST.
+fn extract_three_part_table_refs(
+    query: &sqlparser::ast::Query,
+) -> Vec<(String, String, String)> {
+    let mut refs = Vec::new();
+    extract_three_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn extract_three_part_refs_from_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(s) => {
+            for from in &s.from {
+                extract_three_part_refs_from_factor(&from.relation, refs);
+                for join in &from.joins {
+                    extract_three_part_refs_from_factor(&join.relation, refs);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_three_part_refs_from_set_expr(left, refs);
+            extract_three_part_refs_from_set_expr(right, refs);
+        }
+        sqlparser::ast::SetExpr::Query(q) => {
+            extract_three_part_refs_from_set_expr(q.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_three_part_refs_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if parts.len() == 3 {
+                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            extract_three_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite a query AST in-place: convert all 3-part table references
+/// `catalog.database.table` to 2-part `database.table` by stripping the
+/// leading catalog element.
+fn strip_catalog_from_three_part_names(query: &mut sqlparser::ast::Query) {
+    strip_catalog_in_set_expr(query.body.as_mut());
+}
+
+fn strip_catalog_in_set_expr(expr: &mut sqlparser::ast::SetExpr) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(s) => {
+            for from in &mut s.from {
+                strip_catalog_in_factor(&mut from.relation);
+                for join in &mut from.joins {
+                    strip_catalog_in_factor(&mut join.relation);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            strip_catalog_in_set_expr(left.as_mut());
+            strip_catalog_in_set_expr(right.as_mut());
+        }
+        sqlparser::ast::SetExpr::Query(q) => {
+            strip_catalog_in_set_expr(q.body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+fn strip_catalog_in_factor(factor: &mut sqlparser::ast::TableFactor) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            if name.0.len() == 3 {
+                name.0.remove(0);
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            strip_catalog_in_set_expr(subquery.body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local-parquet CREATE TABLE without column defs
+// ---------------------------------------------------------------------------
+
+/// Try to parse `CREATE TABLE <name> PROPERTIES("path"="...")` -- a
+/// local-parquet shorthand that omits column definitions (schema is inferred
+/// from the parquet file).  Returns `None` if the SQL does not match this
+/// pattern so the caller can fall through to the standard parser.
+fn try_parse_local_parquet_create_table(
+    sql: &str,
+) -> Result<Option<crate::sql::parser::ast::CreateTableStmt>, String> {
+    use crate::sql::parser::dialect::{StarRocksDialect, peek_word_eq};
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::Token;
+
+    let dialect = StarRocksDialect;
+    let mut parser = sqlparser::parser::Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|e| format!("sql parser error: {e}"))?;
+
+    // Consume CREATE [EXTERNAL] [TEMPORARY] TABLE [IF NOT EXISTS]
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return Ok(None);
+    }
+    let _ = parser.parse_keyword(Keyword::EXTERNAL);
+    let _ = parser.parse_keyword(Keyword::TEMPORARY);
+    if !parser.parse_keyword(Keyword::TABLE) {
+        return Ok(None);
+    }
+    let _ = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+
+    // Parse table name
+    let raw_name = parser
+        .parse_object_name(false)
+        .map_err(|e| format!("parse table name: {e}"))?;
+    let name = crate::sql::parser::dialect::convert_object_name(raw_name)?;
+
+    // If next token is '(' this is a standard column-def CREATE TABLE, not ours.
+    if parser.peek_token_ref().token == Token::LParen {
+        return Ok(None);
+    }
+
+    // Expect PROPERTIES keyword
+    if !peek_word_eq(&parser, 0, "PROPERTIES") {
+        return Ok(None);
+    }
+    parser.next_token(); // consume PROPERTIES
+
+    // Parse key-value properties: ("k"="v", ...)
+    let props = parse_kv_properties(&mut parser)?;
+
+    let path = props
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("path"))
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| {
+            "CREATE TABLE ... PROPERTIES must include a \"path\" property".to_string()
+        })?;
+
+    Ok(Some(crate::sql::parser::ast::CreateTableStmt {
+        name,
+        kind: CreateTableKind::LocalParquet { path },
+    }))
+}
+
+/// Parse a parenthesized list of key=value pairs:  `("k1"="v1", "k2"="v2")`
+fn parse_kv_properties(
+    parser: &mut sqlparser::parser::Parser<'_>,
+) -> Result<Vec<(String, String)>, String> {
+    use sqlparser::tokenizer::Token;
+
+    let mut props = Vec::new();
+    if !parser.consume_token(&Token::LParen) {
+        return Ok(props);
+    }
+    loop {
+        if parser.consume_token(&Token::RParen) {
+            break;
+        }
+        if !props.is_empty() {
+            let _ = parser.consume_token(&Token::Comma);
+            if parser.consume_token(&Token::RParen) {
+                break;
+            }
+        }
+        let key = parse_prop_string_or_ident(parser)?;
+        let _ = parser.consume_token(&Token::Eq);
+        let value = parse_prop_string_or_ident(parser)?;
+        props.push((key, value));
+    }
+    Ok(props)
+}
+
+fn parse_prop_string_or_ident(
+    parser: &mut sqlparser::parser::Parser<'_>,
+) -> Result<String, String> {
+    use sqlparser::tokenizer::Token;
+    let token = parser.next_token();
+    match token.token {
+        Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => Ok(s),
+        Token::Word(w) => Ok(w.value),
+        Token::Number(n, _) => Ok(n),
+        other => Err(format!("expected string or identifier, got {other}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
