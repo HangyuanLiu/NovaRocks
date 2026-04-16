@@ -640,7 +640,7 @@ impl Rule for AggToHashAgg {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalAggregate(op) = &expr.op else {
             return vec![];
         };
@@ -656,11 +656,37 @@ impl Rule for AggToHashAgg {
             children: expr.children.clone(),
         };
 
-        // Two-phase Local+Global aggregation is deferred — the Global
-        // aggregate's input expressions must reference the Local output
-        // columns (e.g., `sum(sum(x))`), which requires expression
-        // rewriting not yet implemented.  Single-phase only for now.
-        vec![single]
+        // Two-phase Local+Global: skip when any aggregate is DISTINCT or
+        // when there are no group-by keys (scalar agg — deferred).
+        let has_distinct = op.aggregates.iter().any(|a| a.distinct);
+        if has_distinct || op.group_by.is_empty() {
+            return vec![single];
+        }
+
+        // Alternative 2: Local pre-agg → (hash exchange inserted by enforcer) → Global merge.
+        let local_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Local,
+                group_by: op.group_by.clone(),
+                aggregates: op.aggregates.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: expr.children.clone(),
+        };
+        let local_group_id = memo.new_group(local_mexpr);
+
+        let global = NewExpr {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Global,
+                group_by: op.group_by.clone(),
+                aggregates: op.aggregates.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: vec![local_group_id],
+        };
+
+        vec![single, global]
     }
 }
 
@@ -1562,5 +1588,154 @@ mod window_split_tests {
             vec![child_group],
             "no sort should be inserted for empty signature"
         );
+    }
+}
+
+#[cfg(test)]
+mod two_phase_agg_tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::planner::plan::AggregateCall;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn agg_to_hash_agg_produces_single_and_two_phase() {
+        let mut memo = Memo::new();
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![col("city")],
+                aggregates: vec![AggregateCall {
+                    name: "sum".into(),
+                    args: vec![col("amount")],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        name: "city".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "sum(amount)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    },
+                ],
+            }),
+            children: vec![child_group],
+        };
+
+        let rule = AggToHashAgg;
+        let out = rule.apply(&expr, &mut memo);
+
+        // Should produce 2 alternatives: Single and Global.
+        assert_eq!(out.len(), 2, "expected Single + Global alternatives");
+
+        // Alternative 1: Single
+        match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => {
+                assert!(matches!(p.mode, AggMode::Single));
+            }
+            other => panic!("expected PhysicalHashAggregate(Single), got {:?}", other),
+        }
+        assert_eq!(out[0].children, vec![child_group]);
+
+        // Alternative 2: Global (child is a new group containing Local)
+        match &out[1].op {
+            Operator::PhysicalHashAggregate(p) => {
+                assert!(matches!(p.mode, AggMode::Global));
+            }
+            other => panic!("expected PhysicalHashAggregate(Global), got {:?}", other),
+        }
+        let local_group_id = out[1].children[0];
+        assert_ne!(local_group_id, child_group);
+
+        // The new group should contain a Local physical expr
+        let local_group = &memo.groups[local_group_id];
+        assert_eq!(local_group.physical_exprs.len(), 1);
+        match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => {
+                assert!(matches!(p.mode, AggMode::Local));
+            }
+            other => panic!("expected PhysicalHashAggregate(Local), got {:?}", other),
+        }
+        assert_eq!(local_group.physical_exprs[0].children, vec![child_group]);
+    }
+
+    #[test]
+    fn agg_to_hash_agg_skips_two_phase_for_distinct() {
+        let mut memo = Memo::new();
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![col("city")],
+                aggregates: vec![AggregateCall {
+                    name: "count".into(),
+                    args: vec![col("id")],
+                    distinct: true,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        name: "city".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "count(distinct id)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    },
+                ],
+            }),
+            children: vec![child_group],
+        };
+
+        let rule = AggToHashAgg;
+        let out = rule.apply(&expr, &mut memo);
+
+        assert_eq!(out.len(), 1, "DISTINCT agg should only produce Single");
+        match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => {
+                assert!(matches!(p.mode, AggMode::Single));
+            }
+            other => panic!("expected PhysicalHashAggregate(Single), got {:?}", other),
+        }
     }
 }
