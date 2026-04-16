@@ -1,6 +1,7 @@
 pub(crate) mod catalog;
 pub(crate) mod coordinator;
 mod engine;
+pub(crate) mod hadoop_catalog;
 pub(crate) mod iceberg;
 pub(crate) mod iceberg_add_files;
 pub(crate) mod iceberg_s3_storage;

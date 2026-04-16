@@ -245,9 +245,15 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let (parse_sql, forced_explain_level) =
+            if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
+                (rewritten, Some(level))
+            } else {
+                (normalized.clone(), None)
+            };
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
-            .try_with_sql(&normalized)
+            .try_with_sql(&parse_sql)
             .map_err(|e| format!("sql parser error: {e}"))?;
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
@@ -312,11 +318,13 @@ impl StandaloneSession {
                 if let Some(cat_name) = current_catalog {
                     self.register_iceberg_tables_for_query(cat_name, current_database, query)?;
                 }
-                let level = if verbose {
-                    crate::sql::explain::ExplainLevel::Verbose
-                } else {
-                    crate::sql::explain::ExplainLevel::Normal
-                };
+                let level = forced_explain_level.unwrap_or_else(|| {
+                    if verbose {
+                        crate::sql::explain::ExplainLevel::Verbose
+                    } else {
+                        crate::sql::explain::ExplainLevel::Normal
+                    }
+                });
                 let catalog = self
                     .inner
                     .catalog
@@ -4043,6 +4051,24 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
             .collect(),
         chunks: handle.take_chunks(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// EXPLAIN COSTS helper
+// ---------------------------------------------------------------------------
+
+fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
+    let trimmed = sql.trim_start();
+    let prefix = "EXPLAIN COSTS ";
+    if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        let body = trimmed[prefix.len()..].trim_start();
+        Some((
+            format!("EXPLAIN {body}"),
+            crate::sql::explain::ExplainLevel::Costs,
+        ))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

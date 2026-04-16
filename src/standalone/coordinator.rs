@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::novarocks_logging::debug;
 use crate::data_sinks;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -21,6 +20,7 @@ use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::fragment::execute_fragment;
 use crate::lower::layout::{build_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::lower_plan;
+use crate::novarocks_logging::debug;
 use crate::partitions;
 use crate::planner;
 use crate::runtime::runtime_state::RuntimeState;
@@ -131,13 +131,20 @@ impl ExecutionCoordinator {
 
         debug!(
             "coordinator topology: fragments={} edges={} root={}",
-            fragment_results.len(), edges.len(), root_fragment_id
+            fragment_results.len(),
+            edges.len(),
+            root_fragment_id
         );
         for e in &edges {
             debug!(
                 "coordinator edge: frag {} -> frag {} (exch_node={}, kind={:?})",
-                e.source_fragment_id, e.target_fragment_id, e.target_exchange_node_id,
-                match &e.edge_kind { FragmentEdgeKind::Stream => "Stream", FragmentEdgeKind::CteMulticast { .. } => "CteMulticast" }
+                e.source_fragment_id,
+                e.target_fragment_id,
+                e.target_exchange_node_id,
+                match &e.edge_kind {
+                    FragmentEdgeKind::Stream => "Stream",
+                    FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
+                }
             );
         }
 

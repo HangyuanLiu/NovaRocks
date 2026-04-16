@@ -186,13 +186,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             }],
             ..Default::default()
         };
-        let result = tokio::task::spawn_blocking(move || {
-            internal_rpc::handle_transmit_chunk(params)
-        })
-        .await
-        .map_err(|e| {
-            tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
-        })?;
+        let result =
+            tokio::task::spawn_blocking(move || internal_rpc::handle_transmit_chunk(params))
+                .await
+                .map_err(|e| {
+                    tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
+                })?;
         if let Some(status) = result.status.as_ref() {
             if status.status_code != 0 {
                 return Err(tonic::Status::internal(status.error_msgs.join("; ")));

@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -116,6 +117,47 @@ fn wait_for_mysql(port: u16, user: &str, password: Option<&str>, child: &mut Chi
             }
         }
     }
+}
+
+fn assert_hadoop_catalog_metadata_compat(
+    warehouse: &Path,
+    namespace: &str,
+    table: &str,
+    expected_version: u32,
+) {
+    let metadata_dir = warehouse.join(namespace).join(table).join("metadata");
+    let entries = std::fs::read_dir(&metadata_dir)
+        .expect("read metadata dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    let compat_metadata = metadata_dir.join(format!("v{expected_version}.metadata.json"));
+    assert!(
+        compat_metadata.is_file(),
+        "missing Hadoop-compatible metadata file {}; entries={entries:?}",
+        compat_metadata.display()
+    );
+
+    let version_hint = metadata_dir.join("version-hint.text");
+    let hint = std::fs::read_to_string(&version_hint).expect("read version-hint.text");
+    assert_eq!(
+        hint.trim(),
+        expected_version.to_string(),
+        "unexpected version-hint content at {}",
+        version_hint.display()
+    );
+
+    // HadoopFileSystemCatalog writes only Hadoop-format files — no internal-format
+    // ({version}-{uuid}.metadata.json) files should be present.
+    let internal_files: Vec<&String> = entries
+        .iter()
+        .filter(|name| name.ends_with(".metadata.json") && !name.starts_with('v'))
+        .collect();
+    assert!(
+        internal_files.is_empty(),
+        "unexpected internal-format metadata files: {internal_files:?}"
+    );
 }
 
 #[test]
@@ -310,6 +352,97 @@ fn standalone_mysql_server_supports_minimal_iceberg_flow() {
         .query("select name from ice.db1.tbl where id = 2")
         .expect("filtered iceberg select");
     assert_eq!(filtered, vec![(Some("b".to_string()),)]);
+}
+
+#[test]
+fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
+    let warehouse = TempDir::new().expect("create iceberg warehouse");
+    let port = alloc_port();
+    let args = vec![
+        "standalone-server".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(format!(
+        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create iceberg catalog");
+    conn.query_drop("create database ice.db1")
+        .expect("create iceberg database");
+    conn.query_drop("create table ice.db1.tbl (id int, name string)")
+        .expect("create iceberg table");
+
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 1);
+
+    conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
+        .expect("insert iceberg rows");
+
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+}
+
+#[test]
+fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
+    let warehouse = TempDir::new().expect("create iceberg warehouse");
+    let port = alloc_port();
+    let args = vec![
+        "standalone-server".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    // Phase 1: Create a table and insert initial data.
+    conn.query_drop(format!(
+        r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create iceberg catalog");
+    conn.query_drop("create database ice.db1")
+        .expect("create iceberg database");
+    conn.query_drop("create table ice.db1.tbl (id int, name string)")
+        .expect("create iceberg table");
+    conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
+        .expect("insert iceberg rows");
+
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+
+    // Phase 2: Register a fresh catalog with a different name over the SAME
+    // warehouse, so the per-entry table_cache is empty. This simulates reading
+    // a table that was written by another engine (StarRocks FE / Spark) — the
+    // on-disk layout is identical (only v{N}.metadata.json + version-hint.text).
+    drop(conn);
+    let mut conn = server.connect_root(port);
+    conn.query_drop(format!(
+        r#"create external catalog ice2 properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create second iceberg catalog");
+    conn.query_drop("use ice2.db1").expect("use db");
+
+    // Verify reads work through the fresh catalog.
+    let rows: Vec<(Option<i32>, Option<String>)> =
+        conn.query("select * from tbl").expect("select hadoop rows");
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some("a".to_string())),
+            (Some(2), Some("b".to_string())),
+        ]
+    );
+
+    // Phase 3: Insert through the fresh catalog (fully-qualified name to avoid
+    // the local-catalog INSERT shortcut that register_iceberg_tables_for_query
+    // creates during SELECT).
+    conn.query_drop("insert into ice2.db1.tbl values (3, 'c')")
+        .expect("insert into hadoop-only table");
+
+    // After the insert, v3.metadata.json must exist and version-hint must be 3.
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
 }
 
 #[test]

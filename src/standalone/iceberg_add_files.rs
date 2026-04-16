@@ -7,12 +7,14 @@ use std::collections::HashMap;
 
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::fs::object_store::{ObjectStoreConfig, build_oss_operator};
 
 use super::catalog::normalize_identifier;
-use super::iceberg::{IcebergCatalogEntry, block_on_iceberg, load_table};
+use super::iceberg::{
+    IcebergCatalogEntry, block_on_iceberg, build_hadoop_catalog, load_table,
+};
 
 /// Execute ADD FILES: register parquet files from an S3 directory into an Iceberg table.
 pub(crate) fn add_files(
@@ -59,9 +61,24 @@ pub(crate) fn add_files(
 
     let count = data_files.len();
 
-    // Build a temporary MemoryCatalog for transaction commit
-    let temp_catalog =
-        build_temp_memory_catalog_for_add_files(entry, namespace, table_name, &loaded)?;
+    let catalog = build_hadoop_catalog(entry)?;
+    let ns = NamespaceIdent::new(normalize_identifier(namespace)?);
+    let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
+    let table_ident = TableIdent::from_strs([
+        normalize_identifier(namespace)?,
+        normalize_identifier(table_name)?,
+    ])
+    .map_err(|e| format!("build table ident: {e}"))?;
+    let metadata_location = loaded
+        .table
+        .metadata_location()
+        .ok_or_else(|| "no metadata location for table".to_string())?
+        .to_string();
+    let _ = block_on_iceberg(async {
+        catalog
+            .register_table(&table_ident, metadata_location)
+            .await
+    });
 
     block_on_iceberg(async {
         let tx = Transaction::new(&loaded.table);
@@ -70,7 +87,7 @@ pub(crate) fn add_files(
             .add_data_files(data_files)
             .apply(tx)
             .map_err(|e| format!("append files failed: {e}"))?;
-        tx.commit(&temp_catalog)
+        tx.commit(&catalog)
             .await
             .map_err(|e| format!("commit failed: {e}"))
     })
@@ -79,64 +96,6 @@ pub(crate) fn add_files(
 
     tracing::info!("ADD FILES: registered {count} parquet files into {namespace}.{table_name}");
     Ok(count)
-}
-
-/// Build a temporary MemoryCatalog and register the table in it for commit.
-fn build_temp_memory_catalog_for_add_files(
-    entry: &IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: &super::iceberg::IcebergLoadedTable,
-) -> Result<iceberg::memory::MemoryCatalog, String> {
-    use iceberg::io::LocalFsStorageFactory;
-    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use std::sync::Arc;
-
-    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory =
-            super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
-                .ok_or_else(|| "missing S3 properties for temp catalog".to_string())?;
-        Arc::new(s3_factory)
-    } else {
-        Arc::new(LocalFsStorageFactory)
-    };
-
-    let catalog = block_on_iceberg(
-        MemoryCatalogBuilder::default()
-            .with_storage_factory(storage_factory)
-            .load(
-                entry.name.clone(),
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    entry.warehouse_uri.clone(),
-                )]),
-            ),
-    )
-    .map_err(|e| format!("create temp catalog runtime: {e}"))?
-    .map_err(|e| format!("create temp catalog: {e}"))?;
-
-    let ns = NamespaceIdent::new(normalize_identifier(namespace)?);
-    let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
-
-    let table_ident = TableIdent::from_strs([
-        normalize_identifier(namespace)?,
-        normalize_identifier(table_name)?,
-    ])
-    .map_err(|e| format!("build table ident: {e}"))?;
-
-    let metadata_location = loaded
-        .table
-        .metadata_location()
-        .ok_or_else(|| "no metadata location for table".to_string())?
-        .to_string();
-
-    let _ = block_on_iceberg(async {
-        catalog
-            .register_table(&table_ident, metadata_location)
-            .await
-    });
-
-    Ok(catalog)
 }
 
 // ---------------------------------------------------------------------------

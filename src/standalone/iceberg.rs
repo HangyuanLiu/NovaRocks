@@ -15,7 +15,6 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{ListType, NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -25,7 +24,7 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::{
-    Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
+    Catalog, NamespaceIdent, TableCreation, TableIdent,
     writer::{IcebergWriter, IcebergWriterBuilder},
 };
 use parquet::file::properties::WriterProperties;
@@ -260,17 +259,16 @@ pub(crate) fn create_table(
         .properties(all_properties)
         .build();
 
-    // Build a temporary MemoryCatalog for table creation (writes metadata to storage)
-    let temp_catalog = build_temp_memory_catalog(entry)?;
+    let catalog = build_hadoop_catalog(entry)?;
     let _ = block_on_iceberg(async {
-        temp_catalog
+        catalog
             .create_namespace(&namespace, HashMap::new())
             .await
     });
-    block_on_iceberg(async { temp_catalog.create_table(&namespace, table_creation).await })
+    block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
-        .map(|_| ())
-        .map_err(|e| format!("create iceberg table failed: {e}"))
+        .map_err(|e| format!("create iceberg table failed: {e}"))?;
+    Ok(())
 }
 
 pub(crate) fn drop_table(
@@ -339,22 +337,20 @@ pub(crate) fn load_table(
             tbl_name
         );
 
-        // Find latest metadata JSON
+        // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
+        // which is the canonical format written by HadoopFileSystemCatalog, with fallback
+        // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
         let (metadata_file_name, metadata_bytes) = block_on_iceberg(async {
             let entries = op
                 .list(&meta_prefix)
                 .await
                 .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
-            let mut json_files: Vec<String> = entries
+            let file_names: Vec<String> = entries
                 .iter()
-                .filter(|e| e.name().ends_with(".metadata.json"))
                 .map(|e| e.name().to_string())
                 .collect();
-            json_files.sort();
-            let latest = json_files
-                .last()
-                .ok_or_else(|| format!("no metadata files for {ns_name}.{tbl_name}"))?
-                .clone();
+            let latest = choose_latest_metadata_filename(&file_names)
+                .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
             let path = format!("{meta_prefix}{latest}");
             let data = op
                 .read(&path)
@@ -470,10 +466,9 @@ pub(crate) fn insert_rows(
     let loaded = load_table(entry, namespace_name, table_name)?;
     let batch = build_insert_batch(&loaded, rows)?;
 
-    // Build a temporary MemoryCatalog for transaction commit
-    let temp_catalog = build_temp_memory_catalog(entry)?;
+    let catalog = build_hadoop_catalog(entry)?;
     let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    let _ = block_on_iceberg(async { temp_catalog.create_namespace(&ns, HashMap::new()).await });
+    let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
     let table_ident = TableIdent::from_strs([
         normalize_identifier(namespace_name)?,
         normalize_identifier(table_name)?,
@@ -485,7 +480,7 @@ pub(crate) fn insert_rows(
         .ok_or_else(|| "no metadata location for table".to_string())?
         .to_string();
     let _ = block_on_iceberg(async {
-        temp_catalog
+        catalog
             .register_table(&table_ident, metadata_location)
             .await
     });
@@ -519,7 +514,7 @@ pub(crate) fn insert_rows(
         let data_files = data_file_writer.close().await?;
         let tx = Transaction::new(&loaded.table);
         let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
-        tx.commit(&temp_catalog).await.map(|_| ())
+        tx.commit(&catalog).await
     })
     .map_err(|e| format!("insert iceberg rows runtime failed: {e}"))?
     .map_err(|e| format!("insert iceberg rows failed: {e}"))?;
@@ -569,6 +564,139 @@ pub(crate) fn extract_data_files(
     .map_err(|e| format!("extract data files runtime: {e}"))?
 }
 
+/// Result of extracting data files with column-level statistics from Iceberg manifests.
+pub(crate) struct DataFileWithStats {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+    pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+}
+
+/// Extract data file paths, sizes, row counts, and per-column statistics from
+/// Iceberg manifest entries.
+///
+/// This reads the manifest list from the current snapshot, loads each data
+/// manifest, and collects per-column stats (null counts, column sizes,
+/// lower/upper bounds) mapped to column names via the table schema.
+///
+/// If no snapshot exists the result is an empty vec.
+pub(crate) fn extract_data_files_with_stats(
+    table: &iceberg::table::Table,
+) -> Result<Vec<DataFileWithStats>, String> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    let metadata = table.metadata();
+    let snapshot = match metadata.current_snapshot() {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+
+    // Build a field-id -> column-name map from the current schema.
+    let schema = metadata.current_schema();
+    let field_id_to_name: HashMap<i32, String> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.id, f.name.clone()))
+        .collect();
+
+    let file_io = table.file_io();
+
+    block_on_iceberg(async {
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, metadata)
+            .await
+            .map_err(|e| format!("load manifest list: {e}"))?;
+
+        let mut results = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            // Only process data manifests, skip delete manifests.
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+
+            let manifest = manifest_file
+                .load_manifest(file_io)
+                .await
+                .map_err(|e| format!("load manifest: {e}"))?;
+
+            for entry in manifest.entries() {
+                // Skip deleted entries.
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+
+                let df = entry.data_file();
+
+                // Only process data files (not delete files).
+                if df.content_type() != DataContentType::Data {
+                    continue;
+                }
+
+                let path = df.file_path().to_string();
+                let size = i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX);
+                let record_count = Some(df.record_count() as i64);
+
+                // Build per-column stats.
+                let null_counts = df.null_value_counts();
+                let col_sizes = df.column_sizes();
+                let lower = df.lower_bounds();
+                let upper = df.upper_bounds();
+
+                let has_any_stats = !null_counts.is_empty()
+                    || !col_sizes.is_empty()
+                    || !lower.is_empty()
+                    || !upper.is_empty();
+
+                let column_stats = if has_any_stats {
+                    // Collect all field IDs that appear in any stats map.
+                    let mut all_ids = std::collections::HashSet::new();
+                    all_ids.extend(null_counts.keys());
+                    all_ids.extend(col_sizes.keys());
+                    all_ids.extend(lower.keys());
+                    all_ids.extend(upper.keys());
+
+                    let mut stats_map = HashMap::new();
+                    for &fid in &all_ids {
+                        if let Some(col_name) = field_id_to_name.get(&fid) {
+                            let lb = lower
+                                .get(&fid)
+                                .and_then(|d| d.to_bytes().ok())
+                                .map(|b| b.to_vec());
+                            let ub = upper
+                                .get(&fid)
+                                .and_then(|d| d.to_bytes().ok())
+                                .map(|b| b.to_vec());
+                            stats_map.insert(
+                                col_name.clone(),
+                                crate::sql::catalog::IcebergColumnStats {
+                                    null_count: null_counts.get(&fid).map(|&v| v as i64),
+                                    column_size: col_sizes.get(&fid).map(|&v| v as i64),
+                                    lower_bound: lb,
+                                    upper_bound: ub,
+                                },
+                            );
+                        }
+                    }
+                    Some(stats_map)
+                } else {
+                    None
+                };
+
+                results.push(DataFileWithStats {
+                    path,
+                    size,
+                    record_count,
+                    column_stats,
+                });
+            }
+        }
+
+        Ok(results)
+    })
+    .map_err(|e| format!("extract data files with stats runtime: {e}"))?
+}
 
 /// Register an existing Iceberg table in the catalog entry by loading it.
 /// This is used by metadata restore to ensure tables are accessible.
@@ -681,33 +809,27 @@ fn build_catalog_entry(
     Ok(entry)
 }
 
-/// Build a temporary MemoryCatalog for operations that need a Catalog impl
-/// (e.g., create_table, insert_rows transaction commit).
-fn build_temp_memory_catalog(entry: &IcebergCatalogEntry) -> Result<MemoryCatalog, String> {
+/// Build a `HadoopFileSystemCatalog` that writes metadata in the Hadoop naming
+/// convention (`v{N}.metadata.json` + `version-hint.text`).
+pub(crate) fn build_hadoop_catalog(
+    entry: &IcebergCatalogEntry,
+) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
-            &entry.properties,
-        )
-        .ok_or_else(|| {
-            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
+        let s3_factory =
+            super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+                .ok_or_else(|| {
+                    "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                        .to_string()
+                })?;
         Arc::new(s3_factory)
     } else {
-        Arc::new(LocalFsStorageFactory)
+        Arc::new(iceberg::io::LocalFsStorageFactory)
     };
-
-    let warehouse_uri = entry.warehouse_uri.clone();
-    block_on_iceberg(
-        MemoryCatalogBuilder::default()
-            .with_storage_factory(storage_factory)
-            .load(
-                entry.name.clone(),
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_uri)]),
-            ),
-    )
-    .map_err(|e| format!("create temp memory catalog runtime: {e}"))?
-    .map_err(|e| format!("create temp memory catalog: {e}"))
+    let file_io = iceberg::io::FileIOBuilder::new(storage_factory).build();
+    Ok(super::hadoop_catalog::HadoopFileSystemCatalog::new(
+        file_io,
+        entry.warehouse_uri.clone(),
+    ))
 }
 
 pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
@@ -742,7 +864,7 @@ fn latest_table_metadata_location_local(
         .join(normalize_identifier(namespace_name)?)
         .join(normalize_identifier(table_name)?)
         .join("metadata");
-    let mut candidates = std::fs::read_dir(&metadata_dir)
+    let file_names: Vec<String> = std::fs::read_dir(&metadata_dir)
         .map_err(|e| {
             format!(
                 "read iceberg metadata dir {} failed: {e}",
@@ -750,21 +872,66 @@ fn latest_table_metadata_location_local(
             )
         })?
         .filter_map(|item| item.ok())
-        .map(|item| item.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".metadata.json"))
+        .filter_map(|item| {
+            item.file_name()
+                .to_str()
+                .filter(|name| name.ends_with(".metadata.json"))
+                .map(|name| name.to_string())
         })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    let latest = candidates.last().ok_or_else(|| {
+        .collect();
+    let latest = choose_latest_metadata_filename(&file_names).map_err(|_| {
         format!(
             "no iceberg metadata files found under {}",
             metadata_dir.display()
         )
     })?;
-    Ok(path_to_file_uri(latest))
+    Ok(path_to_file_uri(&metadata_dir.join(latest)))
+}
+
+fn parse_internal_metadata_version(file_name: &str) -> Option<i32> {
+    let base = file_name.strip_suffix(".metadata.json")?;
+    let (version, uuid) = base.split_once('-')?;
+    if uuid.is_empty() {
+        return None;
+    }
+    version.parse::<i32>().ok()
+}
+
+fn parse_hadoop_metadata_version(file_name: &str) -> Option<i32> {
+    let base = file_name.strip_suffix(".metadata.json")?;
+    let version_str = base.strip_prefix('v')?;
+    // Must be purely numeric (no dash, no UUID suffix) to distinguish from internal format.
+    if version_str.contains('-') {
+        return None;
+    }
+    version_str.parse::<i32>().ok()
+}
+
+/// Choose the latest metadata file from a list of file names found in the
+/// metadata directory. Prefers Hadoop-catalog format (`v{N}.metadata.json`)
+/// which is the canonical format written by `HadoopFileSystemCatalog`. Falls
+/// back to the internal format (`{version}-{uuid}.metadata.json`) for
+/// pre-migration tables.
+fn choose_latest_metadata_filename(file_names: &[String]) -> Result<String, String> {
+    // Prefer Hadoop-catalog format — canonical format written by HadoopFileSystemCatalog
+    let mut hadoop: Vec<(i32, &str)> = file_names
+        .iter()
+        .filter_map(|name| parse_hadoop_metadata_version(name).map(|v| (v, name.as_str())))
+        .collect();
+    if !hadoop.is_empty() {
+        hadoop.sort_by_key(|(v, _)| *v);
+        return Ok(hadoop.last().unwrap().1.to_string());
+    }
+    // Fallback: internal format for pre-migration tables
+    let mut internal: Vec<(i32, &str)> = file_names
+        .iter()
+        .filter_map(|name| parse_internal_metadata_version(name).map(|v| (v, name.as_str())))
+        .collect();
+    if !internal.is_empty() {
+        internal.sort_by_key(|(v, _)| *v);
+        return Ok(internal.last().unwrap().1.to_string());
+    }
+    Err("no iceberg metadata files found".to_string())
 }
 
 fn path_to_file_uri(path: &Path) -> String {

@@ -35,6 +35,7 @@ use crate::version;
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
     QueryResult, QueryResultColumn, StandaloneNovaRocks, StandaloneOptions, StatementResult,
+    build_string_query_result,
 };
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -1272,7 +1273,10 @@ mod tests {
         assert_eq!(parse_set_query_timeout("SELECT 1"), None);
         assert_eq!(parse_set_query_timeout("SET query_timeout = abc"), None);
         assert_eq!(parse_set_query_timeout("SET query_timeout"), None);
-        assert_eq!(parse_set_query_timeout("SET query_timeout = 60 extra"), None);
+        assert_eq!(
+            parse_set_query_timeout("SET query_timeout = 60 extra"),
+            None
+        );
     }
 
     #[test]
