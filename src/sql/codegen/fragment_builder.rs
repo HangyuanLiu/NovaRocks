@@ -867,6 +867,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             agg_tuple_id,
             grouping_exprs,
             aggregate_functions,
+            true,
         );
 
         // Pre-order: agg first, then child nodes
@@ -2127,6 +2128,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             agg_tuple_id,
             grouping_exprs,
             vec![],
+            true,
         );
 
         let mut plan_nodes = vec![agg_plan_node];

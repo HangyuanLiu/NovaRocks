@@ -253,6 +253,7 @@ pub(crate) fn build_aggregation_node(
     intermediate_tuple_id: i32,
     grouping_exprs: Vec<exprs::TExpr>,
     aggregate_functions: Vec<exprs::TExpr>,
+    need_finalize: bool,
 ) -> plan_nodes::TPlanNode {
     let mut node = default_plan_node();
     node.node_id = node_id;
@@ -272,7 +273,7 @@ pub(crate) fn build_aggregation_node(
         aggregate_functions,
         intermediate_tuple_id,
         output_tuple_id,
-        need_finalize: true,
+        need_finalize,
         use_streaming_preaggregation: None,
         has_outer_join_child: None,
         streaming_preaggregation_mode: None,
