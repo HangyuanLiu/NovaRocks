@@ -18,12 +18,11 @@ use crate::plan_nodes;
 
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
-    PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDistributionOp,
-    PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
-    PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp,
-    PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalSubqueryAliasOp,
-    PhysicalTopNOp,
-    PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+    PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
+    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
+    PhysicalSubqueryAliasOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::catalog::CatalogProvider;
@@ -798,7 +797,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut agg_scope = ExprScope::new();
         let mut grouping_exprs = Vec::new();
 
-        // Compile GROUP BY expressions
+        // Compile GROUP BY expressions (same for all modes — the child scope
+        // has the correct columns for both scan-level and Local-output contexts).
         for (idx, gb_expr) in op.group_by.iter().enumerate() {
             let mut compiler = ExprCompiler::new(&child.scope);
             let texpr = compiler.compile_typed(gb_expr)?;
@@ -821,8 +821,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             };
             agg_scope.add_column(None, name, binding.clone());
-            // Also register with qualifier for post-aggregate qualified refs.
-            // Use add_qualified_alias to avoid inflating iter_columns.
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
@@ -833,13 +831,37 @@ impl<'a> PlanFragmentBuilder<'a> {
             grouping_exprs.push(texpr);
         }
 
-        // Compile aggregate function expressions
+        // Compile aggregate function expressions — mode-dependent.
         let agg_start_col = op.group_by.len();
         let mut aggregate_functions = Vec::new();
+        let is_global = matches!(op.mode, AggMode::Global);
 
         for (idx, agg_call) in op.aggregates.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(&child.scope);
-            let texpr = compiler.compile_aggregate_call_typed(agg_call)?;
+            let texpr = if is_global {
+                // Global (merge) phase: the child scope contains the Local's
+                // output.  Each intermediate aggregate column sits at position
+                // group_by.len() + idx in the child scope's ordered columns.
+                let child_columns: Vec<_> = child.scope.iter_columns().collect();
+                let child_col_idx = agg_start_col + idx;
+                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
+                    format!(
+                        "Global agg: child scope missing intermediate column at index {}",
+                        child_col_idx
+                    )
+                })?;
+                let mut compiler = ExprCompiler::new(&child.scope);
+                compiler.compile_merge_aggregate_call(
+                    agg_call,
+                    binding.slot_id,
+                    binding.tuple_id,
+                    &binding.data_type,
+                )?
+            } else {
+                // Single or Local: compile against child scope normally.
+                let mut compiler = ExprCompiler::new(&child.scope);
+                compiler.compile_aggregate_call_typed(agg_call)?
+            };
+
             let data_type = agg_call.result_type.clone();
             let nullable = true;
             let name = agg_call_display_name(agg_call);
@@ -860,6 +882,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             aggregate_functions.push(texpr);
         }
 
+        let need_finalize = !matches!(op.mode, AggMode::Local);
+
         self.desc_builder.add_tuple(agg_tuple_id);
         let agg_plan_node = nodes::build_aggregation_node(
             agg_node_id,
@@ -867,7 +891,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             agg_tuple_id,
             grouping_exprs,
             aggregate_functions,
-            true,
+            need_finalize,
         );
 
         // Pre-order: agg first, then child nodes
