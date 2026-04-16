@@ -154,6 +154,115 @@ impl<'a> ExprCompiler<'a> {
         Ok(exprs::TExpr::new(std::mem::take(&mut self.nodes)))
     }
 
+    /// Compile a merge-phase aggregate call for two-phase distributed aggregation.
+    ///
+    /// Instead of compiling the original args, this generates a single SlotRef
+    /// child pointing to the intermediate column from the Local phase's output.
+    /// The root node has `is_merge_agg: true` so the execution layer calls
+    /// merge+finalize instead of update+serialize.
+    pub fn compile_merge_aggregate_call(
+        &mut self,
+        agg_call: &AggregateCall,
+        input_slot_id: i32,
+        input_tuple_id: i32,
+        input_type: &DataType,
+    ) -> Result<exprs::TExpr, String> {
+        self.nodes.clear();
+
+        let is_distinct = agg_call.distinct;
+        let effective_name = if is_distinct {
+            match agg_call.name.as_str() {
+                "count" => "multi_distinct_count".to_string(),
+                "sum" => "multi_distinct_sum".to_string(),
+                _ => agg_call.name.clone(),
+            }
+        } else {
+            agg_call.name.clone()
+        };
+
+        let parent_idx = self.nodes.len();
+        self.nodes.push(default_expr_node()); // placeholder
+
+        // Single child: SlotRef to the intermediate column from Local phase.
+        let input_type_desc = arrow_type_to_type_desc(input_type)?;
+        self.nodes
+            .push(slot_ref_node(input_slot_id, input_tuple_id, input_type_desc));
+
+        let arg_types = if agg_call.args.is_empty() {
+            // count(*): no original args, but merge needs the intermediate type
+            vec![input_type.clone()]
+        } else {
+            agg_call.args.iter().map(|a| a.data_type.clone()).collect()
+        };
+
+        let return_type = agg_call.result_type.clone();
+        let type_desc = arrow_type_to_type_desc(&return_type)?;
+
+        let (_, intermediate_type) =
+            infer_agg_function_types(&effective_name, &arg_types, is_distinct)?;
+        let intermediate_type_desc = match &intermediate_type {
+            Some(it) => arrow_type_to_type_desc(it)?,
+            None => types::TTypeDesc { types: None },
+        };
+
+        let fn_arg_types: Vec<types::TTypeDesc> = arg_types
+            .iter()
+            .map(|t| arrow_type_to_type_desc(t))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.nodes[parent_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: type_desc.clone(),
+            num_children: 1, // single SlotRef child
+            agg_expr: Some(exprs::TAggregateExpr {
+                is_merge_agg: true,
+            }),
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: effective_name,
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: fn_arg_types,
+                ret_type: type_desc,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: Some(types::TAggregateFunction {
+                    intermediate_type: intermediate_type_desc,
+                    update_fn_symbol: None,
+                    init_fn_symbol: None,
+                    serialize_fn_symbol: None,
+                    merge_fn_symbol: None,
+                    finalize_fn_symbol: None,
+                    get_value_fn_symbol: None,
+                    remove_fn_symbol: None,
+                    is_analytic_only_fn: None,
+                    symbol: None,
+                    is_asc_order: None,
+                    nulls_first: None,
+                    is_distinct: if is_distinct { Some(true) } else { None },
+                }),
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: None,
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..default_expr_node()
+        };
+        self.last_type = return_type;
+        self.last_nullable = true;
+        Ok(exprs::TExpr::new(std::mem::take(&mut self.nodes)))
+    }
+
     /// Compile an expression, inserting a CAST wrapper if its type differs from the target.
     fn compile_with_cast_if_needed(
         &mut self,
