@@ -1095,11 +1095,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalTopNOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // FINAL+split materializes the merging exchange at fragment-build time:
-        // close the partial fragment (PARTIAL TopN at its root emitted a SORT_NODE),
-        // then start a new coordinator fragment whose root is a merging EXCHANGE_NODE
-        // carrying sort_info + offset + limit (the receive side does the k-way merge
-        // and applies offset/limit — no separate final SORT_NODE needed).
         let parent_fragment_id = self.current_fragment_id()?;
         let child_fragment_id = self.alloc_fragment_id();
         self.fragment_stack.push(child_fragment_id);
@@ -1119,7 +1114,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             .and_then(|n| n.sort_node.as_ref())
             .map(|s| s.sort_info.clone())
             .ok_or_else(|| {
-                "FINAL+split TopN: expected PARTIAL child's root to be SORT_NODE".to_string()
+                let got = child_plan_nodes
+                    .first()
+                    .map(|n| format!("{:?}", n.node_type))
+                    .unwrap_or_else(|| "<empty>".to_string());
+                format!(
+                    "FINAL+split TopN (node_id={}): expected PARTIAL child's root to be SORT_NODE, got {}",
+                    child_plan_nodes
+                        .first()
+                        .map(|n| n.node_id)
+                        .unwrap_or(-1),
+                    got
+                )
             })?;
 
         // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
