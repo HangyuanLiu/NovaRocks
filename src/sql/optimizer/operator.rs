@@ -215,6 +215,11 @@ pub(crate) struct PhysicalHashAggregateOp {
     pub group_by: Vec<TypedExpr>,
     pub aggregates: Vec<AggregateCall>,
     pub output_columns: Vec<OutputColumn>,
+    /// Per-aggregate merge flag. `true` → this phase applies the aggregate's
+    /// merge function over an intermediate state slot from the child; `false`
+    /// → this phase applies the update function over raw args from the child
+    /// scope. Length must equal `aggregates.len()`.
+    pub is_merge: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]

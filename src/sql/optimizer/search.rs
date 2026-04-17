@@ -849,6 +849,7 @@ mod tests {
             group_by: vec![col_ref],
             aggregates: vec![],
             output_columns: vec![],
+            is_merge: vec![],
         });
         let props = output_properties(&op);
         match &props.distribution {

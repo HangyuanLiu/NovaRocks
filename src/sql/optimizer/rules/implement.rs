@@ -652,6 +652,7 @@ impl Rule for AggToHashAgg {
                 group_by: op.group_by.clone(),
                 aggregates: op.aggregates.clone(),
                 output_columns: op.output_columns.clone(),
+                is_merge: vec![false; op.aggregates.len()],
             }),
             children: expr.children.clone(),
         };
@@ -671,6 +672,7 @@ impl Rule for AggToHashAgg {
                 group_by: op.group_by.clone(),
                 aggregates: op.aggregates.clone(),
                 output_columns: op.output_columns.clone(),
+                is_merge: vec![false; op.aggregates.len()],
             }),
             children: expr.children.clone(),
         };
@@ -682,6 +684,7 @@ impl Rule for AggToHashAgg {
                 group_by: op.group_by.clone(),
                 aggregates: op.aggregates.clone(),
                 output_columns: op.output_columns.clone(),
+                is_merge: vec![true; op.aggregates.len()],
             }),
             children: vec![local_group_id],
         };

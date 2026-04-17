@@ -245,12 +245,14 @@ mod tests {
             group_by: vec![],
             aggregates: vec![],
             output_columns: vec![],
+            is_merge: vec![],
         });
         let local = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
             group_by: vec![],
             aggregates: vec![],
             output_columns: vec![],
+            is_merge: vec![],
         });
 
         let cs = [&input];

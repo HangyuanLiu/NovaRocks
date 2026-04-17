@@ -834,10 +834,17 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Compile aggregate function expressions — mode-dependent.
         let agg_start_col = op.group_by.len();
         let mut aggregate_functions = Vec::new();
-        let is_global = matches!(op.mode, AggMode::Global);
+
+        if op.is_merge.len() != op.aggregates.len() {
+            return Err(format!(
+                "PhysicalHashAggregate: is_merge length {} != aggregates length {}",
+                op.is_merge.len(),
+                op.aggregates.len()
+            ));
+        }
 
         for (idx, agg_call) in op.aggregates.iter().enumerate() {
-            let texpr = if is_global {
+            let texpr = if op.is_merge[idx] {
                 // Global (merge) phase: the child scope contains the Local's
                 // output.  Each intermediate aggregate column sits at position
                 // group_by.len() + idx in the child scope's ordered columns.
@@ -882,7 +889,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             aggregate_functions.push(texpr);
         }
 
-        let need_finalize = !matches!(op.mode, AggMode::Local);
+        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
 
         self.desc_builder.add_tuple(agg_tuple_id);
         let agg_plan_node = nodes::build_aggregation_node(
