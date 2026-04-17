@@ -143,18 +143,27 @@ fn apply_three_phase(
 
     // GLOBAL: group_by = original g; aggregates = [count(x) update, then each
     // non_distinct merged].
-    let count_x = AggregateCall {
-        name: "count".into(),
-        args: vec![distinct_col.clone()],
-        distinct: false,
-        result_type: arrow::datatypes::DataType::Int64,
-        order_by: vec![],
-    };
+    //
+    // Preserve the original distinct aggregate call (first one from agg.aggregates)
+    // so that agg_call_display_name matches what the PROJECT node expects.
+    // (e.g. "count(distinct x)" not "count(x)").
+    let first_distinct = agg
+        .aggregates
+        .iter()
+        .find(|c| c.distinct)
+        .cloned()
+        .unwrap_or_else(|| AggregateCall {
+            name: "count".into(),
+            args: vec![distinct_col.clone()],
+            distinct: true,
+            result_type: arrow::datatypes::DataType::Int64,
+            order_by: vec![],
+        });
     let mut global_aggs = Vec::with_capacity(1 + non_distinct.len());
-    global_aggs.push(count_x);
+    global_aggs.push(first_distinct);
     global_aggs.extend(non_distinct.iter().cloned());
     let mut global_merge = Vec::with_capacity(1 + non_distinct.len());
-    global_merge.push(false); // count(x) is an update in the GLOBAL phase
+    global_merge.push(false); // distinct agg is an update in the GLOBAL phase
     global_merge.extend(std::iter::repeat(true).take(non_distinct.len()));
 
     vec![NewExpr {
@@ -207,17 +216,25 @@ fn apply_four_phase(
     let dg_group = memo.new_group(dg);
 
     // Build the phase-boundary aggregate list shared by DISTINCT_LOCAL and GLOBAL:
-    // [count(x) first, then each non_distinct]. Fragment builder applies per-call
-    // is_merge dispatch from op.is_merge.
-    let count_x = AggregateCall {
-        name: "count".into(),
-        args: vec![distinct_col.clone()],
-        distinct: false,
-        result_type: arrow::datatypes::DataType::Int64,
-        order_by: vec![],
-    };
+    // [first_distinct_agg first, then each non_distinct]. Fragment builder applies
+    // per-call is_merge dispatch from op.is_merge.
+    //
+    // Use the original distinct aggregate call so that agg_call_display_name
+    // (e.g. "count(distinct x)") matches what the PROJECT node expects.
+    let first_distinct = agg
+        .aggregates
+        .iter()
+        .find(|c| c.distinct)
+        .cloned()
+        .unwrap_or_else(|| AggregateCall {
+            name: "count".into(),
+            args: vec![distinct_col.clone()],
+            distinct: true,
+            result_type: arrow::datatypes::DataType::Int64,
+            order_by: vec![],
+        });
     let mut phase_aggs = Vec::with_capacity(1 + non_distinct.len());
-    phase_aggs.push(count_x);
+    phase_aggs.push(first_distinct);
     phase_aggs.extend(non_distinct.iter().cloned());
 
     // DISTINCT_LOCAL: scalar; [count(x) update, non_distinct merge...].
@@ -427,7 +444,7 @@ mod tests {
         let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
         assert_eq!(out.len(), 1, "expected one multi-phase alternative");
 
-        // Top: GLOBAL, group_by=[g], aggregates[0] = count(x), aggregates[1] = sum(a) (merge)
+        // Top: GLOBAL, group_by=[g], aggregates[0] = count(distinct x), aggregates[1] = sum(a) (merge)
         let top = match &out[0].op {
             Operator::PhysicalHashAggregate(p) => p,
             other => panic!("expected GLOBAL PhysicalHashAggregate, got {:?}", other),
@@ -436,7 +453,8 @@ mod tests {
         assert_eq!(top.group_by.len(), 1, "GLOBAL group_by is just [g]");
         assert_eq!(top.aggregates.len(), 2);
         assert_eq!(top.aggregates[0].name, "count");
-        assert!(!top.aggregates[0].distinct);
+        // distinct=true is preserved so the display name matches what PROJECT looks up.
+        assert!(top.aggregates[0].distinct);
         assert_eq!(top.is_merge, vec![false, true]);
 
         // Follow chain: GLOBAL -> DISTINCT_GLOBAL -> LOCAL -> scan

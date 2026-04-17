@@ -273,3 +273,32 @@ Single phase; work is well-bounded (one new rule file, operator.rs enum extensio
 6. Register rule + validation (TPC-DS 99/99 + hand-crafted 3-phase case + EXPLAIN diff).
 
 Total expected diff: ~600-800 LOC across 4-5 files. No backend changes.
+
+---
+
+## 8. Landing Note (2026-04-17)
+
+Implementation completed on 2026-04-17. Key deviations from the plan above:
+
+### 8.1 Rule registration
+
+`SplitDistinctAgg` was registered in `all_implementation_rules()` (not `all_transformation_rules()`) in `src/sql/optimizer/rules/mod.rs`, matching the pattern for `AggToHashAgg`. This is correct: the rule emits `Physical*` alternatives and must fire during the implementation phase of Cascades search.
+
+### 8.2 `distinct` flag on GLOBAL phase aggregate call
+
+The spec (§3.4) says each `PhysicalHashAggregate` carries `distinct=false` calls at the physical level. In practice the implementation keeps `distinct=true` on the GLOBAL phase's first aggregate (e.g., `count(distinct x)`) so that `agg_call_display_name()` produces `"count(distinct x)"` — the key that the PROJECT node above GLOBAL resolves when compiling its output expressions. Using `distinct=false` in that slot would generate key `"count(x)"` and cause a scope-lookup miss during codegen.
+
+This is an artefact of how `ExprScope` resolves aggregate output columns by display name: the scope key registered in `visit_hash_aggregate` is `agg_call_display_name(agg_call)` which includes the `distinct` qualifier when `call.distinct == true`. The PROJECT's `compile_typed_inner` for an `AggregateCall` expression does the same lookup. The rule's `apply_three_phase` and `apply_four_phase` therefore clone the original `first_distinct` aggregate call (with `distinct=true`) as the first element of the GLOBAL phase's `aggregates` vector, ensuring the key matches.
+
+### 8.3 Fragment builder — unchanged
+
+No changes were required to `fragment_builder.rs`. The existing `visit_hash_aggregate` implementation already handles `DistinctGlobal` and `DistinctLocal` modes correctly because those modes were implemented in earlier commits (commits `64d2df8` and `6fafad7`).
+
+### 8.4 Validation results
+
+- **TPC-DS 99/99 pass** confirmed after registering the rule. Pre-registration, q16/q28/q94/q95 failed with "column not found" due to the `distinct=false` bug described in §8.2; post-fix all 99 queries pass.
+- **Aggregate suite**: `distinct_group_by_multi_phase` case added (`sql-tests/aggregate/sql/distinct_group_by_multi_phase.sql`), 1/1 pass.
+- **EXPLAIN diff (q16, baseline = standalone-merge-topn):**
+  - Before: `HASH AGGREGATE (SINGLE)` over the full join.
+  - After: `HASH AGGREGATE (LOCAL) → HASH AGGREGATE (DISTINCT_GLOBAL) → HASH AGGREGATE (DISTINCT_LOCAL) → HASH AGGREGATE (GLOBAL)` — the 4-phase chain as specified.
+  - All other 95 queries: plan unchanged (no DISTINCT aggregation, rule does not fire).
