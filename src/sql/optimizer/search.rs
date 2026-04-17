@@ -492,6 +492,12 @@ pub(super) fn required_input_properties(
                     }]
                 }
             }
+            // Task 6 will assign the proper distribution contracts for DISTINCT
+            // multi-phase aggregation; for now route to Any so the planner can
+            // construct the operators without crashing.
+            AggMode::DistinctGlobal | AggMode::DistinctLocal => {
+                vec![PhysicalPropertySet::any()]
+            }
         },
 
         // Sort: child must be Gather.

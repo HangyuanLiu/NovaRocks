@@ -22,11 +22,19 @@ pub(crate) enum JoinDistribution {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggMode {
     Single,
     Local,
     Global,
+    /// Dedup by distinct-column + merge non-DISTINCT aggregate states across
+    /// instances. Used as the shuffle-receive phase of 3- and 4-phase DISTINCT
+    /// aggregation.
+    DistinctGlobal,
+    /// Per-instance scalar rollup of DISTINCT_GLOBAL output — emits
+    /// `count(x)` (update) for each DISTINCT call and merges threaded
+    /// non-DISTINCT states. Only used in 4-phase (scalar DISTINCT).
+    DistinctLocal,
 }
 
 #[allow(dead_code)]
