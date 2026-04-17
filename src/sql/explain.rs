@@ -356,7 +356,6 @@ fn format_physical_node(
                 AggMode::Single => "SINGLE",
                 AggMode::Local => "LOCAL",
                 AggMode::Global => "GLOBAL",
-                // Task 2 will refine the display label for DISTINCT multi-phase agg.
                 AggMode::DistinctGlobal => "DISTINCT_GLOBAL",
                 AggMode::DistinctLocal => "DISTINCT_LOCAL",
             };

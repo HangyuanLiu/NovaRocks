@@ -255,8 +255,14 @@ fn apply_four_phase(
     };
     let dl_group = memo.new_group(dl);
 
-    // GLOBAL: scalar; aggregates all MERGES (count's merge adds partial counts;
-    // non_distinct's merge merges intermediate states across instances).
+    // GLOBAL: scalar; aggregates all MERGES.
+    //
+    // Correctness note: when the preserved distinct aggregate is count(distinct x),
+    // the physical expression becomes multi_distinct_count with is_merge_agg=true,
+    // which merges bitmap states across DISTINCT_LOCAL instances. This is correct
+    // because DISTINCT_GLOBAL partitions data by x, guaranteeing each DISTINCT_LOCAL
+    // instance sees a disjoint subset of distinct x values. Bitmap union over
+    // disjoint sets is equivalent to sum of partial counts.
     let global_merge = vec![true; 1 + non_distinct.len()];
 
     vec![NewExpr {

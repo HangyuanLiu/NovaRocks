@@ -113,9 +113,10 @@ pub(crate) fn compute_cost(
                 AggMode::Single => input_size,
                 AggMode::Local => input_size * 0.5,
                 AggMode::Global => input_size * 0.3,
-                // Task 2 will refine cost estimates for DISTINCT multi-phase agg.
-                // For now use the same factor as Global so the optimizer can
-                // produce a finite cost and compare alternatives.
+                // DISTINCT multi-phase agg phases use the same reduction factor
+                // as Global. This is a rough approximation — DistinctGlobal
+                // typically processes more rows than Global (it groups by g+x,
+                // not just g), so this may underestimate its cost.
                 AggMode::DistinctGlobal | AggMode::DistinctLocal => input_size * 0.3,
             }
         }
