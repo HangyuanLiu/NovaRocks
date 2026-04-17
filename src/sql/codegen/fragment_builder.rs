@@ -996,6 +996,26 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalTopNOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
+        use crate::sql::optimizer::operator::TopNPhase;
+        match (op.phase, op.is_split) {
+            // Single-stage (today's behavior) and PARTIAL both emit a single
+            // SORT_NODE and return. PARTIAL's output is consumed by the
+            // FINAL+split visitor without a fragment boundary.
+            (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
+                self.visit_physical_top_n_single_or_partial(op, node)
+            }
+            // FINAL+split: will add fragment boundary + merging EXCHANGE_NODE
+            // in Task 6. Until then, forward to the single/partial path so
+            // behavior is byte-identical to the pre-refactor function.
+            (TopNPhase::Final, true) => self.visit_physical_top_n_final_split(op, node),
+        }
+    }
+
+    fn visit_physical_top_n_single_or_partial(
+        &mut self,
+        op: &PhysicalTopNOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
         let child = self.visit(&node.children[0])?;
 
         let sort_node_id = self.alloc_node();
@@ -1056,7 +1076,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             per_pipeline: None,
         });
 
-        // Pre-order: top-n first, then child
         let mut plan_nodes = vec![sort_plan_node];
         plan_nodes.extend(child.plan_nodes);
 
@@ -1066,6 +1085,22 @@ impl<'a> PlanFragmentBuilder<'a> {
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
         })
+    }
+
+    /// TODO(Task 6): replace with real FINAL+split materialization that emits
+    /// a merging EXCHANGE_NODE (sort_info + offset + limit) in the coordinator
+    /// fragment and a DataStreamSink in the partial fragment.
+    fn visit_physical_top_n_final_split(
+        &mut self,
+        op: &PhysicalTopNOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        // Temporary fallback — emit the same shape as single-stage TopN so
+        // behavior stays byte-identical to the pre-refactor function. This
+        // preserves today's semantics (two stacked SORT_NODEs per original
+        // TopN alternative cost search picks) without introducing the real
+        // merging-exchange materialization yet.
+        self.visit_physical_top_n_single_or_partial(op, node)
     }
 
     // -------------------------------------------------------------------
