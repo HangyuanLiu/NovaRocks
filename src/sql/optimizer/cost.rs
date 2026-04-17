@@ -314,6 +314,8 @@ mod tests {
             items: vec![],
             limit: Some(100),
             offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
         });
         let cost_sort = compute_cost(&sort, &input, &[]);
         let cost_top_n = compute_cost(&top_n, &own, &[&input]);
@@ -334,6 +336,8 @@ mod tests {
             items: vec![],
             limit: Some(10_000),
             offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
         });
         let cost_sort = compute_cost(&sort, &input, &[]);
         let cost_top_n = compute_cost(&top_n, &own, &[&input]);
@@ -349,6 +353,8 @@ mod tests {
             items: vec![],
             limit: Some(50),
             offset: Some(50),
+            phase: TopNPhase::Final,
+            is_split: false,
         });
         let cost = compute_cost(&top_n, &own, &[&input]);
         // input_rows=10_000, k=100, cost = 10_000 * log2(100) ≈ 66_438.56

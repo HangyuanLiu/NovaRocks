@@ -58,6 +58,8 @@ impl Rule for SortLimitToTopN {
                     items: sort_op.items.clone(),
                     limit: limit_op.limit,
                     offset: limit_op.offset,
+                    phase: crate::sql::optimizer::operator::TopNPhase::Final,
+                    is_split: false,
                 }),
                 children: vec![grandchild_group_id],
             });

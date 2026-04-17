@@ -29,6 +29,19 @@ pub(crate) enum AggMode {
     Global,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopNPhase {
+    Partial,
+    Final,
+}
+
+impl Default for TopNPhase {
+    fn default() -> Self {
+        TopNPhase::Final
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logical operator structs
 // ---------------------------------------------------------------------------
@@ -82,6 +95,8 @@ pub(crate) struct LogicalTopNOp {
     pub items: Vec<SortItem>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub phase: TopNPhase,
+    pub is_split: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +225,8 @@ pub(crate) struct PhysicalTopNOp {
     pub items: Vec<SortItem>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub phase: TopNPhase,
+    pub is_split: bool,
 }
 
 #[derive(Clone, Debug)]

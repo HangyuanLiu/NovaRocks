@@ -795,6 +795,8 @@ impl Rule for TopNToPhysical {
                 items: op.items.clone(),
                 limit: op.limit,
                 offset: op.offset,
+                phase: op.phase,
+                is_split: op.is_split,
             }),
             children: expr.children.clone(),
         }]
@@ -1171,7 +1173,7 @@ impl Rule for SubqueryAliasToPhysical {
 mod top_n_tests {
     use super::*;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::LogicalTopNOp;
+    use crate::sql::optimizer::operator::{LogicalTopNOp, TopNPhase};
 
     #[test]
     fn top_n_to_physical_produces_physical_top_n() {
@@ -1192,6 +1194,8 @@ mod top_n_tests {
                 items: vec![],
                 limit: Some(50),
                 offset: Some(10),
+                phase: TopNPhase::Final,
+                is_split: false,
             }),
             children: vec![dummy_child],
         };

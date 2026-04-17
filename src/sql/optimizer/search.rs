@@ -960,7 +960,7 @@ mod tests {
 #[cfg(test)]
 mod top_n_property_tests {
     use super::*;
-    use crate::sql::optimizer::operator::PhysicalTopNOp;
+    use crate::sql::optimizer::operator::{PhysicalTopNOp, TopNPhase};
 
     #[test]
     fn top_n_output_is_gather_when_sort_keys_resolve() {
@@ -968,6 +968,8 @@ mod top_n_property_tests {
             items: vec![],
             limit: Some(100),
             offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
         });
         let out = output_properties(&op);
         // With no sort keys, ordering is Any but distribution should still be Gather
@@ -981,6 +983,8 @@ mod top_n_property_tests {
             items: vec![],
             limit: Some(100),
             offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
         });
         let req = required_input_properties(&op, &PhysicalPropertySet::gather(), 1);
         assert_eq!(req.len(), 1);
