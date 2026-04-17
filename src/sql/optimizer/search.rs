@@ -369,8 +369,8 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                 OrderingSpec::Required(sort_keys)
             };
             let distribution = match t.phase {
-                crate::sql::optimizer::operator::TopNPhase::Partial => DistributionSpec::Any,
-                crate::sql::optimizer::operator::TopNPhase::Final => DistributionSpec::Gather,
+                TopNPhase::Partial => DistributionSpec::Any,
+                TopNPhase::Final => DistributionSpec::Gather,
             };
             PhysicalPropertySet { distribution, ordering }
         }
@@ -504,7 +504,6 @@ pub(super) fn required_input_properties(
         //     enforcer between FINAL(split) and PARTIAL.
         //   - Final + !split (single-stage, today's behavior): child must be Gather.
         Operator::PhysicalTopN(t) => {
-            use crate::sql::optimizer::operator::TopNPhase;
             let req = match (t.phase, t.is_split) {
                 (TopNPhase::Partial, _) => PhysicalPropertySet::any(),
                 (TopNPhase::Final, true) => PhysicalPropertySet::any(),
