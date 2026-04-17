@@ -835,13 +835,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         let agg_start_col = op.group_by.len();
         let mut aggregate_functions = Vec::new();
 
-        if op.is_merge.len() != op.aggregates.len() {
-            return Err(format!(
-                "PhysicalHashAggregate: is_merge length {} != aggregates length {}",
-                op.is_merge.len(),
-                op.aggregates.len()
-            ));
-        }
+        debug_assert_eq!(
+            op.is_merge.len(),
+            op.aggregates.len(),
+            "PhysicalHashAggregate (node_id={}): is_merge.len() = {}, aggregates.len() = {}",
+            agg_node_id,
+            op.is_merge.len(),
+            op.aggregates.len(),
+        );
 
         for (idx, agg_call) in op.aggregates.iter().enumerate() {
             let texpr = if op.is_merge[idx] {
