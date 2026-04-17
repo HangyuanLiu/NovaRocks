@@ -10,7 +10,7 @@
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::planner::plan::AggregateCall;
 
@@ -101,14 +101,72 @@ fn typed_exprs_structurally_equal(a: &TypedExpr, b: &TypedExpr) -> bool {
 }
 
 fn apply_three_phase(
-    _expr: &MExpr,
-    _memo: &mut Memo,
-    _agg: &LogicalAggregateOp,
-    _distinct_col: &TypedExpr,
-    _non_distinct: &[AggregateCall],
+    expr: &MExpr,
+    memo: &mut Memo,
+    agg: &LogicalAggregateOp,
+    distinct_col: &TypedExpr,
+    non_distinct: &[AggregateCall],
 ) -> Vec<NewExpr> {
-    // Implemented in Task 4.
-    vec![]
+    // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by + distinct_col.
+    let mut gb_with_distinct = agg.group_by.clone();
+    gb_with_distinct.push(distinct_col.clone());
+
+    // LOCAL: group_by = g + x; non_distinct aggs computed with update semantics.
+    let local_id = memo.next_expr_id();
+    let local = MExpr {
+        id: local_id,
+        op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: gb_with_distinct.clone(),
+            aggregates: non_distinct.to_vec(),
+            output_columns: vec![],
+            is_merge: vec![false; non_distinct.len()],
+        }),
+        children: expr.children.clone(),
+    };
+    let local_group = memo.new_group(local);
+
+    // DISTINCT_GLOBAL: same group_by; merge non_distinct states.
+    let dg_id = memo.next_expr_id();
+    let dg = MExpr {
+        id: dg_id,
+        op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::DistinctGlobal,
+            group_by: gb_with_distinct,
+            aggregates: non_distinct.to_vec(),
+            output_columns: vec![],
+            is_merge: vec![true; non_distinct.len()],
+        }),
+        children: vec![local_group],
+    };
+    let dg_group = memo.new_group(dg);
+
+    // GLOBAL: group_by = original g; aggregates = [count(x) update, then each
+    // non_distinct merged].
+    let count_x = AggregateCall {
+        name: "count".into(),
+        args: vec![distinct_col.clone()],
+        distinct: false,
+        result_type: arrow::datatypes::DataType::Int64,
+        order_by: vec![],
+    };
+    let mut global_aggs = Vec::with_capacity(1 + non_distinct.len());
+    global_aggs.push(count_x);
+    global_aggs.extend(non_distinct.iter().cloned());
+    let mut global_merge = Vec::with_capacity(1 + non_distinct.len());
+    global_merge.push(false); // count(x) is an update in the GLOBAL phase
+    global_merge.extend(std::iter::repeat(true).take(non_distinct.len()));
+
+    vec![NewExpr {
+        op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Global,
+            group_by: agg.group_by.clone(),
+            aggregates: global_aggs,
+            output_columns: agg.output_columns.clone(),
+            is_merge: global_merge,
+        }),
+        children: vec![dg_group],
+    }]
 }
 
 fn apply_four_phase(
@@ -125,9 +183,9 @@ fn apply_four_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::optimizer::operator::{LogicalAggregateOp, LogicalScanOp};
+    use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, LogicalScanOp};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -260,5 +318,75 @@ mod tests {
             panic!("expected ColumnRef");
         };
         assert_eq!(column, "x");
+    }
+
+    #[test]
+    fn three_phase_chain_with_group_by() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![col("g")],
+                aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
+                output_columns: vec![
+                    OutputColumn {
+                        name: "g".into(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "count(distinct x)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    },
+                    OutputColumn {
+                        name: "sum(a)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    },
+                ],
+            }),
+            children: vec![sg],
+        };
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1, "expected one multi-phase alternative");
+
+        // Top: GLOBAL, group_by=[g], aggregates[0] = count(x), aggregates[1] = sum(a) (merge)
+        let top = match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected GLOBAL PhysicalHashAggregate, got {:?}", other),
+        };
+        assert!(matches!(top.mode, AggMode::Global));
+        assert_eq!(top.group_by.len(), 1, "GLOBAL group_by is just [g]");
+        assert_eq!(top.aggregates.len(), 2);
+        assert_eq!(top.aggregates[0].name, "count");
+        assert!(!top.aggregates[0].distinct);
+        assert_eq!(top.is_merge, vec![false, true]);
+
+        // Follow chain: GLOBAL -> DISTINCT_GLOBAL -> LOCAL -> scan
+        assert_eq!(out[0].children.len(), 1);
+        let dg_group = &memo.groups[out[0].children[0]];
+        let dg = match &dg_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_GLOBAL, got {:?}", other),
+        };
+        assert!(matches!(dg.mode, AggMode::DistinctGlobal));
+        assert_eq!(dg.group_by.len(), 2, "DG group_by is [g, x]");
+        assert_eq!(dg.aggregates.len(), 1); // only sum(a); count(distinct x) is folded into grouping
+        assert_eq!(dg.is_merge, vec![true]);
+        assert_eq!(dg_group.physical_exprs[0].children.len(), 1);
+
+        let local_group = &memo.groups[dg_group.physical_exprs[0].children[0]];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected LOCAL, got {:?}", other),
+        };
+        assert!(matches!(local.mode, AggMode::Local));
+        assert_eq!(local.group_by.len(), 2, "LOCAL group_by is [g, x]");
+        assert_eq!(local.aggregates.len(), 1);
+        assert_eq!(local.is_merge, vec![false]);
+        assert_eq!(local_group.physical_exprs[0].children, vec![sg]);
     }
 }
