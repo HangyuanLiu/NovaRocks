@@ -4,6 +4,7 @@ pub(crate) mod implement;
 pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
 pub(crate) mod sort_limit_to_top_n;
+pub(crate) mod split_distinct_agg;
 pub(crate) mod split_top_n;
 
 use super::rule::Rule;
