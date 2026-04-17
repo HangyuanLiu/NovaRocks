@@ -4,6 +4,7 @@ pub(crate) mod implement;
 pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
 pub(crate) mod sort_limit_to_top_n;
+pub(crate) mod split_top_n;
 
 use super::rule::Rule;
 
@@ -39,5 +40,6 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(join_commutativity::JoinCommutativity),
         Box::new(join_associativity::JoinAssociativity),
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
+        Box::new(split_top_n::SplitTopN),
     ]
 }
