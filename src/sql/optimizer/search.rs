@@ -347,7 +347,10 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
             }
         }
 
-        // TopN: Gather distribution + Ordered (same contract as Sort).
+        // TopN provided properties depend on phase:
+        //   - Partial: Any distribution (preserves child layout). Ordering = Required
+        //     if sort keys present (each partial's output is sorted).
+        //   - Final (split or not): Gather (final output serialized to one instance).
         Operator::PhysicalTopN(t) => {
             let sort_keys: Vec<SortKey> = t
                 .items
@@ -360,14 +363,16 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                     })
                 })
                 .collect();
-            PhysicalPropertySet {
-                distribution: DistributionSpec::Gather,
-                ordering: if sort_keys.is_empty() {
-                    OrderingSpec::Any
-                } else {
-                    OrderingSpec::Required(sort_keys)
-                },
-            }
+            let ordering = if sort_keys.is_empty() {
+                OrderingSpec::Any
+            } else {
+                OrderingSpec::Required(sort_keys)
+            };
+            let distribution = match t.phase {
+                crate::sql::optimizer::operator::TopNPhase::Partial => DistributionSpec::Any,
+                crate::sql::optimizer::operator::TopNPhase::Final => DistributionSpec::Gather,
+            };
+            PhysicalPropertySet { distribution, ordering }
         }
 
         // Distribution enforcer: outputs whatever its spec says.
@@ -492,8 +497,21 @@ pub(super) fn required_input_properties(
         // Sort: child must be Gather.
         Operator::PhysicalSort(_) => vec![PhysicalPropertySet::gather()],
 
-        // TopN: child must be Gather (same as Sort).
-        Operator::PhysicalTopN(_) => vec![PhysicalPropertySet::gather()],
+        // TopN child requirement depends on phase/is_split:
+        //   - Partial: child is Any (don't force gather; we run per-instance).
+        //   - Final + split=true: child is the PARTIAL with Any distribution; the
+        //     fragment builder materializes the merging exchange, so no Gather
+        //     enforcer between FINAL(split) and PARTIAL.
+        //   - Final + !split (single-stage, today's behavior): child must be Gather.
+        Operator::PhysicalTopN(t) => {
+            use crate::sql::optimizer::operator::TopNPhase;
+            let req = match (t.phase, t.is_split) {
+                (TopNPhase::Partial, _) => PhysicalPropertySet::any(),
+                (TopNPhase::Final, true) => PhysicalPropertySet::any(),
+                (TopNPhase::Final, false) => PhysicalPropertySet::gather(),
+            };
+            vec![req]
+        }
 
         // Filter, Project, Limit: passthrough parent requirement.
         Operator::PhysicalFilter(_) | Operator::PhysicalProject(_) | Operator::PhysicalLimit(_) => {
@@ -989,5 +1007,39 @@ mod top_n_property_tests {
         let req = required_input_properties(&op, &PhysicalPropertySet::gather(), 1);
         assert_eq!(req.len(), 1);
         assert!(matches!(req[0].distribution, DistributionSpec::Gather));
+    }
+
+    #[test]
+    fn top_n_partial_requires_any_and_provides_any() {
+        let op = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Partial,
+            is_split: false,
+        });
+        let out = output_properties(&op);
+        assert!(matches!(out.distribution, DistributionSpec::Any));
+
+        let reqs = required_input_properties(&op, &PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn top_n_final_split_requires_any_and_provides_gather() {
+        let op = Operator::PhysicalTopN(PhysicalTopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: true,
+        });
+        let out = output_properties(&op);
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+
+        let reqs = required_input_properties(&op, &PhysicalPropertySet::gather(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
     }
 }
