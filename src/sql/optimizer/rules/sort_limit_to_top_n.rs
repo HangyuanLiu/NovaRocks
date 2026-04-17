@@ -5,7 +5,7 @@
 //! TopN has [grandchild_group].
 
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{LogicalTopNOp, Operator};
+use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 pub(crate) struct SortLimitToTopN;
@@ -58,7 +58,7 @@ impl Rule for SortLimitToTopN {
                     items: sort_op.items.clone(),
                     limit: limit_op.limit,
                     offset: limit_op.offset,
-                    phase: crate::sql::optimizer::operator::TopNPhase::Final,
+                    phase: TopNPhase::Final,
                     is_split: false,
                 }),
                 children: vec![grandchild_group_id],
