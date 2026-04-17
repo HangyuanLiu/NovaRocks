@@ -1004,9 +1004,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
                 self.visit_physical_top_n_single_or_partial(op, node)
             }
-            // FINAL+split: will add fragment boundary + merging EXCHANGE_NODE
-            // in Task 6. Until then, forward to the single/partial path so
-            // behavior is byte-identical to the pre-refactor function.
+            // FINAL+split: adds a fragment boundary + merging EXCHANGE_NODE.
             (TopNPhase::Final, true) => self.visit_physical_top_n_final_split(op, node),
         }
     }
@@ -1087,20 +1085,91 @@ impl<'a> PlanFragmentBuilder<'a> {
         })
     }
 
-    /// TODO(Task 6): replace with real FINAL+split materialization that emits
-    /// a merging EXCHANGE_NODE (sort_info + offset + limit) in the coordinator
-    /// fragment and a DataStreamSink in the partial fragment.
+    /// FINAL+split TopN: close the partial fragment (ending in a SORT_NODE) and
+    /// start a coordinator fragment whose root is a merging EXCHANGE_NODE. The
+    /// receive side does the k-way merge and applies offset/limit — no final
+    /// SORT_NODE is needed because the pre-sorted input streams already give
+    /// the merged output its order.
     fn visit_physical_top_n_final_split(
         &mut self,
         op: &PhysicalTopNOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // Temporary fallback — emit the same shape as single-stage TopN so
-        // behavior stays byte-identical to the pre-refactor function. This
-        // preserves today's semantics (two stacked SORT_NODEs per original
-        // TopN alternative cost search picks) without introducing the real
-        // merging-exchange materialization yet.
-        self.visit_physical_top_n_single_or_partial(op, node)
+        // FINAL+split materializes the merging exchange at fragment-build time:
+        // close the partial fragment (PARTIAL TopN at its root emitted a SORT_NODE),
+        // then start a new coordinator fragment whose root is a merging EXCHANGE_NODE
+        // carrying sort_info + offset + limit (the receive side does the k-way merge
+        // and applies offset/limit — no separate final SORT_NODE needed).
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(&node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
+        let VisitResult {
+            plan_nodes: child_plan_nodes,
+            scope: child_scope,
+            tuple_ids: child_tuple_ids,
+            cte_exchange_nodes,
+        } = child;
+
+        // PARTIAL should have emitted a SORT_NODE at the head.
+        let partial_sort_info = child_plan_nodes
+            .first()
+            .and_then(|n| n.sort_node.as_ref())
+            .map(|s| s.sort_info.clone())
+            .ok_or_else(|| {
+                "FINAL+split TopN: expected PARTIAL child's root to be SORT_NODE".to_string()
+            })?;
+
+        // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
+        let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let exchange_partition_type = output_partition.type_.clone();
+
+        self.completed_fragments.push(FragmentBuildResult {
+            fragment_id: child_fragment_id,
+            plan: plan_nodes::TPlan::new(child_plan_nodes),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(&[])?,
+            output_sink: build_noop_sink(),
+            output_columns: node.children[0]
+                .output_columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect(),
+            cte_id: None,
+            cte_exchange_nodes,
+        });
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_node = nodes::build_merging_exchange_node(
+            exchange_node_id,
+            child_tuple_ids.clone(),
+            exchange_partition_type,
+            partial_sort_info,
+            op.limit,
+            op.offset,
+        );
+
+        self.completed_edges.push(FragmentEdge {
+            source_fragment_id: child_fragment_id,
+            target_fragment_id: parent_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition,
+            edge_kind: FragmentEdgeKind::Stream,
+        });
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope: child_scope,
+            tuple_ids: child_tuple_ids,
+            cte_exchange_nodes: Vec::new(),
+        })
     }
 
     // -------------------------------------------------------------------

@@ -499,7 +499,6 @@ pub(crate) fn build_exchange_node(
 /// Build a merging EXCHANGE_NODE. The receive side performs k-way merge
 /// over sorted input streams using `sort_info`, then applies offset/limit.
 /// Used for distributed TopN FINAL(split) and global ORDER BY.
-#[allow(dead_code)]
 pub(crate) fn build_merging_exchange_node(
     node_id: i32,
     input_row_tuples: Vec<i32>,
