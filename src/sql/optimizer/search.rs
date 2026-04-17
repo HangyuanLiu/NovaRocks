@@ -492,12 +492,25 @@ pub(super) fn required_input_properties(
                     }]
                 }
             }
-            // Task 6 will assign the proper distribution contracts for DISTINCT
-            // multi-phase aggregation; for now route to Any so the planner can
-            // construct the operators without crashing.
-            AggMode::DistinctGlobal | AggMode::DistinctLocal => {
-                vec![PhysicalPropertySet::any()]
+            // DISTINCT_GLOBAL receives shuffled-by-group_by input. Its own
+            // group_by includes the distinct column, so the enforcer inserts a
+            // Hash(group_by) exchange between LOCAL and DISTINCT_GLOBAL.
+            AggMode::DistinctGlobal => {
+                let cols = typed_exprs_to_column_refs(&a.group_by);
+                if cols.is_empty() {
+                    // Shouldn't happen — SplitDistinctAgg always adds the
+                    // distinct column to group_by — but handle defensively.
+                    vec![PhysicalPropertySet::gather()]
+                } else {
+                    vec![PhysicalPropertySet {
+                        distribution: DistributionSpec::HashPartitioned(cols),
+                        ordering: OrderingSpec::Any,
+                    }]
+                }
             }
+            // DISTINCT_LOCAL runs per-instance on DISTINCT_GLOBAL's output; no
+            // exchange needed between them.
+            AggMode::DistinctLocal => vec![PhysicalPropertySet::any()],
         },
 
         // Sort: child must be Gather.
@@ -859,6 +872,57 @@ mod tests {
             }
             other => panic!("expected HashPartitioned, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn distinct_global_requires_hash_on_group_by() {
+        use crate::sql::analysis::{ExprKind, TypedExpr};
+
+        let col_g = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "g".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let col_x = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "x".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        let op = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::DistinctGlobal,
+            group_by: vec![col_g, col_x],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let reqs = required_input_properties(&op, &PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0].distribution {
+            DistributionSpec::HashPartitioned(cols) => {
+                assert_eq!(cols.len(), 2, "Hash on both g and x");
+            }
+            other => panic!("expected HashPartitioned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn distinct_local_requires_any() {
+        let op = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::DistinctLocal,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let reqs = required_input_properties(&op, &PhysicalPropertySet::gather(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
     }
 
     #[test]
