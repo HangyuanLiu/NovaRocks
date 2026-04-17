@@ -266,3 +266,30 @@ Single phase — the change is small and self-contained. The plan (separate docu
 3. `TopNToPhysical` passes phase/split; search distribution rules updated.
 4. Fragment builder FINAL(split) + PARTIAL branches.
 5. Full validation per §5.
+
+---
+
+## 8. Landing Note
+
+**Landed.** Date: 2026-04-17. HEAD: `0927abc`. Implementation complete across 7 tasks (commits `fe29567` → `0927abc`, with minor review fixes). TPC-DS standalone suite verify: **99/99 pass** (`-j 1`, `--query-timeout 120`, wall time 84.34s). Lib tests: 957/0.
+
+**EXPLAIN diff summary (baseline 2026-04-17-pre vs merge-topn):**
+- Queries that differ: **67** of 99
+- Queries with two-stage TopN materialization: **67**
+- Queries with plan shape unchanged: **32**
+- Unrelated plan changes: **0** (hard requirement met)
+
+**Representative two-stage EXPLAIN (query `q3`):**
+```
+TOP-N (limit=100) [d_year ASC NULLS FIRST, sum_agg DESC NULLS LAST, brand_id ASC NULLS FIRST]
+  TOP-N (limit=100, offset=0) [d_year ASC NULLS FIRST, sum_agg DESC NULLS LAST, brand_id ASC NULLS FIRST]
+    PROJECT [dt.d_year AS d_year, item.i_brand_id AS brand_id, item.i_brand AS brand, sum(ss_ext_sales_price) AS sum_agg]
+      HASH AGGREGATE (GLOBAL, ...)
+        HASH AGGREGATE (LOCAL, ...)
+          HASH JOIN (BROADCAST, INNER, ...)
+```
+The coordinator-side `TOP-N (limit=100)` (FINAL phase) merges sorted streams from partial instances, each contributing `TOP-N (limit=100, offset=0)` (PARTIAL phase) output via MERGING EXCHANGE.
+
+**Non-goals deferred:**
+- Plain `ORDER BY` without LIMIT (`ExchangeSortToMergeRule`-equivalent). TPC-DS has one query (q34) in this category.
+- Cost calibration / penalty tuning — if cost picks single-stage too aggressively, a follow-up spec can tune the cost model.
