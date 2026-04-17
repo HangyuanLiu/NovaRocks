@@ -29,10 +29,6 @@ impl Rule for SplitTopN {
         let Operator::LogicalTopN(src) = &expr.op else {
             return vec![];
         };
-        // Only fire on Final, unsplit TopN nodes.
-        if src.phase != TopNPhase::Final || src.is_split {
-            return vec![];
-        }
         // Finite limit required; plain ORDER BY without LIMIT is out of scope.
         let limit = match src.limit {
             Some(l) if l >= 0 => l,
@@ -158,8 +154,10 @@ mod tests {
             }),
             children: vec![scan_group],
         };
-        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
-        assert!(out.is_empty());
+        assert!(
+            !SplitTopN.matches(&topn_mexpr.op),
+            "rule must not match on PARTIAL phase"
+        );
     }
 
     #[test]
@@ -177,8 +175,10 @@ mod tests {
             }),
             children: vec![scan_group],
         };
-        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
-        assert!(out.is_empty());
+        assert!(
+            !SplitTopN.matches(&topn_mexpr.op),
+            "rule must not match when already split"
+        );
     }
 
     #[test]
