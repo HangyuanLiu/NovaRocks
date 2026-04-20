@@ -716,9 +716,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 args,
                 distinct: false,
             },
-            data_type: DataType::List(
-                arrow::datatypes::Field::new("item", item_type, true).into(),
-            ),
+            data_type: DataType::List(arrow::datatypes::Field::new("item", item_type, true).into()),
             nullable: false,
         })
     }
@@ -906,7 +904,14 @@ impl<'a> super::AnalyzerContext<'a> {
         func: &sqlast::Function,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, String> {
-        let name = func.name.to_string().to_lowercase();
+        let original_name = func.name.to_string().to_lowercase();
+        if original_name == "ds_theta_count_distinct" {
+            return Err("unsupported agg function: ds_theta_count_distinct".to_string());
+        }
+        let name = match original_name.as_str() {
+            "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
+            other => other.to_string(),
+        };
 
         // Check for DISTINCT
         let is_distinct = matches!(
@@ -949,6 +954,8 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types.push(typed.data_type.clone());
             args_typed.push(typed);
         }
+
+        self.validate_ds_hll_arguments(&name, &args_typed)?;
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
@@ -1016,6 +1023,34 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
+        let needs_hll_hash_string_arg = matches!(name.as_str(), "hll_hash" | "hll_hash1");
+        if needs_hll_hash_string_arg {
+            for arg in &mut args_typed {
+                if arg.data_type != DataType::Utf8
+                    && arg.data_type != DataType::LargeUtf8
+                    && arg.data_type != DataType::Null
+                {
+                    let inner = std::mem::replace(
+                        arg,
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Null),
+                            data_type: DataType::Null,
+                            nullable: true,
+                        },
+                    );
+                    *arg = TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(inner),
+                            target: DataType::Utf8,
+                        },
+                        data_type: DataType::Utf8,
+                        nullable: true,
+                    };
+                }
+            }
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
         // IF(cond, then, else): cast first arg to Boolean if needed
         if name == "if" && args_typed.len() >= 1 && args_typed[0].data_type != DataType::Boolean {
             let inner = std::mem::replace(
@@ -1065,6 +1100,57 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         self.validate_percentile_arguments(&name, &args_typed)?;
+
+        match original_name.as_str() {
+            "ds_hll_accumulate" => {
+                let state_expr = TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "ds_hll_count_distinct_state".to_string(),
+                        args: args_typed,
+                        distinct: false,
+                    },
+                    data_type: DataType::Binary,
+                    nullable: true,
+                };
+                return Ok(TypedExpr {
+                    kind: ExprKind::AggregateCall {
+                        name: "ds_hll_count_distinct_union".to_string(),
+                        args: vec![state_expr],
+                        distinct: false,
+                        order_by: func_order_by,
+                    },
+                    data_type: DataType::Binary,
+                    nullable: true,
+                });
+            }
+            "ds_hll_combine" => {
+                self.ensure_ds_hll_binary_arg("ds_hll_count_distinct_union", args_typed.first())?;
+                return Ok(TypedExpr {
+                    kind: ExprKind::AggregateCall {
+                        name: "ds_hll_count_distinct_union".to_string(),
+                        args: args_typed,
+                        distinct: false,
+                        order_by: func_order_by,
+                    },
+                    data_type: DataType::Binary,
+                    nullable: true,
+                });
+            }
+            "ds_hll_estimate" => {
+                self.ensure_ds_hll_binary_arg("ds_hll_count_distinct_merge", args_typed.first())?;
+                return Ok(TypedExpr {
+                    kind: ExprKind::AggregateCall {
+                        name: "ds_hll_count_distinct_merge".to_string(),
+                        args: args_typed,
+                        distinct: false,
+                        order_by: func_order_by,
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                });
+            }
+            _ => {}
+        }
 
         if is_aggregate_function(&name) {
             // Aggregate function
@@ -1321,6 +1407,76 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
+    fn validate_ds_hll_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
+        if name != "ds_hll_count_distinct" {
+            return Ok(());
+        }
+
+        if args.len() > 3 {
+            return Err(
+                "ds_hll_count_distinct requires one/two/three parameters: ds_hll_count_distinct(col, <log_k>, <tgt_type>)"
+                    .to_string(),
+            );
+        }
+
+        if let Some(log_k) = args.get(1) {
+            let ExprKind::Literal(LiteralValue::Int(value)) = &log_k.kind else {
+                return Err(
+                    "ds_hll_count_distinct 's second parameter's data type is wrong ".to_string(),
+                );
+            };
+            if !(4..=21).contains(value) {
+                return Err(
+                    "ds_hll_count_distinct second parameter'value should be between 4 and 21"
+                        .to_string(),
+                );
+            }
+        }
+
+        if let Some(target) = args.get(2) {
+            let ExprKind::Literal(LiteralValue::String(value)) = &target.kind else {
+                return Err(
+                    "ds_hll_count_distinct 's third parameter's data type is wrong ".to_string(),
+                );
+            };
+            if !matches!(value.as_str(), "HLL_4" | "HLL_6" | "HLL_8") {
+                return Err(
+                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_ds_hll_binary_arg(
+        &self,
+        fn_name: &str,
+        arg: Option<&TypedExpr>,
+    ) -> Result<(), String> {
+        let Some(arg) = arg else {
+            return Ok(());
+        };
+        let looks_like_standalone_binary_state =
+            matches!(
+                &arg.kind,
+                ExprKind::ColumnRef {
+                    qualifier: _,
+                    column,
+                } if column.starts_with("ds_")
+            ) && matches!(arg.data_type, DataType::Utf8 | DataType::LargeUtf8);
+        if matches!(arg.data_type, DataType::Binary | DataType::LargeBinary)
+            || looks_like_standalone_binary_state
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "Resolved function {fn_name} has no binary as argument type."
+            ))
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Aggregate detection
     // -----------------------------------------------------------------------
@@ -1377,20 +1533,20 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::Expr::UnaryOp { expr, .. } => self.expr_contains_aggregate(expr),
             sqlast::Expr::Nested(inner) => self.expr_contains_aggregate(inner),
             sqlast::Expr::Cast { expr, .. } => self.expr_contains_aggregate(expr),
-            sqlast::Expr::Tuple(items) => items.iter().any(|item| self.expr_contains_aggregate(item)),
-            sqlast::Expr::Array(array) => {
-                array.elem.iter().any(|item| self.expr_contains_aggregate(item))
+            sqlast::Expr::Tuple(items) => {
+                items.iter().any(|item| self.expr_contains_aggregate(item))
             }
+            sqlast::Expr::Array(array) => array
+                .elem
+                .iter()
+                .any(|item| self.expr_contains_aggregate(item)),
             sqlast::Expr::Struct { values, .. } => {
                 values.iter().any(|item| self.expr_contains_aggregate(item))
             }
-            sqlast::Expr::Map(map) => map
-                .entries
-                .iter()
-                .any(|entry| {
-                    self.expr_contains_aggregate(&entry.key)
-                        || self.expr_contains_aggregate(&entry.value)
-                }),
+            sqlast::Expr::Map(map) => map.entries.iter().any(|entry| {
+                self.expr_contains_aggregate(&entry.key)
+                    || self.expr_contains_aggregate(&entry.value)
+            }),
             sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
                 self.expr_contains_aggregate(root)
                     || access_chain.iter().any(|access| match access {

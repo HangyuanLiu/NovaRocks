@@ -982,9 +982,7 @@ impl<'a> ExprCompiler<'a> {
                     .reduce(|acc, ty| wider_type(&acc, &ty))
                     .unwrap_or(DataType::Null);
                 DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    item_type,
-                    true,
+                    "item", item_type, true,
                 )))
             };
             let type_desc = arrow_type_to_type_desc(&return_type)?;
@@ -1378,15 +1376,21 @@ fn infer_scalar_function_return_type(
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
         "bitmap_union_int" | "bitmap_count" | "bitmap_union_count" => Ok(DataType::Int64),
-        "hll_union_agg" | "hll_cardinality" | "ndv" | "approx_count_distinct" => {
-            Ok(DataType::Int64)
-        }
+        "hll_union_agg"
+        | "hll_cardinality"
+        | "ndv"
+        | "approx_count_distinct"
+        | "approx_count_distinct_hll_sketch"
+        | "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_merge" => Ok(DataType::Int64),
+        "hll_union" | "hll_raw_agg" | "ds_hll_count_distinct_union" => Ok(DataType::Binary),
 
         // Misc
         "version" | "database" | "current_user" | "user" => Ok(DataType::Utf8),
         "sleep" => Ok(DataType::Boolean),
         "uuid" | "typeof" => Ok(DataType::Utf8),
         "murmur_hash3_32" => Ok(DataType::Int32),
+        "hll_hash" | "ds_hll_count_distinct_state" => Ok(DataType::Binary),
         "xx_hash3_64" | "xx_hash3_128" => Ok(DataType::Int64),
         "to_binary" | "encode_row_id" => Ok(DataType::Binary),
         "to_datetime_ntz" => Ok(DataType::Timestamp(
@@ -1498,9 +1502,7 @@ fn infer_agg_function_types(
                 | DataType::Int8
                 | DataType::Int16
                 | DataType::Int32
-                | DataType::Int64 => {
-                    DataType::Int64
-                }
+                | DataType::Int64 => DataType::Int64,
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
                 DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
                 _ => DataType::Float64,
@@ -1599,8 +1601,15 @@ fn infer_agg_function_types(
             Ok((map.clone(), Some(map)))
         }
         "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Int64))),
-        "approx_count_distinct" | "ndv" => Ok((DataType::Int64, Some(DataType::Binary))),
-        "hll_union_agg" | "hll_raw_agg" => Ok((DataType::Int64, Some(DataType::Int64))),
+        "approx_count_distinct"
+        | "ndv"
+        | "approx_count_distinct_hll_sketch"
+        | "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_merge" => Ok((DataType::Int64, Some(DataType::Binary))),
+        "hll_union_agg" => Ok((DataType::Int64, Some(DataType::Binary))),
+        "hll_union" | "hll_raw_agg" | "ds_hll_count_distinct_union" => {
+            Ok((DataType::Binary, Some(DataType::Binary)))
+        }
         "multi_distinct_count" => Ok((DataType::Int64, Some(DataType::Binary))),
         "multi_distinct_sum" => {
             let out = match &first_arg {

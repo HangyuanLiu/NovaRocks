@@ -992,6 +992,13 @@ fn array_value_to_mysql_value(
         return timestamp_to_date_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
     }
 
+    let name_lower = declared.name.to_lowercase();
+    if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
+        && (name_lower.starts_with("hll_union(") || name_lower.starts_with("hll_raw_agg("))
+    {
+        return Ok(StandaloneMysqlValue::Null);
+    }
+
     match column.data_type() {
         DataType::Boolean => downcast_array::<BooleanArray>(column, "BooleanArray")
             .map(|arr| StandaloneMysqlValue::Int(if arr.value(row_idx) { 1 } else { 0 })),

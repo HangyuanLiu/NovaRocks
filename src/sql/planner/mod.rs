@@ -73,6 +73,7 @@ fn apply_query_modifiers(
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
         let extra_items = collect_extra_sort_items(&order_by, &output_columns);
+        let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
             if let LogicalPlan::Project(ref mut proj) = body_plan {
                 if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
@@ -88,7 +89,7 @@ fn apply_query_modifiers(
             // Sort with extended scope
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
-                items: order_by,
+                items: sort_items,
             });
 
             // Strip extra columns with a final project
@@ -113,7 +114,7 @@ fn apply_query_modifiers(
         } else {
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
-                items: order_by,
+                items: sort_items,
             });
         }
     }
@@ -146,6 +147,45 @@ fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> V
         }
     }
     extra
+}
+
+fn rewrite_sort_items_to_projection_refs(
+    order_by: &[SortItem],
+    extra_items: &[ProjectItem],
+) -> Vec<SortItem> {
+    let extra_names: std::collections::HashMap<String, &ProjectItem> = extra_items
+        .iter()
+        .map(|item| {
+            (
+                crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase(),
+                item,
+            )
+        })
+        .collect();
+
+    order_by
+        .iter()
+        .map(|item| {
+            let display =
+                crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase();
+            if let Some(extra) = extra_names.get(&display) {
+                SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: extra.output_name.clone(),
+                        },
+                        data_type: item.expr.data_type.clone(),
+                        nullable: item.expr.nullable,
+                    },
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                }
+            } else {
+                item.clone()
+            }
+        })
+        .collect()
 }
 
 /// Check if any ORDER BY expression references columns not in the output.
@@ -382,7 +422,10 @@ fn prepare_repeat_input(
     });
 
     for gb_expr in &mut select.group_by {
-        if let ExprKind::ColumnRef { qualifier: _, column } = &gb_expr.kind
+        if let ExprKind::ColumnRef {
+            qualifier: _,
+            column,
+        } = &gb_expr.kind
             && grouping_key_aliases
                 .iter()
                 .any(|(original_name, _)| column.eq_ignore_ascii_case(original_name))

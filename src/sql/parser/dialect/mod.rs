@@ -14,6 +14,10 @@ use crate::sql::parser::ast::{ObjectName, SqlType};
 pub(crate) struct StarRocksDialect;
 
 impl sqlparser::dialect::Dialect for StarRocksDialect {
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        ch == '`'
+    }
+
     fn is_identifier_start(&self, ch: char) -> bool {
         ch.is_alphabetic() || ch == '_' || ch == '@'
     }
@@ -27,6 +31,10 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     }
 
     fn supports_group_by_expr(&self) -> bool {
+        true
+    }
+
+    fn supports_limit_comma(&self) -> bool {
         true
     }
 }
@@ -115,12 +123,9 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
                 .into_iter()
                 .enumerate()
                 .map(|(idx, field)| {
-                    let name = field
-                        .field_name
-                        .map(|ident| ident.value)
-                        .ok_or_else(|| {
-                            format!("STRUCT field at position {} requires a name", idx + 1)
-                        })?;
+                    let name = field.field_name.map(|ident| ident.value).ok_or_else(|| {
+                        format!("STRUCT field at position {} requires a name", idx + 1)
+                    })?;
                     let field_type = convert_sql_type(field.field_type)?;
                     Ok((name, field_type))
                 })
@@ -293,8 +298,7 @@ fn rewrite_typed_array_literals(sql: &str) -> Result<String, String> {
                     literal_start += 1;
                 }
                 if literal_start < bytes.len() && bytes[literal_start] == b'[' {
-                    let literal_end =
-                        find_matching_delimiter(sql, literal_start, b'[', b']')?;
+                    let literal_end = find_matching_delimiter(sql, literal_start, b'[', b']')?;
                     output.push_str("CAST(");
                     output.push_str(&sql[literal_start..=literal_end]);
                     output.push_str(" AS ");

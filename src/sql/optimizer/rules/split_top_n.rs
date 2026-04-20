@@ -35,6 +35,13 @@ impl Rule for SplitTopN {
             _ => return vec![],
         };
         let offset = src.offset.unwrap_or(0).max(0);
+        if offset > 0 {
+            // Standalone execution already preserves LIMIT/OFFSET correctly for
+            // single-stage TopN. Split TopN with a non-zero final offset still
+            // needs tighter parity work in the merging exchange path, so keep
+            // the conservative single-stage plan for semantic correctness.
+            return vec![];
+        }
         // Saturating add: if L+O would overflow, cap at i64::MAX (effectively
         // means "partial passes everything through"; cost search will prefer
         // single-stage in that corner case).
@@ -107,7 +114,7 @@ mod tests {
             op: Operator::LogicalTopN(LogicalTopNOp {
                 items: vec![],
                 limit: Some(100),
-                offset: Some(10),
+                offset: Some(0),
                 phase: TopNPhase::Final,
                 is_split: false,
             }),
@@ -120,7 +127,7 @@ mod tests {
                 assert_eq!(t.phase, TopNPhase::Final);
                 assert!(t.is_split);
                 assert_eq!(t.limit, Some(100));
-                assert_eq!(t.offset, Some(10));
+                assert_eq!(t.offset, Some(0));
             }
             other => panic!("expected LogicalTopN final+split, got {:?}", other),
         }
@@ -131,12 +138,34 @@ mod tests {
             Operator::LogicalTopN(t) => {
                 assert_eq!(t.phase, TopNPhase::Partial);
                 assert!(!t.is_split);
-                assert_eq!(t.limit, Some(110), "partial limit must be L+O = 100+10");
+                assert_eq!(t.limit, Some(100), "partial limit must be L+O = 100+0");
                 assert_eq!(t.offset, Some(0));
             }
             other => panic!("expected LogicalTopN partial, got {:?}", other),
         }
         assert_eq!(partial_group.logical_exprs[0].children, vec![scan_group]);
+    }
+
+    #[test]
+    fn does_not_fire_with_non_zero_offset() {
+        let mut memo = Memo::new();
+        let scan_group = mk_scan_group(&mut memo);
+        let topn_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTopN(LogicalTopNOp {
+                items: vec![],
+                limit: Some(100),
+                offset: Some(10),
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![scan_group],
+        };
+        let out = SplitTopN.apply(&topn_mexpr, &mut memo);
+        assert!(
+            out.is_empty(),
+            "non-zero offset should stay single-stage for now"
+        );
     }
 
     #[test]

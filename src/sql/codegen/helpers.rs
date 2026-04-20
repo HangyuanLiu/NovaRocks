@@ -55,7 +55,12 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
                 format!("{}({})", name, arg_names.join(", "))
             }
         }
-        ExprKind::AggregateCall { name, .. } => name.clone(),
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            ..
+        } => agg_call_display_name_from_parts(name, args, *distinct),
         ExprKind::Cast {
             expr: inner,
             target,

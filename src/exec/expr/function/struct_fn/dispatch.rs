@@ -54,7 +54,9 @@ pub fn eval_struct_function(
     match canonical {
         "row" => super::struct_func::eval_row(arena, expr, args, chunk),
         "named_struct" => super::struct_func::eval_named_struct(arena, expr, args, chunk),
-        "__struct_subfield" | "subfield" => super::subfield::eval_subfield(arena, expr, args, chunk),
+        "__struct_subfield" | "subfield" => {
+            super::subfield::eval_subfield(arena, expr, args, chunk)
+        }
         other => Err(format!("unsupported struct function: {}", other)),
     }
 }

@@ -1179,6 +1179,42 @@ fn sqlparser_function_to_literal(func: &sqlparser::ast::Function) -> Result<Lite
     let args = function_expr_args(&func.args)?;
     let name = func.name.to_string().to_ascii_lowercase();
     match name.as_str() {
+        "to_binary" => {
+            if args.len() != 1 && args.len() != 2 {
+                return Err("to_binary expects 1 or 2 arguments".to_string());
+            }
+
+            let Literal::String(input) = sqlparser_expr_to_literal(args[0])? else {
+                return Err("to_binary expects VARCHAR as first argument".to_string());
+            };
+
+            let format = if args.len() == 2 {
+                let Literal::String(format) = sqlparser_expr_to_literal(args[1])? else {
+                    return Err("to_binary expects VARCHAR format argument".to_string());
+                };
+                format
+            } else {
+                "hex".to_string()
+            };
+
+            let bytes = match format.to_ascii_lowercase().as_str() {
+                "encode64" => {
+                    if input.is_empty() {
+                        return Ok(Literal::Null);
+                    }
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(input.as_bytes())
+                        .map_err(|e| format!("to_binary encode64 decode failed: {e}"))?
+                }
+                "utf8" => input.into_bytes(),
+                _ => hex::decode(input).map_err(|e| format!("to_binary hex decode failed: {e}"))?,
+            };
+
+            Ok(Literal::String(
+                bytes.iter().map(|b| char::from(*b)).collect(),
+            ))
+        }
         "row" => Ok(Literal::Struct(
             args.into_iter()
                 .map(sqlparser_expr_to_literal)
@@ -1219,7 +1255,9 @@ fn function_expr_args(
             .iter()
             .map(|arg| match arg {
                 sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => Ok(expr),
-                other => Err(format!("unsupported function argument in INSERT VALUES: {other}")),
+                other => Err(format!(
+                    "unsupported function argument in INSERT VALUES: {other}"
+                )),
             })
             .collect(),
         other => Err(format!(
@@ -2527,13 +2565,9 @@ fn build_local_literal_array(
             let key_refs = flattened_keys.iter().collect::<Vec<_>>();
             let value_refs = flattened_values.iter().collect::<Vec<_>>();
             let key_array = build_local_literal_array(entry_fields[0].data_type(), &key_refs)?;
-            let value_array =
-                build_local_literal_array(entry_fields[1].data_type(), &value_refs)?;
-            let entries = StructArray::new(
-                entry_fields.clone(),
-                vec![key_array, value_array],
-                None,
-            );
+            let value_array = build_local_literal_array(entry_fields[1].data_type(), &value_refs)?;
+            let entries =
+                StructArray::new(entry_fields.clone(), vec![key_array, value_array], None);
             Ok(Arc::new(MapArray::new(
                 entries_field.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -2632,20 +2666,84 @@ fn cast_batch_to_schema(
         if source_col.data_type() == target_field.data_type() {
             columns.push(source_col.clone());
         } else {
-            let casted =
-                arrow::compute::cast(source_col, target_field.data_type()).map_err(|e| {
-                    format!(
-                        "cast column {} from {:?} to {:?} failed: {e}",
-                        target_field.name(),
-                        source_col.data_type(),
-                        target_field.data_type()
-                    )
-                })?;
+            let casted = cast_array_for_local_schema(source_col, target_field).map_err(|e| {
+                format!(
+                    "cast column {} from {:?} to {:?} failed: {e}",
+                    target_field.name(),
+                    source_col.data_type(),
+                    target_field.data_type()
+                )
+            })?;
             columns.push(casted);
         }
     }
     RecordBatch::try_new(target_schema.clone(), columns)
         .map_err(|e| format!("rebuild insert-select batch failed: {e}"))
+}
+
+fn cast_array_for_local_schema(
+    source_col: &ArrayRef,
+    target_field: &arrow::datatypes::FieldRef,
+) -> Result<ArrayRef, String> {
+    use arrow::array::{
+        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
+    };
+    use arrow::datatypes::DataType;
+
+    fn encode_bytes(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| char::from(*b)).collect()
+    }
+
+    match (source_col.data_type(), target_field.data_type()) {
+        // Standalone local tables currently map SQL BINARY/VARBINARY columns to Utf8.
+        // Preserve payload bytes explicitly instead of relying on Arrow's UTF-8 cast rules.
+        (DataType::Binary, DataType::Utf8) => {
+            let arr = source_col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast BinaryArray".to_string())?;
+            Ok(Arc::new(StringArray::from(
+                (0..arr.len())
+                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef)
+        }
+        (DataType::LargeBinary, DataType::Utf8) => {
+            let arr = source_col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast LargeBinaryArray".to_string())?;
+            Ok(Arc::new(StringArray::from(
+                (0..arr.len())
+                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef)
+        }
+        (DataType::Binary, DataType::LargeUtf8) => {
+            let arr = source_col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast BinaryArray".to_string())?;
+            Ok(Arc::new(LargeStringArray::from(
+                (0..arr.len())
+                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef)
+        }
+        (DataType::LargeBinary, DataType::LargeUtf8) => {
+            let arr = source_col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast LargeBinaryArray".to_string())?;
+            Ok(Arc::new(LargeStringArray::from(
+                (0..arr.len())
+                    .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef)
+        }
+        _ => arrow::compute::cast(source_col, target_field.data_type())
+            .map_err(|e| format!("{e}")),
+    }
 }
 
 /// Write a RecordBatch to a parquet file at the given path.
@@ -3079,7 +3177,10 @@ fn literal_from_batch(column: &ArrayRef, row_idx: usize) -> Result<Literal, Stri
             let values = entries.column(1);
             let mut out = Vec::with_capacity(entries.len());
             for idx in 0..entries.len() {
-                out.push((literal_from_batch(keys, idx)?, literal_from_batch(values, idx)?));
+                out.push((
+                    literal_from_batch(keys, idx)?,
+                    literal_from_batch(values, idx)?,
+                ));
             }
             Ok(Literal::Map(out))
         }

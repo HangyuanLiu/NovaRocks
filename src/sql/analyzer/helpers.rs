@@ -226,6 +226,7 @@ fn canonical_display_function_name(name: &str) -> String {
     match name.to_lowercase().as_str() {
         "boolor_agg" => "bool_or".to_string(),
         "booland_agg" | "every" => "bool_and".to_string(),
+        "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         other => other.to_string(),
     }
 }

@@ -59,7 +59,15 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "percentile_disc_lc"
             | "percentile_union"
             | "approx_count_distinct"
+            | "approx_count_distinct_hll_sketch"
             | "approx_top_k"
+            | "ds_hll_accumulate"
+            | "ds_hll_combine"
+            | "ds_hll_estimate"
+            | "ds_hll_count_distinct"
+            | "ds_hll_count_distinct_union"
+            | "ds_hll_count_distinct_merge"
+            | "hll_union"
             | "hll_union_agg"
             | "hll_raw_agg"
             | "hll_cardinality"
@@ -170,6 +178,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
+        "hll_hash" | "ds_hll_count_distinct_state" => DataType::Binary,
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "grouping" | "grouping_id" => DataType::Int64,
         "array_min" | "array_max" => match arg_types.first() {
@@ -246,6 +255,9 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         | "bitmap_union_count"
         | "bitmap_union_int"
         | "approx_count_distinct"
+        | "approx_count_distinct_hll_sketch"
+        | "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_merge"
         | "ndv"
         | "hll_union_agg"
         | "multi_distinct_count" => DataType::Int64,
@@ -281,6 +293,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         "min" | "max" | "any_value" => first_arg,
         "group_concat" | "string_agg" => DataType::Utf8,
         "dict_merge" => DataType::Utf8,
+        "ds_hll_count_distinct_union" | "hll_union" | "hll_raw_agg" => DataType::Binary,
         "array_agg" => {
             let elem = first_arg;
             DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)))
@@ -306,9 +319,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
 
         "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop"
         | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
-        "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
-            DataType::Boolean
-        }
+        "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => DataType::Boolean,
 
         "percentile_approx" => {
             if matches!(arg_types.get(1), Some(DataType::List(_))) {

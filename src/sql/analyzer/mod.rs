@@ -474,17 +474,13 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(self.substitute_select_aliases_inner(
-                        *left,
-                        projection,
-                        inside_agg,
-                    )),
+                    left: Box::new(
+                        self.substitute_select_aliases_inner(*left, projection, inside_agg),
+                    ),
                     op,
-                    right: Box::new(self.substitute_select_aliases_inner(
-                        *right,
-                        projection,
-                        inside_agg,
-                    )),
+                    right: Box::new(
+                        self.substitute_select_aliases_inner(*right, projection, inside_agg),
+                    ),
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -492,11 +488,9 @@ impl<'a> AnalyzerContext<'a> {
                 nullable: expr.nullable,
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(self.substitute_select_aliases_inner(
-                        *inner,
-                        projection,
-                        inside_agg,
-                    )),
+                    expr: Box::new(
+                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                    ),
                 },
             },
             ExprKind::FunctionCall {
@@ -510,7 +504,9 @@ impl<'a> AnalyzerContext<'a> {
                     name,
                     args: args
                         .into_iter()
-                        .map(|arg| self.substitute_select_aliases_inner(arg, projection, inside_agg))
+                        .map(|arg| {
+                            self.substitute_select_aliases_inner(arg, projection, inside_agg)
+                        })
                         .collect(),
                     distinct,
                 },
@@ -546,11 +542,9 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::Cast {
-                    expr: Box::new(self.substitute_select_aliases_inner(
-                        *inner,
-                        projection,
-                        inside_agg,
-                    )),
+                    expr: Box::new(
+                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                    ),
                     target,
                 },
             },
@@ -561,15 +555,16 @@ impl<'a> AnalyzerContext<'a> {
                     self.substitute_select_aliases_inner(*inner, projection, inside_agg),
                 )),
             },
-            ExprKind::IsNull { expr: inner, negated } => TypedExpr {
+            ExprKind::IsNull {
+                expr: inner,
+                negated,
+            } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::IsNull {
-                    expr: Box::new(self.substitute_select_aliases_inner(
-                        *inner,
-                        projection,
-                        inside_agg,
-                    )),
+                    expr: Box::new(
+                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                    ),
                     negated,
                 },
             },
@@ -581,11 +576,9 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::IsTruthValue {
-                    expr: Box::new(self.substitute_select_aliases_inner(
-                        *inner,
-                        projection,
-                        inside_agg,
-                    )),
+                    expr: Box::new(
+                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                    ),
                     value,
                     negated,
                 },
@@ -599,11 +592,9 @@ impl<'a> AnalyzerContext<'a> {
                 nullable: expr.nullable,
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
-                        Box::new(self.substitute_select_aliases_inner(
-                            *expr,
-                            projection,
-                            inside_agg,
-                        ))
+                        Box::new(
+                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
+                        )
                     }),
                     when_then: when_then
                         .into_iter()
@@ -615,11 +606,9 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     else_expr: else_expr.map(|expr| {
-                        Box::new(self.substitute_select_aliases_inner(
-                            *expr,
-                            projection,
-                            inside_agg,
-                        ))
+                        Box::new(
+                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
+                        )
                     }),
                 },
             },
@@ -630,10 +619,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Check if a SELECT's GROUP BY clause contains ROLLUP/CUBE/GROUPING SETS.
     /// Returns the explicit grouping-set levels plus the full GROUP BY key list.
-    fn extract_repeat_from_group_by(
-        &self,
-        select: &sqlast::Select,
-    ) -> Option<RepeatGroupBySpec> {
+    fn extract_repeat_from_group_by(&self, select: &sqlast::Select) -> Option<RepeatGroupBySpec> {
         let (exprs, modifiers) = match &select.group_by {
             sqlast::GroupByExpr::Expressions(exprs, modifiers) => (exprs.as_slice(), modifiers),
             sqlast::GroupByExpr::All(modifiers) => (&[][..], modifiers),
@@ -1362,9 +1348,8 @@ impl<'a> AnalyzerContext<'a> {
                                     if let Some(ref from_rel) = sel.from {
                                         let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
                                         match self.analyze_expr(&ob.expr, &from_scope) {
-                                            Ok(typed) => {
-                                                self.substitute_select_aliases(typed, &sel.projection)
-                                            }
+                                            Ok(typed) => self
+                                                .substitute_select_aliases(typed, &sel.projection),
                                             Err(_) => {
                                                 let mut alias_scope = from_scope.clone();
                                                 for item in &sel.projection {
@@ -1376,11 +1361,10 @@ impl<'a> AnalyzerContext<'a> {
                                                     );
                                                 }
                                                 match self.analyze_expr(&ob.expr, &alias_scope) {
-                                                    Ok(typed) => self
-                                                        .substitute_select_aliases(
-                                                            typed,
-                                                            &sel.projection,
-                                                        ),
+                                                    Ok(typed) => self.substitute_select_aliases(
+                                                        typed,
+                                                        &sel.projection,
+                                                    ),
                                                     Err(_) => return Err(proj_err),
                                                 }
                                             }
@@ -1693,7 +1677,10 @@ fn replace_grouping_markers_in_window(
 }
 
 fn flatten_grouping_groups(groups: &[Vec<sqlast::Expr>]) -> Vec<sqlast::Expr> {
-    groups.iter().flat_map(|group| group.iter().cloned()).collect()
+    groups
+        .iter()
+        .flat_map(|group| group.iter().cloned())
+        .collect()
 }
 
 fn unique_exprs_in_order<I>(exprs: I) -> Vec<sqlast::Expr>
@@ -2770,25 +2757,16 @@ mod tests {
             assert_eq!(repeat.grouping_ids, vec![0b11, 0b00]);
             assert_eq!(
                 repeat.all_rollup_columns,
-                vec![
-                    "o_orderstatus".to_string(),
-                    "o_orderpriority".to_string()
-                ]
+                vec!["o_orderstatus".to_string(), "o_orderpriority".to_string()]
             );
             assert_eq!(repeat.grouping_fn_args.len(), 2);
             assert_eq!(
                 repeat.grouping_fn_args[0].1,
-                vec![
-                    "o_orderstatus".to_string(),
-                    "o_orderpriority".to_string()
-                ]
+                vec!["o_orderstatus".to_string(), "o_orderpriority".to_string()]
             );
             assert_eq!(
                 repeat.grouping_fn_args[1].1,
-                vec![
-                    "o_orderstatus".to_string(),
-                    "o_orderpriority".to_string()
-                ]
+                vec!["o_orderstatus".to_string(), "o_orderpriority".to_string()]
             );
         } else {
             panic!("expected Select body with RepeatInfo");

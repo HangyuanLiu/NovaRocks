@@ -16,7 +16,10 @@
 // under the License.
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, StructArray};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, LargeStringArray, StringArray,
+    StructArray,
+};
 use arrow::datatypes::DataType;
 
 use crate::common::datasketches::{self, HllHandle, HllTargetType};
@@ -247,17 +250,47 @@ fn merge_payload_array(
     context: &str,
 ) -> Result<(), String> {
     for (row, &base) in state_ptrs.iter().enumerate() {
-        let Some(payload) = payload_bytes_at(array, row, context)? else {
+        let Some(payload) = payload_bytes_for_merge(array, row, context)? else {
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
         if let Some(state) = unsafe { get_state_mut(ptr) } {
-            state.handle.merge_payload(payload)?;
+            state.handle.merge_payload(&payload)?;
         } else {
-            let _ = unsafe { init_state_from_payload(ptr, payload) }?;
+            let _ = unsafe { init_state_from_payload(ptr, &payload) }?;
         }
     }
     Ok(())
+}
+
+fn payload_bytes_for_merge(
+    array: &ArrayRef,
+    row: usize,
+    context: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| format!("{context}: failed to downcast StringArray"))?;
+            if arr.is_null(row) {
+                return Ok(None);
+            }
+            Ok(Some(arr.value(row).chars().map(|ch| ch as u8).collect()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| format!("{context}: failed to downcast LargeStringArray"))?;
+            if arr.is_null(row) {
+                return Ok(None);
+            }
+            Ok(Some(arr.value(row).chars().map(|ch| ch as u8).collect()))
+        }
+        _ => payload_bytes_at(array, row, context).map(|payload| payload.map(|v| v.to_vec())),
+    }
 }
 
 impl AggregateFunction for DsHllAgg {
