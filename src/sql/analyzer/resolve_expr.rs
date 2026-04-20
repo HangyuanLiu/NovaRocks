@@ -1498,7 +1498,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
     /// Recursively check if an expression contains an aggregate function call.
     /// Window functions (with OVER) are NOT counted as aggregates.
-    fn expr_contains_aggregate(&self, expr: &sqlast::Expr) -> bool {
+    pub(super) fn expr_contains_aggregate(&self, expr: &sqlast::Expr) -> bool {
         match expr {
             sqlast::Expr::Function(f) => {
                 // A function with OVER is a window function, not an aggregate

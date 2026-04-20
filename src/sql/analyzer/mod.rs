@@ -366,6 +366,41 @@ impl<'a> AnalyzerContext<'a> {
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
+            if let sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::Number(n, _),
+                ..
+            }) = gb_expr
+            {
+                let pos = n
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid GROUP BY position: {e}"))?;
+                if pos == 0 || pos > projection.len() {
+                    return Err(format!(
+                        "GROUP BY position {pos} is out of range (1..{})",
+                        projection.len()
+                    ));
+                }
+                let select_item = select
+                    .projection
+                    .get(pos - 1)
+                    .ok_or_else(|| format!("GROUP BY position {pos} is out of range"))?;
+                let select_expr = match select_item {
+                    sqlast::SelectItem::UnnamedExpr(expr)
+                    | sqlast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => {
+                        return Err(format!(
+                            "GROUP BY position {pos} must reference a select expression"
+                        ));
+                    }
+                };
+                if self.expr_contains_aggregate(select_expr) {
+                    return Err(format!(
+                        "GROUP BY position {pos} cannot reference an aggregate expression"
+                    ));
+                }
+                group_by.push(projection[pos - 1].expr.clone());
+                continue;
+            }
             match self.analyze_expr(gb_expr, &scope) {
                 Ok(typed) => group_by.push(typed),
                 Err(_) => {

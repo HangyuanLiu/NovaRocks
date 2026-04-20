@@ -2694,6 +2694,25 @@ fn cast_array_for_local_schema(
         bytes.iter().map(|b| char::from(*b)).collect()
     }
 
+    fn is_numeric_datetime_source(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::FixedSizeBinary(16)
+        )
+    }
+
     match (source_col.data_type(), target_field.data_type()) {
         // Standalone local tables currently map SQL BINARY/VARBINARY columns to Utf8.
         // Preserve payload bytes explicitly instead of relying on Arrow's UTF-8 cast rules.
@@ -2740,6 +2759,12 @@ fn cast_array_for_local_schema(
                     .map(|row| (!arr.is_null(row)).then(|| encode_bytes(arr.value(row))))
                     .collect::<Vec<_>>(),
             )) as ArrayRef)
+        }
+        (source_type, DataType::Date32) if is_numeric_datetime_source(source_type) => {
+            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+        }
+        (source_type, DataType::Timestamp(_, _)) if is_numeric_datetime_source(source_type) => {
+            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }
         _ => arrow::compute::cast(source_col, target_field.data_type())
             .map_err(|e| format!("{e}")),

@@ -1,8 +1,15 @@
 //! EXPLAIN plan formatter — produces text from LogicalPlan or PhysicalPlan.
 
+use std::collections::HashSet;
 use std::fmt::Write;
+use std::fs::File;
+
+use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+use arrow::datatypes::DataType;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::catalog::TableStorage;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -267,6 +274,13 @@ fn format_physical_node(
                 if matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs) {
                     out.push(format!("{pad}     columns: {}", cols.join(", ")));
                 }
+            }
+            let local_hints = explain_hints_for_local_scan(op);
+            if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
+                out.push(format!("{pad}     Decode"));
+            }
+            if matches!(level, ExplainLevel::Verbose) && local_hints.has_min_max_stats {
+                out.push(format!("{pad}     min-max stats"));
             }
             if !op.predicates.is_empty() {
                 let preds: Vec<String> = op.predicates.iter().map(format_expr).collect();
@@ -553,6 +567,194 @@ fn format_physical_node(
             out.push(format!("{pad}<logical operator>{costs_suffix}"));
         }
     }
+}
+
+#[derive(Default)]
+struct LocalScanExplainHints {
+    has_decode: bool,
+    has_min_max_stats: bool,
+}
+
+fn explain_hints_for_local_scan(
+    op: &crate::sql::optimizer::operator::PhysicalScanOp,
+) -> LocalScanExplainHints {
+    let Some(required_columns) = op.required_columns.as_ref() else {
+        return LocalScanExplainHints::default();
+    };
+    let TableStorage::LocalParquetFile { path } = &op.table.storage else {
+        return LocalScanExplainHints::default();
+    };
+    if required_columns.is_empty() {
+        return LocalScanExplainHints::default();
+    }
+
+    let mut hints = LocalScanExplainHints::default();
+    hints.has_min_max_stats = required_columns.iter().all(|required| {
+        op.table
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(required))
+            .map(|column| supports_local_min_max_stats(&column.data_type))
+            .unwrap_or(false)
+    });
+    hints.has_decode = local_parquet_has_low_cardinality_string_dict(&op.table, path);
+    hints
+}
+
+fn supports_local_min_max_stats(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn local_parquet_has_low_cardinality_string_dict(
+    table: &crate::sql::catalog::TableDef,
+    path: &std::path::Path,
+) -> bool {
+    const LOW_CARDINALITY_THRESHOLD: usize = 256;
+
+    let candidate_columns: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|column| {
+            matches!(
+                column.data_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+            )
+        })
+        .map(|column| column.name.clone())
+        .collect();
+    if candidate_columns.is_empty() {
+        return false;
+    }
+
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut reader = match ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|builder| builder.with_batch_size(4096).build())
+    {
+        Ok(reader) => reader,
+        Err(_) => return false,
+    };
+
+    let mut distinct_sets: Vec<HashSet<Vec<u8>>> = candidate_columns
+        .iter()
+        .map(|_| HashSet::with_capacity(LOW_CARDINALITY_THRESHOLD + 1))
+        .collect();
+    let mut non_null_counts = vec![0usize; candidate_columns.len()];
+
+    while let Some(batch) = reader.next() {
+        let Ok(batch) = batch else {
+            return false;
+        };
+        for (idx, column_name) in candidate_columns.iter().enumerate() {
+            if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
+                continue;
+            }
+            let Some(column_index) = batch
+                .schema()
+                .fields()
+                .iter()
+                .position(|field| field.name().eq_ignore_ascii_case(column_name))
+            else {
+                continue;
+            };
+            let column = batch.column(column_index);
+            match column.data_type() {
+                DataType::Utf8 => {
+                    let Some(values) = column.as_any().downcast_ref::<StringArray>() else {
+                        continue;
+                    };
+                    for row in 0..values.len() {
+                        if values.is_null(row) {
+                            continue;
+                        }
+                        non_null_counts[idx] += 1;
+                        distinct_sets[idx].insert(values.value(row).as_bytes().to_vec());
+                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
+                            break;
+                        }
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() else {
+                        continue;
+                    };
+                    for row in 0..values.len() {
+                        if values.is_null(row) {
+                            continue;
+                        }
+                        non_null_counts[idx] += 1;
+                        distinct_sets[idx].insert(values.value(row).as_bytes().to_vec());
+                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
+                            break;
+                        }
+                    }
+                }
+                DataType::Binary => {
+                    let Some(values) = column.as_any().downcast_ref::<BinaryArray>() else {
+                        continue;
+                    };
+                    for row in 0..values.len() {
+                        if values.is_null(row) {
+                            continue;
+                        }
+                        non_null_counts[idx] += 1;
+                        distinct_sets[idx].insert(values.value(row).to_vec());
+                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
+                            break;
+                        }
+                    }
+                }
+                DataType::LargeBinary => {
+                    let Some(values) = column.as_any().downcast_ref::<LargeBinaryArray>() else {
+                        continue;
+                    };
+                    for row in 0..values.len() {
+                        if values.is_null(row) {
+                            continue;
+                        }
+                        non_null_counts[idx] += 1;
+                        distinct_sets[idx].insert(values.value(row).to_vec());
+                        if distinct_sets[idx].len() > LOW_CARDINALITY_THRESHOLD {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    distinct_sets
+        .iter()
+        .zip(non_null_counts.iter())
+        .any(|(distinct, non_null_count)| {
+            *non_null_count > distinct.len()
+                && !distinct.is_empty()
+                && distinct.len() <= LOW_CARDINALITY_THRESHOLD
+        })
 }
 
 fn format_expr(expr: &TypedExpr) -> String {
