@@ -982,6 +982,47 @@ impl<'a> super::AnalyzerContext<'a> {
             (args_typed, arg_types)
         };
 
+        let needs_statistical_float_args = matches!(
+            name.as_str(),
+            "corr"
+                | "covar_pop"
+                | "covar_samp"
+                | "var_pop"
+                | "var_samp"
+                | "variance"
+                | "variance_pop"
+                | "variance_samp"
+                | "stddev"
+                | "stddev_pop"
+                | "stddev_samp"
+        );
+        if needs_statistical_float_args {
+            for arg in &mut args_typed {
+                if matches!(
+                    arg.data_type,
+                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                ) {
+                    let inner = std::mem::replace(
+                        arg,
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Null),
+                            data_type: DataType::Null,
+                            nullable: true,
+                        },
+                    );
+                    *arg = TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(inner),
+                            target: DataType::Float64,
+                        },
+                        data_type: DataType::Float64,
+                        nullable: true,
+                    };
+                }
+            }
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
         self.validate_ds_hll_arguments(&name, &args_typed)?;
 
         if name == "array_agg" && is_distinct {
@@ -1673,6 +1714,23 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.expr_contains_aggregate(left) || self.expr_contains_aggregate(right)
             }
             sqlast::Expr::UnaryOp { expr, .. } => self.expr_contains_aggregate(expr),
+            sqlast::Expr::IsNull(inner) | sqlast::Expr::IsNotNull(inner) => {
+                self.expr_contains_aggregate(inner)
+            }
+            sqlast::Expr::InList { expr, list, .. } => {
+                self.expr_contains_aggregate(expr)
+                    || list.iter().any(|item| self.expr_contains_aggregate(item))
+            }
+            sqlast::Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.expr_contains_aggregate(expr)
+                    || self.expr_contains_aggregate(low)
+                    || self.expr_contains_aggregate(high)
+            }
+            sqlast::Expr::Like { expr, pattern, .. } => {
+                self.expr_contains_aggregate(expr) || self.expr_contains_aggregate(pattern)
+            }
             sqlast::Expr::Nested(inner) => self.expr_contains_aggregate(inner),
             sqlast::Expr::Cast { expr, .. } => self.expr_contains_aggregate(expr),
             sqlast::Expr::Tuple(items) => {

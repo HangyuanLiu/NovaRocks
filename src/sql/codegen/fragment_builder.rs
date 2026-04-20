@@ -1482,7 +1482,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         node: &PhysicalPlanNode,
         groups: &[Vec<usize>],
     ) -> Result<VisitResult, String> {
-        use crate::sql::analysis::WindowFrameType;
+        use crate::sql::analysis::{WindowBound, WindowFrameType};
 
         let mut current = self.visit(&node.children[0])?;
 
@@ -1601,10 +1601,48 @@ impl<'a> PlanFragmentBuilder<'a> {
                     WindowFrameType::Rows => plan_nodes::TAnalyticWindowType::ROWS,
                     WindowFrameType::Range => plan_nodes::TAnalyticWindowType::RANGE,
                 };
+                let window_start = match &frame.start {
+                    WindowBound::UnboundedPreceding => None,
+                    WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                        range_offset_predicate: None,
+                        rows_offset_value: None,
+                    }),
+                    WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                        range_offset_predicate: None,
+                        rows_offset_value: Some(*n),
+                    }),
+                    WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                        range_offset_predicate: None,
+                        rows_offset_value: Some(*n),
+                    }),
+                    WindowBound::UnboundedFollowing => None,
+                };
+                let window_end = match &frame.end {
+                    WindowBound::UnboundedFollowing => None,
+                    WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                        range_offset_predicate: None,
+                        rows_offset_value: None,
+                    }),
+                    WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                        range_offset_predicate: None,
+                        rows_offset_value: Some(*n),
+                    }),
+                    WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                        type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                        range_offset_predicate: None,
+                        rows_offset_value: Some(*n),
+                    }),
+                    WindowBound::UnboundedPreceding => None,
+                };
                 plan_nodes::TAnalyticWindow {
                     type_: window_type,
-                    window_start: None,
-                    window_end: None,
+                    window_start,
+                    window_end,
                 }
             });
 

@@ -640,7 +640,33 @@ fn has_window_call(expr: &TypedExpr) -> bool {
         ExprKind::WindowCall { .. } => true,
         ExprKind::BinaryOp { left, right, .. } => has_window_call(left) || has_window_call(right),
         ExprKind::UnaryOp { expr, .. } => has_window_call(expr),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            args.iter().any(has_window_call)
+        }
         ExprKind::Cast { expr, .. } => has_window_call(expr),
+        ExprKind::IsNull { expr, .. } | ExprKind::IsTruthValue { expr, .. } => {
+            has_window_call(expr)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            has_window_call(expr) || list.iter().any(has_window_call)
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => has_window_call(expr) || has_window_call(low) || has_window_call(high),
+        ExprKind::Like { expr, pattern, .. } => {
+            has_window_call(expr) || has_window_call(pattern)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(has_window_call)
+                || when_then
+                    .iter()
+                    .any(|(when, then)| has_window_call(when) || has_window_call(then))
+                || else_expr.as_deref().is_some_and(has_window_call)
+        }
         ExprKind::Nested(inner) => has_window_call(inner),
         _ => false,
     }
@@ -744,6 +770,47 @@ fn rewrite_window_calls(
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
         },
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .collect(),
+                distinct: *distinct,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .collect(),
+                distinct: *distinct,
+                order_by: order_by
+                    .iter()
+                    .map(|item| SortItem {
+                        expr: rewrite_window_calls(&item.expr, base_name, window_exprs, counter),
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                    .collect(),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
         ExprKind::Cast {
             expr: inner,
             target,
@@ -756,6 +823,129 @@ fn rewrite_window_calls(
                     counter,
                 )),
                 target: target.clone(),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::IsNull {
+            expr: inner,
+            negated,
+        } => TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => TypedExpr {
+            kind: ExprKind::InList {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                list: list
+                    .iter()
+                    .map(|item| rewrite_window_calls(item, base_name, window_exprs, counter))
+                    .collect(),
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => TypedExpr {
+            kind: ExprKind::Between {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                low: Box::new(rewrite_window_calls(low, base_name, window_exprs, counter)),
+                high: Box::new(rewrite_window_calls(high, base_name, window_exprs, counter)),
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => TypedExpr {
+            kind: ExprKind::Like {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                pattern: Box::new(rewrite_window_calls(
+                    pattern,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => TypedExpr {
+            kind: ExprKind::Case {
+                operand: operand.as_ref().map(|inner| {
+                    Box::new(rewrite_window_calls(inner, base_name, window_exprs, counter))
+                }),
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        (
+                            rewrite_window_calls(when, base_name, window_exprs, counter),
+                            rewrite_window_calls(then, base_name, window_exprs, counter),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr.as_ref().map(|inner| {
+                    Box::new(rewrite_window_calls(inner, base_name, window_exprs, counter))
+                }),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::IsTruthValue {
+            expr: inner,
+            value,
+            negated,
+        } => TypedExpr {
+            kind: ExprKind::IsTruthValue {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                value: *value,
+                negated: *negated,
             },
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,

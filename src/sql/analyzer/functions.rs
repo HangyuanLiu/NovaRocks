@@ -156,6 +156,8 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "hll_cardinality"
             | "ndv"
             | "variance"
+            | "variance_samp"
+            | "variance_pop"
             | "var_samp"
             | "var_pop"
             | "stddev"
@@ -166,6 +168,7 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "corr"
             | "max_by"
             | "min_by"
+            | "mann_whitney_u_test"
             | "bool_or"
             | "bool_and"
             | "boolor_agg"
@@ -381,6 +384,11 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             true,
         )))
     };
+    let array_output = |item_type: DataType| {
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item", item_type, true,
+        )))
+    };
     match name {
         "count"
         | "count_if"
@@ -425,11 +433,10 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         "min" | "max" | "any_value" => first_arg,
         "group_concat" | "string_agg" => DataType::Utf8,
         "dict_merge" => DataType::Utf8,
+        "mann_whitney_u_test" => DataType::Utf8,
         "ds_hll_count_distinct_union" | "hll_union" | "hll_raw_agg" => DataType::Binary,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
-            let elem = first_arg;
-            DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)))
-        }
+        "array_agg" | "array_agg_distinct" => array_output(first_arg),
+        "array_unique_agg" => first_arg,
         "map_agg" => {
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
@@ -449,8 +456,17 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             )
         }
 
-        "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop"
-        | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
+        "variance"
+        | "variance_samp"
+        | "variance_pop"
+        | "var_samp"
+        | "var_pop"
+        | "stddev"
+        | "stddev_samp"
+        | "stddev_pop"
+        | "covar_samp"
+        | "covar_pop"
+        | "corr" => DataType::Float64,
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => DataType::Boolean,
 
         "percentile_approx" => {
@@ -468,6 +484,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             }
         }
         "approx_top_k" => approx_top_k_array(first_arg),
+        "min_n" | "max_n" => array_output(first_arg),
 
         // Default: same as first arg
         _ => {

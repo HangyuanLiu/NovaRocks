@@ -126,6 +126,8 @@ fn canonical_agg_display_name(name: &str) -> &str {
     match name {
         "string_agg" => "group_concat",
         "array_agg_distinct" | "array_unique_agg" => "array_agg",
+        "variance_samp" => "var_samp",
+        "variance_pop" => "var_pop",
         other => other,
     }
 }
@@ -267,11 +269,11 @@ pub(crate) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
     }
 }
 
-/// Group window expressions by their (partition_by, order_by) signature.
+/// Group window expressions by their (partition_by, order_by, frame) signature.
 pub(crate) fn group_win_exprs_by_sig(exprs: &[WindowExpr]) -> Vec<Vec<usize>> {
     let sig = |e: &WindowExpr| -> String {
         format!(
-            "{:?}|{:?}",
+            "{:?}|{:?}|{:?}",
             e.partition_by
                 .iter()
                 .map(|p| format!("{:?}", p.kind))
@@ -280,6 +282,7 @@ pub(crate) fn group_win_exprs_by_sig(exprs: &[WindowExpr]) -> Vec<Vec<usize>> {
                 .iter()
                 .map(|o| format!("{:?}:{}", o.expr.kind, o.asc))
                 .collect::<Vec<_>>(),
+            e.window_frame,
         )
     };
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();

@@ -1254,10 +1254,7 @@ fn semantic_aggregate_type_desc(
     args: &[TypedExpr],
     return_type: &DataType,
 ) -> Result<types::TTypeDesc, String> {
-    if matches!(
-        name,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg"
-    ) && let Some(item) = args.first()
+    if matches!(name, "array_agg" | "array_agg_distinct") && let Some(item) = args.first()
     {
         return list_type_desc(typed_expr_type_desc(item)?);
     }
@@ -1624,8 +1621,17 @@ fn infer_scalar_function_return_type(
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
         "bool_or" | "bool_and" | "every" => Ok(DataType::Boolean),
-        "corr" | "covar_pop" | "covar_samp" | "var_pop" | "var_samp" | "variance" | "stddev"
-        | "stddev_pop" | "stddev_samp" => Ok(DataType::Float64),
+        "corr"
+        | "covar_pop"
+        | "covar_samp"
+        | "var_pop"
+        | "var_samp"
+        | "variance"
+        | "variance_pop"
+        | "variance_samp"
+        | "stddev"
+        | "stddev_pop"
+        | "stddev_samp" => Ok(DataType::Float64),
         "percentile_cont"
         | "percentile_disc"
         | "percentile_disc_lc"
@@ -1847,7 +1853,7 @@ fn infer_agg_function_types(
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
             Ok((DataType::Boolean, Some(DataType::Boolean)))
         }
-        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
+        "array_agg" | "array_agg_distinct" => {
             let elem = first_arg.clone();
             let list = DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)));
             let intermediate = if arg_types.len() <= 1 {
@@ -1872,6 +1878,7 @@ fn infer_agg_function_types(
             };
             Ok((list, Some(intermediate)))
         }
+        "array_unique_agg" => Ok((first_arg.clone(), Some(first_arg))),
         "map_agg" => {
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
@@ -1915,13 +1922,23 @@ fn infer_agg_function_types(
         }
         "bitmap_union_int" => Ok((DataType::Int64, Some(DataType::Int64))),
         "dict_merge" => Ok((DataType::Utf8, Some(DataType::Utf8))),
+        "mann_whitney_u_test" => Ok((DataType::Utf8, Some(DataType::Binary))),
         "max_by" | "min_by" => {
             // max_by(value, key) -> type of value (first arg).
             // Intermediate is serialized binary state.
             Ok((first_arg, Some(DataType::Binary)))
         }
-        "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance" | "stddev"
-        | "stddev_pop" | "stddev_samp" => Ok((DataType::Float64, Some(DataType::Binary))),
+        "covar_pop"
+        | "covar_samp"
+        | "corr"
+        | "var_pop"
+        | "var_samp"
+        | "variance"
+        | "variance_pop"
+        | "variance_samp"
+        | "stddev"
+        | "stddev_pop"
+        | "stddev_samp" => Ok((DataType::Float64, Some(DataType::Binary))),
         "percentile_cont" | "percentile_disc" | "percentile_disc_lc" | "percentile_union" => {
             Ok((DataType::Float64, None))
         }
@@ -1950,7 +1967,7 @@ fn infer_agg_function_types(
             Ok((output, None))
         }
         "approx_top_k" => Ok((approx_top_k_output_type(first_arg), Some(DataType::Binary))),
-        "min_n" | "max_n" => Ok((first_arg.clone(), None)),
+        "min_n" | "max_n" => Ok((list_output_type(first_arg), Some(DataType::Binary))),
         _ => {
             // Default: assume output same as first arg, intermediate same as output
             let out = if arg_types.is_empty() {
@@ -1974,5 +1991,11 @@ fn approx_top_k_output_type(item_type: DataType) -> DataType {
             .into(),
         ),
         true,
+    )))
+}
+
+fn list_output_type(item_type: DataType) -> DataType {
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item", item_type, true,
     )))
 }
