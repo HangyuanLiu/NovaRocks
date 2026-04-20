@@ -1000,7 +1000,7 @@ impl<'a> super::AnalyzerContext<'a> {
             for arg in &mut args_typed {
                 if matches!(
                     arg.data_type,
-                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                    DataType::Null | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
                 ) {
                     let inner = std::mem::replace(
                         arg,

@@ -301,7 +301,7 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     }
     if let Some(over) = &function.over {
         out.push_str(" OVER ");
-        out.push_str(&over.to_string());
+        out.push_str(&format_window_display_name(over));
     }
     out
 }
@@ -373,9 +373,79 @@ fn format_group_concat_display_name(function: &sqlast::Function, function_name: 
     }
     if let Some(over) = &function.over {
         out.push_str(" OVER ");
-        out.push_str(&over.to_string());
+        out.push_str(&format_window_display_name(over));
     }
     out
+}
+
+fn format_window_display_name(over: &sqlast::WindowType) -> String {
+    let sqlast::WindowType::WindowSpec(spec) = over else {
+        return over.to_string();
+    };
+
+    let mut parts = Vec::new();
+    if !spec.partition_by.is_empty() {
+        parts.push(format!(
+            "PARTITION BY {}",
+            spec.partition_by
+                .iter()
+                .map(expr_display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !spec.order_by.is_empty() {
+        parts.push(format!(
+            "ORDER BY {}",
+            spec.order_by
+                .iter()
+                .map(format_order_by_expr_display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(frame) = &spec.window_frame {
+        parts.push(format_window_frame_display_name(frame));
+    }
+
+    if parts.is_empty() {
+        "()".to_string()
+    } else {
+        format!("({} )", parts.join(" "))
+    }
+}
+
+fn format_window_frame_display_name(frame: &sqlast::WindowFrame) -> String {
+    let units = match frame.units {
+        sqlast::WindowFrameUnits::Rows => "ROWS",
+        sqlast::WindowFrameUnits::Range => "RANGE",
+        sqlast::WindowFrameUnits::Groups => "GROUPS",
+    };
+    let start = format_window_bound_display_name(&frame.start_bound);
+    if let Some(end) = &frame.end_bound {
+        format!(
+            "{} BETWEEN {} AND {}",
+            units,
+            start,
+            format_window_bound_display_name(end)
+        )
+    } else {
+        format!("{units} {start}")
+    }
+}
+
+fn format_window_bound_display_name(bound: &sqlast::WindowFrameBound) -> String {
+    match bound {
+        sqlast::WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        sqlast::WindowFrameBound::Preceding(None) => "UNBOUNDED PRECEDING".to_string(),
+        sqlast::WindowFrameBound::Preceding(Some(expr)) => {
+            format!("{} PRECEDING", expr_display_name(expr))
+        }
+        sqlast::WindowFrameBound::Following(None) => "UNBOUNDED FOLLOWING".to_string(),
+        sqlast::WindowFrameBound::Following(Some(expr)) => {
+            format!("{} FOLLOWING", expr_display_name(expr))
+        }
+    }
 }
 
 fn format_function_arguments(args: &sqlast::FunctionArguments) -> String {

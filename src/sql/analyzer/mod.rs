@@ -303,7 +303,7 @@ impl<'a> AnalyzerContext<'a> {
             .iter()
             .enumerate()
             .map(|(i, dt)| OutputColumn {
-                name: format!("column{}", i),
+                name: format!("column_{i}"),
                 data_type: dt.clone(),
                 nullable: true,
             })

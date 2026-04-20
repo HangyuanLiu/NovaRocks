@@ -1253,28 +1253,25 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let mut child = self.visit(&node.children[0])?;
 
-        // Limit on a Sort should have been rewritten to TopN at the cascades
-        // level: SortLimitToTopN inserts an equivalent LogicalTopN into the
-        // Limit's group, and LimitToPhysical refuses to produce PhysicalLimit
-        // when its child has a LogicalSort. Here we only apply the limit
-        // value to the child's top node when it is not a SORT_NODE (e.g.,
-        // Limit on a Scan or Filter).
-        if let Some(limit) = op.limit {
-            if let Some(top) = child.plan_nodes.first_mut() {
-                debug_assert!(
-                    top.node_type != plan_nodes::TPlanNodeType::SORT_NODE,
-                    "Limit on Sort should have been rewritten to TopN; found SORT_NODE under Limit"
-                );
-                top.limit = limit;
+        if let Some(top) = child.plan_nodes.first_mut() {
+            if top.node_type == plan_nodes::TPlanNodeType::SORT_NODE {
+                top.limit = op.limit.unwrap_or(-1);
+                let sort_node = top
+                    .sort_node
+                    .as_mut()
+                    .ok_or_else(|| "SORT_NODE missing sort payload".to_string())?;
+                sort_node.offset = op.offset;
+            } else {
+                if let Some(limit) = op.limit {
+                    top.limit = limit;
+                }
+                if op.offset.is_some() {
+                    return Err(
+                        "LIMIT/OFFSET without a SORT child is not supported".to_string(),
+                    );
+                }
             }
         }
-        // Offset on a plain Limit has no direct execution slot outside of
-        // SORT_NODE; it is expected to be folded into a TopN at the cascades
-        // level. Warn via debug_assert if offset is set here.
-        debug_assert!(
-            op.offset.is_none(),
-            "Limit offset without a Sort child is not supported; cascades should have folded into TopN"
-        );
 
         Ok(child)
     }
@@ -1694,47 +1691,75 @@ impl<'a> PlanFragmentBuilder<'a> {
 
     fn visit_values(
         &mut self,
-        _op: &PhysicalValuesOp,
+        op: &PhysicalValuesOp,
         _node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // For values node (SELECT without FROM), produce a scan on __dual__ table.
-        let scan_tuple_id = self.alloc_tuple();
-        let scan_node_id = self.alloc_node();
+        let output_tuple_id = self.alloc_tuple();
+        let values_node_id = self.alloc_node();
 
-        let dual_table = self
-            .catalog
-            .get_table(self.current_database, "__dual__")
-            .or_else(|_| self.catalog.get_table("default", "__dual__"))
-            .map_err(|_| "internal error: __dual__ table not found in catalog")?;
-
-        for (idx, col) in dual_table.columns.iter().enumerate() {
+        let mut scope = ExprScope::new();
+        for (idx, col) in op.columns.iter().enumerate() {
             let slot_id = self.alloc_slot();
             self.desc_builder.add_slot(
                 slot_id,
-                scan_tuple_id,
+                output_tuple_id,
                 &col.name,
                 &col.data_type,
                 col.nullable,
                 idx as i32,
             );
+            scope.add_column(
+                None,
+                col.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: col.data_type.clone(),
+                    type_desc: None,
+                    nullable: col.nullable,
+                },
+            );
         }
-        self.desc_builder.add_tuple(scan_tuple_id);
+        self.desc_builder.add_tuple(output_tuple_id);
 
-        let resolved = ResolvedTable {
-            database: self.current_database.to_string(),
-            table: dual_table,
-            alias: None,
-        };
+        let empty_scope = ExprScope::new();
+        let mut const_expr_lists = Vec::with_capacity(op.rows.len());
+        for row in &op.rows {
+            if row.len() != op.columns.len() {
+                return Err(format!(
+                    "VALUES row column count mismatch: expected {}, got {}",
+                    op.columns.len(),
+                    row.len()
+                ));
+            }
+            let mut exprs = Vec::with_capacity(row.len());
+            for expr in row {
+                let mut compiler = ExprCompiler::new(&empty_scope);
+                exprs.push(compiler.compile_typed(expr)?);
+            }
+            const_expr_lists.push(exprs);
+        }
 
-        let scan_plan_node = nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, vec![]);
-        self.scan_tables.push((scan_node_id, resolved));
-
-        let scope = ExprScope::new();
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = values_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        plan_node.num_children = 0;
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: output_tuple_id,
+            result_expr_lists: vec![],
+            const_expr_lists,
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
 
         Ok(VisitResult {
-            plan_nodes: vec![scan_plan_node],
+            plan_nodes: vec![plan_node],
             scope,
-            tuple_ids: vec![scan_tuple_id],
+            tuple_ids: vec![output_tuple_id],
             cte_exchange_nodes: Vec::new(),
         })
     }
