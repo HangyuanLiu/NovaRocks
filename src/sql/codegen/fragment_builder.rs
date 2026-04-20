@@ -353,6 +353,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 tuple_id: scan_tuple_id,
                 slot_id,
                 data_type: col.data_type.clone(),
+                type_desc: None,
                 nullable: col.nullable,
             };
             scope.add_column(
@@ -463,11 +464,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             let nullable = item.expr.nullable;
             let name = item.output_name.clone();
             let slot_id = self.alloc_slot();
-            self.desc_builder.add_slot(
+            let slot_type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("project expr `{name}` compiled to empty TExpr"))?;
+            self.desc_builder.add_slot_with_type_desc(
                 slot_id,
                 project_tuple_id,
                 &name,
-                &data_type,
+                slot_type_desc.clone(),
                 nullable,
                 output_columns.len() as i32,
             );
@@ -485,6 +491,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: project_tuple_id,
                     slot_id,
                     data_type: data_type.clone(),
+                    type_desc: Some(slot_type_desc.clone()),
                     nullable,
                 },
             );
@@ -505,6 +512,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         tuple_id: project_tuple_id,
                         slot_id,
                         data_type,
+                        type_desc: Some(slot_type_desc),
                         nullable,
                     },
                 );
@@ -808,11 +816,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             let nullable = gb_expr.nullable;
             let name = typed_expr_display_name(gb_expr);
             let slot_id = self.alloc_slot();
-            self.desc_builder.add_slot(
+            let slot_type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("group by expr `{name}` compiled to empty TExpr"))?;
+            self.desc_builder.add_slot_with_type_desc(
                 slot_id,
                 agg_tuple_id,
                 &name,
-                &data_type,
+                slot_type_desc.clone(),
                 nullable,
                 idx as i32,
             );
@@ -820,6 +833,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 tuple_id: agg_tuple_id,
                 slot_id,
                 data_type: data_type.clone(),
+                type_desc: Some(slot_type_desc),
                 nullable,
             };
             agg_scope.add_column(None, name, binding.clone());
@@ -887,8 +901,39 @@ impl<'a> PlanFragmentBuilder<'a> {
             let name = agg_call_display_name(agg_call);
             let slot_id = self.alloc_slot();
             let col_pos = (agg_start_col + idx) as i32;
-            self.desc_builder
-                .add_slot(slot_id, agg_tuple_id, &name, &data_type, nullable, col_pos);
+            let slot_type_desc = if need_finalize {
+                texpr
+                    .nodes
+                    .first()
+                    .map(|root| root.type_.clone())
+                    .ok_or_else(|| format!("aggregate `{name}` compiled to empty TExpr"))?
+            } else {
+                texpr
+                    .nodes
+                    .first()
+                    .and_then(|root| root.fn_.as_ref())
+                    .and_then(|func| func.aggregate_fn.as_ref())
+                    .map(|agg_fn| agg_fn.intermediate_type.clone())
+                    .unwrap_or_else(|| {
+                        texpr
+                            .nodes
+                            .first()
+                            .map(|root| root.type_.clone())
+                            .unwrap_or_else(|| {
+                                crate::lower::thrift::type_lowering::scalar_type_desc(
+                                    crate::types::TPrimitiveType::NULL_TYPE,
+                                )
+                            })
+                    })
+            };
+            self.desc_builder.add_slot_with_type_desc(
+                slot_id,
+                agg_tuple_id,
+                &name,
+                slot_type_desc.clone(),
+                nullable,
+                col_pos,
+            );
             agg_scope.add_column(
                 None,
                 name,
@@ -896,6 +941,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: agg_tuple_id,
                     slot_id,
                     data_type,
+                    type_desc: Some(slot_type_desc),
                     nullable,
                 },
             );
@@ -1324,6 +1370,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: output_tuple_id,
                     slot_id,
                     data_type: win_expr.result_type.clone(),
+                    type_desc: None,
                     nullable: true,
                 },
             );
@@ -1542,6 +1589,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         tuple_id: output_tuple_id,
                         slot_id,
                         data_type: win_expr.result_type.clone(),
+                        type_desc: None,
                         nullable: true,
                     },
                 );
@@ -1813,6 +1861,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: virtual_tuple_id,
                     slot_id: grouping_id_slot,
                     data_type: DataType::Int64,
+                    type_desc: None,
                     nullable: false,
                 },
             );
@@ -1836,6 +1885,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: virtual_tuple_id,
                     slot_id: slot,
                     data_type: DataType::Int64,
+                    type_desc: None,
                     nullable: false,
                 },
             );
@@ -1970,7 +2020,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         child_scope.resolve_column(col.qualifier.as_deref(), &col.column)
                     {
                         let binding = binding.clone();
-                        let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+                        let type_desc = expr_compiler::binding_type_desc(&binding)?;
                         partition_exprs.push(expr_compiler::build_slot_ref_texpr(
                             binding.slot_id,
                             binding.tuple_id,
@@ -2159,14 +2209,25 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         for (idx, (name, child_binding)) in first_child_cols.iter().enumerate() {
             let slot_id = self.alloc_slot();
-            self.desc_builder.add_slot(
-                slot_id,
-                output_tuple_id,
-                name,
-                &child_binding.data_type,
-                child_binding.nullable,
-                idx as i32,
-            );
+            if let Some(slot_type_desc) = child_binding.type_desc.clone() {
+                self.desc_builder.add_slot_with_type_desc(
+                    slot_id,
+                    output_tuple_id,
+                    name,
+                    slot_type_desc,
+                    child_binding.nullable,
+                    idx as i32,
+                );
+            } else {
+                self.desc_builder.add_slot(
+                    slot_id,
+                    output_tuple_id,
+                    name,
+                    &child_binding.data_type,
+                    child_binding.nullable,
+                    idx as i32,
+                );
+            }
             output_scope.add_column(
                 None,
                 name.clone(),
@@ -2174,6 +2235,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: output_tuple_id,
                     slot_id,
                     data_type: child_binding.data_type.clone(),
+                    type_desc: child_binding.type_desc.clone(),
                     nullable: child_binding.nullable,
                 },
             );
@@ -2189,8 +2251,11 @@ impl<'a> PlanFragmentBuilder<'a> {
                     && output_type.is_some_and(|t| !matches!(t, DataType::Null));
                 if needs_cast {
                     let target_type = output_type.unwrap();
-                    let target_desc = type_infer::arrow_type_to_type_desc(target_type)?;
-                    let child_desc = type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
+                    let target_desc = first_child_cols
+                        .get(col_idx)
+                        .and_then(|(_, binding)| binding.type_desc.clone())
+                        .unwrap_or(type_infer::arrow_type_to_type_desc(target_type)?);
+                    let child_desc = expr_compiler::binding_type_desc(child_binding)?;
                     let slot_ref = expr_compiler::build_slot_ref_texpr(
                         child_binding.slot_id,
                         child_binding.tuple_id,
@@ -2198,7 +2263,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     );
                     expr_list.push(expr_compiler::build_cast_texpr(slot_ref, target_desc));
                 } else {
-                    let type_desc = type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
+                    let type_desc = expr_compiler::binding_type_desc(child_binding)?;
                     expr_list.push(expr_compiler::build_slot_ref_texpr(
                         child_binding.slot_id,
                         child_binding.tuple_id,
@@ -2257,20 +2322,31 @@ impl<'a> PlanFragmentBuilder<'a> {
             .collect();
 
         for (idx, (name, binding)) in child_cols.iter().enumerate() {
-            let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
             let texpr =
                 expr_compiler::build_slot_ref_texpr(binding.slot_id, binding.tuple_id, type_desc);
             grouping_exprs.push(texpr);
 
             let slot_id = self.alloc_slot();
-            self.desc_builder.add_slot(
-                slot_id,
-                agg_tuple_id,
-                name,
-                &binding.data_type,
-                binding.nullable,
-                idx as i32,
-            );
+            if let Some(slot_type_desc) = binding.type_desc.clone() {
+                self.desc_builder.add_slot_with_type_desc(
+                    slot_id,
+                    agg_tuple_id,
+                    name,
+                    slot_type_desc,
+                    binding.nullable,
+                    idx as i32,
+                );
+            } else {
+                self.desc_builder.add_slot(
+                    slot_id,
+                    agg_tuple_id,
+                    name,
+                    &binding.data_type,
+                    binding.nullable,
+                    idx as i32,
+                );
+            }
             agg_scope.add_column(
                 None,
                 name.clone(),
@@ -2278,6 +2354,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     tuple_id: agg_tuple_id,
                     slot_id,
                     data_type: binding.data_type.clone(),
+                    type_desc: binding.type_desc.clone(),
                     nullable: binding.nullable,
                 },
             );
@@ -2404,6 +2481,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 tuple_id: exchange_tuple_id,
                 slot_id,
                 data_type: col.data_type.clone(),
+                type_desc: None,
                 nullable: col.nullable,
             };
             scope.add_column(None, col.name.clone(), binding.clone());

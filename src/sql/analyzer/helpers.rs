@@ -114,6 +114,15 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             .map(|i| i.value.clone())
             .unwrap_or_else(|| format!("{expr}")),
         sqlast::Expr::Identifier(ident) => ident.value.clone(),
+        sqlast::Expr::Array(array) => format!(
+            "[{}]",
+            array
+                .elem
+                .iter()
+                .map(expr_display_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         sqlast::Expr::Function(f) => format_function_display_name(f),
         // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
         // wrap inner with parentheses if it's not a simple identifier or literal.
@@ -231,6 +240,9 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     if canonical_name == "group_concat" {
         return format_group_concat_display_name(function, &canonical_name);
     }
+    if canonical_name == "map" {
+        return format_map_display_name(function);
+    }
     let mut out = format!(
         "{}{}{}",
         canonical_name,
@@ -263,6 +275,27 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
         out.push_str(&over.to_string());
     }
     out
+}
+
+fn format_map_display_name(function: &sqlast::Function) -> String {
+    let sqlast::FunctionArguments::List(list) = &function.args else {
+        return format!("map{}", format_function_arguments(&function.args));
+    };
+    let mut parts = Vec::new();
+    let mut iter = list.args.iter();
+    while let Some(key) = iter.next() {
+        let value = iter.next();
+        let key_display = format_function_arg_display_name(key);
+        if let Some(value) = value {
+            parts.push(format!(
+                "{key_display}:{}",
+                format_function_arg_display_name(value)
+            ));
+        } else {
+            parts.push(key_display);
+        }
+    }
+    format!("map{{{}}}", parts.join(","))
 }
 
 fn format_group_concat_display_name(function: &sqlast::Function, function_name: &str) -> String {
@@ -707,6 +740,24 @@ mod tests {
     #[test]
     fn expr_display_name_normalizes_double_quoted_strings_to_single_quotes() {
         let expr = parse_select_expr("SELECT array_agg(\"中国\" ORDER BY 1, id)");
-        assert_eq!(expr_display_name(&expr), "array_agg('中国' ORDER BY id ASC)");
+        assert_eq!(
+            expr_display_name(&expr),
+            "array_agg('中国' ORDER BY id ASC)"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_normalizes_array_literal_string_quotes() {
+        let expr = parse_select_expr("SELECT array_agg(DISTINCT [json_object(\"2:3\")])");
+        assert_eq!(
+            expr_display_name(&expr),
+            "array_agg(DISTINCT [json_object('2:3')])"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_formats_map_constructor_like_starrocks() {
+        let expr = parse_select_expr("SELECT array_agg(map(2, 3))");
+        assert_eq!(expr_display_name(&expr), "array_agg(map{2:3})");
     }
 }

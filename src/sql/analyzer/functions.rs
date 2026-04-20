@@ -98,6 +98,9 @@ pub(super) fn validate_scalar_function_call(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<(), String> {
+    if name == "map" && arg_types.len() % 2 != 0 {
+        return Err(no_matching_signature(name, arg_types));
+    }
     let expected_arity = match name {
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
         | "array_max" => Some(1usize),
@@ -281,6 +284,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             },
             _ => DataType::Null,
         },
+        "map" => infer_map_constructor_return_type(arg_types),
         "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
             (Some(DataType::List(keys)), Some(DataType::List(values))) => DataType::Map(
                 Arc::new(arrow::datatypes::Field::new(
@@ -312,6 +316,36 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,
     }
+}
+
+fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
+    let key_type = arg_types
+        .iter()
+        .step_by(2)
+        .cloned()
+        .reduce(|acc, ty| wider_type(&acc, &ty))
+        .unwrap_or(DataType::Null);
+    let value_type = arg_types
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .cloned()
+        .reduce(|acc, ty| wider_type(&acc, &ty))
+        .unwrap_or(DataType::Null);
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------

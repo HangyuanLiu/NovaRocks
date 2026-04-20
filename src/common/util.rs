@@ -831,7 +831,7 @@ pub(crate) fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result
     format_mysql_container_value_with_schema(col, row, None)
 }
 
-fn format_mysql_container_value_with_schema(
+pub(crate) fn format_mysql_container_value_with_schema(
     col: &ArrayRef,
     row: usize,
     field_schema: Option<&ChunkFieldSchema>,

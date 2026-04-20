@@ -5,7 +5,7 @@ use crate::sql::analysis::*;
 use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
 
 use super::functions::*;
-use super::helpers::{eval_const_i64, sql_type_to_arrow};
+use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
 use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
@@ -952,8 +952,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             if arg_exprs.len() != 1 {
                 return Err(
-                    "Unexpected input 'order', the most similar input is {',', ')'}."
-                        .to_string(),
+                    "Unexpected input 'order', the most similar input is {',', ')'}.".to_string(),
                 );
             }
         }
@@ -968,6 +967,24 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         self.validate_ds_hll_arguments(&name, &args_typed)?;
+
+        if name == "array_agg" && is_distinct {
+            if args_typed
+                .first()
+                .is_some_and(is_non_groupable_map_constructor)
+            {
+                return Err("Unknown error".to_string());
+            }
+            if let Some(semantic_type) = args_typed
+                .first()
+                .and_then(json_semantic_group_by_type_name)
+            {
+                let arg_display = expr_display_name(arg_exprs[0]);
+                return Err(format!(
+                    "array_agg(DISTINCT {arg_display}) can't rewrite distinct to group by on ({semantic_type})."
+                ));
+            }
+        }
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
@@ -1619,6 +1636,45 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             _ => false,
         }
+    }
+}
+
+fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::FunctionCall { name, .. }
+            if matches!(
+                name.as_str(),
+                "json_query"
+                    | "json_extract"
+                    | "get_json_object"
+                    | "json_object"
+                    | "json_array"
+                    | "to_json"
+                    | "parse_json"
+            ) =>
+        {
+            Some("json".to_string())
+        }
+        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => args
+            .first()
+            .and_then(json_semantic_group_by_type_name)
+            .map(|inner| format!("array<{inner}>")),
+        ExprKind::AggregateCall { name, args, .. } if name == "array_agg" => args
+            .first()
+            .and_then(json_semantic_group_by_type_name)
+            .map(|inner| format!("array<{inner}>")),
+        ExprKind::Nested(inner) => json_semantic_group_by_type_name(inner),
+        _ => None,
+    }
+}
+
+fn is_non_groupable_map_constructor(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::FunctionCall { name, .. } => name == "map",
+        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
+            is_non_groupable_map_constructor(expr)
+        }
+        _ => false,
     }
 }
 

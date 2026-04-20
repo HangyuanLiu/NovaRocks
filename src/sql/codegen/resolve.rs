@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
+use crate::types;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTable {
@@ -18,6 +19,7 @@ pub(crate) struct ColumnBinding {
     pub tuple_id: i32,
     pub slot_id: i32,
     pub data_type: DataType,
+    pub type_desc: Option<types::TTypeDesc>,
     pub nullable: bool,
 }
 

@@ -31,6 +31,18 @@ impl DescriptorTableBuilder {
             Ok(t) => t,
             Err(_) => return, // skip unsupported types
         };
+        self.add_slot_with_type_desc(slot_id, tuple_id, name, slot_type, nullable, col_pos);
+    }
+
+    pub fn add_slot_with_type_desc(
+        &mut self,
+        slot_id: types::TSlotId,
+        tuple_id: types::TTupleId,
+        name: &str,
+        slot_type: types::TTypeDesc,
+        nullable: bool,
+        col_pos: i32,
+    ) {
         self.slots.push(descriptors::TSlotDescriptor::new(
             Some(slot_id),
             Some(tuple_id),

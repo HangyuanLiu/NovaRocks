@@ -47,6 +47,23 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
                     .join(", ")
             )
         }
+        ExprKind::FunctionCall { name, args, .. } if name == "map" => {
+            let mut parts = Vec::new();
+            let mut iter = args.iter();
+            while let Some(key) = iter.next() {
+                let value = iter.next();
+                let key_display = typed_expr_array_item_display_name(key);
+                if let Some(value) = value {
+                    parts.push(format!(
+                        "{key_display}:{}",
+                        typed_expr_array_item_display_name(value)
+                    ));
+                } else {
+                    parts.push(key_display);
+                }
+            }
+            format!("map{{{}}}", parts.join(","))
+        }
         ExprKind::FunctionCall { name, args, .. } => {
             if args.is_empty() {
                 format!("{}()", name)

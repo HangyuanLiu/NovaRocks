@@ -7,7 +7,7 @@ use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::opcodes;
 use crate::types;
 
-use super::resolve::ExprScope;
+use super::resolve::{ColumnBinding, ExprScope};
 use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type};
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::planner::plan::AggregateCall;
@@ -81,7 +81,7 @@ impl<'a> ExprCompiler<'a> {
         let total_children = agg_call.args.len() + num_order_by;
 
         let return_type = agg_call.result_type.clone();
-        let type_desc = arrow_type_to_type_desc(&return_type)?;
+        let type_desc = semantic_aggregate_type_desc(&agg_call.name, &agg_call.args, &return_type)?;
 
         let (_, intermediate_type) =
             infer_agg_function_types(&effective_name, &agg_input_types, is_distinct)?;
@@ -203,7 +203,7 @@ impl<'a> ExprCompiler<'a> {
         agg_input_types.extend(agg_call.order_by.iter().map(|ob| ob.expr.data_type.clone()));
 
         let return_type = agg_call.result_type.clone();
-        let type_desc = arrow_type_to_type_desc(&return_type)?;
+        let type_desc = semantic_aggregate_type_desc(&agg_call.name, &agg_call.args, &return_type)?;
 
         let (_, intermediate_type) =
             infer_agg_function_types(&effective_name, &agg_input_types, is_distinct)?;
@@ -302,7 +302,7 @@ impl<'a> ExprCompiler<'a> {
         match &expr.kind {
             ExprKind::ColumnRef { qualifier, column } => {
                 let binding = self.scope.resolve_column(qualifier.as_deref(), column)?;
-                let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
+                let type_desc = binding_type_desc(binding)?;
                 self.nodes
                     .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
                 self.last_type = binding.data_type.clone();
@@ -613,7 +613,7 @@ impl<'a> ExprCompiler<'a> {
                 use crate::sql::codegen::helpers::typed_expr_display_name;
                 let display = typed_expr_display_name(expr);
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
-                    let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
+                    let type_desc = binding_type_desc(binding)?;
                     self.nodes
                         .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
                     self.last_type = binding.data_type.clone();
@@ -641,7 +641,7 @@ impl<'a> ExprCompiler<'a> {
                     name, args, *distinct, order_by,
                 );
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
-                    let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
+                    let type_desc = binding_type_desc(binding)?;
                     self.nodes
                         .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
                     self.last_type = binding.data_type.clone();
@@ -975,6 +975,10 @@ impl<'a> ExprCompiler<'a> {
         let parent_idx = self.nodes.len();
         self.nodes.push(default_expr_node()); // placeholder
 
+        if name == "map" {
+            return self.compile_map_function_call_with_hint(parent_idx, args, type_hint);
+        }
+
         let mut arg_types = Vec::new();
         for arg in args {
             let t = self.compile_typed_inner(arg)?;
@@ -1013,7 +1017,7 @@ impl<'a> ExprCompiler<'a> {
         } else {
             inferred
         };
-        let type_desc = arrow_type_to_type_desc(&return_type)?;
+        let type_desc = semantic_function_type_desc(name, args, &return_type)?;
         let ret_type_desc = type_desc.clone();
 
         let fn_arg_types: Vec<types::TTypeDesc> = arg_types
@@ -1056,6 +1060,95 @@ impl<'a> ExprCompiler<'a> {
         self.last_nullable = true;
         Ok(return_type)
     }
+
+    fn compile_map_function_call_with_hint(
+        &mut self,
+        parent_idx: usize,
+        args: &[TypedExpr],
+        type_hint: &DataType,
+    ) -> Result<DataType, String> {
+        let arg_types = args
+            .iter()
+            .map(|arg| arg.data_type.clone())
+            .collect::<Vec<_>>();
+        let inferred = infer_map_constructor_return_type(&arg_types);
+        let return_type = if *type_hint != DataType::Null {
+            type_hint.clone()
+        } else {
+            inferred
+        };
+        let (key_type, value_type) = map_key_value_types(&return_type)?;
+        let key_desc = map_side_type_desc(
+            args.iter().step_by(2).cloned().collect::<Vec<_>>(),
+            &key_type,
+        )?;
+        let value_desc = map_side_type_desc(
+            args.iter().skip(1).step_by(2).cloned().collect::<Vec<_>>(),
+            &value_type,
+        )?;
+        let key_array_desc = list_type_desc(key_desc.clone())?;
+        let value_array_desc = list_type_desc(value_desc.clone())?;
+
+        let key_array_idx = self.nodes.len();
+        self.nodes.push(default_expr_node());
+        for arg in args.iter().step_by(2) {
+            self.compile_with_cast_if_needed(arg, &key_type)?;
+        }
+        self.nodes[key_array_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::ARRAY_EXPR,
+            type_: key_array_desc.clone(),
+            num_children: args.iter().step_by(2).count() as i32,
+            ..default_expr_node()
+        };
+
+        let value_array_idx = self.nodes.len();
+        self.nodes.push(default_expr_node());
+        for arg in args.iter().skip(1).step_by(2) {
+            self.compile_with_cast_if_needed(arg, &value_type)?;
+        }
+        self.nodes[value_array_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::ARRAY_EXPR,
+            type_: value_array_desc.clone(),
+            num_children: args.iter().skip(1).step_by(2).count() as i32,
+            ..default_expr_node()
+        };
+
+        let ret_type_desc = map_type_desc(key_desc, value_desc)?;
+        self.nodes[parent_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: ret_type_desc.clone(),
+            num_children: 2,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: "map".to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: vec![key_array_desc, value_array_desc],
+                ret_type: ret_type_desc,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: None,
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..default_expr_node()
+        };
+        self.last_type = return_type.clone();
+        self.last_nullable = false;
+        Ok(return_type)
+    }
 }
 
 // Legacy ExprCompiler methods (compile_expr, compile_value, compile_binary_op,
@@ -1073,6 +1166,14 @@ pub(crate) fn build_slot_ref_texpr(
     type_desc: types::TTypeDesc,
 ) -> exprs::TExpr {
     exprs::TExpr::new(vec![slot_ref_node(slot_id, tuple_id, type_desc)])
+}
+
+pub(crate) fn binding_type_desc(binding: &ColumnBinding) -> Result<types::TTypeDesc, String> {
+    binding
+        .type_desc
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| arrow_type_to_type_desc(&binding.data_type))
 }
 
 /// Wrap a TExpr in a CAST node to the given target type.
@@ -1107,6 +1208,137 @@ fn int_literal_node(value: i64) -> exprs::TExprNode {
         num_children: 0,
         int_literal: Some(exprs::TIntLiteral { value }),
         ..default_expr_node()
+    }
+}
+
+fn json_scalar_function_returns_json(name: &str) -> bool {
+    matches!(
+        name,
+        "json_query"
+            | "json_extract"
+            | "get_json_object"
+            | "json_object"
+            | "json_array"
+            | "to_json"
+            | "parse_json"
+    )
+}
+
+fn semantic_function_type_desc(
+    name: &str,
+    args: &[TypedExpr],
+    return_type: &DataType,
+) -> Result<types::TTypeDesc, String> {
+    if json_scalar_function_returns_json(name) {
+        return Ok(scalar_type_desc(types::TPrimitiveType::JSON));
+    }
+    if name == "map" {
+        let (key_type, value_type) = map_key_value_types(return_type)?;
+        let key_desc = map_side_type_desc(args.iter().step_by(2).cloned().collect(), &key_type)?;
+        let value_desc = map_side_type_desc(
+            args.iter().skip(1).step_by(2).cloned().collect(),
+            &value_type,
+        )?;
+        return map_type_desc(key_desc, value_desc);
+    }
+    if name == "__array_literal"
+        && let Some(item) = args.first()
+    {
+        return list_type_desc(typed_expr_type_desc(item)?);
+    }
+    arrow_type_to_type_desc(return_type)
+}
+
+fn semantic_aggregate_type_desc(
+    name: &str,
+    args: &[TypedExpr],
+    return_type: &DataType,
+) -> Result<types::TTypeDesc, String> {
+    if name == "array_agg"
+        && let Some(item) = args.first()
+    {
+        return list_type_desc(typed_expr_type_desc(item)?);
+    }
+    if name == "map_agg" && args.len() >= 2 {
+        return map_type_desc(
+            typed_expr_type_desc(&args[0])?,
+            typed_expr_type_desc(&args[1])?,
+        );
+    }
+    arrow_type_to_type_desc(return_type)
+}
+
+fn typed_expr_type_desc(expr: &TypedExpr) -> Result<types::TTypeDesc, String> {
+    match &expr.kind {
+        ExprKind::FunctionCall { name, args, .. } => {
+            semantic_function_type_desc(name, args, &expr.data_type)
+        }
+        ExprKind::AggregateCall { name, args, .. } => {
+            semantic_aggregate_type_desc(name, args, &expr.data_type)
+        }
+        ExprKind::Nested(inner) => typed_expr_type_desc(inner),
+        _ => arrow_type_to_type_desc(&expr.data_type),
+    }
+}
+
+fn list_type_desc(item_type: types::TTypeDesc) -> Result<types::TTypeDesc, String> {
+    let item_nodes = item_type
+        .types
+        .ok_or_else(|| "list item type desc is empty".to_string())?;
+    let mut nodes = Vec::with_capacity(1 + item_nodes.len());
+    nodes.push(types::TTypeNode {
+        type_: types::TTypeNodeType::ARRAY,
+        scalar_type: None,
+        is_named: None,
+        struct_fields: None,
+    });
+    nodes.extend(item_nodes);
+    Ok(types::TTypeDesc::new(nodes))
+}
+
+fn map_type_desc(
+    key_type: types::TTypeDesc,
+    value_type: types::TTypeDesc,
+) -> Result<types::TTypeDesc, String> {
+    let key_nodes = key_type
+        .types
+        .ok_or_else(|| "map key type desc is empty".to_string())?;
+    let value_nodes = value_type
+        .types
+        .ok_or_else(|| "map value type desc is empty".to_string())?;
+    let mut nodes = Vec::with_capacity(1 + key_nodes.len() + value_nodes.len());
+    nodes.push(types::TTypeNode {
+        type_: types::TTypeNodeType::MAP,
+        scalar_type: None,
+        is_named: None,
+        struct_fields: None,
+    });
+    nodes.extend(key_nodes);
+    nodes.extend(value_nodes);
+    Ok(types::TTypeDesc::new(nodes))
+}
+
+fn map_key_value_types(return_type: &DataType) -> Result<(DataType, DataType), String> {
+    let DataType::Map(entries, _) = return_type else {
+        return Err(format!("map must return MAP type, got {:?}", return_type));
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return Err("map entries type must be STRUCT".to_string());
+    };
+    if fields.len() != 2 {
+        return Err("map entries type must have 2 fields".to_string());
+    }
+    Ok((fields[0].data_type().clone(), fields[1].data_type().clone()))
+}
+
+fn map_side_type_desc(
+    exprs: Vec<TypedExpr>,
+    fallback_type: &DataType,
+) -> Result<types::TTypeDesc, String> {
+    match exprs.as_slice() {
+        [] => arrow_type_to_type_desc(fallback_type),
+        [expr] => typed_expr_type_desc(expr),
+        _ => arrow_type_to_type_desc(fallback_type),
     }
 }
 
@@ -1453,6 +1685,7 @@ fn infer_scalar_function_return_type(
             },
             _ => Ok(DataType::Null),
         },
+        "map" => Ok(infer_map_constructor_return_type(arg_types)),
         "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
             (Some(DataType::List(keys)), Some(DataType::List(values))) => Ok(DataType::Map(
                 Arc::new(arrow::datatypes::Field::new(
@@ -1487,6 +1720,36 @@ fn infer_scalar_function_return_type(
 
         _ => Err(format!("unknown scalar function: {name}")),
     }
+}
+
+fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
+    let key_type = arg_types
+        .iter()
+        .step_by(2)
+        .cloned()
+        .reduce(|acc, ty| wider_type(&acc, &ty))
+        .unwrap_or(DataType::Null);
+    let value_type = arg_types
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .cloned()
+        .reduce(|acc, ty| wider_type(&acc, &ty))
+        .unwrap_or(DataType::Null);
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------

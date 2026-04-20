@@ -48,16 +48,16 @@ fn normalize_array_agg_parse_error(sql: &str, err: &str) -> Option<String> {
         && after_distinct.trim_start().starts_with("order by")
     {
         return Some(
-            "Unexpected input 'order', the most similar input is {a legal identifier}."
-                .to_string(),
+            "Unexpected input 'order', the most similar input is {a legal identifier}.".to_string(),
         );
     }
     if err.contains("Expected: ), found: separator")
         && trimmed.contains(" order by ")
         && trimmed.contains(" separator ")
     {
-        return Some("Unexpected input 'separator', the most similar input is {',', ')'}."
-            .to_string());
+        return Some(
+            "Unexpected input 'separator', the most similar input is {',', ')'}.".to_string(),
+        );
     }
 
     None

@@ -26,11 +26,11 @@ use tokio::net::TcpListener;
 use tokio::task;
 use tracing::{info, warn};
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkFieldSchema};
 use crate::novarocks_config::{
     NovaRocksConfig, StandaloneServerConfig as AppStandaloneServerConfig,
 };
-use crate::{common::util::format_mysql_container_value, version};
+use crate::{common::util::format_mysql_container_value_with_schema, version};
 
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
@@ -1000,11 +1000,21 @@ fn build_mysql_row(
             chunk.columns().len()
         ));
     }
+    if chunk.chunk_schema().slots().len() != columns.len() {
+        return Err(format!(
+            "query result slot count mismatch: schema has {}, metadata has {}",
+            chunk.chunk_schema().slots().len(),
+            columns.len()
+        ));
+    }
     chunk
         .columns()
         .iter()
+        .zip(chunk.chunk_schema().slots().iter())
         .zip(columns.iter())
-        .map(|(column, declared)| array_value_to_mysql_value(column, declared, row_idx))
+        .map(|((column, slot), declared)| {
+            array_value_to_mysql_value(column, declared, row_idx, Some(slot.field_schema()))
+        })
         .collect()
 }
 
@@ -1012,6 +1022,7 @@ fn array_value_to_mysql_value(
     column: &ArrayRef,
     declared: &QueryResultColumn,
     row_idx: usize,
+    field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<StandaloneMysqlValue, String> {
     if column.is_null(row_idx) {
         return Ok(StandaloneMysqlValue::Null);
@@ -1083,7 +1094,8 @@ fn array_value_to_mysql_value(
         DataType::Null => Ok(StandaloneMysqlValue::Null),
         DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
             Ok(StandaloneMysqlValue::Bytes(
-                format_mysql_container_value(column, row_idx)?.into_bytes(),
+                format_mysql_container_value_with_schema(column, row_idx, field_schema)?
+                    .into_bytes(),
             ))
         }
         other => Err(format!(
@@ -1310,9 +1322,31 @@ fn invalid_data_error(err: String) -> io::Error {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::TimestampMicrosecondArray;
+    use arrow::array::{ListBuilder, StringBuilder, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
 
     use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::types;
+
+    fn array_json_type_desc() -> types::TTypeDesc {
+        types::TTypeDesc::new(vec![
+            types::TTypeNode::new(types::TTypeNodeType::ARRAY, None, None, None),
+            types::TTypeNode::new(
+                types::TTypeNodeType::SCALAR,
+                Some(types::TScalarType::new(
+                    types::TPrimitiveType::JSON,
+                    None,
+                    None,
+                    None,
+                )),
+                None,
+                None,
+            ),
+        ])
+    }
 
     #[test]
     fn parse_set_query_timeout_accepts_common_forms() {
@@ -1384,6 +1418,7 @@ mod tests {
             ])) as ArrayRef),
             &declared,
             0,
+            None,
         )
         .expect("convert timestamp to DATE");
 
@@ -1398,5 +1433,53 @@ mod tests {
             .expect("encode DATE text payload");
         assert_eq!(encoded[0], 10);
         assert_eq!(&encoded[1..], b"2020-02-02");
+    }
+
+    #[test]
+    fn build_mysql_row_uses_chunk_field_schema_for_array_json() {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value(r#"{"2:3": null}"#);
+        builder.append(true);
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                array.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::clone(&array)],
+        )
+        .expect("batch");
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            Arc::new(
+                ChunkSchema::try_new(vec![
+                    ChunkSlotSchema::try_from_type_desc(
+                        SlotId::new(1),
+                        "payload",
+                        true,
+                        array_json_type_desc(),
+                        None,
+                    )
+                    .expect("slot schema"),
+                ])
+                .expect("chunk schema"),
+            ),
+        );
+        let columns = vec![QueryResultColumn {
+            name: "payload".to_string(),
+            data_type: array.data_type().clone(),
+            nullable: true,
+            logical_type: None,
+        }];
+
+        let row = build_mysql_row(&chunk, &columns, 0).expect("mysql row");
+
+        assert_eq!(
+            row,
+            vec![StandaloneMysqlValue::Bytes(
+                br#"['{"2:3": null}']"#.to_vec()
+            )]
+        );
     }
 }

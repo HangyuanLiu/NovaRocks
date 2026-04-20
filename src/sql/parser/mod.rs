@@ -51,8 +51,9 @@ mod tests {
 
     #[test]
     fn parse_sql_raw_normalizes_array_agg_separator_error() {
-        let err = parse_sql_raw(r#"SELECT array_agg("中国" order by 2, id separator NULL) from ss"#)
-            .expect_err("malformed array_agg should fail");
+        let err =
+            parse_sql_raw(r#"SELECT array_agg("中国" order by 2, id separator NULL) from ss"#)
+                .expect_err("malformed array_agg should fail");
         assert_eq!(
             err,
             "Unexpected input 'separator', the most similar input is {',', ')'}.",
