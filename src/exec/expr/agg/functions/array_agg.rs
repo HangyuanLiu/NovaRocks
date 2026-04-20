@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray, MapArray,
-    StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    NullArray, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
@@ -527,7 +527,14 @@ fn unwrap_update_value_array<'a>(
     let first = wrapper.columns().first().ok_or_else(|| {
         "array_agg struct input must contain at least 1 field for value extraction".to_string()
     })?;
-    if first.data_type() == expected_item_type {
+    let first_matches_expected = first.data_type() == expected_item_type
+        || reconcile_data_type(
+            expected_item_type,
+            first.data_type(),
+            "array_agg update input",
+        )
+        .is_ok();
+    if first_matches_expected {
         Ok((first, Some(wrapper)))
     } else {
         Ok((array, None))
@@ -536,6 +543,7 @@ fn unwrap_update_value_array<'a>(
 
 fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<Option<ArrayAggValue>, String> {
     match array.data_type() {
+        DataType::Null => Ok(None),
         DataType::Boolean => {
             let arr = array
                 .as_any()
@@ -771,6 +779,12 @@ fn build_scalar_array(
     values: Vec<Option<ArrayAggValue>>,
 ) -> Result<ArrayRef, String> {
     match output_type {
+        DataType::Null => {
+            if values.iter().any(|value| value.is_some()) {
+                return Err("scalar output type mismatch for Null".to_string());
+            }
+            Ok(Arc::new(NullArray::new(values.len())) as ArrayRef)
+        }
         DataType::Boolean => {
             let mut out = Vec::with_capacity(values.len());
             for value in values {
@@ -1519,8 +1533,8 @@ impl AggregateFunction for ArrayAggAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::DataType;
+    use arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields};
     use arrow_buffer::OffsetBuffer;
     use std::mem::MaybeUninit;
 
@@ -1539,6 +1553,68 @@ mod tests {
                 input_arg_type: Some(DataType::Int64),
             }),
         }
+    }
+
+    fn map_type_i32_utf8(key_nullable: bool) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int32, key_nullable)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
+
+    fn array_agg_map_order_types(
+        key_nullable: bool,
+    ) -> crate::exec::node::aggregate::AggTypeSignature {
+        let map_type = map_type_i32_utf8(key_nullable);
+        let output_type = DataType::List(Arc::new(Field::new("item", map_type.clone(), true)));
+        let intermediate_type = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new(
+                "c0",
+                DataType::List(Arc::new(Field::new("item", map_type.clone(), true))),
+                true,
+            )),
+            Arc::new(Field::new(
+                "c1",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+        ]));
+        crate::exec::node::aggregate::AggTypeSignature {
+            intermediate_type: Some(intermediate_type),
+            output_type: Some(output_type),
+            input_arg_type: Some(map_type),
+        }
+    }
+
+    fn build_nullable_key_map_array() -> ArrayRef {
+        let keys = Arc::new(Int32Array::from(vec![Some(3), Some(4), None])) as ArrayRef;
+        let values = Arc::new(StringArray::from(vec![Some("3"), Some("4"), None])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Arc::new(Field::new("key", DataType::Int32, true)),
+                Arc::new(Field::new("value", DataType::Utf8, true)),
+            ]),
+            vec![keys, values],
+            None,
+        );
+        Arc::new(MapArray::new(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entries.fields().clone()),
+                false,
+            )),
+            OffsetBuffer::new(vec![0, 2, 3, 3].into()),
+            entries,
+            Some(arrow_buffer::NullBuffer::from(vec![true, true, false])),
+            false,
+        )) as ArrayRef
     }
 
     #[test]
@@ -1671,5 +1747,92 @@ mod tests {
         let func = make_func("array_unique_agg");
         let spec = super::build_spec_from_type(&func, Some(&DataType::Int64), false).unwrap();
         assert!(matches!(spec.kind, AggKind::ArrayUniqueAgg));
+    }
+
+    #[test]
+    fn test_array_agg_distinct_order_by_accepts_runtime_map_key_widening() {
+        let planned_input_type = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new("f0", map_type_i32_utf8(false), true)),
+            Arc::new(Field::new("f1", DataType::Int32, true)),
+        ]));
+        let update_func = AggFunction {
+            name: "array_agg_distinct|a=1|n=0".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(array_agg_map_order_types(false)),
+        };
+        let update_spec = ArrayAggAgg
+            .build_spec_from_type(&update_func, Some(&planned_input_type), false)
+            .expect("update spec");
+
+        let input = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Arc::new(Field::new("f0", map_type_i32_utf8(true), true)),
+                Arc::new(Field::new("f1", DataType::Int32, true)),
+            ]),
+            vec![
+                build_nullable_key_map_array(),
+                Arc::new(Int32Array::from(vec![None, Some(98), None])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        let view = AggInputView::Any(&input);
+
+        let mut update_state = MaybeUninit::<ArrayAggState>::uninit();
+        ArrayAggAgg.init_state(&update_spec, update_state.as_mut_ptr() as *mut u8);
+        let update_ptr = update_state.as_mut_ptr() as AggStatePtr;
+        let update_ptrs = vec![update_ptr; 3];
+        ArrayAggAgg
+            .update_batch(&update_spec, 0, &update_ptrs, &view)
+            .expect("update batch");
+        let intermediate = ArrayAggAgg
+            .build_array(&update_spec, 0, &[update_ptr], true)
+            .expect("build intermediate");
+        ArrayAggAgg.drop_state(&update_spec, update_state.as_mut_ptr() as *mut u8);
+
+        let merge_func = AggFunction {
+            name: "array_agg_distinct|a=1|n=0".to_string(),
+            inputs: vec![],
+            input_is_intermediate: true,
+            types: Some(array_agg_map_order_types(false)),
+        };
+        let merge_spec = ArrayAggAgg
+            .build_spec_from_type(
+                &merge_func,
+                update_func
+                    .types
+                    .as_ref()
+                    .and_then(|types| types.intermediate_type.as_ref()),
+                true,
+            )
+            .expect("merge spec");
+
+        let mut merge_state = MaybeUninit::<ArrayAggState>::uninit();
+        ArrayAggAgg.init_state(&merge_spec, merge_state.as_mut_ptr() as *mut u8);
+        let merge_ptr = merge_state.as_mut_ptr() as AggStatePtr;
+        let merge_ptrs = vec![merge_ptr];
+        let merge_view = AggInputView::Any(&intermediate);
+        ArrayAggAgg
+            .merge_batch(&merge_spec, 0, &merge_ptrs, &merge_view)
+            .expect("merge batch");
+        let out = ArrayAggAgg
+            .build_array(&merge_spec, 0, &[merge_ptr], false)
+            .expect("build final");
+        ArrayAggAgg.drop_state(&merge_spec, merge_state.as_mut_ptr() as *mut u8);
+
+        let out = out
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("outer list");
+        assert_eq!(out.len(), 1);
+        let values = out
+            .values()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map values");
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value_length(0), 1);
+        assert_eq!(values.value_length(1), 2);
+        assert!(values.is_null(2));
     }
 }

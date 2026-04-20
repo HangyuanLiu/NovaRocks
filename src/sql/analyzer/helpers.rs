@@ -274,18 +274,17 @@ fn format_function_argument_list(list: &sqlast::FunctionArgumentList) -> String 
             .collect::<Vec<_>>()
             .join(", "),
     );
-    if !list.clauses.is_empty() {
+    let visible_clauses = list
+        .clauses
+        .iter()
+        .map(|clause| format_function_clause_display_name(clause, &list.args))
+        .filter(|clause| !clause.is_empty())
+        .collect::<Vec<_>>();
+    if !visible_clauses.is_empty() {
         if !list.args.is_empty() {
             out.push(' ');
         }
-        out.push_str(
-            &list
-                .clauses
-                .iter()
-                .map(|clause| format_function_clause_display_name(clause, &list.args))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
+        out.push_str(&visible_clauses.join(" "));
     }
     out
 }
@@ -326,18 +325,55 @@ fn format_function_clause_display_name(
     args: &[sqlast::FunctionArg],
 ) -> String {
     match clause {
-        sqlast::FunctionArgumentClause::OrderBy(order_by) => format!(
-            "ORDER BY {}",
-            order_by
+        sqlast::FunctionArgumentClause::OrderBy(order_by) => {
+            let visible = order_by
                 .iter()
+                .filter(|item| !is_constant_function_order_by_expr(item, args))
                 .map(|item| format_function_order_by_expr_display_name(item, args))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .collect::<Vec<_>>();
+            if visible.is_empty() {
+                String::new()
+            } else {
+                format!("ORDER BY {}", visible.join(", "))
+            }
+        }
         sqlast::FunctionArgumentClause::Limit(limit) => {
             format!("LIMIT {}", expr_display_name(limit))
         }
         _ => clause.to_string(),
+    }
+}
+
+fn is_constant_function_order_by_expr(
+    order_by: &sqlast::OrderByExpr,
+    args: &[sqlast::FunctionArg],
+) -> bool {
+    match &order_by.expr {
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(n, false),
+            ..
+        }) => n
+            .parse::<usize>()
+            .ok()
+            .and_then(|pos| args.get(pos.saturating_sub(1)))
+            .map(function_arg_is_constant)
+            .unwrap_or(true),
+        sqlast::Expr::Value(_) => true,
+        _ => false,
+    }
+}
+
+fn function_arg_is_constant(arg: &sqlast::FunctionArg) -> bool {
+    match arg {
+        sqlast::FunctionArg::Named { arg, .. }
+        | sqlast::FunctionArg::ExprNamed { arg, .. }
+        | sqlast::FunctionArg::Unnamed(arg) => match arg {
+            sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(_)) => true,
+            sqlast::FunctionArgExpr::Expr(_) => false,
+            sqlast::FunctionArgExpr::QualifiedWildcard(_) | sqlast::FunctionArgExpr::Wildcard => {
+                false
+            }
+        },
     }
 }
 

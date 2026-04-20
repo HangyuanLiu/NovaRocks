@@ -794,9 +794,6 @@ impl AggregateStreamingSinkOperator {
                     ));
                 }
             };
-            if matches!(data_type, Some(DataType::Null)) {
-                return Err("aggregate input type is null".to_string());
-            }
             types.push(data_type);
         }
         Ok(types)
@@ -845,11 +842,16 @@ impl AggregateStreamingSinkOperator {
                 let actual_type = array.data_type();
                 let is_struct_wrapped = match actual_type {
                     DataType::Struct(fields) if !fields.is_empty() => {
-                        fields[0].data_type() == &expected_type
+                        super::is_compatible_aggregate_data_type(
+                            &expected_type,
+                            fields[0].data_type(),
+                        )
                     }
                     _ => false,
                 };
-                if actual_type != &expected_type && !is_struct_wrapped {
+                if !super::is_compatible_aggregate_data_type(&expected_type, actual_type)
+                    && !is_struct_wrapped
+                {
                     return Err(format!(
                         "aggregate intermediate type mismatch at {}: expected {:?}, got {:?}",
                         idx, expected_type, actual_type

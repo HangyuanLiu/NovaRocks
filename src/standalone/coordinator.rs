@@ -556,7 +556,7 @@ impl ExecutionCoordinator {
             None, // spill_manager
         ));
 
-        execute_plan_with_pipeline(
+        let root_exec_result = execute_plan_with_pipeline(
             exec_plan,
             false,
             std::time::Duration::from_millis(10),
@@ -568,15 +568,20 @@ impl ExecutionCoordinator {
             root_query_id,
             None, // fe_addr
             None, // backend_num
-        )?;
+        );
 
         // ---------------------------------------------------------------
         // 6. Wait for background producer threads (Gather stream + CTE) to complete
         // ---------------------------------------------------------------
+        let mut background_error: Option<String> = None;
         for jh in cte_handles {
             match jh.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(format!("CTE fragment execution failed: {e}")),
+                Ok(Err(e)) => {
+                    background_error.get_or_insert_with(|| {
+                        format!("background fragment execution failed: {e}")
+                    });
+                }
                 Err(panic_payload) => {
                     let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
                         (*s).to_string()
@@ -585,9 +590,24 @@ impl ExecutionCoordinator {
                     } else {
                         "unknown panic".to_string()
                     };
-                    return Err(format!("CTE fragment thread panicked: {msg}"));
+                    background_error.get_or_insert_with(|| {
+                        format!("background fragment thread panicked: {msg}")
+                    });
                 }
             }
+        }
+
+        if let Err(root_err) = root_exec_result {
+            if let Some(bg_err) = background_error {
+                if bg_err == root_err {
+                    return Err(bg_err);
+                }
+                return Err(format!("{bg_err}; root fragment error: {root_err}"));
+            }
+            return Err(root_err);
+        }
+        if let Some(bg_err) = background_error {
+            return Err(bg_err);
         }
 
         // ---------------------------------------------------------------

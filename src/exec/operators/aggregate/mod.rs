@@ -116,6 +116,39 @@ pub(super) fn align_schema_with_arrays(
     )))
 }
 
+pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (DataType::List(expected_item), DataType::List(actual_item)) => {
+            is_compatible_aggregate_data_type(expected_item.data_type(), actual_item.data_type())
+        }
+        (
+            DataType::Map(expected_entries, expected_ordered),
+            DataType::Map(actual_entries, actual_ordered),
+        ) => {
+            expected_ordered == actual_ordered
+                && is_compatible_aggregate_data_type(
+                    expected_entries.data_type(),
+                    actual_entries.data_type(),
+                )
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            expected_fields.len() == actual_fields.len()
+                && expected_fields.iter().zip(actual_fields.iter()).all(
+                    |(expected_field, actual_field)| {
+                        is_compatible_aggregate_data_type(
+                            expected_field.data_type(),
+                            actual_field.data_type(),
+                        )
+                    },
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
 pub struct AggregateProcessorFactory {
     name: String,
@@ -1029,9 +1062,6 @@ impl AggregateProcessorOperator {
                     ));
                 }
             };
-            if matches!(data_type, Some(DataType::Null)) {
-                return Err("aggregate input type is null".to_string());
-            }
             types.push(data_type);
         }
         Ok(types)
@@ -1080,11 +1110,13 @@ impl AggregateProcessorOperator {
                 let actual_type = array.data_type();
                 let is_struct_wrapped = match actual_type {
                     DataType::Struct(fields) if !fields.is_empty() => {
-                        fields[0].data_type() == &expected_type
+                        is_compatible_aggregate_data_type(&expected_type, fields[0].data_type())
                     }
                     _ => false,
                 };
-                if actual_type != &expected_type && !is_struct_wrapped {
+                if !is_compatible_aggregate_data_type(&expected_type, actual_type)
+                    && !is_struct_wrapped
+                {
                     return Err(format!(
                         "aggregate intermediate type mismatch at {}: expected {:?}, got {:?}",
                         idx, expected_type, actual_type

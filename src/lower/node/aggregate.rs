@@ -448,9 +448,6 @@ fn pack_struct_inputs(
         let data_type = arena
             .data_type(*expr_id)
             .ok_or_else(|| "aggregate input type missing".to_string())?;
-        if matches!(data_type, DataType::Null) {
-            return Err("aggregate input type is null".to_string());
-        }
         fields.push(Field::new(format!("f{idx}"), data_type.clone(), true));
     }
     let struct_type = DataType::Struct(Fields::from(fields));

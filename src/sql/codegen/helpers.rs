@@ -127,8 +127,13 @@ pub(crate) fn agg_call_display_name_from_parts(
         format!("{}({}", name, args_display)
     };
 
-    if !order_by.is_empty() {
-        let order_by_display = order_by
+    let visible_order_by = order_by
+        .iter()
+        .filter(|item| !matches!(item.expr.kind, ExprKind::Literal(_)))
+        .collect::<Vec<_>>();
+
+    if !visible_order_by.is_empty() {
+        let order_by_display = visible_order_by
             .iter()
             .map(|item| {
                 let mut value = typed_expr_display_name(&item.expr);
