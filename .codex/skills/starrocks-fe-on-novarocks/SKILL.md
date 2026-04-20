@@ -1,36 +1,57 @@
 ---
 name: starrocks-fe-on-novarocks
-description: StarRocks FE 开发 + NovaRocks BE 联调的端到端工作流。涵盖 FE 代码修改、构建、部署到 /Users/harbor/starrocks-on-novarocks、集群启停、SQL 端到端测试。
+description: Use when StarRocks FE Java changes need to be built, deployed into a NovaRocks runtime, and validated end to end.
 ---
 
 # FE 开发与 NovaRocks 联调
 
 目标：修改 StarRocks FE 代码后，在 NovaRocks 环境中完成构建、部署、验证的完整闭环。
 
-本 skill 约定 `StarRocks` 根目录就是任务运行时的当前工作目录，其余路径固定：
+本 skill 统一使用环境变量表达路径；如果未显式设置，则按下面的默认规则初始化：
 
 ```bash
-STARROCKS_ROOT=$(pwd)
-NOVAROCKS_ROOT=/Users/harbor/worktree/NovaRocks/main
-DEPLOY_ROOT=/Users/harbor/starrocks-on-novarocks
-FE_RUNTIME_ROOT=/Users/harbor/starrocks-on-novarocks/fe
-BE_RUNTIME_ROOT=/Users/harbor/starrocks-on-novarocks/novarocks
+CURRENT_DIR_NAME=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]')
+
+if [ "${CURRENT_DIR_NAME}" = "starrocks" ]; then
+  STARROCKS_ROOT=$(pwd)
+else
+  STARROCKS_ROOT="${STARROCKS_ROOT:-$HOME/project/starrocks}"
+fi
+
+if [ "${CURRENT_DIR_NAME}" = "novarocks" ]; then
+  NOVAROCKS_ROOT=$(pwd)
+else
+  NOVAROCKS_ROOT="${NOVAROCKS_ROOT:-$HOME/project/NovaRocks}"
+fi
+
+DEPLOY_ROOT="${DEPLOY_ROOT:-$HOME/starrocks-on-novarocks}"
+FE_RUNTIME_ROOT="${FE_RUNTIME_ROOT:-${DEPLOY_ROOT}/fe}"
+BE_RUNTIME_ROOT="${BE_RUNTIME_ROOT:-${DEPLOY_ROOT}/novarocks}"
+FE_CONF="${FE_CONF:-${FE_RUNTIME_ROOT}/conf/fe.conf}"
+BE_CONF="${BE_CONF:-${BE_RUNTIME_ROOT}/conf/novarocks.toml}"
+STARROCKS_THIRDPARTY_41="${STARROCKS_THIRDPARTY_41:-$HOME/project/thirdparty-4.1}"
+STARROCKS_THIRDPARTY_MAIN="${STARROCKS_THIRDPARTY_MAIN:-$HOME/project/thirdparty}"
 ```
 
-进入本 skill 时，默认当前工作目录已经是 `StarRocks` 根目录。只有在修改 NovaRocks 源码或操作运行时目录时才切换目录。
+如果调用本 skill 时当前目录名是 `starrocks` 或 `novarocks`，则对应的 `*_ROOT` 自动取 `pwd`。否则分别回退到默认值：
+
+- `STARROCKS_ROOT`: `~/project/starrocks`
+- `NOVAROCKS_ROOT`: `~/project/NovaRocks`
+
+后续命令都应基于这些环境变量展开，不再直接写死绝对路径。
 
 ## 1) 目录约定
 
 | 角色 | 路径 | 说明 |
 |------|------|------|
-| StarRocks FE 源码 | 当前工作目录（`$PWD` / `${STARROCKS_ROOT}`） | 默认工作目录；FE Java 代码在此修改和构建 |
-| NovaRocks BE 源码 | `/Users/harbor/worktree/NovaRocks/main` | Rust BE 代码在此修改和构建 |
-| 部署根目录 | `/Users/harbor/starrocks-on-novarocks` | FE/BE 运行时统一部署在此 |
-| FE 运行目录 | `/Users/harbor/starrocks-on-novarocks/fe` | StarRocks FE 运行目录，jar 从 StarRocks 构建产物复制到此 |
-| BE 运行目录 | `/Users/harbor/starrocks-on-novarocks/novarocks` | NovaRocks runtime package 目录 |
+| StarRocks FE 源码 | `${STARROCKS_ROOT}` | FE Java 代码在此修改和构建 |
+| NovaRocks BE 源码 | `${NOVAROCKS_ROOT}` | Rust BE 代码在此修改和构建 |
+| 部署根目录 | `${DEPLOY_ROOT}` | FE/BE 运行时统一部署在此 |
+| FE 运行目录 | `${FE_RUNTIME_ROOT}` | StarRocks FE 运行目录，jar 从 StarRocks 构建产物复制到此 |
+| BE 运行目录 | `${BE_RUNTIME_ROOT}` | NovaRocks runtime package 目录 |
 | FE 构建产物 | `${STARROCKS_ROOT}/output/fe/lib/` | `./build.sh --fe` 的输出 |
-| FE 配置 | `/Users/harbor/starrocks-on-novarocks/fe/conf/fe.conf` | 端口定义（`query_port`、`http_port`） |
-| BE 配置 | `/Users/harbor/starrocks-on-novarocks/novarocks/conf/novarocks.toml` | 端口定义（`heartbeat_port`、`be_port` 等） |
+| FE 配置 | `${FE_CONF}` | 端口定义（`query_port`、`http_port`） |
+| BE 配置 | `${BE_CONF}` | 端口定义（`heartbeat_port`、`be_port` 等） |
 
 ## 2) FE 构建与部署
 
@@ -40,15 +61,15 @@ BE_RUNTIME_ROOT=/Users/harbor/starrocks-on-novarocks/novarocks
 
 ```bash
 # StarRocks 4.1 及更早分支（包括 4.1）
-export STARROCKS_THIRDPARTY=/Users/harbor/project/thirdparty-4.1
+export STARROCKS_THIRDPARTY="${STARROCKS_THIRDPARTY_41}"
 
 # StarRocks 4.1 之后的分支（包括 main）
-# export STARROCKS_THIRDPARTY=/Users/harbor/project/thirdparty
+# export STARROCKS_THIRDPARTY="${STARROCKS_THIRDPARTY_MAIN}"
 ```
 
 规则：
-- `branch-4.1` 及更早分支（包括 `branch-4.1`）使用 `/Users/harbor/project/thirdparty-4.1`
-- `branch-4.1` 之后的分支和 `main` 使用 `/Users/harbor/project/thirdparty`
+- `branch-4.1` 及更早分支（包括 `branch-4.1`）使用 `${STARROCKS_THIRDPARTY_41}`
+- `branch-4.1` 之后的分支和 `main` 使用 `${STARROCKS_THIRDPARTY_MAIN}`
 
 这是为了和分支所依赖的 thirdparty/toolchain 保持一致，尤其是 `thrift` 版本必须匹配，否则 FE 构建可能生成错误的 thrift Java 源码。
 
@@ -67,14 +88,14 @@ export STARROCKS_THIRDPARTY=/Users/harbor/project/thirdparty-4.1
 
 ```bash
 cp "${STARROCKS_ROOT}"/output/fe/lib/*.jar \
-  /Users/harbor/starrocks-on-novarocks/fe/lib/
+  "${FE_RUNTIME_ROOT}"/lib/
 ```
 
 ### 验证部署
 
 ```bash
 # 比对关键 jar 的大小和时间戳
-ls -la /Users/harbor/starrocks-on-novarocks/fe/lib/fe-core-main.jar
+ls -la "${FE_RUNTIME_ROOT}/lib/fe-core-main.jar"
 ls -la "${STARROCKS_ROOT}/output/fe/lib/fe-core-main.jar"
 ```
 
@@ -85,8 +106,8 @@ ls -la "${STARROCKS_ROOT}/output/fe/lib/fe-core-main.jar"
 **关键：必须加 `--features compat`**，否则 brpc 通信层不会编译，FE 无法与 BE 正常交互（heartbeat、plan submission 等全部走 brpc/C++ shim）。没有 `compat` feature 的 binary 只能用于 standalone-server 模式。
 
 ```bash
-cd /Users/harbor/worktree/NovaRocks/main
-./build.sh --release --package --output /Users/harbor/starrocks-on-novarocks/novarocks --features compat
+cd "${NOVAROCKS_ROOT}"
+./build.sh --release --package --output "${BE_RUNTIME_ROOT}" --features compat
 ```
 
 等价的直接 cargo 命令：
@@ -103,13 +124,13 @@ cargo build --release --features compat
 ```bash
 QUERY_PORT=$(
   grep -E '^[[:space:]]*query_port[[:space:]]*=' \
-    /Users/harbor/starrocks-on-novarocks/fe/conf/fe.conf |
+    "${FE_CONF}" |
   awk -F= '{gsub(/[[:space:]]/, "", $2); print $2}'
 )
 
 HEARTBEAT_PORT=$(
   grep -E '^[[:space:]]*heartbeat_port[[:space:]]*=' \
-    /Users/harbor/starrocks-on-novarocks/novarocks/conf/novarocks.toml |
+    "${BE_CONF}" |
   awk -F= '{gsub(/[[:space:]]/, "", $2); print $2}'
 )
 ```
@@ -118,7 +139,7 @@ HEARTBEAT_PORT=$(
 
 1. **启动 FE**：
 ```bash
-cd /Users/harbor/starrocks-on-novarocks/fe
+cd "${FE_RUNTIME_ROOT}"
 bin/start_fe.sh --daemon
 # 等待 FE 就绪（约 10-15 秒）
 sleep 15
@@ -127,7 +148,7 @@ mysql -h 127.0.0.1 -P"${QUERY_PORT}" -u root -e "select 1"
 
 2. **启动 NovaRocks BE**：
 ```bash
-cd /Users/harbor/starrocks-on-novarocks/novarocks
+cd "${BE_RUNTIME_ROOT}"
 ./bin/novarocksctl start --daemon
 ```
 
@@ -146,10 +167,10 @@ mysql -h 127.0.0.1 -P"${QUERY_PORT}" -u root -e "SHOW BACKENDS"
 ### 停止顺序
 
 ```bash
-cd /Users/harbor/starrocks-on-novarocks/novarocks
+cd "${BE_RUNTIME_ROOT}"
 ./bin/novarocksctl stop
 
-cd /Users/harbor/starrocks-on-novarocks/fe
+cd "${FE_RUNTIME_ROOT}"
 bin/stop_fe.sh
 ```
 
@@ -158,10 +179,10 @@ bin/stop_fe.sh
 如果 FE 启动后 `fe.log` 报 journal replay 错误（如 `JournalInconsistentException`），需清理 meta：
 
 ```bash
-cd /Users/harbor/starrocks-on-novarocks/fe
+cd "${FE_RUNTIME_ROOT}"
 bin/stop_fe.sh
-rm -rf /Users/harbor/starrocks-on-novarocks/fe/meta/* \
-       /Users/harbor/starrocks-on-novarocks/fe/log/*
+rm -rf "${FE_RUNTIME_ROOT}"/meta/* \
+       "${FE_RUNTIME_ROOT}"/log/*
 bin/start_fe.sh --daemon
 # 重新注册 BE
 ```
@@ -183,7 +204,7 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 ### 使用 sql-test-runner（推荐）
 
 ```bash
-cd /Users/harbor/worktree/NovaRocks/main
+cd "${NOVAROCKS_ROOT}"
 
 # 运行单个 case
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
@@ -252,37 +273,37 @@ CREATE DATABASE iceberg_cat_${suite_uuid0}.my_db_${uuid0};
 
 3. 部署到 FE 运行目录
    └─ cp ${STARROCKS_ROOT}/output/fe/lib/*.jar \
-        /Users/harbor/starrocks-on-novarocks/fe/lib/
+        ${FE_RUNTIME_ROOT}/lib/
 
 4. 重启 FE（如需要）
-   └─ cd /Users/harbor/starrocks-on-novarocks/fe
+   └─ cd ${FE_RUNTIME_ROOT}
    └─ bin/stop_fe.sh && bin/start_fe.sh --daemon
 
 5. （可选）修改 NovaRocks BE Rust 代码
-   └─ vi /Users/harbor/worktree/NovaRocks/main/src/...
-   └─ cd /Users/harbor/worktree/NovaRocks/main
-   └─ ./build.sh --release --package --output /Users/harbor/starrocks-on-novarocks/novarocks --features compat
-   └─ cd /Users/harbor/starrocks-on-novarocks/novarocks && ./bin/novarocksctl restart --daemon
+   └─ vi ${NOVAROCKS_ROOT}/src/...
+   └─ cd ${NOVAROCKS_ROOT}
+   └─ ./build.sh --release --package --output ${BE_RUNTIME_ROOT} --features compat
+   └─ cd ${BE_RUNTIME_ROOT} && ./bin/novarocksctl restart --daemon
 
 6. 运行测试验证
-   └─ cd /Users/harbor/worktree/NovaRocks/main
+   └─ cd ${NOVAROCKS_ROOT}
    └─ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
         --suite mv-on-iceberg --mode verify
 
 7. 如果测试不过，检查 FE 日志
-   └─ tail -100 /Users/harbor/starrocks-on-novarocks/fe/log/fe.log | grep -i error
+   └─ tail -100 ${FE_RUNTIME_ROOT}/log/fe.log | grep -i error
 ```
 
 ## 7) 常见问题排查
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
-| FE 启动后 `fe.log` 报 `JournalInconsistentException` | 新 jar 与旧 meta 不兼容 | 清理 meta：`rm -rf /Users/harbor/starrocks-on-novarocks/fe/meta/* /Users/harbor/starrocks-on-novarocks/fe/log/*` |
-| `missing shard registry config for path=s3://...` | BE shard registry 缺少 S3 凭证 | 重启 BE：`cd /Users/harbor/starrocks-on-novarocks/novarocks && ./bin/novarocksctl restart --daemon` |
+| FE 启动后 `fe.log` 报 `JournalInconsistentException` | 新 jar 与旧 meta 不兼容 | 清理 meta：`rm -rf ${FE_RUNTIME_ROOT}/meta/* ${FE_RUNTIME_ROOT}/log/*` |
+| `missing shard registry config for path=s3://...` | BE shard registry 缺少 S3 凭证 | 重启 BE：`cd ${BE_RUNTIME_ROOT} && ./bin/novarocksctl restart --daemon` |
 | `Unknown catalog 'iceberg_cat_...'` | Iceberg test case 用了 case 级别 uuid 引用 suite 级别 catalog | 将 `iceberg_cat_${uuid0}` 改为 `iceberg_cat_${suite_uuid0}` |
-| `Can't connect to MySQL server on 127.0.0.1:XXXX` | FE 未启动或端口不对 | 检查 `/Users/harbor/starrocks-on-novarocks/fe/conf/fe.conf` 中的 `query_port`，确认 FE 进程存活 |
+| `Can't connect to MySQL server on 127.0.0.1:XXXX` | FE 未启动或端口不对 | 检查 `${FE_CONF}` 中的 `query_port`，确认 FE 进程存活 |
 | REFRESH MV 失败 `fail to create tablet` | BE 刚注册，StarManager 尚未完成 shard 分配 | 等几秒后重试，或重启 BE |
 | Iceberg INSERT 报 502/空响应 | 本地代理拦截了 localhost 请求 | 执行代理禁用命令（见第 4 节） |
-| `cp` jar 后 FE 行为没变 | 只复制了 `starrocks-fe.jar`（5KB wrapper） | **必须复制全部 jar**：`cp ${STARROCKS_ROOT}/output/fe/lib/*.jar /Users/harbor/starrocks-on-novarocks/fe/lib/` |
+| `cp` jar 后 FE 行为没变 | 只复制了 `starrocks-fe.jar`（5KB wrapper） | **必须复制全部 jar**：`cp ${STARROCKS_ROOT}/output/fe/lib/*.jar ${FE_RUNTIME_ROOT}/lib/` |
 | BE 启动正常但 `SHOW WAREHOUSES` 显示 NodeCount=0，query 报 `No alive backend` | BE binary 编译时缺少 `--features compat`，brpc/C++ shim 未启用，FE 无法与 BE 正常通信 | **必须用 `--features compat` 编译**：`./build.sh --release --package --output ... --features compat` |
 | BE Alive=true 但 query 报 `No alive backend`，`SHOW WAREHOUSES` NodeCount=0 | BE 曾因连接失败被 FE 自动拉黑（如非 compat build 期间） | 1. `SHOW BACKEND BLACKLIST` 确认 2. `DELETE BACKEND BLACKLIST <id>` 移除 3. 确保 compat build 后重启 BE，否则会被持续自动拉黑 |
