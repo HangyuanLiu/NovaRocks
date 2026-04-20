@@ -10,6 +10,10 @@ pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, Stri
     raw::parse_sql_raw(sql)
 }
 
+pub(crate) fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
+    raw::parse_normalized_sql_raw(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +47,35 @@ mod tests {
             sqlparser::ast::DataType::Array(sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner))
                 if matches!(inner.as_ref(), sqlparser::ast::DataType::Double(_) | sqlparser::ast::DataType::DoublePrecision)
         ));
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_array_agg_separator_error() {
+        let err = parse_sql_raw(r#"SELECT array_agg("中国" order by 2, id separator NULL) from ss"#)
+            .expect_err("malformed array_agg should fail");
+        assert_eq!(
+            err,
+            "Unexpected input 'separator', the most similar input is {',', ')'}.",
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_array_agg_missing_argument_error() {
+        let err =
+            parse_sql_raw("SELECT array_agg(order by 1 separator '')").expect_err("should fail");
+        assert_eq!(
+            err,
+            "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_array_agg_distinct_missing_argument_error() {
+        let err = parse_sql_raw("SELECT array_agg(distinct  order by score) from ss order by 1")
+            .expect_err("should fail");
+        assert_eq!(
+            err,
+            "Unexpected input 'order', the most similar input is {a legal identifier}.",
+        );
     }
 }

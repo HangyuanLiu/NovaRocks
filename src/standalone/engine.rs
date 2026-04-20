@@ -309,8 +309,7 @@ impl StandaloneSession {
         }
 
         // Standard SQL: let sqlparser parse the full statement
-        let stmt = parser
-            .parse_statement()
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
             .map_err(|e| format!("sql parser error: {e}"))?;
         match stmt {
             sqlast::Statement::Explain {

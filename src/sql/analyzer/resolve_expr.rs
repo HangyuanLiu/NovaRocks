@@ -946,10 +946,16 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => vec![],
         };
 
-        if name == "array_agg" && arg_exprs.len() != 1 {
-            return Err(
-                "Unexpected input 'order', the most similar input is {',', ')'}.".to_string(),
-            );
+        if name == "array_agg" {
+            if arg_exprs.is_empty() {
+                return Err("array_agg should have at least one input.".to_string());
+            }
+            if arg_exprs.len() != 1 {
+                return Err(
+                    "Unexpected input 'order', the most similar input is {',', ')'}."
+                        .to_string(),
+                );
+            }
         }
 
         // Analyze arguments

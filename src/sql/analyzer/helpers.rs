@@ -108,6 +108,7 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         // This matches how `SELECT distinct(col)` is parsed: DISTINCT is
         // the SELECT modifier and `(col)` is a Nested expression.
         sqlast::Expr::Nested(inner) => expr_display_name(inner),
+        sqlast::Expr::Value(value) => format_literal_display_name(&value.value),
         sqlast::Expr::CompoundIdentifier(parts) if parts.len() >= 2 => parts
             .last()
             .map(|i| i.value.clone())
@@ -158,6 +159,15 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 s
             }
         }
+    }
+}
+
+fn format_literal_display_name(value: &sqlast::Value) -> String {
+    match value {
+        sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+        other => other.to_string(),
     }
 }
 
@@ -692,5 +702,11 @@ mod tests {
             expr_display_name(&expr),
             "group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')"
         );
+    }
+
+    #[test]
+    fn expr_display_name_normalizes_double_quoted_strings_to_single_quotes() {
+        let expr = parse_select_expr("SELECT array_agg(\"中国\" ORDER BY 1, id)");
+        assert_eq!(expr_display_name(&expr), "array_agg('中国' ORDER BY id ASC)");
     }
 }

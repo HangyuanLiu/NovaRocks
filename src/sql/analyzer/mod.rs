@@ -2807,4 +2807,21 @@ mod tests {
             panic!("expected Select body with RepeatInfo");
         }
     }
+
+    #[test]
+    fn array_agg_without_arguments_reports_starrocks_error() {
+        let err = parse_raw_and_analyze("select array_agg()")
+            .expect_err("array_agg() should fail during analysis");
+        assert_eq!(err, "array_agg should have at least one input.");
+    }
+
+    #[test]
+    fn array_agg_with_multiple_arguments_keeps_order_syntax_error() {
+        let err = parse_raw_and_analyze("select array_agg(1, 2 order by 1)")
+            .expect_err("array_agg with multiple arguments should fail");
+        assert_eq!(
+            err,
+            "Unexpected input 'order', the most similar input is {',', ')'}."
+        );
+    }
 }
