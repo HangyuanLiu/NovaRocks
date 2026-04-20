@@ -10,10 +10,10 @@
 //! rewrite is skipped. Full predicate re-association across the rewrite
 //! is a future improvement.
 
+use crate::sql::analysis::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::analysis::JoinKind;
 
 use super::implement::{collect_column_refs_lowercase, get_group_column_names};
 
@@ -105,7 +105,9 @@ impl Rule for JoinAssociativity {
             // in B ∪ C, and at least one column also lies in B (otherwise the
             // condition is purely over A, which is even more clearly wrong).
             let refs_only_bc = cond_cols.iter().all(|c| bc_cols.contains(c));
-            let refs_any_a = cond_cols.iter().any(|c| a_cols.contains(c) && !bc_cols.contains(c));
+            let refs_any_a = cond_cols
+                .iter()
+                .any(|c| a_cols.contains(c) && !bc_cols.contains(c));
             if !refs_only_bc || refs_any_a {
                 return vec![];
             }

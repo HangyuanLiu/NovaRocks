@@ -282,8 +282,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::planner::plan::{FilterNode, ScanNode};
     use arrow::datatypes::DataType;
     use std::path::PathBuf;

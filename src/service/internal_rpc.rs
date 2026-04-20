@@ -322,9 +322,9 @@ pub(crate) fn handle_lookup(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     #[cfg(feature = "compat")]
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::sync::Arc;
     #[cfg(feature = "compat")]
     use std::sync::Mutex;

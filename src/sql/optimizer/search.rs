@@ -372,7 +372,10 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
                 TopNPhase::Partial => DistributionSpec::Any,
                 TopNPhase::Final => DistributionSpec::Gather,
             };
-            PhysicalPropertySet { distribution, ordering }
+            PhysicalPropertySet {
+                distribution,
+                ordering,
+            }
         }
 
         // Distribution enforcer: outputs whatever its spec says.
@@ -672,7 +675,10 @@ enum Side {
 
 /// Extract `ColumnRef`s from the left or right side of equi-join conditions.
 fn eq_keys_to_column_refs(
-    eq_conditions: &[(crate::sql::analysis::TypedExpr, crate::sql::analysis::TypedExpr)],
+    eq_conditions: &[(
+        crate::sql::analysis::TypedExpr,
+        crate::sql::analysis::TypedExpr,
+    )],
     side: Side,
 ) -> Vec<ColumnRef> {
     eq_conditions
@@ -971,10 +977,8 @@ mod tests {
                         "{} side should receive both eq column refs",
                         side_label
                     );
-                    let qualifiers: std::collections::HashSet<&str> = cols
-                        .iter()
-                        .filter_map(|c| c.qualifier.as_deref())
-                        .collect();
+                    let qualifiers: std::collections::HashSet<&str> =
+                        cols.iter().filter_map(|c| c.qualifier.as_deref()).collect();
                     assert!(
                         qualifiers.contains("a"),
                         "{} side missing a.id, got qualifiers {:?}",
@@ -1023,7 +1027,9 @@ mod tests {
     fn filter_passthrough_parent_required() {
         let op = Operator::PhysicalFilter(PhysicalFilterOp {
             predicate: crate::sql::analysis::TypedExpr {
-                kind: crate::sql::analysis::ExprKind::Literal(crate::sql::analysis::LiteralValue::Bool(true)),
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
                 data_type: arrow::datatypes::DataType::Boolean,
                 nullable: false,
             },

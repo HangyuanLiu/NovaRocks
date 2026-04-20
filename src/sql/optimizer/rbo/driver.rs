@@ -119,10 +119,7 @@ fn rewrite_children(
         }
         LogicalPlan::Aggregate(n) => {
             let (input, ch) = rec!(n.input);
-            (
-                LogicalPlan::Aggregate(AggregateNode { input, ..n }),
-                ch,
-            )
+            (LogicalPlan::Aggregate(AggregateNode { input, ..n }), ch)
         }
         LogicalPlan::Sort(n) => {
             let (input, ch) = rec!(n.input);
@@ -226,7 +223,10 @@ fn rewrite_children(
                     out
                 })
                 .collect();
-            (LogicalPlan::Union(UnionNode { inputs, all: n.all }), changed)
+            (
+                LogicalPlan::Union(UnionNode { inputs, all: n.all }),
+                changed,
+            )
         }
         LogicalPlan::Intersect(n) => {
             let mut changed = false;
@@ -264,8 +264,8 @@ fn rewrite_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::rbo::rule::RewriteRule;
     use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::optimizer::rbo::rule::RewriteRule;
     use crate::sql::planner::plan::{FilterNode, ScanNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -357,7 +357,9 @@ mod tests {
         let plan = LogicalPlan::Filter(FilterNode {
             input: Box::new(dummy_scan()),
             predicate: crate::sql::analysis::TypedExpr {
-                kind: crate::sql::analysis::ExprKind::Literal(crate::sql::analysis::LiteralValue::Bool(true)),
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
                 data_type: arrow::datatypes::DataType::Boolean,
                 nullable: false,
             },

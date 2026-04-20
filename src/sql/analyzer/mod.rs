@@ -1583,8 +1583,8 @@ fn replace_grouping_markers_in_typed_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::{ExprKind, JoinKind, Relation};
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 
     struct TestCatalog;
     impl crate::sql::catalog::CatalogProvider for TestCatalog {

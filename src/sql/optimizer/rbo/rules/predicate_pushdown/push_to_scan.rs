@@ -67,8 +67,8 @@ impl RewriteRule for PushDownPredicateScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -195,15 +195,16 @@ mod tests {
             input: Box::new(scan),
             predicate: pred,
         });
-        let out = PushDownPredicateScan
-            .apply(filter)
-            .expect("should rewrite");
+        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
         match out {
             LogicalPlan::Filter(f) => match *f.input {
                 LogicalPlan::Scan(s) => assert_eq!(s.predicates.len(), 1),
                 other => panic!("expected Scan under residual Filter, got {:?}", other),
             },
-            other => panic!("expected Filter(Scan) for partial pushdown, got {:?}", other),
+            other => panic!(
+                "expected Filter(Scan) for partial pushdown, got {:?}",
+                other
+            ),
         }
     }
 }

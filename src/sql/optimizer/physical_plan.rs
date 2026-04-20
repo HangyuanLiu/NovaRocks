@@ -1,7 +1,7 @@
 //! PhysicalPlan tree extracted from the Memo after optimization.
 
-use crate::sql::optimizer::operator::Operator;
 use crate::sql::analysis::OutputColumn;
+use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// A node in the physical plan tree produced by `extract_best`.

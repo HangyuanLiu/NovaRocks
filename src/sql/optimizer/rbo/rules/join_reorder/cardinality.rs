@@ -5,10 +5,10 @@
 
 use std::collections::HashMap;
 
-use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
 use crate::sql::analysis::*;
-use crate::sql::planner::plan::*;
 use crate::sql::optimizer::statistics::*;
+use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
+use crate::sql::planner::plan::*;
 
 /// Estimate output statistics for a logical plan node recursively.
 pub(crate) fn estimate_statistics(
@@ -393,8 +393,8 @@ fn get_join_key_ndv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
     use arrow::datatypes::DataType;
 
     fn make_table_stats(

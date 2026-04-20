@@ -25,12 +25,12 @@ use crate::partitions;
 use crate::planner;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter;
-use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
 };
+use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::types;
 
 use super::engine::{QueryResult, QueryResultColumn};

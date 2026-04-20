@@ -261,8 +261,8 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use arrow::datatypes::DataType;
     use std::path::PathBuf;
 

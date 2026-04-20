@@ -178,8 +178,7 @@ impl Catalog for HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let ident =
-            TableIdent::new(namespace.clone(), creation.name.clone());
+        let ident = TableIdent::new(namespace.clone(), creation.name.clone());
         let table_location = creation
             .location
             .clone()
@@ -199,12 +198,7 @@ impl Catalog for HadoopFileSystemCatalog {
                 )
             })?
             .build()
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("build metadata: {}", e),
-                )
-            })?;
+            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("build metadata: {}", e)))?;
 
         let metadata = build_result.metadata;
         let metadata_location = self.write_metadata(&table_location, &metadata, 1).await?;
@@ -266,11 +260,7 @@ impl Catalog for HadoopFileSystemCatalog {
 
     /// Register an existing table that already has metadata written at
     /// `metadata_location`.
-    async fn register_table(
-        &self,
-        table: &TableIdent,
-        metadata_location: String,
-    ) -> Result<Table> {
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
             .await
             .map_err(|e| {
@@ -306,7 +296,10 @@ impl Catalog for HadoopFileSystemCatalog {
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("no metadata location for table: {}", Self::table_key(&ident)),
+                    format!(
+                        "no metadata location for table: {}",
+                        Self::table_key(&ident)
+                    ),
                 )
             })?
             .to_string();

@@ -260,11 +260,7 @@ pub(crate) fn create_table(
         .build();
 
     let catalog = build_hadoop_catalog(entry)?;
-    let _ = block_on_iceberg(async {
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-    });
+    let _ = block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
     block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;
@@ -345,10 +341,7 @@ pub(crate) fn load_table(
                 .list(&meta_prefix)
                 .await
                 .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
-            let file_names: Vec<String> = entries
-                .iter()
-                .map(|e| e.name().to_string())
-                .collect();
+            let file_names: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
             let latest = choose_latest_metadata_filename(&file_names)
                 .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
             let path = format!("{meta_prefix}{latest}");
@@ -815,12 +808,13 @@ pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory =
-            super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
-                .ok_or_else(|| {
-                    "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                        .to_string()
-                })?;
+        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
+            &entry.properties,
+        )
+        .ok_or_else(|| {
+            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                .to_string()
+        })?;
         Arc::new(s3_factory)
     } else {
         Arc::new(iceberg::io::LocalFsStorageFactory)

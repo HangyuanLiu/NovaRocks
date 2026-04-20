@@ -54,12 +54,7 @@ impl ExprScope {
     /// Register a qualified alias for lookup without adding to the ordered
     /// column list.  Use this for secondary qualifiers (e.g. `ss.s_store_sk`
     /// when the unqualified `s_store_sk` is already registered).
-    pub fn add_qualified_alias(
-        &mut self,
-        qualifier: String,
-        name: String,
-        binding: ColumnBinding,
-    ) {
+    pub fn add_qualified_alias(&mut self, qualifier: String, name: String, binding: ColumnBinding) {
         let name_lower = name.to_lowercase();
         self.qualified
             .insert((qualifier.to_lowercase(), name_lower), binding);

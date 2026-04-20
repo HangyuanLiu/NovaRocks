@@ -45,11 +45,7 @@ impl RewriteRule for PushDownPredicateJoin {
             return None;
         };
         let (rewritten, pushed_any) = push_predicates_through_join(filter.predicate, join);
-        if pushed_any {
-            Some(rewritten)
-        } else {
-            None
-        }
+        if pushed_any { Some(rewritten) } else { None }
     }
 }
 
@@ -335,9 +331,10 @@ fn factor_common_eq_from_or(
         }
     }
 
-    let or_remaining = if new_branches.iter().all(|b| {
-        matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true)))
-    }) {
+    let or_remaining = if new_branches
+        .iter()
+        .all(|b| matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true))))
+    {
         None // All branches were just the common eq
     } else {
         let mut result = new_branches.remove(0);
@@ -445,8 +442,8 @@ fn merge_join_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -513,7 +510,11 @@ mod tests {
         })
     }
 
-    fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: Option<TypedExpr>) -> LogicalPlan {
+    fn inner_join(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        condition: Option<TypedExpr>,
+    ) -> LogicalPlan {
         LogicalPlan::Join(JoinNode {
             left: Box::new(left),
             right: Box::new(right),
@@ -553,12 +554,10 @@ mod tests {
             LogicalPlan::Join(j) => {
                 assert_eq!(j.join_type, JoinKind::Inner);
                 match *j.left {
-                    LogicalPlan::Filter(f) => {
-                        match *f.input {
-                            LogicalPlan::Scan(_) => {}
-                            other => panic!("expected Scan under left Filter, got {:?}", other),
-                        }
-                    }
+                    LogicalPlan::Filter(f) => match *f.input {
+                        LogicalPlan::Scan(_) => {}
+                        other => panic!("expected Scan under left Filter, got {:?}", other),
+                    },
                     other => panic!("expected Filter on left child, got {:?}", other),
                 }
                 // Right child must be unmodified scan
@@ -591,12 +590,10 @@ mod tests {
                 // Left child must be unmodified scan
                 assert!(matches!(*j.left, LogicalPlan::Scan(_)));
                 match *j.right {
-                    LogicalPlan::Filter(f) => {
-                        match *f.input {
-                            LogicalPlan::Scan(_) => {}
-                            other => panic!("expected Scan under right Filter, got {:?}", other),
-                        }
-                    }
+                    LogicalPlan::Filter(f) => match *f.input {
+                        LogicalPlan::Scan(_) => {}
+                        other => panic!("expected Scan under right Filter, got {:?}", other),
+                    },
                     other => panic!("expected Filter on right child, got {:?}", other),
                 }
             }
@@ -624,7 +621,11 @@ mod tests {
         // Expected: INNER join with condition — no outer Filter
         match out {
             LogicalPlan::Join(j) => {
-                assert_eq!(j.join_type, JoinKind::Inner, "CROSS should be upgraded to INNER");
+                assert_eq!(
+                    j.join_type,
+                    JoinKind::Inner,
+                    "CROSS should be upgraded to INNER"
+                );
                 assert!(j.condition.is_some(), "join condition must be set");
                 // Children should be bare scans (no pushed filters)
                 assert!(matches!(*j.left, LogicalPlan::Scan(_)));

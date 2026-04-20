@@ -424,7 +424,8 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
             iceberg_virtual_file_slot = Some(slot_id);
-            iceberg_virtual_file_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            iceberg_virtual_file_field =
+                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
         if crate::exec::row_position::is_iceberg_row_pos(&name) {
@@ -435,7 +436,8 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
             iceberg_virtual_pos_slot = Some(slot_id);
-            iceberg_virtual_pos_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            iceberg_virtual_pos_field =
+                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
 
@@ -905,8 +907,7 @@ pub(crate) fn lower_hdfs_scan_node(
     // `_pos` are synthesized by the scan runner afterwards), so its chunk
     // schema must omit virtual-column slots to keep the column-count check on
     // the parquet side happy.
-    let parquet_chunk_schema =
-        sub_chunk_schema(desc_tbl, &data_slot_ids, &output_chunk_schema)?;
+    let parquet_chunk_schema = sub_chunk_schema(desc_tbl, &data_slot_ids, &output_chunk_schema)?;
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
         chunk_schema: parquet_chunk_schema,

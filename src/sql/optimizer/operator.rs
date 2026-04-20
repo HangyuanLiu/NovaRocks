@@ -4,9 +4,9 @@
 //! (children are represented as `GroupId`s in `MExpr`).
 //! Physical operators add physical execution decisions (distribution, agg mode).
 
-use crate::sql::catalog::TableDef;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::catalog::TableDef;
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ pub(crate) mod memo;
 pub(crate) mod operator;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
-pub(crate) mod rbo;
 pub(crate) mod property;
+pub(crate) mod rbo;
 pub(crate) mod rule;
 pub(crate) mod rules;
 pub(crate) mod runtime_filter_planner;
@@ -25,8 +25,8 @@ pub(crate) use property::PhysicalPropertySet;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::sql::planner::plan::LogicalPlan;
 use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::planner::plan::LogicalPlan;
 use memo::MExpr;
 use rule::Rule;
 
@@ -68,8 +68,7 @@ pub(crate) fn optimize(
         &options,
         deadline,
     )?;
-    let rewritten =
-        rbo::rules::join_reorder::reorder_joins_cbo(rewritten, table_stats);
+    let rewritten = rbo::rules::join_reorder::reorder_joins_cbo(rewritten, table_stats);
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         rewritten,
         &rbo::rules::predicate_pushdown_rbo_rules(),

@@ -148,7 +148,10 @@ mod tests {
 
         let rule = SortLimitToTopN;
         let out = rule.apply(&limit_mexpr, &mut memo);
-        assert!(out.is_empty(), "expected no alternatives without a Sort child");
+        assert!(
+            out.is_empty(),
+            "expected no alternatives without a Sort child"
+        );
     }
 
     #[test]

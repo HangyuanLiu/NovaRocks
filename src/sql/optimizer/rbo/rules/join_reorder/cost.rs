@@ -5,8 +5,8 @@
 //! hash joins cost build + probe, sorts cost N*log(N), etc.
 
 use crate::sql::analysis::JoinKind;
-use crate::sql::planner::plan::*;
 use crate::sql::optimizer::statistics::*;
+use crate::sql::planner::plan::*;
 
 /// Estimate the self-cost of a single operator (not including children).
 ///
@@ -170,7 +170,9 @@ mod tests {
         let plan = LogicalPlan::Filter(FilterNode {
             input: Box::new(dummy_values()),
             predicate: crate::sql::analysis::TypedExpr {
-                kind: crate::sql::analysis::ExprKind::Literal(crate::sql::analysis::LiteralValue::Bool(true)),
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
                 data_type: DataType::Boolean,
                 nullable: false,
             },

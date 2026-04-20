@@ -24,13 +24,13 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use arrow::datatypes::DataType;
-use crate::sql::catalog::TableStorage;
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use super::cardinality;
 use super::cost;
-use crate::sql::planner::plan::*;
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
+use crate::sql::catalog::TableStorage;
 use crate::sql::optimizer::statistics::*;
+use crate::sql::planner::plan::*;
+use arrow::datatypes::DataType;
 
 /// Count the number of AND-conjuncts in a predicate expression.
 fn count_conjuncts(expr: &TypedExpr) -> usize {
@@ -317,14 +317,13 @@ pub(crate) fn reorder_joins_cbo(
                         dp_join_reorder(optimized_graph, table_stats)
                     } else if n <= 16 {
                         tracing::debug!(n, "join_reorder: using Greedy algorithm");
-                        greedy_join_reorder(optimized_graph.clone(), table_stats)
-                            .or_else(|| {
-                                tracing::debug!(
-                                    n,
-                                    "join_reorder: Greedy failed, falling back to LeftDeep"
-                                );
-                                left_deep_join_reorder(optimized_graph, table_stats)
-                            })
+                        greedy_join_reorder(optimized_graph.clone(), table_stats).or_else(|| {
+                            tracing::debug!(
+                                n,
+                                "join_reorder: Greedy failed, falling back to LeftDeep"
+                            );
+                            left_deep_join_reorder(optimized_graph, table_stats)
+                        })
                     } else {
                         tracing::debug!(n, "join_reorder: using LeftDeep algorithm");
                         left_deep_join_reorder(optimized_graph, table_stats)
@@ -450,8 +449,7 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
         .flat_map(|s| s.iter().map(|r| r.1.clone()))
         .collect();
     for pred in raw_predicates {
-        let (factored, remaining) =
-            factor_common_eq_from_or_for_reorder(&pred);
+        let (factored, remaining) = factor_common_eq_from_or_for_reorder(&pred);
         if factored.is_empty() {
             expanded_predicates.push(pred);
         } else {
@@ -620,7 +618,6 @@ fn dp_join_reorder(
                         table_stats,
                         &mut best,
                     );
-
                 }
 
                 left = (left - 1) & subset;
@@ -1124,8 +1121,8 @@ fn next_k_subset(current: u32, universe: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
     use arrow::datatypes::DataType;
 
     /// Helper: build a `TableDef` backed by S3 parquet files with the given
@@ -1780,9 +1777,10 @@ fn factor_common_eq_from_or_any_side(
             new_branches.push(combine_and(remaining));
         }
     }
-    let or_rem = if new_branches.iter().all(|b| {
-        matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true)))
-    }) {
+    let or_rem = if new_branches
+        .iter()
+        .all(|b| matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true))))
+    {
         None
     } else {
         let mut r = new_branches.remove(0);

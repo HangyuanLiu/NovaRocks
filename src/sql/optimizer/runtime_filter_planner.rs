@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::exprs;
 use crate::plan_nodes;
 use crate::runtime_filter;
-use crate::sql::optimizer::operator::JoinDistribution;
-use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::FragmentBuildResult;
+use crate::sql::codegen::FragmentId;
+use crate::sql::optimizer::operator::JoinDistribution;
 
 use crate::sql::codegen::fragment_builder::ScanTupleOwner;
 

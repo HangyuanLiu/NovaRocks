@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::sql::optimizer::rbo::rule::RewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
 use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::planner::plan::LogicalPlan;
 
 /// Wraps `reorder_joins_cbo` as a RewriteRule.
 ///
@@ -58,8 +58,8 @@ impl RewriteRule for JoinReorderRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{TableDef, TableStorage};
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::{TableDef, TableStorage};
     use crate::sql::planner::plan::ScanNode;
     use arrow::datatypes::DataType;
 

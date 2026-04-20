@@ -2,10 +2,10 @@
 
 use std::fmt::Write;
 
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::planner::plan::LogicalPlan;
 
 /// Detail level for EXPLAIN output.
@@ -407,13 +407,21 @@ fn format_physical_node(
                 .iter()
                 .map(|s| {
                     let dir = if s.asc { "ASC" } else { "DESC" };
-                    let nulls = if s.nulls_first { " NULLS FIRST" } else { " NULLS LAST" };
+                    let nulls = if s.nulls_first {
+                        " NULLS FIRST"
+                    } else {
+                        " NULLS LAST"
+                    };
                     format!("{} {dir}{nulls}", format_expr(&s.expr))
                 })
                 .collect();
             let mut parts = Vec::new();
-            if let Some(l) = op.limit { parts.push(format!("limit={l}")); }
-            if let Some(o) = op.offset { parts.push(format!("offset={o}")); }
+            if let Some(l) = op.limit {
+                parts.push(format!("limit={l}"));
+            }
+            if let Some(o) = op.offset {
+                parts.push(format!("offset={o}"));
+            }
             out.push(format!(
                 "{pad}TOP-N ({}) [{}]{costs_suffix}",
                 parts.join(", "),

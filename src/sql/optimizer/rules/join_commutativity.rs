@@ -3,10 +3,10 @@
 //! Swaps children of a LogicalJoin: `A JOIN B` -> `B JOIN A`, adjusting the
 //! join type to preserve semantics (LeftOuter <-> RightOuter, etc.).
 
+use crate::sql::analysis::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::analysis::JoinKind;
 
 pub(crate) struct JoinCommutativity;
 

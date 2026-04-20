@@ -912,7 +912,9 @@ fn widen_for_join_kind(
     right_cols: Vec<crate::sql::analysis::OutputColumn>,
 ) -> Vec<crate::sql::analysis::OutputColumn> {
     use crate::sql::analysis::JoinKind::*;
-    fn widen(cols: Vec<crate::sql::analysis::OutputColumn>) -> Vec<crate::sql::analysis::OutputColumn> {
+    fn widen(
+        cols: Vec<crate::sql::analysis::OutputColumn>,
+    ) -> Vec<crate::sql::analysis::OutputColumn> {
         cols.into_iter()
             .map(|mut c| {
                 c.nullable = true;
@@ -1334,10 +1336,10 @@ fn child_output_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{JoinKind, OutputColumn};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
-    use crate::sql::analysis::{JoinKind, OutputColumn};
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
@@ -1689,11 +1691,7 @@ mod join_widening_tests {
 
     #[test]
     fn inner_preserves_nullability() {
-        let out = widen_for_join_kind(
-            JoinKind::Inner,
-            vec![c("a", false)],
-            vec![c("b", false)],
-        );
+        let out = widen_for_join_kind(JoinKind::Inner, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 2);
         assert!(!out[0].nullable);
         assert!(!out[1].nullable);
@@ -1734,11 +1732,7 @@ mod join_widening_tests {
 
     #[test]
     fn left_semi_returns_left_only() {
-        let out = widen_for_join_kind(
-            JoinKind::LeftSemi,
-            vec![c("a", false)],
-            vec![c("b", false)],
-        );
+        let out = widen_for_join_kind(JoinKind::LeftSemi, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "a");
         assert!(!out[0].nullable);
@@ -1767,6 +1761,9 @@ mod join_widening_tests {
         assert_eq!(out.len(), 3);
         assert!(out[0].nullable, "nullable source stays nullable");
         assert!(!out[1].nullable, "non-nullable source stays non-nullable");
-        assert!(!out[2].nullable, "non-nullable source on right stays non-nullable");
+        assert!(
+            !out[2].nullable,
+            "non-nullable source on right stays non-nullable"
+        );
     }
 }

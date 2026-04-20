@@ -525,10 +525,9 @@ impl ScanAsyncRunner {
 
         // Pre-build the constant / row-indexed arrays up front so they can be
         // cheaply cloned into the output regardless of slot order.
-        let file_path_array = state
-            .spec
-            .file_path_slot
-            .map(|_| Arc::new(StringArray::from(vec![state.file_path.as_str(); row_count])) as ArrayRef);
+        let file_path_array = state.spec.file_path_slot.map(|_| {
+            Arc::new(StringArray::from(vec![state.file_path.as_str(); row_count])) as ArrayRef
+        });
         let pos_array = state.spec.row_pos_slot.map(|_| {
             let start = state.next_row_offset;
             let values: Vec<i64> = (0..row_count as i64).map(|i| start + i).collect();

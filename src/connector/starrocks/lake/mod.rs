@@ -41,9 +41,9 @@ pub(crate) mod transactions;
 pub(crate) mod txn_loader;
 pub(crate) mod txn_log;
 
+pub(crate) use compaction::{abort_compaction, compact};
 pub(crate) use context::TabletWriteContext;
 pub(crate) use create_tablet::create_lake_tablet_from_req;
-pub(crate) use compaction::{abort_compaction, compact};
 pub(crate) use schema::build_sink_tablet_schema;
 pub(crate) use schema_change::{execute_alter_tablet_task, execute_update_tablet_meta_info_task};
 pub(crate) use transactions::{

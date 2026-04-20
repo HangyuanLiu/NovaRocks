@@ -34,9 +34,9 @@ pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
 pub(crate) fn join_reorder_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn RewriteRule>> {
-    vec![Box::new(join_reorder::JoinReorderRule::new(
-        Arc::new(table_stats.clone()),
-    ))]
+    vec![Box::new(join_reorder::JoinReorderRule::new(Arc::new(
+        table_stats.clone(),
+    )))]
 }
 
 /// All RBO rules including join reorder. For registry test only;

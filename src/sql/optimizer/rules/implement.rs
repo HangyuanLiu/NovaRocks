@@ -7,10 +7,10 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
 
 /// Get lowercase column names from a memo group's output columns.
 pub(super) fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
@@ -816,8 +816,7 @@ impl Rule for TopNToPhysical {
 fn split_window_exprs_by_signature(
     exprs: &[crate::sql::planner::plan::WindowExpr],
 ) -> Vec<Vec<crate::sql::planner::plan::WindowExpr>> {
-    let index_groups =
-        crate::sql::codegen::helpers::group_win_exprs_by_sig(exprs);
+    let index_groups = crate::sql::codegen::helpers::group_win_exprs_by_sig(exprs);
     index_groups
         .into_iter()
         .map(|idxs| idxs.into_iter().map(|i| exprs[i].clone()).collect())
@@ -1280,9 +1279,9 @@ mod eq_pair_tests {
 #[cfg(test)]
 mod join_demotion_tests {
     use super::*;
-    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-    use crate::sql::catalog::{TableDef, TableStorage};
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -1397,17 +1396,15 @@ mod join_demotion_tests {
         );
         let (lhs, rhs) = &phys.eq_conditions[0];
         match &lhs.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(
-                column, "a_id",
-                "left side of eq_condition should be a_id"
-            ),
+            ExprKind::ColumnRef { column, .. } => {
+                assert_eq!(column, "a_id", "left side of eq_condition should be a_id")
+            }
             other => panic!("expected ColumnRef on left of eq pair, got {:?}", other),
         }
         match &rhs.kind {
-            ExprKind::ColumnRef { column, .. } => assert_eq!(
-                column, "b_id",
-                "right side of eq_condition should be b_id"
-            ),
+            ExprKind::ColumnRef { column, .. } => {
+                assert_eq!(column, "b_id", "right side of eq_condition should be b_id")
+            }
             other => panic!("expected ColumnRef on right of eq pair, got {:?}", other),
         }
 
@@ -1441,10 +1438,7 @@ mod join_demotion_tests {
                     ),
                 }
             }
-            other => panic!(
-                "expected BinaryOp::Eq in other_condition, got {:?}",
-                other
-            ),
+            other => panic!("expected BinaryOp::Eq in other_condition, got {:?}", other),
         }
     }
 }
@@ -1452,8 +1446,8 @@ mod join_demotion_tests {
 #[cfg(test)]
 mod window_split_tests {
     use super::*;
-    use arrow::datatypes::DataType;
     use crate::sql::planner::plan::WindowExpr;
+    use arrow::datatypes::DataType;
 
     fn mk_window_expr(name: &str, partition: Vec<TypedExpr>) -> WindowExpr {
         WindowExpr {
@@ -1584,7 +1578,11 @@ mod window_split_tests {
         let terminal = &out[0];
         match &terminal.op {
             Operator::PhysicalWindow(p) => {
-                assert_eq!(p.window_exprs.len(), 1, "should have exactly one window expr");
+                assert_eq!(
+                    p.window_exprs.len(),
+                    1,
+                    "should have exactly one window expr"
+                );
             }
             other => panic!("expected PhysicalWindow, got {:?}", other),
         }

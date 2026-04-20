@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use super::operator::Operator;
-use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::cte::CteId;
 
 // ---------------------------------------------------------------------------
 // Core type aliases

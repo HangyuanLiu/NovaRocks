@@ -168,8 +168,8 @@ pub(crate) fn compute_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::operator::*;
     use crate::sql::analysis::JoinKind;
+    use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use std::collections::HashMap;
 
@@ -327,9 +327,12 @@ mod tests {
         let cost_sort = compute_cost(&sort, &input, &[]);
         let cost_top_n = compute_cost(&top_n, &own, &[&input]);
         // Expected ratio ~ log2(100)/log2(10M) ≈ 0.286.
-        assert!(cost_top_n < cost_sort * 0.5,
+        assert!(
+            cost_top_n < cost_sort * 0.5,
             "expected TOP-N strictly cheaper than Sort; got top_n={} sort={}",
-            cost_top_n, cost_sort);
+            cost_top_n,
+            cost_sort
+        );
     }
 
     #[test]
@@ -366,6 +369,11 @@ mod tests {
         let cost = compute_cost(&top_n, &own, &[&input]);
         // input_rows=10_000, k=100, cost = 10_000 * log2(100) ≈ 66_438.56
         let expected = 10_000.0 * (100f64).log2();
-        assert!((cost - expected).abs() < 1.0, "got {}, expected {}", cost, expected);
+        assert!(
+            (cost - expected).abs() < 1.0,
+            "got {}, expected {}",
+            cost,
+            expected
+        );
     }
 }

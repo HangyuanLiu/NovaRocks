@@ -89,8 +89,10 @@ impl RewriteRule for PushDownPredicateProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -267,7 +269,10 @@ mod tests {
             LogicalPlan::Project(p) => {
                 assert!(matches!(*p.input, LogicalPlan::Filter(_)));
             }
-            other => panic!("expected Project(Filter(Scan)) for pushed constant, got {:?}", other),
+            other => panic!(
+                "expected Project(Filter(Scan)) for pushed constant, got {:?}",
+                other
+            ),
         }
     }
 

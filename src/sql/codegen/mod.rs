@@ -52,7 +52,8 @@ pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,
-    #[allow(dead_code)] // populated by fragment builder, will be read when partition-aware exchange is enabled
+    #[allow(dead_code)]
+    // populated by fragment builder, will be read when partition-aware exchange is enabled
     pub output_partition: partitions::TDataPartition,
     pub edge_kind: FragmentEdgeKind,
 }
@@ -74,7 +75,8 @@ pub(crate) struct FragmentBuildResult {
     pub plan: plan_nodes::TPlan,
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
-    #[allow(dead_code)] // populated by fragment builder, will be read when standalone multi-fragment execution is wired
+    #[allow(dead_code)]
+    // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
     pub output_columns: Vec<OutputColumn>,
     /// CTE ID if this is a multicast fragment.

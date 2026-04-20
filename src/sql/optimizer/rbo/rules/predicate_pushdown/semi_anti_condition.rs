@@ -116,8 +116,8 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
