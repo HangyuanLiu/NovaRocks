@@ -72,12 +72,13 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             // replace the function name portion with the lowercased form.
             let display = format!("{expr}");
             let func_name = f.name.to_string();
+            let display_name = canonical_display_function_name(&func_name);
             let func_lower = func_name.to_lowercase();
             // Case-insensitive find and replace the function name prefix.
             if let Some(pos) = display.to_lowercase().find(&func_lower) {
                 let mut result = String::with_capacity(display.len());
                 result.push_str(&display[..pos]);
-                result.push_str(&func_lower);
+                result.push_str(&display_name);
                 result.push_str(&display[pos + func_name.len()..]);
                 result
             } else {
@@ -164,6 +165,14 @@ fn decimal_kind(precision: u64) -> &'static str {
         "DECIMAL64"
     } else {
         "DECIMAL128"
+    }
+}
+
+fn canonical_display_function_name(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "boolor_agg" => "bool_or".to_string(),
+        "booland_agg" | "every" => "bool_and".to_string(),
+        other => other.to_string(),
     }
 }
 

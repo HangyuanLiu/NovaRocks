@@ -64,7 +64,9 @@ pub fn eval_map_function(
         }
         "map_concat" => super::map_concat::eval_map_concat(arena, expr, args, chunk),
         "map_apply" => super::map_apply::eval_map_apply(arena, expr, args, chunk),
-        "element_at" => super::element_at::eval_element_at(arena, expr, args, chunk),
+        "__map_element_at" | "element_at" => {
+            super::element_at::eval_element_at(arena, expr, args, chunk)
+        }
         "cardinality" => super::cardinality::eval_cardinality(arena, expr, args, chunk),
         other => Err(format!("unsupported map function: {}", other)),
     }
@@ -84,6 +86,7 @@ static MAP_FUNCTIONS: &[(&str, &str)] = &[
     ("map_apply", "map_apply"),
     ("transform_keys", "map_apply"),
     ("transform_values", "map_apply"),
+    ("__map_element_at", "element_at"),
     ("element_at", "element_at"),
     ("cardinality", "cardinality"),
 ];
@@ -153,6 +156,11 @@ static MAP_METADATA: &[FunctionMeta] = &[
         name: "transform_values",
         min_args: 2,
         max_args: 2,
+    },
+    FunctionMeta {
+        name: "__map_element_at",
+        min_args: 2,
+        max_args: 3,
     },
     FunctionMeta {
         name: "element_at",

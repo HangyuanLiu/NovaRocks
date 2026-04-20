@@ -1145,7 +1145,86 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
                 .map(sqlparser_expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
+        sqlast::Expr::Function(func) => sqlparser_function_to_literal(func),
+        sqlast::Expr::Tuple(values) => Ok(Literal::Struct(
+            values
+                .iter()
+                .map(sqlparser_expr_to_literal)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        sqlast::Expr::Struct { values, .. } => Ok(Literal::Struct(
+            values
+                .iter()
+                .map(sqlparser_expr_to_literal)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        sqlast::Expr::Map(map) => Ok(Literal::Map(
+            map.entries
+                .iter()
+                .map(|entry| {
+                    Ok((
+                        sqlparser_expr_to_literal(&entry.key)?,
+                        sqlparser_expr_to_literal(&entry.value)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
         _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+    }
+}
+
+fn sqlparser_function_to_literal(func: &sqlparser::ast::Function) -> Result<Literal, String> {
+    use sqlparser::ast as sqlast;
+
+    let args = function_expr_args(&func.args)?;
+    let name = func.name.to_string().to_ascii_lowercase();
+    match name.as_str() {
+        "row" => Ok(Literal::Struct(
+            args.into_iter()
+                .map(sqlparser_expr_to_literal)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        "map" => {
+            if args.len() % 2 != 0 {
+                return Err(format!(
+                    "MAP literal requires an even number of arguments, got {}",
+                    args.len()
+                ));
+            }
+            let mut entries = Vec::with_capacity(args.len() / 2);
+            for pair in args.chunks_exact(2) {
+                entries.push((
+                    sqlparser_expr_to_literal(pair[0])?,
+                    sqlparser_expr_to_literal(pair[1])?,
+                ));
+            }
+            Ok(Literal::Map(entries))
+        }
+        _ => Err(format!(
+            "unsupported expression in INSERT VALUES: {}",
+            sqlast::Expr::Function(func.clone())
+        )),
+    }
+}
+
+fn function_expr_args(
+    args: &sqlparser::ast::FunctionArguments,
+) -> Result<Vec<&sqlparser::ast::Expr>, String> {
+    use sqlparser::ast as sqlast;
+
+    match args {
+        sqlast::FunctionArguments::None => Ok(Vec::new()),
+        sqlast::FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => Ok(expr),
+                other => Err(format!("unsupported function argument in INSERT VALUES: {other}")),
+            })
+            .collect(),
+        other => Err(format!(
+            "unsupported function argument form in INSERT VALUES: {other}"
+        )),
     }
 }
 
@@ -1671,7 +1750,9 @@ fn cast_literal(value: Literal, data_type: &crate::sql::SqlType) -> Result<Liter
             Literal::Int(v) => Ok(Literal::String(v.to_string())),
             Literal::Float(v) => Ok(Literal::String(v.to_string())),
             Literal::String(_) | Literal::Date(_) => Ok(value),
-            Literal::Array(_) => Err("cannot cast array to string".to_string()),
+            Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
+                Err("cannot cast complex literal to string".to_string())
+            }
         },
         SqlType::Int | SqlType::BigInt | SqlType::TinyInt | SqlType::SmallInt => match &value {
             Literal::Null => Ok(Literal::Null),
@@ -1904,6 +1985,34 @@ fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
                 "item", inner_type, true,
             ))))
         }
+        SqlType::Map(key, value) => {
+            let key_type = sql_type_to_arrow_type(key)?;
+            let value_type = sql_type_to_arrow_type(value)?;
+            let entries = DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", key_type, false)),
+                    Arc::new(Field::new("value", value_type, true)),
+                ]
+                .into(),
+            );
+            Ok(DataType::Map(
+                Arc::new(Field::new("entries", entries, false)),
+                false,
+            ))
+        }
+        SqlType::Struct(fields) => Ok(DataType::Struct(
+            fields
+                .iter()
+                .map(|(name, data_type)| {
+                    Ok(Arc::new(Field::new(
+                        name,
+                        sql_type_to_arrow_type(data_type)?,
+                        true,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into(),
+        )),
     }
 }
 
@@ -2319,6 +2428,120 @@ fn build_local_literal_array(
                 nulls.finish(),
             )))
         }
+        DataType::Struct(fields) => {
+            let mut struct_nulls = NullBufferBuilder::new(values.len());
+            let mut child_values = vec![Vec::with_capacity(values.len()); fields.len()];
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        struct_nulls.append(false);
+                        for child in &mut child_values {
+                            child.push(Literal::Null);
+                        }
+                    }
+                    Literal::Struct(items) => {
+                        if items.len() != fields.len() {
+                            return Err(format!(
+                                "literal {:?} does not match STRUCT field count {}",
+                                literal,
+                                fields.len()
+                            ));
+                        }
+                        struct_nulls.append(true);
+                        for (idx, item) in items.iter().enumerate() {
+                            child_values[idx].push(item.clone());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for STRUCT<{:?}>",
+                            other, fields
+                        ));
+                    }
+                }
+            }
+
+            let child_arrays = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let refs = child_values[idx].iter().collect::<Vec<_>>();
+                    build_local_literal_array(field.data_type(), &refs)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(StructArray::new(
+                fields.clone(),
+                child_arrays,
+                struct_nulls.finish(),
+            )))
+        }
+        DataType::Map(entries_field, ordered) => {
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "local table insert map entries must be STRUCT, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if entry_fields.len() != 2 {
+                return Err(format!(
+                    "local table insert map entries must have 2 fields, got {}",
+                    entry_fields.len()
+                ));
+            }
+
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            let mut map_nulls = NullBufferBuilder::new(values.len());
+            let mut flattened_keys = Vec::new();
+            let mut flattened_values = Vec::new();
+            offsets.push(0_i32);
+
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        map_nulls.append(false);
+                    }
+                    Literal::Map(items) => {
+                        map_nulls.append(true);
+                        for (key, value) in items {
+                            if matches!(key, Literal::Null) {
+                                return Err("MAP literal keys must be non-null".to_string());
+                            }
+                            flattened_keys.push(key.clone());
+                            flattened_values.push(value.clone());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for MAP<{:?}, {:?}>",
+                            other,
+                            entry_fields[0].data_type(),
+                            entry_fields[1].data_type()
+                        ));
+                    }
+                }
+                offsets.push(i32::try_from(flattened_keys.len()).map_err(|_| {
+                    "local table insert map entry count exceeds i32 range".to_string()
+                })?);
+            }
+
+            let key_refs = flattened_keys.iter().collect::<Vec<_>>();
+            let value_refs = flattened_values.iter().collect::<Vec<_>>();
+            let key_array = build_local_literal_array(entry_fields[0].data_type(), &key_refs)?;
+            let value_array =
+                build_local_literal_array(entry_fields[1].data_type(), &value_refs)?;
+            let entries = StructArray::new(
+                entry_fields.clone(),
+                vec![key_array, value_array],
+                None,
+            );
+            Ok(Arc::new(MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                entries,
+                map_nulls.finish(),
+                *ordered,
+            )))
+        }
         other => Err(format!(
             "local table insert does not support column type {:?}",
             other
@@ -2702,6 +2925,8 @@ fn literal_to_key(literal: &Literal) -> LiteralKey {
                 .join(",");
             LiteralKey::String(s)
         }
+        Literal::Map(entries) => LiteralKey::String(format!("{entries:?}")),
+        Literal::Struct(values) => LiteralKey::String(format!("{values:?}")),
     }
 }
 
@@ -2822,6 +3047,41 @@ fn literal_from_batch(column: &ArrayRef, row_idx: usize) -> Result<Literal, Stri
                 items.push(literal_from_batch(&values, idx)?);
             }
             Ok(Literal::Array(items))
+        }
+        DataType::Struct(_) => {
+            let struct_array = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or("downcast StructArray")?;
+            let mut items = Vec::with_capacity(struct_array.num_columns());
+            for child_idx in 0..struct_array.num_columns() {
+                items.push(literal_from_batch(struct_array.column(child_idx), row_idx)?);
+            }
+            Ok(Literal::Struct(items))
+        }
+        DataType::Map(_, _) => {
+            let map = column
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or("downcast MapArray")?;
+            let entries = map.value(row_idx);
+            let entries = entries
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or("downcast StructArray for map entries")?;
+            if entries.num_columns() != 2 {
+                return Err(format!(
+                    "map entries must contain 2 fields, got {}",
+                    entries.num_columns()
+                ));
+            }
+            let keys = entries.column(0);
+            let values = entries.column(1);
+            let mut out = Vec::with_capacity(entries.len());
+            for idx in 0..entries.len() {
+                out.push((literal_from_batch(keys, idx)?, literal_from_batch(values, idx)?));
+            }
+            Ok(Literal::Map(out))
         }
         other => Err(format!(
             "literal_from_batch does not support column type {:?}",
@@ -4190,6 +4450,26 @@ mod tests {
                 crate::sql::parser::ast::Literal::Null,
                 crate::sql::parser::ast::Literal::String("c".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn convert_insert_values_accepts_map_and_row_literals() {
+        use crate::sql::parser::dialect::StarRocksDialect;
+
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &StarRocksDialect,
+            "INSERT INTO t VALUES (1, map('key', 5.5), row(100, 'abc'))",
+        )
+        .expect("parse insert");
+        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert statement");
+        };
+
+        let converted = super::convert_sqlparser_insert_to_custom(insert);
+        assert!(
+            converted.is_ok(),
+            "expected complex literals to convert: {converted:?}"
         );
     }
 

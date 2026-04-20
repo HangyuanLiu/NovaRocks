@@ -4,7 +4,7 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::sql::parser::ast::{
-    CreateTableKind, CreateTableStmt, TableColumnDef, TableKeyDesc, TableKeyKind,
+    CreateTableKind, CreateTableStmt, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 /// Parse StarRocks CREATE TABLE statement:
@@ -113,8 +113,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             }
         }
         let col_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-        let data_type = parser.parse_data_type().map_err(|e| e.to_string())?;
-        let sql_type = convert_sql_type(data_type)?;
+        let sql_type = parse_sql_type_definition(parser)?;
 
         let mut _nullable = true;
         let mut _comment = None;
@@ -152,6 +151,49 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         });
     }
     Ok(columns)
+}
+
+fn parse_sql_type_definition(parser: &mut Parser<'_>) -> Result<SqlType, String> {
+    if peek_word_eq(parser, 0, "MAP") {
+        parse_map_sql_type(parser)
+    } else if peek_word_eq(parser, 0, "STRUCT") {
+        parse_struct_sql_type(parser)
+    } else {
+        let data_type = parser.parse_data_type().map_err(|e| e.to_string())?;
+        convert_sql_type(data_type)
+    }
+}
+
+fn parse_map_sql_type(parser: &mut Parser<'_>) -> Result<SqlType, String> {
+    parser.next_token(); // MAP
+    parser.expect_token(&Token::Lt).map_err(|e| e.to_string())?;
+    let key_type = parse_sql_type_definition(parser)?;
+    parser
+        .expect_token(&Token::Comma)
+        .map_err(|e| e.to_string())?;
+    let value_type = parse_sql_type_definition(parser)?;
+    parser.expect_token(&Token::Gt).map_err(|e| e.to_string())?;
+    Ok(SqlType::Map(Box::new(key_type), Box::new(value_type)))
+}
+
+fn parse_struct_sql_type(parser: &mut Parser<'_>) -> Result<SqlType, String> {
+    parser.next_token(); // STRUCT
+    parser.expect_token(&Token::Lt).map_err(|e| e.to_string())?;
+    let mut fields = Vec::new();
+    loop {
+        if parser.consume_token(&Token::Gt) {
+            break;
+        }
+        if !fields.is_empty() {
+            parser
+                .expect_token(&Token::Comma)
+                .map_err(|e| e.to_string())?;
+        }
+        let field_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+        let field_type = parse_sql_type_definition(parser)?;
+        fields.push((field_name, field_type));
+    }
+    Ok(SqlType::Struct(fields))
 }
 
 fn parse_key_desc(parser: &mut Parser<'_>, kind: TableKeyKind) -> Result<TableKeyDesc, String> {
@@ -284,5 +326,30 @@ fn skip_default_value(parser: &mut Parser<'_>) {
                 parser.next_token();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_create_table_statement;
+    use crate::sql::parser::dialect::StarRocksDialect;
+
+    #[test]
+    fn parse_create_table_accepts_map_and_struct_columns() {
+        let sql = r#"
+            CREATE TABLE t1 (
+                c12 map<varchar(5), double>,
+                c13 struct<a bigint, b string>
+            )
+            DUPLICATE KEY(c12)
+            DISTRIBUTED BY HASH(c12) BUCKETS 3
+            PROPERTIES ("replication_num" = "1")
+        "#;
+
+        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser);
+        assert!(stmt.is_ok(), "expected complex type DDL to parse: {stmt:?}");
     }
 }

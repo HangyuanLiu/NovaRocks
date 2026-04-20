@@ -15,7 +15,7 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
-use iceberg::spec::{ListType, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -1004,6 +1004,38 @@ fn iceberg_type_for_sql_type(data_type: &SqlType, next_field_id: &mut i32) -> Re
                 iceberg_type_for_sql_type(inner, next_field_id)?,
             ))))
         }
+        SqlType::Map(key, value) => {
+            let key_field_id = *next_field_id;
+            *next_field_id += 1;
+            let value_field_id = *next_field_id;
+            *next_field_id += 1;
+            Type::Map(MapType::new(
+                Arc::new(NestedField::required(
+                    key_field_id,
+                    "key",
+                    iceberg_type_for_sql_type(key, next_field_id)?,
+                )),
+                Arc::new(NestedField::optional(
+                    value_field_id,
+                    "value",
+                    iceberg_type_for_sql_type(value, next_field_id)?,
+                )),
+            ))
+        }
+        SqlType::Struct(fields) => Type::Struct(StructType::new(
+            fields
+                .iter()
+                .map(|(name, field_type)| {
+                    let field_id = *next_field_id;
+                    *next_field_id += 1;
+                    Ok(Arc::new(NestedField::optional(
+                        field_id,
+                        name,
+                        iceberg_type_for_sql_type(field_type, next_field_id)?,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
     })
 }
 

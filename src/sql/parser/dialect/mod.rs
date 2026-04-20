@@ -106,6 +106,26 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
             };
             Ok(SqlType::Array(Box::new(inner)))
         }
+        sqlast::DataType::Map(key_type, value_type) => Ok(SqlType::Map(
+            Box::new(convert_sql_type(*key_type)?),
+            Box::new(convert_sql_type(*value_type)?),
+        )),
+        sqlast::DataType::Struct(fields, _) => Ok(SqlType::Struct(
+            fields
+                .into_iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let name = field
+                        .field_name
+                        .map(|ident| ident.value)
+                        .ok_or_else(|| {
+                            format!("STRUCT field at position {} requires a name", idx + 1)
+                        })?;
+                    let field_type = convert_sql_type(field.field_type)?;
+                    Ok((name, field_type))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
         sqlast::DataType::Varbinary(_) => Ok(SqlType::String),
         sqlast::DataType::Binary(_) => Ok(SqlType::String),
         sqlast::DataType::Custom(name, modifiers) => {

@@ -1117,7 +1117,20 @@ pub(crate) fn lower_function_call(
             }
         }
         if let function::FunctionKind::StructFn(name) = kind {
-            if !matches!(data_type, DataType::Struct(_)) {
+            if name == "subfield" {
+                let arg0 = arena
+                    .data_type(children[0])
+                    .ok_or_else(|| "subfield missing arg0 type".to_string())?;
+                let arg1 = arena
+                    .data_type(children[1])
+                    .ok_or_else(|| "subfield missing arg1 type".to_string())?;
+                if !matches!(arg0, DataType::Struct(_)) {
+                    return Err("subfield expects STRUCT as first argument".to_string());
+                }
+                if !matches!(arg1, DataType::Utf8) {
+                    return Err("subfield expects VARCHAR field name as second argument".to_string());
+                }
+            } else if !matches!(data_type, DataType::Struct(_)) {
                 return Err(format!("{} must return STRUCT type", name));
             }
             if name == "named_struct" && children.len() % 2 != 0 {

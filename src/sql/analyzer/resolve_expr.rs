@@ -29,33 +29,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Qualified column reference: table.column or db.table.column
-            sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let qualifier = &parts[0].value;
-                let col_name = &parts[1].value;
-                let (data_type, nullable) = scope.resolve(Some(qualifier), col_name)?;
-                Ok(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        qualifier: Some(qualifier.to_lowercase()),
-                        column: col_name.to_lowercase(),
-                    },
-                    data_type,
-                    nullable,
-                })
-            }
-            // Three-part reference: db.table.column — ignore the db part
-            sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
-                let qualifier = &parts[1].value;
-                let col_name = &parts[2].value;
-                let (data_type, nullable) = scope.resolve(Some(qualifier), col_name)?;
-                Ok(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        qualifier: Some(qualifier.to_lowercase()),
-                        column: col_name.to_lowercase(),
-                    },
-                    data_type,
-                    nullable,
-                })
+            // Qualified column reference or STRUCT field chain encoded by sqlparser
+            // as a compound identifier (for example `c13.a`).
+            sqlast::Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                self.analyze_compound_identifier(parts, scope)
             }
 
             // Literals
@@ -241,6 +218,14 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Function call
             sqlast::Expr::Function(func) => self.analyze_function(func, scope),
+
+            sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+                let mut current = self.analyze_expr(root, scope)?;
+                for access in access_chain {
+                    current = self.analyze_compound_field_access(current, access, scope)?;
+                }
+                Ok(current)
+            }
 
             // Nested (parenthesized)
             sqlast::Expr::Nested(inner) => {
@@ -504,6 +489,156 @@ impl<'a> super::AnalyzerContext<'a> {
 
             other => Err(format!("unsupported expression: {other}")),
         }
+    }
+
+    fn analyze_compound_field_access(
+        &self,
+        base: TypedExpr,
+        access: &sqlast::AccessExpr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, String> {
+        match access {
+            sqlast::AccessExpr::Dot(expr) => {
+                let sqlast::Expr::Identifier(ident) = expr else {
+                    return Err(format!("unsupported dotted field access: {expr}"));
+                };
+                self.analyze_struct_field_access(base, ident.value.clone())
+            }
+            sqlast::AccessExpr::Subscript(sqlast::Subscript::Index { index }) => {
+                let mut index_typed = self.analyze_expr(index, scope)?;
+                let output_type = match &base.data_type {
+                    DataType::List(item) => {
+                        index_typed = cast_to_target_type(index_typed, &DataType::Int32);
+                        item.data_type().clone()
+                    }
+                    DataType::Map(entries, _) => {
+                        let DataType::Struct(fields) = entries.data_type() else {
+                            return Err("map subscript expects STRUCT map entries".to_string());
+                        };
+                        if fields.len() != 2 {
+                            return Err("map subscript expects key/value entries".to_string());
+                        }
+                        index_typed = cast_to_target_type(index_typed, fields[0].data_type());
+                        fields[1].data_type().clone()
+                    }
+                    DataType::Struct(_) => {
+                        return match &index_typed.kind {
+                            ExprKind::Literal(LiteralValue::String(field_name)) => {
+                                self.analyze_struct_field_access(base, field_name.clone())
+                            }
+                            _ => Err(format!(
+                                "struct subscript requires a string literal field name, got {:?}",
+                                index_typed.kind
+                            )),
+                        };
+                    }
+                    other => {
+                        return Err(format!(
+                            "subscript access expects ARRAY, MAP, or STRUCT input, got {:?}",
+                            other
+                        ));
+                    }
+                };
+                let function_name = match &base.data_type {
+                    DataType::List(_) => "__array_element_at",
+                    DataType::Map(_, _) => "__map_element_at",
+                    _ => unreachable!("only array/map subscripts reach this branch"),
+                };
+                Ok(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: function_name.to_string(),
+                        args: vec![base, index_typed],
+                        distinct: false,
+                    },
+                    data_type: output_type,
+                    nullable: true,
+                })
+            }
+            sqlast::AccessExpr::Subscript(sqlast::Subscript::Slice { .. }) => {
+                Err("array slice syntax is not supported".to_string())
+            }
+        }
+    }
+
+    fn analyze_compound_identifier(
+        &self,
+        parts: &[sqlast::Ident],
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, String> {
+        if parts.len() == 2 {
+            let qualifier = &parts[0].value;
+            let col_name = &parts[1].value;
+            if let Ok((data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+                return Ok(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(qualifier.to_lowercase()),
+                        column: col_name.to_lowercase(),
+                    },
+                    data_type,
+                    nullable,
+                });
+            }
+        } else if parts.len() == 3 {
+            let qualifier = &parts[1].value;
+            let col_name = &parts[2].value;
+            if let Ok((data_type, nullable)) = scope.resolve(Some(qualifier), col_name) {
+                return Ok(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(qualifier.to_lowercase()),
+                        column: col_name.to_lowercase(),
+                    },
+                    data_type,
+                    nullable,
+                });
+            }
+        }
+
+        let base_name = &parts[0].value;
+        let (data_type, nullable) = scope.resolve(None, base_name)?;
+        let mut current = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: base_name.to_lowercase(),
+            },
+            data_type,
+            nullable,
+        };
+        for field in &parts[1..] {
+            current = self.analyze_struct_field_access(current, field.value.clone())?;
+        }
+        Ok(current)
+    }
+
+    fn analyze_struct_field_access(
+        &self,
+        base: TypedExpr,
+        field_name: String,
+    ) -> Result<TypedExpr, String> {
+        let DataType::Struct(fields) = &base.data_type else {
+            return Err(format!(
+                "field access expects STRUCT input, got {:?}",
+                base.data_type
+            ));
+        };
+        let field = fields
+            .iter()
+            .find(|field| field.name() == &field_name)
+            .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
+        let field_type = field.data_type().clone();
+        let field_name_expr = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(field_name)),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__struct_subfield".to_string(),
+                args: vec![base, field_name_expr],
+                distinct: false,
+            },
+            data_type: field_type,
+            nullable: true,
+        })
     }
 
     /// Analyze a literal value.
@@ -874,6 +1009,34 @@ impl<'a> super::AnalyzerContext<'a> {
             };
         }
 
+        let needs_boolean_args = matches!(
+            name.as_str(),
+            "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every"
+        );
+        if needs_boolean_args {
+            for arg in &mut args_typed {
+                if arg.data_type != DataType::Boolean {
+                    let inner = std::mem::replace(
+                        arg,
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Null),
+                            data_type: DataType::Null,
+                            nullable: true,
+                        },
+                    );
+                    *arg = TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(inner),
+                            target: DataType::Boolean,
+                        },
+                        data_type: DataType::Boolean,
+                        nullable: true,
+                    };
+                }
+            }
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
         if is_aggregate_function(&name) {
             // Aggregate function
             let return_type = if is_count_star {
@@ -1073,7 +1236,27 @@ impl<'a> super::AnalyzerContext<'a> {
                 if f.over.is_some() {
                     return false;
                 }
-                is_aggregate_function(&f.name.to_string().to_lowercase())
+                if is_aggregate_function(&f.name.to_string().to_lowercase()) {
+                    return true;
+                }
+                match &f.args {
+                    sqlast::FunctionArguments::List(list) => {
+                        list.args.iter().any(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
+                                self.expr_contains_aggregate(expr)
+                            }
+                            _ => false,
+                        }) || list.clauses.iter().any(|clause| match clause {
+                            sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) => {
+                                order_by_exprs
+                                    .iter()
+                                    .any(|item| self.expr_contains_aggregate(&item.expr))
+                            }
+                            _ => false,
+                        })
+                    }
+                    _ => false,
+                }
             }
             sqlast::Expr::BinaryOp { left, right, .. } => {
                 self.expr_contains_aggregate(left) || self.expr_contains_aggregate(right)
@@ -1081,6 +1264,44 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::Expr::UnaryOp { expr, .. } => self.expr_contains_aggregate(expr),
             sqlast::Expr::Nested(inner) => self.expr_contains_aggregate(inner),
             sqlast::Expr::Cast { expr, .. } => self.expr_contains_aggregate(expr),
+            sqlast::Expr::Tuple(items) => items.iter().any(|item| self.expr_contains_aggregate(item)),
+            sqlast::Expr::Array(array) => {
+                array.elem.iter().any(|item| self.expr_contains_aggregate(item))
+            }
+            sqlast::Expr::Struct { values, .. } => {
+                values.iter().any(|item| self.expr_contains_aggregate(item))
+            }
+            sqlast::Expr::Map(map) => map
+                .entries
+                .iter()
+                .any(|entry| {
+                    self.expr_contains_aggregate(&entry.key)
+                        || self.expr_contains_aggregate(&entry.value)
+                }),
+            sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+                self.expr_contains_aggregate(root)
+                    || access_chain.iter().any(|access| match access {
+                        sqlast::AccessExpr::Dot(expr) => self.expr_contains_aggregate(expr),
+                        sqlast::AccessExpr::Subscript(sqlast::Subscript::Index { index }) => {
+                            self.expr_contains_aggregate(index)
+                        }
+                        sqlast::AccessExpr::Subscript(sqlast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => {
+                            lower_bound
+                                .as_ref()
+                                .is_some_and(|expr| self.expr_contains_aggregate(expr))
+                                || upper_bound
+                                    .as_ref()
+                                    .is_some_and(|expr| self.expr_contains_aggregate(expr))
+                                || stride
+                                    .as_ref()
+                                    .is_some_and(|expr| self.expr_contains_aggregate(expr))
+                        }
+                    })
+            }
             sqlast::Expr::Case {
                 conditions,
                 else_result,
@@ -1142,6 +1363,21 @@ fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
         }
     } else {
         expr
+    }
+}
+
+fn cast_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
+    if expr.data_type == *target || expr.data_type == DataType::Null {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(expr),
+            target: target.clone(),
+        },
+        data_type: target.clone(),
+        nullable,
     }
 }
 

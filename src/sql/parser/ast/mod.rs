@@ -117,6 +117,8 @@ pub enum SqlType {
     DateTime,
     Time,
     Array(Box<SqlType>),
+    Map(Box<SqlType>, Box<SqlType>),
+    Struct(Vec<(String, SqlType)>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,4 +227,6 @@ pub(crate) enum Literal {
     String(String),
     Date(String),
     Array(Vec<Literal>),
+    Map(Vec<(Literal, Literal)>),
+    Struct(Vec<Literal>),
 }

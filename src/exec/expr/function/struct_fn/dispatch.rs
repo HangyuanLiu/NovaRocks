@@ -54,7 +54,7 @@ pub fn eval_struct_function(
     match canonical {
         "row" => super::struct_func::eval_row(arena, expr, args, chunk),
         "named_struct" => super::struct_func::eval_named_struct(arena, expr, args, chunk),
-        "subfield" => super::subfield::eval_subfield(arena, expr, args, chunk),
+        "__struct_subfield" | "subfield" => super::subfield::eval_subfield(arena, expr, args, chunk),
         other => Err(format!("unsupported struct function: {}", other)),
     }
 }
@@ -63,6 +63,7 @@ static STRUCT_FUNCTIONS: &[(&str, &str)] = &[
     ("row", "row"),
     ("struct", "row"),
     ("named_struct", "named_struct"),
+    ("__struct_subfield", "subfield"),
 ];
 
 static STRUCT_METADATA: &[FunctionMeta] = &[
@@ -75,6 +76,11 @@ static STRUCT_METADATA: &[FunctionMeta] = &[
         name: "named_struct",
         min_args: 2,
         max_args: usize::MAX,
+    },
+    FunctionMeta {
+        name: "__struct_subfield",
+        min_args: 2,
+        max_args: 2,
     },
     FunctionMeta {
         name: "subfield",

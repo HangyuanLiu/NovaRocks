@@ -190,7 +190,10 @@ pub(crate) fn arrow_type_from_nodes(
             Some(DataType::List(item_field))
         }
         t if t == types::TTypeNodeType::MAP => {
-            let key_field = arrow_field_from_nodes_with_name(types, cursor, "key", true)?;
+            // Arrow MAP keys are non-nullable by definition. Keep the reconstructed
+            // schema aligned with scan/exec-produced MapArray batches so exchange
+            // decode does not reject map columns on key nullability alone.
+            let key_field = arrow_field_from_nodes_with_name(types, cursor, "key", false)?;
             let value_field = arrow_field_from_nodes_with_name(types, cursor, "value", true)?;
             let entries = Arc::new(Field::new(
                 "entries",

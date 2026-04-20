@@ -51,6 +51,7 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "multi_distinct_count"
             | "array_agg"
             | "array_unique_agg"
+            | "map_agg"
             | "percentile_approx"
             | "percentile_approx_weighted"
             | "percentile_cont"
@@ -167,9 +168,52 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
-        "array_length" | "array_position" | "cardinality" => DataType::Int32,
+        "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => item.data_type().clone(),
+            _ => DataType::Null,
+        },
+        "map_keys" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
+                    arrow::datatypes::Field::new("item", fields[0].data_type().clone(), true),
+                )),
+                _ => DataType::Null,
+            },
+            _ => DataType::Null,
+        },
+        "map_values" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
+                    arrow::datatypes::Field::new("item", fields[1].data_type().clone(), true),
+                )),
+                _ => DataType::Null,
+            },
+            _ => DataType::Null,
+        },
+        "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
+            (Some(DataType::List(keys)), Some(DataType::List(values))) => DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new(
+                                "key",
+                                keys.data_type().clone(),
+                                false,
+                            )),
+                            Arc::new(arrow::datatypes::Field::new(
+                                "value",
+                                values.data_type().clone(),
+                                true,
+                            )),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
             _ => DataType::Null,
         },
 
@@ -195,7 +239,11 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         | "multi_distinct_count" => DataType::Int64,
 
         "sum" => match &first_arg {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64 => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
             DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
             _ => DataType::Float64,
@@ -225,9 +273,30 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             let elem = first_arg;
             DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)))
         }
+        "map_agg" => {
+            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
+            let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
+            DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
+                            Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            )
+        }
 
         "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop"
         | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
+        "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
+            DataType::Boolean
+        }
 
         "percentile_approx" => DataType::Float64,
 

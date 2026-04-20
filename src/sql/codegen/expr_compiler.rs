@@ -1364,7 +1364,7 @@ fn infer_scalar_function_return_type(
         )),
         "date" => Ok(DataType::Date32),
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
-        "array_length" | "array_position" | "cardinality" => Ok(DataType::Int32),
+        "array_length" | "array_position" | "cardinality" | "map_size" => Ok(DataType::Int32),
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),
             _ => Ok(DataType::Null),
@@ -1376,14 +1376,66 @@ fn infer_scalar_function_return_type(
         | "array_map" | "array_flatten" | "array_concat" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
+        "__array_element_at" => match arg_types.first() {
+            Some(DataType::List(item)) => Ok(item.data_type().clone()),
+            _ => Ok(DataType::Null),
+        },
         "array_join" | "array_to_string" => Ok(DataType::Utf8),
-        "map_keys" | "map_values" | "map_from_arrays" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
-        }
+        "__map_element_at" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => Ok(fields[1].data_type().clone()),
+                _ => Ok(DataType::Null),
+            },
+            _ => Ok(DataType::Null),
+        },
+        "map_keys" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => Ok(DataType::List(Arc::new(
+                    arrow::datatypes::Field::new("item", fields[0].data_type().clone(), true),
+                ))),
+                _ => Ok(DataType::Null),
+            },
+            _ => Ok(DataType::Null),
+        },
+        "map_values" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => Ok(DataType::List(Arc::new(
+                    arrow::datatypes::Field::new("item", fields[1].data_type().clone(), true),
+                ))),
+                _ => Ok(DataType::Null),
+            },
+            _ => Ok(DataType::Null),
+        },
+        "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
+            (Some(DataType::List(keys)), Some(DataType::List(values))) => Ok(DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new(
+                                "key",
+                                keys.data_type().clone(),
+                                false,
+                            )),
+                            Arc::new(arrow::datatypes::Field::new(
+                                "value",
+                                values.data_type().clone(),
+                                true,
+                            )),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            )),
+            _ => Ok(DataType::Null),
+        },
         "json_query" | "json_extract" | "get_json_string" | "get_json_int" | "get_json_double"
         | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json" => {
             Ok(DataType::Utf8)
         }
+        "__struct_subfield" => Ok(DataType::Null),
         "named_struct" | "struct" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
 
         _ => Err(format!("unknown scalar function: {name}")),
@@ -1408,7 +1460,11 @@ fn infer_agg_function_types(
         "count" => Ok((DataType::Int64, Some(DataType::Int64))),
         "sum" => {
             let out = match &first_arg {
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64 => {
                     DataType::Int64
                 }
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
@@ -1461,7 +1517,9 @@ fn infer_agg_function_types(
             Ok((DataType::Utf8, Some(intermediate)))
         }
         "count_if" => Ok((DataType::Int64, Some(DataType::Int64))),
-        "bool_or" | "bool_and" => Ok((DataType::Boolean, Some(DataType::Boolean))),
+        "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
+            Ok((DataType::Boolean, Some(DataType::Boolean)))
+        }
         "array_agg" => {
             let elem = first_arg.clone();
             let list = DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)));
@@ -1486,6 +1544,25 @@ fn infer_agg_function_types(
                 DataType::Struct(arrow::datatypes::Fields::from(fields))
             };
             Ok((list, Some(intermediate)))
+        }
+        "map_agg" => {
+            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
+            let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
+            let map = DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
+                            Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+            Ok((map.clone(), Some(map)))
         }
         "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Int64))),
         "approx_count_distinct" | "ndv" => Ok((DataType::Int64, Some(DataType::Binary))),

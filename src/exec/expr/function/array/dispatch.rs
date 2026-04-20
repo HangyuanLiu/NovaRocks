@@ -70,7 +70,9 @@ pub fn eval_array_function(
         "array_difference" => {
             super::array_difference::eval_array_difference(arena, expr, args, chunk)
         }
-        "element_at" => super::element_at::eval_element_at(arena, expr, args, chunk),
+        "__array_element_at" | "element_at" => {
+            super::element_at::eval_element_at(arena, expr, args, chunk)
+        }
         "array_filter" => super::array_filter::eval_array_filter(arena, expr, args, chunk),
         "array_flatten" => super::array_flatten::eval_array_flatten(arena, expr, args, chunk),
         "array_generate" => super::array_generate::eval_array_generate(arena, expr, args, chunk),
@@ -106,6 +108,7 @@ static ARRAY_FUNCTIONS: &[(&str, &str)] = &[
     ("array_contains_all", "array_contains_all"),
     ("array_contains_seq", "array_contains_seq"),
     ("array_difference", "array_difference"),
+    ("__array_element_at", "element_at"),
     ("array_distinct", "array_distinct"),
     ("array_filter", "array_filter"),
     ("array_flatten", "array_flatten"),
@@ -181,6 +184,11 @@ static ARRAY_METADATA: &[FunctionMeta] = &[
         name: "array_difference",
         min_args: 1,
         max_args: 1,
+    },
+    FunctionMeta {
+        name: "__array_element_at",
+        min_args: 2,
+        max_args: 3,
     },
     FunctionMeta {
         name: "element_at",

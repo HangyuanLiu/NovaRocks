@@ -398,6 +398,10 @@ fn select_aggregate_inputs(
         "array_agg" | "array_unique_agg" if is_merge => {
             return select_first_for_merge(args, fn_name);
         }
+        // Merge map_agg consumes intermediate map state only.
+        "map_agg" if is_merge => {
+            return select_first_for_merge(args, "map_agg");
+        }
         // Merge approx_top_k consumes intermediate binary state only.
         "approx_top_k" if is_merge => {
             return select_first_for_merge(args, "approx_top_k");
