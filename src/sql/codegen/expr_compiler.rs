@@ -972,6 +972,33 @@ impl<'a> ExprCompiler<'a> {
             arg_types.push(t);
         }
 
+        if name == "__array_literal" {
+            let return_type = if *type_hint != DataType::Null {
+                type_hint.clone()
+            } else {
+                let item_type = arg_types
+                    .iter()
+                    .cloned()
+                    .reduce(|acc, ty| wider_type(&acc, &ty))
+                    .unwrap_or(DataType::Null);
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    item_type,
+                    true,
+                )))
+            };
+            let type_desc = arrow_type_to_type_desc(&return_type)?;
+            self.nodes[parent_idx] = exprs::TExprNode {
+                node_type: exprs::TExprNodeType::ARRAY_EXPR,
+                type_: type_desc,
+                num_children: args.len() as i32,
+                ..default_expr_node()
+            };
+            self.last_type = return_type.clone();
+            self.last_nullable = false;
+            return Ok(return_type);
+        }
+
         let inferred = infer_scalar_function_return_type(name, &arg_types)?;
         // Use the analyzer's type hint if available and more specific than inferred
         let return_type = if *type_hint != DataType::Null {
@@ -1388,6 +1415,8 @@ fn infer_scalar_function_return_type(
             },
             _ => Ok(DataType::Null),
         },
+        "percentile_hash" | "percentile_empty" => Ok(DataType::Binary),
+        "percentile_approx_raw" => Ok(DataType::Float64),
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => Ok(DataType::List(Arc::new(
@@ -1588,12 +1617,33 @@ fn infer_agg_function_types(
         }
         "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance" | "stddev"
         | "stddev_pop" | "stddev_samp" => Ok((DataType::Float64, Some(DataType::Binary))),
-        "percentile_cont"
-        | "percentile_disc"
-        | "percentile_disc_lc"
-        | "percentile_approx"
-        | "percentile_approx_weighted"
-        | "percentile_union" => Ok((DataType::Float64, None)),
+        "percentile_cont" | "percentile_disc" | "percentile_disc_lc" | "percentile_union" => {
+            Ok((DataType::Float64, None))
+        }
+        "percentile_approx" => {
+            let output = if matches!(arg_types.get(1), Some(DataType::List(_))) {
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                )))
+            } else {
+                DataType::Float64
+            };
+            Ok((output, None))
+        }
+        "percentile_approx_weighted" => {
+            let output = if matches!(arg_types.get(2), Some(DataType::List(_))) {
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                )))
+            } else {
+                DataType::Float64
+            };
+            Ok((output, None))
+        }
         "approx_top_k" | "min_n" | "max_n" => Ok((first_arg.clone(), None)),
         _ => {
             // Default: assume output same as first arg, intermediate same as output

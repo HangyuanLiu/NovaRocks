@@ -38,6 +38,8 @@ impl<'a> super::AnalyzerContext<'a> {
             // Literals
             sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => self.analyze_literal(value),
 
+            sqlast::Expr::Array(array) => self.analyze_array_literal(array, scope),
+
             // Binary operations
             sqlast::Expr::BinaryOp { left, op, right } => {
                 self.analyze_binary_op(left, op, right, scope)
@@ -696,6 +698,31 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
+    fn analyze_array_literal(
+        &self,
+        array: &sqlast::Array,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, String> {
+        let mut args = Vec::with_capacity(array.elem.len());
+        let mut item_type = DataType::Null;
+        for item in &array.elem {
+            let typed = self.analyze_expr(item, scope)?;
+            item_type = wider_type(&item_type, &typed.data_type);
+            args.push(typed);
+        }
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__array_literal".to_string(),
+                args,
+                distinct: false,
+            },
+            data_type: DataType::List(
+                arrow::datatypes::Field::new("item", item_type, true).into(),
+            ),
+            nullable: false,
+        })
+    }
+
     /// Analyze a binary operation.
     fn analyze_binary_op(
         &self,
@@ -1037,6 +1064,8 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
+        self.validate_percentile_arguments(&name, &args_typed)?;
+
         if is_aggregate_function(&name) {
             // Aggregate function
             let return_type = if is_count_star {
@@ -1079,6 +1108,90 @@ impl<'a> super::AnalyzerContext<'a> {
                 nullable: true,
             })
         }
+    }
+
+    fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
+        match name {
+            "percentile_cont" | "percentile_disc_lc" => {
+                if let Some(expr) = args.get(1)
+                    && let Some(value) = const_numeric_value(expr)
+                    && !(0.0..=1.0).contains(&value)
+                {
+                    return Err(format!(
+                        "{name} second parameter'value should be between 0 and 1"
+                    ));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let (quantile_idx, compression_idx) = match name {
+            "percentile_approx" => (1usize, 2usize),
+            "percentile_approx_weighted" => (2usize, 3usize),
+            _ => return Ok(()),
+        };
+        if let Some(expr) = args.get(quantile_idx) {
+            self.validate_percentile_quantile_arg(name, quantile_idx, expr)?;
+        }
+        if let Some(expr) = args.get(compression_idx) {
+            self.validate_percentile_compression_arg(name, expr)?;
+        }
+        Ok(())
+    }
+
+    fn validate_percentile_quantile_arg(
+        &self,
+        name: &str,
+        quantile_idx: usize,
+        expr: &TypedExpr,
+    ) -> Result<(), String> {
+        match &expr.data_type {
+            DataType::List(item) => {
+                if matches!(item.data_type(), DataType::Null) {
+                    return Err(format!(
+                        "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.",
+                        ordinal_name(quantile_idx)
+                    ));
+                }
+                if !is_numeric_type(item.data_type()) {
+                    return Err(format!(
+                        "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<{:?}>.",
+                        ordinal_name(quantile_idx),
+                        item.data_type()
+                    ));
+                }
+                if let Some(items) = array_literal_items(expr) {
+                    for (idx, item) in items.iter().enumerate() {
+                        if let Some(value) = const_numeric_value(item) {
+                            validate_percentile_value(name, value, Some(idx))?;
+                        }
+                    }
+                }
+            }
+            data_type if is_numeric_type(data_type) => {
+                if let Some(value) = const_numeric_value(expr) {
+                    validate_percentile_value(name, value, None)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_percentile_compression_arg(
+        &self,
+        name: &str,
+        expr: &TypedExpr,
+    ) -> Result<(), String> {
+        if let Some(value) = const_numeric_value(expr)
+            && value <= 0.0
+        {
+            return Err(format!(
+                "Type check failed. compression parameter must be positive in {name}, but got: {value}"
+            ));
+        }
+        Ok(())
     }
 
     /// Extract ORDER BY clauses from within function arguments (e.g. array_agg(x ORDER BY y)).
@@ -1395,5 +1508,70 @@ fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
         },
         data_type: DataType::Boolean,
         nullable,
+    }
+}
+
+fn ordinal_name(index: usize) -> &'static str {
+    match index {
+        0 => "first",
+        1 => "second",
+        2 => "third",
+        3 => "fourth",
+        _ => "unknown",
+    }
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+    )
+}
+
+fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
+    match &expr.kind {
+        ExprKind::Cast { expr, .. } => strip_casts(expr),
+        ExprKind::Nested(inner) => strip_casts(inner),
+        _ => expr,
+    }
+}
+
+fn array_literal_items(expr: &TypedExpr) -> Option<&[TypedExpr]> {
+    match &strip_casts(expr).kind {
+        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => Some(args),
+        _ => None,
+    }
+}
+
+fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
+    match &strip_casts(expr).kind {
+        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
+        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
+        ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn validate_percentile_value(
+    name: &str,
+    value: f64,
+    array_index: Option<usize>,
+) -> Result<(), String> {
+    if (0.0..=1.0).contains(&value) {
+        return Ok(());
+    }
+    match array_index {
+        Some(idx) => Err(format!(
+            "Type check failed. percentile array element[{idx}] must be between 0 and 1 in {name}, but got: {value}"
+        )),
+        None => Err(format!(
+            "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {value}"
+        )),
     }
 }

@@ -1,4 +1,6 @@
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Fields};
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::JoinKind;
@@ -47,6 +49,49 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                 _ => Err(format!("unsupported SQL type: {name}")),
             }
         }
+        sqlast::DataType::Array(elem_def) => {
+            let inner = match elem_def {
+                sqlast::ArrayElemTypeDef::AngleBracket(inner_type)
+                | sqlast::ArrayElemTypeDef::SquareBracket(inner_type, _)
+                | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => {
+                    sql_type_to_arrow(inner_type)?
+                }
+                sqlast::ArrayElemTypeDef::None => {
+                    return Err("ARRAY type requires an element type".to_string());
+                }
+            };
+            Ok(DataType::List(Arc::new(Field::new("item", inner, true))))
+        }
+        sqlast::DataType::Map(key_type, value_type) => Ok(DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", sql_type_to_arrow(key_type)?, false)),
+                    Arc::new(Field::new("value", sql_type_to_arrow(value_type)?, true)),
+                ])),
+                false,
+            )),
+            false,
+        )),
+        sqlast::DataType::Struct(fields, _) => {
+            let out_fields: Vec<Arc<Field>> = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let name = field
+                        .field_name
+                        .as_ref()
+                        .map(|ident| ident.value.clone())
+                        .unwrap_or_else(|| format!("f{}", idx + 1));
+                    Ok(Arc::new(Field::new(
+                        name,
+                        sql_type_to_arrow(&field.field_type)?,
+                        true,
+                    )))
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(DataType::Struct(Fields::from(out_fields)))
+        }
         other => Err(format!("unsupported CAST target type: {other:?}")),
     }
 }
@@ -87,6 +132,15 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         }
         // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
         // wrap inner with parentheses if it's not a simple identifier or literal.
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } if matches!(data_type, sqlast::DataType::Array(_))
+            && matches!(inner.as_ref(), sqlast::Expr::Array(_)) =>
+        {
+            expr_display_name(inner)
+        }
         sqlast::Expr::Cast {
             expr: inner,
             data_type,

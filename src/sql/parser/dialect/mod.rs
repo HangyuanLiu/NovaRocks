@@ -216,7 +216,8 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
 }
 
 pub(crate) fn normalize_function_syntax(sql: &str) -> Result<String, String> {
-    rewrite_group_concat_separator(sql)
+    let sql = rewrite_group_concat_separator(sql)?;
+    rewrite_typed_array_literals(&sql)
 }
 
 fn rewrite_group_concat_separator(sql: &str) -> Result<String, String> {
@@ -272,7 +273,54 @@ fn rewrite_group_concat_inner(inner: &str) -> Result<String, String> {
     }
 }
 
+fn rewrite_typed_array_literals(sql: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if starts_with_keyword(bytes, idx, "array")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let type_start = idx;
+            let mut cursor = idx + "array".len();
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'<' {
+                let type_end = find_matching_delimiter(sql, cursor, b'<', b'>')?;
+                let mut literal_start = type_end + 1;
+                while literal_start < bytes.len() && bytes[literal_start].is_ascii_whitespace() {
+                    literal_start += 1;
+                }
+                if literal_start < bytes.len() && bytes[literal_start] == b'[' {
+                    let literal_end =
+                        find_matching_delimiter(sql, literal_start, b'[', b']')?;
+                    output.push_str("CAST(");
+                    output.push_str(&sql[literal_start..=literal_end]);
+                    output.push_str(" AS ");
+                    output.push_str(&sql[type_start..=type_end]);
+                    output.push(')');
+                    idx = literal_end + 1;
+                    continue;
+                }
+            }
+        }
+        output.push(bytes[idx] as char);
+        idx += 1;
+    }
+    Ok(output)
+}
+
 fn find_matching_paren(sql: &str, open_idx: usize) -> Result<usize, String> {
+    find_matching_delimiter(sql, open_idx, b'(', b')')
+}
+
+fn find_matching_delimiter(
+    sql: &str,
+    open_idx: usize,
+    open_byte: u8,
+    close_byte: u8,
+) -> Result<usize, String> {
     let bytes = sql.as_bytes();
     let mut depth = 0usize;
     let mut idx = open_idx;
@@ -298,8 +346,8 @@ fn find_matching_paren(sql: &str, open_idx: usize) -> Result<usize, String> {
                 b'\'' => single_quote = true,
                 b'"' => double_quote = true,
                 b'`' => backtick = true,
-                b'(' => depth += 1,
-                b')' => {
+                value if value == open_byte => depth += 1,
+                value if value == close_byte => {
                     depth = depth
                         .checked_sub(1)
                         .ok_or_else(|| "unbalanced parentheses in SQL".to_string())?;

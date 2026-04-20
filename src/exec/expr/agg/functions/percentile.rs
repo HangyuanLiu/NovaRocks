@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Array, ArrayRef, BinaryBuilder, StructArray};
+use arrow::array::{Array, ArrayRef, BinaryBuilder, ListArray, StructArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
@@ -120,15 +120,7 @@ fn canonical_agg_name(name: &str) -> &str {
 }
 
 fn integer_value_at(array: &ArrayRef, row: usize, context: &str) -> Result<Option<i64>, String> {
-    match scalar_from_array(array, row)? {
-        Some(AggScalarValue::Int64(v)) => Ok(Some(v)),
-        Some(AggScalarValue::Float64(v)) => Ok(Some(v as i64)),
-        Some(other) => Err(format!(
-            "{context}: percentile weight expects numeric scalar, got {:?}",
-            other
-        )),
-        None => Ok(None),
-    }
+    Ok(numeric_value_at(array, row, context)?.map(|value| value as i64))
 }
 
 fn validate_quantile(context: &str, quantile: f64) -> Result<(), String> {
@@ -147,43 +139,36 @@ fn apply_unweighted_quantiles(
     row: usize,
     context: &str,
 ) -> Result<(), String> {
-    match scalar_from_array(array, row)? {
-        Some(AggScalarValue::Float64(v)) => {
-            validate_quantile(context, v)?;
-            percentile::set_quantile(state, v)
+    if matches!(array.data_type(), DataType::List(_)) {
+        let list = array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| format!("{context}: failed to downcast percentile array input"))?;
+        if list.is_null(row) {
+            return Ok(());
         }
-        Some(AggScalarValue::Int64(v)) => {
-            let quantile = v as f64;
+        let offsets = list.value_offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        let values = list.values();
+        let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
+        for (idx, value_row) in (start..end).enumerate() {
+            let Some(quantile) = numeric_value_at(&values, value_row, context)? else {
+                return Err(format!(
+                    "{context}: percentile array element[{idx}] cannot be null"
+                ));
+            };
+            validate_quantile(context, quantile)?;
+            quantiles.push(quantile);
+        }
+        return percentile::set_quantiles(state, quantiles);
+    }
+
+    match numeric_value_at(array, row, context)? {
+        Some(quantile) => {
             validate_quantile(context, quantile)?;
             percentile::set_quantile(state, quantile)
         }
-        Some(AggScalarValue::List(values)) => {
-            let mut quantiles = Vec::with_capacity(values.len());
-            for (idx, item) in values.into_iter().enumerate() {
-                let quantile = match item {
-                    Some(AggScalarValue::Float64(v)) => v,
-                    Some(AggScalarValue::Int64(v)) => v as f64,
-                    None => {
-                        return Err(format!(
-                            "{context}: percentile array element[{idx}] cannot be null"
-                        ));
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "{context}: percentile array element[{idx}] must be numeric, got {:?}",
-                            other
-                        ));
-                    }
-                };
-                validate_quantile(context, quantile)?;
-                quantiles.push(quantile);
-            }
-            percentile::set_quantiles(state, quantiles)
-        }
-        Some(other) => Err(format!(
-            "{context}: percentile expects numeric or numeric array, got {:?}",
-            other
-        )),
         None => Ok(()),
     }
 }
@@ -194,43 +179,36 @@ fn apply_weighted_quantiles(
     row: usize,
     context: &str,
 ) -> Result<(), String> {
-    match scalar_from_array(array, row)? {
-        Some(AggScalarValue::Float64(v)) => {
-            validate_quantile(context, v)?;
-            percentile::set_quantile(state, v)
+    if matches!(array.data_type(), DataType::List(_)) {
+        let list = array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| format!("{context}: failed to downcast percentile array input"))?;
+        if list.is_null(row) {
+            return Ok(());
         }
-        Some(AggScalarValue::Int64(v)) => {
-            let quantile = v as f64;
+        let offsets = list.value_offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        let values = list.values();
+        let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
+        for (idx, value_row) in (start..end).enumerate() {
+            let Some(quantile) = numeric_value_at(&values, value_row, context)? else {
+                return Err(format!(
+                    "{context}: percentile array element[{idx}] cannot be null"
+                ));
+            };
+            validate_quantile(context, quantile)?;
+            quantiles.push(quantile);
+        }
+        return percentile::set_quantiles(state, quantiles);
+    }
+
+    match numeric_value_at(array, row, context)? {
+        Some(quantile) => {
             validate_quantile(context, quantile)?;
             percentile::set_quantile(state, quantile)
         }
-        Some(AggScalarValue::List(values)) => {
-            let mut quantiles = Vec::with_capacity(values.len());
-            for (idx, item) in values.into_iter().enumerate() {
-                let quantile = match item {
-                    Some(AggScalarValue::Float64(v)) => v,
-                    Some(AggScalarValue::Int64(v)) => v as f64,
-                    None => {
-                        return Err(format!(
-                            "{context}: percentile array element[{idx}] cannot be null"
-                        ));
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "{context}: percentile array element[{idx}] must be numeric, got {:?}",
-                            other
-                        ));
-                    }
-                };
-                validate_quantile(context, quantile)?;
-                quantiles.push(quantile);
-            }
-            percentile::set_quantiles(state, quantiles)
-        }
-        Some(other) => Err(format!(
-            "{context}: percentile expects numeric or numeric array, got {:?}",
-            other
-        )),
         None => Ok(()),
     }
 }

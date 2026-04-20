@@ -38,6 +38,15 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             column,
         } => column.clone(),
         ExprKind::Literal(lit) => format!("{:?}", lit),
+        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
+            format!(
+                "[{}]",
+                args.iter()
+                    .map(typed_expr_array_item_display_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         ExprKind::FunctionCall { name, args, .. } => {
             if args.is_empty() {
                 format!("{}()", name)
@@ -47,6 +56,20 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             }
         }
         ExprKind::AggregateCall { name, .. } => name.clone(),
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } if matches!(target, arrow::datatypes::DataType::List(_))
+            && matches!(
+                inner.kind,
+                ExprKind::FunctionCall {
+                    ref name,
+                    ..
+                } if name == "__array_literal"
+            ) =>
+        {
+            typed_expr_display_name(inner)
+        }
         ExprKind::Cast {
             expr: inner,
             target,
@@ -62,6 +85,18 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             )
         }
         _ => format!("{:?}", expr.kind),
+    }
+}
+
+fn typed_expr_array_item_display_name(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        ExprKind::Literal(query_ir::LiteralValue::Null) => "NULL".to_string(),
+        ExprKind::Literal(query_ir::LiteralValue::Bool(v)) => v.to_string(),
+        ExprKind::Literal(query_ir::LiteralValue::Int(v)) => v.to_string(),
+        ExprKind::Literal(query_ir::LiteralValue::Float(v)) => v.to_string(),
+        ExprKind::Literal(query_ir::LiteralValue::Decimal(v)) => v.clone(),
+        ExprKind::Literal(query_ir::LiteralValue::String(v)) => format!("'{}'", v),
+        _ => typed_expr_display_name(expr),
     }
 }
 

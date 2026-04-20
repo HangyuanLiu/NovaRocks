@@ -216,6 +216,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             ),
             _ => DataType::Null,
         },
+        "percentile_hash" | "percentile_empty" => DataType::Binary,
+        "percentile_approx_raw" => DataType::Float64,
 
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,
@@ -228,6 +230,13 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
 
 pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
+    let float_array = || {
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Float64,
+            true,
+        )))
+    };
     match name {
         "count"
         | "count_if"
@@ -298,7 +307,20 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             DataType::Boolean
         }
 
-        "percentile_approx" => DataType::Float64,
+        "percentile_approx" => {
+            if matches!(arg_types.get(1), Some(DataType::List(_))) {
+                float_array()
+            } else {
+                DataType::Float64
+            }
+        }
+        "percentile_approx_weighted" => {
+            if matches!(arg_types.get(2), Some(DataType::List(_))) {
+                float_array()
+            } else {
+                DataType::Float64
+            }
+        }
 
         // Default: same as first arg
         _ => {

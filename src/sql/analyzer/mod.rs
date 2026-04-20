@@ -1830,6 +1830,16 @@ mod tests {
         analyze(&query, &TestCatalog, "default")
     }
 
+    fn parse_raw_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
+        let stmt = crate::sql::parser::parse_sql_raw(sql)?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected a query".into()),
+        };
+        let (resolved, _registry) = analyze(&query, &TestCatalog, "default")?;
+        Ok(resolved)
+    }
+
     /// Helper to check that a Relation tree contains a JOIN of a given kind.
     fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
         match rel {
@@ -2342,6 +2352,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_percentile_approx_with_array_literal_returns_array_type() {
+        let resolved = parse_raw_and_analyze(
+            "SELECT percentile_approx(o_totalprice, array<double>[0.25, 0.5]) FROM orders",
+        )
+        .expect("analysis should succeed");
+        assert_eq!(resolved.output_columns.len(), 1);
+        assert!(matches!(
+            resolved.output_columns[0].data_type,
+            arrow::datatypes::DataType::List(_)
+        ));
     }
 
     #[test]
