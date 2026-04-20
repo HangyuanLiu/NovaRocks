@@ -144,6 +144,15 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             let type_str = format_cast_type(data_type);
             format!("CAST({inner_str} AS {type_str})")
         }
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => {
+            let left_str = expr_display_name_with_parens(left);
+            let right_str = expr_display_name_preserve_path(right);
+            format!("{left_str} -> {right_str}")
+        }
         // Binary ops: wrap each operand with parentheses unless it's a simple
         // identifier or literal, matching StarRocks AST2StringVisitor behavior.
         sqlast::Expr::BinaryOp { left, op, right } => {
@@ -168,6 +177,18 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 s
             }
         }
+    }
+}
+
+fn expr_display_name_preserve_path(expr: &sqlast::Expr) -> String {
+    match expr {
+        sqlast::Expr::Nested(inner) => expr_display_name_preserve_path(inner),
+        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => expr_display_name(expr),
     }
 }
 
@@ -230,15 +251,23 @@ fn canonical_display_function_name(name: &str) -> String {
         "boolor_agg" => "bool_or".to_string(),
         "booland_agg" | "every" => "bool_and".to_string(),
         "string_agg" => "group_concat".to_string(),
+        "array_agg_distinct" | "array_unique_agg" => "array_agg".to_string(),
         "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         other => other.to_string(),
     }
 }
 
 fn format_function_display_name(function: &sqlast::Function) -> String {
+    let original_name = function.name.to_string().to_lowercase();
     let canonical_name = canonical_display_function_name(&function.name.to_string());
     if canonical_name == "group_concat" {
         return format_group_concat_display_name(function, &canonical_name);
+    }
+    if matches!(
+        original_name.as_str(),
+        "array_agg_distinct" | "array_unique_agg"
+    ) {
+        return format_array_agg_distinct_display_name(function, &canonical_name);
     }
     if canonical_name == "map" {
         return format_map_display_name(function);
@@ -274,6 +303,38 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
         out.push_str(" OVER ");
         out.push_str(&over.to_string());
     }
+    out
+}
+
+fn format_array_agg_distinct_display_name(
+    function: &sqlast::Function,
+    canonical_name: &str,
+) -> String {
+    let args_display = match &function.args {
+        sqlast::FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(format_function_arg_display_name)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => format_function_arguments(other),
+    };
+    let mut out = format!("{canonical_name}(DISTINCT {args_display}");
+    if let sqlast::FunctionArguments::List(list) = &function.args {
+        for clause in &list.clauses {
+            if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
+                out.push_str(" ORDER BY ");
+                out.push_str(
+                    &order_by_exprs
+                        .iter()
+                        .map(|item| format_function_order_by_expr_display_name(item, &list.args))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+    }
+    out.push(')');
     out
 }
 
@@ -759,5 +820,20 @@ mod tests {
     fn expr_display_name_formats_map_constructor_like_starrocks() {
         let expr = parse_select_expr("SELECT array_agg(map(2, 3))");
         assert_eq!(expr_display_name(&expr), "array_agg(map{2:3})");
+    }
+
+    #[test]
+    fn expr_display_name_formats_array_agg_distinct_like_starrocks() {
+        let expr = parse_select_expr("SELECT array_agg_distinct(name ORDER BY 1 ASC)");
+        assert_eq!(
+            expr_display_name(&expr),
+            "array_agg(DISTINCT name ORDER BY name ASC)"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_preserves_lambda_field_paths() {
+        let expr = parse_select_expr("SELECT array_sortby((x) -> x.item, x)");
+        assert_eq!(expr_display_name(&expr), "array_sortby(x -> x.item, x)");
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
@@ -945,8 +947,10 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::FunctionArguments::None => vec![],
             _ => vec![],
         };
-
-        if name == "array_agg" {
+        if matches!(
+            name.as_str(),
+            "array_agg" | "array_agg_distinct" | "array_unique_agg"
+        ) {
             if arg_exprs.is_empty() {
                 return Err("array_agg should have at least one input.".to_string());
             }
@@ -957,14 +961,26 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
-        // Analyze arguments
-        let mut args_typed = Vec::with_capacity(arg_exprs.len());
-        let mut arg_types = Vec::with_capacity(arg_exprs.len());
-        for arg in &arg_exprs {
-            let typed = self.analyze_expr(arg, scope)?;
-            arg_types.push(typed.data_type.clone());
-            args_typed.push(typed);
-        }
+        // Analyze arguments. For the narrow standalone lambda support needed by
+        // aggregate suite, rewrite `array_sortby((x) -> x.field, arr)` into
+        // `array_sortby(arr, __array_struct_subfield(arr, 'field'))`.
+        let (mut args_typed, mut arg_types) = if name == "array_sortby"
+            && arg_exprs
+                .first()
+                .and_then(|expr| parse_array_sortby_lambda(expr))
+                .is_some()
+        {
+            self.analyze_array_sortby_lambda_arguments(&arg_exprs, scope)?
+        } else {
+            let mut args_typed = Vec::with_capacity(arg_exprs.len());
+            let mut arg_types = Vec::with_capacity(arg_exprs.len());
+            for arg in &arg_exprs {
+                let typed = self.analyze_expr(arg, scope)?;
+                arg_types.push(typed.data_type.clone());
+                args_typed.push(typed);
+            }
+            (args_typed, arg_types)
+        };
 
         self.validate_ds_hll_arguments(&name, &args_typed)?;
 
@@ -1228,6 +1244,77 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
+    fn analyze_array_sortby_lambda_arguments(
+        &self,
+        arg_exprs: &[&sqlast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
+        if arg_exprs.len() != 2 {
+            return Err(
+                "array_sortby lambda rewrite currently supports exactly one lambda and one array argument"
+                    .to_string(),
+            );
+        }
+        let (param_name, lambda_body) = parse_array_sortby_lambda(arg_exprs[0])
+            .ok_or_else(|| "array_sortby lambda rewrite expected a lambda argument".to_string())?;
+        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
+        let field_chain = extract_lambda_field_chain(lambda_body, &param_name)?;
+        if field_chain.is_empty() {
+            return Err(
+                "array_sortby lambda rewrite requires direct struct field access like (x) -> x.item"
+                    .to_string(),
+            );
+        }
+
+        let mut key_expr = array_expr.clone();
+        for field_name in field_chain {
+            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name)?;
+        }
+
+        let arg_types = vec![array_expr.data_type.clone(), key_expr.data_type.clone()];
+        Ok((vec![array_expr, key_expr], arg_types))
+    }
+
+    fn build_array_struct_subfield_expr(
+        &self,
+        base: TypedExpr,
+        field_name: String,
+    ) -> Result<TypedExpr, String> {
+        let DataType::List(item_field) = &base.data_type else {
+            return Err(format!(
+                "array_sortby lambda expects ARRAY input, got {:?}",
+                base.data_type
+            ));
+        };
+        let DataType::Struct(fields) = item_field.data_type() else {
+            return Err(format!(
+                "array_sortby lambda field access expects ARRAY<STRUCT>, got {:?}",
+                base.data_type
+            ));
+        };
+        let field = fields
+            .iter()
+            .find(|field| field.name() == &field_name)
+            .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
+        let field_type = field.data_type().clone();
+        let field_name_expr = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(field_name)),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__array_struct_subfield".to_string(),
+                args: vec![base, field_name_expr],
+                distinct: false,
+            },
+            data_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item", field_type, true,
+            ))),
+            nullable: true,
+        })
+    }
+
     fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
         match name {
             "percentile_cont" | "percentile_disc_lc" => {
@@ -1343,7 +1430,11 @@ impl<'a> super::AnalyzerContext<'a> {
                                         visible_args[pos - 1].clone()
                                     } else if matches!(
                                         func_name.as_str(),
-                                        "array_agg" | "group_concat" | "string_agg"
+                                        "array_agg"
+                                            | "array_agg_distinct"
+                                            | "array_unique_agg"
+                                            | "group_concat"
+                                            | "string_agg"
                                     ) {
                                         let display_name = if func_name == "string_agg" {
                                             "group_concat"
@@ -1819,5 +1910,68 @@ fn validate_percentile_value(
         None => Err(format!(
             "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {value}"
         )),
+    }
+}
+
+fn extract_lambda_field_chain(
+    expr: &sqlast::Expr,
+    param_name: &str,
+) -> Result<Vec<String>, String> {
+    match expr {
+        sqlast::Expr::Nested(inner) => extract_lambda_field_chain(inner, param_name),
+        sqlast::Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(param_name) => {
+            Ok(vec![])
+        }
+        sqlast::Expr::CompoundIdentifier(parts)
+            if !parts.is_empty() && parts[0].value.eq_ignore_ascii_case(param_name) =>
+        {
+            Ok(parts[1..].iter().map(|part| part.value.clone()).collect())
+        }
+        sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut fields = extract_lambda_field_chain(root, param_name)?;
+            for access in access_chain {
+                match access {
+                    sqlast::AccessExpr::Dot(sqlast::Expr::Identifier(ident)) => {
+                        fields.push(ident.value.clone());
+                    }
+                    _ => {
+                        return Err(
+                            "array_sortby lambda rewrite only supports dotted struct field access"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Ok(fields)
+        }
+        _ => Err(
+            "array_sortby lambda rewrite only supports direct struct field access like (x) -> x.item"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_array_sortby_lambda(expr: &sqlast::Expr) -> Option<(String, &sqlast::Expr)> {
+    match expr {
+        sqlast::Expr::Lambda(lambda) => lambda
+            .params
+            .iter()
+            .next()
+            .map(|ident| (ident.value.to_lowercase(), lambda.body.as_ref())),
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => parse_array_sortby_lambda_param(left).map(|param| (param, right.as_ref())),
+        sqlast::Expr::Nested(inner) => parse_array_sortby_lambda(inner),
+        _ => None,
+    }
+}
+
+fn parse_array_sortby_lambda_param(expr: &sqlast::Expr) -> Option<String> {
+    match expr {
+        sqlast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+        sqlast::Expr::Nested(inner) => parse_array_sortby_lambda_param(inner),
+        _ => None,
     }
 }

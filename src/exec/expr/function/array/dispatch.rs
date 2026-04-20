@@ -73,6 +73,9 @@ pub fn eval_array_function(
         "__array_element_at" | "element_at" => {
             super::element_at::eval_element_at(arena, expr, args, chunk)
         }
+        "__array_struct_subfield" | "array_struct_subfield" => {
+            super::array_struct_subfield::eval_array_struct_subfield(arena, expr, args, chunk)
+        }
         "array_filter" => super::array_filter::eval_array_filter(arena, expr, args, chunk),
         "array_flatten" => super::array_flatten::eval_array_flatten(arena, expr, args, chunk),
         "array_generate" => super::array_generate::eval_array_generate(arena, expr, args, chunk),
@@ -109,6 +112,8 @@ static ARRAY_FUNCTIONS: &[(&str, &str)] = &[
     ("array_contains_seq", "array_contains_seq"),
     ("array_difference", "array_difference"),
     ("__array_element_at", "element_at"),
+    ("__array_struct_subfield", "array_struct_subfield"),
+    ("array_struct_subfield", "array_struct_subfield"),
     ("array_distinct", "array_distinct"),
     ("array_filter", "array_filter"),
     ("array_flatten", "array_flatten"),
@@ -189,6 +194,16 @@ static ARRAY_METADATA: &[FunctionMeta] = &[
         name: "__array_element_at",
         min_args: 2,
         max_args: 3,
+    },
+    FunctionMeta {
+        name: "__array_struct_subfield",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "array_struct_subfield",
+        min_args: 2,
+        max_args: 2,
     },
     FunctionMeta {
         name: "element_at",

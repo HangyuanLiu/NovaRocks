@@ -258,15 +258,25 @@ fn encode_aggregate_name(
     fn_name: &str,
     query_opts: Option<&crate::internal_service::TQueryOptions>,
 ) -> Result<String, String> {
-    if fn_name == "array_agg" {
+    if matches!(
+        fn_name,
+        "array_agg" | "array_agg_distinct" | "array_unique_agg"
+    ) {
         let aggregate_fn = node.fn_.as_ref().and_then(|f| f.aggregate_fn.as_ref());
-        let is_distinct = aggregate_fn
-            .and_then(|agg| agg.is_distinct)
-            .unwrap_or(false);
-        let base = if is_distinct {
-            "array_agg_distinct"
-        } else {
-            "array_agg"
+        let base = match fn_name {
+            "array_agg" => {
+                let is_distinct = aggregate_fn
+                    .and_then(|agg| agg.is_distinct)
+                    .unwrap_or(false);
+                if is_distinct {
+                    "array_agg_distinct"
+                } else {
+                    "array_agg"
+                }
+            }
+            "array_agg_distinct" => "array_agg_distinct",
+            "array_unique_agg" => "array_unique_agg",
+            _ => unreachable!("unexpected array_agg variant: {fn_name}"),
         };
         let is_asc_order = aggregate_fn
             .and_then(|agg| agg.is_asc_order.clone())
@@ -395,7 +405,7 @@ fn select_aggregate_inputs(
             return select_first_for_merge(args, "group_concat");
         }
         // Merge array_agg consumes intermediate state only.
-        "array_agg" | "array_unique_agg" if is_merge => {
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" if is_merge => {
             return select_first_for_merge(args, fn_name);
         }
         // Merge map_agg consumes intermediate map state only.

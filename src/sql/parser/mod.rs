@@ -79,4 +79,53 @@ mod tests {
             "Unexpected input 'order', the most similar input is {a legal identifier}.",
         );
     }
+
+    #[test]
+    fn parse_sql_raw_parses_array_sortby_lambda_argument_shape() {
+        let stmt =
+            parse_sql_raw("SELECT array_sortby((x) -> x.item, x)").expect("parse should succeed");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Function(func)) =
+            &select.projection[0]
+        else {
+            panic!("expected function call projection");
+        };
+        let sqlparser::ast::FunctionArguments::List(args) = &func.args else {
+            panic!("expected list arguments");
+        };
+        let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(first_arg)) =
+            &args.args[0]
+        else {
+            panic!("expected first function argument expr");
+        };
+        assert!(
+            matches!(
+                first_arg,
+                sqlparser::ast::Expr::BinaryOp {
+                    left,
+                    op: sqlparser::ast::BinaryOperator::Arrow,
+                    right,
+                } if matches!(
+                    left.as_ref(),
+                    sqlparser::ast::Expr::Nested(inner)
+                        if matches!(
+                            inner.as_ref(),
+                            sqlparser::ast::Expr::Identifier(ident) if ident.value == "x"
+                        )
+                ) && matches!(
+                    right.as_ref(),
+                    sqlparser::ast::Expr::CompoundIdentifier(parts)
+                        if parts.len() == 2
+                            && parts[0].value == "x"
+                            && parts[1].value == "item"
+                )
+            ),
+            "unexpected lambda arg shape: {first_arg:?}"
+        );
+    }
 }

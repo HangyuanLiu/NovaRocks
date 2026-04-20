@@ -1254,8 +1254,10 @@ fn semantic_aggregate_type_desc(
     args: &[TypedExpr],
     return_type: &DataType,
 ) -> Result<types::TTypeDesc, String> {
-    if name == "array_agg"
-        && let Some(item) = args.first()
+    if matches!(
+        name,
+        "array_agg" | "array_agg_distinct" | "array_unique_agg"
+    ) && let Some(item) = args.first()
     {
         return list_type_desc(typed_expr_type_desc(item)?);
     }
@@ -1264,6 +1266,22 @@ fn semantic_aggregate_type_desc(
             typed_expr_type_desc(&args[0])?,
             typed_expr_type_desc(&args[1])?,
         );
+    }
+    if name == "approx_top_k"
+        && let Some(item) = args.first()
+    {
+        let struct_type = DataType::Struct(
+            vec![
+                Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    item.data_type.clone(),
+                    true,
+                )),
+                Arc::new(arrow::datatypes::Field::new("count", DataType::Int64, true)),
+            ]
+            .into(),
+        );
+        return list_type_desc(arrow_type_to_type_desc(&struct_type)?);
     }
     arrow_type_to_type_desc(return_type)
 }
@@ -1613,9 +1631,10 @@ fn infer_scalar_function_return_type(
         | "percentile_disc_lc"
         | "percentile_approx"
         | "percentile_approx_weighted" => Ok(DataType::Float64),
-        "approx_top_k" | "min_n" | "max_n" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
-        }
+        "approx_top_k" => Ok(approx_top_k_output_type(
+            arg_types.first().cloned().unwrap_or(DataType::Null),
+        )),
+        "min_n" | "max_n" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "bitmap_union_int" | "bitmap_count" | "bitmap_union_count" => Ok(DataType::Int64),
         "hll_union_agg"
         | "hll_cardinality"
@@ -1649,8 +1668,8 @@ fn infer_scalar_function_return_type(
         "array_contains" | "array_distinct" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
-        "array_sort" | "array_reverse" | "array_slice" | "array_remove" | "array_filter"
-        | "array_map" | "array_flatten" | "array_concat" => {
+        "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
+        | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
         "__array_element_at" => match arg_types.first() {
@@ -1715,7 +1734,7 @@ fn infer_scalar_function_return_type(
         | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json" => {
             Ok(DataType::Utf8)
         }
-        "__struct_subfield" => Ok(DataType::Null),
+        "__struct_subfield" | "__array_struct_subfield" => Ok(DataType::Null),
         "named_struct" | "struct" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
 
         _ => Err(format!("unknown scalar function: {name}")),
@@ -1828,7 +1847,7 @@ fn infer_agg_function_types(
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
             Ok((DataType::Boolean, Some(DataType::Boolean)))
         }
-        "array_agg" => {
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
             let elem = first_arg.clone();
             let list = DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)));
             let intermediate = if arg_types.len() <= 1 {
@@ -1930,7 +1949,8 @@ fn infer_agg_function_types(
             };
             Ok((output, None))
         }
-        "approx_top_k" | "min_n" | "max_n" => Ok((first_arg.clone(), None)),
+        "approx_top_k" => Ok((approx_top_k_output_type(first_arg), Some(DataType::Binary))),
+        "min_n" | "max_n" => Ok((first_arg.clone(), None)),
         _ => {
             // Default: assume output same as first arg, intermediate same as output
             let out = if arg_types.is_empty() {
@@ -1941,4 +1961,18 @@ fn infer_agg_function_types(
             Ok((out.clone(), Some(out)))
         }
     }
+}
+
+fn approx_top_k_output_type(item_type: DataType) -> DataType {
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item",
+        DataType::Struct(
+            vec![
+                Arc::new(arrow::datatypes::Field::new("item", item_type, true)),
+                Arc::new(arrow::datatypes::Field::new("count", DataType::Int64, true)),
+            ]
+            .into(),
+        ),
+        true,
+    )))
 }

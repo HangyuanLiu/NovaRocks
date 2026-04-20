@@ -104,6 +104,7 @@ pub(super) fn validate_scalar_function_call(
     let expected_arity = match name {
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
         | "array_max" => Some(1usize),
+        "__array_struct_subfield" => Some(2usize),
         _ => None,
     };
     if let Some(expected) = expected_arity
@@ -131,6 +132,7 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "bitmap_union_int"
             | "multi_distinct_count"
             | "array_agg"
+            | "array_agg_distinct"
             | "array_unique_agg"
             | "map_agg"
             | "percentile_approx"
@@ -266,6 +268,10 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             Some(DataType::List(item)) => item.data_type().clone(),
             _ => DataType::Null,
         },
+        "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
+        | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
+            arg_types.first().cloned().unwrap_or(DataType::Null)
+        }
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
@@ -312,6 +318,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         },
         "percentile_hash" | "percentile_empty" => DataType::Binary,
         "percentile_approx_raw" => DataType::Float64,
+        "__array_struct_subfield" => DataType::Null,
 
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,
@@ -361,6 +368,19 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             true,
         )))
     };
+    let approx_top_k_array = |item_type: DataType| {
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("item", item_type, true)),
+                    Arc::new(arrow::datatypes::Field::new("count", DataType::Int64, true)),
+                ]
+                .into(),
+            ),
+            true,
+        )))
+    };
     match name {
         "count"
         | "count_if"
@@ -406,7 +426,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         "group_concat" | "string_agg" => DataType::Utf8,
         "dict_merge" => DataType::Utf8,
         "ds_hll_count_distinct_union" | "hll_union" | "hll_raw_agg" => DataType::Binary,
-        "array_agg" => {
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
             let elem = first_arg;
             DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)))
         }
@@ -447,6 +467,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
                 DataType::Float64
             }
         }
+        "approx_top_k" => approx_top_k_array(first_arg),
 
         // Default: same as first arg
         _ => {
