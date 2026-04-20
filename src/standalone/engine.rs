@@ -260,9 +260,7 @@ impl StandaloneSession {
         if looks_like_create_table(&parser) {
             // Handle CREATE TABLE <name> PROPERTIES(...) (no column defs) for
             // local-parquet tables whose schema is inferred from the file.
-            if let Some(local_parquet_stmt) =
-                try_parse_local_parquet_create_table(&normalized)?
-            {
+            if let Some(local_parquet_stmt) = try_parse_local_parquet_create_table(&normalized)? {
                 return execute_create_table_statement(
                     &self.inner,
                     local_parquet_stmt,
@@ -1142,29 +1140,11 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
             }
         }
         // Handle array literal [1, 2, 3]
-        sqlast::Expr::Array(sqlast::Array { elem, .. }) => {
-            // Store as JSON-like string for now
-            let elements: Result<Vec<String>, _> = elem
-                .iter()
-                .map(|e| {
-                    sqlparser_expr_to_literal(e).map(|l| match l {
-                        Literal::Null => "null".to_string(),
-                        Literal::Bool(b) => b.to_string(),
-                        Literal::Int(i) => i.to_string(),
-                        Literal::Float(f) => f.to_string(),
-                        Literal::String(s) | Literal::Date(s) => format!("\"{s}\""),
-                        Literal::Array(a) => format!(
-                            "[{}]",
-                            a.iter()
-                                .map(|x| format!("{x:?}"))
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ),
-                    })
-                })
-                .collect();
-            Ok(Literal::String(format!("[{}]", elements?.join(","))))
-        }
+        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(Literal::Array(
+            elem.iter()
+                .map(sqlparser_expr_to_literal)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
     }
 }
@@ -2139,6 +2119,7 @@ fn build_local_literal_array(
     values: &[&Literal],
 ) -> Result<ArrayRef, String> {
     use arrow::array::*;
+    use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
     match data_type {
         DataType::Int8 => Ok(Arc::new(Int8Array::from(
@@ -2297,6 +2278,45 @@ fn build_local_literal_array(
                         other => Err(format!("literal {:?} is not valid for DATETIME", other)),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
+            )))
+        }
+        DataType::List(field) => {
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            let mut nulls = NullBufferBuilder::new(values.len());
+            let mut flattened = Vec::new();
+            offsets.push(0_i32);
+
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        nulls.append(false);
+                        offsets.push(i32::try_from(flattened.len()).map_err(|_| {
+                            "local table insert list value count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    Literal::Array(items) => {
+                        nulls.append(true);
+                        flattened.extend(items.iter());
+                        offsets.push(i32::try_from(flattened.len()).map_err(|_| {
+                            "local table insert list value count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for ARRAY<{:?}>",
+                            other,
+                            field.data_type()
+                        ));
+                    }
+                }
+            }
+
+            let values = build_local_literal_array(field.data_type(), &flattened)?;
+            Ok(Arc::new(ListArray::new(
+                field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                values,
+                nulls.finish(),
             )))
         }
         other => Err(format!(
@@ -3411,9 +3431,7 @@ fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut 
 
 /// Extract `(catalog, database, table)` triples from 3-part table references
 /// in a query AST.
-fn extract_three_part_table_refs(
-    query: &sqlparser::ast::Query,
-) -> Vec<(String, String, String)> {
+fn extract_three_part_table_refs(query: &sqlparser::ast::Query) -> Vec<(String, String, String)> {
     let mut refs = Vec::new();
     extract_three_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
     refs.sort();
@@ -4078,7 +4096,7 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
 #[cfg(test)]
 mod tests {
     use super::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
-    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, ListArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -4137,6 +4155,98 @@ mod tests {
             &physical, &catalog, "default",
         )
         .expect("build fragments")
+    }
+
+    #[test]
+    fn sqlparser_insert_values_preserves_array_literals() {
+        use crate::sql::parser::dialect::StarRocksDialect;
+
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &StarRocksDialect,
+            "INSERT INTO t VALUES (1, [1, NULL, 3], ['a', NULL, 'c'])",
+        )
+        .expect("parse insert");
+        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert statement");
+        };
+        let source = insert.source.as_ref().expect("insert source");
+        let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+            panic!("expected values source");
+        };
+        let row = &values.rows[0];
+
+        assert_eq!(
+            super::sqlparser_expr_to_literal(&row[1]).expect("parse int array"),
+            crate::sql::parser::ast::Literal::Array(vec![
+                crate::sql::parser::ast::Literal::Int(1),
+                crate::sql::parser::ast::Literal::Null,
+                crate::sql::parser::ast::Literal::Int(3),
+            ])
+        );
+        assert_eq!(
+            super::sqlparser_expr_to_literal(&row[2]).expect("parse string array"),
+            crate::sql::parser::ast::Literal::Array(vec![
+                crate::sql::parser::ast::Literal::String("a".to_string()),
+                crate::sql::parser::ast::Literal::Null,
+                crate::sql::parser::ast::Literal::String("c".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn build_local_insert_batch_supports_array_columns() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let columns = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "score_items".to_string(),
+                data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                nullable: true,
+            },
+            ColumnDef {
+                name: "tags".to_string(),
+                data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                nullable: true,
+            },
+        ];
+        let rows = vec![
+            vec![
+                Literal::Int(1),
+                Literal::Array(vec![Literal::Int(90), Literal::Null, Literal::Int(80)]),
+                Literal::Array(vec![
+                    Literal::String("a".to_string()),
+                    Literal::Null,
+                    Literal::String("c".to_string()),
+                ]),
+            ],
+            vec![Literal::Int(2), Literal::Null, Literal::Array(vec![])],
+        ];
+
+        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
+        let scores = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("score_items list array");
+        let tags = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("tags list array");
+
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores.value(0).len(), 3);
+        assert!(scores.is_null(1));
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags.value(0).len(), 3);
+        assert_eq!(tags.value(1).len(), 0);
     }
 
     #[test]

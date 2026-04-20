@@ -10,7 +10,9 @@
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::optimizer::memo::{MExpr, Memo};
-use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp};
+use crate::sql::optimizer::operator::{
+    AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
+};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::planner::plan::AggregateCall;
 
@@ -33,6 +35,14 @@ impl Rule for SplitDistinctAgg {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return vec![];
         };
+
+        if agg
+            .aggregates
+            .iter()
+            .any(|call| !call.distinct && !call.order_by.is_empty())
+        {
+            return vec![];
+        }
 
         // Validate single-DISTINCT-column precondition.
         let distinct_col = match extract_single_distinct_col(&agg.aggregates) {
@@ -284,6 +294,7 @@ mod tests {
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, LogicalScanOp};
     use arrow::datatypes::DataType;
+    use std::sync::Arc;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
@@ -400,6 +411,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_skips_non_distinct_order_sensitive_aggregate() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![col("g")],
+                aggregates: vec![
+                    AggregateCall {
+                        name: "array_agg".into(),
+                        args: vec![col("name")],
+                        distinct: false,
+                        result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
+                            "item",
+                            DataType::Int64,
+                            true,
+                        ))),
+                        order_by: vec![crate::sql::analysis::SortItem {
+                            expr: col("id"),
+                            asc: true,
+                            nulls_first: true,
+                        }],
+                    },
+                    count_distinct("name"),
+                ],
+                output_columns: vec![],
+            }),
+            children: vec![sg],
+        };
+        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+    }
+
+    #[test]
     fn extracts_distinct_col_for_same_col_multi_distinct() {
         // count(distinct x) + sum(distinct x) -- same col. Accepts both.
         let sum_distinct_x = AggregateCall {
@@ -410,7 +455,10 @@ mod tests {
             order_by: vec![],
         };
         let col_out = extract_single_distinct_col(&[count_distinct("x"), sum_distinct_x]);
-        assert!(col_out.is_some(), "expected Some for same-column multi-DISTINCT");
+        assert!(
+            col_out.is_some(),
+            "expected Some for same-column multi-DISTINCT"
+        );
         let ExprKind::ColumnRef { column, .. } = &col_out.unwrap().kind else {
             panic!("expected ColumnRef");
         };

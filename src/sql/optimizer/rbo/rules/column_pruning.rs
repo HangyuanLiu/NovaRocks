@@ -146,6 +146,11 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                         child_needed.insert(col.to_lowercase());
                     }
                 }
+                for item in &agg.order_by {
+                    for col in collect_column_refs(&item.expr) {
+                        child_needed.insert(col.to_lowercase());
+                    }
+                }
             }
             let input = prune_inner(*node.input, Some(&child_needed));
             LogicalPlan::Aggregate(AggregateNode {
@@ -294,8 +299,10 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use arrow::datatypes::DataType;
 
     fn three_col_table() -> TableDef {
@@ -388,7 +395,9 @@ mod tests {
         });
 
         let rule = PruneColumns;
-        let out = rule.apply(project).expect("rule should fire and set required_columns");
+        let out = rule
+            .apply(project)
+            .expect("rule should fire and set required_columns");
 
         if let LogicalPlan::Project(p) = out {
             if let LogicalPlan::Scan(s) = *p.input {
@@ -471,8 +480,16 @@ mod tests {
                 order_by: vec![],
             }],
             output_columns: vec![
-                OutputColumn { name: "b".to_string(), data_type: DataType::Utf8, nullable: true },
-                OutputColumn { name: "sum_c".to_string(), data_type: DataType::Float64, nullable: true },
+                OutputColumn {
+                    name: "b".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                },
+                OutputColumn {
+                    name: "sum_c".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                },
             ],
         });
 

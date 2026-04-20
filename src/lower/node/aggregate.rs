@@ -289,7 +289,7 @@ fn encode_aggregate_name(
         return Ok(format!("{base}|a={asc}|n={nulls}"));
     }
 
-    if fn_name != "group_concat" {
+    if fn_name != "group_concat" && fn_name != "string_agg" {
         return Ok(fn_name.to_string());
     }
 
@@ -318,7 +318,7 @@ fn encode_aggregate_name(
         .unwrap_or(1024)
         .max(4);
     Ok(format!(
-        "group_concat|d={}|a={}|n={}|m={}",
+        "{fn_name}|d={}|a={}|n={}|m={}",
         if is_distinct { 1 } else { 0 },
         asc,
         nulls,

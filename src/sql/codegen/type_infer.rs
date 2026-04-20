@@ -5,7 +5,71 @@ use crate::types;
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
+    let mut nodes = Vec::new();
+    append_arrow_type_nodes(data_type, &mut nodes)?;
+    Ok(types::TTypeDesc::new(nodes))
+}
+
+fn append_arrow_type_nodes(
+    data_type: &DataType,
+    nodes: &mut Vec<types::TTypeNode>,
+) -> Result<(), String> {
     match data_type {
+        DataType::List(field) => {
+            nodes.push(types::TTypeNode {
+                type_: types::TTypeNodeType::ARRAY,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: None,
+            });
+            append_arrow_type_nodes(field.data_type(), nodes)
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "MAP logical entries field must be Struct, got {:?}",
+                    entries.data_type()
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "MAP logical entries field must have exactly 2 children, got {}",
+                    fields.len()
+                ));
+            }
+            nodes.push(types::TTypeNode {
+                type_: types::TTypeNodeType::MAP,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: None,
+            });
+            append_arrow_type_nodes(fields[0].data_type(), nodes)?;
+            append_arrow_type_nodes(fields[1].data_type(), nodes)
+        }
+        DataType::Struct(fields) => {
+            nodes.push(types::TTypeNode {
+                type_: types::TTypeNodeType::STRUCT,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: Some(
+                    fields
+                        .iter()
+                        .map(|field| {
+                            types::TStructField::new(
+                                Some(field.name().to_string()),
+                                None::<String>,
+                                None::<i32>,
+                                None::<String>,
+                            )
+                        })
+                        .collect(),
+                ),
+            });
+            for field in fields {
+                append_arrow_type_nodes(field.data_type(), nodes)?;
+            }
+            Ok(())
+        }
         DataType::Decimal128(p, s) => {
             let scalar = types::TScalarType::new(
                 types::TPrimitiveType::DECIMAL128,
@@ -13,12 +77,13 @@ pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTy
                 Some(i32::from(*p)),
                 Some(i32::from(*s)),
             );
-            Ok(types::TTypeDesc::new(vec![types::TTypeNode::new(
+            nodes.push(types::TTypeNode::new(
                 types::TTypeNodeType::SCALAR,
                 scalar,
                 None,
                 None,
-            )]))
+            ));
+            Ok(())
         }
         DataType::Decimal256(p, s) => {
             let scalar = types::TScalarType::new(
@@ -27,16 +92,18 @@ pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTy
                 Some(i32::from(*p)),
                 Some(i32::from(*s)),
             );
-            Ok(types::TTypeDesc::new(vec![types::TTypeNode::new(
+            nodes.push(types::TTypeNode::new(
                 types::TTypeNodeType::SCALAR,
                 scalar,
                 None,
                 None,
-            )]))
+            ));
+            Ok(())
         }
         _ => {
             let primitive = arrow_type_to_primitive(data_type)?;
-            Ok(scalar_type_desc(primitive))
+            nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
+            Ok(())
         }
     }
 }

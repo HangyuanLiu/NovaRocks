@@ -110,7 +110,7 @@ impl GroupConcatLayout {
 
 fn parse_group_concat_metadata(name: &str) -> Result<(bool, Vec<bool>, Vec<bool>, i64), String> {
     let base = name.split('|').next().unwrap_or(name);
-    if base != "group_concat" {
+    if base != "group_concat" && base != "string_agg" {
         return Err(format!("unsupported group_concat function: {}", name));
     }
     if !name.contains('|') {
@@ -868,6 +868,38 @@ mod tests {
         let arg_types = vec![DataType::Utf8, DataType::Utf8, DataType::Int64];
         let func = make_func(
             "group_concat|d=1|a=1|n=0",
+            false,
+            intermediate_type(&arg_types),
+            input_type.clone(),
+        );
+        let spec = GroupConcatAgg
+            .build_spec_from_type(&func, Some(&input_type), false)
+            .unwrap();
+        match &spec.kind {
+            AggKind::GroupConcat {
+                is_distinct,
+                is_asc_order,
+                nulls_first,
+                ..
+            } => {
+                assert!(*is_distinct);
+                assert_eq!(is_asc_order, &vec![true]);
+                assert_eq!(nulls_first, &vec![false]);
+            }
+            other => panic!("unexpected kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_agg_alias_uses_group_concat_metadata() {
+        let input_type = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new("v", DataType::Utf8, true)),
+            Arc::new(Field::new("sep", DataType::Utf8, true)),
+            Arc::new(Field::new("k", DataType::Int64, true)),
+        ]));
+        let arg_types = vec![DataType::Utf8, DataType::Utf8, DataType::Int64];
+        let func = make_func(
+            "string_agg|d=1|a=1|n=0",
             false,
             intermediate_type(&arg_types),
             input_type.clone(),

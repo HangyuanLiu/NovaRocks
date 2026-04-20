@@ -30,7 +30,7 @@ use crate::exec::chunk::Chunk;
 use crate::novarocks_config::{
     NovaRocksConfig, StandaloneServerConfig as AppStandaloneServerConfig,
 };
-use crate::version;
+use crate::{common::util::format_mysql_container_value, version};
 
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
@@ -925,9 +925,13 @@ fn query_result_column_to_mysql_column(column: &QueryResultColumn) -> Result<Col
         }
         DataType::Float32 => ColumnType::MYSQL_TYPE_FLOAT,
         DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-            ColumnType::MYSQL_TYPE_VAR_STRING
-        }
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::List(_)
+        | DataType::Map(_, _)
+        | DataType::Struct(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
         DataType::Decimal128(_, _) => ColumnType::MYSQL_TYPE_NEWDECIMAL,
         DataType::Date32 => ColumnType::MYSQL_TYPE_DATE,
         DataType::Time32(_) | DataType::Time64(_) => ColumnType::MYSQL_TYPE_TIME,
@@ -1028,6 +1032,11 @@ fn array_value_to_mysql_value(
         DataType::Time64(unit) => time_to_mysql_value(column, *unit, row_idx),
         DataType::Timestamp(unit, _) => timestamp_to_mysql_value(column, *unit, row_idx),
         DataType::Null => Ok(StandaloneMysqlValue::Null),
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            Ok(StandaloneMysqlValue::Bytes(
+                format_mysql_container_value(column, row_idx)?.into_bytes(),
+            ))
+        }
         other => Err(format!(
             "standalone mysql server does not support output column type {:?}",
             other

@@ -380,6 +380,36 @@ fn first_item_type_from_intermediate_input(input_type: &DataType) -> Result<Data
     }
 }
 
+fn extract_arg_types(input_type: &DataType) -> Vec<DataType> {
+    match input_type {
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect(),
+        other => vec![other.clone()],
+    }
+}
+
+fn build_default_intermediate_type(arg_types: &[DataType]) -> DataType {
+    if arg_types.len() <= 1 {
+        let item_type = arg_types.first().cloned().unwrap_or(DataType::Null);
+        return DataType::List(Arc::new(Field::new("item", item_type, true)));
+    }
+
+    let fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            Arc::new(Field::new(
+                format!("c{idx}"),
+                DataType::List(Arc::new(Field::new("item", data_type.clone(), true))),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    DataType::Struct(Fields::from(fields))
+}
+
 fn append_value(state: &mut ArrayAggState, value: Option<ArrayAggValue>, distinct: bool) {
     if distinct {
         let key = encode_scalar_key(&value);
@@ -1049,6 +1079,7 @@ impl AggregateFunction for ArrayAggAgg {
             other => return Err(format!("unsupported array agg function: {}", other)),
         };
 
+        let arg_types = extract_arg_types(input_type);
         let item_type = if input_is_intermediate {
             first_item_type_from_intermediate_input(input_type)?
         } else if matches!(kind, AggKind::ArrayUniqueAgg) {
@@ -1075,7 +1106,7 @@ impl AggregateFunction for ArrayAggAgg {
                 .as_ref()
                 .and_then(|t| t.intermediate_type.as_ref())
                 .cloned()
-                .unwrap_or_else(|| output_list_type.clone())
+                .unwrap_or_else(|| build_default_intermediate_type(&arg_types))
         };
 
         Ok(AggSpec {

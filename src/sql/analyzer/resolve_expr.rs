@@ -789,7 +789,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
-        let func_order_by = self.extract_function_order_by(func, scope)?;
+        let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
 
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.over {
@@ -923,6 +923,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         func: &sqlast::Function,
         scope: &AnalyzerScope,
+        args: &[TypedExpr],
     ) -> Result<Vec<SortItem>, String> {
         let clauses = match &func.args {
             sqlast::FunctionArguments::List(list) => &list.clauses,
@@ -933,7 +934,24 @@ impl<'a> super::AnalyzerContext<'a> {
             if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
                 let mut items = Vec::with_capacity(order_by_exprs.len());
                 for ob in order_by_exprs {
-                    let typed = self.analyze_expr(&ob.expr, scope)?;
+                    let typed = match &ob.expr {
+                        sqlast::Expr::Value(v) => {
+                            if let sqlast::Value::Number(n, false) = &v.value {
+                                if let Ok(pos) = n.parse::<usize>() {
+                                    if (1..=args.len()).contains(&pos) {
+                                        args[pos - 1].clone()
+                                    } else {
+                                        self.analyze_expr(&ob.expr, scope)?
+                                    }
+                                } else {
+                                    self.analyze_expr(&ob.expr, scope)?
+                                }
+                            } else {
+                                self.analyze_expr(&ob.expr, scope)?
+                            }
+                        }
+                        _ => self.analyze_expr(&ob.expr, scope)?,
+                    };
                     let asc = ob.options.asc.unwrap_or(true);
                     let nulls_first = ob.options.nulls_first.unwrap_or(asc);
                     items.push(SortItem {

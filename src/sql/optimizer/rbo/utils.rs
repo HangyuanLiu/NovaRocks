@@ -68,9 +68,12 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
                 collect_column_refs_inner(arg, out);
             }
         }
-        ExprKind::AggregateCall { args, .. } => {
+        ExprKind::AggregateCall { args, order_by, .. } => {
             for arg in args {
                 collect_column_refs_inner(arg, out);
+            }
+            for ob in order_by {
+                collect_column_refs_inner(&ob.expr, out);
             }
         }
         ExprKind::Cast { expr, .. } => collect_column_refs_inner(expr, out),
@@ -274,9 +277,12 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
                 collect_qualified_column_refs_inner(arg, out);
             }
         }
-        ExprKind::AggregateCall { args, .. } => {
+        ExprKind::AggregateCall { args, order_by, .. } => {
             for arg in args {
                 collect_qualified_column_refs_inner(arg, out);
+            }
+            for ob in order_by {
+                collect_qualified_column_refs_inner(&ob.expr, out);
             }
         }
         ExprKind::Cast { expr, .. } => collect_qualified_column_refs_inner(expr, out),

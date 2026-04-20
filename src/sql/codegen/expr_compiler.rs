@@ -69,11 +69,13 @@ impl<'a> ExprCompiler<'a> {
             self.compile_typed_inner(arg)?;
             arg_types.push(arg.data_type.clone());
         }
+        let mut agg_input_types = arg_types.clone();
 
         // Compile ORDER BY expressions as additional children (for group_concat etc.)
         let num_order_by = agg_call.order_by.len();
         for ob in &agg_call.order_by {
             self.compile_typed_inner(&ob.expr)?;
+            agg_input_types.push(ob.expr.data_type.clone());
         }
 
         let total_children = agg_call.args.len() + num_order_by;
@@ -82,7 +84,7 @@ impl<'a> ExprCompiler<'a> {
         let type_desc = arrow_type_to_type_desc(&return_type)?;
 
         let (_, intermediate_type) =
-            infer_agg_function_types(&effective_name, &arg_types, is_distinct)?;
+            infer_agg_function_types(&effective_name, &agg_input_types, is_distinct)?;
         let intermediate_type_desc = match &intermediate_type {
             Some(it) => arrow_type_to_type_desc(it)?,
             None => types::TTypeDesc { types: None },
@@ -185,8 +187,11 @@ impl<'a> ExprCompiler<'a> {
 
         // Single child: SlotRef to the intermediate column from Local phase.
         let input_type_desc = arrow_type_to_type_desc(input_type)?;
-        self.nodes
-            .push(slot_ref_node(input_slot_id, input_tuple_id, input_type_desc));
+        self.nodes.push(slot_ref_node(
+            input_slot_id,
+            input_tuple_id,
+            input_type_desc,
+        ));
 
         let arg_types = if agg_call.args.is_empty() {
             // count(*): no original args, but merge needs the intermediate type
@@ -194,12 +199,14 @@ impl<'a> ExprCompiler<'a> {
         } else {
             agg_call.args.iter().map(|a| a.data_type.clone()).collect()
         };
+        let mut agg_input_types = arg_types.clone();
+        agg_input_types.extend(agg_call.order_by.iter().map(|ob| ob.expr.data_type.clone()));
 
         let return_type = agg_call.result_type.clone();
         let type_desc = arrow_type_to_type_desc(&return_type)?;
 
         let (_, intermediate_type) =
-            infer_agg_function_types(&effective_name, &arg_types, is_distinct)?;
+            infer_agg_function_types(&effective_name, &agg_input_types, is_distinct)?;
         let intermediate_type_desc = match &intermediate_type {
             Some(it) => arrow_type_to_type_desc(it)?,
             None => types::TTypeDesc { types: None },
@@ -214,9 +221,7 @@ impl<'a> ExprCompiler<'a> {
             node_type: exprs::TExprNodeType::FUNCTION_CALL,
             type_: type_desc.clone(),
             num_children: 1, // single SlotRef child
-            agg_expr: Some(exprs::TAggregateExpr {
-                is_merge_agg: true,
-            }),
+            agg_expr: Some(exprs::TAggregateExpr { is_merge_agg: true }),
             fn_: Some(types::TFunction {
                 name: types::TFunctionName {
                     db_name: None,
@@ -1360,6 +1365,10 @@ fn infer_scalar_function_return_type(
         "date" => Ok(DataType::Date32),
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" => Ok(DataType::Int32),
+        "array_min" | "array_max" => match arg_types.first() {
+            Some(DataType::List(item)) => Ok(item.data_type().clone()),
+            _ => Ok(DataType::Null),
+        },
         "array_contains" | "array_distinct" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
@@ -1382,7 +1391,6 @@ fn infer_scalar_function_return_type(
 }
 
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Aggregate function type inference
@@ -1431,15 +1439,53 @@ fn infer_agg_function_types(
         }
         "min" | "max" => Ok((first_arg.clone(), Some(first_arg))),
         "any_value" => Ok((first_arg.clone(), Some(first_arg))),
-        // group_concat/string_agg: use None to let the execution layer build the correct
-        // STRUCT intermediate type from the actual argument types.
-        "group_concat" | "string_agg" => Ok((DataType::Utf8, None)),
+        "group_concat" | "string_agg" => {
+            let intermediate = {
+                let fields = arg_types
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, data_type)| {
+                        Arc::new(arrow::datatypes::Field::new(
+                            format!("c{idx}"),
+                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                data_type.clone(),
+                                true,
+                            ))),
+                            true,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                DataType::Struct(arrow::datatypes::Fields::from(fields))
+            };
+            Ok((DataType::Utf8, Some(intermediate)))
+        }
         "count_if" => Ok((DataType::Int64, Some(DataType::Int64))),
         "bool_or" | "bool_and" => Ok((DataType::Boolean, Some(DataType::Boolean))),
         "array_agg" => {
             let elem = first_arg.clone();
             let list = DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)));
-            Ok((list.clone(), Some(list)))
+            let intermediate = if arg_types.len() <= 1 {
+                list.clone()
+            } else {
+                let fields = arg_types
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, data_type)| {
+                        Arc::new(arrow::datatypes::Field::new(
+                            format!("c{idx}"),
+                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                data_type.clone(),
+                                true,
+                            ))),
+                            true,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                DataType::Struct(arrow::datatypes::Fields::from(fields))
+            };
+            Ok((list, Some(intermediate)))
         }
         "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Int64))),
         "approx_count_distinct" | "ndv" => Ok((DataType::Int64, Some(DataType::Binary))),
@@ -1457,6 +1503,7 @@ fn infer_agg_function_types(
             Ok((out, Some(DataType::Binary)))
         }
         "bitmap_union_int" => Ok((DataType::Int64, Some(DataType::Int64))),
+        "dict_merge" => Ok((DataType::Utf8, Some(DataType::Utf8))),
         "max_by" | "min_by" => {
             // max_by(value, key) -> type of value (first arg).
             // Intermediate is serialized binary state.
@@ -1480,6 +1527,5 @@ fn infer_agg_function_types(
             };
             Ok((out.clone(), Some(out)))
         }
-
     }
 }

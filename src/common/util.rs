@@ -827,7 +827,7 @@ fn http_json_object_key_with_schema(
     }
 }
 
-fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, String> {
+pub(crate) fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, String> {
     format_mysql_container_value_with_schema(col, row, None)
 }
 

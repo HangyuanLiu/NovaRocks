@@ -13,9 +13,24 @@ use arrow::datatypes::DataType;
 
 use crate::data_sinks;
 use crate::exprs;
+use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::partitions;
 use crate::plan_nodes;
 
+use crate::sql::analysis::cte::CteId;
+use crate::sql::catalog::CatalogProvider;
+use crate::sql::codegen::FragmentId;
+use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
+use crate::sql::codegen::helpers::{
+    agg_call_display_name, join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
+};
+use crate::sql::codegen::nodes;
+use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
+use crate::sql::codegen::type_infer;
+use crate::sql::codegen::{
+    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn,
+};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
     AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
@@ -25,20 +40,6 @@ use crate::sql::optimizer::operator::{
     PhysicalSubqueryAliasOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::catalog::CatalogProvider;
-use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::FragmentId;
-use crate::sql::codegen::descriptors::DescriptorTableBuilder;
-use crate::sql::codegen::helpers::{
-    agg_call_display_name, join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
-};
-use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
-use crate::sql::codegen::nodes;
-use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
-use crate::sql::codegen::type_infer;
-use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn,
-};
 
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::planner::plan::AggregateCall;
@@ -790,6 +791,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         let child = self.visit(&node.children[0])?;
+        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
 
         let agg_tuple_id = self.alloc_tuple();
         let agg_node_id = self.alloc_node();
@@ -870,7 +872,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                 compiler.compile_aggregate_call_typed(agg_call)?
             };
 
-            let data_type = agg_call.result_type.clone();
+            let data_type = if need_finalize {
+                agg_call.result_type.clone()
+            } else {
+                texpr
+                    .nodes
+                    .first()
+                    .and_then(|root| root.fn_.as_ref())
+                    .and_then(|func| func.aggregate_fn.as_ref())
+                    .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type))
+                    .unwrap_or_else(|| agg_call.result_type.clone())
+            };
             let nullable = true;
             let name = agg_call_display_name(agg_call);
             let slot_id = self.alloc_slot();
@@ -889,8 +901,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             );
             aggregate_functions.push(texpr);
         }
-
-        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
 
         self.desc_builder.add_tuple(agg_tuple_id);
         let agg_plan_node = nodes::build_aggregation_node(
@@ -1236,8 +1246,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Group window expressions by (partition_by, order_by) signature.
         // Different signatures need separate Sort + Analytic nodes.
-        let groups =
-            crate::sql::codegen::helpers::group_win_exprs_by_sig(&op.window_exprs);
+        let groups = crate::sql::codegen::helpers::group_win_exprs_by_sig(&op.window_exprs);
         if groups.len() > 1 {
             return self.visit_window_multi_group(op, node, &groups);
         }
@@ -2485,13 +2494,13 @@ mod tests {
 
     use super::*;
     use crate::plan_nodes;
+    use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
     use crate::sql::optimizer::operator::{
         Operator, PhysicalDistributionOp, PhysicalScanOp, PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
-    use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::optimizer::statistics::Statistics;
 
     struct DummyCatalog;

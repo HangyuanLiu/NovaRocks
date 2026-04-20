@@ -167,6 +167,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
+        "array_length" | "array_position" | "cardinality" => DataType::Int32,
+        "array_min" | "array_max" => match arg_types.first() {
+            Some(DataType::List(item)) => item.data_type().clone(),
+            _ => DataType::Null,
+        },
 
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,
@@ -215,6 +220,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         },
         "min" | "max" | "any_value" => first_arg,
         "group_concat" | "string_agg" => DataType::Utf8,
+        "dict_merge" => DataType::Utf8,
         "array_agg" => {
             let elem = first_arg;
             DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)))
@@ -233,5 +239,34 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
                 first_arg
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn array_type(item_type: DataType) -> DataType {
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item", item_type, true,
+        )))
+    }
+
+    #[test]
+    fn infer_scalar_return_type_for_collection_length_functions() {
+        let int_array = array_type(DataType::Int32);
+
+        assert_eq!(
+            infer_scalar_return_type("array_length", std::slice::from_ref(&int_array)),
+            DataType::Int32
+        );
+        assert_eq!(
+            infer_scalar_return_type("cardinality", std::slice::from_ref(&int_array)),
+            DataType::Int32
+        );
+        assert_eq!(
+            infer_scalar_return_type("array_position", &[int_array, DataType::Int32]),
+            DataType::Int32
+        );
     }
 }
