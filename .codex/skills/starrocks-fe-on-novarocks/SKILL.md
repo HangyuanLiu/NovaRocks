@@ -36,6 +36,22 @@ BE_RUNTIME_ROOT=/Users/harbor/starrocks-on-novarocks/novarocks
 
 ### 构建 FE
 
+先显式设置 `STARROCKS_THIRDPARTY`，不要假设非交互 shell 会自动加载 `~/.zshrc`：
+
+```bash
+# StarRocks 4.1 及更早分支（包括 4.1）
+export STARROCKS_THIRDPARTY=/Users/harbor/project/thirdparty-4.1
+
+# StarRocks 4.1 之后的分支（包括 main）
+# export STARROCKS_THIRDPARTY=/Users/harbor/project/thirdparty
+```
+
+规则：
+- `branch-4.1` 及更早分支（包括 `branch-4.1`）使用 `/Users/harbor/project/thirdparty-4.1`
+- `branch-4.1` 之后的分支和 `main` 使用 `/Users/harbor/project/thirdparty`
+
+这是为了和分支所依赖的 thirdparty/toolchain 保持一致，尤其是 `thrift` 版本必须匹配，否则 FE 构建可能生成错误的 thrift Java 源码。
+
 ```bash
 ./build.sh --fe
 ```
