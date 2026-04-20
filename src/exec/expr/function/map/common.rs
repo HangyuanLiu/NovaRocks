@@ -381,7 +381,7 @@ pub(super) fn output_map_field(
         )),
         None => {
             let entry_fields = Fields::from(vec![
-                Arc::new(Field::new("key", key_type.clone(), false)),
+                Arc::new(Field::new("key", key_type.clone(), true)),
                 Arc::new(Field::new("value", value_type.clone(), true)),
             ]);
             Ok((

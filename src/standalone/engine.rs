@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use tokio::runtime::Handle;
@@ -2879,6 +2879,37 @@ fn cast_batch_to_schema(
         .map_err(|e| format!("rebuild insert-select batch failed: {e}"))
 }
 
+fn cast_list_struct_to_map_for_local_schema(
+    source_col: &ArrayRef,
+    target_entries: &Arc<Field>,
+    ordered: bool,
+) -> Result<ArrayRef, String> {
+    use arrow::array::{ListArray, MapArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+
+    let list = source_col
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| "failed to downcast ListArray".to_string())?;
+    let values = if list.values().data_type() == target_entries.data_type() {
+        list.values().clone()
+    } else {
+        crate::exec::expr::cast_with_special_rules(&list.values(), target_entries.data_type())?
+    };
+    let entries = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| "failed to cast LIST values to STRUCT for MAP rebuild".to_string())?
+        .clone();
+    Ok(Arc::new(MapArray::new(
+        target_entries.clone(),
+        OffsetBuffer::new(list.value_offsets().to_vec().into()),
+        entries,
+        list.nulls().cloned(),
+        ordered,
+    )) as ArrayRef)
+}
+
 fn cast_array_for_local_schema(
     source_col: &ArrayRef,
     target_field: &arrow::datatypes::FieldRef,
@@ -2967,6 +2998,11 @@ fn cast_array_for_local_schema(
         {
             crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }
+        (DataType::List(source_field), DataType::Map(target_entries, ordered))
+            if matches!(source_field.data_type(), DataType::Struct(_)) =>
+        {
+            cast_list_struct_to_map_for_local_schema(source_col, target_entries, *ordered)
+        }
         (_, DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)) => {
             crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }
@@ -2974,16 +3010,79 @@ fn cast_array_for_local_schema(
     }
 }
 
+fn parquet_storage_type_for_local_batch(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Map(entries_field, _) => DataType::List(Arc::new(Field::new(
+            "item",
+            entries_field.data_type().clone(),
+            true,
+        ))),
+        other => other.clone(),
+    }
+}
+
+fn encode_array_for_local_parquet_storage(array: &ArrayRef) -> Result<ArrayRef, String> {
+    use arrow::array::{ListArray, MapArray};
+    use arrow_buffer::OffsetBuffer;
+
+    match array.data_type() {
+        DataType::Map(_, _) => {
+            let map = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast MapArray".to_string())?;
+            Ok(Arc::new(ListArray::new(
+                Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(map.entries().fields().clone()),
+                    true,
+                )),
+                OffsetBuffer::new(map.value_offsets().to_vec().into()),
+                Arc::new(map.entries().clone()) as ArrayRef,
+                map.nulls().cloned(),
+            )) as ArrayRef)
+        }
+        _ => Ok(array.clone()),
+    }
+}
+
+fn normalize_local_parquet_batch(batch: &RecordBatch) -> Result<RecordBatch, String> {
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns().iter()) {
+        let encoded = encode_array_for_local_parquet_storage(column)?;
+        if !Arc::ptr_eq(column, &encoded) {
+            changed = true;
+        }
+        let storage_type = parquet_storage_type_for_local_batch(field.data_type());
+        if &storage_type != field.data_type() {
+            changed = true;
+        }
+        fields.push(
+            Field::new(field.name(), storage_type, field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        );
+        columns.push(encoded);
+    }
+    if !changed {
+        return Ok(batch.clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("build local parquet storage batch failed: {e}"))
+}
+
 /// Write a RecordBatch to a parquet file at the given path.
 pub(crate) fn write_parquet_to_path(path: &Path, batch: &RecordBatch) -> Result<(), String> {
     use parquet::arrow::ArrowWriter;
 
+    let batch = normalize_local_parquet_batch(batch)?;
     let file = std::fs::File::create(path)
         .map_err(|e| format!("create local parquet file failed: {e}"))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
         .map_err(|e| format!("create local parquet writer failed: {e}"))?;
     writer
-        .write(batch)
+        .write(&batch)
         .map_err(|e| format!("write local parquet batch failed: {e}"))?;
     writer
         .close()
@@ -5125,6 +5224,60 @@ mod tests {
             entry_fields[0].is_nullable(),
             "expected casted map key field to become nullable"
         );
+    }
+
+    #[test]
+    fn local_parquet_round_trip_preserves_nullable_map_keys() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let columns = vec![ColumnDef {
+            name: "m".to_string(),
+            data_type: DataType::Map(entries_field, false),
+            nullable: true,
+        }];
+        let rows = vec![vec![Literal::Map(vec![(
+            Literal::Null,
+            Literal::String("v".to_string()),
+        )])]];
+        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("map_round_trip.parquet");
+
+        super::write_parquet_to_path(&path, &batch).expect("write local parquet");
+        let round_tripped =
+            super::read_local_parquet_data(&path, &columns).expect("read local parquet");
+        let map = round_tripped
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("map array");
+        let entries = map.entries();
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("key array");
+
+        assert!(keys.is_null(0));
+        let DataType::Map(entries_field, _) = round_tripped.schema().field(0).data_type() else {
+            panic!("expected map field");
+        };
+        let DataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected struct entries");
+        };
+        assert!(entry_fields[0].is_nullable());
     }
 
     #[test]

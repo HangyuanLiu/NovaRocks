@@ -33,6 +33,84 @@ pub(super) fn infer_window_return_type(name: &str, arg_types: &[DataType]) -> Da
     }
 }
 
+fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {
+    match data_type {
+        DataType::Null => "null_type".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint(4)".to_string(),
+        DataType::Int16 => "smallint(6)".to_string(),
+        DataType::Int32 => "int(11)".to_string(),
+        DataType::Int64 => "bigint(20)".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            if map_value_context {
+                "varchar(20)".to_string()
+            } else {
+                "varchar(255)".to_string()
+            }
+        }
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            format!("decimal({precision},{scale})")
+        }
+        DataType::List(item) => {
+            format!("array<{}>", format_signature_type(item.data_type(), false))
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return "map<unknown,unknown>".to_string();
+            };
+            if fields.len() != 2 {
+                return "map<unknown,unknown>".to_string();
+            }
+            format!(
+                "map<{},{}>",
+                format_signature_type(fields[0].data_type(), false),
+                format_signature_type(fields[1].data_type(), true)
+            )
+        }
+        DataType::Struct(fields) => format!(
+            "struct<{}>",
+            fields
+                .iter()
+                .map(|field| format_signature_type(field.data_type(), false))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+fn no_matching_signature(name: &str, arg_types: &[DataType]) -> String {
+    format!(
+        "No matching function with signature: {}({}).",
+        name,
+        arg_types
+            .iter()
+            .map(|arg| format_signature_type(arg, false))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+pub(super) fn validate_scalar_function_call(
+    name: &str,
+    arg_types: &[DataType],
+) -> Result<(), String> {
+    let expected_arity = match name {
+        "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
+        | "array_max" => Some(1usize),
+        _ => None,
+    };
+    if let Some(expected) = expected_arity
+        && arg_types.len() != expected
+    {
+        return Err(no_matching_signature(name, arg_types));
+    }
+    Ok(())
+}
+
 pub(super) fn is_aggregate_function(name: &str) -> bool {
     // Keep in sync with expr_compiler::is_aggregate_function.
     matches!(
@@ -212,7 +290,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
                             Arc::new(arrow::datatypes::Field::new(
                                 "key",
                                 keys.data_type().clone(),
-                                false,
+                                true,
                             )),
                             Arc::new(arrow::datatypes::Field::new(
                                 "value",
@@ -306,7 +384,7 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
+                            Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
                             Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
                         ]
                         .into(),

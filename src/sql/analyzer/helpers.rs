@@ -68,7 +68,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
             Arc::new(Field::new(
                 "entries",
                 DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", sql_type_to_arrow(key_type)?, false)),
+                    Arc::new(Field::new("key", sql_type_to_arrow(key_type)?, true)),
                     Arc::new(Field::new("value", sql_type_to_arrow(value_type)?, true)),
                 ])),
                 false,

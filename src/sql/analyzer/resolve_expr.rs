@@ -1106,6 +1106,9 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         self.validate_percentile_arguments(&name, &args_typed)?;
+        if !is_aggregate_function(&name) {
+            validate_scalar_function_call(&name, &arg_types)?;
+        }
 
         match original_name.as_str() {
             "ds_hll_accumulate" => {

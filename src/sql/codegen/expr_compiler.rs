@@ -1462,7 +1462,7 @@ fn infer_scalar_function_return_type(
                             Arc::new(arrow::datatypes::Field::new(
                                 "key",
                                 keys.data_type().clone(),
-                                false,
+                                true,
                             )),
                             Arc::new(arrow::datatypes::Field::new(
                                 "value",
@@ -1598,7 +1598,7 @@ fn infer_agg_function_types(
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
+                            Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
                             Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
                         ]
                         .into(),

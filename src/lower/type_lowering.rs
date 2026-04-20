@@ -190,10 +190,11 @@ pub(crate) fn arrow_type_from_nodes(
             Some(DataType::List(item_field))
         }
         t if t == types::TTypeNodeType::MAP => {
-            // Arrow MAP keys are non-nullable by definition. Keep the reconstructed
-            // schema aligned with scan/exec-produced MapArray batches so exchange
-            // decode does not reject map columns on key nullability alone.
-            let key_field = arrow_field_from_nodes_with_name(types, cursor, "key", false)?;
+            // Standalone local tables may persist MAP columns through a list/struct
+            // storage surrogate and recover them at scan time with nullable keys.
+            // Preserve that logical nullability across type-desc lowering so
+            // planner/codegen do not force them back to a narrower MAP schema.
+            let key_field = arrow_field_from_nodes_with_name(types, cursor, "key", true)?;
             let value_field = arrow_field_from_nodes_with_name(types, cursor, "value", true)?;
             let entries = Arc::new(Field::new(
                 "entries",

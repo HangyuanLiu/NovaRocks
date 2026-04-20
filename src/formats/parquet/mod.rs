@@ -50,6 +50,7 @@ use std::sync::Arc;
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
@@ -75,6 +76,45 @@ fn read_app_io_time_ns(profile: &RuntimeProfile) -> i64 {
     profile
         .add_child_timer("AppIOTime", INPUT_STREAM_PROFILE_GROUP)
         .value()
+}
+
+fn normalize_batch_to_chunk_schema(
+    batch: RecordBatch,
+    chunk_schema: &ChunkSchemaRef,
+) -> Result<RecordBatch, String> {
+    if batch.num_columns() != chunk_schema.slots().len() {
+        return Err(format!(
+            "parquet batch/chunk schema length mismatch: batch_columns={} chunk_slots={}",
+            batch.num_columns(),
+            chunk_schema.slots().len()
+        ));
+    }
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (idx, slot) in chunk_schema.slots().iter().enumerate() {
+        let column = batch.column(idx).clone();
+        let casted = if column.data_type() == slot.data_type() {
+            column
+        } else {
+            cast_with_special_rules(&column, slot.data_type()).map_err(|e| {
+                format!(
+                    "cast parquet scan column {} from {:?} to {:?} failed: {e}",
+                    slot.name(),
+                    column.data_type(),
+                    slot.data_type()
+                )
+            })?
+        };
+        let field = if casted.null_count() > 0 && !slot.nullable() {
+            slot.field().clone().with_nullable(true)
+        } else {
+            slot.field().clone()
+        };
+        fields.push(field);
+        columns.push(casted);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("normalize parquet scan batch failed: {e}"))
 }
 
 fn runtime_filters_to_min_max_predicates(
@@ -930,6 +970,7 @@ impl Iterator for ParquetScanIter {
                     }
                     let batch = match reorder_batch(&self.cfg, batch)
                         .and_then(|b| convert_variant_columns(&self.cfg, b))
+                        .and_then(|b| normalize_batch_to_chunk_schema(b, &self.cfg.chunk_schema))
                     {
                         Ok(batch) => batch,
                         Err(e) => return Some(Err(e)),

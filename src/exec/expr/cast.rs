@@ -1726,6 +1726,35 @@ fn cast_map_to_map(
     Ok(Arc::new(out) as ArrayRef)
 }
 
+fn cast_list_to_map(
+    array: &ArrayRef,
+    target_entries: &Arc<Field>,
+    ordered: bool,
+) -> Result<ArrayRef, String> {
+    let source = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+    let values = if source.values().data_type() == target_entries.data_type() {
+        source.values().clone()
+    } else {
+        cast_with_special_rules(&source.values(), target_entries.data_type())?
+    };
+    let entries = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| "CAST LIST to MAP requires STRUCT list values".to_string())?
+        .clone();
+    let out = MapArray::new(
+        target_entries.clone(),
+        OffsetBuffer::new(source.value_offsets().to_vec().into()),
+        entries,
+        source.nulls().cloned(),
+        ordered,
+    );
+    Ok(Arc::new(out) as ArrayRef)
+}
+
 pub(crate) fn cast_with_special_rules(
     array: &ArrayRef,
     target_type: &DataType,
@@ -1944,6 +1973,11 @@ fn cast_with_special_rules_with_field_schema(
         }
         (DataType::Utf8, DataType::Struct(_)) | (DataType::Utf8, DataType::Map(_, _)) => {
             cast_utf8_json_to_target(array, target_type, target_field_schema)
+        }
+        (DataType::List(source_field), DataType::Map(target_entries, ordered))
+            if matches!(source_field.data_type(), DataType::Struct(_)) =>
+        {
+            cast_list_to_map(array, target_entries, *ordered)
         }
         (DataType::List(_), DataType::List(target_field)) => {
             let list = array

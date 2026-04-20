@@ -692,7 +692,9 @@ pub(super) fn align_chunk_schema_to_columns(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, MapArray, StructArray};
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, MapArray, StructArray,
+    };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
