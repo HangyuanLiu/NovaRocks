@@ -104,9 +104,10 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         // Math functions that return Int64
         "ceil" | "ceiling" | "floor" => DataType::Int64,
 
-        // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
-        // When the second argument is Int (constant decimal places), clamp to
-        // a reasonable output scale to avoid excess trailing zeros.
+        // round/truncate:
+        // - Decimal input -> Decimal128 with adjusted scale
+        // - Non-decimal without explicit scale -> Int64
+        // - Non-decimal with explicit scale -> Float64
         "round" | "truncate" => match arg_types.first() {
             Some(DataType::Decimal128(_, s)) => {
                 // If second arg is an integer type, the value is the target
@@ -116,7 +117,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
                 // rely on the execution layer's output scale adjustment.
                 DataType::Decimal128(38, *s)
             }
-            _ => DataType::Float64,
+            _ if arg_types.len() >= 2 => DataType::Float64,
+            _ => DataType::Int64,
         },
 
         // Math functions that return Float64
@@ -169,6 +171,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
+        "grouping" | "grouping_id" => DataType::Int64,
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => item.data_type().clone(),
             _ => DataType::Null,

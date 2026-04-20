@@ -150,6 +150,7 @@ pub(crate) struct LogicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
 }
 
@@ -277,6 +278,7 @@ pub(crate) struct PhysicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
 }
 

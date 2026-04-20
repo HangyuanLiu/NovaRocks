@@ -223,6 +223,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 repeat_column_ref_list: node.repeat_column_ref_list.clone(),
                 grouping_ids: node.grouping_ids.clone(),
                 all_rollup_columns: node.all_rollup_columns.clone(),
+                grouping_key_aliases: node.grouping_key_aliases.clone(),
                 grouping_fn_args: node.grouping_fn_args.clone(),
             });
             let expr = MExpr {

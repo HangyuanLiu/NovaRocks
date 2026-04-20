@@ -131,6 +131,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             repeat_column_ref_list: node.repeat_column_ref_list,
             grouping_ids: node.grouping_ids,
             all_rollup_columns: node.all_rollup_columns,
+            grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
         }),
         LogicalPlan::CTEProduce(node) => LogicalPlan::CTEProduce(CTEProduceNode {
@@ -243,6 +244,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             repeat_column_ref_list: node.repeat_column_ref_list,
             grouping_ids: node.grouping_ids,
             all_rollup_columns: node.all_rollup_columns,
+            grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
         }),
         LogicalPlan::CTEProduce(node) => LogicalPlan::CTEProduce(CTEProduceNode {

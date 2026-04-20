@@ -1782,6 +1782,16 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Start with the child's full scope
         let mut output_scope = child.scope;
 
+        for (original_name, alias_name) in &op.grouping_key_aliases {
+            if let Ok(binding) = output_scope.resolve_column(None, alias_name) {
+                output_scope.add_qualified_alias(
+                    "__repeat_group".to_string(),
+                    original_name.clone(),
+                    binding.clone(),
+                );
+            }
+        }
+
         // Add virtual slots
         let num_virtual = 1 + op.grouping_fn_args.len();
         let mut virtual_slot_ids = Vec::with_capacity(num_virtual);
@@ -1883,7 +1893,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                         .iter()
                         .any(|c| c.to_lowercase() == arg_col.to_lowercase());
                     if is_null {
-                        bits |= 1 << bit_pos;
+                        let reverse_bit_pos = fn_args.len() - 1 - bit_pos;
+                        bits |= 1 << reverse_bit_pos;
                     }
                 }
                 values.push(bits as i64);

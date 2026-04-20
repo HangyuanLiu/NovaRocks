@@ -1237,7 +1237,10 @@ fn infer_scalar_function_return_type(
         // Numeric functions
         "abs" | "negative" => Ok(arg_types.first().cloned().unwrap_or(DataType::Float64)),
         "ceil" | "ceiling" | "floor" => Ok(DataType::Int64),
-        // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
+        // round/truncate:
+        // - Decimal input -> Decimal128 with adjusted scale
+        // - Non-decimal without explicit scale -> Int64
+        // - Non-decimal with explicit scale -> Float64
         "round" | "truncate" => Ok(match arg_types.first() {
             Some(DataType::Decimal128(_, s)) => {
                 // If second arg is a constant integer (target decimal places),
@@ -1260,7 +1263,8 @@ fn infer_scalar_function_return_type(
                 };
                 DataType::Decimal128(38, out_scale)
             }
-            _ => DataType::Float64,
+            _ if arg_types.len() >= 2 => DataType::Float64,
+            _ => DataType::Int64,
         }),
         "mod"
         | "fmod"
@@ -1392,6 +1396,7 @@ fn infer_scalar_function_return_type(
         "date" => Ok(DataType::Date32),
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" | "map_size" => Ok(DataType::Int32),
+        "grouping" | "grouping_id" => Ok(DataType::Int64),
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),
             _ => Ok(DataType::Null),

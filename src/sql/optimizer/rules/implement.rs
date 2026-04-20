@@ -996,6 +996,7 @@ impl Rule for RepeatToPhysical {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                 grouping_ids: op.grouping_ids.clone(),
                 all_rollup_columns: op.all_rollup_columns.clone(),
+                grouping_key_aliases: op.grouping_key_aliases.clone(),
                 grouping_fn_args: op.grouping_fn_args.clone(),
             }),
             children: expr.children.clone(),

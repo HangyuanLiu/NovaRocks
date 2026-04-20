@@ -290,6 +290,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 repeat_column_ref_list: node.repeat_column_ref_list,
                 grouping_ids: node.grouping_ids,
                 all_rollup_columns: node.all_rollup_columns,
+                grouping_key_aliases: node.grouping_key_aliases,
                 grouping_fn_args: node.grouping_fn_args,
             })
         }

@@ -72,19 +72,14 @@ fn apply_query_modifiers(
 ) -> LogicalPlan {
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
-        // If ORDER BY references columns not in the projection, we need to
-        // extend the project to include them (hidden columns) so the sort can
-        // reference them.  After sort, a top-level project strips them.
-        let needs_hidden = has_non_projected_sort_columns(&order_by, &output_columns);
-        if needs_hidden {
-            // Collect extra columns needed by ORDER BY
-            let mut extra_items = Vec::new();
-            for sort_item in &order_by {
-                collect_extra_columns(&sort_item.expr, &output_columns, &mut extra_items);
-            }
-
-            // Extend the project node at the top of body_plan
+        let extra_items = collect_extra_sort_items(&order_by, &output_columns);
+        if !extra_items.is_empty() {
             if let LogicalPlan::Project(ref mut proj) = body_plan {
+                if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
+                    for extra in &extra_items {
+                        collect_aggregates(&extra.expr, &mut agg.aggregates);
+                    }
+                }
                 for extra in &extra_items {
                     proj.items.push(extra.clone());
                 }
@@ -133,6 +128,24 @@ fn apply_query_modifiers(
     }
 
     body_plan
+}
+
+fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> Vec<ProjectItem> {
+    let output_names: std::collections::HashSet<String> =
+        output.iter().map(|c| c.name.to_lowercase()).collect();
+    let mut added = std::collections::HashSet::new();
+    let mut extra = Vec::new();
+    for item in order_by {
+        let output_name = crate::sql::codegen::helpers::typed_expr_display_name(&item.expr);
+        let output_name_lower = output_name.to_lowercase();
+        if !output_names.contains(&output_name_lower) && added.insert(output_name_lower) {
+            extra.push(ProjectItem {
+                expr: item.expr.clone(),
+                output_name,
+            });
+        }
+    }
+    extra
 }
 
 /// Check if any ORDER BY expression references columns not in the output.
@@ -238,7 +251,9 @@ fn plan_select_scoped(
     mut select: ResolvedSelect,
     cte_registry: &CTERegistry,
 ) -> Result<LogicalPlan, String> {
-    let mut current = match select.from {
+    const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
+
+    let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry)?,
         None => LogicalPlan::Values(ValuesNode {
             rows: vec![vec![]],
@@ -246,19 +261,26 @@ fn plan_select_scoped(
         }),
     };
 
-    if let Some(predicate) = select.filter {
+    if let Some(predicate) = select.filter.take() {
         current = LogicalPlan::Filter(FilterNode {
             input: Box::new(current),
             predicate,
         });
     }
 
-    if let Some(repeat_info) = select.repeat.take() {
+    if let Some(mut repeat_info) = select.repeat.take() {
+        let grouping_key_aliases = prepare_repeat_input(
+            &mut current,
+            &mut select,
+            &mut repeat_info,
+            REPEAT_GROUP_QUALIFIER,
+        );
         current = LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(current),
             repeat_column_ref_list: repeat_info.repeat_column_ref_list,
             grouping_ids: repeat_info.grouping_ids,
             all_rollup_columns: repeat_info.all_rollup_columns,
+            grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
         });
     }
@@ -301,6 +323,181 @@ fn plan_select_scoped(
     }
 
     Ok(current)
+}
+
+fn prepare_repeat_input(
+    current: &mut LogicalPlan,
+    select: &mut ResolvedSelect,
+    repeat_info: &mut crate::sql::analysis::RepeatInfo,
+    repeat_group_qualifier: &str,
+) -> Vec<(String, String)> {
+    let grouping_key_aliases: Vec<(String, String)> = repeat_info
+        .all_rollup_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (name.clone(), format!("__repeat_group_key_{idx}")))
+        .collect();
+    if grouping_key_aliases.is_empty() {
+        return grouping_key_aliases;
+    }
+
+    let mut project_items = Vec::new();
+    let mut seen_refs = std::collections::HashSet::new();
+    for gb_expr in &select.group_by {
+        collect_repeat_input_refs(gb_expr, &mut project_items, &mut seen_refs);
+    }
+    for item in &select.projection {
+        collect_repeat_input_refs(&item.expr, &mut project_items, &mut seen_refs);
+    }
+    if let Some(having) = &select.having {
+        collect_repeat_input_refs(having, &mut project_items, &mut seen_refs);
+    }
+
+    for (original_name, alias_name) in &grouping_key_aliases {
+        if let Some(source_expr) = select.group_by.iter().find_map(|expr| match &expr.kind {
+            ExprKind::ColumnRef { qualifier, column }
+                if column.eq_ignore_ascii_case(original_name) =>
+            {
+                Some(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: qualifier.clone(),
+                        column: column.clone(),
+                    },
+                    data_type: expr.data_type.clone(),
+                    nullable: expr.nullable,
+                })
+            }
+            _ => None,
+        }) {
+            project_items.push(ProjectItem {
+                expr: source_expr,
+                output_name: alias_name.clone(),
+            });
+        }
+    }
+
+    *current = LogicalPlan::Project(ProjectNode {
+        input: Box::new(current.clone()),
+        items: project_items,
+    });
+
+    for gb_expr in &mut select.group_by {
+        if let ExprKind::ColumnRef { qualifier: _, column } = &gb_expr.kind
+            && grouping_key_aliases
+                .iter()
+                .any(|(original_name, _)| column.eq_ignore_ascii_case(original_name))
+        {
+            gb_expr.kind = ExprKind::ColumnRef {
+                qualifier: Some(repeat_group_qualifier.to_string()),
+                column: column.clone(),
+            };
+        }
+    }
+
+    for non_null_cols in &mut repeat_info.repeat_column_ref_list {
+        for col in non_null_cols {
+            if let Some((_, alias_name)) = grouping_key_aliases
+                .iter()
+                .find(|(original_name, _)| col.eq_ignore_ascii_case(original_name))
+            {
+                *col = alias_name.clone();
+            }
+        }
+    }
+    repeat_info.all_rollup_columns = grouping_key_aliases
+        .iter()
+        .map(|(_, alias_name)| alias_name.clone())
+        .collect();
+    for (_fn_name, arg_cols) in &mut repeat_info.grouping_fn_args {
+        for col in arg_cols {
+            if let Some((_, alias_name)) = grouping_key_aliases
+                .iter()
+                .find(|(original_name, _)| col.eq_ignore_ascii_case(original_name))
+            {
+                *col = alias_name.clone();
+            }
+        }
+    }
+
+    grouping_key_aliases
+}
+
+fn collect_repeat_input_refs(
+    expr: &TypedExpr,
+    out: &mut Vec<ProjectItem>,
+    seen: &mut std::collections::HashSet<(Option<String>, String)>,
+) {
+    match &expr.kind {
+        ExprKind::ColumnRef { qualifier, column } => {
+            if qualifier.is_none() && column.starts_with("__grouping_") {
+                return;
+            }
+            let key = (qualifier.clone(), column.to_lowercase());
+            if seen.insert(key) {
+                out.push(ProjectItem {
+                    expr: expr.clone(),
+                    output_name: column.clone(),
+                });
+            }
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_repeat_input_refs(arg, out, seen);
+            }
+            for sort_item in order_by {
+                collect_repeat_input_refs(&sort_item.expr, out, seen);
+            }
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_repeat_input_refs(arg, out, seen);
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_repeat_input_refs(left, out, seen);
+            collect_repeat_input_refs(right, out, seen);
+        }
+        ExprKind::UnaryOp { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Nested(inner)
+        | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::IsTruthValue { expr: inner, .. } => {
+            collect_repeat_input_refs(inner, out, seen);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_repeat_input_refs(op, out, seen);
+            }
+            for (when, then) in when_then {
+                collect_repeat_input_refs(when, out, seen);
+                collect_repeat_input_refs(then, out, seen);
+            }
+            if let Some(el) = else_expr {
+                collect_repeat_input_refs(el, out, seen);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_repeat_input_refs(arg, out, seen);
+            }
+            for part in partition_by {
+                collect_repeat_input_refs(part, out, seen);
+            }
+            for sort_item in order_by {
+                collect_repeat_input_refs(&sort_item.expr, out, seen);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build a deduplication Aggregate for SELECT DISTINCT.

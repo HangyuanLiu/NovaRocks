@@ -165,6 +165,7 @@ fn rewrite_children(
                     repeat_column_ref_list: n.repeat_column_ref_list,
                     grouping_ids: n.grouping_ids,
                     all_rollup_columns: n.all_rollup_columns,
+                    grouping_key_aliases: n.grouping_key_aliases,
                     grouping_fn_args: n.grouping_fn_args,
                 }),
                 ch,

@@ -25,6 +25,12 @@ use crate::sql::types::wider_type;
 use helpers::{expr_display_name, extract_limit, extract_offset};
 use scope::AnalyzerScope;
 
+#[derive(Clone, Debug)]
+struct RepeatGroupBySpec {
+    grouping_sets: Vec<Vec<sqlast::Expr>>,
+    all_group_by_exprs: Vec<sqlast::Expr>,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -183,9 +189,8 @@ impl<'a> AnalyzerContext<'a> {
         match set_expr {
             sqlast::SetExpr::Select(s) => {
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
-                // If so, expand into a UNION ALL of GROUP BY variants.
-                if let Some(rollup_exprs) = self.extract_rollup_from_group_by(s) {
-                    return self.resolve_rollup(s, &rollup_exprs);
+                if let Some(repeat_spec) = self.extract_repeat_from_group_by(s) {
+                    return self.resolve_repeat_group_by(s, &repeat_spec);
                 }
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
@@ -442,11 +447,20 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Replace ColumnRef nodes that match SELECT aliases with the aliased expression.
     fn substitute_select_aliases(&self, expr: TypedExpr, projection: &[ProjectItem]) -> TypedExpr {
+        self.substitute_select_aliases_inner(expr, projection, false)
+    }
+
+    fn substitute_select_aliases_inner(
+        &self,
+        expr: TypedExpr,
+        projection: &[ProjectItem],
+        inside_agg: bool,
+    ) -> TypedExpr {
         match expr.kind {
             ExprKind::ColumnRef {
                 ref qualifier,
                 ref column,
-            } if qualifier.is_none() => {
+            } if qualifier.is_none() && !inside_agg => {
                 // Check if this column name matches a SELECT alias
                 let col_lower = column.to_lowercase();
                 for item in projection {
@@ -460,9 +474,17 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(self.substitute_select_aliases(*left, projection)),
+                    left: Box::new(self.substitute_select_aliases_inner(
+                        *left,
+                        projection,
+                        inside_agg,
+                    )),
                     op,
-                    right: Box::new(self.substitute_select_aliases(*right, projection)),
+                    right: Box::new(self.substitute_select_aliases_inner(
+                        *right,
+                        projection,
+                        inside_agg,
+                    )),
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -470,59 +492,265 @@ impl<'a> AnalyzerContext<'a> {
                 nullable: expr.nullable,
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(self.substitute_select_aliases(*inner, projection)),
+                    expr: Box::new(self.substitute_select_aliases_inner(
+                        *inner,
+                        projection,
+                        inside_agg,
+                    )),
+                },
+            },
+            ExprKind::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::FunctionCall {
+                    name,
+                    args: args
+                        .into_iter()
+                        .map(|arg| self.substitute_select_aliases_inner(arg, projection, inside_agg))
+                        .collect(),
+                    distinct,
+                },
+            },
+            ExprKind::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::AggregateCall {
+                    name,
+                    args: args
+                        .into_iter()
+                        .map(|arg| self.substitute_select_aliases_inner(arg, projection, true))
+                        .collect(),
+                    distinct,
+                    order_by: order_by
+                        .into_iter()
+                        .map(|item| SortItem {
+                            expr: self.substitute_select_aliases_inner(item.expr, projection, true),
+                            ..item
+                        })
+                        .collect(),
+                },
+            },
+            ExprKind::Cast {
+                expr: inner,
+                target,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Cast {
+                    expr: Box::new(self.substitute_select_aliases_inner(
+                        *inner,
+                        projection,
+                        inside_agg,
+                    )),
+                    target,
                 },
             },
             ExprKind::Nested(inner) => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::Nested(Box::new(
-                    self.substitute_select_aliases(*inner, projection),
+                    self.substitute_select_aliases_inner(*inner, projection, inside_agg),
                 )),
+            },
+            ExprKind::IsNull { expr: inner, negated } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::IsNull {
+                    expr: Box::new(self.substitute_select_aliases_inner(
+                        *inner,
+                        projection,
+                        inside_agg,
+                    )),
+                    negated,
+                },
+            },
+            ExprKind::IsTruthValue {
+                expr: inner,
+                value,
+                negated,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::IsTruthValue {
+                    expr: Box::new(self.substitute_select_aliases_inner(
+                        *inner,
+                        projection,
+                        inside_agg,
+                    )),
+                    value,
+                    negated,
+                },
+            },
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Case {
+                    operand: operand.map(|expr| {
+                        Box::new(self.substitute_select_aliases_inner(
+                            *expr,
+                            projection,
+                            inside_agg,
+                        ))
+                    }),
+                    when_then: when_then
+                        .into_iter()
+                        .map(|(when, then)| {
+                            (
+                                self.substitute_select_aliases_inner(when, projection, inside_agg),
+                                self.substitute_select_aliases_inner(then, projection, inside_agg),
+                            )
+                        })
+                        .collect(),
+                    else_expr: else_expr.map(|expr| {
+                        Box::new(self.substitute_select_aliases_inner(
+                            *expr,
+                            projection,
+                            inside_agg,
+                        ))
+                    }),
+                },
             },
             // For other node types, return as-is
             _ => expr,
         }
     }
 
-    /// Check if a SELECT's GROUP BY clause contains a ROLLUP expression.
-    /// Returns the flattened rollup column expressions if found, None otherwise.
-    fn extract_rollup_from_group_by(
+    /// Check if a SELECT's GROUP BY clause contains ROLLUP/CUBE/GROUPING SETS.
+    /// Returns the explicit grouping-set levels plus the full GROUP BY key list.
+    fn extract_repeat_from_group_by(
         &self,
         select: &sqlast::Select,
-    ) -> Option<Vec<Vec<sqlast::Expr>>> {
-        let exprs = match &select.group_by {
-            sqlast::GroupByExpr::Expressions(exprs, _) => exprs,
-            _ => return None,
+    ) -> Option<RepeatGroupBySpec> {
+        let (exprs, modifiers) = match &select.group_by {
+            sqlast::GroupByExpr::Expressions(exprs, modifiers) => (exprs.as_slice(), modifiers),
+            sqlast::GroupByExpr::All(modifiers) => (&[][..], modifiers),
         };
-        // Look for a single Rollup expression in the GROUP BY list.
-        // sqlparser produces Expr::Rollup when the dialect has
-        // supports_group_by_expr() = true.  As a fallback, also detect
-        // Expr::Function with name "rollup" (case-insensitive), which is
-        // what the parser produces when the dialect flag is off.
+
         for expr in exprs {
-            if let sqlast::Expr::Rollup(groups) = expr {
-                return Some(groups.clone());
-            }
-            // Fallback: Expr::Function { name: "rollup", args: [a, b, ...] }
-            if let sqlast::Expr::Function(func) = expr {
-                let func_name = func.name.to_string().to_lowercase();
-                if func_name == "rollup" {
-                    if let sqlast::FunctionArguments::List(ref arg_list) = func.args {
-                        let groups: Vec<Vec<sqlast::Expr>> = arg_list
-                            .args
-                            .iter()
-                            .filter_map(|arg| match arg {
-                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                                    Some(vec![e.clone()])
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if !groups.is_empty() {
-                            return Some(groups);
-                        }
+            match expr {
+                sqlast::Expr::Rollup(groups) => {
+                    return Some(RepeatGroupBySpec {
+                        grouping_sets: rollup_grouping_sets(groups),
+                        all_group_by_exprs: flatten_grouping_groups(groups),
+                    });
+                }
+                sqlast::Expr::Cube(groups) => {
+                    return Some(RepeatGroupBySpec {
+                        grouping_sets: cube_grouping_sets(groups),
+                        all_group_by_exprs: flatten_grouping_groups(groups),
+                    });
+                }
+                sqlast::Expr::GroupingSets(sets) => {
+                    return Some(RepeatGroupBySpec {
+                        grouping_sets: sets.clone(),
+                        all_group_by_exprs: unique_exprs_in_order(
+                            sets.iter().flat_map(|set| set.iter().cloned()),
+                        ),
+                    });
+                }
+                sqlast::Expr::Function(func) => {
+                    let func_name = func.name.to_string().to_lowercase();
+                    let sqlast::FunctionArguments::List(arg_list) = &func.args else {
+                        continue;
+                    };
+                    let groups: Vec<Vec<sqlast::Expr>> = arg_list
+                        .args
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                Some(vec![e.clone()])
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if groups.is_empty() {
+                        continue;
                     }
+                    match func_name.as_str() {
+                        "rollup" => {
+                            return Some(RepeatGroupBySpec {
+                                grouping_sets: rollup_grouping_sets(&groups),
+                                all_group_by_exprs: flatten_grouping_groups(&groups),
+                            });
+                        }
+                        "cube" => {
+                            return Some(RepeatGroupBySpec {
+                                grouping_sets: cube_grouping_sets(&groups),
+                                all_group_by_exprs: flatten_grouping_groups(&groups),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if exprs.is_empty() {
+            for modifier in modifiers {
+                match modifier {
+                    sqlast::GroupByWithModifier::Rollup => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: rollup_grouping_sets(&[]),
+                            all_group_by_exprs: vec![],
+                        });
+                    }
+                    sqlast::GroupByWithModifier::Cube => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: cube_grouping_sets(&[]),
+                            all_group_by_exprs: vec![],
+                        });
+                    }
+                    sqlast::GroupByWithModifier::GroupingSets(sqlast::Expr::GroupingSets(sets)) => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: sets.clone(),
+                            all_group_by_exprs: unique_exprs_in_order(
+                                sets.iter().flat_map(|set| set.iter().cloned()),
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            let singleton_groups: Vec<Vec<sqlast::Expr>> =
+                exprs.iter().cloned().map(|expr| vec![expr]).collect();
+            for modifier in modifiers {
+                match modifier {
+                    sqlast::GroupByWithModifier::Rollup => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: rollup_grouping_sets(&singleton_groups),
+                            all_group_by_exprs: exprs.to_vec(),
+                        });
+                    }
+                    sqlast::GroupByWithModifier::Cube => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: cube_grouping_sets(&singleton_groups),
+                            all_group_by_exprs: exprs.to_vec(),
+                        });
+                    }
+                    sqlast::GroupByWithModifier::GroupingSets(sqlast::Expr::GroupingSets(sets)) => {
+                        return Some(RepeatGroupBySpec {
+                            grouping_sets: sets.clone(),
+                            all_group_by_exprs: unique_exprs_in_order(
+                                sets.iter().flat_map(|set| set.iter().cloned()),
+                            ),
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -666,55 +894,46 @@ impl<'a> AnalyzerContext<'a> {
         Ok((result_body, result_cols))
     }
 
-    /// Resolve `GROUP BY ROLLUP(a, b, ...)` into a single SELECT with RepeatInfo
-    /// instead of expanding into N+1 UNION ALL branches.
+    /// Resolve `GROUP BY ROLLUP/CUBE/GROUPING SETS` into a single SELECT with
+    /// RepeatInfo instead of rewriting to UNION ALL branches.
     ///
-    /// The SELECT is analyzed once with all rollup keys in the GROUP BY.
-    /// RepeatInfo records the per-level null patterns and grouping_id bitmaps
-    /// so the Repeat operator can replay the aggregated result at execution time.
-    fn resolve_rollup(
+    /// The SELECT is analyzed once with the union of all grouping keys in the
+    /// GROUP BY. RepeatInfo records the per-level null patterns and grouping_id
+    /// bitmaps so the Repeat operator can replay the grouping-set semantics.
+    fn resolve_repeat_group_by(
         &self,
         select: &sqlast::Select,
-        rollup_groups: &[Vec<sqlast::Expr>],
+        repeat_spec: &RepeatGroupBySpec,
     ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
         use crate::sql::analysis::RepeatInfo;
 
-        let n = rollup_groups.len();
-
-        // Flatten all rollup column names (lowercased) in order.
-        let all_rollup_columns: Vec<String> = rollup_groups
+        let all_rollup_columns: Vec<String> = repeat_spec
+            .all_group_by_exprs
             .iter()
-            .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+            .map(|expr| format!("{expr}").to_lowercase())
             .collect();
 
-        // Compute per-level non-null columns and grouping_id bitmaps.
-        // ROLLUP(a, b, c) produces N+1 levels:
-        //   Level 0: all active (a, b, c)  — grouping_id = 0b000
-        //   Level 1: (a, b) active         — grouping_id = 0b100 (c NULLed)
-        //   Level 2: (a) active            — grouping_id = 0b110 (b, c NULLed)
-        //   Level 3: none active           — grouping_id = 0b111 (all NULLed)
-        let mut repeat_column_ref_list: Vec<Vec<String>> = Vec::with_capacity(n + 1);
-        let mut grouping_ids: Vec<u64> = Vec::with_capacity(n + 1);
+        // StarRocks uses the last grouping argument as the least-significant
+        // bit, so for GROUPING_ID(a, b) nulling b yields 0b01, not 0b10.
+        let total_grouping_columns = all_rollup_columns.len();
+        let mut repeat_column_ref_list: Vec<Vec<String>> =
+            Vec::with_capacity(repeat_spec.grouping_sets.len());
+        let mut grouping_ids: Vec<u64> = Vec::with_capacity(repeat_spec.grouping_sets.len());
 
-        for level in 0..=n {
-            let active_count = n - level;
-
-            // Non-null columns: flatten first `active_count` groups
-            let non_null_cols: Vec<String> = rollup_groups
+        for grouping_set in &repeat_spec.grouping_sets {
+            let non_null_cols: Vec<String> = grouping_set
                 .iter()
-                .take(active_count)
-                .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+                .map(|expr| format!("{expr}").to_lowercase())
                 .collect();
+            let active_cols: std::collections::HashSet<String> =
+                non_null_cols.iter().cloned().collect();
             repeat_column_ref_list.push(non_null_cols);
 
-            // Grouping ID bitmap: bit i = 1 if column i is NULLed
             let mut bitmap: u64 = 0;
-            for group in rollup_groups.iter().skip(active_count) {
-                for expr in group {
-                    let col_name = format!("{expr}").to_lowercase();
-                    if let Some(bit_pos) = all_rollup_columns.iter().position(|c| *c == col_name) {
-                        bitmap |= 1u64 << bit_pos;
-                    }
+            for (idx, col_name) in all_rollup_columns.iter().enumerate() {
+                if !active_cols.contains(col_name) {
+                    let bit_pos = total_grouping_columns - 1 - idx;
+                    bitmap |= 1u64 << bit_pos;
                 }
             }
             grouping_ids.push(bitmap);
@@ -754,13 +973,10 @@ impl<'a> AnalyzerContext<'a> {
             }
         }
 
-        // Build modified SELECT with all rollup keys in GROUP BY (level 0).
+        // Build modified SELECT with the union of all grouping keys in GROUP BY.
         let mut modified_select = select.clone();
-        let all_gb_exprs: Vec<sqlast::Expr> = rollup_groups
-            .iter()
-            .flat_map(|group| group.iter().cloned())
-            .collect();
-        modified_select.group_by = sqlast::GroupByExpr::Expressions(all_gb_exprs, vec![]);
+        modified_select.group_by =
+            sqlast::GroupByExpr::Expressions(repeat_spec.all_group_by_exprs.clone(), vec![]);
         modified_select.projection = modified_projection;
 
         // Replace GROUPING() in HAVING too.
@@ -1134,14 +1350,40 @@ impl<'a> AnalyzerContext<'a> {
                     } else {
                         // Try projection scope first, then fall back to FROM scope
                         match self.analyze_expr(&ob.expr, &projection_scope) {
-                            Ok(typed) => typed,
+                            Ok(typed) => {
+                                if let QueryBody::Select(sel) = body {
+                                    self.substitute_select_aliases(typed, &sel.projection)
+                                } else {
+                                    typed
+                                }
+                            }
                             Err(proj_err) => {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
                                         let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
                                         match self.analyze_expr(&ob.expr, &from_scope) {
-                                            Ok(typed) => typed,
-                                            Err(_) => return Err(proj_err),
+                                            Ok(typed) => {
+                                                self.substitute_select_aliases(typed, &sel.projection)
+                                            }
+                                            Err(_) => {
+                                                let mut alias_scope = from_scope.clone();
+                                                for item in &sel.projection {
+                                                    alias_scope.add_column(
+                                                        None,
+                                                        &item.output_name,
+                                                        item.expr.data_type.clone(),
+                                                        item.expr.nullable,
+                                                    );
+                                                }
+                                                match self.analyze_expr(&ob.expr, &alias_scope) {
+                                                    Ok(typed) => self
+                                                        .substitute_select_aliases(
+                                                            typed,
+                                                            &sel.projection,
+                                                        ),
+                                                    Err(_) => return Err(proj_err),
+                                                }
+                                            }
                                         }
                                     } else {
                                         return Err(proj_err);
@@ -1303,7 +1545,7 @@ fn replace_grouping_in_window(
     }
 }
 
-/// Replace GROUPING(col) calls in an AST expression with unique marker
+/// Replace GROUPING/GROUPING_ID calls in an AST expression with unique marker
 /// literals (-9000, -9001, ...). Each call is recorded in `args` as
 /// (virtual_name, [column_args]) for the RepeatInfo.
 fn replace_grouping_calls_with_markers(
@@ -1314,7 +1556,7 @@ fn replace_grouping_calls_with_markers(
     match expr {
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
-            if name == "grouping" {
+            if matches!(name.as_str(), "grouping" | "grouping_id") {
                 if let sqlast::FunctionArguments::List(ref list) = func.args {
                     let arg_cols: Vec<String> = list
                         .args
@@ -1336,7 +1578,7 @@ fn replace_grouping_calls_with_markers(
                     );
                 }
             }
-            // Not GROUPING — recurse into args and OVER clause
+            // Not a grouping pseudo-column — recurse into args and OVER clause
             let new_args = match &func.args {
                 sqlast::FunctionArguments::List(list) => {
                     let new_list_args: Vec<_> = list
@@ -1450,8 +1692,56 @@ fn replace_grouping_markers_in_window(
     }
 }
 
+fn flatten_grouping_groups(groups: &[Vec<sqlast::Expr>]) -> Vec<sqlast::Expr> {
+    groups.iter().flat_map(|group| group.iter().cloned()).collect()
+}
+
+fn unique_exprs_in_order<I>(exprs: I) -> Vec<sqlast::Expr>
+where
+    I: IntoIterator<Item = sqlast::Expr>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for expr in exprs {
+        let key = format!("{expr}").to_lowercase();
+        if seen.insert(key) {
+            result.push(expr);
+        }
+    }
+    result
+}
+
+fn rollup_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> {
+    let mut grouping_sets = Vec::with_capacity(groups.len() + 1);
+    for active_count in (0..=groups.len()).rev() {
+        let grouping_set = groups
+            .iter()
+            .take(active_count)
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        grouping_sets.push(grouping_set);
+    }
+    grouping_sets
+}
+
+fn cube_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> {
+    let group_count = groups.len();
+    let total = 1usize.checked_shl(group_count as u32).unwrap_or(0);
+    let mut grouping_sets = Vec::with_capacity(total);
+    for mask in (0..total).rev() {
+        let grouping_set = groups
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| mask & (1usize << idx) != 0)
+            .flat_map(|(_, group)| group.iter().cloned())
+            .collect();
+        grouping_sets.push(grouping_set);
+    }
+    grouping_sets
+}
+
 /// Walk a resolved TypedExpr tree and replace marker literals (Int(-9000), Int(-9001), ...)
-/// with ColumnRef to the corresponding GROUPING() virtual slot name.
+/// with ColumnRef to the corresponding GROUPING/GROUPING_ID virtual slot name.
 fn replace_grouping_markers_in_typed_expr(
     expr: &TypedExpr,
     grouping_fn_args: &[(String, Vec<String>)],
@@ -2397,7 +2687,7 @@ mod tests {
 
             // Grouping IDs
             assert_eq!(repeat.grouping_ids[0], 0b00); // both active
-            assert_eq!(repeat.grouping_ids[1], 0b10); // b NULLed (bit 1)
+            assert_eq!(repeat.grouping_ids[1], 0b01); // b NULLed (least-significant bit)
             assert_eq!(repeat.grouping_ids[2], 0b11); // both NULLed
 
             // All rollup columns
@@ -2457,6 +2747,49 @@ mod tests {
             assert_eq!(repeat.grouping_fn_args.len(), 1);
             assert_eq!(repeat.grouping_fn_args[0].0, "__grouping_fn_0");
             assert_eq!(repeat.grouping_fn_args[0].1, vec!["o_orderstatus"]);
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
+    }
+
+    #[test]
+    fn test_group_by_grouping_sets_with_grouping_id() {
+        let sql = "SELECT o_orderstatus, o_orderpriority, \
+                          grouping_id(o_orderstatus, o_orderpriority) as gid, \
+                          grouping(o_orderstatus, o_orderpriority) as grp, \
+                          count(*) as cnt \
+                   FROM orders \
+                   GROUP BY GROUPING SETS ((), (o_orderstatus, o_orderpriority))";
+        let resolved = parse_and_analyze(sql).expect("GROUPING SETS should work");
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("GROUPING SETS should produce RepeatInfo");
+            assert_eq!(repeat.repeat_column_ref_list.len(), 2);
+            assert_eq!(repeat.grouping_ids, vec![0b11, 0b00]);
+            assert_eq!(
+                repeat.all_rollup_columns,
+                vec![
+                    "o_orderstatus".to_string(),
+                    "o_orderpriority".to_string()
+                ]
+            );
+            assert_eq!(repeat.grouping_fn_args.len(), 2);
+            assert_eq!(
+                repeat.grouping_fn_args[0].1,
+                vec![
+                    "o_orderstatus".to_string(),
+                    "o_orderpriority".to_string()
+                ]
+            );
+            assert_eq!(
+                repeat.grouping_fn_args[1].1,
+                vec![
+                    "o_orderstatus".to_string(),
+                    "o_orderpriority".to_string()
+                ]
+            );
         } else {
             panic!("expected Select body with RepeatInfo");
         }
