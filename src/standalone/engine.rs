@@ -2748,10 +2748,26 @@ fn build_local_literal_array(
             let value_refs = flattened_values.iter().collect::<Vec<_>>();
             let key_array = build_local_literal_array(entry_fields[0].data_type(), &key_refs)?;
             let value_array = build_local_literal_array(entry_fields[1].data_type(), &value_refs)?;
+            let entries_fields = if key_array.null_count() > 0 && !entry_fields[0].is_nullable() {
+                let mut adjusted = entry_fields.iter().cloned().collect::<Vec<_>>();
+                adjusted[0] = Arc::new(Field::new(
+                    entry_fields[0].name(),
+                    entry_fields[0].data_type().clone(),
+                    true,
+                ));
+                Fields::from(adjusted)
+            } else {
+                entry_fields.clone()
+            };
             let entries =
-                StructArray::new(entry_fields.clone(), vec![key_array, value_array], None);
+                StructArray::new(entries_fields.clone(), vec![key_array, value_array], None);
+            let entries_field = Arc::new(Field::new(
+                entries_field.name(),
+                DataType::Struct(entries_fields),
+                entries_field.is_nullable(),
+            ));
             Ok(Arc::new(MapArray::new(
-                entries_field.clone(),
+                entries_field,
                 OffsetBuffer::new(offsets.into()),
                 entries,
                 map_nulls.finish(),
@@ -5040,8 +5056,15 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("key array");
+        let DataType::Map(entries_field, _) = batch.schema().field(0).data_type() else {
+            panic!("expected map field");
+        };
+        let DataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected struct entries");
+        };
 
         assert!(keys.is_null(0));
+        assert!(entry_fields[0].is_nullable());
     }
 
     #[test]

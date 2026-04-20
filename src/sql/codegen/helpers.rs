@@ -105,6 +105,13 @@ fn typed_expr_array_item_display_name(expr: &TypedExpr) -> String {
     }
 }
 
+fn canonical_agg_display_name(name: &str) -> &str {
+    match name {
+        "string_agg" => "group_concat",
+        other => other,
+    }
+}
+
 /// Build aggregate display name from components (used by expr_compiler for scope lookup).
 pub(crate) fn agg_call_display_name_from_parts(
     name: &str,
@@ -112,6 +119,10 @@ pub(crate) fn agg_call_display_name_from_parts(
     distinct: bool,
     order_by: &[query_ir::SortItem],
 ) -> String {
+    if matches!(name, "group_concat" | "string_agg") {
+        return group_concat_display_name_from_parts(name, args, distinct, order_by);
+    }
+
     let args_display = if args.is_empty() {
         "*".to_string()
     } else {
@@ -152,6 +163,66 @@ pub(crate) fn agg_call_display_name_from_parts(
         out.push_str(" order by ");
         out.push_str(&order_by_display);
     }
+    out.push(')');
+    out
+}
+
+fn group_concat_display_name_from_parts(
+    name: &str,
+    args: &[TypedExpr],
+    distinct: bool,
+    order_by: &[query_ir::SortItem],
+) -> String {
+    let (value_args, separator_arg) = args
+        .split_last()
+        .map(|(separator, values)| (values, Some(separator)))
+        .unwrap_or((&[][..], None));
+    let args_display = value_args
+        .iter()
+        .map(typed_expr_array_item_display_name)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut out = if distinct {
+        format!(
+            "{}(DISTINCT {}",
+            canonical_agg_display_name(name),
+            args_display
+        )
+    } else {
+        format!("{}({}", canonical_agg_display_name(name), args_display)
+    };
+
+    let visible_order_by = order_by
+        .iter()
+        .filter(|item| !matches!(item.expr.kind, ExprKind::Literal(_)))
+        .collect::<Vec<_>>();
+    if !visible_order_by.is_empty() {
+        let order_by_display = visible_order_by
+            .iter()
+            .map(|item| {
+                let mut value = typed_expr_array_item_display_name(&item.expr);
+                value.push_str(if item.asc { " ASC" } else { " DESC" });
+                if item.nulls_first != item.asc {
+                    value.push_str(if item.nulls_first {
+                        " NULLS FIRST"
+                    } else {
+                        " NULLS LAST"
+                    });
+                }
+                value
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(" ORDER BY ");
+        out.push_str(&order_by_display);
+    }
+
+    let separator_display = separator_arg
+        .map(typed_expr_array_item_display_name)
+        .unwrap_or_else(|| "','".to_string());
+    out.push_str(" SEPARATOR ");
+    out.push_str(&separator_display);
     out.push(')');
     out
 }

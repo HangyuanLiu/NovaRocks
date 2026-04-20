@@ -1293,6 +1293,13 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
         args: &[TypedExpr],
     ) -> Result<Vec<SortItem>, String> {
+        let func_name = func.name.to_string().to_lowercase();
+        let visible_args =
+            if matches!(func_name.as_str(), "group_concat" | "string_agg") && !args.is_empty() {
+                &args[..args.len() - 1]
+            } else {
+                args
+            };
         let clauses = match &func.args {
             sqlast::FunctionArguments::List(list) => &list.clauses,
             _ => return Ok(vec![]),
@@ -1306,8 +1313,20 @@ impl<'a> super::AnalyzerContext<'a> {
                         sqlast::Expr::Value(v) => {
                             if let sqlast::Value::Number(n, false) = &v.value {
                                 if let Ok(pos) = n.parse::<usize>() {
-                                    if (1..=args.len()).contains(&pos) {
-                                        args[pos - 1].clone()
+                                    if (1..=visible_args.len()).contains(&pos) {
+                                        visible_args[pos - 1].clone()
+                                    } else if matches!(
+                                        func_name.as_str(),
+                                        "array_agg" | "group_concat" | "string_agg"
+                                    ) {
+                                        let display_name = if func_name == "string_agg" {
+                                            "group_concat"
+                                        } else {
+                                            func_name.as_str()
+                                        };
+                                        return Err(format!(
+                                            "ORDER BY position {pos} is not in {display_name} output list."
+                                        ));
                                     } else {
                                         self.analyze_expr(&ob.expr, scope)?
                                     }

@@ -261,21 +261,35 @@ fn rewrite_group_concat_separator(sql: &str) -> Result<String, String> {
 }
 
 fn rewrite_group_concat_inner(inner: &str) -> Result<String, String> {
-    let Some(separator_pos) = find_top_level_keyword(inner, "separator") else {
-        return Ok(inner.to_string());
-    };
-    let separator_start = separator_pos + "separator".len();
-    let before_separator = inner[..separator_pos].trim_end();
-    let separator_expr = inner[separator_start..].trim();
-    if before_separator.is_empty() || separator_expr.is_empty() {
-        return Err("invalid GROUP_CONCAT separator syntax".to_string());
-    }
-    if let Some(order_by_pos) = find_top_level_order_by(before_separator) {
-        let args = before_separator[..order_by_pos].trim_end();
-        let order_by = before_separator[order_by_pos..].trim_start();
-        Ok(format!("{args}, {separator_expr} {order_by}"))
+    if let Some(separator_pos) = find_top_level_keyword(inner, "separator") {
+        let separator_start = separator_pos + "separator".len();
+        let before_separator = inner[..separator_pos].trim_end();
+        let separator_expr = inner[separator_start..].trim();
+        if before_separator.is_empty() || separator_expr.is_empty() {
+            return Err("invalid GROUP_CONCAT separator syntax".to_string());
+        }
+        if let Some(order_by_pos) = find_top_level_order_by(before_separator) {
+            let args = before_separator[..order_by_pos].trim_end();
+            let order_by = before_separator[order_by_pos..].trim_start();
+            Ok(format!("{args}, {separator_expr} {order_by}"))
+        } else {
+            Ok(format!("{before_separator}, {separator_expr}"))
+        }
+    } else if let Some(order_by_pos) = find_top_level_order_by(inner) {
+        let args = inner[..order_by_pos].trim_end();
+        let order_by = inner[order_by_pos..].trim_start();
+        if args.is_empty() {
+            Ok(inner.to_string())
+        } else {
+            Ok(format!("{args}, ',' {order_by}"))
+        }
     } else {
-        Ok(format!("{before_separator}, {separator_expr}"))
+        let args = inner.trim_end();
+        if args.is_empty() {
+            Ok(inner.to_string())
+        } else {
+            Ok(format!("{args}, ','"))
+        }
     }
 }
 
@@ -728,5 +742,20 @@ mod tests {
         let normalized = super::normalize_for_raw_parse("SELECT '王武程咬金', '中国'")
             .expect("normalize should succeed");
         assert_eq!(normalized, "SELECT '王武程咬金', '中国'");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_injects_group_concat_default_separator() {
+        let normalized = super::normalize_for_raw_parse("SELECT group_concat(name ORDER BY 1)")
+            .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT group_concat(name, ',' ORDER BY 1)");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_group_concat_explicit_separator() {
+        let normalized =
+            super::normalize_for_raw_parse("SELECT group_concat(name ORDER BY 1 SEPARATOR '|')")
+                .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT group_concat(name, '|' ORDER BY 1)");
     }
 }

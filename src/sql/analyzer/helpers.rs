@@ -210,15 +210,20 @@ fn canonical_display_function_name(name: &str) -> String {
     match name.to_lowercase().as_str() {
         "boolor_agg" => "bool_or".to_string(),
         "booland_agg" | "every" => "bool_and".to_string(),
+        "string_agg" => "group_concat".to_string(),
         "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         other => other.to_string(),
     }
 }
 
 fn format_function_display_name(function: &sqlast::Function) -> String {
+    let canonical_name = canonical_display_function_name(&function.name.to_string());
+    if canonical_name == "group_concat" {
+        return format_group_concat_display_name(function, &canonical_name);
+    }
     let mut out = format!(
         "{}{}{}",
-        canonical_display_function_name(&function.name.to_string()),
+        canonical_name,
         function.parameters,
         format_function_arguments(&function.args)
     );
@@ -250,12 +255,41 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     out
 }
 
+fn format_group_concat_display_name(function: &sqlast::Function, function_name: &str) -> String {
+    let mut out = format!("{}{}", function_name, function.parameters);
+    out.push_str(&format_group_concat_arguments(&function.args));
+    if let Some(filter_cond) = &function.filter {
+        out.push_str(" FILTER (WHERE ");
+        out.push_str(&expr_display_name(filter_cond));
+        out.push(')');
+    }
+    if let Some(null_treatment) = &function.null_treatment {
+        out.push(' ');
+        out.push_str(&null_treatment.to_string());
+    }
+    if let Some(over) = &function.over {
+        out.push_str(" OVER ");
+        out.push_str(&over.to_string());
+    }
+    out
+}
+
 fn format_function_arguments(args: &sqlast::FunctionArguments) -> String {
     match args {
         sqlast::FunctionArguments::None => String::new(),
         sqlast::FunctionArguments::Subquery(query) => format!("({query})"),
         sqlast::FunctionArguments::List(list) => {
             format!("({})", format_function_argument_list(list))
+        }
+    }
+}
+
+fn format_group_concat_arguments(args: &sqlast::FunctionArguments) -> String {
+    match args {
+        sqlast::FunctionArguments::None => String::new(),
+        sqlast::FunctionArguments::Subquery(query) => format!("({query})"),
+        sqlast::FunctionArguments::List(list) => {
+            format!("({})", format_group_concat_argument_list(list))
         }
     }
 }
@@ -286,6 +320,50 @@ fn format_function_argument_list(list: &sqlast::FunctionArgumentList) -> String 
         }
         out.push_str(&visible_clauses.join(" "));
     }
+    out
+}
+
+fn format_group_concat_argument_list(list: &sqlast::FunctionArgumentList) -> String {
+    let mut out = String::new();
+    let (value_args, separator_arg) = list
+        .args
+        .split_last()
+        .map(|(separator, values)| (values, Some(separator)))
+        .unwrap_or((&[][..], None));
+
+    if let Some(duplicate_treatment) = list.duplicate_treatment {
+        out.push_str(&duplicate_treatment.to_string());
+        out.push(' ');
+    }
+    out.push_str(
+        &value_args
+            .iter()
+            .map(format_function_arg_display_name)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
+    let visible_clauses = list
+        .clauses
+        .iter()
+        .map(|clause| format_function_clause_display_name(clause, value_args))
+        .filter(|clause| !clause.is_empty())
+        .collect::<Vec<_>>();
+    if !visible_clauses.is_empty() {
+        if !value_args.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&visible_clauses.join(" "));
+    }
+
+    let separator = separator_arg
+        .map(format_function_arg_display_name)
+        .unwrap_or_else(|| "','".to_string());
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("SEPARATOR ");
+    out.push_str(&separator);
     out
 }
 
@@ -604,6 +682,15 @@ mod tests {
         assert_eq!(
             expr_display_name(&expr),
             "array_min(array_unique_agg(col_boolean))"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_formats_group_concat_like_starrocks() {
+        let expr = parse_select_expr("SELECT group_concat(name, subject, ',' ORDER BY 1, 2)");
+        assert_eq!(
+            expr_display_name(&expr),
+            "group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')"
         );
     }
 }

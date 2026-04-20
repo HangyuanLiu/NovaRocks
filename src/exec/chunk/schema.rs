@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::common::ids::SlotId;
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::types;
+use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
@@ -408,6 +409,77 @@ fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> boo
     }
 }
 
+fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Arc<Field>, String> {
+    let data_type = reconcile_chunk_data_type(expected.data_type(), actual.data_type())?;
+    let nullable = expected.is_nullable() || actual.is_nullable();
+    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
+        Ok(Arc::new(expected.clone()))
+    } else {
+        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
+    }
+}
+
+fn reconcile_chunk_field_to_data_type(
+    expected: &Field,
+    actual: &DataType,
+    actual_nullable: bool,
+) -> Result<Arc<Field>, String> {
+    let data_type = reconcile_chunk_data_type(expected.data_type(), actual)?;
+    let nullable = expected.is_nullable() || actual_nullable;
+    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
+        Ok(Arc::new(expected.clone()))
+    } else {
+        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
+    }
+}
+
+fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<DataType, String> {
+    if expected == actual {
+        return Ok(expected.clone());
+    }
+
+    match (expected, actual) {
+        (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
+        | (DataType::Decimal256(_, _), DataType::Decimal256(_, _))
+        | (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => Ok(actual.clone()),
+        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => {
+            Ok(actual.clone())
+        }
+        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
+            reconcile_chunk_field_to_field(expected_field, actual_field)?,
+        )),
+        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
+            Ok(DataType::LargeList(reconcile_chunk_field_to_field(
+                expected_field,
+                actual_field,
+            )?))
+        }
+        (
+            DataType::Map(expected_field, expected_ordered),
+            DataType::Map(actual_field, actual_ordered),
+        ) if expected_ordered == actual_ordered => Ok(DataType::Map(
+            reconcile_chunk_field_to_field(expected_field, actual_field)?,
+            *expected_ordered,
+        )),
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
+            if expected_fields.len() == actual_fields.len() =>
+        {
+            let fields = expected_fields
+                .iter()
+                .zip(actual_fields.iter())
+                .map(|(expected_field, actual_field)| {
+                    reconcile_chunk_field_to_field(expected_field, actual_field)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(fields.into()))
+        }
+        _ => Err(format!(
+            "chunk schema type mismatch: expected {:?}, got {:?}",
+            expected, actual
+        )),
+    }
+}
+
 impl ChunkSchema {
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
@@ -586,12 +658,43 @@ pub(super) fn align_chunk_schema_to_batch(
     Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
 
+pub(super) fn align_chunk_schema_to_columns(
+    columns: &[ArrayRef],
+    chunk_schema: &ChunkSchema,
+) -> Result<ChunkSchemaRef, String> {
+    if columns.len() != chunk_schema.slots().len() {
+        return Err(format!(
+            "chunk schema contract length mismatch: columns={} contract_slots={}",
+            columns.len(),
+            chunk_schema.slots().len()
+        ));
+    }
+    let mut slots = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
+        let expected = chunk_schema
+            .slots()
+            .get(idx)
+            .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
+        let reconciled_field = reconcile_chunk_field_to_data_type(
+            expected.field(),
+            column.data_type(),
+            column.null_count() > 0,
+        )?;
+        slots.push(
+            expected
+                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
+        );
+    }
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::BinaryArray;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
 
     use super::{ChunkSchema, ChunkSlotSchema};
@@ -651,5 +754,57 @@ mod tests {
         assert_eq!(slot.primitive_type(), Some(TPrimitiveType::HLL));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
+    }
+
+    #[test]
+    fn align_chunk_schema_to_columns_preserves_nullable_map_keys() {
+        let expected_map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let schema = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+            SlotId::new(1),
+            Field::new("m", expected_map, false),
+            None,
+            None,
+        )])
+        .expect("chunk schema");
+
+        let key_array = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
+        let value_array = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Arc::new(Field::new("key", DataType::Int32, true)),
+                Arc::new(Field::new("value", DataType::Int64, true)),
+            ]),
+            vec![key_array, value_array],
+            None,
+        );
+        let map = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+
+        let aligned = super::align_chunk_schema_to_columns(&[map], &schema).expect("align schema");
+        let DataType::Map(entries_field, _) = aligned.slots()[0].data_type() else {
+            panic!("expected map type");
+        };
+        let DataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected entry struct");
+        };
+        assert!(entry_fields[0].is_nullable(), "map key should be nullable");
     }
 }

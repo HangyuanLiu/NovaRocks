@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arrow::array::ArrayRef;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -134,6 +135,87 @@ fn is_compatible_exchange_arrow_type(
         }
         _ => expected == actual,
     }
+}
+
+fn merge_exchange_field_type(
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+) -> Result<arrow::datatypes::DataType, String> {
+    use arrow::datatypes::DataType;
+
+    if expected == actual {
+        return Ok(expected.clone());
+    }
+
+    match (expected, actual) {
+        (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
+        | (DataType::Decimal256(_, _), DataType::Decimal256(_, _))
+        | (DataType::Timestamp(_, _), DataType::Timestamp(_, _))
+        | (DataType::Utf8, DataType::Binary)
+        | (DataType::Binary, DataType::Utf8) => Ok(actual.clone()),
+        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
+            merge_exchange_field(expected_field, actual_field)?,
+        )),
+        (
+            DataType::Map(expected_field, expected_ordered),
+            DataType::Map(actual_field, actual_ordered),
+        ) if expected_ordered == actual_ordered => Ok(DataType::Map(
+            merge_exchange_field(expected_field, actual_field)?,
+            *expected_ordered,
+        )),
+        (DataType::List(_), DataType::Struct(actual_fields)) if actual_fields.len() == 1 => {
+            Ok(DataType::Struct(actual_fields.clone()))
+        }
+        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
+            Ok(expected.clone())
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
+            if expected_fields.len() == actual_fields.len() =>
+        {
+            let fields = expected_fields
+                .iter()
+                .zip(actual_fields.iter())
+                .map(|(expected_field, actual_field)| {
+                    merge_exchange_field(expected_field, actual_field)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(fields.into()))
+        }
+        _ => Err(format!(
+            "exchange schema merge type mismatch: expected {:?}, got {:?}",
+            expected, actual
+        )),
+    }
+}
+
+fn merge_exchange_field(
+    expected: &Arc<arrow::datatypes::Field>,
+    actual: &Arc<arrow::datatypes::Field>,
+) -> Result<Arc<arrow::datatypes::Field>, String> {
+    let data_type = merge_exchange_field_type(expected.data_type(), actual.data_type())?;
+    let nullable = expected.is_nullable() || actual.is_nullable();
+    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
+        Ok(expected.clone())
+    } else {
+        Ok(Arc::new(
+            arrow::datatypes::Field::new(expected.name(), data_type, nullable)
+                .with_metadata(expected.metadata().clone()),
+        ))
+    }
+}
+
+fn exchange_field_from_array(
+    field: &Arc<arrow::datatypes::Field>,
+    array: &ArrayRef,
+) -> Arc<arrow::datatypes::Field> {
+    Arc::new(
+        arrow::datatypes::Field::new(
+            field.name(),
+            array.data_type().clone(),
+            field.is_nullable() || array.null_count() > 0,
+        )
+        .with_metadata(field.metadata().clone()),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -959,7 +1041,8 @@ fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
         .schema()
         .fields()
         .iter()
-        .map(|field| field.as_ref().clone())
+        .zip(first.batch.columns().iter())
+        .map(|(field, array)| exchange_field_from_array(field, array))
         .collect::<Vec<_>>();
 
     for (chunk_idx, chunk) in chunks.iter().enumerate().skip(1) {
@@ -971,16 +1054,21 @@ fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
                 chunk.schema()
             ));
         }
-        for (field_idx, actual_field) in chunk.schema().fields().iter().enumerate() {
+        for (field_idx, (actual_field, actual_array)) in chunk
+            .schema()
+            .fields()
+            .iter()
+            .zip(chunk.batch.columns().iter())
+            .enumerate()
+        {
             let merged = fields.get_mut(field_idx).ok_or_else(|| {
                 format!(
                     "exchange merged schema missing field {} for chunk index {}",
                     field_idx, chunk_idx
                 )
             })?;
-            if actual_field.is_nullable() && !merged.is_nullable() {
-                *merged = merged.clone().with_nullable(true);
-            }
+            let actual_field = exchange_field_from_array(actual_field, actual_array);
+            *merged = merge_exchange_field(merged, &actual_field)?;
         }
     }
 
