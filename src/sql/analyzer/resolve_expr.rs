@@ -946,6 +946,12 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => vec![],
         };
 
+        if name == "array_agg" && arg_exprs.len() != 1 {
+            return Err(
+                "Unexpected input 'order', the most similar input is {',', ')'}.".to_string(),
+            );
+        }
+
         // Analyze arguments
         let mut args_typed = Vec::with_capacity(arg_exprs.len());
         let mut arg_types = Vec::with_capacity(arg_exprs.len());

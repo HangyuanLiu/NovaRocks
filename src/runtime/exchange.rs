@@ -96,6 +96,46 @@ fn is_key_canceled(key: &ExchangeKey) -> bool {
     guard.contains_key(key)
 }
 
+fn is_compatible_exchange_arrow_type(
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+
+    match (expected, actual) {
+        (DataType::Decimal128(_, _), DataType::Decimal128(_, _)) => true,
+        (DataType::Decimal256(_, _), DataType::Decimal256(_, _)) => true,
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
+        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
+        (DataType::List(expected_field), DataType::List(actual_field)) => {
+            is_compatible_exchange_arrow_type(expected_field.data_type(), actual_field.data_type())
+        }
+        (DataType::Map(expected_field, _), DataType::Map(actual_field, _)) => {
+            is_compatible_exchange_arrow_type(expected_field.data_type(), actual_field.data_type())
+        }
+        (DataType::List(_), DataType::Struct(actual_fields)) if actual_fields.len() == 1 => {
+            is_compatible_exchange_arrow_type(expected, actual_fields[0].data_type())
+        }
+        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
+            is_compatible_exchange_arrow_type(expected_fields[0].data_type(), actual)
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            if expected_fields.len() != actual_fields.len() {
+                return false;
+            }
+            expected_fields.iter().zip(actual_fields.iter()).all(
+                |(expected_field, actual_field)| {
+                    is_compatible_exchange_arrow_type(
+                        expected_field.data_type(),
+                        actual_field.data_type(),
+                    )
+                },
+            )
+        }
+        _ => expected == actual,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExchangeWireMeta {
     slot_ids_by_index: Vec<SlotId>,
@@ -1091,7 +1131,9 @@ fn chunk_schema_for_wire_meta(
                             | DataType::Float32
                             | DataType::Float64
                     );
-                    if !(is_opaque_binary_expected && is_numeric_actual) {
+                    let is_compatible_complex =
+                        is_compatible_exchange_arrow_type(&expected_arrow_type, field.data_type());
+                    if !(is_opaque_binary_expected && is_numeric_actual) && !is_compatible_complex {
                         return Err(format!(
                             "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
                             idx,

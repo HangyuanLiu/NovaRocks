@@ -44,6 +44,7 @@ pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
     exchange_host: String,
     exchange_port: u16,
+    query_options: Option<crate::internal_service::TQueryOptions>,
 }
 
 impl ExecutionCoordinator {
@@ -51,11 +52,13 @@ impl ExecutionCoordinator {
         build_result: MultiFragmentBuildResult,
         exchange_host: String,
         exchange_port: u16,
+        query_options: Option<crate::internal_service::TQueryOptions>,
     ) -> Self {
         Self {
             build_result,
             exchange_host,
             exchange_port,
+            query_options,
         }
     }
 
@@ -68,6 +71,7 @@ impl ExecutionCoordinator {
         } = self.build_result;
         let exchange_host = self.exchange_host;
         let exchange_port = self.exchange_port;
+        let query_options = self.query_options;
 
         // ---------------------------------------------------------------
         // 1. Assign fragment instance IDs
@@ -459,12 +463,13 @@ impl ExecutionCoordinator {
             let desc_tbl = cte_fr.desc_tbl.clone();
             let dop = pipeline_dop;
             let cancel_instances = all_instance_ids.clone();
+            let query_options = query_options.clone();
             let handle = std::thread::spawn(move || {
                 let result = execute_fragment(
                     &thrift_fragment,
                     Some(&desc_tbl),
                     Some(&cte_exec_params),
-                    None, // query_opts
+                    query_options.as_ref(),
                     None, // session_time_zone
                     dop,
                     None, // group_execution_scan_dop
@@ -514,7 +519,7 @@ impl ExecutionCoordinator {
             None, // query_global_dicts
             None, // query_global_dict_exprs
             Some(&root_exec_params),
-            None, // query_opts
+            query_options.as_ref(),
             None, // db_name
             &connectors,
             &layout_hints,
@@ -540,7 +545,7 @@ impl ExecutionCoordinator {
             lo: root_instance_id.1,
         });
         let root_runtime_state = Arc::new(RuntimeState::new(
-            None, // query_options
+            query_options,
             None, // cache_options
             root_query_id,
             root_exec_params.runtime_filter_params.clone(),

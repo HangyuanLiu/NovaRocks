@@ -17,7 +17,8 @@ use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::parser::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
 use crate::sql::parser::ast::{
-    ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyKind,
+    ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyDesc,
+    TableKeyKind,
 };
 
 use super::catalog::{
@@ -101,8 +102,15 @@ pub(crate) fn build_string_query_result(
 struct StandaloneState {
     catalog: RwLock<InMemoryCatalog>,
     iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
+    local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
     metadata_store: Option<SqliteMetadataStore>,
     exchange_port: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalTableSemantics {
+    key_desc: Option<TableKeyDesc>,
+    column_aggregations: HashMap<String, ColumnAggregation>,
 }
 
 #[derive(Clone)]
@@ -218,7 +226,7 @@ impl StandaloneNovaRocks {
 
 impl StandaloneSession {
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
-        match self.execute_in_context(sql, None, DEFAULT_DATABASE)? {
+        match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Query(result) => Ok(result),
             StatementResult::Ok => Err("statement did not return rows".to_string()),
         }
@@ -229,7 +237,7 @@ impl StandaloneSession {
         sql: &str,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        self.execute_in_context(sql, None, current_database)
+        self.execute_in_context(sql, None, current_database, None)
     }
 
     pub(crate) fn execute_in_context(
@@ -237,6 +245,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        query_opts: Option<crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -360,6 +369,7 @@ impl StandaloneSession {
                         &catalog,
                         current_database,
                         self.inner.exchange_port,
+                        query_opts.clone(),
                     )?;
                     drop(catalog);
                     return Ok(StatementResult::Query(result));
@@ -370,14 +380,22 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result =
-                    execute_query(query, &catalog, current_database, self.inner.exchange_port)?;
+                let result = execute_query(
+                    query,
+                    &catalog,
+                    current_database,
+                    self.inner.exchange_port,
+                    query_opts.clone(),
+                )?;
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
-            sqlast::Statement::Insert(ref insert) => {
-                self.handle_sqlparser_insert(insert, current_catalog, current_database)
-            }
+            sqlast::Statement::Insert(ref insert) => self.handle_sqlparser_insert(
+                insert,
+                current_catalog,
+                current_database,
+                query_opts.as_ref(),
+            ),
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
                     let table_name = crate::sql::parser::dialect::convert_object_name(
@@ -613,6 +631,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
+        query_opts: Option<&crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         use sqlparser::ast as sqlast;
 
@@ -620,7 +639,12 @@ impl StandaloneSession {
             // INSERT SELECT
             let is_select = matches!(source.body.as_ref(), sqlast::SetExpr::Select(_));
             if is_select && !insert.overwrite {
-                return self.execute_insert_select(insert, current_catalog, current_database);
+                return self.execute_insert_select(
+                    insert,
+                    current_catalog,
+                    current_database,
+                    query_opts,
+                );
             }
             // INSERT VALUES for local tables
             if let sqlast::SetExpr::Values(_) = source.body.as_ref() {
@@ -657,6 +681,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         _current_catalog: Option<&str>,
         current_database: &str,
+        query_opts: Option<&crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
         use sqlparser::ast as sqlast;
 
@@ -676,6 +701,7 @@ impl StandaloneSession {
             &catalog,
             current_database,
             self.inner.exchange_port,
+            query_opts.cloned(),
         )?;
         drop(catalog);
 
@@ -729,6 +755,12 @@ impl StandaloneSession {
             arrow::compute::concat_batches(&schema, all_batches.iter())
                 .map_err(|e| format!("concat insert-select batches failed: {e}"))?
         };
+        let combined = apply_local_table_semantics_if_needed(
+            &self.inner,
+            &resolved,
+            &table_def.columns,
+            combined,
+        )?;
 
         write_parquet_to_path(&path, &combined)?;
 
@@ -820,6 +852,12 @@ impl StandaloneSession {
         } else {
             new_batch
         };
+        let combined = apply_local_table_semantics_if_needed(
+            &self.inner,
+            resolved,
+            &table_def.columns,
+            combined,
+        )?;
 
         write_parquet_to_path(&path, &combined)?;
 
@@ -1001,15 +1039,7 @@ fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, St
             let lit = match value {
                 sqlast::Value::Null => Literal::Null,
                 sqlast::Value::Boolean(b) => Literal::Bool(*b),
-                sqlast::Value::Number(n, _) => {
-                    if let Ok(i) = n.parse::<i64>() {
-                        Literal::Int(i)
-                    } else if let Ok(f) = n.parse::<f64>() {
-                        Literal::Float(f)
-                    } else {
-                        Literal::String(n.clone())
-                    }
-                }
+                sqlast::Value::Number(n, _) => sql_number_literal(n),
                 sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
                     Literal::String(s.clone())
                 }
@@ -1064,14 +1094,9 @@ fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, St
         sqlast::Expr::UnaryOp {
             op: sqlast::UnaryOperator::Minus,
             expr: inner,
-        } => {
-            let lit = sqlparser_expr_to_literal(inner)?;
-            match lit {
-                Literal::Int(i) => Ok(Expr::Literal(Literal::Int(-i))),
-                Literal::Float(f) => Ok(Expr::Literal(Literal::Float(-f))),
-                _ => Err(format!("cannot negate {lit:?}")),
-            }
-        }
+        } => Ok(Expr::Literal(negate_literal(sqlparser_expr_to_literal(
+            inner,
+        )?)?)),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_custom_expr(inner),
         other => Err(format!("unsupported expression: {other}")),
     }
@@ -1083,15 +1108,7 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
     match expr {
         sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
             sqlast::Value::Null => Ok(Literal::Null),
-            sqlast::Value::Number(n, _) => {
-                if let Ok(i) = n.parse::<i64>() {
-                    Ok(Literal::Int(i))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Ok(Literal::Float(f))
-                } else {
-                    Ok(Literal::String(n.clone()))
-                }
-            }
+            sqlast::Value::Number(n, _) => Ok(sql_number_literal(n)),
             sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
                 Ok(Literal::String(s.clone()))
             }
@@ -1101,14 +1118,7 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
         sqlast::Expr::UnaryOp {
             op: sqlast::UnaryOperator::Minus,
             expr: inner,
-        } => {
-            let lit = sqlparser_expr_to_literal(inner)?;
-            match lit {
-                Literal::Int(i) => Ok(Literal::Int(-i)),
-                Literal::Float(f) => Ok(Literal::Float(-f)),
-                _ => Err(format!("cannot negate {lit:?}")),
-            }
-        }
+        } => negate_literal(sqlparser_expr_to_literal(inner)?),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_literal(inner),
         // Handle CAST(expr AS type) — evaluate inner and convert to string
         sqlast::Expr::Cast { expr: inner, .. } => sqlparser_expr_to_literal(inner),
@@ -1170,6 +1180,69 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
                 .collect::<Result<Vec<_>, String>>()?,
         )),
         _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+    }
+}
+
+fn sql_number_literal(input: &str) -> Literal {
+    if is_integral_sql_number(input) {
+        input
+            .parse::<i64>()
+            .map(Literal::Int)
+            .unwrap_or_else(|_| Literal::String(input.to_string()))
+    } else {
+        input
+            .parse::<f64>()
+            .map(Literal::Float)
+            .unwrap_or_else(|_| Literal::String(input.to_string()))
+    }
+}
+
+fn is_integral_sql_number(input: &str) -> bool {
+    !input.contains(['.', 'e', 'E'])
+}
+
+fn negate_literal(literal: Literal) -> Result<Literal, String> {
+    match literal {
+        Literal::Int(i) => Ok(Literal::Int(-i)),
+        Literal::Float(f) => Ok(Literal::Float(-f)),
+        Literal::String(s) if is_integral_sql_number(s.trim()) => {
+            Ok(Literal::String(format!("-{}", s.trim())))
+        }
+        other => Err(format!("cannot negate {other:?}")),
+    }
+}
+
+fn literal_to_i128_for_integer(literal: &Literal, type_name: &str) -> Result<Option<i128>, String> {
+    match literal {
+        Literal::Null => Ok(None),
+        Literal::Int(v) => Ok(Some(i128::from(*v))),
+        Literal::Float(v) => {
+            if !v.is_finite() {
+                return Err(format!(
+                    "literal {:?} is not valid for {type_name}",
+                    literal
+                ));
+            }
+            if v.fract() != 0.0 {
+                return Err(format!(
+                    "literal {:?} is not an integral value for {type_name}",
+                    literal
+                ));
+            }
+            if *v < i128::MIN as f64 || *v > i128::MAX as f64 {
+                return Err(format!(
+                    "literal {:?} is out of range for {type_name}",
+                    literal
+                ));
+            }
+            Ok(Some(*v as i128))
+        }
+        Literal::String(s) => s
+            .trim()
+            .parse::<i128>()
+            .map(Some)
+            .map_err(|_| format!("literal `{s}` is not valid for {type_name}")),
+        other => Err(format!("literal {:?} is not valid for {type_name}", other)),
     }
 }
 
@@ -1341,6 +1414,7 @@ fn execute_create_table_statement(
                     &stmt.name,
                     current_database,
                     &columns,
+                    key_desc.as_ref(),
                 );
             }
 
@@ -1406,6 +1480,7 @@ fn execute_drop_database_statement(
             Ok(()) => {
                 let database_name = normalize_identifier(name.leaf())?;
                 drop(guard);
+                remove_local_database_semantics(state, &database_name)?;
                 delete_local_database_if_needed(state, &database_name)?;
                 return Ok(StatementResult::Ok);
             }
@@ -1469,6 +1544,7 @@ fn execute_drop_table_statement(
                 match guard.drop_table(&resolved.database, &resolved.table) {
                     Ok(()) => {
                         drop(guard);
+                        remove_local_table_semantics(state, &resolved.database, &resolved.table)?;
                         delete_local_table_if_needed(state, &resolved.database, &resolved.table)?;
                         Ok(StatementResult::Ok)
                     }
@@ -2008,7 +2084,9 @@ fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
         SqlType::SmallInt => Ok(DataType::Int16),
         SqlType::Int => Ok(DataType::Int32),
         SqlType::BigInt => Ok(DataType::Int64),
-        SqlType::LargeInt => Ok(DataType::Int64),
+        SqlType::LargeInt => Ok(DataType::FixedSizeBinary(
+            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+        )),
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
         SqlType::String => Ok(DataType::Utf8),
@@ -2028,7 +2106,7 @@ fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
             let value_type = sql_type_to_arrow_type(value)?;
             let entries = DataType::Struct(
                 vec![
-                    Arc::new(Field::new("key", key_type, false)),
+                    Arc::new(Field::new("key", key_type, true)),
                     Arc::new(Field::new("value", value_type, true)),
                 ]
                 .into(),
@@ -2060,6 +2138,7 @@ fn create_local_table_from_columns(
     name: &ObjectName,
     current_database: &str,
     columns: &[TableColumnDef],
+    key_desc: Option<&TableKeyDesc>,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
 
@@ -2113,8 +2192,93 @@ fn create_local_table_from_columns(
         .expect("standalone catalog write lock");
     guard.register(&resolved.database, table_def)?;
     drop(guard);
+    update_local_table_semantics(
+        state,
+        &resolved.database,
+        &resolved.table,
+        columns,
+        key_desc,
+    )?;
     persist_local_table_if_needed(state, &resolved.database, &resolved.table, &table_file)?;
     Ok(StatementResult::Ok)
+}
+
+fn update_local_table_semantics(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    columns: &[TableColumnDef],
+    key_desc: Option<&TableKeyDesc>,
+) -> Result<(), String> {
+    let key = (
+        normalize_identifier(database_name)?,
+        normalize_identifier(table_name)?,
+    );
+    let column_aggregations = columns
+        .iter()
+        .filter_map(|column| {
+            column.aggregation.map(|aggregation| {
+                Ok::<_, String>((normalize_identifier(&column.name)?, aggregation))
+            })
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let semantics = LocalTableSemantics {
+        key_desc: key_desc.cloned(),
+        column_aggregations,
+    };
+    state
+        .local_table_semantics
+        .write()
+        .expect("standalone local table semantics write lock")
+        .insert(key, semantics);
+    Ok(())
+}
+
+fn get_local_table_semantics(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+) -> Result<Option<LocalTableSemantics>, String> {
+    let key = (
+        normalize_identifier(database_name)?,
+        normalize_identifier(table_name)?,
+    );
+    Ok(state
+        .local_table_semantics
+        .read()
+        .expect("standalone local table semantics read lock")
+        .get(&key)
+        .cloned())
+}
+
+fn remove_local_table_semantics(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+) -> Result<(), String> {
+    let key = (
+        normalize_identifier(database_name)?,
+        normalize_identifier(table_name)?,
+    );
+    state
+        .local_table_semantics
+        .write()
+        .expect("standalone local table semantics write lock")
+        .remove(&key);
+    Ok(())
+}
+
+fn remove_local_database_semantics(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+) -> Result<(), String> {
+    let database_key = normalize_identifier(database_name)?;
+    state
+        .local_table_semantics
+        .write()
+        .expect("standalone local table semantics write lock")
+        .retain(|(db, _), _| db != &database_key);
+    Ok(())
 }
 
 /// Insert rows into a local parquet table.
@@ -2162,6 +2326,8 @@ fn insert_into_local_table(
     } else {
         new_batch
     };
+    let combined =
+        apply_local_table_semantics_if_needed(state, resolved, &table_def.columns, combined)?;
 
     // Write back
     write_parquet_to_path(&path, &combined)?;
@@ -2225,7 +2391,14 @@ fn read_local_parquet_data(path: &Path, columns: &[ColumnDef]) -> Result<RecordB
         let batch = batch_result.map_err(|e| format!("read local parquet batch failed: {e}"))?;
         batches.push(batch);
     }
-    concat_or_empty_batches(columns, batches)
+    let batch = concat_or_empty_batches(columns, batches)?;
+    let target_schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|c| Field::new(&c.name, c.data_type.clone(), c.nullable))
+            .collect::<Vec<_>>(),
+    ));
+    cast_batch_to_schema(&batch, &target_schema)
 }
 
 /// Build a RecordBatch from literal value rows for a local table.
@@ -2274,10 +2447,13 @@ fn build_local_literal_array(
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::Int(v) => i8::try_from(*v)
-                        .map(Some)
-                        .map_err(|_| format!("literal {v} is out of range for TINYINT")),
-                    other => Err(format!("literal {:?} is not valid for TINYINT", other)),
+                    _ => {
+                        literal_to_i128_for_integer(literal, "TINYINT")?.map_or(Ok(None), |value| {
+                            i8::try_from(value)
+                                .map(Some)
+                                .map_err(|_| format!("literal {value} is out of range for TINYINT"))
+                        })
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
@@ -2286,10 +2462,14 @@ fn build_local_literal_array(
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::Int(v) => i16::try_from(*v)
-                        .map(Some)
-                        .map_err(|_| format!("literal {v} is out of range for SMALLINT")),
-                    other => Err(format!("literal {:?} is not valid for SMALLINT", other)),
+                    _ => literal_to_i128_for_integer(literal, "SMALLINT")?.map_or(
+                        Ok(None),
+                        |value| {
+                            i16::try_from(value).map(Some).map_err(|_| {
+                                format!("literal {value} is out of range for SMALLINT")
+                            })
+                        },
+                    ),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
@@ -2298,15 +2478,11 @@ fn build_local_literal_array(
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::Int(v) => i32::try_from(*v)
-                        .map(Some)
-                        .map_err(|_| format!("literal {v} is out of range for INT")),
-                    Literal::String(s) => s
-                        .trim()
-                        .parse::<i32>()
-                        .map(Some)
-                        .map_err(|_| format!("literal `{s}` is not valid for INT")),
-                    other => Err(format!("literal {:?} is not valid for INT", other)),
+                    _ => literal_to_i128_for_integer(literal, "INT")?.map_or(Ok(None), |value| {
+                        i32::try_from(value)
+                            .map(Some)
+                            .map_err(|_| format!("literal {value} is out of range for INT"))
+                    }),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
@@ -2315,16 +2491,25 @@ fn build_local_literal_array(
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::Int(v) => Ok(Some(*v)),
-                    Literal::String(s) => s
-                        .trim()
-                        .parse::<i64>()
-                        .map(Some)
-                        .map_err(|_| format!("literal `{s}` is not valid for BIGINT")),
-                    other => Err(format!("literal {:?} is not valid for BIGINT", other)),
+                    _ => {
+                        literal_to_i128_for_integer(literal, "BIGINT")?.map_or(Ok(None), |value| {
+                            i64::try_from(value)
+                                .map(Some)
+                                .map_err(|_| format!("literal {value} is out of range for BIGINT"))
+                        })
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            let parsed = values
+                .iter()
+                .map(|literal| literal_to_i128_for_integer(literal, "LARGEINT"))
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::common::largeint::array_from_i128(&parsed)
+        }
         DataType::Float32 => Ok(Arc::new(Float32Array::from(
             values
                 .iter()
@@ -2541,9 +2726,6 @@ fn build_local_literal_array(
                     Literal::Map(items) => {
                         map_nulls.append(true);
                         for (key, value) in items {
-                            if matches!(key, Literal::Null) {
-                                return Err("MAP literal keys must be non-null".to_string());
-                            }
                             flattened_keys.push(key.clone());
                             flattened_values.push(value.clone());
                         }
@@ -2685,9 +2867,7 @@ fn cast_array_for_local_schema(
     source_col: &ArrayRef,
     target_field: &arrow::datatypes::FieldRef,
 ) -> Result<ArrayRef, String> {
-    use arrow::array::{
-        Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
-    };
+    use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
     use arrow::datatypes::DataType;
 
     fn encode_bytes(bytes: &[u8]) -> String {
@@ -2766,8 +2946,15 @@ fn cast_array_for_local_schema(
         (source_type, DataType::Timestamp(_, _)) if is_numeric_datetime_source(source_type) => {
             crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
         }
-        _ => arrow::compute::cast(source_col, target_field.data_type())
-            .map_err(|e| format!("{e}")),
+        (_, DataType::FixedSizeBinary(width))
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+        }
+        (_, DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)) => {
+            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+        }
+        _ => arrow::compute::cast(source_col, target_field.data_type()).map_err(|e| format!("{e}")),
     }
 }
 
@@ -2862,15 +3049,55 @@ fn apply_iceberg_table_semantics_if_needed(
     loaded: &IcebergLoadedTable,
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
-    let Some(key_desc) = loaded.key_desc.as_ref() else {
+    let Some(merged_rows) = merge_aggregate_table_rows_if_needed(
+        &loaded.columns,
+        loaded.key_desc.as_ref(),
+        &loaded.column_aggregations,
+        &batch,
+    )?
+    else {
         return Ok(batch);
     };
-    if key_desc.kind != TableKeyKind::Aggregate || batch.num_rows() <= 1 {
+    super::iceberg::build_insert_batch(loaded, &merged_rows)
+}
+
+fn apply_local_table_semantics_if_needed(
+    state: &Arc<StandaloneState>,
+    resolved: &ResolvedLocalTableName,
+    columns: &[ColumnDef],
+    batch: RecordBatch,
+) -> Result<RecordBatch, String> {
+    let Some(semantics) = get_local_table_semantics(state, &resolved.database, &resolved.table)?
+    else {
         return Ok(batch);
+    };
+    let Some(merged_rows) = merge_aggregate_table_rows_if_needed(
+        columns,
+        semantics.key_desc.as_ref(),
+        &semantics.column_aggregations,
+        &batch,
+    )?
+    else {
+        return Ok(batch);
+    };
+    build_local_insert_batch(columns, &merged_rows)
+}
+
+fn merge_aggregate_table_rows_if_needed(
+    columns: &[ColumnDef],
+    key_desc: Option<&TableKeyDesc>,
+    column_aggregations: &HashMap<String, ColumnAggregation>,
+    batch: &RecordBatch,
+) -> Result<Option<Vec<Vec<Literal>>>, String> {
+    let Some(key_desc) = key_desc else {
+        return Ok(None);
+    };
+    if key_desc.kind != TableKeyKind::Aggregate || batch.num_rows() <= 1 {
+        return Ok(None);
     }
 
-    let mut column_index_by_name = HashMap::with_capacity(loaded.columns.len());
-    for (idx, column) in loaded.columns.iter().enumerate() {
+    let mut column_index_by_name = HashMap::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
         column_index_by_name.insert(normalize_identifier(&column.name)?, idx);
     }
     let key_indices = key_desc
@@ -2885,11 +3112,10 @@ fn apply_iceberg_table_semantics_if_needed(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let num_columns = batch.num_columns();
     let mut merged_rows = Vec::<Vec<Literal>>::new();
     let mut row_index_by_key = HashMap::<Vec<LiteralKey>, usize>::new();
     for row_idx in 0..batch.num_rows() {
-        let row = (0..num_columns)
+        let row = (0..batch.num_columns())
             .map(|col_idx| literal_from_batch(batch.column(col_idx), row_idx))
             .collect::<Result<Vec<_>, _>>()?;
         let key = key_indices
@@ -2900,21 +3126,21 @@ fn apply_iceberg_table_semantics_if_needed(
             let existing = merged_rows
                 .get_mut(existing_idx)
                 .ok_or_else(|| "aggregate key merge state is inconsistent".to_string())?;
-            merge_aggregate_table_row(existing, &row, &key_indices, loaded)?;
+            merge_aggregate_table_row(existing, &row, &key_indices, columns, column_aggregations)?;
         } else {
             row_index_by_key.insert(key, merged_rows.len());
             merged_rows.push(row);
         }
     }
-
-    super::iceberg::build_insert_batch(loaded, &merged_rows)
+    Ok(Some(merged_rows))
 }
 
 fn merge_aggregate_table_row(
     existing: &mut [Literal],
     incoming: &[Literal],
     key_indices: &[usize],
-    loaded: &IcebergLoadedTable,
+    columns: &[ColumnDef],
+    column_aggregations: &HashMap<String, ColumnAggregation>,
 ) -> Result<(), String> {
     for (column_idx, (existing_value, incoming_value)) in
         existing.iter_mut().zip(incoming.iter()).enumerate()
@@ -2922,13 +3148,11 @@ fn merge_aggregate_table_row(
         if key_indices.contains(&column_idx) {
             continue;
         }
-        let column = loaded
-            .columns
+        let column = columns
             .get(column_idx)
             .ok_or_else(|| "aggregate table column index is out of bounds".to_string())?;
         let key = normalize_identifier(&column.name)?;
-        let aggregation = loaded
-            .column_aggregations
+        let aggregation = column_aggregations
             .get(&key)
             .copied()
             .unwrap_or(ColumnAggregation::Replace);
@@ -4220,6 +4444,7 @@ fn execute_query(
     catalog: &InMemoryCatalog,
     current_database: &str,
     exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
@@ -4234,12 +4459,13 @@ fn execute_query(
     let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan),
+        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan, query_opts),
         StandaloneExecutionPlan::Coordinated(build_result) => {
             super::coordinator::ExecutionCoordinator::new(
                 build_result,
                 "127.0.0.1".to_string(),
                 exchange_port,
+                query_opts,
             )
             .execute()
         }
@@ -4383,7 +4609,10 @@ fn collect_scan_stats(
     }
 }
 
-fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
+fn execute_plan(
+    result: PlanBuildResult,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<QueryResult, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
@@ -4410,7 +4639,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
         None,
         None,
         Some(&exec_params),
-        None,
+        query_opts.as_ref(),
         None,
         &connectors,
         &layout_hints,
@@ -4436,7 +4665,9 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
         None,
         None,
         pipeline_dop as _,
-        std::sync::Arc::new(RuntimeState::default()),
+        std::sync::Arc::new(RuntimeState::new(
+            query_opts, None, None, None, None, None, None, None, None,
+        )),
         None,
         None,
         None,
@@ -4464,7 +4695,11 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
 fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
     let trimmed = sql.trim_start();
     let prefix = "EXPLAIN COSTS ";
-    if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if trimmed
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    {
         let body = trimmed[prefix.len()..].trim_start();
         Some((
             format!("EXPLAIN {body}"),
@@ -4482,7 +4717,9 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
 #[cfg(test)]
 mod tests {
     use super::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
-    use arrow::array::{Array, Int32Array, ListArray, StringArray};
+    use arrow::array::{
+        Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -4580,6 +4817,35 @@ mod tests {
     }
 
     #[test]
+    fn sqlparser_insert_values_preserves_large_integer_literals() {
+        use crate::sql::parser::ast::Literal;
+        use crate::sql::parser::dialect::StarRocksDialect;
+
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &StarRocksDialect,
+            "INSERT INTO t VALUES (-9223372036854775808, -170141183460469231731687303715884105728)",
+        )
+        .expect("parse insert");
+        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert statement");
+        };
+        let source = insert.source.as_ref().expect("insert source");
+        let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+            panic!("expected values source");
+        };
+        let row = &values.rows[0];
+
+        assert_eq!(
+            super::sqlparser_expr_to_literal(&row[0]).expect("parse BIGINT literal"),
+            Literal::String("-9223372036854775808".to_string())
+        );
+        assert_eq!(
+            super::sqlparser_expr_to_literal(&row[1]).expect("parse LARGEINT literal"),
+            Literal::String("-170141183460469231731687303715884105728".to_string())
+        );
+    }
+
+    #[test]
     fn convert_insert_values_accepts_map_and_row_literals() {
         use crate::sql::parser::dialect::StarRocksDialect;
 
@@ -4653,6 +4919,189 @@ mod tests {
         assert_eq!(tags.len(), 2);
         assert_eq!(tags.value(0).len(), 3);
         assert_eq!(tags.value(1).len(), 0);
+    }
+
+    #[test]
+    fn sql_type_to_arrow_type_maps_largeint_to_fixed_size_binary() {
+        assert_eq!(
+            super::sql_type_to_arrow_type(&crate::sql::parser::ast::SqlType::LargeInt)
+                .expect("map largeint type"),
+            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+        );
+    }
+
+    #[test]
+    fn build_local_insert_batch_supports_largeint_columns() {
+        use crate::common::largeint;
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let columns = vec![ColumnDef {
+            name: "v".to_string(),
+            data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
+            nullable: true,
+        }];
+        let rows = vec![
+            vec![Literal::String(
+                "-170141183460469231731687303715884105728".to_string(),
+            )],
+            vec![Literal::String("0".to_string())],
+            vec![Literal::Null],
+            vec![Literal::String(
+                "170141183460469231731687303715884105727".to_string(),
+            )],
+        ];
+
+        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint array");
+
+        assert_eq!(
+            largeint::value_at(values, 0).expect("decode min"),
+            i128::MIN
+        );
+        assert_eq!(largeint::value_at(values, 1).expect("decode zero"), 0);
+        assert!(values.is_null(2));
+        assert_eq!(
+            largeint::value_at(values, 3).expect("decode max"),
+            i128::MAX
+        );
+    }
+
+    #[test]
+    fn build_local_insert_batch_accepts_integral_float_literals_for_bigint_arrays() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let columns = vec![ColumnDef {
+            name: "nums".to_string(),
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            nullable: true,
+        }];
+        let rows = vec![vec![Literal::Array(vec![
+            Literal::Float(1.0),
+            Literal::Float(2.0),
+        ])]];
+
+        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
+        let nums = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("nums list array");
+        let values = nums
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 values");
+
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+    }
+
+    #[test]
+    fn build_local_insert_batch_accepts_null_map_keys() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            true,
+        ));
+        let columns = vec![ColumnDef {
+            name: "m".to_string(),
+            data_type: DataType::Map(entries_field, false),
+            nullable: true,
+        }];
+        let rows = vec![vec![Literal::Map(vec![(
+            Literal::Null,
+            Literal::String("v".to_string()),
+        )])]];
+
+        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("map array");
+        let entries = map.entries();
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("key array");
+
+        assert!(keys.is_null(0));
+    }
+
+    #[test]
+    fn cast_batch_to_schema_relaxes_map_key_nullability() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::parser::ast::Literal;
+
+        let source_entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let source_columns = vec![ColumnDef {
+            name: "m".to_string(),
+            data_type: DataType::Map(source_entries_field, false),
+            nullable: true,
+        }];
+        let rows = vec![vec![Literal::Map(vec![(
+            Literal::Int(1),
+            Literal::String("v".to_string()),
+        )])]];
+        let source_batch =
+            super::build_local_insert_batch(&source_columns, &rows).expect("build source batch");
+
+        let target_entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(target_entries_field, false),
+            true,
+        )]));
+
+        let casted =
+            super::cast_batch_to_schema(&source_batch, &target_schema).expect("cast batch");
+        let DataType::Map(entries_field, _) = casted.schema().field(0).data_type() else {
+            panic!("expected MAP column");
+        };
+        let DataType::Struct(entry_fields) = entries_field.data_type() else {
+            panic!("expected MAP entries to be STRUCT");
+        };
+
+        assert!(
+            entry_fields[0].is_nullable(),
+            "expected casted map key field to become nullable"
+        );
     }
 
     #[test]
@@ -5171,7 +5620,12 @@ mod tests {
         assert!(matches!(insert, StatementResult::Ok));
 
         let result = session
-            .execute_in_context("select c2, c1 from nums order by 1, 2", Some("ice"), "db1")
+            .execute_in_context(
+                "select c2, c1 from nums order by 1, 2",
+                Some("ice"),
+                "db1",
+                None,
+            )
             .expect("query iceberg table in current catalog context");
         let StatementResult::Query(result) = result else {
             panic!("expected query result");

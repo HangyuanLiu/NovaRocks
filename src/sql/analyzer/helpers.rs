@@ -44,7 +44,9 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
             let type_name = name.to_string().to_lowercase();
             match type_name.as_str() {
                 "string" => Ok(DataType::Utf8),
-                "largeint" => Ok(DataType::Int64),
+                "largeint" => Ok(DataType::FixedSizeBinary(
+                    crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
                 _ => Err(format!("unsupported SQL type: {name}")),
             }
@@ -111,25 +113,7 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             .map(|i| i.value.clone())
             .unwrap_or_else(|| format!("{expr}")),
         sqlast::Expr::Identifier(ident) => ident.value.clone(),
-        sqlast::Expr::Function(f) => {
-            // Lowercase function name to match StarRocks FE behavior.
-            // sqlparser's Display may uppercase SQL keywords, so we
-            // replace the function name portion with the lowercased form.
-            let display = format!("{expr}");
-            let func_name = f.name.to_string();
-            let display_name = canonical_display_function_name(&func_name);
-            let func_lower = func_name.to_lowercase();
-            // Case-insensitive find and replace the function name prefix.
-            if let Some(pos) = display.to_lowercase().find(&func_lower) {
-                let mut result = String::with_capacity(display.len());
-                result.push_str(&display[..pos]);
-                result.push_str(&display_name);
-                result.push_str(&display[pos + func_name.len()..]);
-                result
-            } else {
-                display
-            }
-        }
+        sqlast::Expr::Function(f) => format_function_display_name(f),
         // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
         // wrap inner with parentheses if it's not a simple identifier or literal.
         sqlast::Expr::Cast {
@@ -229,6 +213,190 @@ fn canonical_display_function_name(name: &str) -> String {
         "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         other => other.to_string(),
     }
+}
+
+fn format_function_display_name(function: &sqlast::Function) -> String {
+    let mut out = format!(
+        "{}{}{}",
+        canonical_display_function_name(&function.name.to_string()),
+        function.parameters,
+        format_function_arguments(&function.args)
+    );
+    if !function.within_group.is_empty() {
+        out.push_str(" WITHIN GROUP (ORDER BY ");
+        out.push_str(
+            &function
+                .within_group
+                .iter()
+                .map(format_order_by_expr_display_name)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push(')');
+    }
+    if let Some(filter_cond) = &function.filter {
+        out.push_str(" FILTER (WHERE ");
+        out.push_str(&expr_display_name(filter_cond));
+        out.push(')');
+    }
+    if let Some(null_treatment) = &function.null_treatment {
+        out.push(' ');
+        out.push_str(&null_treatment.to_string());
+    }
+    if let Some(over) = &function.over {
+        out.push_str(" OVER ");
+        out.push_str(&over.to_string());
+    }
+    out
+}
+
+fn format_function_arguments(args: &sqlast::FunctionArguments) -> String {
+    match args {
+        sqlast::FunctionArguments::None => String::new(),
+        sqlast::FunctionArguments::Subquery(query) => format!("({query})"),
+        sqlast::FunctionArguments::List(list) => {
+            format!("({})", format_function_argument_list(list))
+        }
+    }
+}
+
+fn format_function_argument_list(list: &sqlast::FunctionArgumentList) -> String {
+    let mut out = String::new();
+    if let Some(duplicate_treatment) = list.duplicate_treatment {
+        out.push_str(&duplicate_treatment.to_string());
+        out.push(' ');
+    }
+    out.push_str(
+        &list
+            .args
+            .iter()
+            .map(format_function_arg_display_name)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if !list.clauses.is_empty() {
+        if !list.args.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(
+            &list
+                .clauses
+                .iter()
+                .map(|clause| format_function_clause_display_name(clause, &list.args))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    out
+}
+
+fn format_function_arg_display_name(arg: &sqlast::FunctionArg) -> String {
+    match arg {
+        sqlast::FunctionArg::Named {
+            name,
+            arg,
+            operator,
+        } => format!(
+            "{name} {operator} {}",
+            format_function_arg_expr_display_name(arg)
+        ),
+        sqlast::FunctionArg::ExprNamed {
+            name,
+            arg,
+            operator,
+        } => format!(
+            "{} {operator} {}",
+            expr_display_name(name),
+            format_function_arg_expr_display_name(arg)
+        ),
+        sqlast::FunctionArg::Unnamed(arg) => format_function_arg_expr_display_name(arg),
+    }
+}
+
+fn format_function_arg_expr_display_name(arg: &sqlast::FunctionArgExpr) -> String {
+    match arg {
+        sqlast::FunctionArgExpr::Expr(expr) => expr_display_name(expr),
+        sqlast::FunctionArgExpr::QualifiedWildcard(prefix) => format!("{prefix}.*"),
+        sqlast::FunctionArgExpr::Wildcard => "*".to_string(),
+    }
+}
+
+fn format_function_clause_display_name(
+    clause: &sqlast::FunctionArgumentClause,
+    args: &[sqlast::FunctionArg],
+) -> String {
+    match clause {
+        sqlast::FunctionArgumentClause::OrderBy(order_by) => format!(
+            "ORDER BY {}",
+            order_by
+                .iter()
+                .map(|item| format_function_order_by_expr_display_name(item, args))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        sqlast::FunctionArgumentClause::Limit(limit) => {
+            format!("LIMIT {}", expr_display_name(limit))
+        }
+        _ => clause.to_string(),
+    }
+}
+
+fn format_order_by_expr_display_name(order_by: &sqlast::OrderByExpr) -> String {
+    let mut out = expr_display_name(&order_by.expr);
+    let asc = order_by.options.asc.unwrap_or(true);
+    out.push(' ');
+    out.push_str(if asc { "ASC" } else { "DESC" });
+    if let Some(nulls_first) = order_by.options.nulls_first
+        && nulls_first != asc
+    {
+        out.push_str(if nulls_first {
+            " NULLS FIRST"
+        } else {
+            " NULLS LAST"
+        });
+    }
+    if let Some(with_fill) = &order_by.with_fill {
+        out.push(' ');
+        out.push_str(&with_fill.to_string());
+    }
+    out
+}
+
+fn format_function_order_by_expr_display_name(
+    order_by: &sqlast::OrderByExpr,
+    args: &[sqlast::FunctionArg],
+) -> String {
+    let expr = match &order_by.expr {
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(n, false),
+            ..
+        }) => n
+            .parse::<usize>()
+            .ok()
+            .and_then(|pos| args.get(pos.saturating_sub(1)))
+            .map(format_function_arg_display_name)
+            .unwrap_or_else(|| expr_display_name(&order_by.expr)),
+        _ => expr_display_name(&order_by.expr),
+    };
+
+    let mut out = expr;
+    let asc = order_by.options.asc.unwrap_or(true);
+    out.push(' ');
+    out.push_str(if asc { "ASC" } else { "DESC" });
+    if let Some(nulls_first) = order_by.options.nulls_first
+        && nulls_first != asc
+    {
+        out.push_str(if nulls_first {
+            " NULLS FIRST"
+        } else {
+            " NULLS LAST"
+        });
+    }
+    if let Some(with_fill) = &order_by.with_fill {
+        out.push(' ');
+        out.push_str(&with_fill.to_string());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -363,5 +531,43 @@ pub(super) fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
         }
         sqlast::Expr::Nested(inner) => eval_const_i64(inner),
         _ => Err(format!("expected constant integer expression, got: {expr}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::ast as sqlast;
+
+    use super::expr_display_name;
+    use crate::sql::parser::dialect::StarRocksDialect;
+
+    fn parse_select_expr(sql: &str) -> sqlast::Expr {
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&StarRocksDialect, sql).expect("parse sql");
+        let sqlast::Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        expr.clone()
+    }
+
+    #[test]
+    fn expr_display_name_formats_distinct_function_args_recursively() {
+        let expr = parse_select_expr("SELECT ARRAY_AGG(DISTINCT score > 0)");
+        assert_eq!(expr_display_name(&expr), "array_agg(DISTINCT score > 0)");
+    }
+
+    #[test]
+    fn expr_display_name_lowercases_nested_function_names() {
+        let expr = parse_select_expr("SELECT array_min(ARRAY_UNIQUE_AGG(col_boolean))");
+        assert_eq!(
+            expr_display_name(&expr),
+            "array_min(array_unique_agg(col_boolean))"
+        );
     }
 }

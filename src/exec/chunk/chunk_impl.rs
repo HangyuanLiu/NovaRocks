@@ -24,7 +24,7 @@ use crate::common::ids::SlotId;
 use crate::runtime::mem_tracker::MemTracker;
 
 use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};
-use super::schema::{ChunkSchema, ChunkSchemaRef, validate_chunk_schema_against_batch};
+use super::schema::{ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch};
 
 /// A chunk of data, consisting of multiple rows.
 /// Phase 2: Wrapper around Arrow RecordBatch.
@@ -60,7 +60,7 @@ impl Chunk {
         batch: RecordBatch,
         chunk_schema: ChunkSchemaRef,
     ) -> Result<Self, String> {
-        validate_chunk_schema_against_batch(&batch, chunk_schema.as_ref())?;
+        let chunk_schema = align_chunk_schema_to_batch(&batch, chunk_schema.as_ref())?;
         Ok(Self {
             batch,
             chunk_schema,

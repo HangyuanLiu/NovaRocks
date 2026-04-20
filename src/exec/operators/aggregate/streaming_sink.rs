@@ -36,7 +36,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use super::streaming_state::AggregateStreamingState;
-use super::{ENABLE_GROUP_KEY_OPTIMIZATIONS, build_agg_views};
+use super::{ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_views};
 use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
@@ -569,6 +569,7 @@ impl AggregateStreamingSinkOperator {
                     .map_err(|e| e.to_string())?,
             );
         }
+        let schema = align_schema_with_arrays(&schema, &arrays, "aggregate streaming output")?;
 
         let batch = if arrays.is_empty() {
             let options = arrow::array::RecordBatchOptions::new()

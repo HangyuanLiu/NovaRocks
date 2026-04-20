@@ -378,6 +378,36 @@ pub struct ChunkSchema {
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
+fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
+    match (expected, actual) {
+        (DataType::Decimal128(_, _), DataType::Decimal128(_, _)) => true,
+        (DataType::Decimal256(_, _), DataType::Decimal256(_, _)) => true,
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
+        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
+        (DataType::List(expected_field), DataType::List(actual_field))
+        | (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
+            is_compatible_chunk_field_type(expected_field.data_type(), actual_field.data_type())
+        }
+        (DataType::Map(expected_field, _), DataType::Map(actual_field, _)) => {
+            is_compatible_chunk_field_type(expected_field.data_type(), actual_field.data_type())
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            if expected_fields.len() != actual_fields.len() {
+                return false;
+            }
+            expected_fields.iter().zip(actual_fields.iter()).all(
+                |(expected_field, actual_field)| {
+                    is_compatible_chunk_field_type(
+                        expected_field.data_type(),
+                        actual_field.data_type(),
+                    )
+                },
+            )
+        }
+        _ => expected == actual,
+    }
+}
+
 impl ChunkSchema {
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
         let mut index_by_slot = HashMap::with_capacity(slots.len());
@@ -514,10 +544,10 @@ impl ChunkSchema {
     }
 }
 
-pub(super) fn validate_chunk_schema_against_batch(
+pub(super) fn align_chunk_schema_to_batch(
     batch: &RecordBatch,
     chunk_schema: &ChunkSchema,
-) -> Result<(), String> {
+) -> Result<ChunkSchemaRef, String> {
     if batch.num_columns() != chunk_schema.slots().len() {
         return Err(format!(
             "chunk schema contract length mismatch: batch_columns={} contract_slots={}",
@@ -525,17 +555,19 @@ pub(super) fn validate_chunk_schema_against_batch(
             chunk_schema.slots().len()
         ));
     }
+    let mut slots = Vec::with_capacity(batch.num_columns());
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         let expected = chunk_schema
-            .field(idx)
+            .slots()
+            .get(idx)
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
         // Allow nullable batch fields to satisfy a non-nullable contract.
         // Source operators (e.g. FILE_SCAN for CSV) always produce nullable
         // columns; the actual NOT-NULL constraint is enforced downstream
         // (e.g. by the sink's row validation or the storage layer).
-        let nullable_ok = field.is_nullable() == expected.is_nullable() || field.is_nullable();
+        let nullable_ok = field.is_nullable() == expected.nullable() || field.is_nullable();
         if field.name() != expected.name()
-            || field.data_type() != expected.data_type()
+            || !is_compatible_chunk_field_type(expected.data_type(), field.data_type())
             || !nullable_ok
         {
             return Err(format!(
@@ -546,11 +578,12 @@ pub(super) fn validate_chunk_schema_against_batch(
                 field.is_nullable(),
                 expected.name(),
                 expected.data_type(),
-                expected.is_nullable()
+                expected.nullable()
             ));
         }
+        slots.push(expected.with_field_and_slot_id(expected.slot_id(), field.as_ref().clone())?);
     }
-    Ok(())
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
 
 #[cfg(test)]

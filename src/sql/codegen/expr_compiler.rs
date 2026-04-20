@@ -246,8 +246,16 @@ impl<'a> ExprCompiler<'a> {
                     remove_fn_symbol: None,
                     is_analytic_only_fn: None,
                     symbol: None,
-                    is_asc_order: None,
-                    nulls_first: None,
+                    is_asc_order: if agg_call.order_by.is_empty() {
+                        None
+                    } else {
+                        Some(agg_call.order_by.iter().map(|s| s.asc).collect())
+                    },
+                    nulls_first: if agg_call.order_by.is_empty() {
+                        None
+                    } else {
+                        Some(agg_call.order_by.iter().map(|s| s.nulls_first).collect())
+                    },
                     is_distinct: if is_distinct { Some(true) } else { None },
                 }),
                 id: None,
@@ -624,13 +632,14 @@ impl<'a> ExprCompiler<'a> {
                 name,
                 args,
                 distinct,
-                ..
+                order_by,
             } => {
                 // In a project-over-aggregate context, the scope has aggregate
                 // output columns registered by display name. Try to look up
                 // as a slot reference first.
-                let display =
-                    super::helpers::agg_call_display_name_from_parts(name, args, *distinct);
+                let display = super::helpers::agg_call_display_name_from_parts(
+                    name, args, *distinct, order_by,
+                );
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
                     let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
                     self.nodes

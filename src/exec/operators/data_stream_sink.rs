@@ -1647,8 +1647,18 @@ impl DataStreamSinkOperator {
 
         let mut batch = Vec::new();
         let mut batch_bytes = 0usize;
+        let mut first_schema: Option<crate::exec::chunk::ChunkSchemaRef> = None;
         while let Some(front) = pending.front() {
             let chunk_bytes = front.batch.get_array_memory_size();
+            if let Some(schema) = first_schema.as_ref()
+                && front.chunk_schema() != schema.as_ref()
+            {
+                // Keep a single exchange payload schema-stable. Complex aggregate
+                // outputs can diverge in nested nullability (for example MAP keys)
+                // across drivers, and Arrow IPC normalization cannot widen those
+                // nested field contracts without rebuilding the arrays.
+                break;
+            }
             if !batch.is_empty() && batch_bytes.saturating_add(chunk_bytes) > max_bytes {
                 break;
             }
@@ -1656,6 +1666,9 @@ impl DataStreamSinkOperator {
                 .pop_front()
                 .ok_or_else(|| "pending buffer empty unexpectedly".to_string())?;
             batch_bytes = batch_bytes.saturating_add(chunk_bytes);
+            if first_schema.is_none() {
+                first_schema = Some(chunk.chunk_schema_ref());
+            }
             batch.push(chunk);
             if batch_bytes >= max_bytes {
                 break;

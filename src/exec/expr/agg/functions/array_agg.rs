@@ -410,6 +410,99 @@ fn build_default_intermediate_type(arg_types: &[DataType]) -> DataType {
     DataType::Struct(Fields::from(fields))
 }
 
+fn reconcile_field_to_field(
+    expected: &Arc<Field>,
+    actual: &Arc<Field>,
+    context: &str,
+) -> Result<Arc<Field>, String> {
+    let data_type = reconcile_data_type(expected.data_type(), actual.data_type(), context)?;
+    let nullable = if expected.is_nullable() == actual.is_nullable() {
+        expected.is_nullable()
+    } else {
+        actual.is_nullable()
+    };
+    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
+        Ok(expected.clone())
+    } else {
+        Ok(Arc::new(Field::new(expected.name(), data_type, nullable)))
+    }
+}
+
+fn reconcile_field_to_data_type(
+    expected: &Arc<Field>,
+    actual: &DataType,
+    context: &str,
+) -> Result<Arc<Field>, String> {
+    let data_type = reconcile_data_type(expected.data_type(), actual, context)?;
+    if &data_type == expected.data_type() {
+        Ok(expected.clone())
+    } else {
+        Ok(Arc::new(Field::new(
+            expected.name(),
+            data_type,
+            expected.is_nullable(),
+        )))
+    }
+}
+
+fn reconcile_data_type(
+    expected: &DataType,
+    actual: &DataType,
+    context: &str,
+) -> Result<DataType, String> {
+    if expected == actual {
+        return Ok(expected.clone());
+    }
+    match (expected, actual) {
+        (DataType::Map(_, expected_ordered), DataType::Map(_, actual_ordered))
+            if expected_ordered == actual_ordered =>
+        {
+            Ok(actual.clone())
+        }
+        (DataType::List(expected_item), DataType::List(actual_item)) => Ok(DataType::List(
+            reconcile_field_to_field(expected_item, actual_item, context)?,
+        )),
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
+            if expected_fields.len() == actual_fields.len() =>
+        {
+            let fields = expected_fields
+                .iter()
+                .zip(actual_fields.iter())
+                .map(|(expected_field, actual_field)| {
+                    reconcile_field_to_field(expected_field, actual_field, context)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(Fields::from(fields)))
+        }
+        _ => Err(format!(
+            "{context} type mismatch: expected {:?}, got {:?}",
+            expected, actual
+        )),
+    }
+}
+
+fn reconcile_fields_for_columns(
+    expected_fields: &Fields,
+    columns: &[ArrayRef],
+    context: &str,
+) -> Result<Fields, String> {
+    if expected_fields.len() != columns.len() {
+        return Err(format!(
+            "{context} field count mismatch: expected {}, got {}",
+            expected_fields.len(),
+            columns.len()
+        ));
+    }
+    let fields = expected_fields
+        .iter()
+        .zip(columns.iter())
+        .map(|(expected_field, column)| {
+            reconcile_field_to_data_type(expected_field, column.data_type(), context)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Fields::from(fields))
+}
+
 fn append_value(state: &mut ArrayAggState, value: Option<ArrayAggValue>, distinct: bool) {
     if distinct {
         let key = encode_scalar_key(&value);
@@ -901,7 +994,9 @@ fn build_scalar_array(
                     std::mem::take(&mut by_field[idx]),
                 )?);
             }
-            let out = StructArray::new(fields.clone(), columns, null_builder.finish());
+            let output_fields =
+                reconcile_fields_for_columns(fields, &columns, "array_agg struct output")?;
+            let out = StructArray::new(output_fields, columns, null_builder.finish());
             Ok(Arc::new(out) as ArrayRef)
         }
         DataType::Map(entries_field, ordered) => {
@@ -1020,8 +1115,13 @@ fn build_scalar_array(
                 }
             }
             let child_values = build_scalar_array(field.data_type(), flattened)?;
+            let list_field = reconcile_field_to_data_type(
+                field,
+                child_values.data_type(),
+                "array_agg list item",
+            )?;
             let out = ListArray::new(
-                field.clone(),
+                list_field,
                 OffsetBuffer::new(offsets.into()),
                 child_values,
                 null_builder.finish(),
@@ -1317,8 +1417,13 @@ impl AggregateFunction for ArrayAggAgg {
                     flattened.extend(values);
                 }
                 let values = build_scalar_array(list_field.data_type(), flattened)?;
+                let output_list_field = reconcile_field_to_data_type(
+                    list_field,
+                    values.data_type(),
+                    "array_agg output list item",
+                )?;
                 let list_out = ListArray::new(
-                    list_field.clone(),
+                    output_list_field,
                     OffsetBuffer::new(out_offsets.into()),
                     values,
                     None,
@@ -1382,8 +1487,13 @@ impl AggregateFunction for ArrayAggAgg {
                     } else {
                         build_scalar_array(list_field.data_type(), flattened_by_col[idx].clone())?
                     };
+                    let output_list_field = reconcile_field_to_data_type(
+                        list_field,
+                        values.data_type(),
+                        "array_agg intermediate list item",
+                    )?;
                     let list = ListArray::new(
-                        list_field.clone(),
+                        output_list_field,
                         OffsetBuffer::new(out_offsets.clone().into()),
                         values,
                         None,
@@ -1391,7 +1501,12 @@ impl AggregateFunction for ArrayAggAgg {
                     columns.push(Arc::new(list) as ArrayRef);
                 }
 
-                Ok(Arc::new(StructArray::new(fields.clone(), columns, None)) as ArrayRef)
+                let output_fields = reconcile_fields_for_columns(
+                    fields,
+                    &columns,
+                    "array_agg intermediate struct output",
+                )?;
+                Ok(Arc::new(StructArray::new(output_fields, columns, None)) as ArrayRef)
             }
             other => Err(format!(
                 "array_agg target type must be List or Struct(List...), got {:?}",

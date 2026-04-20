@@ -36,11 +36,13 @@ impl Rule for SplitDistinctAgg {
             return vec![];
         };
 
-        if agg
-            .aggregates
-            .iter()
-            .any(|call| !call.distinct && !call.order_by.is_empty())
-        {
+        // Ordered aggregates need all order-by inputs available at the update
+        // phase. The current split-distinct lowering only preserves the
+        // shared DISTINCT column across phase boundaries, so ordered DISTINCT
+        // aggregates like `array_agg(distinct x order by y)` lose `y` in the
+        // GLOBAL phase. Fall back to the single-stage aggregate for semantic
+        // correctness until multi-phase ordered DISTINCT is implemented.
+        if agg.aggregates.iter().any(|call| !call.order_by.is_empty()) {
             return vec![];
         }
 
@@ -437,6 +439,37 @@ mod tests {
                     },
                     count_distinct("name"),
                 ],
+                output_columns: vec![],
+            }),
+            children: vec![sg],
+        };
+        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+    }
+
+    #[test]
+    fn apply_skips_distinct_order_sensitive_aggregate() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![col("g")],
+                aggregates: vec![AggregateCall {
+                    name: "array_agg".into(),
+                    args: vec![col("name")],
+                    distinct: true,
+                    result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Int64,
+                        true,
+                    ))),
+                    order_by: vec![crate::sql::analysis::SortItem {
+                        expr: col("id"),
+                        asc: true,
+                        nulls_first: true,
+                    }],
+                }],
                 output_columns: vec![],
             }),
             children: vec![sg],

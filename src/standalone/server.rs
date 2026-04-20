@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
@@ -326,6 +326,9 @@ struct NovaRocksMysqlShim {
     /// Per-session query timeout (in seconds). `None` means no timeout.
     /// Set via `SET query_timeout = N`. `N == 0` clears the timeout.
     query_timeout_secs: Option<u64>,
+    /// Per-session group_concat limit (in bytes).
+    /// Set via `SET group_concat_max_len = N`.
+    group_concat_max_len: i64,
 }
 
 impl NovaRocksMysqlShim {
@@ -337,6 +340,7 @@ impl NovaRocksMysqlShim {
             current_catalog: None,
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
+            group_concat_max_len: 1024,
         }
     }
 }
@@ -556,11 +560,7 @@ fn parse_set_catalog_query(query: &str) -> Option<&str> {
     Some(value)
 }
 
-/// Parse `SET query_timeout = N` and `SET query_timeout=N`. Returns the
-/// integer seconds value if the statement matches that shape. The optional
-/// `=` separator may have spaces around it or be glued to the keyword/value.
-/// `N` must be a non-negative integer; `N == 0` clears the session timeout.
-fn parse_set_query_timeout(query: &str) -> Option<u64> {
+fn parse_set_non_negative_integer(query: &str, keyword: &str) -> Option<u64> {
     // Normalize: collapse whitespace around `=` so we can split simply.
     let normalized = query.replace('=', " = ");
     let mut parts = normalized.split_whitespace();
@@ -568,8 +568,8 @@ fn parse_set_query_timeout(query: &str) -> Option<u64> {
     if !head.eq_ignore_ascii_case("set") {
         return None;
     }
-    let keyword = parts.next()?;
-    if !keyword.eq_ignore_ascii_case("query_timeout") {
+    let actual_keyword = parts.next()?;
+    if !actual_keyword.eq_ignore_ascii_case(keyword) {
         return None;
     }
     let next = parts.next()?;
@@ -578,6 +578,22 @@ fn parse_set_query_timeout(query: &str) -> Option<u64> {
         return None;
     }
     value_str.parse::<u64>().ok()
+}
+
+/// Parse `SET query_timeout = N` and `SET query_timeout=N`. Returns the
+/// integer seconds value if the statement matches that shape. The optional
+/// `=` separator may have spaces around it or be glued to the keyword/value.
+/// `N` must be a non-negative integer; `N == 0` clears the session timeout.
+fn parse_set_query_timeout(query: &str) -> Option<u64> {
+    parse_set_non_negative_integer(query, "query_timeout")
+}
+
+/// Parse `SET group_concat_max_len = N` and `SET group_concat_max_len=N`.
+/// `N` must be a non-negative integer and is clamped later by FE-compatible
+/// lowering rules.
+fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
+    let value = parse_set_non_negative_integer(query, "group_concat_max_len")?;
+    i64::try_from(value).ok()
 }
 
 fn is_supported_embedded_statement(query: &str) -> bool {
@@ -662,6 +678,11 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some(max_len) = parse_set_group_concat_max_len(trimmed) {
+        shim.group_concat_max_len = max_len;
+        return Ok(StatementResult::Ok);
+    }
+
     if is_session_noop(trimmed) {
         return Ok(StatementResult::Ok);
     }
@@ -691,9 +712,18 @@ async fn execute_statement_text(
     let current_catalog = shim.current_catalog.clone();
     let current_db = shim.current_db.clone();
     let query_timeout = shim.query_timeout_secs;
+    let query_options = crate::internal_service::TQueryOptions {
+        group_concat_max_len: Some(shim.group_concat_max_len),
+        ..Default::default()
+    };
 
     let join_handle = task::spawn_blocking(move || {
-        session.execute_in_context(&sql, current_catalog.as_deref(), &current_db)
+        session.execute_in_context(
+            &sql,
+            current_catalog.as_deref(),
+            &current_db,
+            Some(query_options),
+        )
     });
 
     let result = match query_timeout {
@@ -925,6 +955,11 @@ fn query_result_column_to_mysql_column(column: &QueryResultColumn) -> Result<Col
         }
         DataType::Float32 => ColumnType::MYSQL_TYPE_FLOAT,
         DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
+        DataType::FixedSizeBinary(width)
+            if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            ColumnType::MYSQL_TYPE_STRING
+        }
         DataType::Utf8
         | DataType::LargeUtf8
         | DataType::Binary
@@ -1022,6 +1057,13 @@ fn array_value_to_mysql_value(
             .map(|arr| StandaloneMysqlValue::Float(arr.value(row_idx))),
         DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
             .map(|arr| StandaloneMysqlValue::Double(arr.value(row_idx))),
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            let arr = downcast_array::<FixedSizeBinaryArray>(column, "FixedSizeBinaryArray")?;
+            let value = crate::common::largeint::i128_from_be_bytes(arr.value(row_idx))?;
+            Ok(StandaloneMysqlValue::Bytes(value.to_string().into_bytes()))
+        }
         DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
             .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
         DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
@@ -1291,6 +1333,39 @@ mod tests {
         assert_eq!(parse_set_query_timeout("SET query_timeout"), None);
         assert_eq!(
             parse_set_query_timeout("SET query_timeout = 60 extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_set_group_concat_max_len_accepts_common_forms() {
+        assert_eq!(
+            parse_set_group_concat_max_len("SET group_concat_max_len = 65535"),
+            Some(65535)
+        );
+        assert_eq!(
+            parse_set_group_concat_max_len("set group_concat_max_len=4096"),
+            Some(4096)
+        );
+        assert_eq!(
+            parse_set_group_concat_max_len("SET GROUP_CONCAT_MAX_LEN = 0"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_set_group_concat_max_len_rejects_unrelated_statements() {
+        assert_eq!(
+            parse_set_group_concat_max_len("SET query_timeout = 60"),
+            None
+        );
+        assert_eq!(parse_set_group_concat_max_len("SELECT 1"), None);
+        assert_eq!(
+            parse_set_group_concat_max_len("SET group_concat_max_len = abc"),
+            None
+        );
+        assert_eq!(
+            parse_set_group_concat_max_len("SET group_concat_max_len"),
             None
         );
     }

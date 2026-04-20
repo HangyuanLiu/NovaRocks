@@ -59,8 +59,8 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             name,
             args,
             distinct,
-            ..
-        } => agg_call_display_name_from_parts(name, args, *distinct),
+            order_by,
+        } => agg_call_display_name_from_parts(name, args, *distinct, order_by),
         ExprKind::Cast {
             expr: inner,
             target,
@@ -110,31 +110,50 @@ pub(crate) fn agg_call_display_name_from_parts(
     name: &str,
     args: &[TypedExpr],
     distinct: bool,
+    order_by: &[query_ir::SortItem],
 ) -> String {
-    if args.is_empty() {
-        format!("{}(*)", name)
+    let args_display = if args.is_empty() {
+        "*".to_string()
     } else {
-        let arg_names: Vec<String> = args.iter().map(typed_expr_display_name).collect();
-        if distinct {
-            format!("{}(distinct {})", name, arg_names.join(", "))
-        } else {
-            format!("{}({})", name, arg_names.join(", "))
-        }
+        args.iter()
+            .map(typed_expr_display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut out = if distinct {
+        format!("{}(distinct {}", name, args_display)
+    } else {
+        format!("{}({}", name, args_display)
+    };
+
+    if !order_by.is_empty() {
+        let order_by_display = order_by
+            .iter()
+            .map(|item| {
+                let mut value = typed_expr_display_name(&item.expr);
+                value.push_str(if item.asc { " asc" } else { " desc" });
+                if item.nulls_first != item.asc {
+                    value.push_str(if item.nulls_first {
+                        " nulls first"
+                    } else {
+                        " nulls last"
+                    });
+                }
+                value
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(" order by ");
+        out.push_str(&order_by_display);
     }
+    out.push(')');
+    out
 }
 
 /// Display name for an AggregateCall.
 pub(crate) fn agg_call_display_name(call: &AggregateCall) -> String {
-    if call.args.is_empty() {
-        format!("{}(*)", call.name)
-    } else {
-        let arg_names: Vec<String> = call.args.iter().map(typed_expr_display_name).collect();
-        if call.distinct {
-            format!("{}(distinct {})", call.name, arg_names.join(", "))
-        } else {
-            format!("{}({})", call.name, arg_names.join(", "))
-        }
-    }
+    agg_call_display_name_from_parts(&call.name, &call.args, call.distinct, &call.order_by)
 }
 
 /// Map JoinKind to TJoinOp.

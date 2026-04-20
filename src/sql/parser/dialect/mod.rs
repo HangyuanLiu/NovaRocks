@@ -217,12 +217,14 @@ pub(crate) fn parse_create_database_name(parser: &mut Parser<'_>) -> Result<Obje
 /// Normalize SQL syntax for parsing. This applies rewrites that make
 /// StarRocks-specific syntax compatible with the sqlparser crate.
 pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
-    normalize_function_syntax(sql)
+    let sql = normalize_function_syntax(sql)?;
+    Ok(rewrite_create_table_nested_generic_closers(&sql))
 }
 
 pub(crate) fn normalize_function_syntax(sql: &str) -> Result<String, String> {
     let sql = rewrite_group_concat_separator(sql)?;
-    rewrite_typed_array_literals(&sql)
+    let sql = rewrite_typed_array_literals(&sql)?;
+    rewrite_legacy_map_literals(&sql)
 }
 
 fn rewrite_group_concat_separator(sql: &str) -> Result<String, String> {
@@ -252,8 +254,7 @@ fn rewrite_group_concat_separator(sql: &str) -> Result<String, String> {
             output.push(')');
             idx = call_end + 1;
         } else {
-            output.push(bytes[idx] as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
         }
     }
     Ok(output)
@@ -309,10 +310,240 @@ fn rewrite_typed_array_literals(sql: &str) -> Result<String, String> {
                 }
             }
         }
-        output.push(bytes[idx] as char);
-        idx += 1;
+        idx = push_original_char(&mut output, sql, idx);
     }
     Ok(output)
+}
+
+fn rewrite_legacy_map_literals(sql: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if starts_with_keyword(bytes, idx, "map")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let name_end = idx + "map".len();
+            let mut cursor = name_end;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'{' {
+                output.push_str("map(");
+                let (body, end_idx) = rewrite_legacy_map_literal_body(sql, cursor)?;
+                output.push_str(&body);
+                output.push(')');
+                idx = end_idx + 1;
+                continue;
+            }
+        }
+        idx = push_original_char(&mut output, sql, idx);
+    }
+    Ok(output)
+}
+
+fn rewrite_legacy_map_literal_body(sql: &str, open_idx: usize) -> Result<(String, usize), String> {
+    let bytes = sql.as_bytes();
+    let mut output = String::new();
+    let mut idx = open_idx + 1;
+    let mut paren_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                output.push('\'');
+                single_quote = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                output.push('"');
+                double_quote = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                output.push('`');
+                backtick = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+
+        if starts_with_keyword(bytes, idx, "map")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let name_end = idx + "map".len();
+            let mut cursor = name_end;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'{' {
+                output.push_str("map(");
+                let (body, end_idx) = rewrite_legacy_map_literal_body(sql, cursor)?;
+                output.push_str(&body);
+                output.push(')');
+                idx = end_idx + 1;
+                continue;
+            }
+        }
+
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+            }
+            b'(' => {
+                paren_depth += 1;
+                output.push('(');
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                output.push(')');
+            }
+            b'[' => {
+                square_depth += 1;
+                output.push('[');
+            }
+            b']' => {
+                square_depth = square_depth.saturating_sub(1);
+                output.push(']');
+            }
+            b'{' => {
+                brace_depth += 1;
+                output.push('{');
+            }
+            b'}' => {
+                if brace_depth == 0 {
+                    return Ok((output, idx));
+                }
+                brace_depth -= 1;
+                output.push('}');
+            }
+            b':' if paren_depth == 0 && square_depth == 0 && brace_depth == 0 => {
+                output.push(',');
+            }
+            _ => {
+                idx = push_original_char(&mut output, sql, idx);
+                continue;
+            }
+        }
+        idx += 1;
+    }
+
+    Err("unterminated legacy MAP literal in SQL".to_string())
+}
+
+fn rewrite_create_table_nested_generic_closers(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("create table")
+        || lower.starts_with("create temporary table")
+        || lower.starts_with("create external table"))
+    {
+        return sql.to_string();
+    }
+
+    let mut output = String::with_capacity(sql.len() + 8);
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                output.push('\'');
+                single_quote = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                output.push('"');
+                double_quote = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                output.push('`');
+                backtick = false;
+                idx += 1;
+            } else {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+                idx += 1;
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+                idx += 1;
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+                idx += 1;
+            }
+            b'>' => {
+                let mut end = idx + 1;
+                while end < bytes.len() && bytes[end] == b'>' {
+                    end += 1;
+                }
+                let count = end - idx;
+                output.push('>');
+                for _ in 1..count {
+                    output.push(' ');
+                    output.push('>');
+                }
+                idx = end;
+            }
+            _ => {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+        }
+    }
+
+    output
 }
 
 fn find_matching_paren(sql: &str, open_idx: usize) -> Result<usize, String> {
@@ -450,4 +681,52 @@ fn starts_with_keyword(bytes: &[u8], idx: usize, keyword: &str) -> bool {
 
 fn is_identifier_byte(byte: Option<u8>) -> bool {
     byte.is_some_and(|value| value == b'_' || value.is_ascii_alphanumeric())
+}
+
+fn push_original_char(output: &mut String, sql: &str, idx: usize) -> usize {
+    let end = idx + utf8_char_width(sql.as_bytes()[idx]);
+    output.push_str(&sql[idx..end]);
+    end
+}
+
+fn utf8_char_width(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normalize_function_syntax_rewrites_legacy_map_literals() {
+        let normalized = super::normalize_for_raw_parse(
+            "INSERT INTO t VALUES (map{'k1': 1, 'k2': map{'nested': 2}}, [map{\"k3\": 3}])",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "INSERT INTO t VALUES (map('k1', 1, 'k2', map('nested', 2)), [map(\"k3\", 3)])"
+        );
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_splits_nested_generic_closers_in_create_table() {
+        let normalized = super::normalize_for_raw_parse(
+            "CREATE TABLE t (c1 ARRAY<ARRAY<INT>>, c2 ARRAY<STRUCT<f1 INT>>) DUPLICATE KEY(c1) DISTRIBUTED BY HASH(c1) BUCKETS 1 PROPERTIES (\"replication_num\" = \"1\")",
+        )
+        .expect("normalize should succeed");
+        assert!(normalized.contains("ARRAY<ARRAY<INT> >"));
+        assert!(normalized.contains("ARRAY<STRUCT<f1 INT> >"));
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_preserves_utf8_text() {
+        let normalized = super::normalize_for_raw_parse("SELECT '王武程咬金', '中国'")
+            .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT '王武程咬金', '中国'");
+    }
 }

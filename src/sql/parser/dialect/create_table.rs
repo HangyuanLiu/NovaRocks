@@ -4,7 +4,8 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::sql::parser::ast::{
-    CreateTableKind, CreateTableStmt, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    ColumnAggregation, CreateTableKind, CreateTableStmt, SqlType, TableColumnDef, TableKeyDesc,
+    TableKeyKind,
 };
 
 /// Parse StarRocks CREATE TABLE statement:
@@ -115,12 +116,17 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         let col_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
         let sql_type = parse_sql_type_definition(parser)?;
 
+        let mut aggregation = None;
         let mut _nullable = true;
         let mut _comment = None;
 
         // Parse optional NOT NULL, NULL, DEFAULT, COMMENT, AUTO_INCREMENT, etc.
         loop {
-            if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
+            if aggregation.is_none()
+                && let Some(parsed) = parse_column_aggregation(parser)
+            {
+                aggregation = Some(parsed);
+            } else if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
                 _nullable = false;
             } else if parser.parse_keyword(Keyword::NULL) {
                 _nullable = true;
@@ -147,20 +153,53 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         columns.push(TableColumnDef {
             name: col_name,
             data_type: sql_type,
-            aggregation: None,
+            aggregation,
         });
     }
     Ok(columns)
 }
 
+fn parse_column_aggregation(parser: &mut Parser<'_>) -> Option<ColumnAggregation> {
+    let aggregation = if peek_word_eq(parser, 0, "SUM") {
+        Some(ColumnAggregation::Sum)
+    } else if peek_word_eq(parser, 0, "MIN") {
+        Some(ColumnAggregation::Min)
+    } else if peek_word_eq(parser, 0, "MAX") {
+        Some(ColumnAggregation::Max)
+    } else if peek_word_eq(parser, 0, "REPLACE") {
+        Some(ColumnAggregation::Replace)
+    } else {
+        None
+    }?;
+    parser.next_token();
+    Some(aggregation)
+}
+
 fn parse_sql_type_definition(parser: &mut Parser<'_>) -> Result<SqlType, String> {
-    if peek_word_eq(parser, 0, "MAP") {
+    if peek_word_eq(parser, 0, "ARRAY") {
+        parse_array_sql_type(parser)
+    } else if peek_word_eq(parser, 0, "MAP") {
         parse_map_sql_type(parser)
     } else if peek_word_eq(parser, 0, "STRUCT") {
         parse_struct_sql_type(parser)
     } else {
         let data_type = parser.parse_data_type().map_err(|e| e.to_string())?;
         convert_sql_type(data_type)
+    }
+}
+
+fn parse_array_sql_type(parser: &mut Parser<'_>) -> Result<SqlType, String> {
+    parser.next_token(); // ARRAY
+    if parser.consume_token(&Token::Lt) {
+        let element_type = parse_sql_type_definition(parser)?;
+        parser.expect_token(&Token::Gt).map_err(|e| e.to_string())?;
+        Ok(SqlType::Array(Box::new(element_type)))
+    } else {
+        convert_sql_type(sqlparser::ast::DataType::Array(
+            sqlparser::ast::ArrayElemTypeDef::AngleBracket(Box::new(
+                parser.parse_data_type().map_err(|e| e.to_string())?,
+            )),
+        ))
     }
 }
 
@@ -351,5 +390,28 @@ mod tests {
             .expect("build parser");
         let stmt = parse_create_table_statement(&mut parser);
         assert!(stmt.is_ok(), "expected complex type DDL to parse: {stmt:?}");
+    }
+
+    #[test]
+    fn parse_create_table_accepts_nested_array_complex_columns() {
+        let sql = r#"
+            CREATE TABLE t1 (
+                c1 array<array<int>>,
+                c2 array<map<string, int>>,
+                c3 array<struct<f1 int, f2 string>>
+            )
+            DUPLICATE KEY(c1)
+            DISTRIBUTED BY HASH(c1) BUCKETS 3
+            PROPERTIES ("replication_num" = "1")
+        "#;
+
+        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser);
+        assert!(
+            stmt.is_ok(),
+            "expected nested complex type DDL to parse: {stmt:?}"
+        );
     }
 }

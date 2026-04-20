@@ -819,15 +819,23 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
             distinct,
             order_by,
         } => {
-            // Avoid duplicates — compare name, distinct, and actual arg content
+            // Avoid duplicates — compare full aggregate semantics, including
+            // ORDER BY metadata for ordered aggregates like
+            // `array_agg(distinct x order by y desc)`.
             let already = out.iter().any(|a| {
                 a.name == *name
                     && a.distinct == *distinct
                     && a.args.len() == args.len()
+                    && a.order_by.len() == order_by.len()
                     && a.args
                         .iter()
                         .zip(args.iter())
                         .all(|(a, b)| format!("{:?}", a.kind) == format!("{:?}", b.kind))
+                    && a.order_by.iter().zip(order_by.iter()).all(|(left, right)| {
+                        left.asc == right.asc
+                            && left.nulls_first == right.nulls_first
+                            && format!("{:?}", left.expr.kind) == format!("{:?}", right.expr.kind)
+                    })
             });
             if !already {
                 out.push(AggregateCall {

@@ -78,6 +78,44 @@ pub(super) fn build_agg_views<'a>(
     Ok(views)
 }
 
+pub(super) fn align_schema_with_arrays(
+    schema: &SchemaRef,
+    arrays: &[ArrayRef],
+    context: &str,
+) -> Result<SchemaRef, String> {
+    if schema.fields().len() != arrays.len() {
+        return Err(format!(
+            "{context} schema/array length mismatch: schema_fields={} arrays={}",
+            schema.fields().len(),
+            arrays.len()
+        ));
+    }
+    let mut changed = false;
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(arrays.iter())
+        .map(|(field, array)| {
+            if field.data_type() == array.data_type() {
+                Ok(field.as_ref().clone())
+            } else {
+                changed = true;
+                Ok(
+                    Field::new(field.name(), array.data_type().clone(), field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                )
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if !changed {
+        return Ok(Arc::clone(schema));
+    }
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
 /// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
 pub struct AggregateProcessorFactory {
     name: String,
@@ -630,6 +668,7 @@ impl AggregateProcessorOperator {
                     .map_err(|e| e.to_string())?,
             );
         }
+        let schema = align_schema_with_arrays(&schema, &arrays, "aggregate finalize output")?;
 
         let batch = if arrays.is_empty() {
             let options = arrow::array::RecordBatchOptions::new()
