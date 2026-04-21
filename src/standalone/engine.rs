@@ -36,7 +36,11 @@ use super::iceberg::{
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable, StoredLocalTable};
+use super::lake_ddl::create_managed_table;
+use super::lake_recovery::{
+    ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
+};
+use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -56,6 +60,27 @@ pub struct QueryResultColumn {
 pub struct QueryResult {
     pub columns: Vec<QueryResultColumn>,
     pub chunks: Vec<Chunk>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneManagedTabletInfo {
+    pub tablet_id: i64,
+    pub bucket_seq: i64,
+    pub tablet_root_path: String,
+    pub runtime_registered: bool,
+    pub snapshot_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneManagedTableInfo {
+    pub database_name: String,
+    pub table_name: String,
+    pub table_id: i64,
+    pub current_schema_id: i64,
+    pub keys_type: String,
+    pub bucket_num: i64,
+    pub visible_version: i64,
+    pub tablets: Vec<StandaloneManagedTabletInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,28 +175,45 @@ fn append_string_query_rows(result: QueryResult, rows: Vec<String>) -> Result<Qu
     build_string_query_result(&column_name, merged_rows)
 }
 
-#[derive(Default)]
-struct StandaloneState {
-    catalog: RwLock<InMemoryCatalog>,
-    iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
-    local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
-    materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
-    materialized_view_seq: AtomicU64,
-    metadata_store: Option<SqliteMetadataStore>,
-    exchange_port: u16,
+pub(crate) struct StandaloneState {
+    pub(crate) catalog: RwLock<InMemoryCatalog>,
+    pub(crate) iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
+    pub(crate) local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
+    pub(crate) materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
+    pub(crate) materialized_view_seq: AtomicU64,
+    pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
+    pub(crate) metadata_store: Option<SqliteMetadataStore>,
+    pub(crate) exchange_port: u16,
+}
+
+impl Default for StandaloneState {
+    fn default() -> Self {
+        Self {
+            catalog: RwLock::new(InMemoryCatalog::default()),
+            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            local_table_semantics: RwLock::new(HashMap::new()),
+            materialized_views: RwLock::new(HashMap::new()),
+            materialized_view_seq: AtomicU64::new(0),
+            managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            managed_lake_config: None,
+            metadata_store: None,
+            exchange_port: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
-struct LocalTableSemantics {
-    key_desc: Option<TableKeyDesc>,
-    column_aggregations: HashMap<String, ColumnAggregation>,
+pub(crate) struct LocalTableSemantics {
+    pub(crate) key_desc: Option<TableKeyDesc>,
+    pub(crate) column_aggregations: HashMap<String, ColumnAggregation>,
 }
 
 #[derive(Clone, Debug)]
-struct StandaloneMaterializedView {
-    name: String,
-    create_seq: u64,
-    bitmap_count_rewrite: bool,
+pub(crate) struct StandaloneMaterializedView {
+    pub(crate) name: String,
+    pub(crate) create_seq: u64,
+    pub(crate) bitmap_count_rewrite: bool,
 }
 
 #[derive(Clone)]
@@ -201,7 +243,10 @@ impl StandaloneNovaRocks {
             opts.metadata_db_path.as_deref(),
             opts.config_path.as_deref(),
         )?;
+        let managed_lake_config = resolve_managed_lake_config()?;
         let inner = Arc::new(StandaloneState {
+            managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
+            managed_lake_config,
             metadata_store,
             exchange_port,
             ..Default::default()
@@ -215,6 +260,65 @@ impl StandaloneNovaRocks {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    pub fn managed_table_info(
+        &self,
+        database_name: &str,
+        table_name: &str,
+    ) -> Result<StandaloneManagedTableInfo, String> {
+        let managed = self
+            .inner
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock");
+        let runtime = managed.table(database_name, table_name)?;
+        let visible_version = runtime
+            .partitions
+            .iter()
+            .map(|partition| partition.visible_version)
+            .max()
+            .unwrap_or(1);
+        let object_store_profile = managed
+            .config
+            .as_ref()
+            .map(|config| {
+                crate::connector::starrocks::ObjectStoreProfile::from_s3_store_config(&config.s3)
+            })
+            .transpose()?;
+        let tablets = runtime
+            .tablets
+            .iter()
+            .map(|tablet| {
+                let snapshot_version = object_store_profile.as_ref().and_then(|profile| {
+                    crate::formats::starrocks::metadata::load_tablet_snapshot(
+                        tablet.tablet_id,
+                        visible_version,
+                        &tablet.tablet_root_path,
+                        Some(profile),
+                    )
+                    .ok()
+                    .map(|snapshot| snapshot.version)
+                });
+                StandaloneManagedTabletInfo {
+                    tablet_id: tablet.tablet_id,
+                    bucket_seq: tablet.bucket_seq,
+                    tablet_root_path: tablet.tablet_root_path.clone(),
+                    runtime_registered: runtime_registered(tablet.tablet_id),
+                    snapshot_version,
+                }
+            })
+            .collect();
+        Ok(StandaloneManagedTableInfo {
+            database_name: runtime.database_name.clone(),
+            table_name: runtime.table.name.clone(),
+            table_id: runtime.table.table_id,
+            current_schema_id: runtime.table.current_schema_id,
+            keys_type: runtime.table.keys_type.clone(),
+            bucket_num: runtime.table.bucket_num,
+            visible_version,
+            tablets,
+        })
     }
 
     pub fn register_parquet_table(
@@ -308,6 +412,13 @@ impl StandaloneNovaRocks {
 }
 
 impl StandaloneSession {
+    pub fn execute(&self, sql: &str) -> Result<(), String> {
+        match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
+            StatementResult::Ok => Ok(()),
+            StatementResult::Query(_) => Err("statement returned rows".to_string()),
+        }
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Query(result) => Ok(result),
@@ -905,15 +1016,25 @@ impl StandaloneSession {
                 };
                 if let Ok(table_name) = crate::sql::parser::dialect::convert_object_name(raw_name) {
                     if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
-                        let guard = self
+                        let is_managed = self
                             .inner
-                            .catalog
+                            .managed_lake
                             .read()
-                            .expect("standalone catalog read lock");
-                        if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
-                            drop(guard);
-                            return self
-                                .execute_insert_values_sqlparser(insert, &resolved, &table_def);
+                            .expect("standalone managed lake read lock")
+                            .contains_table(&resolved.database, &resolved.table)
+                            .unwrap_or(false);
+                        if !is_managed {
+                            let guard = self
+                                .inner
+                                .catalog
+                                .read()
+                                .expect("standalone catalog read lock");
+                            if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
+                                drop(guard);
+                                return self.execute_insert_values_sqlparser(
+                                    insert, &resolved, &table_def,
+                                );
+                            }
                         }
                     }
                 }
@@ -1771,10 +1892,21 @@ fn execute_create_table_statement(
         CreateTableKind::Iceberg {
             columns,
             key_desc,
+            bucket_count,
             properties,
         } => {
             // When there is no iceberg catalog context, create a local parquet table
             if current_catalog.is_none() && stmt.name.parts.len() <= 2 {
+                if state.managed_lake_config.is_some() {
+                    return create_managed_table(
+                        state.as_ref(),
+                        &stmt.name,
+                        current_database,
+                        &columns,
+                        key_desc.as_ref(),
+                        bucket_count,
+                    );
+                }
                 return create_local_table_from_columns(
                     state,
                     &stmt.name,
@@ -1901,6 +2033,18 @@ fn execute_drop_table_statement(
     _force: bool,
 ) -> Result<StatementResult, String> {
     if current_catalog.is_none() && name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(name, current_database)?;
+        if state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock")
+            .contains_table(&resolved.database, &resolved.table)?
+        {
+            return Err(format!(
+                "DROP TABLE is not supported for managed standalone lake tables yet: {}.{}",
+                resolved.database, resolved.table
+            ));
+        }
         match resolve_local_table_name(name, current_database) {
             Ok(resolved) => {
                 let mut guard = state
@@ -1954,6 +2098,17 @@ fn execute_truncate_table_statement(
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
+    if state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .contains_table(&resolved.database, &resolved.table)?
+    {
+        return Err(format!(
+            "TRUNCATE TABLE is not supported for managed standalone lake tables yet: {}.{}",
+            resolved.database, resolved.table
+        ));
+    }
     let guard = state.catalog.read().expect("standalone catalog read lock");
     let table_def = guard.get(&resolved.database, &resolved.table)?;
     let path = match &table_def.storage {
@@ -1993,6 +2148,20 @@ fn execute_insert_statement(
     // When there is no iceberg catalog context, try local table insert
     if current_catalog.is_none() && name.parts.len() <= 2 {
         if let Ok(resolved) = resolve_local_table_name(name, current_database) {
+            if state
+                .managed_lake
+                .read()
+                .expect("standalone managed lake read lock")
+                .contains_table(&resolved.database, &resolved.table)?
+            {
+                return super::lake_txn::insert_into_managed_lake_table(
+                    state,
+                    name,
+                    columns,
+                    source,
+                    current_database,
+                );
+            }
             let guard = state.catalog.read().expect("standalone catalog read lock");
             if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
                 drop(guard);
@@ -2066,7 +2235,7 @@ fn insert_generate_series_rows(
     Ok(())
 }
 
-fn reorder_insert_rows(
+pub(crate) fn reorder_insert_rows(
     rows: &[Vec<Literal>],
     insert_columns: &[String],
     target_columns: &[ColumnDef],
@@ -2528,7 +2697,7 @@ fn create_local_table_from_columns(
         .iter()
         .map(|col| {
             let dt = sql_type_to_arrow_type(&col.data_type)?;
-            Ok(Field::new(&col.name, dt, true))
+            Ok(Field::new(&col.name, dt, col.nullable))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -3019,7 +3188,7 @@ fn json_value_to_field(value: Option<&Value>) -> Option<String> {
 }
 
 /// Generate series rows for local table insert.
-fn insert_generate_series_rows_local(
+pub(crate) fn insert_generate_series_rows_local(
     source: &GenerateSeriesSelect,
     insert_columns: &[String],
     target_columns: &[ColumnDef],
@@ -3071,7 +3240,7 @@ fn read_local_parquet_data(path: &Path, columns: &[ColumnDef]) -> Result<RecordB
 }
 
 /// Build a RecordBatch from literal value rows for a local table.
-fn build_local_insert_batch(
+pub(crate) fn build_local_insert_batch(
     columns: &[ColumnDef],
     rows: &[Vec<Literal>],
 ) -> Result<RecordBatch, String> {
@@ -4372,9 +4541,9 @@ fn concat_or_empty_batches(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct ResolvedLocalTableName {
-    database: String,
-    table: String,
+pub(crate) struct ResolvedLocalTableName {
+    pub(crate) database: String,
+    pub(crate) table: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4506,6 +4675,15 @@ fn resolve_metadata_store(
     resolved_path.map(SqliteMetadataStore::open).transpose()
 }
 
+fn resolve_managed_lake_config() -> Result<Option<ManagedLakeConfig>, String> {
+    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    let Some(standalone) = cfg.standalone_server.as_ref() else {
+        return Ok(None);
+    };
+    let app_cfg = standalone.managed_lake_config()?;
+    app_cfg.map(ManagedLakeConfig::from_app_config).transpose()
+}
+
 fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -4526,6 +4704,7 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     };
     let snapshot = store.load_snapshot()?;
     restore_local_catalog(state, &snapshot)?;
+    restore_managed_lake(state, &snapshot)?;
     restore_iceberg_catalogs(state, &snapshot)?;
     Ok(())
 }
@@ -4540,15 +4719,6 @@ fn restore_local_catalog(
         .expect("standalone catalog write lock");
     for database_name in &snapshot.local_databases {
         guard.create_database(database_name)?;
-    }
-    for StoredLocalTable {
-        database,
-        table,
-        path,
-    } in &snapshot.local_tables
-    {
-        let table = build_parquet_table(table, path)?;
-        guard.register(database, table)?;
     }
     Ok(())
 }
@@ -4587,6 +4757,54 @@ fn restore_iceberg_catalogs(
     Ok(())
 }
 
+fn restore_managed_lake(
+    state: &Arc<StandaloneState>,
+    snapshot: &MetadataSnapshot,
+) -> Result<(), String> {
+    let Some(store) = state.metadata_store.as_ref() else {
+        return Ok(());
+    };
+    let mut managed = snapshot.managed.clone();
+    super::lake_recovery::reconcile_on_open(store, &mut managed, |snapshot, txn| {
+        let tablet_ids = snapshot
+            .tablets
+            .iter()
+            .filter(|tablet| {
+                snapshot.indexes.iter().any(|index| {
+                    index.index_id == tablet.index_id
+                        && index.table_id == txn.table_id
+                        && index.partition_id == txn.partition_id
+                })
+            })
+            .map(|tablet| tablet.tablet_id)
+            .collect::<Vec<_>>();
+        super::lake_txn::publish_tablets_at_version(
+            tablet_ids,
+            txn.txn_id,
+            txn.base_version,
+            txn.commit_version,
+        )
+    })?;
+    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), managed)?;
+    {
+        let mut catalog = state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        for database in &snapshot.managed.databases {
+            catalog.create_database(&database.name)?;
+        }
+        register_managed_tables_in_catalog(&mut catalog, &rebuilt)?;
+    }
+    rebuilt.re_register_active_tablet_runtimes()?;
+    let mut guard = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    *guard = rebuilt;
+    Ok(())
+}
+
 fn persist_local_database_if_needed(
     state: &Arc<StandaloneState>,
     database_name: &str,
@@ -4600,28 +4818,19 @@ fn persist_local_database_if_needed(
 }
 
 fn persist_local_table_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
-    path: &Path,
+    _state: &Arc<StandaloneState>,
+    _database_name: &str,
+    _table_name: &str,
+    _path: &Path,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        if database_name != DEFAULT_DATABASE {
-            store.upsert_local_database(database_name)?;
-        }
-        store.upsert_local_table(database_name, table_name, path)?;
-    }
     Ok(())
 }
 
 fn delete_local_table_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
+    _state: &Arc<StandaloneState>,
+    _database_name: &str,
+    _table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_local_table(database_name, table_name)?;
-    }
     Ok(())
 }
 
@@ -5802,8 +6011,8 @@ mod tests {
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("nums list array");
-        let values = nums
-            .value(0)
+        let values_ref = nums.value(0);
+        let values = values_ref
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
@@ -5850,7 +6059,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("key array");
-        let DataType::Map(entries_field, _) = batch.schema().field(0).data_type() else {
+        let schema = batch.schema();
+        let DataType::Map(entries_field, _) = schema.field(0).data_type() else {
             panic!("expected map field");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
@@ -5908,7 +6118,8 @@ mod tests {
 
         let casted =
             super::cast_batch_to_schema(&source_batch, &target_schema).expect("cast batch");
-        let DataType::Map(entries_field, _) = casted.schema().field(0).data_type() else {
+        let casted_schema = casted.schema();
+        let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
             panic!("expected MAP column");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
@@ -5966,7 +6177,8 @@ mod tests {
             .expect("key array");
 
         assert!(keys.is_null(0));
-        let DataType::Map(entries_field, _) = round_tripped.schema().field(0).data_type() else {
+        let round_schema = round_tripped.schema();
+        let DataType::Map(entries_field, _) = round_schema.field(0).data_type() else {
             panic!("expected map field");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
@@ -6527,7 +6739,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_session_restores_local_metadata_from_sqlite() {
+    fn embedded_session_does_not_restore_external_preloaded_parquet_tables() {
         let parquet = write_parquet_file();
         let metadata_dir = TempDir::new().expect("create metadata dir");
         let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
@@ -6538,49 +6750,21 @@ mod tests {
                 metadata_db_path: Some(metadata_db_path.clone()),
             })
             .expect("open engine");
-            let session = engine.session();
-
-            let create_db = session
-                .execute_in_database("create database analytics", "default")
-                .expect("create database");
-            assert!(matches!(create_db, StatementResult::Ok));
-
-            let create_table_sql = format!(
-                r#"create table tbl properties("path"="{}")"#,
-                parquet.path().display()
-            );
-            let create_table = session
-                .execute_in_database(&create_table_sql, "analytics")
-                .expect("create table");
-            assert!(matches!(create_table, StatementResult::Ok));
+            engine
+                .register_parquet_table("ext_tbl", parquet.path())
+                .expect("register external parquet");
         }
 
-        let restored = StandaloneNovaRocks::open(StandaloneOptions {
+        let reopened = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: None,
             metadata_db_path: Some(metadata_db_path),
         })
         .expect("reopen engine");
-        assert!(
-            restored
-                .database_exists("analytics")
-                .expect("check restored database")
-        );
-
-        let session = restored.session();
-        let result = session
-            .execute_in_database("select name from tbl where id = 2", "analytics")
-            .expect("query restored table");
-        let StatementResult::Query(result) = result else {
-            panic!("expected query result");
-        };
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
+        let err = reopened
+            .session()
+            .query("select * from ext_tbl")
+            .expect_err("external preload must not be restored");
+        assert!(err.contains("unknown table"), "err={err}");
     }
 
     #[test]

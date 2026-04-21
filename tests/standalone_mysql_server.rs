@@ -581,7 +581,7 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 }
 
 #[test]
-fn standalone_mysql_server_restores_local_metadata_from_sqlite_config() {
+fn standalone_mysql_server_does_not_restore_external_preloaded_parquet_tables_from_sqlite_config() {
     let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b"))]);
     let config_dir = TempDir::new().expect("create config dir");
     let config_path = config_dir.path().join("novarocks.toml");
@@ -632,10 +632,12 @@ metadata_db_path = "meta/catalog.db"
     let mut conn = server.connect_root(restart_port);
     conn.query_drop("use analytics").expect("use analytics");
 
-    let rows: Vec<(i32, Option<String>)> = conn.query("select * from tbl").expect("select *");
-    assert_eq!(
-        rows,
-        vec![(1, Some("a".to_string())), (2, Some("b".to_string()))]
+    let err = conn
+        .query_drop("select * from tbl")
+        .expect_err("external parquet table must not be restored");
+    assert!(
+        err.to_string().to_lowercase().contains("unknown table"),
+        "err={err}"
     );
 }
 
@@ -692,4 +694,80 @@ user = "root"
 
     let rows: Vec<(i32, String)> = conn.query("select * from t2").expect("select loaded rows");
     assert_eq!(rows, vec![(1, "1234".to_string())]);
+}
+
+#[test]
+fn standalone_mysql_server_managed_lake_round_trip() {
+    if std::env::var("AWS_S3_ENDPOINT").is_err() {
+        eprintln!("skipping managed lake MySQL test: AWS_S3_ENDPOINT is not set");
+        return;
+    }
+    let endpoint = std::env::var("AWS_S3_ENDPOINT").unwrap();
+    let access_key_id = std::env::var("MINIO_ROOT_USER").unwrap_or_else(|_| "admin".to_string());
+    let access_key_secret =
+        std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_else(|_| "admin123".to_string());
+    let bucket = std::env::var("NOVAROCKS_TEST_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+
+    let temp_dir = TempDir::new().expect("tempdir");
+    let metadata_db_path = temp_dir.path().join("standalone.sqlite");
+    let run_id = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    );
+    let warehouse_uri = format!("s3://{bucket}/standalone-managed-lake-mysql-tests/{run_id}");
+    let mysql_port = alloc_port();
+    let config_path = temp_dir.path().join("novarocks.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[standalone_server]
+mysql_port = {mysql_port}
+user = "root"
+metadata_db_path = "{}"
+warehouse_uri = "{warehouse_uri}"
+
+[standalone_server.object_store]
+endpoint = "{endpoint}"
+access_key_id = "{access_key_id}"
+access_key_secret = "{access_key_secret}"
+enable_path_style_access = true
+"#,
+            metadata_db_path.display(),
+        ),
+    )
+    .expect("write managed lake config");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(mysql_port);
+
+    conn.query_drop("create database analytics")
+        .expect("create database");
+    conn.query_drop(
+        "create table analytics.orders (k1 int, v1 string) \
+         duplicate key(k1) distributed by hash(k1) buckets 2",
+    )
+    .expect("create managed table");
+    conn.query_drop("insert into analytics.orders values (1, 'a'), (2, 'b'), (3, NULL)")
+        .expect("insert values");
+
+    let rows: Vec<(i32, Option<String>)> = conn
+        .query("select k1, v1 from analytics.orders order by k1")
+        .expect("select rows");
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some("a".to_string())),
+            (2, Some("b".to_string())),
+            (3, None),
+        ]
+    );
 }

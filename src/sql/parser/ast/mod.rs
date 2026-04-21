@@ -38,6 +38,7 @@ pub(crate) enum CreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,
+        bucket_count: Option<u32>,
         properties: Vec<(String, String)>,
     },
 }
@@ -76,6 +77,7 @@ pub(crate) struct GenerateSeriesSelect {
 pub(crate) struct TableColumnDef {
     pub name: String,
     pub data_type: SqlType,
+    pub nullable: bool,
     pub aggregation: Option<ColumnAggregation>,
 }
 
