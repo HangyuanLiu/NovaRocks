@@ -217,14 +217,336 @@ pub(crate) fn parse_create_database_name(parser: &mut Parser<'_>) -> Result<Obje
 /// Normalize SQL syntax for parsing. This applies rewrites that make
 /// StarRocks-specific syntax compatible with the sqlparser crate.
 pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
-    let sql = normalize_function_syntax(sql)?;
+    let sql = rewrite_set_user_variables(sql)?;
+    let sql = normalize_function_syntax(&sql)?;
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+fn rewrite_set_user_variables(sql: &str) -> Result<String, String> {
+    let assignments = extract_set_user_variable_assignments(sql)?;
+    if assignments.is_empty() {
+        return Ok(sql.to_string());
+    }
+    substitute_user_variables(sql, &assignments)
 }
 
 pub(crate) fn normalize_function_syntax(sql: &str) -> Result<String, String> {
     let sql = rewrite_group_concat_separator(sql)?;
+    let sql = rewrite_cast_target_type_syntax(&sql)?;
     let sql = rewrite_typed_array_literals(&sql)?;
     rewrite_legacy_map_literals(&sql)
+}
+
+fn rewrite_cast_target_type_syntax(sql: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx = push_original_char(&mut output, sql, idx);
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                idx = push_original_char(&mut output, sql, idx);
+                continue;
+            }
+            b'"' => {
+                double_quote = true;
+                idx = push_original_char(&mut output, sql, idx);
+                continue;
+            }
+            b'`' => {
+                backtick = true;
+                idx = push_original_char(&mut output, sql, idx);
+                continue;
+            }
+            _ => {}
+        }
+
+        if starts_with_keyword(bytes, idx, "cast")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let mut cursor = idx + "cast".len();
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'(' {
+                let close_idx = find_matching_paren(sql, cursor)?;
+                let body = &sql[cursor + 1..close_idx];
+                let rewritten_body = rewrite_cast_call_body(body)?;
+                output.push_str(&sql[idx..cursor + 1]);
+                output.push_str(&rewritten_body);
+                output.push(')');
+                idx = close_idx + 1;
+                continue;
+            }
+        }
+
+        idx = push_original_char(&mut output, sql, idx);
+    }
+
+    Ok(output)
+}
+
+fn rewrite_cast_call_body(body: &str) -> Result<String, String> {
+    let Some(as_idx) = find_top_level_keyword(body, "as") else {
+        return Ok(body.to_string());
+    };
+    let expr = body[..as_idx].trim_end();
+    let target = body[as_idx + "as".len()..].trim_start();
+    let rewritten_target = rewrite_map_type_generics(target)?;
+    if rewritten_target == target {
+        Ok(body.to_string())
+    } else {
+        Ok(format!("{expr} AS {rewritten_target}"))
+    }
+}
+
+fn rewrite_map_type_generics(target: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(target.len());
+    let bytes = target.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if starts_with_keyword(bytes, idx, "map")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let mut cursor = idx + "map".len();
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'<' {
+                let end_idx = find_matching_delimiter(target, cursor, b'<', b'>')?;
+                let inner = rewrite_map_type_generics(&target[cursor + 1..end_idx])?;
+                output.push_str("MAP(");
+                output.push_str(&inner);
+                output.push(')');
+                idx = end_idx + 1;
+                continue;
+            }
+        }
+        idx = push_original_char(&mut output, target, idx);
+    }
+    Ok(output)
+}
+
+fn extract_set_user_variable_assignments(sql: &str) -> Result<Vec<(String, String)>, String> {
+    let bytes = sql.as_bytes();
+    let mut assignments = Vec::new();
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => single_quote = true,
+            b'"' => double_quote = true,
+            b'`' => backtick = true,
+            b'/' if bytes.get(idx + 1) == Some(&b'*') && bytes.get(idx + 2) == Some(&b'+') => {
+                let comment_end = sql[idx + 3..]
+                    .find("*/")
+                    .map(|offset| idx + 3 + offset)
+                    .ok_or_else(|| "unterminated optimizer hint comment".to_string())?;
+                collect_set_user_variable_assignments(
+                    &sql[idx + 3..comment_end],
+                    &mut assignments,
+                )?;
+                idx = comment_end + 2;
+                continue;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    Ok(assignments)
+}
+
+fn collect_set_user_variable_assignments(
+    hint_text: &str,
+    assignments: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let lower = hint_text.to_ascii_lowercase();
+    let mut search_idx = 0usize;
+    while let Some(rel) = lower[search_idx..].find("set_user_variable") {
+        let keyword_idx = search_idx + rel;
+        let mut open_idx = keyword_idx + "set_user_variable".len();
+        while hint_text
+            .as_bytes()
+            .get(open_idx)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            open_idx += 1;
+        }
+        if hint_text.as_bytes().get(open_idx) != Some(&b'(') {
+            search_idx = keyword_idx + "set_user_variable".len();
+            continue;
+        }
+        let close_idx = find_matching_paren(hint_text, open_idx)?;
+        let body = &hint_text[open_idx + 1..close_idx];
+        for assignment in split_top_level_items(body, b',') {
+            if assignment.trim().is_empty() {
+                continue;
+            }
+            let Some(eq_idx) = find_top_level_char(assignment, b'=') else {
+                return Err(format!(
+                    "invalid set_user_variable hint assignment: {}",
+                    assignment.trim()
+                ));
+            };
+            let name = assignment[..eq_idx].trim().to_ascii_lowercase();
+            let value = assignment[eq_idx + 1..].trim();
+            if !name.starts_with('@') || value.is_empty() {
+                return Err(format!(
+                    "invalid set_user_variable hint assignment: {}",
+                    assignment.trim()
+                ));
+            }
+            if let Some(existing_idx) = assignments.iter().position(|(key, _)| key == &name) {
+                assignments.remove(existing_idx);
+            }
+            assignments.push((name, value.to_string()));
+        }
+        search_idx = close_idx + 1;
+    }
+    Ok(())
+}
+
+fn substitute_user_variables(
+    sql: &str,
+    assignments: &[(String, String)],
+) -> Result<String, String> {
+    let assignment_map = assignments
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            output.push(byte as char);
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            output.push(byte as char);
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            output.push(byte as char);
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+                idx += 1;
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+                idx += 1;
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+                idx += 1;
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                let comment_end = sql[idx + 2..]
+                    .find("*/")
+                    .map(|offset| idx + 2 + offset)
+                    .ok_or_else(|| "unterminated comment in SQL".to_string())?;
+                output.push_str(&sql[idx..comment_end + 2]);
+                idx = comment_end + 2;
+            }
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                let line_end = sql[idx..]
+                    .find('\n')
+                    .map(|offset| idx + offset)
+                    .unwrap_or(sql.len());
+                output.push_str(&sql[idx..line_end]);
+                idx = line_end;
+            }
+            b'@' => {
+                let end_idx = find_variable_name_end(bytes, idx);
+                let variable_name = sql[idx..end_idx].to_ascii_lowercase();
+                if let Some(value) = assignment_map.get(variable_name.as_str()) {
+                    output.push_str(value);
+                    idx = end_idx;
+                } else {
+                    output.push_str(&sql[idx..end_idx]);
+                    idx = end_idx;
+                }
+            }
+            _ => {
+                idx = push_original_char(&mut output, sql, idx);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn rewrite_group_concat_separator(sql: &str) -> Result<String, String> {
@@ -693,8 +1015,114 @@ fn starts_with_keyword(bytes: &[u8], idx: usize, keyword: &str) -> bool {
         .is_some_and(|slice| slice.eq_ignore_ascii_case(keyword_bytes))
 }
 
+fn find_top_level_char(sql: &str, target: u8) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => single_quote = true,
+            b'"' => double_quote = true,
+            b'`' => backtick = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            value if depth == 0 && value == target => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_items<'a>(sql: &'a str, delimiter: u8) -> Vec<&'a str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => single_quote = true,
+            b'"' => double_quote = true,
+            b'`' => backtick = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            value if depth == 0 && value == delimiter => {
+                out.push(sql[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    out.push(sql[start..].trim());
+    out
+}
+
 fn is_identifier_byte(byte: Option<u8>) -> bool {
     byte.is_some_and(|value| value == b'_' || value.is_ascii_alphanumeric())
+}
+
+fn is_variable_name_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn find_variable_name_end(bytes: &[u8], start_idx: usize) -> usize {
+    let mut idx = start_idx + 1;
+    while idx < bytes.len() && is_variable_name_byte(bytes[idx]) {
+        idx += 1;
+    }
+    idx
 }
 
 fn push_original_char(output: &mut String, sql: &str, idx: usize) -> usize {
@@ -749,6 +1177,40 @@ mod tests {
         let normalized = super::normalize_for_raw_parse("SELECT group_concat(name ORDER BY 1)")
             .expect("normalize should succeed");
         assert_eq!(normalized, "SELECT group_concat(name, ',' ORDER BY 1)");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_cast_map_target_syntax() {
+        let normalized =
+            super::normalize_for_raw_parse("SELECT CAST(NULL AS MAP<INT, MAP<INT, INT>>)")
+                .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT CAST(NULL AS MAP(INT, MAP(INT, INT)))");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_set_user_variable_hint_references() {
+        let normalized = super::normalize_for_raw_parse(
+            "WITH tt AS (SELECT @v1 AS v1, c1 FROM t1) \
+             SELECT /*+ set_user_variable(@v1 = 0.5) */ v1 FROM tt",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "WITH tt AS (SELECT 0.5 AS v1, c1 FROM t1) \
+             SELECT /*+ set_user_variable(@v1 = 0.5) */ v1 FROM tt"
+        );
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_rewrites_multiple_set_user_variables() {
+        let normalized = super::normalize_for_raw_parse(
+            "SELECT /*+ set_user_variable(@v1 = 0.5, @v2 = 4096) */ @v1, @v2 + 1",
+        )
+        .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "SELECT /*+ set_user_variable(@v1 = 0.5, @v2 = 4096) */ 0.5, 4096 + 1"
+        );
     }
 
     #[test]

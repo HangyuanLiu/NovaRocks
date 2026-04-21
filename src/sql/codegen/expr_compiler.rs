@@ -1254,7 +1254,8 @@ fn semantic_aggregate_type_desc(
     args: &[TypedExpr],
     return_type: &DataType,
 ) -> Result<types::TTypeDesc, String> {
-    if matches!(name, "array_agg" | "array_agg_distinct") && let Some(item) = args.first()
+    if matches!(name, "array_agg" | "array_agg_distinct")
+        && let Some(item) = args.first()
     {
         return list_type_desc(typed_expr_type_desc(item)?);
     }
@@ -1621,17 +1622,10 @@ fn infer_scalar_function_return_type(
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
         "bool_or" | "bool_and" | "every" => Ok(DataType::Boolean),
-        "corr"
-        | "covar_pop"
-        | "covar_samp"
-        | "var_pop"
-        | "var_samp"
-        | "variance"
-        | "variance_pop"
-        | "variance_samp"
-        | "stddev"
-        | "stddev_pop"
-        | "stddev_samp" => Ok(DataType::Float64),
+        "corr" | "covar_pop" | "covar_samp" | "var_pop" | "var_samp" | "variance"
+        | "variance_pop" | "variance_samp" | "stddev" | "stddev_pop" | "stddev_samp" => {
+            Ok(DataType::Float64)
+        }
         "percentile_cont"
         | "percentile_disc"
         | "percentile_disc_lc"
@@ -1641,6 +1635,7 @@ fn infer_scalar_function_return_type(
             arg_types.first().cloned().unwrap_or(DataType::Null),
         )),
         "min_n" | "max_n" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
+        "bitmap_agg" | "bitmap_union" => Ok(DataType::Binary),
         "bitmap_union_int" | "bitmap_count" | "bitmap_union_count" => Ok(DataType::Int64),
         "hll_union_agg"
         | "hll_cardinality"
@@ -1652,11 +1647,11 @@ fn infer_scalar_function_return_type(
         "hll_union" | "hll_raw_agg" | "ds_hll_count_distinct_union" => Ok(DataType::Binary),
 
         // Misc
-        "version" | "database" | "current_user" | "user" => Ok(DataType::Utf8),
+        "version" | "database" | "current_user" | "user" | "bitmap_to_string" => Ok(DataType::Utf8),
         "sleep" => Ok(DataType::Boolean),
         "uuid" | "typeof" => Ok(DataType::Utf8),
         "murmur_hash3_32" => Ok(DataType::Int32),
-        "hll_hash" | "ds_hll_count_distinct_state" => Ok(DataType::Binary),
+        "hll_hash" | "ds_hll_count_distinct_state" | "to_bitmap" => Ok(DataType::Binary),
         "xx_hash3_64" | "xx_hash3_128" => Ok(DataType::Int64),
         "to_binary" | "encode_row_id" => Ok(DataType::Binary),
         "to_datetime_ntz" => Ok(DataType::Timestamp(
@@ -1741,10 +1736,43 @@ fn infer_scalar_function_return_type(
             Ok(DataType::Utf8)
         }
         "__struct_subfield" | "__array_struct_subfield" => Ok(DataType::Null),
-        "named_struct" | "struct" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
+        "row" | "struct" => Ok(infer_struct_constructor_return_type(arg_types)),
+        "named_struct" => Ok(infer_named_struct_return_type(arg_types)),
 
         _ => Err(format!("unknown scalar function: {name}")),
     }
+}
+
+fn infer_struct_constructor_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                data_type.clone(),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    DataType::Struct(arrow::datatypes::Fields::from(fields))
+}
+
+fn infer_named_struct_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .enumerate()
+        .map(|(idx, data_type)| {
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                data_type.clone(),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    DataType::Struct(arrow::datatypes::Fields::from(fields))
 }
 
 fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
@@ -1879,6 +1907,14 @@ fn infer_agg_function_types(
             Ok((list, Some(intermediate)))
         }
         "array_unique_agg" => Ok((first_arg.clone(), Some(first_arg))),
+        "sum_map" => {
+            let map = if first_arg == DataType::Null {
+                null_map_output_type()
+            } else {
+                first_arg.clone()
+            };
+            Ok((map.clone(), Some(map)))
+        }
         "map_agg" => {
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
@@ -1898,7 +1934,8 @@ fn infer_agg_function_types(
             );
             Ok((map.clone(), Some(map)))
         }
-        "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Int64))),
+        "bitmap_agg" | "bitmap_union" => Ok((DataType::Binary, Some(DataType::Binary))),
+        "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Binary))),
         "approx_count_distinct"
         | "ndv"
         | "approx_count_distinct_hll_sketch"
@@ -1920,7 +1957,7 @@ fn infer_agg_function_types(
             };
             Ok((out, Some(DataType::Binary)))
         }
-        "bitmap_union_int" => Ok((DataType::Int64, Some(DataType::Int64))),
+        "bitmap_union_int" => Ok((DataType::Int64, Some(DataType::Binary))),
         "dict_merge" => Ok((DataType::Utf8, Some(DataType::Utf8))),
         "mann_whitney_u_test" => Ok((DataType::Utf8, Some(DataType::Binary))),
         "max_by" | "min_by" => {
@@ -1928,20 +1965,14 @@ fn infer_agg_function_types(
             // Intermediate is serialized binary state.
             Ok((first_arg, Some(DataType::Binary)))
         }
-        "covar_pop"
-        | "covar_samp"
-        | "corr"
-        | "var_pop"
-        | "var_samp"
-        | "variance"
-        | "variance_pop"
-        | "variance_samp"
-        | "stddev"
-        | "stddev_pop"
-        | "stddev_samp" => Ok((DataType::Float64, Some(DataType::Binary))),
-        "percentile_cont" | "percentile_disc" | "percentile_disc_lc" | "percentile_union" => {
-            Ok((DataType::Float64, None))
+        "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance"
+        | "variance_pop" | "variance_samp" | "stddev" | "stddev_pop" | "stddev_samp" => {
+            Ok((DataType::Float64, Some(DataType::Binary)))
         }
+        "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
+            Ok((first_arg, Some(DataType::Binary)))
+        }
+        "percentile_union" => Ok((DataType::Binary, Some(DataType::Binary))),
         "percentile_approx" => {
             let output = if matches!(arg_types.get(1), Some(DataType::List(_))) {
                 DataType::List(Arc::new(arrow::datatypes::Field::new(
@@ -1952,7 +1983,7 @@ fn infer_agg_function_types(
             } else {
                 DataType::Float64
             };
-            Ok((output, None))
+            Ok((output, Some(DataType::Binary)))
         }
         "percentile_approx_weighted" => {
             let output = if matches!(arg_types.get(2), Some(DataType::List(_))) {
@@ -1964,7 +1995,7 @@ fn infer_agg_function_types(
             } else {
                 DataType::Float64
             };
-            Ok((output, None))
+            Ok((output, Some(DataType::Binary)))
         }
         "approx_top_k" => Ok((approx_top_k_output_type(first_arg), Some(DataType::Binary))),
         "min_n" | "max_n" => Ok((list_output_type(first_arg), Some(DataType::Binary))),
@@ -1994,8 +2025,55 @@ fn approx_top_k_output_type(item_type: DataType) -> DataType {
     )))
 }
 
+fn null_map_output_type() -> DataType {
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", DataType::Null, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", DataType::Null, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
+}
+
 fn list_output_type(item_type: DataType) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item", item_type, true,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_agg_function_types;
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn percentile_family_uses_binary_intermediate_state() {
+        let (_, exact_intermediate) = infer_agg_function_types(
+            "percentile_cont",
+            &[DataType::Int64, DataType::Float64],
+            false,
+        )
+        .expect("percentile_cont type inference");
+        assert_eq!(exact_intermediate, Some(DataType::Binary));
+
+        let (_, approx_intermediate) = infer_agg_function_types(
+            "percentile_approx",
+            &[DataType::Float64, DataType::Float64],
+            false,
+        )
+        .expect("percentile_approx type inference");
+        assert_eq!(approx_intermediate, Some(DataType::Binary));
+
+        let (_, union_intermediate) =
+            infer_agg_function_types("percentile_union", &[DataType::Binary], false)
+                .expect("percentile_union type inference");
+        assert_eq!(union_intermediate, Some(DataType::Binary));
+    }
 }

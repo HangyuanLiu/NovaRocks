@@ -61,6 +61,17 @@ impl Rule for SplitDistinctAgg {
             .cloned()
             .collect();
 
+        // Stateful sketch/bitmap aggregates preserve null/empty-state semantics
+        // across the current split-distinct phase boundaries poorly. Fall back
+        // to the single-stage plan for correctness until their merge path is
+        // aligned with StarRocks FE.
+        if non_distinct
+            .iter()
+            .any(|call| split_distinct_sensitive_agg(call.name.as_str()))
+        {
+            return vec![];
+        }
+
         if agg.group_by.is_empty() {
             apply_four_phase(expr, memo, agg, &distinct_col, &non_distinct)
         } else {
@@ -110,6 +121,23 @@ fn typed_exprs_structurally_equal(a: &TypedExpr, b: &TypedExpr) -> bool {
         ) => qa == qb && ca == cb,
         _ => false,
     }
+}
+
+fn split_distinct_sensitive_agg(name: &str) -> bool {
+    matches!(
+        name,
+        "approx_count_distinct_hll_sketch"
+            | "bitmap_agg"
+            | "bitmap_union"
+            | "bitmap_union_count"
+            | "bitmap_union_int"
+            | "ds_hll_count_distinct"
+            | "ds_hll_count_distinct_merge"
+            | "ds_hll_count_distinct_union"
+            | "hll_raw_agg"
+            | "hll_union"
+            | "hll_union_agg"
+    )
 }
 
 fn apply_three_phase(
@@ -438,6 +466,32 @@ mod tests {
                         }],
                     },
                     count_distinct("name"),
+                ],
+                output_columns: vec![],
+            }),
+            children: vec![sg],
+        };
+        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+    }
+
+    #[test]
+    fn apply_skips_stateful_sketch_non_distinct_aggregate() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![],
+                aggregates: vec![
+                    count_distinct("x"),
+                    AggregateCall {
+                        name: "ds_hll_count_distinct".into(),
+                        args: vec![col("x")],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                    },
                 ],
                 output_columns: vec![],
             }),

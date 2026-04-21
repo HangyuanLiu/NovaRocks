@@ -48,6 +48,9 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                     crate::common::largeint::LARGEINT_BYTE_WIDTH,
                 )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
+                "array" => custom_array_type_to_arrow(sql_type),
+                "map" => custom_map_type_to_arrow(sql_type),
+                "struct" => custom_struct_type_to_arrow(sql_type),
                 _ => Err(format!("unsupported SQL type: {name}")),
             }
         }
@@ -98,6 +101,339 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
     }
 }
 
+fn custom_array_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
+    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
+        return Err(format!("expected custom ARRAY type, got {sql_type:?}"));
+    };
+    if modifiers.len() != 1 {
+        return Err(format!(
+            "ARRAY type requires exactly one element type, got {}",
+            modifiers.len()
+        ));
+    }
+    let inner = parse_custom_type_string(&modifiers[0])?;
+    Ok(DataType::List(Arc::new(Field::new("item", inner, true))))
+}
+
+fn custom_map_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
+    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
+        return Err(format!("expected custom MAP type, got {sql_type:?}"));
+    };
+    if modifiers.len() != 2 {
+        return Err(format!(
+            "MAP type requires exactly two type parameters, got {}",
+            modifiers.len()
+        ));
+    }
+    let key_type = parse_custom_type_string(&modifiers[0])?;
+    let value_type = parse_custom_type_string(&modifiers[1])?;
+    Ok(DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("key", key_type, true)),
+                Arc::new(Field::new("value", value_type, true)),
+            ])),
+            false,
+        )),
+        false,
+    ))
+}
+
+fn custom_struct_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
+    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
+        return Err(format!("expected custom STRUCT type, got {sql_type:?}"));
+    };
+    let fields = modifiers
+        .iter()
+        .enumerate()
+        .map(|(idx, field_spec)| {
+            let (name, field_type) = split_custom_struct_field(field_spec)?;
+            Ok(Arc::new(Field::new(
+                name.unwrap_or_else(|| format!("f{}", idx + 1)),
+                parse_custom_type_string(field_type)?,
+                true,
+            )))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(DataType::Struct(Fields::from(fields)))
+}
+
+fn split_custom_struct_field(field_spec: &str) -> Result<(Option<String>, &str), String> {
+    let trimmed = field_spec.trim();
+    let Some(split_idx) = find_top_level_type_whitespace(trimmed) else {
+        return Ok((None, trimmed));
+    };
+    let name = trimmed[..split_idx].trim();
+    let field_type = trimmed[split_idx..].trim();
+    if field_type.is_empty() {
+        return Err(format!("STRUCT field missing type: {field_spec}"));
+    }
+    Ok((Some(name.to_string()), field_type))
+}
+
+fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
+    let trimmed = type_sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "tinyint" => return Ok(DataType::Int8),
+        "smallint" => return Ok(DataType::Int16),
+        "int" | "integer" => return Ok(DataType::Int32),
+        "bigint" => return Ok(DataType::Int64),
+        "float" => return Ok(DataType::Float32),
+        "double" | "double precision" => return Ok(DataType::Float64),
+        "boolean" | "bool" => return Ok(DataType::Boolean),
+        "string" | "varchar" | "char" | "character" | "text" => return Ok(DataType::Utf8),
+        "date" => return Ok(DataType::Date32),
+        "datetime" | "timestamp" => {
+            return Ok(DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            ));
+        }
+        "largeint" => {
+            return Ok(DataType::FixedSizeBinary(
+                crate::common::largeint::LARGEINT_BYTE_WIDTH,
+            ));
+        }
+        "json" | "jsonb" => return Ok(DataType::Utf8),
+        _ => {}
+    }
+
+    if let Some(inner) = strip_type_parameters(trimmed, "array")? {
+        return Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            parse_custom_type_string(inner)?,
+            true,
+        ))));
+    }
+    if let Some(inner) = strip_type_parameters(trimmed, "map")? {
+        let parts = split_top_level_type_items(inner, b',');
+        if parts.len() != 2 {
+            return Err(format!("MAP type requires two type parameters: {trimmed}"));
+        }
+        return Ok(DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", parse_custom_type_string(parts[0])?, true)),
+                    Arc::new(Field::new(
+                        "value",
+                        parse_custom_type_string(parts[1])?,
+                        true,
+                    )),
+                ])),
+                false,
+            )),
+            false,
+        ));
+    }
+    if let Some(inner) = strip_type_parameters(trimmed, "struct")? {
+        let fields = split_top_level_type_items(inner, b',')
+            .into_iter()
+            .enumerate()
+            .map(|(idx, field_spec)| {
+                let (name, field_type) = split_custom_struct_field(field_spec)?;
+                Ok(Arc::new(Field::new(
+                    name.unwrap_or_else(|| format!("f{}", idx + 1)),
+                    parse_custom_type_string(field_type)?,
+                    true,
+                )))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(DataType::Struct(Fields::from(fields)));
+    }
+    if lower.starts_with("varchar(")
+        || lower.starts_with("char(")
+        || lower.starts_with("character(")
+    {
+        return Ok(DataType::Utf8);
+    }
+    if lower.starts_with("decimal(") || lower.starts_with("dec(") || lower.starts_with("numeric(") {
+        let open_idx = trimmed
+            .find('(')
+            .ok_or_else(|| format!("invalid decimal type: {trimmed}"))?;
+        let close_idx = find_matching_type_delimiter(trimmed, open_idx, b'(', b')')?;
+        let params = split_top_level_type_items(&trimmed[open_idx + 1..close_idx], b',');
+        let precision = params
+            .first()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .unwrap_or(38);
+        let scale = params
+            .get(1)
+            .and_then(|value| value.trim().parse::<i8>().ok())
+            .unwrap_or(0);
+        return Ok(DataType::Decimal128(precision, scale));
+    }
+
+    Err(format!("unsupported SQL type: {trimmed}"))
+}
+
+fn strip_type_parameters<'a>(type_sql: &'a str, keyword: &str) -> Result<Option<&'a str>, String> {
+    if !type_sql
+        .get(..keyword.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+    {
+        return Ok(None);
+    }
+    let bytes = type_sql.as_bytes();
+    let mut cursor = keyword.len();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= bytes.len() {
+        return Ok(None);
+    }
+    let (open, close) = match bytes[cursor] {
+        b'<' => (b'<', b'>'),
+        b'(' => (b'(', b')'),
+        _ => return Ok(None),
+    };
+    let end_idx = find_matching_type_delimiter(type_sql, cursor, open, close)?;
+    if !type_sql[end_idx + 1..].trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(&type_sql[cursor + 1..end_idx]))
+}
+
+fn find_matching_type_delimiter(
+    sql: &str,
+    open_idx: usize,
+    open: u8,
+    close: u8,
+) -> Result<usize, String> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut idx = open_idx;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+        } else if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+        } else if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+        } else {
+            match byte {
+                b'\'' => single_quote = true,
+                b'"' => double_quote = true,
+                b'`' => backtick = true,
+                value if value == open => depth += 1,
+                value if value == close => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("unbalanced type delimiter in {sql}"))?;
+                    if depth == 0 {
+                        return Ok(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    Err(format!("unterminated type parameters in {sql}"))
+}
+
+fn split_top_level_type_items(sql: &str, delimiter: u8) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' => single_quote = true,
+            b'"' => double_quote = true,
+            b'`' => backtick = true,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => square_depth += 1,
+            b']' => square_depth = square_depth.saturating_sub(1),
+            b'<' => angle_depth += 1,
+            b'>' => angle_depth = angle_depth.saturating_sub(1),
+            value
+                if paren_depth == 0
+                    && square_depth == 0
+                    && angle_depth == 0
+                    && value == delimiter =>
+            {
+                items.push(sql[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    items.push(sql[start..].trim());
+    items
+}
+
+fn find_top_level_type_whitespace(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut paren_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut angle_depth = 0usize;
+    for (idx, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => square_depth += 1,
+            b']' => square_depth = square_depth.saturating_sub(1),
+            b'<' => angle_depth += 1,
+            b'>' => angle_depth = angle_depth.saturating_sub(1),
+            value
+                if paren_depth == 0
+                    && square_depth == 0
+                    && angle_depth == 0
+                    && value.is_ascii_whitespace() =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Expression display name
 // ---------------------------------------------------------------------------
@@ -109,10 +445,47 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         // the SELECT modifier and `(col)` is a Nested expression.
         sqlast::Expr::Nested(inner) => expr_display_name(inner),
         sqlast::Expr::Value(value) => format_literal_display_name(&value.value),
-        sqlast::Expr::CompoundIdentifier(parts) if parts.len() >= 2 => parts
-            .last()
-            .map(|i| i.value.clone())
-            .unwrap_or_else(|| format!("{expr}")),
+        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<_>>()
+            .join("."),
+        sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut out = expr_display_name_preserve_path(root);
+            for access in access_chain {
+                match access {
+                    sqlast::AccessExpr::Dot(expr) => {
+                        out.push('.');
+                        out.push_str(&expr_display_name_preserve_path(expr));
+                    }
+                    sqlast::AccessExpr::Subscript(sqlast::Subscript::Index { index }) => {
+                        out.push('[');
+                        out.push_str(&expr_display_name(index));
+                        out.push(']');
+                    }
+                    sqlast::AccessExpr::Subscript(sqlast::Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => {
+                        out.push('[');
+                        if let Some(lower) = lower_bound {
+                            out.push_str(&expr_display_name(lower));
+                        }
+                        out.push(':');
+                        if let Some(upper) = upper_bound {
+                            out.push_str(&expr_display_name(upper));
+                        }
+                        if let Some(stride) = stride {
+                            out.push(':');
+                            out.push_str(&expr_display_name(stride));
+                        }
+                        out.push(']');
+                    }
+                }
+            }
+            out
+        }
         sqlast::Expr::Identifier(ident) => ident.value.clone(),
         sqlast::Expr::Array(array) => format!(
             "[{}]",
@@ -124,6 +497,12 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 .join(", ")
         ),
         sqlast::Expr::Function(f) => format_function_display_name(f),
+        sqlast::Expr::IsNull(inner) => {
+            format!("{} IS NULL", expr_display_name_with_parens(inner))
+        }
+        sqlast::Expr::IsNotNull(inner) => {
+            format!("{} IS NOT NULL", expr_display_name_with_parens(inner))
+        }
         // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
         // wrap inner with parentheses if it's not a simple identifier or literal.
         sqlast::Expr::Cast {
@@ -188,6 +567,7 @@ fn expr_display_name_preserve_path(expr: &sqlast::Expr) -> String {
             .map(|ident| ident.value.clone())
             .collect::<Vec<_>>()
             .join("."),
+        sqlast::Expr::CompoundFieldAccess { .. } => expr_display_name(expr),
         _ => expr_display_name(expr),
     }
 }
@@ -197,6 +577,8 @@ fn format_literal_display_name(value: &sqlast::Value) -> String {
         sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
             format!("'{}'", s.replace('\'', "''"))
         }
+        sqlast::Value::Boolean(true) => "TRUE".to_string(),
+        sqlast::Value::Boolean(false) => "FALSE".to_string(),
         other => other.to_string(),
     }
 }
@@ -251,7 +633,7 @@ fn canonical_display_function_name(name: &str) -> String {
         "boolor_agg" => "bool_or".to_string(),
         "booland_agg" | "every" => "bool_and".to_string(),
         "string_agg" => "group_concat".to_string(),
-        "array_agg_distinct" | "array_unique_agg" => "array_agg".to_string(),
+        "array_agg_distinct" => "array_agg".to_string(),
         "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         other => other.to_string(),
     }
@@ -263,11 +645,11 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     if canonical_name == "group_concat" {
         return format_group_concat_display_name(function, &canonical_name);
     }
-    if matches!(
-        original_name.as_str(),
-        "array_agg_distinct" | "array_unique_agg"
-    ) {
+    if original_name == "array_agg_distinct" {
         return format_array_agg_distinct_display_name(function, &canonical_name);
+    }
+    if original_name == "array_unique_agg" {
+        return format_function_call_with_order_by(function, "array_unique_agg");
     }
     if canonical_name == "map" {
         return format_map_display_name(function);
@@ -320,6 +702,35 @@ fn format_array_agg_distinct_display_name(
         other => format_function_arguments(other),
     };
     let mut out = format!("{canonical_name}(DISTINCT {args_display}");
+    if let sqlast::FunctionArguments::List(list) = &function.args {
+        for clause in &list.clauses {
+            if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
+                out.push_str(" ORDER BY ");
+                out.push_str(
+                    &order_by_exprs
+                        .iter()
+                        .map(|item| format_function_order_by_expr_display_name(item, &list.args))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn format_function_call_with_order_by(function: &sqlast::Function, function_name: &str) -> String {
+    let args_display = match &function.args {
+        sqlast::FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(format_function_arg_display_name)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => format_function_arguments(other),
+    };
+    let mut out = format!("{function_name}({args_display}");
     if let sqlast::FunctionArguments::List(list) = &function.args {
         for clause in &list.clauses {
             if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
@@ -860,6 +1271,12 @@ mod tests {
     }
 
     #[test]
+    fn expr_display_name_preserves_array_unique_agg_name() {
+        let expr = parse_select_expr("SELECT ARRAY_UNIQUE_AGG(s_1)");
+        assert_eq!(expr_display_name(&expr), "array_unique_agg(s_1)");
+    }
+
+    #[test]
     fn expr_display_name_formats_group_concat_like_starrocks() {
         let expr = parse_select_expr("SELECT group_concat(name, subject, ',' ORDER BY 1, 2)");
         assert_eq!(
@@ -893,6 +1310,12 @@ mod tests {
     }
 
     #[test]
+    fn expr_display_name_parenthesizes_is_not_null_inner_binary_expr() {
+        let expr = parse_select_expr("SELECT count_if((v4 + v4) is not null)");
+        assert_eq!(expr_display_name(&expr), "count_if((v4 + v4) IS NOT NULL)");
+    }
+
+    #[test]
     fn expr_display_name_formats_array_agg_distinct_like_starrocks() {
         let expr = parse_select_expr("SELECT array_agg_distinct(name ORDER BY 1 ASC)");
         assert_eq!(
@@ -905,5 +1328,21 @@ mod tests {
     fn expr_display_name_preserves_lambda_field_paths() {
         let expr = parse_select_expr("SELECT array_sortby((x) -> x.item, x)");
         assert_eq!(expr_display_name(&expr), "array_sortby(x -> x.item, x)");
+    }
+
+    #[test]
+    fn expr_display_name_preserves_compound_field_access_paths() {
+        let expr = parse_select_expr("SELECT c13.a");
+        assert_eq!(expr_display_name(&expr), "c13.a");
+    }
+
+    #[test]
+    fn expr_display_name_preserves_struct_field_paths_inside_function_args() {
+        let expr =
+            parse_select_expr("SELECT cast(percentile_approx_weighted(c13.a, c1, 0.5) as int)");
+        assert_eq!(
+            expr_display_name(&expr),
+            "CAST((percentile_approx_weighted(c13.a, c1, 0.5)) AS INT)"
+        );
     }
 }

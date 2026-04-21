@@ -1195,6 +1195,16 @@ impl DataStreamSinkOperator {
         self.pending_bytes_per_dest.iter().sum()
     }
 
+    fn pending_chunk_count_total(&self) -> usize {
+        self.pending_per_dest.iter().map(VecDeque::len).sum()
+    }
+
+    fn has_pending_chunks(&self) -> bool {
+        self.pending_per_dest
+            .iter()
+            .any(|chunks| !chunks.is_empty())
+    }
+
     fn pending_payload_bytes_total(&self) -> usize {
         self.pending_payloads_per_dest
             .iter()
@@ -1214,7 +1224,7 @@ impl DataStreamSinkOperator {
     }
 
     fn has_pending_data(&self) -> bool {
-        self.pending_chunk_bytes_total() > 0 || self.has_pending_payloads()
+        self.has_pending_chunks() || self.has_pending_payloads()
     }
 
     fn pending_payloads_can_send(&self) -> bool {
@@ -1234,6 +1244,23 @@ impl DataStreamSinkOperator {
         true
     }
 
+    fn should_flush_pending_dest(&self, dest_idx: usize, force: bool) -> bool {
+        let Some(pending) = self.pending_per_dest.get(dest_idx) else {
+            return false;
+        };
+        if pending.is_empty() {
+            return false;
+        }
+        if force {
+            return true;
+        }
+        self.pending_bytes_per_dest
+            .get(dest_idx)
+            .copied()
+            .unwrap_or(0)
+            >= self.max_transmit_batched_bytes.max(1)
+    }
+
     fn pending_batch_reserve_bytes(&self) -> usize {
         self.pending_bytes_per_dest
             .iter()
@@ -1251,7 +1278,7 @@ impl DataStreamSinkOperator {
         let inflight_bytes = exchange_send_queue().inflight_bytes();
         let max_inflight_bytes = exchange_send_queue().max_inflight_bytes();
         debug!(
-            "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
+            "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_chunks={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
             reason,
             format_uuid(
                 self.exec_params.fragment_instance_id.hi,
@@ -1260,6 +1287,7 @@ impl DataStreamSinkOperator {
             self.driver_id,
             self.sender_id,
             self.pending_chunk_bytes_total(),
+            self.pending_chunk_count_total(),
             self.pending_payload_count(),
             self.pending_payload_bytes_total(),
             reserve_bytes,
@@ -1704,11 +1732,7 @@ impl DataStreamSinkOperator {
             }
 
             loop {
-                let bytes = self.pending_bytes_per_dest.get(i).copied().unwrap_or(0);
-                if bytes == 0 {
-                    break;
-                }
-                if !force && bytes < self.max_transmit_batched_bytes {
+                if !self.should_flush_pending_dest(i, force) {
                     break;
                 }
                 let (chunks, _batch_bytes) = self.drain_pending_batch(i)?;
@@ -1956,6 +1980,7 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::record_batch::RecordBatchOptions;
     use std::collections::BTreeMap;
 
     fn make_test_operator() -> DataStreamSinkOperator {
@@ -2022,6 +2047,26 @@ mod tests {
         }
     }
 
+    fn make_test_destination() -> data_sinks::TPlanFragmentDestination {
+        data_sinks::TPlanFragmentDestination::new(
+            types::TUniqueId::new(9, 9),
+            None::<types::TNetworkAddress>,
+            Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9030)),
+            None::<i32>,
+        )
+    }
+
+    fn zero_column_chunk_with_rows(row_count: usize) -> Chunk {
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        let batch = arrow::array::RecordBatch::try_new_with_options(
+            Arc::new(arrow::datatypes::Schema::empty()),
+            vec![],
+            &options,
+        )
+        .expect("zero-column batch");
+        Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+    }
+
     #[test]
     fn bind_runtime_state_uses_backend_num_as_be_number() {
         let mut op = make_test_operator();
@@ -2031,5 +2076,21 @@ mod tests {
 
         assert_eq!(op.sender_id, 11);
         assert_eq!(op.be_number, 7);
+    }
+
+    #[test]
+    fn zero_byte_pending_chunks_are_tracked_for_force_flush() {
+        let mut op = make_test_operator();
+        op.exec_params.destinations = Some(vec![make_test_destination()]);
+
+        op.buffer_chunk(zero_column_chunk_with_rows(1))
+            .expect("buffer chunk");
+
+        assert_eq!(op.pending_chunk_bytes_total(), 0);
+        assert_eq!(op.pending_chunk_count_total(), 1);
+        assert!(op.has_pending_chunks());
+        assert!(op.has_pending_data());
+        assert!(!op.should_flush_pending_dest(0, false));
+        assert!(op.should_flush_pending_dest(0, true));
     }
 }

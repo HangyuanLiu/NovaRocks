@@ -379,11 +379,11 @@ impl AggregateFunction for BitmapUnionIntAgg {
                         continue;
                     }
                     let raw = i64::from(arr.value(row));
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     if !include_negative && raw < 0 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     state.values.insert(raw as u64);
                 }
                 Ok(())
@@ -419,11 +419,11 @@ impl AggregateFunction for BitmapUnionIntAgg {
                         continue;
                     }
                     let raw = arr.value(row);
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     if !include_negative && raw < 0 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     state.values.insert(raw as u64);
                 }
                 Ok(())
@@ -497,8 +497,6 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     let Ok(value) = arr.value(row).trim().parse::<i128>() else {
                         continue;
                     };
@@ -508,6 +506,8 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if value < i64::MIN as i128 || value > u64::MAX as i128 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     if value < 0 {
                         state.values.insert((value as i64) as u64);
                     } else {
@@ -525,8 +525,6 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     let Ok(value) = arr.value(row).trim().parse::<i128>() else {
                         continue;
                     };
@@ -536,6 +534,8 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if value < i64::MIN as i128 || value > u64::MAX as i128 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     if value < 0 {
                         state.values.insert((value as i64) as u64);
                     } else {
@@ -553,9 +553,9 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     if let Ok(decoded) = decode_bitmap(arr.value(row)) {
+                        let ptr = unsafe { (base as *mut u8).add(offset) };
+                        let state = unsafe { get_or_init_state(ptr) };
                         state.values.extend(decoded.into_iter());
                         continue;
                     }
@@ -571,6 +571,8 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if value < i64::MIN as i128 || value > u64::MAX as i128 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     if value < 0 {
                         state.values.insert((value as i64) as u64);
                     } else {
@@ -588,9 +590,9 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     if let Ok(decoded) = decode_bitmap(arr.value(row)) {
+                        let ptr = unsafe { (base as *mut u8).add(offset) };
+                        let state = unsafe { get_or_init_state(ptr) };
                         state.values.extend(decoded.into_iter());
                         continue;
                     }
@@ -606,6 +608,8 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if value < i64::MIN as i128 || value > u64::MAX as i128 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     if value < 0 {
                         state.values.insert((value as i64) as u64);
                     } else {
@@ -623,8 +627,6 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
                     let Ok(value) = largeint::i128_from_be_bytes(arr.value(row)) else {
                         continue;
                     };
@@ -634,6 +636,8 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     if value < i64::MIN as i128 || value > u64::MAX as i128 {
                         continue;
                     }
+                    let ptr = unsafe { (base as *mut u8).add(offset) };
+                    let state = unsafe { get_or_init_state(ptr) };
                     if value < 0 {
                         state.values.insert((value as i64) as u64);
                     } else {
@@ -682,11 +686,11 @@ impl AggregateFunction for BitmapUnionIntAgg {
             let mut builder = BinaryBuilder::new();
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
-                let payload = match unsafe { get_state(ptr) } {
-                    Some(state) => encode_bitmap(&state.values)?,
-                    None => vec![BITMAP_TYPE_EMPTY],
-                };
-                builder.append_value(payload);
+                match unsafe { get_state(ptr) } {
+                    Some(state) => builder.append_value(encode_bitmap(&state.values)?),
+                    None if matches!(spec.kind, AggKind::BitmapAgg) => builder.append_null(),
+                    None => builder.append_value(vec![BITMAP_TYPE_EMPTY]),
+                }
             }
             return Ok(Arc::new(builder.finish()));
         }

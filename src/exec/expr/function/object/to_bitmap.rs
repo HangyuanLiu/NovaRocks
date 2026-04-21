@@ -92,6 +92,22 @@ pub fn eval_to_bitmap(
     if let Some(arr) = input.as_any().downcast_ref::<Int64Array>() {
         encode_signed_array!(arr);
     }
+    if crate::common::largeint::is_largeint_data_type(input.data_type()) {
+        let arr = crate::common::largeint::as_fixed_size_binary_array(&input, "to_bitmap")?;
+        for row in 0..arr.len() {
+            if arr.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let raw = crate::common::largeint::value_at(arr, row)?;
+            if raw < 0 || raw > i128::from(u64::MAX) {
+                builder.append_null();
+                continue;
+            }
+            builder.append_value(encode_bitmap_single(raw as u64));
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
 
     if let Some(arr) = input.as_any().downcast_ref::<UInt8Array>() {
         encode_unsigned_array!(arr);

@@ -87,12 +87,12 @@ impl AnalyzerScope {
             self.qualified
                 .get(&(q_lower.clone(), name_lower.clone()))
                 .cloned()
-                .ok_or_else(|| format!("column `{q}.{name}` not found"))
+                .ok_or_else(|| format!("Column '{}.{}' cannot be resolved.", q, name))
         } else {
             self.unqualified
                 .get(&name_lower)
                 .cloned()
-                .ok_or_else(|| format!("column `{name}` not found"))
+                .ok_or_else(|| format!("Column '{}' cannot be resolved.", name))
         }
     }
 

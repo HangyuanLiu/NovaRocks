@@ -546,6 +546,11 @@ pub fn merge_state(target: &mut PercentileState, incoming: &PercentileState) -> 
             QuantileSpec::Array(qs) => set_quantiles(target, qs.clone())?,
         }
     }
+    if target.digest.is_empty() {
+        target.compression = incoming.compression;
+        target.digest = incoming.digest.clone();
+        return Ok(());
+    }
     target.compression = target.compression.max(incoming.compression);
     target.digest.merge(&incoming.digest);
     Ok(())
@@ -842,5 +847,26 @@ mod tests {
         let encoded = encode_state(&state);
         let decoded = decode_state(&encoded).expect("decode");
         assert_eq!(decoded.digest.total_weight() as i64, 3);
+    }
+
+    #[test]
+    fn merge_serialized_state_into_empty_target_preserves_compression() {
+        let mut source = PercentileState::default();
+        set_quantiles(&mut source, vec![0.5, 0.9]).expect("set quantiles");
+        set_compression(&mut source, 5000.0).expect("set compression");
+        for value in 1..=50_000 {
+            add_value(&mut source, value as f64);
+        }
+
+        let payload = encode_state(&source);
+        let expected = quantiles_from_state(&decode_state(&payload).expect("decode source"))
+            .expect("source quantiles");
+
+        let mut merged = PercentileState::default();
+        merge_serialized_state_into(&mut merged, &payload).expect("merge payload");
+        let actual = quantiles_from_state(&merged).expect("merged quantiles");
+
+        assert_eq!(merged.compression, 5000);
+        assert_eq!(actual, expected);
     }
 }

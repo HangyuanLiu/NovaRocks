@@ -1,4 +1,6 @@
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Fields};
 
 /// Determine the result type for a Decimal binary arithmetic operation,
 /// taking the operator into account (multiply/divide need different scale rules).
@@ -96,6 +98,33 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
     }
     match (a, b) {
         (DataType::Null, other) | (other, DataType::Null) => other.clone(),
+        (DataType::List(left_field), DataType::List(right_field)) => {
+            DataType::List(Arc::new(Field::new(
+                left_field.name(),
+                wider_type(left_field.data_type(), right_field.data_type()),
+                left_field.is_nullable() || right_field.is_nullable(),
+            )))
+        }
+        (DataType::Map(left_entries, _), DataType::Map(right_entries, _)) => {
+            wider_map_type(left_entries, right_entries)
+        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields))
+            if left_fields.len() == right_fields.len() =>
+        {
+            DataType::Struct(Fields::from(
+                left_fields
+                    .iter()
+                    .zip(right_fields.iter())
+                    .map(|(left_field, right_field)| {
+                        Arc::new(Field::new(
+                            left_field.name(),
+                            wider_type(left_field.data_type(), right_field.data_type()),
+                            left_field.is_nullable() || right_field.is_nullable(),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        }
         // Decimal + Decimal -> wider Decimal
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
             let scale = (*s1).max(*s2);
@@ -137,6 +166,43 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         _ => a.clone(),
     }
+}
+
+fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
+    let DataType::Struct(left_fields) = left_entries.data_type() else {
+        return DataType::Map(Arc::new(left_entries.clone()), false);
+    };
+    let DataType::Struct(right_fields) = right_entries.data_type() else {
+        return DataType::Map(Arc::new(left_entries.clone()), false);
+    };
+    if left_fields.len() != 2 || right_fields.len() != 2 {
+        return DataType::Map(Arc::new(left_entries.clone()), false);
+    }
+
+    let key_type = wider_type(left_fields[0].data_type(), right_fields[0].data_type());
+    let value_type = wider_type(left_fields[1].data_type(), right_fields[1].data_type());
+    DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new(
+                        "key",
+                        key_type,
+                        left_fields[0].is_nullable() || right_fields[0].is_nullable(),
+                    )),
+                    Arc::new(Field::new(
+                        "value",
+                        value_type,
+                        left_fields[1].is_nullable() || right_fields[1].is_nullable(),
+                    )),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -192,5 +258,47 @@ mod tests {
         let result =
             arithmetic_result_type_with_op(&DataType::Decimal128(7, 2), &DataType::Int32, "add");
         assert_eq!(result, DataType::Decimal128(22, 2));
+    }
+
+    #[test]
+    fn wider_type_promotes_map_key_and_value_types() {
+        let left = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Null, true)),
+                        Arc::new(Field::new("value", DataType::Null, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let right = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int64, true)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let widened = wider_type(&left, &right);
+        let DataType::Map(entries, _) = widened else {
+            panic!("expected map type");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected entries struct");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Int64);
+        assert_eq!(fields[1].data_type(), &DataType::Int64);
     }
 }

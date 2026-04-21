@@ -512,7 +512,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 let mut index_typed = self.analyze_expr(index, scope)?;
                 let output_type = match &base.data_type {
                     DataType::List(item) => {
-                        index_typed = cast_to_target_type(index_typed, &DataType::Int32);
+                        index_typed =
+                            cast_null_preserving_target_type(index_typed, &DataType::Int32);
                         item.data_type().clone()
                     }
                     DataType::Map(entries, _) => {
@@ -522,7 +523,8 @@ impl<'a> super::AnalyzerContext<'a> {
                         if fields.len() != 2 {
                             return Err("map subscript expects key/value entries".to_string());
                         }
-                        index_typed = cast_to_target_type(index_typed, fields[0].data_type());
+                        index_typed =
+                            cast_null_preserving_target_type(index_typed, fields[0].data_type());
                         fields[1].data_type().clone()
                     }
                     DataType::Struct(_) => {
@@ -1043,6 +1045,40 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         }
 
+        let needs_boolean_args = matches!(
+            name.as_str(),
+            "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" | "count_if"
+        );
+        if needs_boolean_args {
+            for arg in &mut args_typed {
+                if arg.data_type != DataType::Boolean {
+                    let inner = std::mem::replace(
+                        arg,
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Null),
+                            data_type: DataType::Null,
+                            nullable: true,
+                        },
+                    );
+                    *arg = TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(inner),
+                            target: DataType::Boolean,
+                        },
+                        data_type: DataType::Boolean,
+                        nullable: true,
+                    };
+                }
+            }
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
+        if name == "count_if" && is_distinct {
+            return Err(
+                "Unexpected input '(', the most similar input is {<EOF>, ';'}.".to_string(),
+            );
+        }
+
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
 
@@ -1157,36 +1193,10 @@ impl<'a> super::AnalyzerContext<'a> {
             };
         }
 
-        let needs_boolean_args = matches!(
-            name.as_str(),
-            "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every"
-        );
-        if needs_boolean_args {
-            for arg in &mut args_typed {
-                if arg.data_type != DataType::Boolean {
-                    let inner = std::mem::replace(
-                        arg,
-                        TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Null),
-                            data_type: DataType::Null,
-                            nullable: true,
-                        },
-                    );
-                    *arg = TypedExpr {
-                        kind: ExprKind::Cast {
-                            expr: Box::new(inner),
-                            target: DataType::Boolean,
-                        },
-                        data_type: DataType::Boolean,
-                        nullable: true,
-                    };
-                }
-            }
-            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
-        }
-
         self.validate_percentile_arguments(&name, &args_typed)?;
-        if !is_aggregate_function(&name) {
+        if is_aggregate_function(&name) {
+            validate_aggregate_function_call(&name, &arg_types)?;
+        } else {
             validate_scalar_function_call(&name, &arg_types)?;
         }
 
@@ -1372,6 +1382,23 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => {}
         }
 
+        match name {
+            "percentile_approx" => {
+                if let Some(expr) = args.first() {
+                    validate_percentile_numeric_arg(name, 0, "value", expr)?;
+                }
+            }
+            "percentile_approx_weighted" => {
+                if let Some(expr) = args.first() {
+                    validate_percentile_numeric_arg(name, 0, "value", expr)?;
+                }
+                if let Some(expr) = args.get(1) {
+                    validate_percentile_numeric_arg(name, 1, "weight", expr)?;
+                }
+            }
+            _ => {}
+        }
+
         let (quantile_idx, compression_idx) = match name {
             "percentile_approx" => (1usize, 2usize),
             "percentile_approx_weighted" => (2usize, 3usize),
@@ -1434,7 +1461,8 @@ impl<'a> super::AnalyzerContext<'a> {
             && value <= 0.0
         {
             return Err(format!(
-                "Type check failed. compression parameter must be positive in {name}, but got: {value}"
+                "Type check failed. compression parameter must be positive in {name}, but got: {}",
+                format_percentile_error_value(value)
             ));
         }
         Ok(())
@@ -1610,7 +1638,7 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             if !(4..=21).contains(value) {
                 return Err(
-                    "ds_hll_count_distinct second parameter'value should be between 4 and 21"
+                    "ds_hll_count_distinct second parameter'value should be between 4 and 21."
                         .to_string(),
                 );
             }
@@ -1624,7 +1652,7 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             if !matches!(value.as_str(), "HLL_4" | "HLL_6" | "HLL_8") {
                 return Err(
-                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8"
+                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8."
                         .to_string(),
                 );
             }
@@ -1889,6 +1917,21 @@ fn cast_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
     }
 }
 
+fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
+    if expr.data_type == *target {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(expr),
+            target: target.clone(),
+        },
+        data_type: target.clone(),
+        nullable,
+    }
+}
+
 /// Wrap a non-boolean expression with CAST(... AS BOOLEAN) for implicit
 /// boolean coercion (used by `||` as logical OR with string operands).
 fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
@@ -1926,7 +1969,34 @@ fn is_numeric_type(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Decimal128(_, _)
-    )
+    ) || crate::common::largeint::is_largeint_data_type(data_type)
+}
+
+fn validate_percentile_numeric_arg(
+    name: &str,
+    index: usize,
+    role: &str,
+    expr: &TypedExpr,
+) -> Result<(), String> {
+    if is_numeric_type(&expr.data_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "{name} requires the {} parameter ({role}) to be numeric type, but got: {}.",
+        ordinal_name(index),
+        percentile_argument_type_name(&expr.data_type)
+    ))
+}
+
+fn percentile_argument_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Null => "NULL_TYPE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
+        DataType::Date32 => "date".to_string(),
+        DataType::Timestamp(_, _) => "datetime".to_string(),
+        dt if crate::common::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
+        other => format!("{other:?}").to_lowercase(),
+    }
 }
 
 fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
@@ -1949,6 +2019,10 @@ fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
         ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
         ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
         ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
+        ExprKind::UnaryOp {
+            op: UnOp::Negate,
+            expr,
+        } => const_numeric_value(expr).map(|value| -value),
         _ => None,
     }
 }
@@ -1963,11 +2037,21 @@ fn validate_percentile_value(
     }
     match array_index {
         Some(idx) => Err(format!(
-            "Type check failed. percentile array element[{idx}] must be between 0 and 1 in {name}, but got: {value}"
+            "Type check failed. percentile array element[{idx}] must be between 0 and 1 in {name}, but got: {}",
+            format_percentile_error_value(value)
         )),
         None => Err(format!(
-            "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {value}"
+            "Type check failed. percentile parameter must be between 0 and 1 in {name}, but got: {}",
+            format_percentile_error_value(value)
         )),
+    }
+}
+
+fn format_percentile_error_value(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
     }
 }
 

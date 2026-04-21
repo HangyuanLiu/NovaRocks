@@ -115,6 +115,101 @@ pub(super) fn validate_scalar_function_call(
     Ok(())
 }
 
+pub(super) fn validate_aggregate_function_call(
+    name: &str,
+    arg_types: &[DataType],
+) -> Result<(), String> {
+    match name {
+        "sum_map" => validate_sum_map_arguments(arg_types),
+        _ => Ok(()),
+    }
+}
+
+fn validate_sum_map_arguments(arg_types: &[DataType]) -> Result<(), String> {
+    let Some(arg_type) = arg_types.first() else {
+        return Ok(());
+    };
+    if matches!(arg_type, DataType::Null) {
+        return Ok(());
+    }
+    let DataType::Map(entries, _) = arg_type else {
+        return Ok(());
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return Ok(());
+    };
+    if fields.len() != 2 {
+        return Ok(());
+    }
+    if is_sum_map_scalar_kv_type(fields[0].data_type())
+        && is_sum_map_scalar_kv_type(fields[1].data_type())
+    {
+        if is_sum_map_supported_value_type(fields[1].data_type()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "unsupported value type:{}",
+                sum_map_value_type_name(fields[1].data_type())
+            ))
+        }
+    } else {
+        Err("sum_map only support scalar KV".to_string())
+    }
+}
+
+fn is_sum_map_scalar_kv_type(data_type: &DataType) -> bool {
+    !matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    )
+}
+
+fn is_sum_map_supported_value_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn sum_map_value_type_name(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Null => "NULL_TYPE",
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 => "TINYINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INT",
+        DataType::Int64 => "BIGINT",
+        DataType::Float32 => "FLOAT",
+        DataType::Float64 => "DOUBLE",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
+        DataType::Date32 => "DATE",
+        DataType::Timestamp(_, _) => "DATETIME",
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
+        DataType::FixedSizeBinary(_) => "LARGEINT",
+        DataType::Binary | DataType::LargeBinary => "VARBINARY",
+        DataType::List(_) => "ARRAY",
+        DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "ARRAY",
+        DataType::Struct(_) => "STRUCT",
+        DataType::Map(_, _) => "MAP",
+        DataType::Union(_, _) => "UNION",
+        _ => "UNKNOWN",
+    }
+}
+
 pub(super) fn is_aggregate_function(name: &str) -> bool {
     // Keep in sync with expr_compiler::is_aggregate_function.
     matches!(
@@ -128,12 +223,15 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "any_value"
             | "group_concat"
             | "string_agg"
+            | "bitmap_agg"
+            | "bitmap_union"
             | "bitmap_union_count"
             | "bitmap_union_int"
             | "multi_distinct_count"
             | "array_agg"
             | "array_agg_distinct"
             | "array_unique_agg"
+            | "sum_map"
             | "map_agg"
             | "percentile_approx"
             | "percentile_approx_weighted"
@@ -261,10 +359,12 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "to_date" | "str_to_date" => DataType::Date32,
 
         // Misc
-        "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
+        "version" | "database" | "current_user" | "user" | "uuid" | "bitmap_to_string" => {
+            DataType::Utf8
+        }
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
-        "hll_hash" | "ds_hll_count_distinct_state" => DataType::Binary,
+        "hll_hash" | "ds_hll_count_distinct_state" | "to_bitmap" => DataType::Binary,
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "grouping" | "grouping_id" => DataType::Int64,
         "array_min" | "array_max" => match arg_types.first() {
@@ -294,6 +394,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             _ => DataType::Null,
         },
         "map" => infer_map_constructor_return_type(arg_types),
+        "row" | "struct" => infer_struct_constructor_return_type(arg_types),
+        "named_struct" => infer_named_struct_return_type(arg_types),
         "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
             (Some(DataType::List(keys)), Some(DataType::List(values))) => DataType::Map(
                 Arc::new(arrow::datatypes::Field::new(
@@ -356,6 +458,55 @@ fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
         )),
         false,
     )
+}
+
+fn null_map_type() -> DataType {
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", DataType::Null, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", DataType::Null, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
+}
+
+fn infer_struct_constructor_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                data_type.clone(),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    DataType::Struct(arrow::datatypes::Fields::from(fields))
+}
+
+fn infer_named_struct_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .enumerate()
+        .map(|(idx, data_type)| {
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                data_type.clone(),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    DataType::Struct(arrow::datatypes::Fields::from(fields))
 }
 
 // ---------------------------------------------------------------------------
@@ -434,9 +585,20 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         "group_concat" | "string_agg" => DataType::Utf8,
         "dict_merge" => DataType::Utf8,
         "mann_whitney_u_test" => DataType::Utf8,
-        "ds_hll_count_distinct_union" | "hll_union" | "hll_raw_agg" => DataType::Binary,
+        "bitmap_agg"
+        | "bitmap_union"
+        | "ds_hll_count_distinct_union"
+        | "hll_union"
+        | "hll_raw_agg" => DataType::Binary,
         "array_agg" | "array_agg_distinct" => array_output(first_arg),
         "array_unique_agg" => first_arg,
+        "sum_map" => {
+            if first_arg == DataType::Null {
+                null_map_type()
+            } else {
+                first_arg
+            }
+        }
         "map_agg" => {
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
@@ -456,17 +618,8 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             )
         }
 
-        "variance"
-        | "variance_samp"
-        | "variance_pop"
-        | "var_samp"
-        | "var_pop"
-        | "stddev"
-        | "stddev_samp"
-        | "stddev_pop"
-        | "covar_samp"
-        | "covar_pop"
-        | "corr" => DataType::Float64,
+        "variance" | "variance_samp" | "variance_pop" | "var_samp" | "var_pop" | "stddev"
+        | "stddev_samp" | "stddev_pop" | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => DataType::Boolean,
 
         "percentile_approx" => {
@@ -523,5 +676,95 @@ mod tests {
             infer_scalar_return_type("array_position", &[int_array, DataType::Int32]),
             DataType::Int32
         );
+    }
+
+    #[test]
+    fn infer_scalar_return_type_for_row_constructor() {
+        let actual = infer_scalar_return_type("row", &[DataType::Int32, DataType::Float64]);
+        let DataType::Struct(fields) = actual else {
+            panic!("row() should infer a struct type");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].data_type(), &DataType::Int32);
+        assert_eq!(fields[1].data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn sum_map_is_treated_as_aggregate_map_output() {
+        let map_type = DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
+                        Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert!(is_aggregate_function("sum_map"));
+        assert_eq!(
+            infer_agg_return_type("sum_map", std::slice::from_ref(&map_type)),
+            map_type
+        );
+    }
+
+    #[test]
+    fn sum_map_rejects_non_scalar_values() {
+        let map_type = DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
+                        Arc::new(arrow::datatypes::Field::new(
+                            "value",
+                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                DataType::Int32,
+                                true,
+                            ))),
+                            true,
+                        )),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let err = validate_aggregate_function_call("sum_map", &[map_type])
+            .expect_err("sum_map should reject non-scalar map values");
+        assert_eq!(err, "sum_map only support scalar KV");
+    }
+
+    #[test]
+    fn sum_map_rejects_unsupported_scalar_value_types() {
+        let map_type = DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
+                        Arc::new(arrow::datatypes::Field::new(
+                            "value",
+                            DataType::Date32,
+                            true,
+                        )),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let err = validate_aggregate_function_call("sum_map", &[map_type])
+            .expect_err("sum_map should reject date values");
+        assert_eq!(err, "unsupported value type:DATE");
     }
 }

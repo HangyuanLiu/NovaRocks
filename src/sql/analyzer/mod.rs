@@ -1064,7 +1064,10 @@ impl<'a> AnalyzerContext<'a> {
             match item {
                 sqlast::SelectItem::UnnamedExpr(expr) => {
                     let typed = self.analyze_expr(expr, scope)?;
-                    let name = expr_display_name(expr);
+                    let name = match &typed.kind {
+                        ExprKind::ColumnRef { column, .. } => column.clone(),
+                        _ => expr_display_name(expr),
+                    };
                     output_columns.push(OutputColumn {
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
@@ -2478,6 +2481,20 @@ mod tests {
     }
 
     #[test]
+    fn test_cte_qualified_projection_uses_base_column_names() {
+        let sql = "WITH joined AS ( \
+                     SELECT o1.o_orderkey, o2.o_custkey \
+                     FROM orders o1 JOIN orders o2 ON o1.o_orderkey = o2.o_orderkey \
+                   ) \
+                   SELECT o_orderkey, o_custkey FROM joined";
+        let resolved =
+            parse_and_analyze(sql).expect("qualified CTE projection should expose base names");
+        assert_eq!(resolved.output_columns.len(), 2);
+        assert_eq!(resolved.output_columns[0].name, "o_orderkey");
+        assert_eq!(resolved.output_columns[1].name, "o_custkey");
+    }
+
+    #[test]
     fn test_single_use_cte_is_still_registered() {
         let sql = "WITH order_totals AS (SELECT o_orderkey AS ok FROM orders) \
                    SELECT ok FROM order_totals";
@@ -2680,6 +2697,33 @@ mod tests {
     }
 
     #[test]
+    fn test_percentile_approx_weighted_rejects_null_weight_in_analyzer() {
+        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, NULL, 0.9)")
+            .expect_err("analysis should reject NULL weight");
+        assert!(err.contains(
+            "percentile_approx_weighted requires the second parameter (weight) to be numeric type, but got: NULL_TYPE."
+        ));
+    }
+
+    #[test]
+    fn test_percentile_approx_weighted_rejects_negative_scalar_percentile_in_analyzer() {
+        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, -0.1)")
+            .expect_err("analysis should reject negative percentile");
+        assert!(err.contains(
+            "Type check failed. percentile parameter must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
+        ));
+    }
+
+    #[test]
+    fn test_percentile_approx_weighted_rejects_negative_array_percentile_in_analyzer() {
+        let err = parse_raw_and_analyze("SELECT percentile_approx_weighted(1, 1, [-0.1, 0.5])")
+            .expect_err("analysis should reject negative percentile array item");
+        assert!(err.contains(
+            "Type check failed. percentile array element[0] must be between 0 and 1 in percentile_approx_weighted, but got: -0.1"
+        ));
+    }
+
+    #[test]
     fn test_group_by_rollup() {
         // q5 pattern: GROUP BY ROLLUP(a, b)
         let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \
@@ -2823,5 +2867,32 @@ mod tests {
             err,
             "Unexpected input 'order', the most similar input is {',', ')'}."
         );
+    }
+
+    #[test]
+    fn bool_or_window_coerces_non_boolean_arguments() {
+        let resolved = parse_and_analyze(
+            "select bool_or(o_orderkey) over (partition by o_custkey order by o_orderkey) as v \
+             from orders",
+        )
+        .expect("bool_or window should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let expr = &sel.projection[0].expr;
+        assert_eq!(expr.data_type, arrow::datatypes::DataType::Boolean);
+        let ExprKind::WindowCall { name, args, .. } = &expr.kind else {
+            panic!("expected WindowCall, got {:?}", expr.kind);
+        };
+        assert_eq!(name, "bool_or");
+        assert_eq!(args.len(), 1);
+        let ExprKind::Cast { target, .. } = &args[0].kind else {
+            panic!(
+                "expected bool_or window argument cast, got {:?}",
+                args[0].kind
+            );
+        };
+        assert_eq!(target, &arrow::datatypes::DataType::Boolean);
+        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Boolean);
     }
 }

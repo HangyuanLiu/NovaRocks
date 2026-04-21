@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, Int8Array};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -58,6 +58,7 @@ const EXCHANGE_READY_LOG_EVERY: u64 = 4096;
 const EXCHANGE_PAYLOAD_MAGIC: &[u8; 4] = b"NRX1";
 const EXCHANGE_PAYLOAD_VERSION: u8 = 1;
 const EXCHANGE_PAYLOAD_FLAG_SLOT_IDS: u8 = 0x01;
+const EXCHANGE_ZERO_COLUMN_MARKER_FIELD: &str = "__novarocks_exchange_zero_column__";
 
 static EXCHANGE_NOT_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static EXCHANGE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1083,21 +1084,35 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     let mut buffer = Vec::new();
     let schema = merged_exchange_schema(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
-        if chunk.schema().as_ref() == schema.as_ref() {
-            batches.push(chunk.batch.clone());
-            continue;
+    let writer_schema;
+    if schema.fields().is_empty() {
+        for chunk in chunks {
+            batches.push(build_zero_column_marker_batch(chunk.len())?);
         }
-        let normalized = RecordBatch::try_new(Arc::clone(&schema), chunk.batch.columns().to_vec())
-            .map_err(|e| {
-                format!(
-                    "failed to normalize exchange chunk schema at index {}: {e}",
-                    i
-                )
-            })?;
-        batches.push(normalized);
+        writer_schema = batches
+            .first()
+            .map(|batch| batch.schema())
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+    } else {
+        for (i, chunk) in chunks.iter().enumerate() {
+            if chunk.schema().as_ref() == schema.as_ref() {
+                batches.push(chunk.batch.clone());
+                continue;
+            }
+            let normalized =
+                RecordBatch::try_new(Arc::clone(&schema), chunk.batch.columns().to_vec()).map_err(
+                    |e| {
+                        format!(
+                            "failed to normalize exchange chunk schema at index {}: {e}",
+                            i
+                        )
+                    },
+                )?;
+            batches.push(normalized);
+        }
+        writer_schema = schema;
     }
-    let mut writer = StreamWriter::try_new(&mut buffer, &schema)
+    let mut writer = StreamWriter::try_new(&mut buffer, &writer_schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
     for batch in batches {
@@ -1141,6 +1156,33 @@ fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, String> {
     }
 
     Ok(batches)
+}
+
+fn build_zero_column_marker_batch(row_count: usize) -> Result<RecordBatch, String> {
+    let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+        EXCHANGE_ZERO_COLUMN_MARKER_FIELD,
+        arrow::datatypes::DataType::Int8,
+        false,
+    )]));
+    let values = Arc::new(Int8Array::from(vec![0_i8; row_count])) as ArrayRef;
+    RecordBatch::try_new(schema, vec![values]).map_err(|e| e.to_string())
+}
+
+fn restore_zero_column_batch_if_needed(
+    batch: RecordBatch,
+    wire_meta: &ExchangeWireMeta,
+) -> Result<RecordBatch, String> {
+    if !wire_meta.slot_ids_by_index.is_empty() {
+        return Ok(batch);
+    }
+    if batch.num_columns() != 1
+        || batch.schema().field(0).name() != EXCHANGE_ZERO_COLUMN_MARKER_FIELD
+    {
+        return Ok(batch);
+    }
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+        .map_err(|e| e.to_string())
 }
 
 fn chunk_schema_for_wire_meta(
@@ -1269,6 +1311,7 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     let batches = decode_arrow_ipc_batches(arrow_payload)?;
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
+        let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
         let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
             &wire_meta.slot_ids_by_index,
@@ -1339,6 +1382,7 @@ pub fn decode_chunks_for_sender(
     let batches = decode_arrow_ipc_batches(arrow_payload)?;
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
+        let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
         let chunk_schema =
             chunk_schema_for_wire_meta(expected_chunk_schema.as_ref(), &batch, &wire_meta)?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
@@ -1351,6 +1395,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow::record_batch::RecordBatchOptions;
     use std::sync::Arc;
 
     use super::{
@@ -1404,6 +1449,13 @@ mod tests {
         Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).expect("chunk")
     }
 
+    fn exchange_test_zero_column_chunk(row_count: usize) -> Chunk {
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+            .expect("empty batch");
+        Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+    }
+
     #[test]
     fn encode_chunks_normalizes_field_name_only_schema_differences() {
         let chunks = vec![exchange_test_chunk("_cse_0"), exchange_test_chunk("_cse_2")];
@@ -1413,6 +1465,17 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].schema(), decoded[1].schema());
         assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
+    }
+
+    #[test]
+    fn encode_chunks_round_trip_zero_column_row_count() {
+        let chunk = exchange_test_zero_column_chunk(1);
+        let bytes = encode_chunks(&[chunk], true).expect("encode");
+        let decoded = decode_chunks(&bytes).expect("decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), 1);
+        assert_eq!(decoded[0].batch.num_columns(), 0);
     }
 
     #[test]

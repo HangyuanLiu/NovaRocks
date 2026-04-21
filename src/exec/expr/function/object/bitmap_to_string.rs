@@ -45,7 +45,7 @@ pub fn eval_bitmap_to_string(
     for row in 0..chunk.len() {
         let idx = row_index(row, arr.len());
         if arr.is_null(idx) {
-            builder.append_null();
+            builder.append_value("");
             continue;
         }
         let values = super::bitmap_common::decode_bitmap(arr.value(idx))?;

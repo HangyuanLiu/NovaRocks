@@ -70,6 +70,8 @@ fn apply_query_modifiers(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> LogicalPlan {
+    let mut final_projection: Option<Vec<ProjectItem>> = None;
+
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
         let extra_items = collect_extra_sort_items(&order_by, &output_columns);
@@ -92,25 +94,24 @@ fn apply_query_modifiers(
                 items: sort_items,
             });
 
-            // Strip extra columns with a final project
-            let final_items: Vec<ProjectItem> = output_columns
-                .iter()
-                .map(|col| ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            qualifier: None,
-                            column: col.name.clone(),
+            // Strip synthetic sort-only columns after LIMIT/OFFSET so the
+            // limit stays directly above Sort and can be rewritten to TopN.
+            final_projection = Some(
+                output_columns
+                    .iter()
+                    .map(|col| ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: None,
+                                column: col.name.clone(),
+                            },
+                            data_type: col.data_type.clone(),
+                            nullable: col.nullable,
                         },
-                        data_type: col.data_type.clone(),
-                        nullable: col.nullable,
-                    },
-                    output_name: col.name.clone(),
-                })
-                .collect();
-            body_plan = LogicalPlan::Project(ProjectNode {
-                input: Box::new(body_plan),
-                items: final_items,
-            });
+                        output_name: col.name.clone(),
+                    })
+                    .collect(),
+            );
         } else {
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
@@ -125,6 +126,13 @@ fn apply_query_modifiers(
             input: Box::new(body_plan),
             limit,
             offset,
+        });
+    }
+
+    if let Some(items) = final_projection {
+        body_plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(body_plan),
+            items,
         });
     }
 
@@ -653,9 +661,7 @@ fn has_window_call(expr: &TypedExpr) -> bool {
         ExprKind::Between {
             expr, low, high, ..
         } => has_window_call(expr) || has_window_call(low) || has_window_call(high),
-        ExprKind::Like { expr, pattern, .. } => {
-            has_window_call(expr) || has_window_call(pattern)
-        }
+        ExprKind::Like { expr, pattern, .. } => has_window_call(expr) || has_window_call(pattern),
         ExprKind::Case {
             operand,
             when_then,
@@ -914,7 +920,12 @@ fn rewrite_window_calls(
         } => TypedExpr {
             kind: ExprKind::Case {
                 operand: operand.as_ref().map(|inner| {
-                    Box::new(rewrite_window_calls(inner, base_name, window_exprs, counter))
+                    Box::new(rewrite_window_calls(
+                        inner,
+                        base_name,
+                        window_exprs,
+                        counter,
+                    ))
                 }),
                 when_then: when_then
                     .iter()
@@ -926,7 +937,12 @@ fn rewrite_window_calls(
                     })
                     .collect(),
                 else_expr: else_expr.as_ref().map(|inner| {
-                    Box::new(rewrite_window_calls(inner, base_name, window_exprs, counter))
+                    Box::new(rewrite_window_calls(
+                        inner,
+                        base_name,
+                        window_exprs,
+                        counter,
+                    ))
                 }),
             },
             data_type: expr.data_type.clone(),
@@ -1327,6 +1343,38 @@ mod tests {
                         path: std::path::PathBuf::from("/tmp/orders.parquet"),
                     },
                 }),
+                "maps" => Ok(TableDef {
+                    name: "maps".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "m".to_string(),
+                        data_type: arrow::datatypes::DataType::Map(
+                            std::sync::Arc::new(arrow::datatypes::Field::new(
+                                "entries",
+                                arrow::datatypes::DataType::Struct(
+                                    vec![
+                                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                                            "key",
+                                            arrow::datatypes::DataType::Int32,
+                                            true,
+                                        )),
+                                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                                            "value",
+                                            arrow::datatypes::DataType::Int32,
+                                            true,
+                                        )),
+                                    ]
+                                    .into(),
+                                ),
+                                false,
+                            )),
+                            false,
+                        ),
+                        nullable: true,
+                    }],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/maps.parquet"),
+                    },
+                }),
                 other => Err(format!("unknown test table: {other}")),
             }
         }
@@ -1392,6 +1440,23 @@ mod tests {
                 other => panic!("expected nested CTEAnchor, got {other:?}"),
             },
             other => panic!("expected outer CTEAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sum_map_subscript_plans_as_aggregate() {
+        let plan = parse_analyze_and_plan("SELECT sum_map(m)[1] FROM maps")
+            .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::Project(project) => match *project.input {
+                LogicalPlan::Aggregate(agg) => {
+                    assert_eq!(agg.aggregates.len(), 1);
+                    assert_eq!(agg.aggregates[0].name, "sum_map");
+                }
+                other => panic!("expected Aggregate under Project, got {other:?}"),
+            },
+            other => panic!("expected Project root, got {other:?}"),
         }
     }
 

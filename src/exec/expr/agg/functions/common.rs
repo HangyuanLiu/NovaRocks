@@ -20,7 +20,7 @@ use arrow::array::{
     FixedSizeBinaryArray, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
     Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
     ListArray, MapArray, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
@@ -685,6 +685,7 @@ pub(crate) fn build_scalar_array(
     values: Vec<Option<AggScalarValue>>,
 ) -> Result<ArrayRef, String> {
     match output_type {
+        DataType::Null => Ok(new_null_array(output_type, values.len())),
         DataType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for value in values {

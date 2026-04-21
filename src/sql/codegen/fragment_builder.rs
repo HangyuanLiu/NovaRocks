@@ -883,7 +883,21 @@ impl<'a> PlanFragmentBuilder<'a> {
             } else {
                 // Single or Local: compile against child scope normally.
                 let mut compiler = ExprCompiler::new(&child.scope);
-                compiler.compile_aggregate_call_typed(agg_call)?
+                compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
+                    let available = child
+                        .scope
+                        .iter_columns()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
+                        agg_call_display_name(agg_call),
+                        op.mode,
+                        available,
+                        err
+                    )
+                })?
             };
 
             let data_type = if need_finalize {
@@ -1266,9 +1280,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     top.limit = limit;
                 }
                 if op.offset.is_some() {
-                    return Err(
-                        "LIMIT/OFFSET without a SORT child is not supported".to_string(),
-                    );
+                    return Err("LIMIT/OFFSET without a SORT child is not supported".to_string());
                 }
             }
         }
@@ -2263,6 +2275,21 @@ impl<'a> PlanFragmentBuilder<'a> {
         let output_tuple_id = self.alloc_tuple();
         let set_op_node_id = self.alloc_node();
 
+        let output_columns: Vec<crate::sql::analysis::OutputColumn> =
+            if node.output_columns.is_empty() {
+                child_results[0]
+                    .scope
+                    .iter_columns()
+                    .map(|(name, binding)| crate::sql::analysis::OutputColumn {
+                        name: name.clone(),
+                        data_type: binding.data_type.clone(),
+                        nullable: binding.nullable,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                node.output_columns.clone()
+            };
+
         let mut output_scope = ExprScope::new();
         let first_child_cols: Vec<(String, ColumnBinding)> = child_results[0]
             .scope
@@ -2270,36 +2297,33 @@ impl<'a> PlanFragmentBuilder<'a> {
             .map(|(name, binding)| (name.clone(), binding.clone()))
             .collect();
 
-        for (idx, (name, child_binding)) in first_child_cols.iter().enumerate() {
+        if first_child_cols.len() != output_columns.len() {
+            return Err(format!(
+                "set operation column count mismatch during codegen: child has {}, output has {}",
+                first_child_cols.len(),
+                output_columns.len()
+            ));
+        }
+
+        for (idx, output_col) in output_columns.iter().enumerate() {
             let slot_id = self.alloc_slot();
-            if let Some(slot_type_desc) = child_binding.type_desc.clone() {
-                self.desc_builder.add_slot_with_type_desc(
-                    slot_id,
-                    output_tuple_id,
-                    name,
-                    slot_type_desc,
-                    child_binding.nullable,
-                    idx as i32,
-                );
-            } else {
-                self.desc_builder.add_slot(
-                    slot_id,
-                    output_tuple_id,
-                    name,
-                    &child_binding.data_type,
-                    child_binding.nullable,
-                    idx as i32,
-                );
-            }
+            self.desc_builder.add_slot(
+                slot_id,
+                output_tuple_id,
+                &output_col.name,
+                &output_col.data_type,
+                output_col.nullable,
+                idx as i32,
+            );
             output_scope.add_column(
                 None,
-                name.clone(),
+                output_col.name.clone(),
                 ColumnBinding {
                     tuple_id: output_tuple_id,
                     slot_id,
-                    data_type: child_binding.data_type.clone(),
-                    type_desc: child_binding.type_desc.clone(),
-                    nullable: child_binding.nullable,
+                    data_type: output_col.data_type.clone(),
+                    type_desc: None,
+                    nullable: output_col.nullable,
                 },
             );
         }
@@ -2309,15 +2333,12 @@ impl<'a> PlanFragmentBuilder<'a> {
         for child_result in &child_results {
             let mut expr_list = Vec::new();
             for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
-                let output_type = first_child_cols.get(col_idx).map(|(_, b)| &b.data_type);
-                let needs_cast = matches!(child_binding.data_type, DataType::Null)
-                    && output_type.is_some_and(|t| !matches!(t, DataType::Null));
+                let output_col = output_columns.get(col_idx).ok_or_else(|| {
+                    format!("missing output column {} for set operation", col_idx)
+                })?;
+                let needs_cast = child_binding.data_type != output_col.data_type;
                 if needs_cast {
-                    let target_type = output_type.unwrap();
-                    let target_desc = first_child_cols
-                        .get(col_idx)
-                        .and_then(|(_, binding)| binding.type_desc.clone())
-                        .unwrap_or(type_infer::arrow_type_to_type_desc(target_type)?);
+                    let target_desc = type_infer::arrow_type_to_type_desc(&output_col.data_type)?;
                     let child_desc = expr_compiler::binding_type_desc(child_binding)?;
                     let slot_ref = expr_compiler::build_slot_ref_texpr(
                         child_binding.slot_id,

@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use arrow::array::{Array, ArrayRef, MapArray};
+use arrow::array::{Array, ArrayRef, MapArray, NullArray};
 use arrow::datatypes::DataType;
 
 use crate::exec::node::aggregate::AggFunction;
@@ -59,7 +59,7 @@ impl AggregateFunction for SumMapAgg {
         } else {
             input_type
         };
-        if !matches!(check_type, DataType::Map(_, _)) {
+        if !matches!(check_type, DataType::Map(_, _) | DataType::Null) {
             return Err(format!("sum_map expects MAP input, got {:?}", check_type));
         }
 
@@ -93,6 +93,11 @@ impl AggregateFunction for SumMapAgg {
         let arr = array
             .as_ref()
             .ok_or_else(|| "sum_map input missing".to_string())?;
+        if matches!(arr.data_type(), DataType::Null)
+            && arr.as_any().downcast_ref::<NullArray>().is_some()
+        {
+            return Ok(AggInputView::Any(arr));
+        }
         let _ = arr
             .as_any()
             .downcast_ref::<MapArray>()
@@ -130,6 +135,11 @@ impl AggregateFunction for SumMapAgg {
         let AggInputView::Any(array) = input else {
             return Err("sum_map input type mismatch".to_string());
         };
+        if matches!(array.data_type(), DataType::Null)
+            && array.as_any().downcast_ref::<NullArray>().is_some()
+        {
+            return Ok(());
+        }
         let map = array
             .as_any()
             .downcast_ref::<MapArray>()

@@ -128,4 +128,36 @@ mod tests {
             "unexpected lambda arg shape: {first_arg:?}"
         );
     }
+
+    #[test]
+    fn parse_sql_raw_parses_cast_null_as_map_type() {
+        let stmt = parse_sql_raw("SELECT CAST(NULL AS MAP<INT, INT>)").expect("parse should work");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Cast {
+            data_type, ..
+        }) = &select.projection[0]
+        else {
+            panic!("expected cast projection");
+        };
+        assert!(
+            matches!(
+                data_type,
+                sqlparser::ast::DataType::Map(key_type, value_type)
+                    if matches!(key_type.as_ref(), sqlparser::ast::DataType::Int(_))
+                        && matches!(value_type.as_ref(), sqlparser::ast::DataType::Int(_))
+            ) || matches!(
+                data_type,
+                sqlparser::ast::DataType::Custom(name, modifiers)
+                    if name.to_string().eq_ignore_ascii_case("map")
+                        && modifiers.len() == 2
+                        && modifiers[0].eq_ignore_ascii_case("int")
+                        && modifiers[1].eq_ignore_ascii_case("int")
+            )
+        );
+    }
 }

@@ -35,7 +35,6 @@ use crate::{common::util::format_mysql_container_value_with_schema, version};
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
     QueryResult, QueryResultColumn, StandaloneNovaRocks, StandaloneOptions, StatementResult,
-    build_string_query_result,
 };
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -478,6 +477,14 @@ fn is_session_noop(query: &str) -> bool {
         || lower.starts_with("analyze ")
 }
 
+fn is_materialized_view_management_statement(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    lower.starts_with("create materialized view ")
+        || lower.starts_with("drop materialized view ")
+        || lower.starts_with("refresh materialized view ")
+        || lower.starts_with("show alter materialized view ")
+}
+
 fn split_sql_statements(query: &str) -> Result<Vec<String>, String> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum QuoteState {
@@ -683,7 +690,7 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if is_session_noop(trimmed) {
+    if is_session_noop(trimmed) && !is_materialized_view_management_statement(trimmed) {
         return Ok(StatementResult::Ok);
     }
 
@@ -700,7 +707,9 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if !is_supported_embedded_statement(trimmed) {
+    if !is_supported_embedded_statement(trimmed)
+        && !is_materialized_view_management_statement(trimmed)
+    {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
             "unsupported sql in standalone server v1".to_string(),
@@ -1040,7 +1049,10 @@ fn array_value_to_mysql_value(
 
     let name_lower = declared.name.to_lowercase();
     if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
-        && (name_lower.starts_with("hll_union(") || name_lower.starts_with("hll_raw_agg("))
+        && (name_lower.starts_with("bitmap_agg(")
+            || name_lower.starts_with("bitmap_union(")
+            || name_lower.starts_with("hll_union(")
+            || name_lower.starts_with("hll_raw_agg("))
     {
         return Ok(StandaloneMysqlValue::Null);
     }

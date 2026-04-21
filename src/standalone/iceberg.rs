@@ -1193,8 +1193,7 @@ fn build_literal_array(
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     Literal::Bool(value) => Ok(Some(*value)),
-                    Literal::Int(value) if *value == 0 => Ok(Some(false)),
-                    Literal::Int(value) if *value == 1 => Ok(Some(true)),
+                    Literal::Int(value) => Ok(Some(*value != 0)),
                     other => Err(format!("literal {:?} is not valid for BOOLEAN", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,

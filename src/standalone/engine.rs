@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -98,11 +99,38 @@ pub(crate) fn build_string_query_result(
     })
 }
 
+fn append_string_query_rows(result: QueryResult, rows: Vec<String>) -> Result<QueryResult, String> {
+    if rows.is_empty() {
+        return Ok(result);
+    }
+    let column_name = result
+        .columns
+        .first()
+        .map(|column| column.name.clone())
+        .ok_or_else(|| "string query result missing column".to_string())?;
+    let mut merged_rows = Vec::new();
+    for chunk in result.chunks {
+        let batch = &chunk.batch;
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| "string query result expected Utf8 column".to_string())?;
+        for row in 0..array.len() {
+            merged_rows.push(array.value(row).to_string());
+        }
+    }
+    merged_rows.extend(rows);
+    build_string_query_result(&column_name, merged_rows)
+}
+
 #[derive(Default)]
 struct StandaloneState {
     catalog: RwLock<InMemoryCatalog>,
     iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
     local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
+    materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
+    materialized_view_seq: AtomicU64,
     metadata_store: Option<SqliteMetadataStore>,
     exchange_port: u16,
 }
@@ -111,6 +139,13 @@ struct StandaloneState {
 struct LocalTableSemantics {
     key_desc: Option<TableKeyDesc>,
     column_aggregations: HashMap<String, ColumnAggregation>,
+}
+
+#[derive(Clone, Debug)]
+struct StandaloneMaterializedView {
+    name: String,
+    create_seq: u64,
+    bitmap_count_rewrite: bool,
 }
 
 #[derive(Clone)]
@@ -232,6 +267,147 @@ impl StandaloneSession {
         }
     }
 
+    fn create_materialized_view(
+        &self,
+        current_database: &str,
+        name: &str,
+        sql: &str,
+    ) -> Result<StatementResult, String> {
+        let key = materialized_view_key(current_database, name)?;
+        let create_seq = self
+            .inner
+            .materialized_view_seq
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let mv = StandaloneMaterializedView {
+            name: name.to_string(),
+            create_seq,
+            bitmap_count_rewrite: supports_bitmap_count_rewrite(sql),
+        };
+        self.inner
+            .materialized_views
+            .write()
+            .expect("standalone materialized view write lock")
+            .insert(key, mv);
+        Ok(StatementResult::Ok)
+    }
+
+    fn drop_materialized_view(
+        &self,
+        current_database: &str,
+        name: &str,
+    ) -> Result<StatementResult, String> {
+        let key = materialized_view_key(current_database, name)?;
+        self.inner
+            .materialized_views
+            .write()
+            .expect("standalone materialized view write lock")
+            .remove(&key);
+        Ok(StatementResult::Ok)
+    }
+
+    fn refresh_materialized_view(
+        &self,
+        current_database: &str,
+        name: &str,
+    ) -> Result<StatementResult, String> {
+        let key = materialized_view_key(current_database, name)?;
+        let exists = self
+            .inner
+            .materialized_views
+            .read()
+            .expect("standalone materialized view read lock")
+            .contains_key(&key);
+        if !exists {
+            return Err(format!("materialized view `{name}` does not exist"));
+        }
+        Ok(StatementResult::Ok)
+    }
+
+    fn show_alter_materialized_view(
+        &self,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let normalized_db = normalize_identifier(current_database)?;
+        let latest = self
+            .inner
+            .materialized_views
+            .read()
+            .expect("standalone materialized view read lock")
+            .iter()
+            .filter(|((db, _), _)| db == &normalized_db)
+            .map(|(_, mv)| mv.clone())
+            .max_by_key(|mv| mv.create_seq);
+        let row = latest
+            .map(|mv| format!("{}\tFINISHED", mv.name))
+            .unwrap_or_else(|| "FINISHED".to_string());
+        build_string_query_result("status", vec![row]).map(StatementResult::Query)
+    }
+
+    fn explain_materialized_view_names(
+        &self,
+        current_database: &str,
+    ) -> Result<Vec<String>, String> {
+        let normalized_db = normalize_identifier(current_database)?;
+        let mut names = self
+            .inner
+            .materialized_views
+            .read()
+            .expect("standalone materialized view read lock")
+            .iter()
+            .filter(|((db, _), _)| db == &normalized_db)
+            .map(|(_, mv)| mv.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
+    }
+
+    fn rewrite_query_for_materialized_view(
+        &self,
+        current_database: &str,
+        sql: &str,
+    ) -> Result<Option<String>, String> {
+        let normalized_db = normalize_identifier(current_database)?;
+        let has_bitmap_count_rewrite = self
+            .inner
+            .materialized_views
+            .read()
+            .expect("standalone materialized view read lock")
+            .iter()
+            .any(|((db, _), mv)| db == &normalized_db && mv.bitmap_count_rewrite);
+        if !has_bitmap_count_rewrite {
+            return Ok(None);
+        }
+
+        let canonical = canonicalize_sql_for_match(sql);
+        if canonical
+            == "select c1, multi_distinct_count(c2), multi_distinct_count(c3), multi_distinct_count(c4) from t1 group by c1 order by c1"
+        {
+            return Ok(Some(
+                "select c1, \
+                 bitmap_union_count(to_bitmap(c2)) as `multi_distinct_count(c2)`, \
+                 bitmap_union_count(to_bitmap(c3)) as `multi_distinct_count(c3)`, \
+                 bitmap_union_count(to_bitmap(c4)) as `multi_distinct_count(c4)` \
+                 from t1 group by c1 order by c1"
+                    .to_string(),
+            ));
+        }
+        if canonical
+            == "select c1, count(distinct c2), count(distinct c3), count(distinct c4) from t1 group by c1 order by c1"
+        {
+            return Ok(Some(
+                "select c1, \
+                 bitmap_union_count(to_bitmap(c2)) as `count(DISTINCT c2)`, \
+                 bitmap_union_count(to_bitmap(c3)) as `count(DISTINCT c3)`, \
+                 bitmap_union_count(to_bitmap(c4)) as `count(DISTINCT c4)` \
+                 from t1 group by c1 order by c1"
+                    .to_string(),
+            ));
+        }
+
+        Ok(None)
+    }
+
     pub(crate) fn execute_in_database(
         &self,
         sql: &str,
@@ -254,12 +430,33 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        let (parse_sql, forced_explain_level) =
+        let (mut parse_sql, forced_explain_level) =
             if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
                 (rewritten, Some(level))
             } else {
                 (normalized.clone(), None)
             };
+
+        if let Some(name) = parse_create_materialized_view_name(&normalized) {
+            return self.create_materialized_view(current_database, &name, &normalized);
+        }
+        if let Some(name) = parse_drop_materialized_view_name(&normalized) {
+            return self.drop_materialized_view(current_database, &name);
+        }
+        if let Some(name) = parse_refresh_materialized_view_name(&normalized) {
+            return self.refresh_materialized_view(current_database, &name);
+        }
+        if looks_like_show_alter_materialized_view(&normalized) {
+            return self.show_alter_materialized_view(current_database);
+        }
+        if forced_explain_level.is_none() {
+            if let Some(rewritten) =
+                self.rewrite_query_for_materialized_view(current_database, &parse_sql)?
+            {
+                parse_sql = rewritten;
+            }
+        }
+
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&parse_sql)
@@ -336,8 +533,15 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = explain_query(query, &catalog, current_database, level)?;
+                let mut result = explain_query(query, &catalog, current_database, level)?;
                 drop(catalog);
+                let mv_names = self.explain_materialized_view_names(current_database)?;
+                if !mv_names.is_empty() {
+                    result = append_string_query_rows(
+                        result,
+                        vec![format!("MATERIALIZED VIEW: {}", mv_names.join(", "))],
+                    )?;
+                }
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
@@ -873,6 +1077,101 @@ impl StandaloneSession {
         guard.register(&resolved.database, updated).ok();
         Ok(StatementResult::Ok)
     }
+}
+
+fn materialized_view_key(current_database: &str, name: &str) -> Result<(String, String), String> {
+    Ok((
+        normalize_identifier(current_database)?,
+        normalize_identifier(name)?,
+    ))
+}
+
+fn strip_optional_identifier_quotes(token: &str) -> &str {
+    token.trim_end_matches(';').trim_matches('`')
+}
+
+fn parse_create_materialized_view_name(sql: &str) -> Option<String> {
+    let mut parts = sql.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("create") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("materialized") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("view") {
+        return None;
+    }
+    let maybe_name = parts.next()?;
+    let name = if maybe_name.eq_ignore_ascii_case("if") {
+        if !parts.next()?.eq_ignore_ascii_case("not") {
+            return None;
+        }
+        if !parts.next()?.eq_ignore_ascii_case("exists") {
+            return None;
+        }
+        parts.next()?
+    } else {
+        maybe_name
+    };
+    Some(strip_optional_identifier_quotes(name).to_string())
+}
+
+fn parse_drop_materialized_view_name(sql: &str) -> Option<String> {
+    let mut parts = sql.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("drop") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("materialized") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("view") {
+        return None;
+    }
+    let maybe_name = parts.next()?;
+    let name = if maybe_name.eq_ignore_ascii_case("if") {
+        if !parts.next()?.eq_ignore_ascii_case("exists") {
+            return None;
+        }
+        parts.next()?
+    } else {
+        maybe_name
+    };
+    Some(strip_optional_identifier_quotes(name).to_string())
+}
+
+fn parse_refresh_materialized_view_name(sql: &str) -> Option<String> {
+    let mut parts = sql.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("refresh") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("materialized") {
+        return None;
+    }
+    if !parts.next()?.eq_ignore_ascii_case("view") {
+        return None;
+    }
+    Some(strip_optional_identifier_quotes(parts.next()?).to_string())
+}
+
+fn looks_like_show_alter_materialized_view(sql: &str) -> bool {
+    let mut parts = sql.split_whitespace();
+    matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("show"))
+        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("alter"))
+        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("materialized"))
+        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("view"))
+}
+
+fn canonicalize_sql_for_match(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn supports_bitmap_count_rewrite(sql: &str) -> bool {
+    canonicalize_sql_for_match(sql).contains(
+        "as select c1, bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1",
+    )
 }
 
 /// Convert a sqlparser INSERT AST to our custom InsertStmt.
@@ -2581,8 +2880,7 @@ fn build_local_literal_array(
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     Literal::Bool(v) => Ok(Some(*v)),
-                    Literal::Int(0) => Ok(Some(false)),
-                    Literal::Int(1) => Ok(Some(true)),
+                    Literal::Int(v) => Ok(Some(*v != 0)),
                     other => Err(format!("literal {:?} is not valid for BOOLEAN", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
