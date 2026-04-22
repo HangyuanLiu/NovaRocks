@@ -2,3 +2,8 @@
 //! materialized-view recognition, generate_series helpers.
 //!
 //! Populated incrementally during the PR1 refactor.
+
+pub(crate) mod expr;
+pub(crate) mod generate_series;
+pub(crate) mod materialized_view;
+pub(crate) mod statement;
