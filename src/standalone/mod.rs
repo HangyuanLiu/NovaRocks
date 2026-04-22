@@ -1,23 +1,17 @@
 use std::sync::OnceLock;
 
 pub(crate) mod catalog;
-pub(crate) mod coordinator;
 mod engine;
-pub(crate) mod hadoop_catalog;
 pub(crate) mod iceberg;
-pub(crate) mod iceberg_add_files;
-pub(crate) mod iceberg_s3_storage;
-pub(crate) mod lake_ddl;
-pub(crate) mod lake_recovery;
-pub(crate) mod lake_txn;
+pub(crate) mod lake;
 mod server;
-pub(crate) mod store;
 
+pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 pub use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 pub(crate) use engine::StandaloneStreamLoadRequest;
 pub use engine::{
-    QueryResult, QueryResultColumn, StandaloneManagedTableInfo, StandaloneManagedTabletInfo,
-    StandaloneNovaRocks, StandaloneOptions, StandaloneSession,
+    StandaloneManagedTableInfo, StandaloneManagedTabletInfo, StandaloneNovaRocks,
+    StandaloneOptions, StandaloneSession,
 };
 pub use server::{StandaloneServerOptions, StandaloneTableConfig, run_standalone_server};
 

@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use prost::Message;
-use std::sync::Arc;
 
-use crate::common::app_config::StandaloneManagedLakeConfig as AppManagedLakeConfig;
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::connector::starrocks::ObjectStoreProfile;
@@ -13,60 +12,18 @@ use crate::connector::starrocks::lake::context::{
     TabletWriteContext, get_tablet_runtime, register_tablet_runtime, remove_tablet_runtime,
 };
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-use super::catalog::normalize_identifier;
-use super::catalog::{
+use super::super::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    normalize_identifier,
 };
-use super::iceberg_add_files::parse_s3_path;
+use super::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
     SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
     StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
-
-#[derive(Clone, Debug)]
-pub(crate) struct ManagedLakeConfig {
-    pub(crate) warehouse_uri: String,
-    pub(crate) s3: S3StoreConfig,
-}
-
-impl ManagedLakeConfig {
-    pub(crate) fn from_app_config(config: AppManagedLakeConfig) -> Result<Self, String> {
-        let warehouse_uri = config
-            .warehouse_uri
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        if warehouse_uri.is_empty() {
-            return Err("standalone managed lake warehouse_uri is empty".to_string());
-        }
-        let (bucket, root) = parse_s3_path(&warehouse_uri)?;
-        Ok(Self {
-            warehouse_uri,
-            s3: S3StoreConfig {
-                endpoint: config.endpoint.trim().to_string(),
-                bucket,
-                root: root.trim_matches('/').to_string(),
-                access_key_id: config.access_key_id.trim().to_string(),
-                access_key_secret: config.access_key_secret.trim().to_string(),
-                region: config.region.as_ref().map(|value| value.trim().to_string()),
-                enable_path_style_access: config.enable_path_style_access,
-            },
-        })
-    }
-
-    pub(crate) fn tablet_root_path(&self, db_id: i64, table_id: i64, _tablet_id: i64) -> String {
-        // All tablets for a partition share the same root so the bundle-metadata
-        // scheme (`meta/0000000000000000_<version>.meta`) and the scanner's
-        // partition_storage_path lookup stay in lockstep. Per-tablet files are
-        // disambiguated inside the shared meta/ and data/ directories by the
-        // tablet_id- and txn_id-prefixed filenames StarRocks emits.
-        format!("{}/db_{db_id}/table_{table_id}", self.warehouse_uri)
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ManagedLakeCatalog {
@@ -248,6 +205,9 @@ impl ManagedLakeCatalog {
 
         let mut tables_by_name = HashMap::new();
         for table in &snapshot.tables {
+            if table.state != ManagedTableState::Active {
+                continue;
+            }
             let database_name = databases_by_id.get(&table.db_id).cloned().ok_or_else(|| {
                 format!(
                     "managed table {} references unknown db_id={}",
@@ -267,6 +227,29 @@ impl ManagedLakeCatalog {
                 normalize_identifier(&database_name)?,
                 normalize_identifier(&table.name)?,
             );
+            let partitions = partitions_by_table
+                .remove(&table.table_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|partition| partition.state == ManagedPartitionState::Active)
+                .collect::<Vec<_>>();
+            let active_partition_ids = partitions
+                .iter()
+                .map(|partition| partition.partition_id)
+                .collect::<HashSet<_>>();
+            let indexes = indexes_by_table
+                .remove(&table.table_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|index| {
+                    index.state == ManagedIndexState::Active
+                        && active_partition_ids.contains(&index.partition_id)
+                })
+                .collect::<Vec<_>>();
+            let active_index_ids = indexes
+                .iter()
+                .map(|index| index.index_id)
+                .collect::<HashSet<_>>();
             tables_by_name.insert(
                 key,
                 ManagedTableRuntime {
@@ -277,11 +260,17 @@ impl ManagedLakeCatalog {
                     columns: columns_by_schema
                         .remove(&table.current_schema_id)
                         .unwrap_or_default(),
-                    partitions: partitions_by_table
+                    partitions,
+                    indexes,
+                    tablets: tablets_by_table
                         .remove(&table.table_id)
-                        .unwrap_or_default(),
-                    indexes: indexes_by_table.remove(&table.table_id).unwrap_or_default(),
-                    tablets: tablets_by_table.remove(&table.table_id).unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|tablet| {
+                            active_partition_ids.contains(&tablet.partition_id)
+                                && active_index_ids.contains(&tablet.index_id)
+                        })
+                        .collect(),
                 },
             );
         }
@@ -402,6 +391,25 @@ where
         }
     }
 
+    let dangling_partition_ids = snapshot
+        .partitions
+        .iter()
+        .filter(|partition| partition.state == ManagedPartitionState::Creating)
+        .map(|partition| partition.partition_id)
+        .collect::<Vec<_>>();
+    for partition_id in &dangling_partition_ids {
+        store.delete_creating_partition(*partition_id)?;
+    }
+    snapshot
+        .partitions
+        .retain(|partition| !dangling_partition_ids.contains(&partition.partition_id));
+    snapshot
+        .indexes
+        .retain(|index| !dangling_partition_ids.contains(&index.partition_id));
+    snapshot
+        .tablets
+        .retain(|tablet| !dangling_partition_ids.contains(&tablet.partition_id));
+
     let mut aborted = Vec::new();
     let mut replayed = Vec::new();
     for txn in &snapshot.txns {
@@ -452,6 +460,7 @@ pub(crate) fn snapshot_is_empty(snapshot: &ManagedSnapshot) -> bool {
         && snapshot.indexes.is_empty()
         && snapshot.tablets.is_empty()
         && snapshot.txns.is_empty()
+        && snapshot.erase_jobs.is_empty()
 }
 
 pub(crate) fn runtime_registered(tablet_id: i64) -> bool {
@@ -668,6 +677,7 @@ fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
     use crate::standalone::catalog::DEFAULT_DATABASE;
 
@@ -868,7 +878,7 @@ mod tests {
     }
 
     fn snapshot_seed() -> ManagedSnapshot {
-        use crate::standalone::store::{
+        use crate::standalone::lake::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
         };
         ManagedSnapshot {
@@ -912,6 +922,7 @@ mod tests {
             indexes: Vec::new(),
             tablets: Vec::new(),
             txns: Vec::new(),
+            erase_jobs: Vec::new(),
         }
     }
 
@@ -932,8 +943,109 @@ mod tests {
     }
 
     #[test]
+    fn managed_lake_config_uses_partition_scoped_root() {
+        let config = ManagedLakeConfig {
+            warehouse_uri: "s3://bucket/warehouse".to_string(),
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "bucket".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+        };
+
+        assert_eq!(
+            config.tablet_root_path(1, 10, 20),
+            "s3://bucket/warehouse/db_1/table_10/partition_20"
+        );
+    }
+
+    #[test]
+    fn rebuild_ignores_dropping_tables_and_retired_partitions() {
+        let mut snapshot = snapshot_seed();
+        snapshot.tables[0].state = ManagedTableState::Dropping;
+        snapshot.partitions[0].state = ManagedPartitionState::Retired;
+
+        let rebuilt = ManagedLakeCatalog::rebuild(
+            Some(ManagedLakeConfig {
+                warehouse_uri: "s3://test/warehouse".to_string(),
+                s3: S3StoreConfig {
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    bucket: "test".to_string(),
+                    root: "warehouse".to_string(),
+                    access_key_id: "ak".to_string(),
+                    access_key_secret: "sk".to_string(),
+                    region: Some("us-east-1".to_string()),
+                    enable_path_style_access: Some(true),
+                },
+            }),
+            snapshot,
+        )
+        .expect("rebuild");
+
+        assert!(
+            !rebuilt
+                .contains_table("analytics", "orders")
+                .expect("contains table"),
+            "dropping table should not remain visible"
+        );
+    }
+
+    #[test]
+    fn reconcile_on_open_drops_incomplete_creating_partition_rows() {
+        let mut snapshot = snapshot_seed();
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 21,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Creating,
+        });
+        snapshot.indexes.push(StoredManagedIndex {
+            index_id: 31,
+            table_id: 10,
+            partition_id: 21,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Creating,
+        });
+        snapshot.tablets.push(StoredManagedTablet {
+            tablet_id: 41,
+            partition_id: 21,
+            index_id: 31,
+            bucket_seq: 0,
+            tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_21".to_string(),
+        });
+        let (_dir, store) = test_store_with_snapshot(&snapshot);
+
+        reconcile_on_open(&store, &mut snapshot, |_, _| Ok(())).expect("reconcile");
+
+        assert!(
+            !snapshot
+                .partitions
+                .iter()
+                .any(|partition| partition.partition_id == 21)
+        );
+        assert!(
+            !snapshot
+                .indexes
+                .iter()
+                .any(|index| index.partition_id == 21)
+        );
+        assert!(
+            !snapshot
+                .tablets
+                .iter()
+                .any(|tablet| tablet.partition_id == 21)
+        );
+    }
+
+    #[test]
     fn reconcile_on_open_aborts_prepared_txns_without_replay() {
-        use crate::standalone::store::StoredManagedTxn;
+        use crate::standalone::lake::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 90,
@@ -962,7 +1074,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_replays_written_txns_and_advances_partition() {
-        use crate::standalone::store::StoredManagedTxn;
+        use crate::standalone::lake::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 91,
