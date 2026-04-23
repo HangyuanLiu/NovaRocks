@@ -1,78 +1,17 @@
-//! Stream-load entrypoint for local (on-disk parquet) tables: parse the raw
-//! CSV/JSON payload into a `Vec<Vec<Literal>>` and dispatch it through the
-//! normal local-insert path.
+//! Neutral, backend-independent parsers for HTTP stream-load payloads.
 //!
-//! Only the subset used by `stream_load_local_table` is implemented — unsupported
-//! formats or option combinations return an explicit error rather than being
-//! silently coerced.
-
-use std::sync::Arc;
+//! These helpers take the raw request body (CSV or JSON) and produce
+//! `Vec<Vec<Literal>>` rows that any INSERT backend can consume. They
+//! intentionally live outside the `local/` module so the managed-lake
+//! stream load (and any future backend) can share them.
 
 use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
-use super::{TableDef, normalize_identifier};
-use crate::plan_nodes::TFileFormatType;
-use crate::sql::parser::ast::{InsertSource, Literal};
-use crate::standalone::engine::{
-    ResolvedLocalTableName, StandaloneState, StandaloneStreamLoadRequest,
-    StandaloneStreamLoadResult,
-};
+use crate::sql::catalog::TableDef;
+use crate::sql::parser::ast::Literal;
 
-use super::insert::insert_into_local_table;
-
-pub(crate) fn stream_load_local_table(
-    state: &Arc<StandaloneState>,
-    request: StandaloneStreamLoadRequest,
-) -> Result<StandaloneStreamLoadResult, String> {
-    let database = normalize_identifier(&request.database)?;
-    let table = normalize_identifier(&request.table)?;
-    let resolved = ResolvedLocalTableName { database, table };
-    let table_def = {
-        let guard = state.catalog.read().expect("standalone catalog read lock");
-        guard.get(&resolved.database, &resolved.table)?
-    };
-
-    let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
-    let rows = match request.format_type {
-        TFileFormatType::FORMAT_JSON => parse_json_stream_load_rows(
-            &request.payload,
-            &insert_columns,
-            request.jsonpaths.as_deref(),
-            request.strip_outer_array.unwrap_or(false),
-        )?,
-        TFileFormatType::FORMAT_CSV_PLAIN => parse_csv_stream_load_rows(
-            &request.payload,
-            &insert_columns,
-            request.column_separator.as_deref(),
-            request.row_delimiter.as_deref(),
-            request.skip_header.unwrap_or(0),
-            request.trim_space.unwrap_or(false),
-            request.enclose,
-            request.escape,
-        )?,
-        other => {
-            return Err(format!(
-                "standalone stream load only supports CSV/JSON, got {:?}",
-                other
-            ));
-        }
-    };
-
-    insert_into_local_table(
-        state,
-        &resolved,
-        &table_def,
-        &insert_columns,
-        &InsertSource::Values(rows.clone()),
-    )?;
-    Ok(StandaloneStreamLoadResult {
-        loaded_rows: rows.len() as i64,
-        loaded_bytes: request.payload.len() as i64,
-    })
-}
-
-fn parse_stream_load_columns(
+pub(crate) fn parse_stream_load_columns(
     raw: Option<&str>,
     table_def: &TableDef,
 ) -> Result<Vec<String>, String> {
@@ -106,7 +45,7 @@ fn parse_stream_load_columns(
     }
 }
 
-fn parse_csv_stream_load_rows(
+pub(crate) fn parse_csv_stream_load_rows(
     payload: &[u8],
     insert_columns: &[String],
     column_separator: Option<&str>,
@@ -177,7 +116,7 @@ fn parse_csv_stream_load_rows(
     Ok(rows)
 }
 
-fn single_byte_stream_load_delimiter(value: &str, name: &str) -> Result<u8, String> {
+pub(crate) fn single_byte_stream_load_delimiter(value: &str, name: &str) -> Result<u8, String> {
     let bytes = value.as_bytes();
     if bytes.len() != 1 {
         return Err(format!(
@@ -187,7 +126,7 @@ fn single_byte_stream_load_delimiter(value: &str, name: &str) -> Result<u8, Stri
     Ok(bytes[0])
 }
 
-fn parse_json_stream_load_rows(
+pub(crate) fn parse_json_stream_load_rows(
     payload: &[u8],
     insert_columns: &[String],
     jsonpaths: Option<&str>,
@@ -211,7 +150,7 @@ fn parse_json_stream_load_rows(
     Ok(output)
 }
 
-fn parse_stream_load_jsonpaths(
+pub(crate) fn parse_stream_load_jsonpaths(
     raw: Option<&str>,
     insert_columns: &[String],
 ) -> Result<Vec<String>, String> {
@@ -233,7 +172,10 @@ fn parse_stream_load_jsonpaths(
     Ok(paths)
 }
 
-fn parse_json_rows(payload: &str, strip_outer_array: bool) -> Result<Vec<Value>, String> {
+pub(crate) fn parse_json_rows(
+    payload: &str,
+    strip_outer_array: bool,
+) -> Result<Vec<Value>, String> {
     let value: Value =
         serde_json::from_str(payload).map_err(|e| format!("invalid json payload: {e}"))?;
     if strip_outer_array {
@@ -248,7 +190,10 @@ fn parse_json_rows(payload: &str, strip_outer_array: bool) -> Result<Vec<Value>,
     })
 }
 
-fn extract_json_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>, String> {
+pub(crate) fn extract_json_path<'a>(
+    root: &'a Value,
+    path: &str,
+) -> Result<Option<&'a Value>, String> {
     if path == "$" {
         return Ok(Some(root));
     }
@@ -299,7 +244,7 @@ fn extract_json_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value
     Ok(Some(current))
 }
 
-fn json_value_to_field(value: Option<&Value>) -> Option<String> {
+pub(crate) fn json_value_to_field(value: Option<&Value>) -> Option<String> {
     match value {
         None | Some(Value::Null) => None,
         Some(Value::String(v)) => Some(v.clone()),

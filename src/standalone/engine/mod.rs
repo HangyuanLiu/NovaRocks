@@ -17,9 +17,8 @@ use crate::novarocks_config;
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
 
-use self::local::{
-    DEFAULT_DATABASE, InMemoryCatalog, TableDef, TableStorage,
-    apply_local_table_semantics_if_needed, build_parquet_table, normalize_identifier,
+use self::catalog::{
+    DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table, normalize_identifier,
 };
 use super::iceberg::{
     IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
@@ -31,20 +30,24 @@ use super::lake::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
 
+pub(crate) mod aggregate;
+pub(crate) mod catalog;
 pub(crate) mod iceberg_glue;
-pub(crate) mod local;
+pub(crate) mod insert;
 pub(crate) mod name_resolve;
+pub(crate) mod parquet;
 pub(crate) mod sqlparse;
+pub(crate) mod stream_load;
 
-pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
+pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
-pub(crate) use self::local::insert::{build_local_insert_batch, reorder_insert_rows};
-use self::local::parquet::{cast_batch_to_schema, read_local_parquet_data, write_parquet_to_path};
-use self::local::stream_load::stream_load_local_table;
-use self::local::{LocalTableSemantics, ensure_dual_table};
+pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
+use self::parquet::write_parquet_to_path;
+use self::sqlparse::expr::canonicalize_sql_for_match;
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
-use self::sqlparse::expr::{canonicalize_sql_for_match, sqlparser_expr_to_literal};
+#[cfg(test)]
+use self::sqlparse::expr::sqlparser_expr_to_literal;
 pub(crate) use self::sqlparse::generate_series::insert_generate_series_rows_local;
 use self::sqlparse::materialized_view::{
     looks_like_show_alter_materialized_view, materialized_view_key,
@@ -57,7 +60,10 @@ use self::sqlparse::statement::{
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, extract_table_names_from_query,
     extract_three_part_table_refs, looks_like_add_files, parse_add_files_sql,
-    strip_catalog_from_three_part_names, try_parse_local_parquet_create_table,
+    strip_catalog_from_three_part_names,
+};
+use self::stream_load::{
+    parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -174,7 +180,6 @@ fn append_string_query_rows(result: QueryResult, rows: Vec<String>) -> Result<Qu
 pub(crate) struct StandaloneState {
     pub(crate) catalog: RwLock<InMemoryCatalog>,
     pub(crate) iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
-    pub(crate) local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
     pub(crate) materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
     pub(crate) materialized_view_seq: AtomicU64,
     pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
@@ -190,7 +195,6 @@ impl Default for StandaloneState {
         Self {
             catalog: RwLock::new(InMemoryCatalog::default()),
             iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
-            local_table_semantics: RwLock::new(HashMap::new()),
             materialized_views: RwLock::new(HashMap::new()),
             materialized_view_seq: AtomicU64::new(0),
             managed_lake: RwLock::new(ManagedLakeCatalog::default()),
@@ -279,7 +283,6 @@ impl StandaloneNovaRocks {
             ..Default::default()
         });
         restore_metadata_if_needed(&inner)?;
-        ensure_dual_table(&inner)?;
         if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
             super::lake::erase::spawn_erase_worker(Arc::clone(&inner));
         }
@@ -366,24 +369,18 @@ impl StandaloneNovaRocks {
         path: impl AsRef<Path>,
     ) -> Result<(), String> {
         let table = build_parquet_table(table_name, path)?;
-        let persisted_path = match &table.storage {
-            TableStorage::LocalParquetFile { path } => path.clone(),
+        match &table.storage {
+            TableStorage::LocalParquetFile { .. } => {}
             TableStorage::S3ParquetFiles { .. } => {
                 return Err("register_parquet_table_in_database does not support S3".to_string());
             }
-        };
+        }
         let mut guard = self
             .inner
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        guard.register(database_name, table)?;
-        persist_local_table_if_needed(
-            &self.inner,
-            &normalize_identifier(database_name)?,
-            &normalize_identifier(table_name)?,
-            &persisted_path,
-        )
+        guard.register(database_name, table)
     }
 
     pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
@@ -433,11 +430,11 @@ impl StandaloneNovaRocks {
         guard.get(&database_name, &table_name).is_ok()
     }
 
-    pub(crate) fn stream_load_local_table(
+    pub(crate) fn stream_load_managed_lake_table(
         &self,
         request: StandaloneStreamLoadRequest,
     ) -> Result<StandaloneStreamLoadResult, String> {
-        stream_load_local_table(&self.inner, request)
+        stream_load_managed_lake_table(&self.inner, request)
     }
 }
 
@@ -653,16 +650,6 @@ impl StandaloneSession {
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
-            // Handle CREATE TABLE <name> PROPERTIES(...) (no column defs) for
-            // local-parquet tables whose schema is inferred from the file.
-            if let Some(local_parquet_stmt) = try_parse_local_parquet_create_table(&normalized)? {
-                return execute_create_table_statement(
-                    &self.inner,
-                    local_parquet_stmt,
-                    current_catalog,
-                    current_database,
-                );
-            }
             let result = crate::sql::parser::dialect::create_table::parse_create_table_statement(
                 &mut parser,
             )?;
@@ -1018,172 +1005,22 @@ impl StandaloneSession {
         }
     }
 
-    /// Consolidated INSERT handler using sqlparser AST.
+    /// Consolidated INSERT handler using sqlparser AST. All INSERT targets
+    /// flow through the custom parser so the shared dispatch in
+    /// `execute_insert_statement` chooses between managed-lake and iceberg
+    /// backends. The retired local-parquet backend is no longer consulted.
     fn handle_sqlparser_insert(
         &self,
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&crate::internal_service::TQueryOptions>,
+        _query_opts: Option<&crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
-        use sqlparser::ast as sqlast;
-
-        if let Some(ref source) = insert.source {
-            // INSERT SELECT
-            let is_select = matches!(source.body.as_ref(), sqlast::SetExpr::Select(_));
-            if is_select && !insert.overwrite {
-                return self.execute_insert_select(
-                    insert,
-                    current_catalog,
-                    current_database,
-                    query_opts,
-                );
-            }
-            // INSERT VALUES for local tables
-            if let sqlast::SetExpr::Values(_) = source.body.as_ref() {
-                let raw_name = match &insert.table {
-                    sqlast::TableObject::TableName(name) => name.clone(),
-                    other => return Err(format!("unsupported INSERT target: {other}")),
-                };
-                if let Ok(table_name) = crate::sql::parser::dialect::convert_object_name(raw_name) {
-                    if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
-                        let is_managed = self
-                            .inner
-                            .managed_lake
-                            .read()
-                            .expect("standalone managed lake read lock")
-                            .contains_table(&resolved.database, &resolved.table)
-                            .unwrap_or(false);
-                        if !is_managed {
-                            let guard = self
-                                .inner
-                                .catalog
-                                .read()
-                                .expect("standalone catalog read lock");
-                            if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
-                                drop(guard);
-                                return self.execute_insert_values_sqlparser(
-                                    insert, &resolved, &table_def,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: parse INSERT via the custom parser for Iceberg tables
-        // (handles generate_series, literal SELECT rows, etc.)
         self.execute_insert_via_custom_parser(insert, current_catalog, current_database)
     }
 
-    /// Handle INSERT INTO ... SELECT ... by executing the SELECT via ThriftPlanBuilder
-    /// and writing results to the target local table.
-    fn execute_insert_select(
-        &self,
-        insert: &sqlparser::ast::Insert,
-        _current_catalog: Option<&str>,
-        current_database: &str,
-        query_opts: Option<&crate::internal_service::TQueryOptions>,
-    ) -> Result<StatementResult, String> {
-        use sqlparser::ast as sqlast;
-
-        let source_query = insert
-            .source
-            .as_ref()
-            .ok_or_else(|| "INSERT SELECT requires a source query".to_string())?;
-
-        // Execute the SELECT query
-        let catalog = self
-            .inner
-            .catalog
-            .read()
-            .expect("standalone catalog read lock");
-        let query_result = execute_query(
-            source_query,
-            &catalog,
-            current_database,
-            self.inner.exchange_port,
-            query_opts.cloned(),
-        )?;
-        drop(catalog);
-
-        // Resolve target table
-        let raw_name = match &insert.table {
-            sqlast::TableObject::TableName(name) => name.clone(),
-            other => return Err(format!("unsupported INSERT target: {other}")),
-        };
-        let table_name = crate::sql::parser::dialect::convert_object_name(raw_name)?;
-        let resolved = resolve_local_table_name(&table_name, current_database)?;
-        let guard = self
-            .inner
-            .catalog
-            .read()
-            .expect("standalone catalog read lock");
-        let table_def = guard.get(&resolved.database, &resolved.table)?;
-        drop(guard);
-
-        let path = match &table_def.storage {
-            TableStorage::LocalParquetFile { path } => path.clone(),
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("INSERT SELECT into S3 tables is not supported".to_string());
-            }
-        };
-
-        // Read existing data
-        let existing_batch = read_local_parquet_data(&path, &table_def.columns)?;
-
-        // Convert query result chunks to a single RecordBatch
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
-            table_def
-                .columns
-                .iter()
-                .map(|c| arrow::datatypes::Field::new(&c.name, c.data_type.clone(), c.nullable))
-                .collect::<Vec<_>>(),
-        ));
-        let mut all_batches = Vec::new();
-        if existing_batch.num_rows() > 0 {
-            all_batches.push(existing_batch);
-        }
-        for chunk in query_result.into_chunks() {
-            if chunk.len() > 0 {
-                let casted = cast_batch_to_schema(&chunk.batch, &schema)?;
-                all_batches.push(casted);
-            }
-        }
-
-        let combined = if all_batches.is_empty() {
-            arrow::record_batch::RecordBatch::new_empty(schema)
-        } else {
-            arrow::compute::concat_batches(&schema, all_batches.iter())
-                .map_err(|e| format!("concat insert-select batches failed: {e}"))?
-        };
-        let combined = apply_local_table_semantics_if_needed(
-            &self.inner,
-            &resolved,
-            &table_def.columns,
-            combined,
-        )?;
-
-        write_parquet_to_path(&path, &combined)?;
-
-        // Re-register table in catalog
-        let mut guard = self
-            .inner
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        let updated = TableDef {
-            name: table_def.name.clone(),
-            columns: table_def.columns.clone(),
-            storage: TableStorage::LocalParquetFile { path },
-        };
-        guard.register(&resolved.database, updated).ok();
-        Ok(StatementResult::Ok)
-    }
-
-    /// Fallback: convert sqlparser INSERT to custom InsertStmt and execute.
-    /// Used for Iceberg tables and generate_series INSERT paths.
+    /// Convert sqlparser INSERT to our custom InsertStmt and delegate to the
+    /// shared dispatcher in `execute_insert_statement`.
     fn execute_insert_via_custom_parser(
         &self,
         insert: &sqlparser::ast::Insert,
@@ -1199,83 +1036,6 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )
-    }
-
-    /// Handle INSERT VALUES via sqlparser AST for local tables
-    fn execute_insert_values_sqlparser(
-        &self,
-        insert: &sqlparser::ast::Insert,
-        resolved: &ResolvedLocalTableName,
-        table_def: &TableDef,
-    ) -> Result<StatementResult, String> {
-        use sqlparser::ast as sqlast;
-
-        let source = insert.source.as_ref().ok_or("INSERT missing source")?;
-        let values = match source.body.as_ref() {
-            sqlast::SetExpr::Values(v) => v,
-            _ => return Err("expected VALUES".into()),
-        };
-
-        // Map insert column names
-        let insert_columns: Vec<String> = insert
-            .columns
-            .iter()
-            .map(|c| c.value.to_lowercase())
-            .collect();
-
-        // Convert sqlparser Values to Literals
-        let mut literal_rows = Vec::new();
-        for row in &values.rows {
-            let mut literal_row = Vec::new();
-            for expr in row {
-                literal_row.push(sqlparser_expr_to_literal(expr)?);
-            }
-            literal_rows.push(literal_row);
-        }
-
-        // Reorder columns
-        let rows = reorder_insert_rows(&literal_rows, &insert_columns, &table_def.columns)?;
-
-        let path = match &table_def.storage {
-            TableStorage::LocalParquetFile { path } => path.clone(),
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("INSERT VALUES into S3 tables is not supported".to_string());
-            }
-        };
-
-        let existing_batch = read_local_parquet_data(&path, &table_def.columns)?;
-        let new_batch = build_local_insert_batch(&table_def.columns, &rows)?;
-
-        let combined = if existing_batch.num_rows() > 0 {
-            arrow::compute::concat_batches(
-                &new_batch.schema(),
-                [&existing_batch, &new_batch].iter().copied(),
-            )
-            .map_err(|e| format!("concat batches failed: {e}"))?
-        } else {
-            new_batch
-        };
-        let combined = apply_local_table_semantics_if_needed(
-            &self.inner,
-            resolved,
-            &table_def.columns,
-            combined,
-        )?;
-
-        write_parquet_to_path(&path, &combined)?;
-
-        let mut guard = self
-            .inner
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        let updated = TableDef {
-            name: table_def.name.clone(),
-            columns: table_def.columns.clone(),
-            storage: TableStorage::LocalParquetFile { path },
-        };
-        guard.register(&resolved.database, updated).ok();
-        Ok(StatementResult::Ok)
     }
 }
 
@@ -1333,23 +1093,8 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
         return Ok(());
     };
     let snapshot = store.load_snapshot()?;
-    restore_local_catalog(state, &snapshot)?;
     restore_managed_lake(state, &snapshot)?;
     restore_iceberg_catalogs(state, &snapshot)?;
-    Ok(())
-}
-
-fn restore_local_catalog(
-    state: &Arc<StandaloneState>,
-    snapshot: &MetadataSnapshot,
-) -> Result<(), String> {
-    let mut guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
-    for database_name in &snapshot.local_databases {
-        guard.create_database(database_name)?;
-    }
     Ok(())
 }
 
@@ -1432,47 +1177,6 @@ fn restore_managed_lake(
         .write()
         .expect("standalone managed lake write lock");
     *guard = rebuilt;
-    Ok(())
-}
-
-pub(crate) fn persist_local_database_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref()
-        && database_name != DEFAULT_DATABASE
-    {
-        store.upsert_local_database(database_name)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn persist_local_table_if_needed(
-    _state: &Arc<StandaloneState>,
-    _database_name: &str,
-    _table_name: &str,
-    _path: &Path,
-) -> Result<(), String> {
-    Ok(())
-}
-
-pub(crate) fn delete_local_table_if_needed(
-    _state: &Arc<StandaloneState>,
-    _database_name: &str,
-    _table_name: &str,
-) -> Result<(), String> {
-    Ok(())
-}
-
-pub(crate) fn delete_local_database_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref()
-        && database_name != DEFAULT_DATABASE
-    {
-        store.delete_local_database(database_name)?;
-    }
     Ok(())
 }
 
@@ -1992,6 +1696,79 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
 }
 
 // ---------------------------------------------------------------------------
+// Managed-lake stream-load entrypoint
+// ---------------------------------------------------------------------------
+
+/// HTTP stream-load entrypoint for managed-lake tables. Parses CSV / JSON
+/// payloads via the neutral helpers in `engine::stream_load` and hands the
+/// resulting rows to `insert_into_managed_lake_table`, so every stream-load
+/// target goes through the same path as a plain `INSERT INTO ... VALUES`.
+fn stream_load_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    request: StandaloneStreamLoadRequest,
+) -> Result<StandaloneStreamLoadResult, String> {
+    let database = normalize_identifier(&request.database)?;
+    let table = normalize_identifier(&request.table)?;
+    let is_managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .contains_table(&database, &table)?;
+    if !is_managed {
+        return Err(format!(
+            "standalone stream load only supports managed-lake tables, got {}.{}",
+            database, table
+        ));
+    }
+
+    let table_def = {
+        let guard = state.catalog.read().expect("standalone catalog read lock");
+        guard.get(&database, &table)?
+    };
+    let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
+    let rows = match request.format_type {
+        TFileFormatType::FORMAT_JSON => parse_json_stream_load_rows(
+            &request.payload,
+            &insert_columns,
+            request.jsonpaths.as_deref(),
+            request.strip_outer_array.unwrap_or(false),
+        )?,
+        TFileFormatType::FORMAT_CSV_PLAIN => parse_csv_stream_load_rows(
+            &request.payload,
+            &insert_columns,
+            request.column_separator.as_deref(),
+            request.row_delimiter.as_deref(),
+            request.skip_header.unwrap_or(0),
+            request.trim_space.unwrap_or(false),
+            request.enclose,
+            request.escape,
+        )?,
+        other => {
+            return Err(format!(
+                "standalone stream load only supports CSV/JSON, got {:?}",
+                other
+            ));
+        }
+    };
+    let object_name = crate::sql::parser::ast::ObjectName {
+        parts: vec![database.clone(), table.clone()],
+    };
+    let loaded_rows = rows.len() as i64;
+    let loaded_bytes = request.payload.len() as i64;
+    super::lake::txn::insert_into_managed_lake_table(
+        state,
+        &object_name,
+        &insert_columns,
+        &crate::sql::parser::ast::InsertSource::Values(rows),
+        &database,
+    )?;
+    Ok(StandaloneStreamLoadResult {
+        loaded_rows,
+        loaded_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2466,8 +2243,8 @@ enable_path_style_access = true
             true,
         )]));
 
-        let casted =
-            super::cast_batch_to_schema(&source_batch, &target_schema).expect("cast batch");
+        let casted = super::parquet::cast_batch_to_schema(&source_batch, &target_schema)
+            .expect("cast batch");
         let casted_schema = casted.schema();
         let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
             panic!("expected MAP column");
@@ -2511,9 +2288,9 @@ enable_path_style_access = true
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("map_round_trip.parquet");
 
-        super::write_parquet_to_path(&path, &batch).expect("write local parquet");
+        super::parquet::write_parquet_to_path(&path, &batch).expect("write local parquet");
         let round_tripped =
-            super::read_local_parquet_data(&path, &columns).expect("read local parquet");
+            super::parquet::read_local_parquet_data(&path, &columns).expect("read local parquet");
         let map = round_tripped
             .column(0)
             .as_any()
@@ -2888,14 +2665,9 @@ enable_path_style_access = true
                 .expect("check database exists")
         );
 
-        let create_table_sql = format!(
-            r#"create table tbl properties("path"="{}")"#,
-            parquet.path().display()
-        );
-        let create_table = session
-            .execute_in_database(&create_table_sql, "analytics")
-            .expect("create table");
-        assert!(matches!(create_table, StatementResult::Ok));
+        engine
+            .register_parquet_table_in_database("analytics", "tbl", parquet.path())
+            .expect("register parquet table in analytics");
 
         let query_result = session
             .execute_in_database("select name from tbl where id = 2", "analytics")
