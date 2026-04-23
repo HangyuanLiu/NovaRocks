@@ -146,6 +146,21 @@ sleep 15
 mysql -h 127.0.0.1 -P"${QUERY_PORT}" -u root -e "select 1"
 ```
 
+#### Codex 桌面端里的 FE 进程托管
+
+在 Codex 桌面端联调时，**不要**用“一次性命令执行完就退出”的 shell 来启动 FE 后立刻结束当前命令；桌面端可能在回收该命令会话时把 FE 一起回收，表现为：
+
+- `bin/start_fe.sh --daemon` 刚启动时端口短暂可连，但随后 `9030` 很快拒绝连接
+- `fe.out` 没有新的 fatal 日志，但 `fe.pid` 对应进程已经消失
+
+正确做法：
+
+- 需要在本地 runtime 上做 SQL/端到端验证时，优先用 **持久 PTY 会话** 启动 FE，并让这个会话在整个验证期间保持存活
+- 在这个持久 PTY 会话里前台执行 `bin/start_fe.sh`（**不加** `--daemon`），再从另一个 shell 执行 `mysql` / SQL / 探针命令
+- 验证结束后，再显式执行 `bin/stop_fe.sh`
+
+如果必须使用 `--daemon`，也要确保承载该命令的 shell/PTY 不要立刻退出。
+
 2. **启动 NovaRocks BE**：
 ```bash
 cd "${BE_RUNTIME_ROOT}"
@@ -188,6 +203,32 @@ bin/start_fe.sh --daemon
 ```
 
 **注意**：清理 meta 后所有 catalog、database、table 都会丢失，需重新创建。
+
+### 本地 macOS/JDK21 的 async-profiler 注意事项
+
+在本地 macOS + JDK21 的 NovaRocks 联调环境里，如果 FE 运行时出现如下特征：
+
+- `hs_err_pid*.log` 的 fatal stack 落在 `libasyncProfiler`，例如 `WallClock::signalHandler` / `SafeAccess::load`
+- FE 在运行一段时间后异常退出，且 `${FE_RUNTIME_ROOT}/log/proc_profile/` 持续生成新的 `cpu-profile-*` / `mem-profile-*` 文件
+
+优先在**测试环境运行时配置** `${FE_CONF}` 中临时关闭：
+
+```bash
+proc_profile_cpu_enable = false
+proc_profile_mem_enable = false
+```
+
+规则：
+
+- 这是本地联调 workaround，优先只改 `${FE_RUNTIME_ROOT}/conf/fe.conf`
+- **不要**顺手改仓库里的默认模板 `conf/fe.conf`，除非用户明确要求改默认配置
+- 关闭后，`proc_profile` 目录不应再产生新的 profile 文件
+
+注意：
+
+- 即使关闭了 `proc_profile`，仍可能在 `fe.out` 里看到 `Unable to get Instrumentation` / `Unable to attach Serviceability Agent`
+- 这些 warning 可能来自其他依赖（例如 JOL 的 attach 路径），**不等同于** `async-profiler` 仍在采样
+- 判断 `proc_profile` 是否真的关闭，优先看 `${FE_RUNTIME_ROOT}/log/proc_profile/` 是否继续生成新文件，而不是只看 warning
 
 ## 4) 代理设置
 
