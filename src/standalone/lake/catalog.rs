@@ -20,9 +20,9 @@ use super::super::engine::catalog::{
 };
 use super::config::ManagedLakeConfig;
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-    SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
-    StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+    ManagedTxnState, SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex,
+    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -246,9 +246,14 @@ impl ManagedLakeCatalog {
                 .remove(&table.table_id)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|partition| partition.state == ManagedPartitionState::Active)
+                .filter(|partition| {
+                    matches!(
+                        partition.state,
+                        ManagedPartitionState::Active | ManagedPartitionState::Creating
+                    )
+                })
                 .collect::<Vec<_>>();
-            let active_partition_ids = partitions
+            let live_partition_ids = partitions
                 .iter()
                 .map(|partition| partition.partition_id)
                 .collect::<HashSet<_>>();
@@ -257,11 +262,13 @@ impl ManagedLakeCatalog {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|index| {
-                    index.state == ManagedIndexState::Active
-                        && active_partition_ids.contains(&index.partition_id)
+                    matches!(
+                        index.state,
+                        ManagedIndexState::Active | ManagedIndexState::Creating
+                    ) && live_partition_ids.contains(&index.partition_id)
                 })
                 .collect::<Vec<_>>();
-            let active_index_ids = indexes
+            let live_index_ids = indexes
                 .iter()
                 .map(|index| index.index_id)
                 .collect::<HashSet<_>>();
@@ -282,8 +289,8 @@ impl ManagedLakeCatalog {
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|tablet| {
-                            active_partition_ids.contains(&tablet.partition_id)
-                                && active_index_ids.contains(&tablet.index_id)
+                            live_partition_ids.contains(&tablet.partition_id)
+                                && live_index_ids.contains(&tablet.index_id)
                         })
                         .collect(),
                 },
@@ -708,6 +715,7 @@ mod tests {
                 bucket_num: 2,
                 current_schema_id: 30,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             },
             schema: StoredManagedSchema {
                 schema_id: 30,
@@ -892,6 +900,21 @@ mod tests {
         (dir, store)
     }
 
+    fn test_managed_config() -> ManagedLakeConfig {
+        ManagedLakeConfig {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+        }
+    }
+
     fn snapshot_seed() -> ManagedSnapshot {
         use crate::standalone::lake::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
@@ -918,6 +941,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -938,6 +962,7 @@ mod tests {
             tablets: Vec::new(),
             txns: Vec::new(),
             erase_jobs: Vec::new(),
+            materialized_views: Vec::new(),
         }
     }
 
@@ -984,22 +1009,8 @@ mod tests {
         snapshot.tables[0].state = ManagedTableState::Dropping;
         snapshot.partitions[0].state = ManagedPartitionState::Retired;
 
-        let rebuilt = ManagedLakeCatalog::rebuild(
-            Some(ManagedLakeConfig {
-                warehouse_uri: "s3://test/warehouse".to_string(),
-                s3: S3StoreConfig {
-                    endpoint: "http://127.0.0.1:9000".to_string(),
-                    bucket: "test".to_string(),
-                    root: "warehouse".to_string(),
-                    access_key_id: "ak".to_string(),
-                    access_key_secret: "sk".to_string(),
-                    region: Some("us-east-1".to_string()),
-                    enable_path_style_access: Some(true),
-                },
-            }),
-            snapshot,
-        )
-        .expect("rebuild");
+        let rebuilt =
+            ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot).expect("rebuild");
 
         assert!(
             !rebuilt
@@ -1118,5 +1129,27 @@ mod tests {
         let persisted = store.load_snapshot().expect("load snapshot");
         assert_eq!(persisted.managed.txns[0].state, ManagedTxnState::Visible);
         assert_eq!(persisted.managed.partitions[0].visible_version, 2);
+    }
+
+    #[test]
+    fn rebuild_preserves_kind_column() {
+        let mut snapshot = snapshot_seed();
+        // snapshot_seed creates a kind='TABLE' row by default; spot-check.
+        let rebuilt = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot.clone())
+            .expect("rebuild");
+        let runtime = rebuilt
+            .table("analytics", "orders")
+            .expect("runtime")
+            .clone();
+        assert_eq!(runtime.table.kind, ManagedTableKind::Table);
+
+        snapshot.tables[0].kind = ManagedTableKind::MaterializedView;
+        let rebuilt_mv =
+            ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot).expect("rebuild mv");
+        let runtime_mv = rebuilt_mv
+            .table("analytics", "orders")
+            .expect("runtime")
+            .clone();
+        assert_eq!(runtime_mv.table.kind, ManagedTableKind::MaterializedView);
     }
 }

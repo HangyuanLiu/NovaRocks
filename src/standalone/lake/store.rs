@@ -28,6 +28,7 @@ pub(crate) struct ManagedSnapshot {
     pub tablets: Vec<StoredManagedTablet>,
     pub txns: Vec<StoredManagedTxn>,
     pub erase_jobs: Vec<StoredManagedEraseJob>,
+    pub materialized_views: Vec<StoredMaterializedView>,
 }
 
 impl ManagedSnapshot {
@@ -42,6 +43,7 @@ impl ManagedSnapshot {
             && self.tablets.is_empty()
             && self.txns.is_empty()
             && self.erase_jobs.is_empty()
+            && self.materialized_views.is_empty()
     }
 }
 
@@ -71,6 +73,77 @@ pub(crate) struct StoredManagedTable {
     pub bucket_num: i64,
     pub current_schema_id: i64,
     pub state: ManagedTableState,
+    pub kind: ManagedTableKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedTableKind {
+    #[default]
+    Table,
+    MaterializedView,
+}
+
+impl ManagedTableKind {
+    pub(crate) fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Table => "TABLE",
+            Self::MaterializedView => "MATERIALIZED_VIEW",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "TABLE" => Ok(Self::Table),
+            "MATERIALIZED_VIEW" => Ok(Self::MaterializedView),
+            _ => Err(format!("unknown managed table kind `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedMvRefreshMode {
+    #[default]
+    DeferredManual,
+}
+
+impl ManagedMvRefreshMode {
+    pub(crate) fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::DeferredManual => "DEFERRED_MANUAL",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "DEFERRED_MANUAL" => Ok(Self::DeferredManual),
+            _ => Err(format!("unknown managed mv refresh mode `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IcebergTableRef {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+}
+
+impl IcebergTableRef {
+    pub(crate) fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredMaterializedView {
+    pub mv_id: i64,
+    pub select_sql: String,
+    pub refresh_mode: ManagedMvRefreshMode,
+    pub base_table_refs: Vec<IcebergTableRef>,
+    pub last_refresh_ms: Option<i64>,
+    pub last_refresh_rows: Option<i64>,
+    pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,
+    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +239,34 @@ pub(crate) struct StagedManagedTruncate {
     pub partition_id: i64,
     pub index_id: i64,
     pub tablet_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StageMvRefreshRequest {
+    pub table_id: i64,
+    pub db_id: i64,
+    pub bucket_num: i64,
+    pub partition_name: String,
+    pub warehouse_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StagedMvRefresh {
+    pub partition_id: i64,
+    pub index_id: i64,
+    pub tablet_ids: Vec<i64>,
+    pub partition_root_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActivateMvRefreshRequest {
+    pub table_id: i64,
+    pub old_partition_id: i64,
+    pub new_partition_id: i64,
+    pub new_index_id: i64,
+    pub retired_root_path: String,
+    pub rows_written: i64,
+    pub snapshots: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -488,6 +589,7 @@ impl SqliteMetadataStore {
             .map_err(|e| format!("begin managed snapshot transaction failed: {e}"))?;
 
         for table in [
+            "materialized_views",
             "erase_jobs",
             "txns",
             "tablets",
@@ -544,8 +646,9 @@ impl SqliteMetadataStore {
                         keys_type,
                         bucket_num,
                         current_schema_id,
-                        state
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        state,
+                        kind
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         table.table_id,
                         table.db_id,
@@ -554,6 +657,7 @@ impl SqliteMetadataStore {
                         table.bucket_num,
                         table.current_schema_id,
                         table.state.as_sql_str(),
+                        table.kind.as_sql_str(),
                     ],
                 )
                 .map_err(|e| format!("persist managed table failed: {e}"))?;
@@ -703,6 +807,42 @@ impl SqliteMetadataStore {
                 )
                 .map_err(|e| format!("persist managed erase job failed: {e}"))?;
             }
+
+            for mv in &snapshot.materialized_views {
+                let base_json = serde_json::to_string(&mv.base_table_refs)
+                    .map_err(|e| format!("serialize mv base refs failed: {e}"))?;
+                let snapshots_json = if mv.last_refresh_snapshots.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&mv.last_refresh_snapshots)
+                            .map_err(|e| format!("serialize mv snapshots failed: {e}"))?,
+                    )
+                };
+                tx.execute(
+                    "INSERT INTO materialized_views(
+                        mv_id,
+                        select_sql,
+                        refresh_mode,
+                        base_table_refs_json,
+                        last_refresh_ms,
+                        last_refresh_rows,
+                        last_refresh_snapshots_json,
+                        created_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        mv.mv_id,
+                        mv.select_sql,
+                        mv.refresh_mode.as_sql_str(),
+                        base_json,
+                        mv.last_refresh_ms,
+                        mv.last_refresh_rows,
+                        snapshots_json,
+                        mv.created_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("insert materialized_view failed: {e}"))?;
+            }
         }
 
         tx.commit()
@@ -727,6 +867,17 @@ impl SqliteMetadataStore {
             return Err(format!(
                 "cannot drop managed table {table_id}: inflight managed txns exist"
             ));
+        }
+        let creating_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM partitions
+                 WHERE table_id = ?1 AND state = 'CREATING'",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count creating partitions for drop failed: {e}"))?;
+        if creating_count > 0 {
+            return Err(format!("cannot drop table {table_id}: refresh in progress"));
         }
         let next_job_id: i64 = tx
             .query_row(
@@ -935,6 +1086,261 @@ impl SqliteMetadataStore {
         .map_err(|e| format!("insert truncate erase job failed: {e}"))?;
         tx.commit()
             .map_err(|e| format!("commit activate_truncate_partition failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_mv_refresh_partition(
+        &self,
+        req: StageMvRefreshRequest,
+    ) -> Result<StagedMvRefresh, String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin stage_mv_refresh_partition transaction failed: {e}"))?;
+
+        // Reject if MV is not active.
+        let (table_state, table_kind): (String, String) = tx
+            .query_row(
+                "SELECT state, kind FROM tables WHERE table_id = ?1",
+                params![req.table_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("lookup mv table {} failed: {e}", req.table_id))?;
+        if table_kind != "MATERIALIZED_VIEW" {
+            return Err(format!("table {} is not a materialized view", req.table_id));
+        }
+        if table_state != "ACTIVE" {
+            return Err(format!(
+                "materialized view {} is not active (state={table_state})",
+                req.table_id
+            ));
+        }
+
+        // Reject if a refresh is already in progress (any CREATING partition).
+        let creating_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM partitions
+                 WHERE table_id = ?1 AND state = 'CREATING'",
+                params![req.table_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count creating partitions failed: {e}"))?;
+        if creating_count > 0 {
+            return Err(format!(
+                "cannot refresh materialized view {}: refresh already in progress",
+                req.table_id
+            ));
+        }
+
+        let partition_id: i64 = tx
+            .query_row(
+                "SELECT next_partition_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_partition_id failed: {e}"))?;
+        let index_id: i64 = tx
+            .query_row(
+                "SELECT next_index_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_index_id failed: {e}"))?;
+        let first_tablet_id: i64 = tx
+            .query_row(
+                "SELECT next_tablet_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_tablet_id failed: {e}"))?;
+
+        tx.execute(
+            "UPDATE global_meta
+             SET next_partition_id = ?1, next_index_id = ?2, next_tablet_id = ?3
+             WHERE singleton = 1",
+            params![
+                partition_id + 1,
+                index_id + 1,
+                first_tablet_id + req.bucket_num
+            ],
+        )
+        .map_err(|e| format!("bump mv refresh ids failed: {e}"))?;
+
+        tx.execute(
+            "INSERT INTO partitions(partition_id, table_id, name, visible_version, next_version, state)
+             VALUES (?1, ?2, ?3, 1, 2, 'CREATING')",
+            params![partition_id, req.table_id, req.partition_name],
+        )
+        .map_err(|e| format!("insert mv creating partition failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO indexes(index_id, table_id, partition_id, index_type, state)
+             VALUES (?1, ?2, ?3, 'BASE', 'CREATING')",
+            params![index_id, req.table_id, partition_id],
+        )
+        .map_err(|e| format!("insert mv creating index failed: {e}"))?;
+
+        let partition_root_path = format!(
+            "{}/db_{}/table_{}/partition_{}",
+            req.warehouse_uri.trim_end_matches('/'),
+            req.db_id,
+            req.table_id,
+            partition_id
+        );
+        let mut tablet_ids = Vec::new();
+        for bucket_seq in 0..req.bucket_num {
+            let tablet_id = first_tablet_id + bucket_seq;
+            tx.execute(
+                "INSERT INTO tablets(tablet_id, partition_id, index_id, bucket_seq, tablet_root_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    tablet_id,
+                    partition_id,
+                    index_id,
+                    bucket_seq,
+                    partition_root_path,
+                ],
+            )
+            .map_err(|e| format!("insert mv creating tablet failed: {e}"))?;
+            tablet_ids.push(tablet_id);
+        }
+
+        tx.commit()
+            .map_err(|e| format!("commit stage_mv_refresh_partition failed: {e}"))?;
+
+        Ok(StagedMvRefresh {
+            partition_id,
+            index_id,
+            tablet_ids,
+            partition_root_path,
+        })
+    }
+
+    pub(crate) fn activate_mv_refresh_partition(
+        &self,
+        req: ActivateMvRefreshRequest,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin activate_mv_refresh_partition transaction failed: {e}"))?;
+
+        let next_job_id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("allocate erase job id failed: {e}"))?;
+
+        tx.execute(
+            "UPDATE partitions
+             SET state = CASE
+                 WHEN partition_id = ?1 THEN 'ACTIVE'
+                 WHEN partition_id = ?2 THEN 'RETIRED'
+                 ELSE state
+             END,
+                 visible_version = CASE
+                 WHEN partition_id = ?1 THEN 2
+                 ELSE visible_version
+             END,
+                 next_version = CASE
+                 WHEN partition_id = ?1 THEN 3
+                 ELSE next_version
+             END
+             WHERE table_id = ?3",
+            params![req.new_partition_id, req.old_partition_id, req.table_id],
+        )
+        .map_err(|e| format!("switch mv partition states failed: {e}"))?;
+        tx.execute(
+            "UPDATE indexes
+             SET state = CASE
+                 WHEN index_id = ?1 THEN 'ACTIVE'
+                 WHEN partition_id = ?2 THEN 'RETIRED'
+                 ELSE state
+             END
+             WHERE table_id = ?3",
+            params![req.new_index_id, req.old_partition_id, req.table_id],
+        )
+        .map_err(|e| format!("switch mv index states failed: {e}"))?;
+
+        tx.execute(
+            "INSERT INTO erase_jobs(
+                job_id,
+                job_kind,
+                table_id,
+                partition_id,
+                root_path,
+                state,
+                retry_at_ms,
+                updated_at_ms,
+                last_error
+             ) VALUES (?1, 'DROP_PARTITION', ?2, ?3, ?4, 'PENDING', NULL, strftime('%s','now') * 1000, NULL)",
+            params![
+                next_job_id,
+                req.table_id,
+                req.old_partition_id,
+                req.retired_root_path,
+            ],
+        )
+        .map_err(|e| format!("insert mv refresh erase job failed: {e}"))?;
+
+        let snapshots_json = if req.snapshots.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&req.snapshots)
+                    .map_err(|e| format!("serialize mv activate snapshots failed: {e}"))?,
+            )
+        };
+        tx.execute(
+            "UPDATE materialized_views
+             SET last_refresh_ms = strftime('%s','now') * 1000,
+                 last_refresh_rows = ?1,
+                 last_refresh_snapshots_json = ?2
+             WHERE mv_id = ?3",
+            params![req.rows_written, snapshots_json, req.table_id],
+        )
+        .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("commit activate_mv_refresh_partition failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_erase_job_for_partition_root(
+        &self,
+        table_id: i64,
+        partition_id: i64,
+        root_path: &str,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            format!("begin enqueue_erase_job_for_partition_root transaction failed: {e}")
+        })?;
+        let next_job_id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("allocate erase job id failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO erase_jobs(
+                job_id,
+                job_kind,
+                table_id,
+                partition_id,
+                root_path,
+                state,
+                retry_at_ms,
+                updated_at_ms,
+                last_error
+             ) VALUES (?1, 'DROP_PARTITION', ?2, ?3, ?4, 'PENDING', NULL, strftime('%s','now') * 1000, NULL)",
+            params![next_job_id, table_id, partition_id, root_path],
+        )
+        .map_err(|e| format!("insert erase job for partition root failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit enqueue_erase_job_for_partition_root failed: {e}"))?;
         Ok(())
     }
 
@@ -1157,6 +1563,11 @@ impl SqliteMetadataStore {
             params![table_id],
         )
         .map_err(|e| format!("delete retired table partitions failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM materialized_views WHERE mv_id = ?1",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete materialized_view row failed: {e}"))?;
         tx.execute("DELETE FROM tables WHERE table_id = ?1", params![table_id])
             .map_err(|e| format!("delete dropping table row failed: {e}"))?;
         tx.commit()
@@ -1373,7 +1784,7 @@ impl SqliteMetadataStore {
         let current_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| format!("read standalone metadata schema version failed: {e}"))?;
-        if current_version != 0 && current_version != 3 {
+        if current_version != 0 && current_version != 4 {
             return Err(format!(
                 "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
             ));
@@ -1409,6 +1820,8 @@ impl SqliteMetadataStore {
                 bucket_num INTEGER NOT NULL,
                 current_schema_id INTEGER NOT NULL,
                 state TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'TABLE'
+                    CHECK (kind IN ('TABLE', 'MATERIALIZED_VIEW')),
                 UNIQUE(db_id, name)
             );
             CREATE TABLE IF NOT EXISTS table_schemas (
@@ -1468,6 +1881,17 @@ impl SqliteMetadataStore {
                 updated_at_ms INTEGER NOT NULL,
                 last_error TEXT
             );
+            CREATE TABLE IF NOT EXISTS materialized_views (
+                mv_id INTEGER PRIMARY KEY REFERENCES tables(table_id),
+                select_sql TEXT NOT NULL,
+                refresh_mode TEXT NOT NULL DEFAULT 'DEFERRED_MANUAL'
+                    CHECK (refresh_mode IN ('DEFERRED_MANUAL')),
+                base_table_refs_json TEXT NOT NULL,
+                last_refresh_ms INTEGER,
+                last_refresh_rows INTEGER,
+                last_refresh_snapshots_json TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS iceberg_catalogs (
                 name TEXT PRIMARY KEY,
                 properties_json TEXT NOT NULL
@@ -1483,7 +1907,7 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -1546,7 +1970,8 @@ impl SqliteMetadataStore {
                         keys_type,
                         bucket_num,
                         current_schema_id,
-                        state
+                        state,
+                        kind
                      FROM tables
                      ORDER BY table_id",
                 )
@@ -1554,6 +1979,8 @@ impl SqliteMetadataStore {
             let rows = stmt
                 .query_map([], |row| {
                     let state = ManagedTableState::from_sql_str(&row.get::<_, String>(6)?)
+                        .map_err(invalid_state_sql_error)?;
+                    let kind = ManagedTableKind::from_sql_str(&row.get::<_, String>(7)?)
                         .map_err(invalid_state_sql_error)?;
                     Ok(StoredManagedTable {
                         table_id: row.get(0)?,
@@ -1563,6 +1990,7 @@ impl SqliteMetadataStore {
                         bucket_num: row.get(4)?,
                         current_schema_id: row.get(5)?,
                         state,
+                        kind,
                     })
                 })
                 .map_err(|e| format!("query managed tables failed: {e}"))?;
@@ -1771,6 +2199,51 @@ impl SqliteMetadataStore {
                 .map_err(|e| format!("read managed erase_jobs failed: {e}"))?
         };
 
+        let materialized_views = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        mv_id,
+                        select_sql,
+                        refresh_mode,
+                        base_table_refs_json,
+                        last_refresh_ms,
+                        last_refresh_rows,
+                        last_refresh_snapshots_json,
+                        created_at_ms
+                     FROM materialized_views
+                     ORDER BY mv_id",
+                )
+                .map_err(|e| format!("prepare materialized_views query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let refresh_mode =
+                        ManagedMvRefreshMode::from_sql_str(&row.get::<_, String>(2)?)
+                            .map_err(invalid_state_sql_error)?;
+                    let base_json: String = row.get(3)?;
+                    let base_table_refs: Vec<IcebergTableRef> =
+                        serde_json::from_str(&base_json).map_err(json_to_sql_error)?;
+                    let snapshots: std::collections::BTreeMap<String, i64> =
+                        match row.get::<_, Option<String>>(6)? {
+                            Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
+                            None => std::collections::BTreeMap::new(),
+                        };
+                    Ok(StoredMaterializedView {
+                        mv_id: row.get(0)?,
+                        select_sql: row.get(1)?,
+                        refresh_mode,
+                        base_table_refs,
+                        last_refresh_ms: row.get(4)?,
+                        last_refresh_rows: row.get(5)?,
+                        last_refresh_snapshots: snapshots,
+                        created_at_ms: row.get(7)?,
+                    })
+                })
+                .map_err(|e| format!("query materialized_views failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read materialized_views failed: {e}"))?
+        };
+
         if global == ManagedGlobalMeta::default()
             && (!databases.is_empty()
                 || !tables.is_empty()
@@ -1780,7 +2253,8 @@ impl SqliteMetadataStore {
                 || !indexes.is_empty()
                 || !tablets.is_empty()
                 || !txns.is_empty()
-                || !erase_jobs.is_empty())
+                || !erase_jobs.is_empty()
+                || !materialized_views.is_empty())
         {
             return Err("managed metadata missing global_meta row".to_string());
         }
@@ -1796,6 +2270,7 @@ impl SqliteMetadataStore {
             tablets,
             txns,
             erase_jobs,
+            materialized_views,
         })
     }
 }
@@ -1837,11 +2312,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
-        ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-        SqliteMetadataStore, StageManagedTruncateRequest, StoredManagedColumn,
+        ActivateMvRefreshRequest, IcebergTableRef, ManagedEraseJobKind, ManagedEraseJobState,
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
+        ManagedSnapshot, ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
+        StageManagedTruncateRequest, StageMvRefreshRequest, StoredManagedColumn,
         StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+        StoredMaterializedView,
     };
 
     #[test]
@@ -1872,6 +2349,7 @@ mod tests {
                 bucket_num: 2,
                 current_schema_id: 100,
                 state: ManagedTableState::Creating,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -1919,6 +2397,7 @@ mod tests {
                 updated_at_ms: 5_678,
             }],
             erase_jobs: Vec::new(),
+            materialized_views: Vec::new(),
         };
 
         store
@@ -1957,6 +2436,7 @@ mod tests {
                 bucket_num: 2,
                 current_schema_id: 10,
                 state: ManagedTableState::Dropping,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![],
             columns: vec![],
@@ -1994,6 +2474,7 @@ mod tests {
                 updated_at_ms: 0,
                 last_error: None,
             }],
+            materialized_views: Vec::new(),
         };
 
         store
@@ -2030,6 +2511,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -2050,6 +2532,7 @@ mod tests {
             tablets: Vec::new(),
             txns: Vec::new(),
             erase_jobs: Vec::new(),
+            materialized_views: Vec::new(),
         };
         store
             .replace_managed_snapshot(&snapshot)
@@ -2474,5 +2957,427 @@ mod tests {
         assert_eq!(loaded.managed.tablets[0].partition_id, 21);
         assert_eq!(loaded.managed.txns.len(), 1);
         assert_eq!(loaded.managed.txns[0].partition_id, 21);
+    }
+
+    #[test]
+    fn init_schema_v4_creates_tables_with_kind_and_materialized_views_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
+            .expect("open fresh store");
+        let conn = store.connection().expect("connection");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 4);
+
+        // `tables` must have the new `kind` column with the expected default and check.
+        let kind_col_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tables') WHERE name = 'kind'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma_table_info tables");
+        assert_eq!(kind_col_exists, 1);
+
+        // `materialized_views` must exist with mv_id primary key and the declared columns.
+        let mv_cols: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info('materialized_views') ORDER BY cid")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect");
+            rows
+        };
+        let names: Vec<&str> = mv_cols.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "mv_id",
+                "select_sql",
+                "refresh_mode",
+                "base_table_refs_json",
+                "last_refresh_ms",
+                "last_refresh_rows",
+                "last_refresh_snapshots_json",
+                "created_at_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn init_schema_rejects_pre_v4_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch("PRAGMA user_version = 3;")
+                .expect("set old version");
+        }
+        let err = SqliteMetadataStore::open(&path).expect_err("open on v3 must fail");
+        assert!(err.contains("schema version 3"), "err={err}");
+    }
+
+    #[test]
+    fn managed_snapshot_round_trips_mv_rows_and_kind_column() {
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+
+        let mut snapshot = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 43,
+                next_txn_id: 1,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders_mv".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::MaterializedView,
+            }],
+            schemas: vec![],
+            columns: vec![],
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Active,
+            }],
+            indexes: vec![StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Active,
+            }],
+            tablets: vec![
+                StoredManagedTablet {
+                    tablet_id: 40,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 0,
+                    tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20"
+                        .to_string(),
+                },
+                StoredManagedTablet {
+                    tablet_id: 41,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 1,
+                    tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20"
+                        .to_string(),
+                },
+            ],
+            txns: vec![],
+            erase_jobs: vec![],
+            materialized_views: vec![StoredMaterializedView {
+                mv_id: 10,
+                select_sql: "SELECT k1, sum(v2) FROM iceberg_cat.ns.orders GROUP BY k1".to_string(),
+                refresh_mode: ManagedMvRefreshMode::DeferredManual,
+                base_table_refs: vec![IcebergTableRef {
+                    catalog: "iceberg_cat".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders".to_string(),
+                }],
+                last_refresh_ms: Some(1_700_000_000_000),
+                last_refresh_rows: Some(123),
+                last_refresh_snapshots: {
+                    let mut map = BTreeMap::new();
+                    map.insert("iceberg_cat.ns.orders".to_string(), 7_391_842_i64);
+                    map
+                },
+                created_at_ms: 1_699_999_999_000,
+            }],
+        };
+
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+        let loaded = store.load_snapshot().expect("reload").managed;
+        assert_eq!(loaded, snapshot);
+    }
+
+    #[test]
+    fn managed_snapshot_round_trips_kind_table_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+
+        let mut snapshot = ManagedSnapshot::default();
+        snapshot.global.warehouse_uri = "s3://bucket/warehouse".to_string();
+        snapshot.global.next_table_id = 2;
+        snapshot.tables.push(StoredManagedTable {
+            table_id: 1,
+            db_id: 1,
+            name: "orders".to_string(),
+            keys_type: "DUP_KEYS".to_string(),
+            bucket_num: 2,
+            current_schema_id: 1,
+            state: ManagedTableState::Active,
+            kind: ManagedTableKind::Table,
+        });
+        snapshot.databases.push(StoredManagedDatabase {
+            db_id: 1,
+            name: "analytics".to_string(),
+        });
+
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+        let loaded = store.load_snapshot().expect("reload").managed;
+        assert_eq!(loaded.tables[0].kind, ManagedTableKind::Table);
+        assert!(loaded.materialized_views.is_empty());
+    }
+
+    fn empty_mv_refresh_snapshot(warehouse: &str) -> ManagedSnapshot {
+        let mut snapshot = ManagedSnapshot::default();
+        snapshot.global.warehouse_uri = warehouse.to_string();
+        snapshot.global.next_db_id = 2;
+        snapshot.global.next_table_id = 11;
+        snapshot.global.next_partition_id = 21;
+        snapshot.global.next_index_id = 31;
+        snapshot.global.next_tablet_id = 43;
+        snapshot.global.next_txn_id = 1;
+        snapshot.databases.push(StoredManagedDatabase {
+            db_id: 1,
+            name: "analytics".to_string(),
+        });
+        snapshot.tables.push(StoredManagedTable {
+            table_id: 10,
+            db_id: 1,
+            name: "orders_mv".to_string(),
+            keys_type: "DUP_KEYS".to_string(),
+            bucket_num: 2,
+            current_schema_id: 10,
+            state: ManagedTableState::Active,
+            kind: ManagedTableKind::MaterializedView,
+        });
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 20,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Active,
+        });
+        snapshot.indexes.push(StoredManagedIndex {
+            index_id: 30,
+            table_id: 10,
+            partition_id: 20,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Active,
+        });
+        for bucket_seq in 0..2 {
+            snapshot.tablets.push(StoredManagedTablet {
+                tablet_id: 40 + bucket_seq,
+                partition_id: 20,
+                index_id: 30,
+                bucket_seq,
+                tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20".to_string(),
+            });
+        }
+        snapshot.materialized_views.push(StoredMaterializedView {
+            mv_id: 10,
+            select_sql: "SELECT k1 FROM iceberg_cat.ns.orders".to_string(),
+            refresh_mode: ManagedMvRefreshMode::DeferredManual,
+            base_table_refs: vec![IcebergTableRef {
+                catalog: "iceberg_cat".to_string(),
+                namespace: "ns".to_string(),
+                table: "orders".to_string(),
+            }],
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: std::collections::BTreeMap::new(),
+            created_at_ms: 1_700_000_000_000,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn stage_mv_refresh_partition_rejects_when_refresh_already_in_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 22,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Creating,
+        });
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+
+        let err = store
+            .stage_mv_refresh_partition(StageMvRefreshRequest {
+                table_id: 10,
+                db_id: 1,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            })
+            .expect_err("stage should reject");
+        assert!(err.contains("refresh already in progress"), "err={err}");
+    }
+
+    #[test]
+    fn stage_mv_refresh_partition_rejects_when_mv_not_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        snapshot.tables[0].state = ManagedTableState::Dropping;
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+
+        let err = store
+            .stage_mv_refresh_partition(StageMvRefreshRequest {
+                table_id: 10,
+                db_id: 1,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            })
+            .expect_err("stage should reject");
+        assert!(err.contains("is not active"), "err={err}");
+    }
+
+    #[test]
+    fn activate_mv_refresh_partition_swaps_and_writes_last_refresh_fields() {
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+
+        let staged = store
+            .stage_mv_refresh_partition(StageMvRefreshRequest {
+                table_id: 10,
+                db_id: 1,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            })
+            .expect("stage");
+
+        let mut snapshots_map = BTreeMap::new();
+        snapshots_map.insert("iceberg_cat.ns.orders".to_string(), 9_999_i64);
+
+        store
+            .activate_mv_refresh_partition(ActivateMvRefreshRequest {
+                table_id: 10,
+                old_partition_id: 20,
+                new_partition_id: staged.partition_id,
+                new_index_id: staged.index_id,
+                retired_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20".to_string(),
+                rows_written: 42,
+                snapshots: snapshots_map.clone(),
+            })
+            .expect("activate");
+
+        let loaded = store.load_snapshot().expect("reload").managed;
+        let active_pids: Vec<i64> = loaded
+            .partitions
+            .iter()
+            .filter(|p| p.state == ManagedPartitionState::Active)
+            .map(|p| p.partition_id)
+            .collect();
+        assert_eq!(active_pids, vec![staged.partition_id]);
+        assert!(
+            loaded
+                .partitions
+                .iter()
+                .any(|p| p.partition_id == 20 && p.state == ManagedPartitionState::Retired)
+        );
+        let erase_jobs: Vec<&StoredManagedEraseJob> = loaded
+            .erase_jobs
+            .iter()
+            .filter(|j| j.partition_id == Some(20))
+            .collect();
+        assert_eq!(erase_jobs.len(), 1);
+        assert_eq!(erase_jobs[0].job_kind, ManagedEraseJobKind::DropPartition);
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv row");
+        assert_eq!(mv.last_refresh_rows, Some(42));
+        assert_eq!(mv.last_refresh_snapshots, snapshots_map);
+        assert!(mv.last_refresh_ms.is_some());
+    }
+
+    #[test]
+    fn drop_managed_table_rejects_mv_with_inflight_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 22,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Creating,
+        });
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+
+        let err = store
+            .drop_managed_table(10, "s3://bucket/warehouse/db_1/table_10")
+            .expect_err("drop should reject");
+        assert!(err.contains("refresh in progress"), "err={err}");
+    }
+
+    #[test]
+    fn purge_retired_table_metadata_removes_mv_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        snapshot.tables[0].state = ManagedTableState::Dropping;
+        for partition in &mut snapshot.partitions {
+            partition.state = ManagedPartitionState::Retired;
+        }
+        for index in &mut snapshot.indexes {
+            index.state = ManagedIndexState::Retired;
+        }
+        store
+            .replace_managed_snapshot(&mut snapshot)
+            .expect("persist");
+
+        store.purge_retired_table_metadata(10).expect("purge");
+        let loaded = store.load_snapshot().expect("reload").managed;
+        assert!(loaded.tables.is_empty());
+        assert!(loaded.materialized_views.is_empty());
     }
 }
