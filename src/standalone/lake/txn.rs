@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array, new_null_array};
@@ -9,13 +9,16 @@ use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
+use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
 use crate::connector::starrocks::lake::{append_lake_txn_log_with_chunk_rowset, publish_version};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
+use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::query_result::QueryResult;
+use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
@@ -120,6 +123,13 @@ pub(crate) struct ManagedInsertPlan {
 pub(crate) struct ManagedInsertTablet {
     pub(crate) tablet_id: i64,
     pub(crate) tablet_root_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MvRefreshWriteMetadata {
+    pub(crate) table_id: i64,
+    pub(crate) previous_refresh_rows: i64,
+    pub(crate) snapshots: BTreeMap<String, i64>,
 }
 
 pub(crate) fn load_insert_plan(
@@ -256,6 +266,35 @@ pub(crate) fn write_chunks_into_managed_partition(
     plan: ManagedInsertPlan,
     chunks: &[Chunk],
 ) -> Result<i64, String> {
+    write_chunks_into_managed_partition_inner(state, plan, chunks, VisibleCommitAction::Plain)
+}
+
+pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
+    state: &Arc<StandaloneState>,
+    plan: ManagedInsertPlan,
+    chunks: &[Chunk],
+    metadata: MvRefreshWriteMetadata,
+) -> Result<i64, String> {
+    write_chunks_into_managed_partition_inner(
+        state,
+        plan,
+        chunks,
+        VisibleCommitAction::MvRefresh(metadata),
+    )
+}
+
+enum VisibleCommitAction {
+    Plain,
+    MvRefresh(MvRefreshWriteMetadata),
+}
+
+fn write_chunks_into_managed_partition_inner(
+    state: &Arc<StandaloneState>,
+    plan: ManagedInsertPlan,
+    chunks: &[Chunk],
+    commit_action: VisibleCommitAction,
+) -> Result<i64, String> {
+    let total_rows = chunks_total_rows(chunks)?;
     let metadata_store = state
         .metadata_store
         .as_ref()
@@ -264,10 +303,8 @@ pub(crate) fn write_chunks_into_managed_partition(
         metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
 
     let mut written_tablet_ids = Vec::new();
-    let mut total_rows = 0_i64;
     let mut next_file_seq = 0_u64;
     for chunk in chunks {
-        total_rows += chunk.len() as i64;
         let write_outcome =
             write_routed_chunks(state, &plan, chunk, prepared.txn_id, &mut next_file_seq);
         let chunk_written_ids = match write_outcome {
@@ -287,9 +324,21 @@ pub(crate) fn write_chunks_into_managed_partition(
     written_tablet_ids.sort_unstable();
     written_tablet_ids.dedup();
 
+    let written: HashSet<i64> = written_tablet_ids.iter().copied().collect();
+    if let Err(err) =
+        append_empty_txn_logs_for_unwritten_tablets(state, &plan, prepared.txn_id, &written)
+    {
+        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+            return Err(format!(
+                "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+            ));
+        }
+        return Err(err);
+    }
+
     metadata_store.mark_txn_written(prepared.txn_id)?;
 
-    publish_managed_txn(&plan, &prepared, &written_tablet_ids).map_err(|err| {
+    publish_managed_txn(&plan, &prepared).map_err(|err| {
         if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
             return format!(
                 "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
@@ -298,10 +347,43 @@ pub(crate) fn write_chunks_into_managed_partition(
         format!("managed-lake publish failed: {err}")
     })?;
 
-    metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
+    match commit_action {
+        VisibleCommitAction::Plain => {
+            metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
+        }
+        VisibleCommitAction::MvRefresh(metadata) => {
+            let last_refresh_rows = metadata
+                .previous_refresh_rows
+                .checked_add(total_rows)
+                .ok_or_else(|| {
+                    format!(
+                        "managed-lake mv refresh row count overflow: {} + {}",
+                        metadata.previous_refresh_rows, total_rows
+                    )
+                })?;
+            metadata_store.mark_txn_visible_with_mv_refresh_metadata(
+                prepared.txn_id,
+                prepared.commit_version,
+                super::store::UpdateMvRefreshMetadataRequest {
+                    table_id: metadata.table_id,
+                    last_refresh_rows,
+                    snapshots: metadata.snapshots,
+                },
+            )?;
+        }
+    }
     commit_catalog_visible_version(state, &plan, prepared.commit_version)?;
 
     Ok(total_rows)
+}
+
+fn chunks_total_rows(chunks: &[Chunk]) -> Result<i64, String> {
+    chunks.iter().try_fold(0_i64, |acc, chunk| {
+        let rows = i64::try_from(chunk.len())
+            .map_err(|_| "managed-lake chunk row count overflow".to_string())?;
+        acc.checked_add(rows)
+            .ok_or_else(|| "managed-lake chunk row count overflow".to_string())
+    })
 }
 
 fn derive_column_defs(
@@ -390,7 +472,7 @@ fn write_routed_chunks(
             tablet_id: tablet.tablet_id,
             tablet_root_path: tablet.tablet_root_path.clone(),
             tablet_schema: plan.tablet_schema.clone(),
-            s3_config: Some(managed_config.s3.clone()),
+            s3_config: s3_config_for_tablet_path(&tablet.tablet_root_path, &managed_config.s3)?,
             partial_update: PartialUpdateWritePolicy::default(),
         };
         // Keep the tablet runtime's schema in lockstep with what we persist,
@@ -436,34 +518,19 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
 fn publish_managed_txn(
     plan: &ManagedInsertPlan,
     prepared: &super::store::PreparedManagedTxn,
-    written_tablet_ids: &[i64],
 ) -> Result<(), String> {
-    // Publish all tablets that actually have a txn log at this version.
-    if !written_tablet_ids.is_empty() {
-        publish_tablets_at_version(
-            written_tablet_ids.to_vec(),
-            prepared.txn_id,
-            prepared.base_version,
-            prepared.commit_version,
-        )?;
-    }
-
-    // For tablets that received no rows, publish via the empty-txnlog path so
-    // their metadata still advances to the new version. This matches StarRocks
-    // BE's handling of bucket-hash inserts that only touch a subset of tablets.
-    let written: std::collections::HashSet<i64> = written_tablet_ids.iter().copied().collect();
-    let empty_tablet_ids: Vec<i64> = plan
+    // Publish the whole partition in one batch. Splitting written and empty
+    // tablets into separate publish calls can make the second bundle write
+    // synthesize siblings from the old base version and overwrite rowsets.
+    let tablet_ids = plan
         .tablets
         .iter()
         .map(|tablet| tablet.tablet_id)
-        .filter(|tablet_id| !written.contains(tablet_id))
-        .collect();
-    if !empty_tablet_ids.is_empty() {
-        // StarRocks treats txn_id=-1 as the empty-txnlog sentinel; BE bumps the
-        // tablet's metadata to new_version without applying any rowset.
+        .collect::<Vec<_>>();
+    if !tablet_ids.is_empty() {
         publish_tablets_at_version(
-            empty_tablet_ids,
-            EMPTY_TXNLOG_TXN_ID,
+            tablet_ids,
+            prepared.txn_id,
             prepared.base_version,
             prepared.commit_version,
         )?;
@@ -471,7 +538,49 @@ fn publish_managed_txn(
     Ok(())
 }
 
-const EMPTY_TXNLOG_TXN_ID: i64 = -1;
+fn append_empty_txn_logs_for_unwritten_tablets(
+    state: &Arc<StandaloneState>,
+    plan: &ManagedInsertPlan,
+    txn_id: i64,
+    written_tablet_ids: &HashSet<i64>,
+) -> Result<(), String> {
+    let managed_config = state
+        .managed_lake_config
+        .as_ref()
+        .ok_or_else(|| "standalone managed lake config is missing during insert".to_string())?
+        .clone();
+
+    for tablet in &plan.tablets {
+        if written_tablet_ids.contains(&tablet.tablet_id) {
+            continue;
+        }
+        let write_ctx = TabletWriteContext {
+            db_id: plan.db_id,
+            table_id: plan.table_id,
+            tablet_id: tablet.tablet_id,
+            tablet_root_path: tablet.tablet_root_path.clone(),
+            tablet_schema: plan.tablet_schema.clone(),
+            s3_config: s3_config_for_tablet_path(&tablet.tablet_root_path, &managed_config.s3)?,
+            partial_update: PartialUpdateWritePolicy::default(),
+        };
+        update_tablet_runtime_schema(tablet.tablet_id, &plan.tablet_schema)?;
+        append_lake_txn_log_empty_rowset(&write_ctx, txn_id, plan.partition_id, None)?;
+    }
+    Ok(())
+}
+
+fn s3_config_for_tablet_path(
+    tablet_root_path: &str,
+    managed_s3: &S3StoreConfig,
+) -> Result<Option<S3StoreConfig>, String> {
+    match classify_scan_paths([tablet_root_path])? {
+        ScanPathScheme::Local => Ok(None),
+        ScanPathScheme::Oss => Ok(Some(managed_s3.clone())),
+        ScanPathScheme::Hdfs => Err(format!(
+            "managed-lake write does not support hdfs tablet path yet: {tablet_root_path}"
+        )),
+    }
+}
 
 /// Drive `publish_version` for a specific txn against the given tablet ids.
 /// Also used by restart recovery to finish a `WRITTEN` txn whose rowsets are
@@ -567,42 +676,12 @@ fn insert_from_query_into_managed_lake(
     }
     let chunk = build_chunk_for_insert(aligned, plan.columns.len())?;
 
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "managed lake insert requires sqlite metadata store".to_string())?;
-    let prepared =
-        metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
-
-    let mut next_file_seq = 0_u64;
-    let write_outcome =
-        write_routed_chunks(state, plan, &chunk, prepared.txn_id, &mut next_file_seq);
-    let written_tablet_ids = match write_outcome {
-        Ok(ids) => ids,
-        Err(err) => {
-            if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
-                return Err(format!(
-                    "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
-                ));
-            }
-            return Err(err);
-        }
-    };
-
-    metadata_store.mark_txn_written(prepared.txn_id)?;
-
-    publish_managed_txn(plan, &prepared, &written_tablet_ids).map_err(|err| {
-        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
-            return format!(
-                "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
-            );
-        }
-        format!("managed-lake publish failed: {err}")
-    })?;
-
-    metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
-
-    commit_catalog_visible_version(state, plan, prepared.commit_version)?;
+    write_chunks_into_managed_partition_inner(
+        state,
+        plan.clone(),
+        &[chunk],
+        VisibleCommitAction::Plain,
+    )?;
 
     Ok(StatementResult::Ok)
 }
@@ -781,24 +860,38 @@ fn resolve_managed_name(
 mod mv_target_tests {
     use super::*;
 
+    use crate::connector::starrocks::lake::context::{
+        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
+    };
+    use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
+    use crate::formats::starrocks::writer::bundle_meta::{
+        empty_tablet_metadata, write_bundle_meta_file,
+    };
+    use crate::formats::starrocks::writer::layout::txn_log_file_path;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
+    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::standalone::engine::catalog::InMemoryCatalog;
     use crate::standalone::lake::store::{
-        ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
-        ManagedTableKind, ManagedTableState, StoredManagedDatabase, StoredManagedIndex,
-        StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
+        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::standalone::lake::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
+    use arrow::array::{Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
+    use std::net::ToSocketAddrs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn write_chunks_into_managed_partition_routes_rows_to_staged_tablets() {
-        let state = seed_state_with_staged_mv();
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_staged_mv();
         let plan = load_insert_plan(
-            &state,
+            &fixture.state,
             &ResolvedLocalTableName {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
@@ -821,24 +914,221 @@ mod mv_target_tests {
         );
     }
 
-    fn seed_state_with_staged_mv() -> Arc<StandaloneState> {
-        let config = ManagedLakeConfig {
-            warehouse_uri: "s3://bucket/warehouse".to_string(),
-            s3: S3StoreConfig {
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                bucket: "bucket".to_string(),
-                root: "warehouse".to_string(),
-                access_key_id: "ak".to_string(),
-                access_key_secret: "sk".to_string(),
-                region: None,
-                enable_path_style_access: Some(true),
+    #[test]
+    fn mv_refresh_noop_chunks_updates_metadata_atomically() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_active_mv();
+        let plan = load_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
             },
+            PartitionTarget::Active,
+        )
+        .expect("plan");
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert("ice.ns.orders".to_string(), 42);
+
+        let rows = write_chunks_into_managed_partition_for_mv_refresh(
+            &fixture.state,
+            plan,
+            &[],
+            MvRefreshWriteMetadata {
+                table_id: 10,
+                previous_refresh_rows: 3,
+                snapshots: snapshots.clone(),
+            },
+        )
+        .expect("write");
+        assert_eq!(rows, 0);
+
+        let store = fixture.state.metadata_store.as_ref().expect("store");
+        let loaded = store.load_snapshot().expect("snapshot").managed;
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(3));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+    }
+
+    #[test]
+    fn mv_refresh_write_phase_persists_empty_logs_for_unwritten_tablets() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_active_mv();
+        let plan = load_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("plan");
+        assert_eq!(plan.tablets.len(), 2);
+
+        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
+        let prepared = metadata_store
+            .prepare_txn(plan.table_id, plan.partition_id, plan.base_version)
+            .expect("prepare txn");
+        let chunk = single_i32_chunk("k1", &[1]);
+        let mut next_file_seq = 0_u64;
+        let mut written_tablet_ids = write_routed_chunks(
+            &fixture.state,
+            &plan,
+            &chunk,
+            prepared.txn_id,
+            &mut next_file_seq,
+        )
+        .expect("write routed chunk");
+        written_tablet_ids.sort_unstable();
+        written_tablet_ids.dedup();
+        assert_eq!(written_tablet_ids.len(), 1);
+
+        let written = written_tablet_ids.iter().copied().collect::<HashSet<_>>();
+        append_empty_txn_logs_for_unwritten_tablets(
+            &fixture.state,
+            &plan,
+            prepared.txn_id,
+            &written,
+        )
+        .expect("append empty logs");
+
+        let mut row_counts = Vec::new();
+        for tablet in &plan.tablets {
+            let log_path =
+                txn_log_file_path(&tablet.tablet_root_path, tablet.tablet_id, prepared.txn_id)
+                    .expect("txn log path");
+            let log = read_txn_log_if_exists(&log_path)
+                .expect("read txn log")
+                .expect("txn log exists before written boundary");
+            let rows = log
+                .op_write
+                .as_ref()
+                .and_then(|op| op.rowset.as_ref())
+                .and_then(|rowset| rowset.num_rows)
+                .unwrap_or(-1);
+            row_counts.push(rows);
+        }
+        row_counts.sort_unstable();
+        assert_eq!(row_counts, vec![0, 1]);
+    }
+
+    #[test]
+    fn mv_refresh_writes_chunks_when_object_store_available() {
+        let Some(config) = maybe_object_store_config() else {
+            return;
+        };
+        let _guard = lock_runtime_test_state();
+        let fixture =
+            seed_state_with_active_mv_on_object_store(config).expect("object-store fixture");
+        let plan = load_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("plan");
+        let chunk = single_i32_chunk("k1", &[1, 2, 3]);
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert("ice.ns.orders".to_string(), 42);
+
+        let rows = write_chunks_into_managed_partition_for_mv_refresh(
+            &fixture.state,
+            plan,
+            &[chunk],
+            MvRefreshWriteMetadata {
+                table_id: 10,
+                previous_refresh_rows: 7,
+                snapshots: snapshots.clone(),
+            },
+        )
+        .expect("write");
+        assert_eq!(rows, 3);
+
+        let store = fixture.state.metadata_store.as_ref().expect("store");
+        let loaded = store.load_snapshot().expect("snapshot").managed;
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(10));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+    }
+
+    struct MvTestFixture {
+        state: Arc<StandaloneState>,
+        _metadata_dir: tempfile::TempDir,
+    }
+
+    fn seed_state_with_staged_mv() -> MvTestFixture {
+        seed_state_with_mv_fixture(false, MvFixtureStorage::Local).expect("local fixture")
+    }
+
+    fn seed_state_with_active_mv() -> MvTestFixture {
+        seed_state_with_mv_fixture(true, MvFixtureStorage::Local).expect("local fixture")
+    }
+
+    fn seed_state_with_active_mv_on_object_store(
+        config: ManagedLakeConfig,
+    ) -> Result<MvTestFixture, String> {
+        seed_state_with_mv_fixture(true, MvFixtureStorage::ObjectStore(config))
+    }
+
+    enum MvFixtureStorage {
+        Local,
+        ObjectStore(ManagedLakeConfig),
+    }
+
+    fn seed_state_with_mv_fixture(
+        active_mv_metadata: bool,
+        storage: MvFixtureStorage,
+    ) -> Result<MvTestFixture, String> {
+        let metadata_dir =
+            tempfile::tempdir().map_err(|e| format!("create tempdir failed: {e}"))?;
+        let metadata_root = metadata_dir.path().to_string_lossy().to_string();
+        let (config, active_tablet_root, staged_tablet_root, tablet_s3_config) = match storage {
+            MvFixtureStorage::Local => {
+                let config = ManagedLakeConfig {
+                    warehouse_uri: metadata_root.clone(),
+                    s3: S3StoreConfig {
+                        endpoint: "http://127.0.0.1:9000".to_string(),
+                        bucket: "bucket".to_string(),
+                        root: "warehouse".to_string(),
+                        access_key_id: "ak".to_string(),
+                        access_key_secret: "sk".to_string(),
+                        region: None,
+                        enable_path_style_access: Some(true),
+                    },
+                };
+                (
+                    config,
+                    format!("{metadata_root}/db_1/table_10/partition_20"),
+                    format!("{metadata_root}/db_1/table_10/partition_21"),
+                    None,
+                )
+            }
+            MvFixtureStorage::ObjectStore(config) => {
+                let root = config.warehouse_uri.trim_end_matches('/').to_string();
+                (
+                    config.clone(),
+                    format!("{root}/db_1/table_10/partition_20"),
+                    format!("{root}/db_1/table_10/partition_21"),
+                    Some(config.s3.clone()),
+                )
+            }
         };
 
         let tablet_schema = TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
             column: vec![
                 ColumnPb {
-                    unique_id: 0,
+                    unique_id: 1,
                     name: Some("k1".to_string()),
                     r#type: "INT".to_string(),
                     is_nullable: Some(false),
@@ -847,7 +1137,7 @@ mod mv_target_tests {
                     ..Default::default()
                 },
                 ColumnPb {
-                    unique_id: 1,
+                    unique_id: 2,
                     name: Some("total".to_string()),
                     r#type: "BIGINT".to_string(),
                     is_nullable: Some(true),
@@ -856,6 +1146,12 @@ mod mv_target_tests {
                     ..Default::default()
                 },
             ],
+            num_short_key_columns: Some(1),
+            next_column_unique_id: Some(3),
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            id: Some(100),
             ..Default::default()
         };
 
@@ -866,7 +1162,7 @@ mod mv_target_tests {
                 next_table_id: 11,
                 next_partition_id: 22,
                 next_index_id: 32,
-                next_tablet_id: 43,
+                next_tablet_id: 44,
                 next_txn_id: 100,
             },
             databases: vec![StoredManagedDatabase {
@@ -945,45 +1241,192 @@ mod mv_target_tests {
                     partition_id: 20,
                     index_id: 30,
                     bucket_seq: 0,
-                    tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20"
-                        .to_string(),
+                    tablet_root_path: active_tablet_root.clone(),
+                },
+                StoredManagedTablet {
+                    tablet_id: 43,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 1,
+                    tablet_root_path: active_tablet_root.clone(),
                 },
                 StoredManagedTablet {
                     tablet_id: 41,
                     partition_id: 21,
                     index_id: 31,
                     bucket_seq: 0,
-                    tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_21"
-                        .to_string(),
+                    tablet_root_path: staged_tablet_root.clone(),
                 },
                 StoredManagedTablet {
                     tablet_id: 42,
                     partition_id: 21,
                     index_id: 31,
                     bucket_seq: 1,
-                    tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_21"
-                        .to_string(),
+                    tablet_root_path: staged_tablet_root.clone(),
                 },
             ],
             txns: vec![],
             erase_jobs: vec![],
-            materialized_views: vec![],
+            materialized_views: if active_mv_metadata {
+                vec![StoredMaterializedView {
+                    mv_id: 10,
+                    select_sql: "select k1 from ice.ns.orders".to_string(),
+                    refresh_mode: ManagedMvRefreshMode::DeferredManual,
+                    base_table_refs: vec![],
+                    last_refresh_ms: None,
+                    last_refresh_rows: Some(0),
+                    last_refresh_snapshots: std::collections::BTreeMap::new(),
+                    created_at_ms: 1,
+                }]
+            } else {
+                vec![]
+            },
         };
 
-        let managed =
-            ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild managed");
+        let metadata_store =
+            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
+                .map_err(|e| format!("open store failed: {e}"))?;
+        metadata_store
+            .replace_managed_snapshot(&snapshot)
+            .map_err(|e| format!("persist snapshot failed: {e}"))?;
+
+        for tablet_id in [40_i64, 43_i64] {
+            let runtime_ctx = TabletWriteContext {
+                db_id: 1,
+                table_id: 10,
+                tablet_id,
+                tablet_root_path: active_tablet_root.clone(),
+                tablet_schema: tablet_schema.clone(),
+                s3_config: tablet_s3_config.clone(),
+                partial_update: Default::default(),
+            };
+            register_tablet_runtime(&runtime_ctx)
+                .map_err(|e| format!("register runtime failed: {e}"))?;
+            let mut base_meta = empty_tablet_metadata(tablet_id);
+            base_meta.version = Some(1);
+            write_bundle_meta_file(
+                &runtime_ctx.tablet_root_path,
+                runtime_ctx.tablet_id,
+                1,
+                &runtime_ctx.tablet_schema,
+                &base_meta,
+            )
+            .map_err(|e| format!("write base tablet metadata failed: {e}"))?;
+        }
+
+        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)
+            .map_err(|e| format!("rebuild managed failed: {e}"))?;
         let mut catalog = InMemoryCatalog::default();
         catalog
             .create_database("analytics")
-            .expect("create analytics");
+            .map_err(|e| format!("create analytics failed: {e}"))?;
         register_managed_tables_in_catalog(&mut catalog, &managed)
-            .expect("register managed tables");
+            .map_err(|e| format!("register managed tables failed: {e}"))?;
 
-        Arc::new(StandaloneState {
-            catalog: std::sync::RwLock::new(catalog),
-            managed_lake: std::sync::RwLock::new(managed),
-            managed_lake_config: Some(config),
-            ..Default::default()
+        Ok(MvTestFixture {
+            state: Arc::new(StandaloneState {
+                catalog: std::sync::RwLock::new(catalog),
+                managed_lake: std::sync::RwLock::new(managed),
+                managed_lake_config: Some(config),
+                metadata_store: Some(metadata_store),
+                ..Default::default()
+            }),
+            _metadata_dir: metadata_dir,
         })
+    }
+
+    fn maybe_object_store_config() -> Option<ManagedLakeConfig> {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        if !managed_lake_endpoint_reachable(&endpoint) {
+            eprintln!(
+                "skipping mv object-store chunk write test: object store endpoint is unreachable: {endpoint}"
+            );
+            return None;
+        }
+
+        let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+            .unwrap_or_else(|_| "admin".to_string());
+        let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+            .unwrap_or_else(|_| "admin123".to_string());
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root_prefix =
+            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let run_id = format!(
+            "mv_task4_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = if root_prefix.trim_matches('/').is_empty() {
+            run_id
+        } else {
+            format!("{}/{}", root_prefix.trim_matches('/'), run_id)
+        };
+        Some(ManagedLakeConfig {
+            warehouse_uri: format!("s3://{bucket}/{root}"),
+            s3: S3StoreConfig {
+                endpoint,
+                bucket,
+                root,
+                access_key_id,
+                access_key_secret,
+                region: None,
+                enable_path_style_access: Some(true),
+            },
+        })
+    }
+
+    fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+        let stripped = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint);
+        let authority = stripped.split('/').next().unwrap_or(stripped);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(port) => (host, port),
+                Err(_) => return false,
+            },
+            None => {
+                let default_port = if endpoint.starts_with("https://") {
+                    443
+                } else {
+                    80
+                };
+                (authority, default_port)
+            }
+        };
+        let Ok(addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok())
+    }
+
+    fn single_i32_chunk(name: &str, values: &[i32]) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(name, DataType::Int32, false),
+            Field::new("total", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(vec![None; values.len()])),
+            ],
+        )
+        .expect("batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 }
