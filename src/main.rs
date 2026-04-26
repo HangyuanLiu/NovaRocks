@@ -20,7 +20,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -302,6 +302,14 @@ fn stop_process(pid: u32, grace: Duration) {
     }
 }
 
+fn spawn_child_reaper(mut child: Child) {
+    let _ = std::thread::Builder::new()
+        .name("novarocks-daemon-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 fn health_check_host(bind_host: &str) -> String {
     match bind_host {
         "0.0.0.0" => "127.0.0.1".to_string(),
@@ -564,6 +572,7 @@ fn main() {
                 .expect("spawn child");
 
             let child_pid = child.id();
+            spawn_child_reaper(child);
             match wait_for_start_ready(
                 child_pid,
                 pid_file,
@@ -582,6 +591,7 @@ fn main() {
                         "novarocks start health check failed: {}. Check {}",
                         err, log_file
                     );
+                    stop_process(child_pid, Duration::from_secs(2));
                     process::exit(1);
                 }
             }
@@ -679,7 +689,7 @@ fn main() {
                 );
             }
 
-            let log_level_num = match cfg.log_level.as_str() {
+            let _log_level_num = match cfg.log_level.as_str() {
                 "trace" | "debug" => 0,
                 "info" => 0,
                 "warn" => 1,
@@ -839,6 +849,7 @@ fn main() {
                 .expect("spawn child");
 
             let child_pid = child.id();
+            spawn_child_reaper(child);
             match wait_for_start_ready(
                 child_pid,
                 pid_file,
@@ -857,6 +868,7 @@ fn main() {
                         "novarocks restart health check failed: {}. Check {}",
                         err, log_file
                     );
+                    stop_process(child_pid, Duration::from_secs(2));
                     process::exit(1);
                 }
             }

@@ -2,11 +2,11 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::super::engine::StandaloneState;
-use super::config::ManagedLakeConfig;
-use super::store::{ManagedEraseJobKind, SqliteMetadataStore};
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
+use crate::connector::starrocks::managed::store::{ManagedEraseJobKind, SqliteMetadataStore};
 use crate::fs::oss::{oss_block_on, resolve_oss_operator_and_path_with_config};
 use crate::novarocks_logging::warn;
+use crate::standalone::engine::StandaloneState;
 
 const ERASE_RETRY_DELAY_MS: i64 = 5_000;
 const ERASE_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -119,15 +119,15 @@ fn current_time_ms() -> i64 {
 mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
-    use super::super::config::ManagedLakeConfig;
-    use super::super::store::{
+    use super::run_erase_jobs_once_with;
+    use crate::connector::starrocks::managed::config::ManagedLakeConfig;
+    use crate::connector::starrocks::managed::store::{
         ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
         ManagedTxnState, SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob,
         StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
         StoredManagedTablet, StoredManagedTxn,
     };
-    use super::run_erase_jobs_once_with;
 
     fn test_managed_config() -> ManagedLakeConfig {
         ManagedLakeConfig {

@@ -18,29 +18,27 @@ use crate::runtime::global_async_runtime::data_block_on;
 use self::catalog::{
     DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table, normalize_identifier,
 };
-use super::iceberg::{
-    IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
-    namespace_exists as iceberg_namespace_exists,
-    register_existing_table as register_existing_iceberg_table,
-};
-use super::lake::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
-use super::lake::{
-    ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
+use crate::connector::{
+    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, MetadataSnapshot,
+    SqliteMetadataStore, StoredIcebergTable, create_iceberg_namespace, iceberg_namespace_exists,
+    register_existing_iceberg_table, register_managed_tables_in_catalog, runtime_registered,
 };
 
 pub(crate) mod aggregate;
+pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
-pub(crate) mod iceberg_glue;
 pub(crate) mod insert;
+pub(crate) mod insert_flow;
+pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
+pub(crate) mod query_prep;
 pub(crate) mod sqlparse;
 pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
-use self::parquet::write_parquet_to_path;
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
 #[cfg(test)]
@@ -50,8 +48,7 @@ use self::sqlparse::statement::{
     convert_sqlparser_insert_to_custom, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
-    execute_truncate_table_statement, extract_table_names_from_query,
-    extract_three_part_table_refs, looks_like_add_files, parse_add_files_sql,
+    execute_truncate_table_statement, extract_three_part_table_refs, looks_like_add_files,
     strip_catalog_from_three_part_names,
 };
 use self::stream_load::{
@@ -146,8 +143,9 @@ pub(crate) fn build_string_query_result(
 
 pub(crate) struct StandaloneState {
     pub(crate) catalog: RwLock<InMemoryCatalog>,
-    pub(crate) iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
+    pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
     pub(crate) exchange_port: u16,
@@ -159,8 +157,9 @@ impl Default for StandaloneState {
     fn default() -> Self {
         Self {
             catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
             metadata_store: None,
             exchange_port: 0,
@@ -238,9 +237,10 @@ impl StandaloneNovaRocks {
             _test_guard,
             ..Default::default()
         });
+        register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
         if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
-            super::lake::erase::spawn_erase_worker(Arc::clone(&inner));
+            crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
         }
         Ok(Self { inner })
     }
@@ -392,6 +392,10 @@ impl StandaloneNovaRocks {
     ) -> Result<StandaloneStreamLoadResult, String> {
         stream_load_managed_lake_table(&self.inner, request)
     }
+}
+
+fn register_connector_backends(state: &Arc<StandaloneState>) {
+    crate::connector::register_standalone_backends(state);
 }
 
 impl StandaloneSession {
@@ -600,46 +604,12 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        let (table_parts, s3_path) = parse_add_files_sql(sql)?;
-
-        // Resolve catalog and namespace
-        let (catalog_name, namespace, table_name) = match table_parts.len() {
-            1 => {
-                let cat = current_catalog
-                    .ok_or("ADD FILES requires a catalog context (use SET catalog)")?;
-                (
-                    cat.to_string(),
-                    current_database.to_string(),
-                    table_parts[0].clone(),
-                )
-            }
-            2 => {
-                let cat = current_catalog.ok_or("ADD FILES requires a catalog context")?;
-                (
-                    cat.to_string(),
-                    table_parts[0].clone(),
-                    table_parts[1].clone(),
-                )
-            }
-            3 => (
-                table_parts[0].clone(),
-                table_parts[1].clone(),
-                table_parts[2].clone(),
-            ),
-            _ => return Err(format!("invalid table name in ADD FILES")),
-        };
-
-        let guard = self
-            .inner
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg catalog read lock");
-        let entry = guard.get(&catalog_name)?;
-        drop(guard);
-        let count =
-            super::iceberg::add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
-        let msg = format!("Added {count} file(s)");
-        build_string_query_result("status", vec![msg]).map(StatementResult::Query)
+        crate::standalone::engine::query_prep::add_files(
+            &self.inner,
+            sql,
+            current_catalog,
+            current_database,
+        )
     }
 
     /// Handle CREATE CATALOG result.
@@ -736,18 +706,20 @@ pub(crate) fn dispatch_statement(
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
 ) -> Result<StatementResult, String> {
+    use crate::sql::parser::ast::Statement;
+
     match statement {
-        crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) => {
-            super::lake::mv_ddl::create_mv(state, current_database, &stmt)
+        Statement::CreateMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::create_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::DropMaterializedView(stmt) => {
-            super::lake::mv_ddl::drop_mv(state, current_database, &stmt)
+        Statement::DropMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::drop_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => {
-            super::lake::mv_refresh::refresh_mv(state, current_database, &stmt)
+        Statement::RefreshMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::ShowMaterializedViews(stmt) => {
-            super::lake::mv_ddl::list_mvs(state, &stmt)
+        Statement::ShowMaterializedViews(stmt) => {
+            crate::standalone::engine::mv_flow::list_mvs(state, &stmt)
         }
     }
 }
@@ -758,7 +730,12 @@ pub(crate) fn register_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, false)
+    crate::standalone::engine::query_prep::register_external_tables_for_query(
+        state,
+        current_catalog,
+        current_database,
+        query,
+    )
 }
 
 fn refresh_iceberg_tables_for_query(
@@ -767,339 +744,11 @@ fn refresh_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, true)
-}
-
-fn register_empty_iceberg_table(
-    namespace: &str,
-    table_name: &str,
-    columns: &[crate::sql::catalog::ColumnDef],
-) -> Result<TableStorage, String> {
-    let dir = std::env::temp_dir().join("novarocks_iceberg_empty");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create empty dir: {e}"))?;
-    let path = dir.join(format!("{}_{}.parquet", namespace, table_name));
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
-        columns
-            .iter()
-            .map(|column| {
-                arrow::datatypes::Field::new(
-                    &column.name,
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let empty_arrays: Vec<arrow::array::ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| arrow::array::new_empty_array(field.data_type()))
-        .collect();
-    let empty_batch = RecordBatch::try_new(schema, empty_arrays)
-        .map_err(|e| format!("build empty batch: {e}"))?;
-    write_parquet_to_path(&path, &empty_batch)?;
-    Ok(TableStorage::LocalParquetFile { path })
-}
-
-fn build_iceberg_table_def_with_files(
-    entry: &crate::standalone::iceberg::IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::standalone::iceberg::IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<crate::sql::catalog::TableDef, String> {
-    let storage = if entry.is_s3() {
-        let cloud_properties = entry.cloud_properties_map();
-        crate::sql::catalog::TableStorage::S3ParquetFiles {
-            files: data_files
-                .into_iter()
-                .map(|(path, size, row_count)| crate::sql::catalog::S3FileInfo {
-                    path,
-                    size,
-                    row_count,
-                    column_stats: None,
-                })
-                .collect(),
-            cloud_properties,
-        }
-    } else if let Some((first_path, _, _)) = data_files.first() {
-        let local_path = first_path.strip_prefix("file://").unwrap_or(first_path);
-        crate::sql::catalog::TableStorage::LocalParquetFile {
-            path: std::path::PathBuf::from(local_path),
-        }
-    } else {
-        register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
-    };
-
-    Ok(crate::sql::catalog::TableDef {
-        name: table_name.to_string(),
-        columns: loaded.columns,
-        storage,
-    })
-}
-
-fn register_loaded_iceberg_table_with_files(
-    state: &Arc<StandaloneState>,
-    entry: &crate::standalone::iceberg::IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::standalone::iceberg::IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<(), String> {
-    let table_def =
-        build_iceberg_table_def_with_files(entry, namespace, table_name, loaded, data_files)?;
-    let mut guard = state.catalog.write().expect("catalog write lock");
-    guard.create_database(namespace).ok();
-    guard
-        .register(namespace, table_def)
-        .map_err(|e| format!("register iceberg table: {e}"))?;
-    Ok(())
-}
-
-fn register_iceberg_tables_for_query_impl(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-    force_refresh: bool,
-) -> Result<(), String> {
-    let mut targets = if let Some(catalog_name) = current_catalog {
-        extract_table_names_from_query(query)
-            .into_iter()
-            .map(|table_name| {
-                (
-                    catalog_name.to_string(),
-                    current_database.to_string(),
-                    table_name,
-                )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        extract_three_part_table_refs(query)
-    };
-    if targets.is_empty() {
-        return Ok(());
-    }
-    targets.sort();
-    targets.dedup();
-
-    let iceberg_guard = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalog read lock");
-    for (catalog_name, namespace, table_name) in targets {
-        let entry = match iceberg_guard.get(&catalog_name) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-
-        if !force_refresh {
-            let local = state.catalog.read().expect("catalog read lock");
-            if local.get(&namespace, &table_name).is_ok() {
-                continue;
-            }
-        }
-
-        let loaded = match super::iceberg::load_table(&entry, &namespace, &table_name) {
-            Ok(loaded) => loaded,
-            Err(_) => continue,
-        };
-
-        let data_files = super::iceberg::extract_data_files(&loaded.table)?;
-        register_loaded_iceberg_table_with_files(
-            state,
-            &entry,
-            &namespace,
-            &table_name,
-            loaded,
-            data_files,
-        )?;
-    }
-
-    Ok(())
-}
-
-pub(crate) fn execute_query_for_mv_refresh(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-) -> Result<QueryResult, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
-    };
-
-    let three_parts = extract_three_part_table_refs(&query);
-    if !three_parts.is_empty() {
-        refresh_iceberg_tables_for_query(state, None, current_database, &query)?;
-    }
-
-    let mut executable = query.as_ref().clone();
-    if !three_parts.is_empty() {
-        strip_catalog_from_three_part_names(&mut executable);
-    }
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
-    execute_query(
-        &executable,
-        &catalog,
+    crate::standalone::engine::query_prep::refresh_external_tables_for_query(
+        state,
+        current_catalog,
         current_database,
-        state.exchange_port,
-        None,
-    )
-}
-
-fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
-) -> Result<(String, String, String), String> {
-    Ok((
-        normalize_identifier(&base_ref.catalog)?,
-        normalize_identifier(&base_ref.namespace)?,
-        normalize_identifier(&base_ref.table)?,
-    ))
-}
-
-fn extract_three_part_table_ref_occurrences(
-    query: &sqlparser::ast::Query,
-) -> Vec<(String, String, String)> {
-    let mut refs = Vec::new();
-    extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), &mut refs);
-    refs
-}
-
-fn extract_three_part_ref_occurrences_from_set_expr(
-    expr: &sqlparser::ast::SetExpr,
-    refs: &mut Vec<(String, String, String)>,
-) {
-    match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
-            for from in &select.from {
-                extract_three_part_ref_occurrences_from_factor(&from.relation, refs);
-                for join in &from.joins {
-                    extract_three_part_ref_occurrences_from_factor(&join.relation, refs);
-                }
-            }
-        }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            extract_three_part_ref_occurrences_from_set_expr(left, refs);
-            extract_three_part_ref_occurrences_from_set_expr(right, refs);
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), refs);
-        }
-        _ => {}
-    }
-}
-
-fn extract_three_part_ref_occurrences_from_factor(
-    factor: &sqlparser::ast::TableFactor,
-    refs: &mut Vec<(String, String, String)>,
-) {
-    match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
-            let parts: Vec<String> = name
-                .0
-                .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_lowercase())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if parts.len() == 3 {
-                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
-            }
-        }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            extract_three_part_ref_occurrences_from_set_expr(subquery.body.as_ref(), refs);
-        }
-        _ => {}
-    }
-}
-
-fn validate_incremental_mv_base_ref(
-    query: &sqlparser::ast::Query,
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
-) -> Result<(String, String, String), String> {
-    let refs = extract_three_part_table_ref_occurrences(query);
-    if refs.len() != 1 {
-        return Err(format!(
-            "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got {}",
-            refs.len()
-        ));
-    }
-
-    let actual = {
-        let (catalog, namespace, table) = &refs[0];
-        (
-            normalize_identifier(catalog).map_err(|e| {
-                format!("incremental MV refresh stored SQL has invalid catalog reference: {e}")
-            })?,
-            normalize_identifier(namespace).map_err(|e| {
-                format!("incremental MV refresh stored SQL has invalid namespace reference: {e}")
-            })?,
-            normalize_identifier(table).map_err(|e| {
-                format!("incremental MV refresh stored SQL has invalid table reference: {e}")
-            })?,
-        )
-    };
-    let expected = normalize_incremental_mv_base_ref(base_ref)?;
-    if actual != expected {
-        return Err(format!(
-            "incremental MV refresh stored SQL base table mismatch: expected {}.{}.{}, got {}.{}.{}",
-            expected.0, expected.1, expected.2, actual.0, actual.1, actual.2
-        ));
-    }
-    Ok(expected)
-}
-
-pub(crate) fn execute_query_for_mv_incremental_refresh(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
-    delta_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<QueryResult, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
-    };
-
-    let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(&catalog_name)?
-    };
-    if !entry.is_s3() && delta_files.len() > 1 {
-        return Err(
-            "incremental MV refresh over local iceberg supports at most one delta file".to_string(),
-        );
-    }
-
-    let loaded = super::iceberg::load_table(&entry, &namespace, &table_name)?;
-    let table_def =
-        build_iceberg_table_def_with_files(&entry, &namespace, &table_name, loaded, delta_files)?;
-    let mut incremental_catalog = InMemoryCatalog::default();
-    incremental_catalog.create_database(&namespace)?;
-    incremental_catalog
-        .register(&namespace, table_def)
-        .map_err(|e| format!("register incremental iceberg table: {e}"))?;
-
-    let mut executable = query.as_ref().clone();
-    strip_catalog_from_three_part_names(&mut executable);
-    execute_query(
-        &executable,
-        &incremental_catalog,
-        current_database,
-        state.exchange_port,
-        None,
+        query,
     )
 }
 
@@ -1204,7 +853,7 @@ fn restore_managed_lake(
         return Ok(());
     };
     let mut managed = snapshot.managed.clone();
-    super::lake::reconcile_on_open(store, &mut managed, |snapshot, txn| {
+    crate::connector::reconcile_managed_on_open(store, &mut managed, |snapshot, txn| {
         let tablet_ids = snapshot
             .tablets
             .iter()
@@ -1217,7 +866,7 @@ fn restore_managed_lake(
             })
             .map(|tablet| tablet.tablet_id)
             .collect::<Vec<_>>();
-        super::lake::txn::publish_tablets_at_version(
+        crate::connector::publish_tablets_at_version(
             tablet_ids,
             txn.txn_id,
             txn.base_version,
@@ -1819,7 +1468,7 @@ fn stream_load_managed_lake_table(
     };
     let loaded_rows = rows.len() as i64;
     let loaded_bytes = request.payload.len() as i64;
-    super::lake::txn::insert_into_managed_lake_table(
+    crate::connector::insert_into_managed_lake_table(
         state,
         &object_name,
         &insert_columns,
@@ -1840,7 +1489,7 @@ fn stream_load_managed_lake_table(
 mod tests {
     use super::{
         StandaloneNovaRocks, StandaloneOptions, StandaloneState, StatementResult,
-        dispatch_statement,
+        dispatch_statement, register_connector_backends,
     };
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -2906,7 +2555,7 @@ enable_path_style_access = true
             registry.get("ice").expect("load iceberg catalog entry")
         };
         let first_loaded =
-            crate::standalone::iceberg::load_table(&entry, "db1", "tbl").expect("load first table");
+            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()
@@ -2919,19 +2568,17 @@ enable_path_style_access = true
             .expect("insert second iceberg row");
         assert!(matches!(second_insert, StatementResult::Ok));
 
-        let second_loaded = crate::standalone::iceberg::load_table(&entry, "db1", "tbl")
-            .expect("load second table");
-        let delta = crate::standalone::iceberg::plan_append_delta(
-            &second_loaded.table,
-            previous_snapshot_id,
-        )
-        .expect("plan append delta");
+        let second_loaded =
+            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
+        let delta =
+            crate::connector::plan_iceberg_append_delta(&second_loaded.table, previous_snapshot_id)
+                .expect("plan append delta");
 
-        let result = super::execute_query_for_mv_incremental_refresh(
+        let result = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl order by id",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "tbl".to_string(),
@@ -2988,11 +2635,11 @@ enable_path_style_access = true
             .expect("create iceberg table");
         assert!(matches!(create_table, StatementResult::Ok));
 
-        let err = super::execute_query_for_mv_incremental_refresh(
+        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "other".to_string(),
@@ -3009,13 +2656,13 @@ enable_path_style_access = true
     #[test]
     fn execute_mv_incremental_refresh_rejects_zero_or_multiple_base_refs() {
         let state = Arc::new(StandaloneState::default());
-        let base_ref = crate::standalone::lake::store::IcebergTableRef {
+        let base_ref = crate::connector::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "tbl".to_string(),
         };
 
-        let err = super::execute_query_for_mv_incremental_refresh(
+        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &state,
             "default",
             "select 1",
@@ -3030,7 +2677,7 @@ enable_path_style_access = true
             "err={err}"
         );
 
-        let err = super::execute_query_for_mv_incremental_refresh(
+        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &state,
             "default",
             "select * from ice.db1.tbl t join ice.db1.other o on t.id = o.id",
@@ -3045,7 +2692,7 @@ enable_path_style_access = true
             "err={err}"
         );
 
-        let err = super::execute_query_for_mv_incremental_refresh(
+        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &state,
             "default",
             "select * from ice.db1.tbl t join ice.db1.tbl u on t.id = u.id",
@@ -3100,7 +2747,7 @@ enable_path_style_access = true
             registry.get("ice").expect("load iceberg catalog entry")
         };
         let first_loaded =
-            crate::standalone::iceberg::load_table(&entry, "db1", "tbl").expect("load first table");
+            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()
@@ -3113,25 +2760,23 @@ enable_path_style_access = true
             .expect("insert second iceberg row");
         assert!(matches!(second_insert, StatementResult::Ok));
 
-        let second_loaded = crate::standalone::iceberg::load_table(&entry, "db1", "tbl")
-            .expect("load second table");
-        let mut delta_files = crate::standalone::iceberg::plan_append_delta(
-            &second_loaded.table,
-            previous_snapshot_id,
-        )
-        .expect("plan append delta")
-        .added_files;
+        let second_loaded =
+            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
+        let mut delta_files =
+            crate::connector::plan_iceberg_append_delta(&second_loaded.table, previous_snapshot_id)
+                .expect("plan append delta")
+                .added_files;
         let first_delta_file = delta_files
             .first()
             .expect("at least one delta file")
             .clone();
         delta_files.push(first_delta_file);
 
-        let err = super::execute_query_for_mv_incremental_refresh(
+        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "tbl".to_string(),
@@ -3311,7 +2956,8 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks as starrocks_connector;
+        use starrocks_connector::managed::store::{
             ManagedIndexState, ManagedPartitionState, SqliteMetadataStore, StoredManagedIndex,
             StoredManagedPartition, StoredManagedTablet,
         };
@@ -3449,7 +3095,8 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks as starrocks_connector;
+        use starrocks_connector::managed::store::{
             ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
             ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
             SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
@@ -3586,6 +3233,7 @@ enable_path_style_access = true
     #[test]
     fn dispatch_statement_routes_materialized_view_ast_variants() {
         let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
         let err = dispatch_statement(
             &state,
             "analytics",
@@ -3599,7 +3247,9 @@ enable_path_style_access = true
         )
         .expect_err("refresh should fail without managed lake config");
         assert!(
-            err.contains("managed lake config is missing") || err.contains("materialized view"),
+            err.contains("managed lake config is missing")
+                || err.contains("sqlite metadata store")
+                || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
     }

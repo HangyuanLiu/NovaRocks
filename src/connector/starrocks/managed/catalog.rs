@@ -14,15 +14,15 @@ use crate::connector::starrocks::lake::context::{
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-use super::super::engine::catalog::{
+use super::store::{
+    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
+    SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
+    StoredManagedTable, StoredManagedTablet,
+};
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
+use crate::standalone::engine::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     normalize_identifier,
-};
-use super::config::ManagedLakeConfig;
-use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-    ManagedTxnState, SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex,
-    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -229,7 +229,7 @@ impl ManagedLakeCatalog {
                     table.table_id, table.db_id
                 )
             })?;
-            let (schema, tablet_schema) = schemas_by_id
+            let (_, tablet_schema) = schemas_by_id
                 .get(&table.current_schema_id)
                 .cloned()
                 .ok_or_else(|| {
@@ -277,7 +277,6 @@ impl ManagedLakeCatalog {
                 ManagedTableRuntime {
                     database_name,
                     table: table.clone(),
-                    schema,
                     tablet_schema,
                     columns: columns_by_schema
                         .remove(&table.current_schema_id)
@@ -370,7 +369,6 @@ impl ManagedLakeCatalog {
 pub(crate) struct ManagedTableRuntime {
     pub(crate) database_name: String,
     pub(crate) table: StoredManagedTable,
-    pub(crate) schema: StoredManagedSchema,
     pub(crate) tablet_schema: TabletSchemaPb,
     pub(crate) columns: Vec<StoredManagedColumn>,
     pub(crate) partitions: Vec<StoredManagedPartition>,
@@ -699,6 +697,7 @@ fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::starrocks::managed::store::{ManagedTableKind, StoredManagedSchema};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
     use crate::standalone::engine::catalog::DEFAULT_DATABASE;
@@ -716,12 +715,6 @@ mod tests {
                 current_schema_id: 30,
                 state: ManagedTableState::Active,
                 kind: ManagedTableKind::Table,
-            },
-            schema: StoredManagedSchema {
-                schema_id: 30,
-                table_id: 20,
-                schema_version: 0,
-                tablet_schema_pb: vec![],
             },
             tablet_schema: TabletSchemaPb {
                 column: vec![
@@ -916,7 +909,7 @@ mod tests {
     }
 
     fn snapshot_seed() -> ManagedSnapshot {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks::managed::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
         };
         ManagedSnapshot {
@@ -1071,7 +1064,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_aborts_prepared_txns_without_replay() {
-        use crate::standalone::lake::store::StoredManagedTxn;
+        use crate::connector::starrocks::managed::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 90,
@@ -1100,7 +1093,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_replays_written_txns_and_advances_partition() {
-        use crate::standalone::lake::store::StoredManagedTxn;
+        use crate::connector::starrocks::managed::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 91,

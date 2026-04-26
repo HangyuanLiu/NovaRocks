@@ -8,16 +8,16 @@ use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
-use super::super::engine::catalog::normalize_identifier;
-use super::super::engine::{StandaloneState, StatementResult};
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
-use super::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
     ManagedTxnState, StageManagedTruncateRequest, StagedManagedTruncate, StoredManagedColumn,
     StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
     StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
 };
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
+use crate::standalone::engine::catalog::normalize_identifier;
+use crate::standalone::engine::{StandaloneState, StatementResult};
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
 const DEFAULT_MANAGED_BUCKET_COUNT: u32 = 1;
@@ -1162,19 +1162,18 @@ mod tests {
 
     use prost::Message;
 
-    use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
-    use crate::standalone::engine::StandaloneState;
-    use crate::standalone::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
-    use crate::standalone::lake::store::{
+    use crate::connector::starrocks::managed::catalog::register_managed_table_in_catalog;
+    use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
         StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
-    use crate::standalone::lake::{
-        ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
-    };
+    use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
+    use crate::standalone::engine::StandaloneState;
+    use crate::standalone::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
 
     use super::{
         build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,

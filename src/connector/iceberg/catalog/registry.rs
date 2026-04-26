@@ -12,7 +12,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
@@ -32,8 +31,8 @@ use tokio::runtime::Handle;
 
 use crate::runtime::global_async_runtime::data_block_on;
 
-use super::super::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
+use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
@@ -42,7 +41,6 @@ pub(crate) struct IcebergCatalogRegistry {
 
 #[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
-    pub(crate) name: String,
     pub(crate) warehouse_uri: String,
     pub(crate) properties: Vec<(String, String)>,
     s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
@@ -155,8 +153,9 @@ pub(crate) fn namespace_exists(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let (_, root_prefix) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+                .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
             match op.list(&ns_prefix).await {
@@ -199,8 +198,9 @@ pub(crate) fn list_tables(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let (_, root_prefix) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+                .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
             let entries = op
@@ -324,8 +324,9 @@ pub(crate) fn load_table(
         // S3 path: discover metadata from S3 directly
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let (_, root_prefix) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+                .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let meta_prefix = format!(
             "{}/{}/{}/metadata/",
             root_prefix.trim_end_matches('/'),
@@ -361,7 +362,7 @@ pub(crate) fn load_table(
             format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
 
         let storage_factory =
-            super::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+            crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
                 .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
         let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
 
@@ -457,6 +458,7 @@ pub(crate) fn insert_rows(
     rows: &[Vec<Literal>],
 ) -> Result<(), String> {
     let loaded = load_table(entry, namespace_name, table_name)?;
+    reject_unsupported_iceberg_table_semantics(&loaded)?;
     let batch = build_insert_batch(&loaded, rows)?;
 
     let catalog = build_hadoop_catalog(entry)?;
@@ -527,34 +529,19 @@ pub(crate) fn insert_rows(
     Ok(())
 }
 
-/// Extract data file paths, sizes, and row counts from an Iceberg table via scan planning.
-pub(crate) fn extract_data_files(
-    table: &iceberg::table::Table,
-) -> Result<Vec<(String, i64, Option<i64>)>, String> {
-    block_on_iceberg(async {
-        let scan = table
-            .scan()
-            .build()
-            .map_err(|e| format!("build scan: {e}"))?;
-        let tasks: Vec<_> = scan
-            .plan_files()
-            .await
-            .map_err(|e| format!("plan files: {e}"))?
-            .try_collect()
-            .await
-            .map_err(|e| format!("collect tasks: {e}"))?;
-        Ok(tasks
-            .iter()
-            .map(|t| {
-                (
-                    t.data_file_path.clone(),
-                    i64::try_from(t.file_size_in_bytes).unwrap_or(i64::MAX),
-                    t.record_count.map(|c| i64::try_from(c).unwrap_or(i64::MAX)),
-                )
-            })
-            .collect())
-    })
-    .map_err(|e| format!("extract data files runtime: {e}"))?
+fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Result<(), String> {
+    if let Some(key_desc) = loaded.key_desc.as_ref()
+        && key_desc.kind != TableKeyKind::Duplicate
+    {
+        return Err(format!(
+            "iceberg INSERT does not support {:?} key table semantics",
+            key_desc.kind
+        ));
+    }
+    if !loaded.column_aggregations.is_empty() {
+        return Err("iceberg INSERT does not support aggregate column semantics".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -890,13 +877,14 @@ fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(properties)
+        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(properties)
             .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;
-        let (bucket, _root_prefix) = super::add_files::parse_s3_path(&raw_warehouse)
-            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let (bucket, _root_prefix) =
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
+                .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let cfg = crate::fs::object_store::ObjectStoreConfig {
             endpoint: s3_factory.endpoint.clone(),
             bucket,
@@ -937,7 +925,6 @@ fn build_catalog_entry(
     );
 
     let entry = IcebergCatalogEntry {
-        name: catalog_name.to_string(),
         warehouse_uri,
         properties: sorted_properties(&props),
         s3_config,
@@ -952,9 +939,9 @@ fn build_catalog_entry(
 /// convention (`v{N}.metadata.json` + `version-hint.text`).
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
+) -> Result<crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(
+        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
             &entry.properties,
         )
         .ok_or_else(|| {
@@ -966,10 +953,12 @@ pub(crate) fn build_hadoop_catalog(
         Arc::new(iceberg::io::LocalFsStorageFactory)
     };
     let file_io = iceberg::io::FileIOBuilder::new(storage_factory).build();
-    Ok(super::hadoop_catalog::HadoopFileSystemCatalog::new(
-        file_io,
-        entry.warehouse_uri.clone(),
-    ))
+    Ok(
+        crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+            file_io,
+            entry.warehouse_uri.clone(),
+        ),
+    )
 }
 
 pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>

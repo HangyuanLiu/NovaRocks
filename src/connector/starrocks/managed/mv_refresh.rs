@@ -1,22 +1,26 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
-use crate::standalone::engine::{
-    QueryResult, StandaloneState, StatementResult, execute_query_for_mv_incremental_refresh,
-    execute_query_for_mv_refresh, record_batch_to_chunk,
+use crate::standalone::engine::mv_flow::{
+    execute_query_for_mv_incremental_refresh, execute_query_for_mv_refresh,
 };
-use crate::standalone::iceberg::{load_table, plan_append_delta};
+use crate::standalone::engine::{
+    QueryResult, StandaloneState, StatementResult, record_batch_to_chunk,
+};
 
-use super::catalog::{ManagedLakeCatalog, register_managed_tables_in_catalog};
-use super::ddl::bootstrap_empty_partition_for_tablets;
-use super::store::{
+use crate::connector::starrocks::managed::catalog::{
+    ManagedLakeCatalog, register_managed_tables_in_catalog,
+};
+use crate::connector::starrocks::managed::ddl::bootstrap_empty_partition_for_tablets;
+use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, IcebergTableRef, ManagedPartitionState, ManagedTableKind,
     StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
 };
-use super::txn::{
+use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, write_chunks_into_managed_partition,
     write_chunks_into_managed_partition_for_mv_refresh,
 };
@@ -407,7 +411,7 @@ fn normalize_three_part_base_table(
 fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
     table_ref: &IcebergTableRef,
-) -> Result<crate::standalone::iceberg::IcebergLoadedTable, String> {
+) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -445,7 +449,7 @@ fn collect_current_snapshots(
 
 fn collect_current_snapshots_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &super::store::SqliteMetadataStore,
+    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     refs: &[IcebergTableRef],
@@ -477,7 +481,7 @@ fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String>
 
 fn cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &super::store::SqliteMetadataStore,
+    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     enqueue_erase_job: bool,
@@ -544,16 +548,16 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
 mod tests {
     use super::*;
 
-    use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::iceberg::IcebergCatalogRegistry;
-    use crate::standalone::lake::ManagedLakeConfig;
-    use crate::standalone::lake::store::{
+    use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
+    use crate::connector::starrocks::managed::ManagedLakeConfig;
+    use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,
         StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
         StoredMaterializedView,
     };
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::standalone::engine::catalog::InMemoryCatalog;
     use std::sync::RwLock;
 
     #[test]
@@ -614,8 +618,9 @@ mod tests {
         let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild");
         let state = Arc::new(StandaloneState {
             catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             managed_lake: RwLock::new(managed),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
             metadata_store: Some(store.clone()),
             exchange_port: 0,

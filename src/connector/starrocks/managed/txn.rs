@@ -6,11 +6,12 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
+use crate::connector::starrocks::lake::append_lake_txn_log_with_chunk_rowset;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
+use crate::connector::starrocks::lake::transactions::publish_version;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
-use crate::connector::starrocks::lake::{append_lake_txn_log_with_chunk_rowset, publish_version};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };
@@ -20,14 +21,14 @@ use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
-use crate::sql::parser::ast::{InsertSource, ObjectName};
+use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
-use super::super::engine::catalog::{ColumnDef, normalize_identifier};
-use super::super::engine::{
+use super::catalog::register_managed_table_in_catalog;
+use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::standalone::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     execute_query, insert_generate_series_rows_local, reorder_insert_rows,
 };
-use super::catalog::register_managed_table_in_catalog;
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,
@@ -95,6 +96,45 @@ pub(crate) fn insert_into_managed_lake_table(
     let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
     write_chunks_into_managed_partition(state, plan, &[chunk])?;
     Ok(StatementResult::Ok)
+}
+
+pub(crate) fn insert_rows_into_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    rows: &[Vec<Literal>],
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database)?,
+        table: normalize_identifier(table)?,
+    };
+    let plan = load_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let batch = build_local_insert_batch(&plan.columns, rows)?;
+    let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
+    write_chunks_into_managed_partition(state, plan, &[chunk])?;
+    Ok(())
+}
+
+pub(crate) fn insert_batch_into_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    batch: RecordBatch,
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database)?,
+        table: normalize_identifier(table)?,
+    };
+    let plan = load_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
+    write_chunks_into_managed_partition(state, plan, &[chunk])?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -839,7 +879,7 @@ fn resolve_managed_name(
     name: &ObjectName,
     current_database: &str,
 ) -> Result<ResolvedLocalTableName, String> {
-    use super::super::engine::catalog::normalize_identifier;
+    use crate::standalone::engine::catalog::normalize_identifier;
     match name.parts.as_slice() {
         [table] => Ok(ResolvedLocalTableName {
             database: normalize_identifier(current_database)?,
@@ -864,6 +904,15 @@ mod mv_target_tests {
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
+    use crate::connector::starrocks::managed::store::{
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
+        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
+    };
+    use crate::connector::starrocks::managed::{
+        ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
+    };
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
     };
@@ -871,15 +920,6 @@ mod mv_target_tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::lake::store::{
-        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
-        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
-        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
-    };
-    use crate::standalone::lake::{
-        ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
-    };
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
@@ -1186,14 +1226,14 @@ mod mv_target_tests {
                 tablet_schema_pb: tablet_schema.encode_to_vec(),
             }],
             columns: vec![
-                crate::standalone::lake::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::store::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 0,
                     column_name: "k1".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
                 },
-                crate::standalone::lake::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::store::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 1,
                     column_name: "total".to_string(),
