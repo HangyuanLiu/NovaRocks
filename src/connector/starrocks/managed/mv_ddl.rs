@@ -9,14 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::engine::catalog::normalize_identifier;
+use crate::engine::{record_batch_to_chunk, register_iceberg_tables_for_query};
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
     ShowMaterializedViewsStmt, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
-use crate::standalone::engine::catalog::normalize_identifier;
-use crate::standalone::engine::{record_batch_to_chunk, register_iceberg_tables_for_query};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -38,7 +38,7 @@ use crate::connector::starrocks::managed::store::{
     StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
     StoredManagedTxn, StoredMaterializedView,
 };
-use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
 /// Only the `Iceberg` variant is allowed; anything else fails validation.
@@ -530,9 +530,7 @@ pub(crate) fn analyze_mv_select(
     let mut analyzed_query = query.clone();
     register_iceberg_tables_for_query(state, None, current_database, &analyzed_query)?;
     if has_three_part_refs(&resolved_refs) {
-        crate::standalone::engine::sqlparse::statement::strip_catalog_from_three_part_names(
-            &mut analyzed_query,
-        );
+        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
     }
     let catalog = state.catalog.read().expect("standalone catalog read lock");
     let (resolved, _) =
@@ -955,7 +953,7 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
-    use crate::standalone::engine::catalog::InMemoryCatalog;
+    use crate::engine::catalog::InMemoryCatalog;
 
     fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
         let stmt = crate::sql::parser::parse_sql(sql).expect("parse").remove(0);

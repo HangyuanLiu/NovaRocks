@@ -158,9 +158,7 @@ impl ConnectorRegistry {
     }
 }
 
-pub(crate) fn register_standalone_backends(
-    state: &Arc<crate::standalone::engine::StandaloneState>,
-) {
+pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
     let mut connectors = state
         .connectors
         .write()

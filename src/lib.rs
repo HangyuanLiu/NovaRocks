@@ -19,14 +19,15 @@ include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
 pub mod cache;
 pub mod common;
 pub mod connector;
+pub mod engine;
 pub mod exec;
 pub mod formats;
 pub mod fs;
 pub mod lower;
 pub mod runtime;
+pub mod server;
 pub mod service;
 pub mod sql;
-pub mod standalone;
 pub mod version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::app_config as novarocks_config;

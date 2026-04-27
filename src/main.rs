@@ -27,12 +27,10 @@ use std::time::{Duration, Instant};
 
 use arrow::util::pretty::pretty_format_batches;
 use novarocks::common::network;
+use novarocks::engine::{StandaloneNovaRocks, StandaloneOptions};
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
-use novarocks::standalone::{
-    StandaloneNovaRocks, StandaloneOptions, StandaloneServerOptions, StandaloneTableConfig,
-    run_standalone_server,
-};
+use novarocks::server::{StandaloneServerOptions, StandaloneTableConfig, run_standalone_server};
 use std::eprintln;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -888,7 +886,7 @@ mod tests {
         StandaloneCliArgs, StandaloneServerCliArgs, parse_standalone_args,
         parse_standalone_server_args,
     };
-    use novarocks::standalone::StandaloneTableConfig;
+    use novarocks::server::StandaloneTableConfig;
 
     #[test]
     fn parse_standalone_args_accepts_required_shape() {

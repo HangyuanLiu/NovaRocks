@@ -11,13 +11,13 @@ use sqlparser::ast as sqlast;
 
 use crate::connector::backend::ResolvedTable;
 use crate::connector::{IcebergCatalogEntry, insert_iceberg_rows};
+use crate::engine::StandaloneState;
+use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::reorder_insert_rows;
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
-use crate::standalone::engine::StandaloneState;
-use crate::standalone::engine::backend_resolver::TargetBackend;
-use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::engine::reorder_insert_rows;
 
-use super::expr::{cast_literal, eval_literal_arithmetic, sqlparser_expr_to_literal};
+use super::sql_expr::{cast_literal, eval_literal_arithmetic, sqlparser_expr_to_literal};
 
 pub(crate) fn parse_generate_series_function_expr(
     expr: &sqlast::Expr,

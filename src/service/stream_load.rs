@@ -1095,7 +1095,7 @@ pub(crate) fn handle_stream_load(
     let label = options.label.clone().unwrap_or_else(generate_label);
     let mut stats = LoadStats::default();
 
-    if let Some(engine) = crate::standalone::current_stream_load_engine()
+    if let Some(engine) = crate::engine::current_stream_load_engine()
         && engine.has_local_table(&db, &table)
     {
         if let Err(err) = ensure_standalone_stream_load_supported(&options) {
@@ -1112,7 +1112,7 @@ pub(crate) fn handle_stream_load(
         }
 
         let local_started = Instant::now();
-        let request = crate::standalone::StandaloneStreamLoadRequest {
+        let request = crate::engine::StandaloneStreamLoadRequest {
             database: db.clone(),
             table: table.clone(),
             format_type: options.format_type,

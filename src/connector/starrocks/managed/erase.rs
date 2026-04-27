@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::connector::starrocks::managed::store::{ManagedEraseJobKind, SqliteMetadataStore};
+use crate::engine::StandaloneState;
 use crate::fs::oss::{oss_block_on, resolve_oss_operator_and_path_with_config};
 use crate::novarocks_logging::warn;
-use crate::standalone::engine::StandaloneState;
 
 const ERASE_RETRY_DELAY_MS: i64 = 5_000;
 const ERASE_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);

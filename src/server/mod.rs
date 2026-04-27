@@ -23,8 +23,8 @@ use crate::novarocks_config::{
 use crate::version;
 
 use self::encoding::write_query_result;
-use super::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
-use super::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
+use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -59,7 +59,7 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
         metadata_db_path: None,
     })?;
     preload_tables(&engine, &resolved.tables)?;
-    super::register_stream_load_engine(engine.clone());
+    crate::engine::register_stream_load_engine(engine.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

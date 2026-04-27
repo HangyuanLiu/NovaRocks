@@ -8,12 +8,12 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::ResolvedTable;
+use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
+use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::insert::reorder_insert_rows;
+use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{InsertSource, ObjectName};
-use crate::standalone::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
-use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::engine::insert::reorder_insert_rows;
-use crate::standalone::engine::{StandaloneState, StatementResult};
 
 pub(crate) fn run_insert(
     state: &Arc<StandaloneState>,
@@ -44,12 +44,8 @@ pub(crate) fn run_insert(
             sink.append_rows(&resolved, &reordered)?;
         }
         InsertSource::GenerateSeriesSelect(source) => {
-            crate::standalone::engine::sqlparse::generate_series::insert_generate_series_rows_by_backend(
-                state,
-                &target,
-                &resolved,
-                source,
-                columns,
+            crate::engine::generate_series::insert_generate_series_rows_by_backend(
+                state, &target, &resolved, source, columns,
             )?;
         }
         InsertSource::UnionAll(parts) => {
@@ -93,7 +89,7 @@ fn execute_insert_from_query_on_pipeline(
 ) -> Result<RecordBatch, String> {
     let query_result = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
-        crate::standalone::engine::execute_query(
+        crate::engine::execute_query(
             query,
             &catalog,
             &target.namespace,
@@ -119,9 +115,7 @@ fn align_query_result_to_target(
             .map(|c| {
                 Field::new(
                     &c.name,
-                    crate::standalone::engine::parquet::normalize_map_entries_nullability(
-                        &c.data_type,
-                    ),
+                    crate::engine::parquet::normalize_map_entries_nullability(&c.data_type),
                     c.nullable,
                 )
             })
@@ -142,9 +136,8 @@ fn align_query_result_to_target(
         let chunk_rows = batch.num_rows();
         for (target_idx, source_idx) in mapping.iter().enumerate() {
             let target_column = &target_columns[target_idx];
-            let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
-                &target_column.data_type,
-            );
+            let target_type =
+                crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
             let array: ArrayRef = match source_idx {
                 Some(idx) => {
                     let src = batch.column(*idx);
@@ -171,9 +164,8 @@ fn align_query_result_to_target(
     let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(column_count);
     for (target_idx, arrays) in per_target_columns.into_iter().enumerate() {
         let target_column = &target_columns[target_idx];
-        let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
-            &target_column.data_type,
-        );
+        let target_type =
+            crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
         let merged: ArrayRef = if arrays.is_empty() {
             new_null_array(&target_type, 0)
         } else if arrays.len() == 1 {

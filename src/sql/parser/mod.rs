@@ -2,6 +2,7 @@
 
 pub(crate) mod ast;
 pub(crate) mod dialect;
+pub(crate) mod query_refs;
 mod raw;
 
 use sqlparser::parser::Parser;

@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
+use crate::engine::catalog::{InMemoryCatalog, normalize_identifier};
+use crate::engine::{StandaloneState, StatementResult, execute_query};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
 };
-use crate::standalone::engine::catalog::{InMemoryCatalog, normalize_identifier};
-use crate::standalone::engine::sqlparse::statement::{
+use crate::sql::parser::query_refs::{
     extract_three_part_table_refs, strip_catalog_from_three_part_names,
 };
-use crate::standalone::engine::{StandaloneState, StatementResult, execute_query};
 
 fn mv_backend(
     state: &Arc<StandaloneState>,
@@ -72,7 +72,7 @@ pub(crate) fn execute_query_for_mv_refresh(
 
     let three_parts = extract_three_part_table_refs(&query);
     if !three_parts.is_empty() {
-        crate::standalone::engine::query_prep::refresh_external_tables_for_query(
+        crate::engine::query_prep::refresh_external_tables_for_query(
             state,
             None,
             current_database,
@@ -227,7 +227,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
         );
     }
 
-    let table_def = crate::standalone::engine::query_prep::build_iceberg_table_def_with_files(
+    let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
         state,
         &catalog_name,
         &namespace,

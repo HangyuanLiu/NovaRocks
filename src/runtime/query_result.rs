@@ -1,8 +1,8 @@
 //! Generic query result types for standalone SQL execution.
 //!
-//! These types live here (rather than in `crate::standalone`) so that
+//! These types live here (rather than in `crate::engine`) so that
 //! executors and coordinators under `crate::runtime` can reference the
-//! result type without creating a dependency on the standalone module.
+//! result type without creating a dependency on the standalone engine module.
 
 use arrow::datatypes::DataType;
 

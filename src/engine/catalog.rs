@@ -13,7 +13,7 @@ use std::path::Path;
 use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // Re-export from sql::catalog so callers can use either
-// `crate::standalone::engine::catalog::*` or `crate::sql::catalog::*`
+// `crate::engine::catalog::*` or `crate::sql::catalog::*`
 // interchangeably without double-defining the types.
 pub use crate::sql::catalog::{
     CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,

@@ -3,14 +3,15 @@
 
 use std::sync::Arc;
 
+use crate::engine::StandaloneState;
+use crate::engine::StatementResult;
+use crate::engine::backend_resolver::resolve_table_target;
+use crate::engine::build_string_query_result;
+use crate::engine::statement::parse_add_files_sql;
 use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::ObjectName;
-use crate::standalone::engine::StandaloneState;
-use crate::standalone::engine::StatementResult;
-use crate::standalone::engine::backend_resolver::resolve_table_target;
-use crate::standalone::engine::build_string_query_result;
-use crate::standalone::engine::sqlparse::statement::{
-    extract_table_names_from_query, extract_three_part_table_refs, parse_add_files_sql,
+use crate::sql::parser::query_refs::{
+    extract_table_names_from_query, extract_three_part_table_refs,
 };
 
 pub(crate) fn add_files(

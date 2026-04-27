@@ -1,0 +1,266 @@
+/// Extract table names from a query AST, using the last object-name part and
+/// ignoring catalog/database qualifiers.
+pub(crate) fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_table_names_from_subquery(&cte.query, &mut names);
+        }
+    }
+    extract_table_names_from_set_expr(query.body.as_ref(), &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut Vec<String>) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &select.from {
+                extract_table_names_from_table_factor(&from.relation, names);
+                for join in &from.joins {
+                    extract_table_names_from_table_factor(&join.relation, names);
+                }
+            }
+            extract_table_names_from_expr_opt(select.selection.as_ref(), names);
+            extract_table_names_from_expr_opt(select.having.as_ref(), names);
+            for projection in &select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        extract_table_names_from_expr(expr, names);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_table_names_from_set_expr(left, names);
+            extract_table_names_from_set_expr(right, names);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            extract_table_names_from_set_expr(query.body.as_ref(), names);
+        }
+        _ => {}
+    }
+}
+
+fn extract_table_names_from_table_factor(
+    factor: &sqlparser::ast::TableFactor,
+    names: &mut Vec<String>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            if let Some(last) = name.0.last() {
+                let name = match last {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        ident.value.to_ascii_lowercase()
+                    }
+                    other => other.to_string().to_ascii_lowercase(),
+                };
+                names.push(name);
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            extract_table_names_from_set_expr(subquery.body.as_ref(), names);
+        }
+        _ => {}
+    }
+}
+
+fn extract_table_names_from_expr_opt(expr: Option<&sqlparser::ast::Expr>, names: &mut Vec<String>) {
+    if let Some(expr) = expr {
+        extract_table_names_from_expr(expr, names);
+    }
+}
+
+fn extract_table_names_from_expr(expr: &sqlparser::ast::Expr, names: &mut Vec<String>) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            extract_table_names_from_subquery(query, names);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            extract_table_names_from_subquery(subquery, names);
+            extract_table_names_from_expr(expr, names);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_table_names_from_expr(left, names);
+            extract_table_names_from_expr(right, names);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            extract_table_names_from_expr(expr, names);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            extract_table_names_from_expr(expr, names);
+            extract_table_names_from_expr(low, names);
+            extract_table_names_from_expr(high, names);
+        }
+        _ => {}
+    }
+}
+
+fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut Vec<String>) {
+    extract_table_names_from_set_expr(query.body.as_ref(), names);
+}
+
+/// Extract `(catalog, database, table)` triples from 3-part table references
+/// in a query AST.
+pub(crate) fn extract_three_part_table_refs(
+    query: &sqlparser::ast::Query,
+) -> Vec<(String, String, String)> {
+    let mut refs = Vec::new();
+    extract_three_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn extract_three_part_refs_from_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &select.from {
+                extract_three_part_refs_from_factor(&from.relation, refs);
+                for join in &from.joins {
+                    extract_three_part_refs_from_factor(&join.relation, refs);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_three_part_refs_from_set_expr(left, refs);
+            extract_three_part_refs_from_set_expr(right, refs);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_three_part_refs_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if parts.len() == 3 {
+                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            extract_three_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite a query AST in-place: convert all 3-part table references
+/// `catalog.database.table` to 2-part `database.table` by stripping the
+/// leading catalog element.
+pub(crate) fn strip_catalog_from_three_part_names(query: &mut sqlparser::ast::Query) {
+    strip_catalog_in_set_expr(query.body.as_mut());
+}
+
+fn strip_catalog_in_set_expr(expr: &mut sqlparser::ast::SetExpr) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &mut select.from {
+                strip_catalog_in_factor(&mut from.relation);
+                for join in &mut from.joins {
+                    strip_catalog_in_factor(&mut join.relation);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            strip_catalog_in_set_expr(left.as_mut());
+            strip_catalog_in_set_expr(right.as_mut());
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            strip_catalog_in_set_expr(query.body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+fn strip_catalog_in_factor(factor: &mut sqlparser::ast::TableFactor) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            if name.0.len() == 3 {
+                name.0.remove(0);
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            strip_catalog_in_set_expr(subquery.body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sql::parser::{parse_sql_raw, query_refs};
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let stmt = parse_sql_raw(sql).expect("parse sql");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        *query
+    }
+
+    #[test]
+    fn extracts_three_part_table_refs_from_joins_and_subqueries() {
+        let query = parse_query("SELECT * FROM c1.db1.t1 JOIN (SELECT * FROM c2.db2.t2) d ON true");
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![
+                ("c1".to_string(), "db1".to_string(), "t1".to_string()),
+                ("c2".to_string(), "db2".to_string(), "t2".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn strips_catalog_from_three_part_table_refs() {
+        let mut query = parse_query("SELECT * FROM c1.db1.t1 JOIN c2.db2.t2 ON true");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "SELECT * FROM db1.t1 JOIN db2.t2 ON true"
+        );
+    }
+
+    #[test]
+    fn extracts_table_names_from_ctes_and_having_subqueries() {
+        let query = parse_query(
+            "WITH x AS (SELECT * FROM seed) \
+             SELECT k FROM t1 GROUP BY k HAVING EXISTS (SELECT 1 FROM db2.t2)",
+        );
+
+        assert_eq!(
+            query_refs::extract_table_names_from_query(&query),
+            vec!["seed".to_string(), "t1".to_string(), "t2".to_string()],
+        );
+    }
+}

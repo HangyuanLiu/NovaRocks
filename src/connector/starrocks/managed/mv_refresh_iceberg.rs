@@ -36,14 +36,14 @@ use crate::connector::starrocks::managed::store::{
     InsertIcebergMvRowRequest, ManagedTableKind, ManagedTableState, StoredManagedTable,
     UpdateMvIcebergRefreshMetadataRequest,
 };
+use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
+use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
 };
-use crate::standalone::engine::mv_flow::execute_query_for_mv_incremental_refresh;
-use crate::standalone::engine::{StandaloneState, StatementResult};
 
 pub(crate) fn create_iceberg_mv(
     state: &Arc<StandaloneState>,

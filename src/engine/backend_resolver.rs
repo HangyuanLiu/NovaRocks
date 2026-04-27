@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use crate::sql::parser::ast::ObjectName;
-use crate::standalone::engine::StandaloneState;
-use crate::standalone::engine::name_resolve::{
+use crate::engine::StandaloneState;
+use crate::engine::name_resolve::{
     resolve_iceberg_namespace_name, resolve_iceberg_table_name, resolve_local_table_name,
 };
+use crate::sql::parser::ast::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TargetBackend {
@@ -93,7 +93,7 @@ pub(crate) fn resolve_namespace_target(
         return Ok(TargetBackend {
             backend_name: "managed",
             catalog: String::new(),
-            namespace: crate::standalone::engine::catalog::normalize_identifier(name.leaf())?,
+            namespace: crate::engine::catalog::normalize_identifier(name.leaf())?,
             table: String::new(),
         });
     }

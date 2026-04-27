@@ -17,8 +17,8 @@ use super::store::{
     StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
 };
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-use crate::standalone::engine::catalog::normalize_identifier;
-use crate::standalone::engine::{StandaloneState, StatementResult};
+use crate::engine::catalog::normalize_identifier;
+use crate::engine::{StandaloneState, StatementResult};
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
 const DEFAULT_MANAGED_BUCKET_COUNT: u32 = 1;
@@ -1264,10 +1264,10 @@ mod tests {
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
     use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
+    use crate::engine::StandaloneState;
+    use crate::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
-    use crate::standalone::engine::StandaloneState;
-    use crate::standalone::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
 
     use super::{
         build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,

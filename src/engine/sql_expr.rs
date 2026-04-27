@@ -12,9 +12,9 @@ use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
+use crate::engine::record_batch_to_chunk;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::parser::ast::{ArithmeticOp, Expr, Literal, SqlType};
-use crate::standalone::engine::record_batch_to_chunk;
 
 pub(crate) fn strip_optional_identifier_quotes(token: &str) -> &str {
     token.trim_end_matches(';').trim_matches('`')

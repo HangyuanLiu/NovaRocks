@@ -31,8 +31,8 @@ use tokio::runtime::Handle;
 
 use crate::runtime::global_async_runtime::data_block_on;
 
+use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
-use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {

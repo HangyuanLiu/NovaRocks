@@ -7,8 +7,8 @@
 //! Resolution errors are explicit strings — callers treat any ambiguity as a
 //! hard error rather than guessing.
 
+use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::ast::ObjectName;
-use crate::standalone::engine::catalog::normalize_identifier;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedLocalTableName {

@@ -4,14 +4,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
-use crate::exec::chunk::Chunk;
-use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
-use crate::standalone::engine::mv_flow::{
+use crate::engine::mv_flow::{
     execute_query_for_mv_incremental_refresh, execute_query_for_mv_refresh,
 };
-use crate::standalone::engine::{
-    QueryResult, StandaloneState, StatementResult, record_batch_to_chunk,
-};
+use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
+use crate::exec::chunk::Chunk;
+use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
 use crate::connector::starrocks::managed::catalog::{
     ManagedLakeCatalog, ManagedTableRuntime, register_managed_tables_in_catalog,
@@ -169,7 +167,7 @@ pub(crate) fn refresh_mv(
             let chunks = query_result_to_chunks(result)?;
             let plan = load_insert_plan(
                 state,
-                &crate::standalone::engine::ResolvedLocalTableName {
+                &crate::engine::ResolvedLocalTableName {
                     database: db_name.clone(),
                     table: mv_name.clone(),
                 },
@@ -318,7 +316,7 @@ fn refresh_aggregate_mv_incremental(
     let delta_chunks = super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)?;
     let plan = load_physical_insert_plan(
         ctx.state,
-        &crate::standalone::engine::ResolvedLocalTableName {
+        &crate::engine::ResolvedLocalTableName {
             database: ctx.database.to_string(),
             table: ctx.mv_name.to_string(),
         },
@@ -440,7 +438,7 @@ where
 
     let plan = match load_physical_insert_plan(
         state,
-        &crate::standalone::engine::ResolvedLocalTableName {
+        &crate::engine::ResolvedLocalTableName {
             database: database.to_string(),
             table: mv_name.to_string(),
         },
@@ -525,7 +523,7 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
 }
 
 fn query_result_column_to_output_column(
-    column: &crate::standalone::engine::QueryResultColumn,
+    column: &crate::engine::QueryResultColumn,
 ) -> Result<crate::sql::analysis::OutputColumn, String> {
     Ok(crate::sql::analysis::OutputColumn {
         name: column.name.clone(),
@@ -602,19 +600,13 @@ fn validate_incremental_mv_base_ref(
 ) -> Result<(), String> {
     let actual = normalize_three_part_base_table(base_table)?;
     let expected = (
-        crate::standalone::engine::catalog::normalize_identifier(&base_ref.catalog).map_err(
-            |e| {
-                format!("incremental MV refresh stored metadata has invalid catalog reference: {e}")
-            },
-        )?,
-        crate::standalone::engine::catalog::normalize_identifier(&base_ref.namespace).map_err(
-            |e| {
-                format!(
-                    "incremental MV refresh stored metadata has invalid namespace reference: {e}"
-                )
-            },
-        )?,
-        crate::standalone::engine::catalog::normalize_identifier(&base_ref.table).map_err(|e| {
+        crate::engine::catalog::normalize_identifier(&base_ref.catalog).map_err(|e| {
+            format!("incremental MV refresh stored metadata has invalid catalog reference: {e}")
+        })?,
+        crate::engine::catalog::normalize_identifier(&base_ref.namespace).map_err(|e| {
+            format!("incremental MV refresh stored metadata has invalid namespace reference: {e}")
+        })?,
+        crate::engine::catalog::normalize_identifier(&base_ref.table).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid table reference: {e}")
         })?,
     );
@@ -635,16 +627,15 @@ fn normalize_three_part_base_table(
         .iter()
         .map(|part| match part {
             sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                crate::standalone::engine::catalog::normalize_identifier(&ident.value).map_err(
-                    |e| {
-                        format!(
-                            "incremental MV refresh stored SQL has invalid base table reference: {e}"
-                        )
-                    },
-                )
+                crate::engine::catalog::normalize_identifier(&ident.value).map_err(|e| {
+                    format!(
+                        "incremental MV refresh stored SQL has invalid base table reference: {e}"
+                    )
+                })
             }
-            _ => Err("incremental MV refresh stored SQL base table must use identifiers"
-                .to_string()),
+            _ => {
+                Err("incremental MV refresh stored SQL base table must use identifiers".to_string())
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     let [catalog, namespace, table] = parts.as_slice() else {
@@ -780,12 +771,12 @@ fn refresh_managed_catalog(state: &Arc<StandaloneState>) -> Result<(), String> {
 fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String, String), String> {
     match name.parts.as_slice() {
         [table] => Ok((
-            crate::standalone::engine::catalog::normalize_identifier(current_database)?,
-            crate::standalone::engine::catalog::normalize_identifier(table)?,
+            crate::engine::catalog::normalize_identifier(current_database)?,
+            crate::engine::catalog::normalize_identifier(table)?,
         )),
         [database, table] => Ok((
-            crate::standalone::engine::catalog::normalize_identifier(database)?,
-            crate::standalone::engine::catalog::normalize_identifier(table)?,
+            crate::engine::catalog::normalize_identifier(database)?,
+            crate::engine::catalog::normalize_identifier(table)?,
         )),
         _ => Err(format!(
             "materialized view name must be `<name>` or `<db>.<name>`; got `{}`",
@@ -816,12 +807,12 @@ mod tests {
         StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
         StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
+    use crate::engine::catalog::InMemoryCatalog;
+    use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
-    use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;

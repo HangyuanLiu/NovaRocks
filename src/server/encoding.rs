@@ -17,9 +17,8 @@ use opensrv_mysql::{Column, ColumnFlags, ColumnType, QueryResultWriter, ToMysqlV
 use tokio::io::AsyncWrite;
 
 use crate::common::util::format_mysql_container_value_with_schema;
+use crate::engine::{QueryResult, QueryResultColumn};
 use crate::exec::chunk::{Chunk, ChunkFieldSchema};
-
-use super::super::engine::{QueryResult, QueryResultColumn};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum StandaloneMysqlValue {

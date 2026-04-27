@@ -9,13 +9,13 @@ use arrow::record_batch::RecordBatch;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink, TableSource,
 };
+use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, Literal, ObjectName,
     RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
 };
-use crate::standalone::engine::{StandaloneState, StatementResult};
 
 pub(crate) struct ManagedLakeBackend {
     state: Weak<StandaloneState>,

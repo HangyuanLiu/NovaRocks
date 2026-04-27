@@ -701,7 +701,7 @@ fn standalone_mysql_server_does_not_restore_external_preloaded_parquet_tables_fr
 // removed along with the local-parquet backend. Task 5 rewired the HTTP
 // stream-load endpoint to managed lake; a managed-lake stream-load smoke
 // test belongs with the managed-lake round-trip suite below and is covered
-// indirectly by `standalone::engine::tests` at the lib level.
+// indirectly by `engine::tests` at the lib level.
 
 #[test]
 fn standalone_mysql_server_managed_lake_round_trip() {

@@ -16,7 +16,7 @@ use super::catalog::{ColumnDef, normalize_identifier};
 use super::parquet::{
     normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
 };
-use super::sqlparse::expr::{latin1_string_to_bytes, literal_to_i128_for_integer};
+use super::sql_expr::{latin1_string_to_bytes, literal_to_i128_for_integer};
 use crate::sql::parser::ast::Literal;
 
 pub(crate) fn reorder_insert_rows(

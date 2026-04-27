@@ -15,9 +15,7 @@ use crate::novarocks_config;
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
 
-use self::catalog::{
-    DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table, normalize_identifier,
-};
+use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, build_parquet_table, normalize_identifier};
 use crate::connector::{
     IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, MetadataSnapshot,
     SqliteMetadataStore, StoredIcebergTable, create_iceberg_namespace, iceberg_namespace_exists,
@@ -27,32 +25,36 @@ use crate::connector::{
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
+pub(crate) mod generate_series;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod query_prep;
-pub(crate) mod sqlparse;
+pub(crate) mod sql_expr;
+pub(crate) mod statement;
 pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
+pub(crate) use self::generate_series::insert_generate_series_rows_local;
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
 #[cfg(test)]
-use self::sqlparse::expr::sql_type_to_arrow_type;
+use self::sql_expr::sql_type_to_arrow_type;
 #[cfg(test)]
-use self::sqlparse::expr::sqlparser_expr_to_literal;
-pub(crate) use self::sqlparse::generate_series::insert_generate_series_rows_local;
-use self::sqlparse::statement::{
+use self::sql_expr::sqlparser_expr_to_literal;
+use self::statement::{
     convert_sqlparser_insert_to_custom, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
-    execute_truncate_table_statement, extract_three_part_table_refs, looks_like_add_files,
-    strip_catalog_from_three_part_names,
+    execute_truncate_table_statement, looks_like_add_files,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
+};
+use crate::sql::parser::query_refs::{
+    extract_three_part_table_refs, strip_catalog_from_three_part_names,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -62,6 +64,20 @@ pub struct StandaloneOptions {
 }
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+pub use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+
+fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {
+    static ENGINE: OnceLock<StandaloneNovaRocks> = OnceLock::new();
+    &ENGINE
+}
+
+pub(crate) fn register_stream_load_engine(engine: StandaloneNovaRocks) {
+    let _ = stream_load_engine_cell().set(engine);
+}
+
+pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
+    stream_load_engine_cell().get().cloned()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandaloneManagedTabletInfo {
@@ -604,12 +620,7 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        crate::standalone::engine::query_prep::add_files(
-            &self.inner,
-            sql,
-            current_catalog,
-            current_database,
-        )
+        crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
     }
 
     /// Handle CREATE CATALOG result.
@@ -710,17 +721,15 @@ pub(crate) fn dispatch_statement(
 
     match statement {
         Statement::CreateMaterializedView(stmt) => {
-            crate::standalone::engine::mv_flow::create_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::create_mv(state, current_database, &stmt)
         }
         Statement::DropMaterializedView(stmt) => {
-            crate::standalone::engine::mv_flow::drop_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::drop_mv(state, current_database, &stmt)
         }
         Statement::RefreshMaterializedView(stmt) => {
-            crate::standalone::engine::mv_flow::refresh_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
-        Statement::ShowMaterializedViews(stmt) => {
-            crate::standalone::engine::mv_flow::list_mvs(state, &stmt)
-        }
+        Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
     }
 }
 
@@ -730,7 +739,7 @@ pub(crate) fn register_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    crate::standalone::engine::query_prep::register_external_tables_for_query(
+    crate::engine::query_prep::register_external_tables_for_query(
         state,
         current_catalog,
         current_database,
@@ -744,7 +753,7 @@ fn refresh_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    crate::standalone::engine::query_prep::refresh_external_tables_for_query(
+    crate::engine::query_prep::refresh_external_tables_for_query(
         state,
         current_catalog,
         current_database,

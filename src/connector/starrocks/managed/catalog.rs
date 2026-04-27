@@ -20,7 +20,7 @@ use super::store::{
     StoredManagedTable, StoredManagedTablet,
 };
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-use crate::standalone::engine::catalog::{
+use crate::engine::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     normalize_identifier,
 };
@@ -702,9 +702,9 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
 mod tests {
     use super::*;
     use crate::connector::starrocks::managed::store::{ManagedTableKind, StoredManagedSchema};
+    use crate::engine::catalog::DEFAULT_DATABASE;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
-    use crate::standalone::engine::catalog::DEFAULT_DATABASE;
 
     #[test]
     fn register_managed_tables_in_catalog_populates_logical_table_and_layout() {

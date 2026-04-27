@@ -31,8 +31,8 @@ use crate::service::grpc_client::proto::starrocks::{
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_managed_table_in_catalog;
-use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::engine::{
+use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     execute_query, insert_generate_series_rows_local, record_batch_to_chunk, reorder_insert_rows,
 };
@@ -386,9 +386,7 @@ pub(crate) fn read_active_managed_physical_chunks(
             .map(|column| {
                 Field::new(
                     &column.name,
-                    crate::standalone::engine::parquet::normalize_map_entries_nullability(
-                        &column.data_type,
-                    ),
+                    crate::engine::parquet::normalize_map_entries_nullability(&column.data_type),
                     column.nullable,
                 )
             })
@@ -921,9 +919,7 @@ fn align_query_result_to_target(
             .map(|c| {
                 Field::new(
                     &c.name,
-                    crate::standalone::engine::parquet::normalize_map_entries_nullability(
-                        &c.data_type,
-                    ),
+                    crate::engine::parquet::normalize_map_entries_nullability(&c.data_type),
                     c.nullable,
                 )
             })
@@ -946,9 +942,8 @@ fn align_query_result_to_target(
         total_rows += chunk_rows;
         for (target_idx, source_idx) in mapping.iter().enumerate() {
             let target_column = &target_columns[target_idx];
-            let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
-                &target_column.data_type,
-            );
+            let target_type =
+                crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
             let array: ArrayRef = match source_idx {
                 Some(idx) => {
                     let src = batch.column(*idx);
@@ -975,9 +970,8 @@ fn align_query_result_to_target(
     let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(column_count);
     for (target_idx, arrays) in per_target_columns.into_iter().enumerate() {
         let target_column = &target_columns[target_idx];
-        let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
-            &target_column.data_type,
-        );
+        let target_type =
+            crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
         let merged: ArrayRef = if arrays.is_empty() {
             new_null_array(&target_type, 0)
         } else if arrays.len() == 1 {
@@ -1056,7 +1050,7 @@ fn resolve_managed_name(
     name: &ObjectName,
     current_database: &str,
 ) -> Result<ResolvedLocalTableName, String> {
-    use crate::standalone::engine::catalog::normalize_identifier;
+    use crate::engine::catalog::normalize_identifier;
     match name.parts.as_slice() {
         [table] => Ok(ResolvedLocalTableName {
             database: normalize_identifier(current_database)?,
@@ -1090,13 +1084,13 @@ mod mv_target_tests {
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
+    use crate::engine::catalog::InMemoryCatalog;
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
     };
     use crate::formats::starrocks::writer::layout::txn_log_file_path;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-    use crate::standalone::engine::catalog::InMemoryCatalog;
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;

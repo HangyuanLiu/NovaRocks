@@ -17,11 +17,11 @@ use crate::connector::starrocks::managed::mv_ddl;
 use crate::connector::starrocks::managed::mv_shape::{
     AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
 };
+use crate::engine::{QueryResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::parser::ast::SqlType;
-use crate::standalone::engine::{QueryResult, record_batch_to_chunk};
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";
