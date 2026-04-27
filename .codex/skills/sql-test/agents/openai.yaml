@@ -1,3 +1,0 @@
-interface:
-  display_name: "SQL Test (NovaRocks)"
-  short_description: "Run dev/test schema-change SQL cases with strict FE/NovaRocks port constraints"
