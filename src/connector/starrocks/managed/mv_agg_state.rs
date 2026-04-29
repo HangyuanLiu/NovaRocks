@@ -1,6 +1,4 @@
-//! Aggregate MV state helpers intentionally staged before the following
-//! aggregate MV wiring tasks use them.
-#![allow(dead_code)]
+//! Aggregate MV state helpers for aggregate MV incremental refresh.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -165,7 +163,35 @@ pub(crate) fn load_aggregate_physical_rows(
 ) -> Result<HashMap<String, AggregatePhysicalRow>, String> {
     let mut rows = HashMap::new();
     for chunk in chunks {
-        load_aggregate_physical_rows_from_batch(&chunk.batch, layout, &mut rows)?;
+        load_aggregate_physical_rows_from_batch(
+            &chunk.batch,
+            layout,
+            &mut rows,
+            /* allow_negative_counts */ false,
+        )?;
+    }
+    Ok(rows)
+}
+
+/// Permissive variant for loading delta chunks during incremental
+/// merge. Skips count-state positivity checks (negated DELETE-branch
+/// state values are valid by construction post-`negate_aggregate_state_chunks`)
+/// and skips the visible/state equality invariant (negation flips the
+/// state column but leaves visible columns unchanged, so equality
+/// no longer holds — and visible values are unused by the merge math
+/// anyway).
+pub(crate) fn load_aggregate_physical_rows_for_delta(
+    chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+) -> Result<HashMap<String, AggregatePhysicalRow>, String> {
+    let mut rows = HashMap::new();
+    for chunk in chunks {
+        load_aggregate_physical_rows_from_batch(
+            &chunk.batch,
+            layout,
+            &mut rows,
+            /* allow_negative_counts */ true,
+        )?;
     }
     Ok(rows)
 }
@@ -189,7 +215,7 @@ pub(crate) fn merge_aggregate_state_batches(
     layout: &AggregateMvLayout,
 ) -> Result<Vec<Chunk>, String> {
     let mut merged = old_rows.clone();
-    let delta_rows = load_aggregate_physical_rows(delta_chunks, layout)?;
+    let delta_rows = load_aggregate_physical_rows_for_delta(delta_chunks, layout)?;
     for delta in delta_rows.into_values() {
         let row = merged
             .entry(delta.row_id.clone())
@@ -212,7 +238,35 @@ pub(crate) fn merge_aggregate_state_batches(
             row.visible_values[state_column.visible_source_index] = next_value;
         }
     }
-    physical_rows_to_chunks(merged.into_values().collect(), layout)
+    // Drop merged rows whose every count-state column has reached zero
+    // — the group has been fully retracted by deletes and should
+    // disappear from the MV.
+    let merged_kept: Vec<AggregatePhysicalRow> = merged
+        .into_values()
+        .filter(|row| !all_count_states_zero(row, layout))
+        .collect();
+    physical_rows_to_chunks(merged_kept, layout)
+}
+
+/// Return true when every count-state column on the row has merged to
+/// zero (sum-only states do not influence the decision; sum=0 with
+/// count=N>0 is a valid "this group has N rows whose sum happens to
+/// total 0" state we MUST keep).
+fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> bool {
+    let mut saw_count = false;
+    for (state_index, state_column) in layout.state_columns.iter().enumerate() {
+        if state_column.function != AggregateFunctionKind::Count {
+            continue;
+        }
+        saw_count = true;
+        let value = row.state_values.get(state_index).cloned().unwrap_or(None);
+        let is_zero = matches!(value, Some(AggScalarValue::Int64(0)));
+        if !is_zero {
+            return false;
+        }
+    }
+    // If the layout has no count-state columns at all, never drop.
+    saw_count
 }
 
 fn materialize_aggregate_result_batch(
@@ -259,8 +313,10 @@ fn load_aggregate_physical_rows_from_batch(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
     out: &mut HashMap<String, AggregatePhysicalRow>,
+    allow_negative_counts: bool,
 ) -> Result<(), String> {
-    for row in load_aggregate_physical_rows_from_batch_owned(batch, layout)? {
+    for row in load_aggregate_physical_rows_from_batch_owned(batch, layout, allow_negative_counts)?
+    {
         let row_id = row.row_id.clone();
         if out.insert(row_id.clone(), row).is_some() {
             return Err(format!(
@@ -274,6 +330,7 @@ fn load_aggregate_physical_rows_from_batch(
 fn load_aggregate_physical_rows_from_batch_owned(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
+    allow_negative_counts: bool,
 ) -> Result<Vec<AggregatePhysicalRow>, String> {
     let expected_columns = 1 + layout.visible_columns.len() + layout.state_columns.len();
     if batch.num_columns() != expected_columns {
@@ -300,7 +357,15 @@ fn load_aggregate_physical_rows_from_batch_owned(
             .map(|idx| agg_scalar_from_array(batch.column(state_offset + idx), row))
             .collect::<Result<Vec<_>, _>>()?;
         let row_id = row_ids.value(row).to_string();
-        validate_loaded_physical_row(batch, row, &row_id, &visible_values, &state_values, layout)?;
+        validate_loaded_physical_row(
+            batch,
+            row,
+            &row_id,
+            &visible_values,
+            &state_values,
+            layout,
+            allow_negative_counts,
+        )?;
         out.push(AggregatePhysicalRow {
             row_id,
             visible_values,
@@ -339,6 +404,61 @@ fn physical_rows_to_chunks(
     let batch = RecordBatch::try_new(Arc::new(physical_schema(layout)), arrays)
         .map_err(|e| format!("build aggregate MV merged physical batch failed: {e}"))?;
     Ok(vec![record_batch_to_chunk(batch)?])
+}
+
+/// Negate every state-column value across the given chunks. Used by
+/// the aggregate-IVM delete branch: post-aggregate, the SELECT over
+/// deleted rows produces positive count/sum values; flipping them to
+/// negatives lets the existing `merge_aggregate_state_batches` apply
+/// `old + (-delta)` arithmetic without further reversibility logic.
+///
+/// Visible columns and the row-id column are unchanged. Only the
+/// state columns get sign-flipped.
+pub(crate) fn negate_aggregate_state_chunks(
+    chunks: Vec<Chunk>,
+    layout: &AggregateMvLayout,
+) -> Result<Vec<Chunk>, String> {
+    if layout.state_columns.is_empty() {
+        return Ok(chunks);
+    }
+    let row_id_offset = 1;
+    let visible_count = layout.visible_columns.len();
+    let state_offset = row_id_offset + visible_count;
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let batch = chunk.batch.clone();
+        let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
+        for (state_index, state_column) in layout.state_columns.iter().enumerate() {
+            let column_index = state_offset + state_index;
+            let original = arrays
+                .get(column_index)
+                .ok_or_else(|| {
+                    format!(
+                        "negate_aggregate_state_chunks: state column index {column_index} out of bounds; batch has {} columns",
+                        arrays.len()
+                    )
+                })?
+                .clone();
+            arrays[column_index] = negate_state_array(&original, state_column)?;
+        }
+        let new_batch = RecordBatch::try_new(batch.schema(), arrays)
+            .map_err(|e| format!("rebuild negated state chunk: {e}"))?;
+        out.push(record_batch_to_chunk(new_batch)?);
+    }
+    Ok(out)
+}
+
+fn negate_state_array(
+    array: &ArrayRef,
+    state_column: &AggregateStateColumn,
+) -> Result<ArrayRef, String> {
+    use arrow::compute::kernels::numeric::neg;
+    neg(array.as_ref()).map_err(|e| {
+        format!(
+            "negate state column `{}` ({:?}): {e}",
+            state_column.name, state_column.data_type
+        )
+    })
 }
 
 fn zero_base_row(delta: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> AggregatePhysicalRow {
@@ -485,6 +605,7 @@ fn validate_loaded_physical_row(
     visible_values: &[Option<AggScalarValue>],
     state_values: &[Option<AggScalarValue>],
     layout: &AggregateMvLayout,
+    allow_negative_counts: bool,
 ) -> Result<(), String> {
     if visible_values.len() != layout.visible_columns.len() {
         return Err(format!(
@@ -511,6 +632,7 @@ fn validate_loaded_physical_row(
                 &state_column.name,
                 row_id,
                 state_column.count_star,
+                allow_negative_counts,
             )?;
         }
         let visible_value =
@@ -522,7 +644,12 @@ fn validate_loaded_physical_row(
                         state_column.visible_source_index, state_column.name
                     )
                 })?;
-        if !agg_scalar_values_equal(visible_value, state_value) {
+        // In delta-mode the visible column carries pre-negation values
+        // while the state column has been sign-flipped, so equality is
+        // expected to fail. The merge math reads only state_values, so
+        // the mismatch is harmless. We still keep the check for
+        // strict-mode (stored MV state must satisfy the invariant).
+        if !allow_negative_counts && !agg_scalar_values_equal(visible_value, state_value) {
             return Err(format!(
                 "aggregate MV state corruption: visible aggregate column `{}` does not match state column `{}` for row id `{row_id}`",
                 layout.visible_columns[state_column.visible_source_index].name, state_column.name
@@ -551,8 +678,13 @@ fn validate_loaded_count_state(
     state_name: &str,
     row_id: &str,
     count_star: bool,
+    allow_negative_counts: bool,
 ) -> Result<(), String> {
     match state_value {
+        // Permissive delta-mode: any non-NULL Int64 (including
+        // negatives produced by `negate_aggregate_state_chunks`) is
+        // acceptable. We still reject NULLs and non-Int64 types.
+        Some(AggScalarValue::Int64(_)) if allow_negative_counts => Ok(()),
         Some(AggScalarValue::Int64(v)) if *v > 0 => Ok(()),
         Some(AggScalarValue::Int64(0)) if !count_star => Ok(()),
         Some(AggScalarValue::Int64(v)) if !count_star => Err(format!(
@@ -1323,5 +1455,134 @@ mod tests {
         let err = merge_aggregate_state_batches(&HashMap::new(), &delta, &layout)
             .expect_err("duplicate delta rejected");
         assert!(err.contains("duplicate row id"), "err={err}");
+    }
+
+    #[test]
+    fn negate_aggregate_state_chunks_flips_count_and_sum() {
+        // Build a minimal layout with one Int64 state column.
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                source_index: 0,
+            }],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_c".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                visible_source_index: 0,
+                function: AggregateFunctionKind::Count,
+                count_star: true,
+            }],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        };
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["row1", "row2"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![5, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![5, 3])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+        let negated = negate_aggregate_state_chunks(vec![chunk], &layout).expect("negate");
+        assert_eq!(negated.len(), 1);
+        let state = negated[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("state col");
+        assert_eq!(state.value(0), -5);
+        assert_eq!(state.value(1), -3);
+        // Visible column should be unchanged.
+        let visible = negated[0]
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("visible col");
+        assert_eq!(visible.value(0), 5);
+        assert_eq!(visible.value(1), 3);
+    }
+
+    #[test]
+    fn merge_drops_rows_with_count_fully_retracted() {
+        // The merge's load_aggregate_physical_rows call validates
+        // delta count states as non-negative (count_star=false) or
+        // strictly positive (count_star=true), so we cannot hand it a
+        // chunk with a literal negative count. Instead, we exercise
+        // the drop branch by pre-seeding old_rows with the state
+        // value the merge would produce after the delta has been
+        // applied (i.e. zero), and pass an empty delta. The merge
+        // function leaves merged state untouched and then runs the
+        // new drop filter — which is what we want to exercise here.
+        //
+        // PR-3 Task 10 will call merge with the negated delta on a
+        // load path that allows negative counts; PR-4 will replace
+        // the post-hoc negation with a proper reversible operator.
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                source_index: 0,
+            }],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_c".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                visible_source_index: 0,
+                function: AggregateFunctionKind::Count,
+                count_star: true,
+            }],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        };
+
+        // Pre-merged old state for the group: count already at zero.
+        let mut old_rows: HashMap<String, AggregatePhysicalRow> = HashMap::new();
+        old_rows.insert(
+            "g1".to_string(),
+            AggregatePhysicalRow {
+                row_id: "g1".to_string(),
+                visible_values: vec![Some(AggScalarValue::Int64(0))],
+                state_values: vec![Some(AggScalarValue::Int64(0))],
+            },
+        );
+
+        let merged =
+            merge_aggregate_state_batches(&old_rows, &[], &layout).expect("merge zero count");
+        let total_rows: usize = merged.iter().map(|c| c.batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "row should be dropped after full retraction");
+
+        // Sanity check: a non-zero count must be retained.
+        old_rows.get_mut("g1").unwrap().state_values[0] = Some(AggScalarValue::Int64(1));
+        old_rows.get_mut("g1").unwrap().visible_values[0] = Some(AggScalarValue::Int64(1));
+        let kept = merge_aggregate_state_batches(&old_rows, &[], &layout).expect("merge nonzero");
+        let kept_rows: usize = kept.iter().map(|c| c.batch.num_rows()).sum();
+        assert_eq!(kept_rows, 1, "non-zero count row should be retained");
     }
 }
