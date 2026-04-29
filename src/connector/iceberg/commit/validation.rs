@@ -19,38 +19,53 @@
 //! DELETE (`engine/delete_flow.rs`) entry points before lowering.
 //! All errors returned here are user-visible — keep the messages action-oriented.
 
+use std::collections::HashMap;
+
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use iceberg::spec::FormatVersion;
 use iceberg::table::Table;
 
-/// Phase 1 does not write tables that have row-lineage enabled. Tables with
-/// `variant`-typed columns are also rejected because the parquet writer in
-/// `IcebergSink` has no encoding path for variant.
-pub fn ensure_v3_writable(table: &Table) -> Result<(), String> {
-    if table
-        .metadata()
-        .properties()
-        .get("write.row-lineage")
-        .map(|v| v == "true")
-        .unwrap_or(false)
-    {
-        return Err("iceberg table has row-lineage enabled; phase 1 does not \
-             support writing such tables. Disable row-lineage or wait \
-             for phase 2."
-            .to_string());
-    }
+use super::types::IcebergWriteMode;
 
-    // Check for variant-typed columns. iceberg-rust 0.9 predates the Variant
-    // primitive type, so we use a name-based fallback rather than a match arm.
-    // If a future iceberg-rust release introduces PrimitiveType::Variant, the
-    // Debug output will naturally contain "Variant" and we catch it here.
-    // The check recurses into nested Struct/List/Map so that STRUCT<x VARIANT>
-    // or ARRAY<VARIANT> are not missed.
+pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
+    props
+        .get("write.row-lineage")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn classify_iceberg_write_mode(table: &Table) -> IcebergWriteMode {
+    classify_iceberg_write_mode_from_metadata(
+        table.metadata().format_version(),
+        table.metadata().properties(),
+    )
+}
+
+fn classify_iceberg_write_mode_from_metadata(
+    format_version: FormatVersion,
+    props: &HashMap<String, String>,
+) -> IcebergWriteMode {
+    if format_version == FormatVersion::V3 || row_lineage_property_enabled(props) {
+        IcebergWriteMode::RowLineageV3
+    } else {
+        IcebergWriteMode::LegacyPositionDeletes
+    }
+}
+
+/// Returns the write mode selected from Iceberg table metadata after rejecting
+/// table schemas that the current writer cannot encode.
+pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
+    ensure_no_variant_columns(table)?;
+    Ok(classify_iceberg_write_mode(table))
+}
+
+fn ensure_no_variant_columns(table: &Table) -> Result<(), String> {
     let schema = table.metadata().current_schema();
     for f in schema.as_struct().fields() {
         if type_contains_variant(&f.field_type) {
             return Err(format!(
-                "iceberg table column `{}` contains variant type; phase 1 does not \
-                 support writing variant. Drop the column or wait for phase 2.",
+                "iceberg table column `{}` contains variant type; the current writer \
+                 cannot encode variant values. Drop the column or cast it to a supported type before writing.",
                 f.name
             ));
         }
@@ -200,6 +215,43 @@ fn arrow_iceberg_types_compatible(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn row_lineage_property_parser_accepts_true_case_insensitive() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("write.row-lineage".to_string(), "TrUe".to_string());
+        assert!(row_lineage_property_enabled(&props));
+    }
+
+    #[test]
+    fn row_lineage_property_parser_treats_missing_or_false_as_legacy() {
+        let props = std::collections::HashMap::<String, String>::new();
+        assert!(!row_lineage_property_enabled(&props));
+
+        let mut props = std::collections::HashMap::new();
+        props.insert("write.row-lineage".to_string(), "false".to_string());
+        assert!(!row_lineage_property_enabled(&props));
+    }
+
+    #[test]
+    fn write_mode_classifies_v3_without_property_as_row_lineage() {
+        let props = std::collections::HashMap::<String, String>::new();
+        assert_eq!(
+            classify_iceberg_write_mode_from_metadata(FormatVersion::V3, &props),
+            IcebergWriteMode::RowLineageV3
+        );
+    }
+
+    #[test]
+    fn write_mode_classifies_v2_without_property_as_legacy() {
+        let props = std::collections::HashMap::<String, String>::new();
+        assert_eq!(
+            classify_iceberg_write_mode_from_metadata(FormatVersion::V2, &props),
+            IcebergWriteMode::LegacyPositionDeletes
+        );
+    }
+
     #[test]
     fn errors_carry_actionable_messages() {
         // Sanity test that the module compiles and the public API is accessible.
