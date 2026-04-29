@@ -19,3 +19,4 @@
 thirdparty/installed
 .DS_Store
 nosetests.xml
+/.claude/worktrees/

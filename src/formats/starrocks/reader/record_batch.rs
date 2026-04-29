@@ -652,12 +652,13 @@ fn decode_flat_json_projection_array_for_selected_rows(
     full_segment_selected: bool,
     segment_rows: usize,
 ) -> Result<ArrayRef, String> {
+    let source_data_type = flat_json_source_decode_data_type();
     let source_array = decode_column_array_for_selected_rows(
         segment_path,
         segment_bytes,
         column_meta,
         schema,
-        &DataType::Binary,
+        &source_data_type,
         output_name,
         selected_ranges,
         full_segment_selected,
@@ -786,6 +787,10 @@ fn project_flat_json_array(
             segment_path, output_name, other
         )),
     }
+}
+
+fn flat_json_source_decode_data_type() -> DataType {
+    DataType::Utf8
 }
 
 fn extract_flat_json_path_value(
@@ -3038,6 +3043,11 @@ mod tests {
         let err = build_missing_projected_array(&projected, &DataType::Int64, 1, "segment.dat")
             .expect_err("non-nullable missing column without default should fail");
         assert!(err.contains("no fallback value"), "err={err}");
+    }
+
+    #[test]
+    fn flat_json_projection_reads_json_source_as_utf8() {
+        assert_eq!(flat_json_source_decode_data_type(), DataType::Utf8);
     }
 
     #[test]

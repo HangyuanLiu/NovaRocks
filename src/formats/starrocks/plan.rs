@@ -774,7 +774,15 @@ fn build_projected_columns(
         let source_schema_col_from_unique_id = output_field_unique_id
             .and_then(|unique_id| source_lookup.by_unique_id.get(&unique_id).copied());
         let source_schema_col = source_schema_col_from_unique_id.or(source_schema_col_from_name);
-        let schema_col = if let Some(schema_col) = schema_col_from_unique_id {
+        let flat_json_base = if schema_col_from_name.is_none() {
+            try_build_flat_json_projection(output_name, &current_lookup.by_name)
+        } else {
+            None
+        };
+        let has_flat_json_base = flat_json_base.is_some();
+        let schema_col = if has_flat_json_base {
+            None
+        } else if let Some(schema_col) = schema_col_from_unique_id {
             Some((schema_col, source_schema_col))
         } else if let Some(schema_col) = schema_col_from_name {
             if let Some(expected_unique_id) = output_field_unique_id {
@@ -841,19 +849,21 @@ fn build_projected_columns(
                     schema_col.is_nullable.unwrap_or(field.is_nullable()),
                 )
             }
-        } else if allow_flat_json_fallback {
-            if let Some((schema_col, projection)) =
-                try_build_flat_json_projection(output_name, &current_lookup.by_name)
-            {
+        } else if allow_flat_json_fallback || has_flat_json_base {
+            if let Some((schema_col, projection)) = flat_json_base {
+                let source_schema_col = source_lookup
+                    .by_name
+                    .get(&normalize_column_name(&projection.base_column_name))
+                    .copied();
                 let schema = build_schema_column_plan(
                     snapshot.tablet_id,
                     snapshot.version,
                     output_name,
                     schema_col,
+                    source_schema_col,
                     None,
-                    None,
-                    false,
-                    &DataType::Binary,
+                    source_schema_col.is_some(),
+                    &DataType::Utf8,
                 )?;
                 let schema_unique_id = schema.unique_id.ok_or_else(|| {
                     format!(
@@ -2442,6 +2452,72 @@ mod tests {
         assert_eq!(flat.path, vec!["a".to_string()]);
         assert_eq!(plan.projected_columns[1].schema_unique_id, 2);
         assert!(!plan.projected_columns[1].source_column_missing);
+    }
+
+    #[test]
+    fn build_read_plan_keeps_flat_json_projection_with_base_unique_id_hint() {
+        let snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "id", "BIGINT"),
+            build_column(2, "j", "JSON"),
+        ]);
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new("j.a", DataType::Utf8, true)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(2),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("build read plan");
+
+        let projected = &plan.projected_columns[0];
+        let flat = projected
+            .flat_json_projection
+            .as_ref()
+            .expect("flat json projection should be present");
+        assert_eq!(flat.base_column_name, "j");
+        assert_eq!(flat.path, vec!["a".to_string()]);
+        assert_eq!(projected.schema_unique_id, 2);
+        assert!(!projected.source_column_missing);
+    }
+
+    #[test]
+    fn build_read_plan_keeps_flat_json_projection_with_virtual_unique_id_hint() {
+        let snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "id", "BIGINT"),
+            build_column(2, "j", "JSON"),
+        ]);
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new("j.a", DataType::Utf8, true)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(20),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("build read plan");
+
+        let projected = &plan.projected_columns[0];
+        let flat = projected
+            .flat_json_projection
+            .as_ref()
+            .expect("flat json projection should be present");
+        assert_eq!(flat.base_column_name, "j");
+        assert_eq!(flat.path, vec!["a".to_string()]);
+        assert_eq!(projected.schema_unique_id, 2);
+        assert!(!projected.source_column_missing);
     }
 
     #[test]
