@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::load_table;
-use crate::connector::iceberg::changes::ChangeAction;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::connector::starrocks::managed::ivm_change_stream::{
     materialize_iceberg_change_stream, plan_iceberg_change_batch_for_ivm,
 };
 use crate::engine::mv_flow::{
-    execute_query_for_mv_incremental_refresh, execute_query_for_mv_refresh,
+    analyze_visible_output_types, execute_query_for_mv_incremental_refresh,
+    execute_query_for_mv_refresh,
 };
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
@@ -300,15 +300,26 @@ fn refresh_aggregate_mv_full(
     mv_name: &str,
     shape: &super::mv_shape::AggregateMvShape,
 ) -> Result<StatementResult, String> {
-    refresh_mv_full_with_executor(state, database, mv_name, |ctx| {
-        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &ctx.select_sql)?;
-        let output_columns = result
-            .columns
-            .iter()
-            .map(query_result_column_to_output_column)
-            .collect::<Result<Vec<_>, String>>()?;
-        let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &output_columns)?;
-        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+    let shape = shape.clone();
+    refresh_mv_full_with_executor(state, database, mv_name, move |ctx| {
+        // Step 1: obtain visible-shaped output types by analyzing the ORIGINAL select_sql
+        // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
+        // (one column per visible_output), not state-shaped types (which expand AVG into
+        // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
+        let visible_output_columns =
+            analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
+
+        // Step 2: build the layout from visible types.
+        let layout =
+            super::mv_agg_state::build_aggregate_mv_layout(&shape, &visible_output_columns)?;
+
+        // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
+        // it to obtain the actual state-shaped data.
+        let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, &shape)?;
+        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
+
+        // Step 4: materialize state-shaped executor result using the visible-type layout.
+        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, &shape)
     })
 }
 
@@ -328,10 +339,11 @@ struct AggregateMvIncrementalRefreshContext<'a> {
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(ctx.select_sql, ctx.shape)?;
     let change_stream = materialize_iceberg_change_stream(
         ctx.state,
         ctx.database,
-        ctx.select_sql,
+        &state_sql,
         ctx.base_ref,
         ctx.base_table,
         ctx.previous_snapshot_id,
@@ -363,27 +375,39 @@ fn refresh_aggregate_mv_incremental(
         );
     }
 
-    // Build the layout from whichever branch has chunks (both produce identical column shape).
-    let output_columns = {
-        let branches = change_stream.non_empty_branches();
-        let layout_branch = branches
-            .first()
-            .ok_or_else(|| "aggregate MV incremental refresh: empty change stream".to_string())?;
-        let layout_source = match layout_branch.action {
-            ChangeAction::Insert | ChangeAction::Delete => layout_branch.result,
-        };
-        layout_source
-            .columns
-            .iter()
-            .map(query_result_column_to_output_column)
-            .collect::<Result<Vec<_>, String>>()?
-    };
-    let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
+    // Build the layout early (cheap: parse + analyze only, no SQL execution) so we can
+    // inspect the aggregate functions before deciding how to handle DELETE files.
+    // The rewritten state SQL (AVG → SUM + COUNT) produces state-shaped columns whose count
+    // does not match shape.visible_outputs. Sourcing types from the analyzer avoids this mismatch.
+    let visible_output_columns =
+        analyze_visible_output_types(ctx.state, ctx.database, ctx.select_sql)?;
+    let layout =
+        super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
+
+    // MIN/MAX state has no closed-form retract: negate_aggregate_state_chunks panics on
+    // MIN/MAX columns. When DELETE files appear in the change batch and the layout includes
+    // any MIN or MAX aggregate, fall back to a full refresh instead of attempting a partial
+    // retract that cannot be expressed as state arithmetic.
+    if change_stream.deletes.row_count() > 0 && super::mv_agg_state::layout_has_min_or_max(&layout)
+    {
+        tracing::info!(
+            target: "mv_refresh",
+            mv = %format!("{}.{}", ctx.database, ctx.mv_name),
+            base = %ctx.base_ref.fqn(),
+            snapshot_from = ctx.previous_snapshot_id,
+            snapshot_to = ctx.current_snapshot_id,
+            delete_rows = change_stream.deletes.row_count(),
+            reason = "min_max_with_deletes",
+            "mv_refresh fall-back to Full: MIN/MAX aggregate cannot retract DELETE state"
+        );
+        return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+    }
 
     let (inserts, deletes) = change_stream.into_results();
-    let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout)?;
+    let insert_delta =
+        super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout, ctx.shape)?;
     let delete_delta_positive =
-        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout, ctx.shape)?;
     let delete_delta =
         super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
 
@@ -599,6 +623,7 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
         .collect()
 }
 
+#[cfg(test)]
 fn query_result_column_to_output_column(
     column: &crate::engine::QueryResultColumn,
 ) -> Result<crate::sql::analysis::OutputColumn, String> {
@@ -1007,7 +1032,7 @@ mod tests {
                 let layout =
                     super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
                 let chunks = super::super::mv_agg_state::materialize_aggregate_result_chunks(
-                    result, &layout,
+                    result, &layout, &shape,
                 )?;
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].batch.num_columns(), layout.physical_columns.len());
@@ -2021,5 +2046,170 @@ enable_path_style_access = true
             mv_default_storage_engine: "managed_lake".to_string(),
             mv_iceberg_warehouse_location: None,
         }
+    }
+
+    /// Build a minimal `StandaloneState` with a catalog entry for
+    /// `ns.orders(k BIGINT NOT NULL, v BIGINT)` so that
+    /// `analyze_visible_output_types` can resolve the table schema.
+    ///
+    /// The `TableStorage` path is unused during analysis-only calls.
+    fn state_with_orders_table() -> Arc<crate::engine::StandaloneState> {
+        use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        {
+            let mut catalog = state.catalog.write().expect("catalog write lock");
+            catalog.create_database("ns").expect("create ns database");
+            catalog
+                .register(
+                    "ns",
+                    TableDef {
+                        name: "orders".to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "k".to_string(),
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            },
+                            ColumnDef {
+                                name: "v".to_string(),
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            },
+                        ],
+                        storage: TableStorage::LocalParquetFile {
+                            path: std::path::PathBuf::from("/unused/for/analysis"),
+                        },
+                    },
+                )
+                .expect("register orders table");
+        }
+        state
+    }
+
+    /// `analyze_visible_output_types` on an AVG MV SQL must return visible-shaped
+    /// columns (group key + Float64 avg result), not state-shaped columns
+    /// (group key + sum + count). Verifies the fix for the layout length-mismatch
+    /// blocker: `build_aggregate_mv_layout` expects visible-shaped types.
+    #[test]
+    fn analyze_visible_output_types_for_avg_mv_returns_visible_shape() {
+        let state = state_with_orders_table();
+
+        // Original SQL: SELECT k, AVG(v) AS a FROM ice.ns.orders GROUP BY k
+        // Visible output: 2 columns — k (Int64) + a (Float64).
+        // State-shaped output (after rewrite): 3 columns — k + __sum + __count.
+        let sql = "SELECT k, AVG(v) AS a FROM ice.ns.orders GROUP BY k";
+        let columns =
+            analyze_visible_output_types(&state, "ns", sql).expect("analyze visible output types");
+
+        assert_eq!(
+            columns.len(),
+            2,
+            "AVG MV must produce 2 visible columns (group key + avg result), \
+             not the 3 state-shaped columns (group key + sum + count); \
+             got: {:?}",
+            columns
+                .iter()
+                .map(|c| (&c.name, &c.data_type))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            columns[0].name, "k",
+            "first visible column must be the group key"
+        );
+        assert_eq!(
+            columns[0].data_type,
+            DataType::Int64,
+            "group key must keep its original Int64 type"
+        );
+        assert_eq!(
+            columns[1].name, "a",
+            "second visible column must be the avg alias"
+        );
+        // The analyzer returns Float64 for AVG over an integer column.
+        assert_eq!(
+            columns[1].data_type,
+            DataType::Float64,
+            "AVG visible result must be Float64"
+        );
+    }
+
+    /// COUNT/SUM-only MVs (no AVG) must still produce the correct visible-shaped
+    /// columns via `analyze_visible_output_types`. Regression guard: the fix must
+    /// not break non-AVG aggregate MVs.
+    #[test]
+    fn analyze_visible_output_types_for_count_sum_mv_returns_visible_shape() {
+        let state = state_with_orders_table();
+
+        let sql = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM ice.ns.orders GROUP BY k";
+        let columns =
+            analyze_visible_output_types(&state, "ns", sql).expect("analyze visible output types");
+
+        assert_eq!(
+            columns.len(),
+            3,
+            "COUNT+SUM MV must produce 3 visible columns (k, c, s); got: {:?}",
+            columns
+                .iter()
+                .map(|c| (&c.name, &c.data_type))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(columns[0].name, "k");
+        assert_eq!(columns[0].data_type, DataType::Int64);
+        assert_eq!(columns[1].name, "c");
+        // COUNT returns Int64.
+        assert_eq!(columns[1].data_type, DataType::Int64);
+        assert_eq!(columns[2].name, "s");
+        // SUM over Int64 returns Int64.
+        assert_eq!(columns[2].data_type, DataType::Int64);
+    }
+
+    /// Validates the end-to-end fix: using visible types from the analyzer allows
+    /// `build_aggregate_mv_layout` to succeed for an AVG MV, where the direct
+    /// approach (sourcing types from the state-shaped executor result) would fail
+    /// with a column-count mismatch.
+    #[test]
+    fn build_aggregate_mv_layout_succeeds_with_analyzer_sourced_visible_types() {
+        use super::super::mv_agg_state::build_aggregate_mv_layout;
+
+        let state = state_with_orders_table();
+
+        let sql = "SELECT k, AVG(v) AS a FROM ice.ns.orders GROUP BY k";
+        let shape = match validate_incremental_mv_select(sql).expect("validate mv select") {
+            super::super::mv_shape::IncrementalMvShape::Aggregate(shape) => shape,
+            _ => panic!("expected aggregate shape"),
+        };
+
+        // Visible output columns from the analyzer (2 columns: k + a).
+        let visible_columns =
+            analyze_visible_output_types(&state, "ns", sql).expect("analyze visible output types");
+        assert_eq!(
+            visible_columns.len(),
+            shape.visible_outputs.len(),
+            "analyzer output count must match shape.visible_outputs"
+        );
+
+        // Must succeed: visible-shaped types match what build_aggregate_mv_layout expects.
+        let layout = build_aggregate_mv_layout(&shape, &visible_columns)
+            .expect("build_aggregate_mv_layout must succeed with visible-shaped types");
+
+        assert_eq!(
+            layout.visible_columns.len(),
+            2,
+            "layout must have 2 visible columns (k + a)"
+        );
+        // AVG expands to 2 state columns: __agg_state_a__sum + __agg_state_a__count.
+        assert_eq!(
+            layout.state_columns.len(),
+            2,
+            "AVG must expand to 2 state columns (sum + count)"
+        );
+        assert!(
+            layout.state_columns[0].name.contains("__sum"),
+            "first state column must be the sum sub-state"
+        );
+        assert!(
+            layout.state_columns[1].name.contains("__count"),
+            "second state column must be the count sub-state"
+        );
     }
 }
