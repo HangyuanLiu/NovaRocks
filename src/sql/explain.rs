@@ -275,7 +275,7 @@ fn format_physical_node(
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
-            let local_hints = explain_hints_for_local_scan(op);
+            let local_hints = explain_hints_for_scan(op);
             if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
                 out.push(format!("{pad}     Decode"));
             }
@@ -575,35 +575,59 @@ struct LocalScanExplainHints {
     has_min_max_stats: bool,
 }
 
-fn explain_hints_for_local_scan(
+fn explain_hints_for_scan(
     op: &crate::sql::optimizer::operator::PhysicalScanOp,
 ) -> LocalScanExplainHints {
     let Some(required_columns) = op.required_columns.as_ref() else {
-        return LocalScanExplainHints::default();
-    };
-    let TableStorage::LocalParquetFile { path } = &op.table.storage else {
         return LocalScanExplainHints::default();
     };
     if required_columns.is_empty() {
         return LocalScanExplainHints::default();
     }
 
-    let mut hints = LocalScanExplainHints {
-        has_min_max_stats: required_columns.iter().all(|required| {
-            op.table
+    LocalScanExplainHints {
+        has_decode: scan_supports_decode_hint(&op.table, required_columns),
+        has_min_max_stats: scan_supports_min_max_stats(&op.table, required_columns),
+    }
+}
+
+fn scan_supports_decode_hint(
+    table: &crate::sql::catalog::TableDef,
+    required_columns: &[String],
+) -> bool {
+    match &table.storage {
+        TableStorage::LocalParquetFile { path } => {
+            local_parquet_has_low_cardinality_string_dict(table, path)
+        }
+        TableStorage::S3ParquetFiles { .. } => required_columns.iter().any(|required| {
+            table
                 .columns
                 .iter()
                 .find(|column| column.name.eq_ignore_ascii_case(required))
-                .map(|column| supports_local_min_max_stats(&column.data_type))
+                .map(|column| supports_scan_decode_hint(&column.data_type))
                 .unwrap_or(false)
         }),
-        ..Default::default()
-    };
-    hints.has_decode = local_parquet_has_low_cardinality_string_dict(&op.table, path);
-    hints
+    }
 }
 
-fn supports_local_min_max_stats(data_type: &DataType) -> bool {
+fn scan_supports_min_max_stats(
+    table: &crate::sql::catalog::TableDef,
+    required_columns: &[String],
+) -> bool {
+    match &table.storage {
+        TableStorage::LocalParquetFile { .. } | TableStorage::S3ParquetFiles { .. } => {}
+    }
+    required_columns.iter().all(|required| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(required))
+            .map(|column| supports_scan_min_max_stats(&column.data_type))
+            .unwrap_or(false)
+    })
+}
+
+fn supports_scan_min_max_stats(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Boolean
@@ -625,6 +649,13 @@ fn supports_local_min_max_stats(data_type: &DataType) -> bool {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn supports_scan_decode_hint(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
     )
 }
 
@@ -895,5 +926,105 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             format!("{name}({})", args_str.join(", "))
         }
         ExprKind::SubqueryPlaceholder { id, .. } => format!("<subquery_{id}>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use arrow::datatypes::DataType;
+
+    use super::{ExplainLevel, explain_physical_plan};
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
+    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::statistics::Statistics;
+
+    #[test]
+    fn s3_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {
+        let column = ColumnDef {
+            name: "c_2_0".to_string(),
+            data_type: DataType::FixedSizeBinary(16),
+            nullable: false,
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "t3".to_string(),
+                    columns: vec![column.clone()],
+                    storage: TableStorage::S3ParquetFiles {
+                        files: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                }],
+                predicates: Vec::new(),
+                required_columns: Some(vec![column.name.clone()]),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let lines = explain_physical_plan(&plan, ExplainLevel::Verbose);
+
+        assert!(
+            lines.iter().any(|line| line.contains("min-max stats")),
+            "verbose explain lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn s3_scan_costs_explain_reports_decode_for_string_required_columns() {
+        let column = ColumnDef {
+            name: "c8".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "all_t0".to_string(),
+                    columns: vec![column.clone()],
+                    storage: TableStorage::S3ParquetFiles {
+                        files: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                }],
+                predicates: Vec::new(),
+                required_columns: Some(vec![column.name.clone()]),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let lines = explain_physical_plan(&plan, ExplainLevel::Costs);
+
+        assert!(
+            lines.iter().any(|line| line.contains("Decode")),
+            "costs explain lines: {lines:?}"
+        );
     }
 }

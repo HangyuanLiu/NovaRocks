@@ -7,7 +7,9 @@ use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tabl
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
+use crate::sql::parser::ast::{
+    ColumnAggregation, ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+};
 
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
 use super::store::{
@@ -132,11 +134,6 @@ pub(crate) fn create_managed_table(
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
     let defaults = resolve_managed_create_defaults(columns, key_desc, bucket_count)?;
-    if defaults.key_desc.kind == TableKeyKind::Aggregate {
-        return Err(
-            "managed standalone CREATE TABLE does not support AGGREGATE KEY yet".to_string(),
-        );
-    }
     let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
         "managed standalone CREATE TABLE requires sqlite metadata store".to_string()
     })?;
@@ -920,12 +917,12 @@ pub(crate) fn build_tablet_schema(
         } else {
             (Some(sql_type_to_tcolumn_type(&column.data_type)?), None)
         };
-        // StarRocks value-column aggregation semantics by keys_type:
-        //   DUP_KEYS     -> aggregation_type is unused (column is just stored)
-        //   UNIQUE_KEYS  -> value columns default to REPLACE
-        //   AGG_KEYS     -> value columns need an explicit per-column aggregation,
-        //                    which we do not parse yet; fail earlier in the caller.
         let aggregation_type = if is_key {
+            if column.aggregation.is_some() {
+                return Err(format!(
+                    "managed standalone CREATE TABLE key column `{normalized}` cannot have aggregation"
+                ));
+            }
             None
         } else {
             match key_desc.kind {
@@ -933,7 +930,14 @@ pub(crate) fn build_tablet_schema(
                 TableKeyKind::Unique | TableKeyKind::Primary => {
                     Some(crate::types::TAggregationType::REPLACE)
                 }
-                TableKeyKind::Aggregate => None,
+                TableKeyKind::Aggregate => {
+                    let aggregation = column.aggregation.ok_or_else(|| {
+                        format!(
+                            "managed standalone CREATE TABLE aggregate value column `{normalized}` requires aggregation"
+                        )
+                    })?;
+                    Some(column_aggregation_to_thrift(aggregation))
+                }
             }
         };
         thrift_columns.push(crate::descriptors::TColumn {
@@ -1001,6 +1005,15 @@ pub(crate) fn build_tablet_schema(
         compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
         compression_level: None,
     })
+}
+
+fn column_aggregation_to_thrift(aggregation: ColumnAggregation) -> crate::types::TAggregationType {
+    match aggregation {
+        ColumnAggregation::Sum => crate::types::TAggregationType::SUM,
+        ColumnAggregation::Min => crate::types::TAggregationType::MIN,
+        ColumnAggregation::Max => crate::types::TAggregationType::MAX,
+        ColumnAggregation::Replace => crate::types::TAggregationType::REPLACE,
+    }
 }
 
 fn is_complex_type(data_type: &SqlType) -> bool {
@@ -1267,7 +1280,9 @@ mod tests {
     use crate::engine::StandaloneState;
     use crate::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
+    use crate::sql::parser::ast::{
+        ColumnAggregation, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    };
 
     use super::{
         build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,
@@ -1291,6 +1306,39 @@ mod tests {
             mv_default_storage_engine: "managed_lake".to_string(),
             mv_iceberg_warehouse_location: None,
         }
+    }
+
+    #[test]
+    fn build_tablet_schema_sets_aggregate_value_column_aggregation() {
+        let schema = build_tablet_schema(
+            &[
+                TableColumnDef {
+                    name: "k1".to_string(),
+                    data_type: SqlType::Int,
+                    nullable: false,
+                    aggregation: None,
+                },
+                TableColumnDef {
+                    name: "k2".to_string(),
+                    data_type: SqlType::Int,
+                    nullable: true,
+                    aggregation: Some(ColumnAggregation::Sum),
+                },
+            ],
+            &TableKeyDesc {
+                kind: TableKeyKind::Aggregate,
+                columns: vec!["k1".to_string()],
+            },
+            100,
+        )
+        .expect("build aggregate-key schema");
+
+        assert_eq!(schema.keys_type, crate::types::TKeysType::AGG_KEYS);
+        assert_eq!(schema.columns[0].aggregation_type, None);
+        assert_eq!(
+            schema.columns[1].aggregation_type,
+            Some(crate::types::TAggregationType::SUM)
+        );
     }
 
     fn snapshot_seed() -> ManagedSnapshot {
