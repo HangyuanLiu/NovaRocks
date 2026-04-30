@@ -22,9 +22,6 @@ pub(crate) enum ChangeError {
     /// Equality-delete file encountered; only position-deletes are in scope.
     EqualityDeleteUnsupported { snapshot_id: i64 },
 
-    /// Iceberg v3 deletion-vector file encountered; out of scope.
-    DeletionVectorUnsupported { snapshot_id: i64 },
-
     /// Schema evolution between `previous_snapshot` and `current_snapshot`
     /// (or any unsupported schema-related rejection at CREATE time).
     SchemaEvolutionUnsupported { detail: String },
@@ -62,17 +59,23 @@ impl std::fmt::Display for ChangeError {
                 f,
                 "iceberg lineage broken: previous snapshot {previous_snapshot} is unreachable from current snapshot"
             ),
-            ChangeError::UnsupportedOperation { snapshot_id, op } => write!(
-                f,
-                "iceberg snapshot {snapshot_id} has unsupported operation `{op}`"
-            ),
+            ChangeError::UnsupportedOperation { snapshot_id, op } => {
+                if op == "overwrite" {
+                    write!(
+                        f,
+                        "iceberg snapshot {snapshot_id} is an INSERT OVERWRITE; IVM cannot bridge across an overwrite snapshot. \
+                         Either rewrite the workload as DELETE + INSERT, or DROP and re-CREATE the materialized view to reset its lineage."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "iceberg snapshot {snapshot_id} has unsupported operation `{op}`"
+                    )
+                }
+            }
             ChangeError::EqualityDeleteUnsupported { snapshot_id } => write!(
                 f,
                 "iceberg snapshot {snapshot_id} contains equality-delete files; not supported in this phase"
-            ),
-            ChangeError::DeletionVectorUnsupported { snapshot_id } => write!(
-                f,
-                "iceberg snapshot {snapshot_id} contains v3 deletion-vector files; not supported in this phase"
             ),
             ChangeError::SchemaEvolutionUnsupported { detail } => {
                 write!(f, "iceberg schema evolution not supported: {detail}")
@@ -101,7 +104,7 @@ impl std::fmt::Display for ChangeError {
             }
             ChangeError::IcebergFormatUnsupported { format_version } => write!(
                 f,
-                "iceberg base table format-version {format_version} is not supported; IVM Phase 2 requires v2"
+                "iceberg base table format-version {format_version} is not supported; IVM requires v2 or v3"
             ),
             ChangeError::InternalInconsistency(detail) => {
                 write!(f, "internal inconsistency: {detail}")
@@ -140,6 +143,63 @@ pub(crate) struct PositionDeleteRef {
     pub delete_file_size: i64,
     pub record_count: Option<i64>,
     pub referenced_data_file: Option<String>,
+    /// `Parquet` for v2 position-delete files, `Puffin` for v3 deletion-vector
+    /// files. Other variants are rejected at construction.
+    pub file_format: iceberg::spec::DataFileFormat,
+    /// Required when `file_format == Puffin`: byte offset of the
+    /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
+    /// `file_format == Parquet`.
+    pub content_offset: Option<i64>,
+    /// Required when `file_format == Puffin`: byte length of the
+    /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
+    /// `file_format == Parquet`.
+    pub content_size_in_bytes: Option<i64>,
+}
+
+impl PositionDeleteRef {
+    /// Verify the file_format / content_offset / content_size_in_bytes /
+    /// referenced_data_file fields are mutually consistent. Returns
+    /// `ChangeError::InternalInconsistency` on any mismatch.
+    pub(crate) fn validate_invariants(&self) -> Result<(), ChangeError> {
+        use iceberg::spec::DataFileFormat;
+        match self.file_format {
+            DataFileFormat::Parquet => {
+                if self.content_offset.is_some() || self.content_size_in_bytes.is_some() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "PositionDeleteRef {} has Parquet file_format but content_offset/size set",
+                        self.delete_file_path
+                    )));
+                }
+            }
+            DataFileFormat::Puffin => {
+                if self.referenced_data_file.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing referenced_data_file",
+                        self.delete_file_path
+                    )));
+                }
+                if self.content_offset.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing content_offset",
+                        self.delete_file_path
+                    )));
+                }
+                if self.content_size_in_bytes.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing content_size_in_bytes",
+                        self.delete_file_path
+                    )));
+                }
+            }
+            other => {
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "PositionDeleteRef {} has unsupported file_format {:?}",
+                    self.delete_file_path, other
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Output of `plan_changes`: a flattened, in-order projection of every
@@ -485,6 +545,7 @@ pub(crate) fn materialize_changes(
         let deleted_rows = crate::connector::iceberg::scan_deletes::scan_deletes(
             &batch.deletes,
             &factory,
+            base_table.file_io(),
             size_lookup,
         )
         .map_err(|e| e.to_string())?;
@@ -532,7 +593,7 @@ async fn collect_files(
     file_io: &iceberg::io::FileIO,
     actions: &[LineageAction],
 ) -> Result<(Vec<DataFileRef>, Vec<PositionDeleteRef>), ChangeError> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
     let mut inserts: Vec<DataFileRef> = Vec::new();
     let mut deletes: Vec<PositionDeleteRef> = Vec::new();
@@ -622,15 +683,66 @@ async fn collect_files(
                         let df = entry.data_file();
                         match df.content_type() {
                             DataContentType::PositionDeletes => {
-                                deletes.push(PositionDeleteRef {
-                                    delete_file_path: df.file_path().to_string(),
-                                    delete_file_size: i64::try_from(df.file_size_in_bytes())
-                                        .unwrap_or(i64::MAX),
-                                    record_count: Some(
-                                        i64::try_from(df.record_count()).unwrap_or(i64::MAX),
-                                    ),
-                                    referenced_data_file: df.referenced_data_file(),
-                                });
+                                let r = match df.file_format() {
+                                    DataFileFormat::Parquet => PositionDeleteRef {
+                                        delete_file_path: df.file_path().to_string(),
+                                        delete_file_size: i64::try_from(df.file_size_in_bytes())
+                                            .unwrap_or(i64::MAX),
+                                        record_count: Some(
+                                            i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                                        ),
+                                        referenced_data_file: df.referenced_data_file(),
+                                        file_format: DataFileFormat::Parquet,
+                                        content_offset: None,
+                                        content_size_in_bytes: None,
+                                    },
+                                    DataFileFormat::Puffin => {
+                                        let referenced =
+                                            df.referenced_data_file().ok_or_else(|| {
+                                                ChangeError::InternalInconsistency(format!(
+                                                    "Puffin DV {} in snapshot {snapshot_id} missing referenced_data_file",
+                                                    df.file_path()
+                                                ))
+                                            })?;
+                                        let offset = df.content_offset().ok_or_else(|| {
+                                            ChangeError::InternalInconsistency(format!(
+                                                "Puffin DV {} in snapshot {snapshot_id} missing content_offset",
+                                                df.file_path()
+                                            ))
+                                        })?;
+                                        let length =
+                                            df.content_size_in_bytes().ok_or_else(|| {
+                                                ChangeError::InternalInconsistency(format!(
+                                                    "Puffin DV {} in snapshot {snapshot_id} missing content_size_in_bytes",
+                                                    df.file_path()
+                                                ))
+                                            })?;
+                                        PositionDeleteRef {
+                                            delete_file_path: df.file_path().to_string(),
+                                            delete_file_size: i64::try_from(
+                                                df.file_size_in_bytes(),
+                                            )
+                                            .unwrap_or(i64::MAX),
+                                            record_count: Some(
+                                                i64::try_from(df.record_count())
+                                                    .unwrap_or(i64::MAX),
+                                            ),
+                                            referenced_data_file: Some(referenced),
+                                            file_format: DataFileFormat::Puffin,
+                                            content_offset: Some(offset),
+                                            content_size_in_bytes: Some(length),
+                                        }
+                                    }
+                                    other => {
+                                        return Err(ChangeError::InternalInconsistency(format!(
+                                            "delete manifest in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
+                                            other,
+                                            df.file_path()
+                                        )));
+                                    }
+                                };
+                                r.validate_invariants()?;
+                                deletes.push(r);
                             }
                             DataContentType::EqualityDeletes => {
                                 return Err(ChangeError::EqualityDeleteUnsupported { snapshot_id });
@@ -938,6 +1050,94 @@ mod tests {
             .map(|f| f.record_count.unwrap_or_default())
             .sum();
         assert_eq!(returned_rows, 1);
+    }
+
+    #[test]
+    fn position_delete_ref_validates_parquet_with_no_content_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        r.validate_invariants().expect("ok");
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_parquet_with_content_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: Some(0),
+            content_size_in_bytes: None,
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_parquet_with_content_size() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_validates_puffin_with_full_metadata() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: Some("/tmp/data.parquet".to_string()),
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(120),
+        };
+        r.validate_invariants().expect("ok");
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_puffin_missing_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: Some("/tmp/data.parquet".to_string()),
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: None,
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_puffin_missing_referenced_data_file() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
     }
 
     #[test]
