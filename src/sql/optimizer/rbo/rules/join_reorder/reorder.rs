@@ -1265,12 +1265,16 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
                     row_count: None,
                     column_stats: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    delete_files: vec![],
                 }],
                 cloud_properties: Default::default(),
             },
@@ -1547,12 +1551,16 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
                     row_count: Some(row_count),
                     column_stats: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    delete_files: vec![],
                 }],
                 cloud_properties: Default::default(),
             },

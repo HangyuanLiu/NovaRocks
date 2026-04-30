@@ -142,6 +142,12 @@ pub(crate) fn build_iceberg_table_def_with_files(
                 size,
                 record_count,
                 column_stats: None,
+                first_row_id: None,
+                // data_sequence_number is not available from the caller-supplied
+                // (path, size, record_count) tuple; callers that need it should
+                // use extract_data_files_with_stats instead.
+                data_sequence_number: None,
+                delete_files: vec![],
             },
         )
         .collect::<Vec<_>>();
@@ -165,27 +171,73 @@ fn build_iceberg_table_def_with_data_files(
                     size: file.size,
                     row_count: file.record_count,
                     column_stats: file.column_stats,
+                    first_row_id: file.first_row_id,
+                    data_sequence_number: file.data_sequence_number,
+                    delete_files: file.delete_files,
                 })
                 .collect(),
             cloud_properties,
         }
-    } else if let Some(first_file) = data_files.first() {
-        let local_path = first_file
-            .path
-            .strip_prefix("file://")
-            .unwrap_or(&first_file.path);
-        TableStorage::LocalParquetFile {
-            path: std::path::PathBuf::from(local_path),
+    } else if !data_files.is_empty() {
+        // Local Iceberg tables can have multiple data files across snapshots.
+        // Keep the per-file lineage metadata by using the multi-file scan
+        // shape with empty cloud properties; file:// paths are handled by the
+        // local scan path and do not require object-store credentials.
+        TableStorage::S3ParquetFiles {
+            files: data_files
+                .into_iter()
+                .map(|file| S3FileInfo {
+                    path: file.path,
+                    size: file.size,
+                    row_count: file.record_count,
+                    column_stats: file.column_stats,
+                    first_row_id: file.first_row_id,
+                    data_sequence_number: file.data_sequence_number,
+                    delete_files: file.delete_files,
+                })
+                .collect(),
+            cloud_properties: Default::default(),
         }
     } else {
         register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
     };
 
+    let iceberg_row_lineage_metadata_columns = if is_v3_row_lineage(loaded.table.metadata()) {
+        vec![
+            ColumnDef {
+                name: "_row_id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        ]
+    } else {
+        vec![]
+    };
+
     Ok(TableDef {
         name: table_name.to_string(),
         columns: loaded.columns,
+        iceberg_row_lineage_metadata_columns,
         storage,
     })
+}
+
+/// Returns true when the table is Iceberg format-version=3 with
+/// `write.row-lineage=true`, meaning per-row `_row_id` and
+/// `_last_updated_sequence_number` metadata columns are available.
+fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
+    let v3 = matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3);
+    let lineage = metadata
+        .properties()
+        .get("write.row-lineage")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    v3 && lineage
 }
 
 fn register_empty_iceberg_table(

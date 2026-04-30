@@ -446,12 +446,16 @@ mod tests {
             table: TableDef {
                 name: name.to_string(),
                 columns: col_defs,
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::S3ParquetFiles {
                     files: vec![S3FileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
                         size: 1000,
                         row_count: Some(1000),
                         column_stats: None,
+                        first_row_id: None,
+                        data_sequence_number: None,
+                        delete_files: vec![],
                     }],
                     cloud_properties: Default::default(),
                 },

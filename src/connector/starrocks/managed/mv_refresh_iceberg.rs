@@ -158,6 +158,7 @@ pub(crate) fn create_iceberg_mv(
             TableDef {
                 name: mv_name.clone(),
                 columns,
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::S3ParquetFiles {
                     files: vec![],
                     cloud_properties: Default::default(),
@@ -873,6 +874,9 @@ fn update_iceberg_mv_in_catalog(
                     size: f.size,
                     row_count: f.record_count,
                     column_stats: f.column_stats,
+                    first_row_id: f.first_row_id,
+                    data_sequence_number: f.data_sequence_number,
+                    delete_files: f.delete_files,
                 })
                 .collect(),
             cloud_properties,
@@ -905,6 +909,9 @@ fn update_iceberg_mv_in_catalog(
                     size: f.size,
                     row_count: f.record_count,
                     column_stats: f.column_stats,
+                    first_row_id: f.first_row_id,
+                    data_sequence_number: f.data_sequence_number,
+                    delete_files: f.delete_files,
                 })
                 .collect(),
             // No cloud credentials needed — the file:// scan path reads
@@ -916,6 +923,7 @@ fn update_iceberg_mv_in_catalog(
     let table_def = TableDef {
         name: mv_name.to_string(),
         columns,
+        iceberg_row_lineage_metadata_columns: vec![],
         storage,
     };
 

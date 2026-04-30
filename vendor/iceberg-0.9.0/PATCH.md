@@ -79,6 +79,13 @@ Concretely:
 * `delete_file_loader.rs` calls the shared parquet-open helper with no virtual
   columns so position-delete file loading keeps the old behavior.
 
+* `_row_id` stored-column override: when the parquet file physically contains a
+  column tagged with `RESERVED_FIELD_ID_ROW_ID`, `generate_transform_operations`
+  records its source index in `ColumnSource::RowId::stored_source_index`. At
+  per-row materialization, non-NULL stored values take precedence over the
+  `first_row_id + _pos` fallback. NULL stored values, missing stored columns,
+  and the previous-patch-3 path all fall back unchanged.
+
 No public API renames; downstream callers just see `_pos` and `_row_id`
 working across both plain scans and row-selection scans.
 
@@ -142,6 +149,32 @@ When this lands upstream (tracked under
 [apache/iceberg-rust#1312](https://github.com/apache/iceberg-rust/issues/1312)
 or successor) the helper can be deleted in favour of the upstream Puffin
 loader.
+
+## Patch 5 — `_last_updated_sequence_number` virtual column
+
+iceberg-rust 0.9 declares `_last_updated_sequence_number` in
+[`src/metadata_columns.rs`](src/metadata_columns.rs:65) but neither
+`FileScanTask` nor `RecordBatchTransformer` carry the data-file
+`data_sequence_number` needed to implement the column's spec-defined
+fallback. This patch wires the field through.
+
+Concretely:
+
+* `FileScanTask` gains `data_sequence_number: Option<i64>` populated from
+  the manifest entry's `data_sequence_number()` in
+  `scan/context.rs::into_file_scan_task`.
+* `RecordBatchTransformerBuilder::with_data_sequence_number(Option<i64>)`
+  threads the value to the transformer.
+* New `ColumnSource::LastUpdatedSeqNum { fallback_value, stored_source_index }`
+  variant: when the parquet file physically stores a column tagged with
+  `RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER`, non-NULL stored values
+  take precedence; NULL/missing rows use the file's
+  `data_sequence_number` as the spec-defined fallback.
+* `arrow/reader.rs` calls `with_data_sequence_number(task.data_sequence_number)`
+  on every transformer-builder chain so the value reaches the dispatch.
+
+Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
+`_last_updated_sequence_number` = 2147483539 = `i32::MAX - 108`.
 
 ## Verification after rebase
 
