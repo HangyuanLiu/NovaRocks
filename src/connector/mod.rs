@@ -68,9 +68,9 @@ mod backend_test;
 #[derive(Clone, Debug)]
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
-    Hdfs(HdfsScanConfig),
+    Hdfs(Box<HdfsScanConfig>),
     IcebergMetadata(IcebergMetadataScanConfig),
-    StarRocks(StarRocksScanConfig),
+    StarRocks(Box<StarRocksScanConfig>),
 }
 
 pub trait ScanConnector: Send + Sync {
@@ -259,7 +259,7 @@ impl ScanConnector for HdfsConnector {
 
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
-            ScanConfig::Hdfs(cfg) => Ok(ScanNode::new(Arc::new(hdfs::HdfsScanOp::new(cfg)))),
+            ScanConfig::Hdfs(cfg) => Ok(ScanNode::new(Arc::new(hdfs::HdfsScanOp::new(*cfg)))),
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
@@ -304,7 +304,7 @@ impl ScanConnector for StarRocksConnector {
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
             ScanConfig::StarRocks(cfg) => Ok(ScanNode::new(Arc::new(
-                starrocks::StarRocksScanOp::new(cfg),
+                starrocks::StarRocksScanOp::new(*cfg),
             ))),
             _ => Err(format!(
                 "unsupported scan config for connector {}",

@@ -194,7 +194,7 @@ impl EventScheduler {
         self: &Arc<Self>,
         task: DriverTask,
         reason: BlockedReason,
-    ) -> Result<(), DriverTask> {
+    ) -> Result<(), Box<DriverTask>> {
         self.register_driver(&task);
         match reason {
             BlockedReason::InputEmpty => {
@@ -208,7 +208,7 @@ impl EventScheduler {
                             task.sink_ready()
                         );
                     }
-                    return Err(task);
+                    return Err(Box::new(task));
                 };
                 let should_log = should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT);
                 if should_log {
@@ -237,7 +237,7 @@ impl EventScheduler {
                             task.sink_ready()
                         );
                     }
-                    return Err(task);
+                    return Err(Box::new(task));
                 };
                 let should_log = should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT);
                 if should_log {

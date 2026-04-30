@@ -2337,7 +2337,7 @@ enum PublishInit {
 enum TxnStepDecision {
     ApplyLogs(Vec<LoadedTxnLog>),
     SkipTxn,
-    ReturnPublished(TabletMetadataPb),
+    ReturnPublished(Box<TabletMetadataPb>),
 }
 
 #[derive(Debug)]
@@ -2709,7 +2709,7 @@ fn publish_one_tablet(
                     returned_total_rows = tablet_row_count(&meta),
                     "LAKE_PUBLISH returned already-published metadata"
                 );
-                return Ok(already_published_output(&runtime, meta));
+                return Ok(already_published_output(&runtime, *meta));
             }
         }
     }
@@ -2922,14 +2922,14 @@ fn decide_txn_step(
         next_base_meta.is_some(),
     );
     match policy {
-        MissingTxnLogPolicy::ReturnPublished => Ok(TxnStepDecision::ReturnPublished(
+        MissingTxnLogPolicy::ReturnPublished => Ok(TxnStepDecision::ReturnPublished(Box::new(
             published_meta.ok_or_else(|| {
                 format!(
                     "published metadata disappeared unexpectedly: tablet_id={} version={}",
                     state.tablet_id, state.new_version
                 )
             })?,
-        )),
+        ))),
         MissingTxnLogPolicy::SkipTxn => Ok(TxnStepDecision::SkipTxn),
         MissingTxnLogPolicy::AdvanceToNextBaseVersion => {
             state.metadata = next_base_meta.ok_or_else(|| {

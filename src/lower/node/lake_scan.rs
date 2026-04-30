@@ -562,7 +562,7 @@ pub(crate) fn lower_lake_scan_node(
     });
 
     let scan = connectors
-        .create_scan_node("starrocks", ScanConfig::StarRocks(cfg))?
+        .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(scan_output_chunk_schema.clone())
         .with_limit(limit)

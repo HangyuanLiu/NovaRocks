@@ -26,7 +26,7 @@ const ASCII_UNINIT: i16 = -1;
 const ASCII_DELETED: i16 = -2;
 
 enum TranslateMap {
-    Ascii([i16; 256]),
+    Ascii(Box<[i16; 256]>),
     Utf8(HashMap<char, Option<char>>),
 }
 
@@ -49,7 +49,7 @@ fn build_translate_map(from_str: &str, to_str: &str) -> TranslateMap {
                 map[key] = ASCII_DELETED;
             }
         }
-        return TranslateMap::Ascii(map);
+        return TranslateMap::Ascii(Box::new(map));
     }
 
     let mut map = HashMap::new();

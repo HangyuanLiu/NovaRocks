@@ -973,7 +973,7 @@ pub(crate) fn lower_hdfs_scan_node(
     });
 
     let scan = connectors
-        .create_scan_node("hdfs", ScanConfig::Hdfs(cfg))?
+        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)

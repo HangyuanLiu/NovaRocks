@@ -3,6 +3,7 @@ pub mod novarocks {
 }
 
 pub mod starrocks {
+    #![allow(clippy::doc_lazy_continuation, clippy::len_without_is_empty)]
     tonic::include_proto!("starrocks");
 }
 

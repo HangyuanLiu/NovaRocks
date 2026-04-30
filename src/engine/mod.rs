@@ -1043,8 +1043,8 @@ pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String>
 use crate::sql::codegen::{FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult};
 
 enum StandaloneExecutionPlan {
-    SingleFragment(PlanBuildResult),
-    Coordinated(MultiFragmentBuildResult),
+    SingleFragment(Box<PlanBuildResult>),
+    Coordinated(Box<MultiFragmentBuildResult>),
 }
 
 /// Recognize the narrow compatibility shape where fragment splitting
@@ -1125,17 +1125,17 @@ fn strip_top_level_stream_root_wrapper(
 
 fn single_fragment_plan(
     build_result: MultiFragmentBuildResult,
-) -> Result<PlanBuildResult, MultiFragmentBuildResult> {
+) -> Result<Box<PlanBuildResult>, Box<MultiFragmentBuildResult>> {
     if build_result.fragment_results.len() != 1 {
-        return Err(build_result);
+        return Err(Box::new(build_result));
     }
     let fragment = build_result.fragment_results.into_iter().next().unwrap();
-    Ok(PlanBuildResult {
+    Ok(Box::new(PlanBuildResult {
         plan: fragment.plan,
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
-    })
+    }))
 }
 
 fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> StandaloneExecutionPlan {
@@ -1154,7 +1154,7 @@ fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> Standa
         }
     }
 
-    StandaloneExecutionPlan::Coordinated(build_result)
+    StandaloneExecutionPlan::Coordinated(Box::new(build_result))
 }
 
 /// Produce EXPLAIN output for a query without executing it.
@@ -1205,10 +1205,10 @@ pub(crate) fn execute_query(
     let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan, query_opts),
+        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(*plan, query_opts),
         StandaloneExecutionPlan::Coordinated(build_result) => {
             crate::runtime::coordinator::ExecutionCoordinator::new(
-                build_result,
+                *build_result,
                 "127.0.0.1".to_string(),
                 exchange_port,
                 query_opts,

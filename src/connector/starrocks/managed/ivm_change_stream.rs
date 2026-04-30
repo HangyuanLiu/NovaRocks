@@ -1,15 +1,10 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::changes::{
-    ChangeAction, IcebergChangeBatch, MaterializedChanges, materialize_changes, plan_changes,
+    IcebergChangeBatch, MaterializedChanges, materialize_changes, plan_changes,
 };
 use crate::connector::starrocks::managed::store::IcebergTableRef;
 use crate::engine::{QueryResult, StandaloneState};
-
-pub(crate) struct IvmChangeBranch<'a> {
-    pub(crate) action: ChangeAction,
-    pub(crate) result: &'a QueryResult,
-}
 
 pub(crate) struct IvmChangeStream {
     pub(crate) previous_snapshot_id: i64,
@@ -30,23 +25,6 @@ impl IvmChangeStream {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.inserts.row_count() == 0 && self.deletes.row_count() == 0
-    }
-
-    pub(crate) fn non_empty_branches(&self) -> Vec<IvmChangeBranch<'_>> {
-        let mut branches = Vec::with_capacity(2);
-        if self.inserts.row_count() > 0 {
-            branches.push(IvmChangeBranch {
-                action: ChangeAction::Insert,
-                result: &self.inserts,
-            });
-        }
-        if self.deletes.row_count() > 0 {
-            branches.push(IvmChangeBranch {
-                action: ChangeAction::Delete,
-                result: &self.deletes,
-            });
-        }
-        branches
     }
 
     pub(crate) fn into_results(self) -> (QueryResult, QueryResult) {
@@ -116,9 +94,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::connector::iceberg::changes::{
-        ChangeAction, IcebergChangeBatch, MaterializedChanges,
-    };
+    use crate::connector::iceberg::changes::{IcebergChangeBatch, MaterializedChanges};
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
     use super::{IvmChangeStream, validate_change_batch_current_snapshot};
@@ -156,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_changes_becomes_ordered_ivm_branches() {
+    fn materialized_changes_becomes_ivm_stream_results() {
         let changes = MaterializedChanges {
             previous_snapshot_id: 10,
             current_snapshot_id: 12,
@@ -169,11 +145,8 @@ mod tests {
         assert_eq!(stream.previous_snapshot_id, 10);
         assert_eq!(stream.current_snapshot_id, 12);
         assert!(!stream.is_empty());
-        let branches = stream.non_empty_branches();
-        assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].action, ChangeAction::Insert);
-        assert_eq!(branches[0].result.row_count(), 1);
-        assert_eq!(branches[1].action, ChangeAction::Delete);
-        assert_eq!(branches[1].result.row_count(), 1);
+        let (inserts, deletes) = stream.into_results();
+        assert_eq!(inserts.row_count(), 1);
+        assert_eq!(deletes.row_count(), 1);
     }
 }

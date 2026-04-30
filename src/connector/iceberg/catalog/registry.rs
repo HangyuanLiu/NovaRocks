@@ -145,10 +145,9 @@ impl IcebergCatalogEntry {
         if let (Ok(ns), Ok(tbl)) = (
             normalize_identifier(namespace_name),
             normalize_identifier(table_name),
-        ) {
-            if let Ok(mut cache) = self.table_cache.write() {
-                cache.remove(&(ns, tbl));
-            }
+        ) && let Ok(mut cache) = self.table_cache.write()
+        {
+            cache.remove(&(ns, tbl));
         }
     }
 }
