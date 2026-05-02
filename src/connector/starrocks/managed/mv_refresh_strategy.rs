@@ -1,4 +1,6 @@
-use crate::connector::iceberg::changes::ChangeError;
+use crate::connector::iceberg::changes::{
+    ChangeError, IcebergChangePolicySignal, policy_signal_from_change_error,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MvRefreshPolicy {
@@ -102,61 +104,101 @@ pub(crate) fn choose_snapshot_refresh_policy(
 }
 
 pub(crate) fn policy_from_change_error(err: ChangeError) -> MvRefreshPolicy {
-    match err {
-        ChangeError::UnsupportedOperation { snapshot_id, op } if op == "overwrite" => {
-            MvRefreshPolicy::FullRefresh {
-                target_snapshot_id: Some(snapshot_id),
-                reason: FullRefreshReason::InsertOverwrite { snapshot_id },
-            }
-        }
-        ChangeError::LineageBroken { previous_snapshot } => MvRefreshPolicy::FullRefresh {
+    match (policy_signal_from_change_error(&err), err) {
+        (
+            IcebergChangePolicySignal::FullRefresh { .. },
+            ChangeError::UnsupportedOperation { snapshot_id, op },
+        ) if op == "overwrite" => MvRefreshPolicy::FullRefresh {
+            target_snapshot_id: Some(snapshot_id),
+            reason: FullRefreshReason::InsertOverwrite { snapshot_id },
+        },
+        (
+            IcebergChangePolicySignal::FullRefresh { .. },
+            ChangeError::LineageBroken { previous_snapshot },
+        ) => MvRefreshPolicy::FullRefresh {
             target_snapshot_id: None,
             reason: FullRefreshReason::LineageExpired {
                 previous_snapshot_id: previous_snapshot,
             },
         },
-        ChangeError::EqualityDeleteUnsupported { snapshot_id } => MvRefreshPolicy::Unsupported {
+        (IcebergChangePolicySignal::FullRefresh { reason }, _) => MvRefreshPolicy::FullRefresh {
+            target_snapshot_id: None,
+            reason: FullRefreshReason::SchemaEvolutionSafeFallback { detail: reason },
+        },
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::EqualityDeleteUnsupported { snapshot_id },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::EqualityDelete { snapshot_id },
         },
-        ChangeError::SchemaEvolutionUnsupported { detail } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::SchemaEvolutionUnsupported { detail },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::SchemaEvolution { detail },
         },
-        ChangeError::ReplaceValidationFailed {
-            snapshot_id,
-            reason,
-        } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::ReplaceValidationFailed {
                 snapshot_id,
                 reason,
             },
         },
-        ChangeError::UnsupportedOperation { snapshot_id, op } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::UnsupportedOperation { snapshot_id, op },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::InternalInconsistency {
                 detail: format!("unsupported iceberg snapshot operation `{op}` in {snapshot_id}"),
             },
         },
-        ChangeError::InternalInconsistency(detail) => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::InternalInconsistency(detail),
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::InternalInconsistency { detail },
         },
-        ChangeError::PrimaryKeyMissingFromBase { pk_col }
-        | ChangeError::PrimaryKeyNullable { pk_col }
-        | ChangeError::PrimaryKeyTypeUnsupported { pk_col, .. } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::PrimaryKeyMissingFromBase { pk_col }
+            | ChangeError::PrimaryKeyNullable { pk_col }
+            | ChangeError::PrimaryKeyTypeUnsupported { pk_col, .. },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::InternalInconsistency {
                 detail: format!(
                     "CREATE-time primary key validation reached refresh path: {pk_col}"
                 ),
             },
         },
-        ChangeError::PrimaryKeyValueNull { row_info } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::PrimaryKeyValueNull { row_info },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::InternalInconsistency {
                 detail: format!("primary key value became NULL during refresh: {row_info}"),
             },
         },
-        ChangeError::IcebergFormatUnsupported { format_version } => MvRefreshPolicy::Unsupported {
+        (
+            IcebergChangePolicySignal::Unsupported { .. },
+            ChangeError::IcebergFormatUnsupported { format_version },
+        ) => MvRefreshPolicy::Unsupported {
             reason: UnsupportedRefreshReason::InternalInconsistency {
                 detail: format!(
                     "unsupported Iceberg format reached refresh path: {format_version}"
                 ),
+            },
+        },
+        (IcebergChangePolicySignal::Unsupported { reason }, _) => MvRefreshPolicy::Unsupported {
+            reason: UnsupportedRefreshReason::InternalInconsistency { detail: reason },
+        },
+        (IcebergChangePolicySignal::Incremental, _) => MvRefreshPolicy::Unsupported {
+            reason: UnsupportedRefreshReason::InternalInconsistency {
+                detail: "incremental signal is invalid for change planning errors".to_string(),
             },
         },
     }

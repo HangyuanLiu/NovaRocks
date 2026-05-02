@@ -52,6 +52,43 @@ pub(crate) enum ChangeError {
     InternalInconsistency(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum IcebergChangePolicySignal {
+    Incremental,
+    FullRefresh { reason: String },
+    Unsupported { reason: String },
+}
+
+pub(crate) fn policy_signal_from_change_error(err: &ChangeError) -> IcebergChangePolicySignal {
+    match err {
+        ChangeError::UnsupportedOperation { op, .. } if op == "overwrite" => {
+            IcebergChangePolicySignal::FullRefresh {
+                reason: "insert overwrite requires full refresh".to_string(),
+            }
+        }
+        ChangeError::LineageBroken { .. } => IcebergChangePolicySignal::FullRefresh {
+            reason: "previous snapshot is not reachable".to_string(),
+        },
+        ChangeError::EqualityDeleteUnsupported { .. } => IcebergChangePolicySignal::Unsupported {
+            reason: "equality delete is not supported by IVM".to_string(),
+        },
+        ChangeError::SchemaEvolutionUnsupported { detail } => {
+            IcebergChangePolicySignal::Unsupported {
+                reason: format!("schema evolution is not supported by IVM: {detail}"),
+            }
+        }
+        ChangeError::ReplaceValidationFailed { reason, .. } => {
+            IcebergChangePolicySignal::Unsupported {
+                reason: format!("replace snapshot is not a safe compaction: {reason}"),
+            }
+        }
+        other => IcebergChangePolicySignal::Unsupported {
+            reason: other.to_string(),
+        },
+    }
+}
+
 impl std::fmt::Display for ChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -832,7 +869,8 @@ mod tests {
     use iceberg::spec::{Operation, Snapshot, Summary};
 
     use super::{
-        ChangeError, LineageAction, classify_snapshot, normalize_delete_projection_path,
+        ChangeError, IcebergChangePolicySignal, LineageAction, classify_snapshot,
+        normalize_delete_projection_path, policy_signal_from_change_error,
         validate_replace_snapshot,
     };
 
@@ -844,6 +882,31 @@ mod tests {
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
     use super::plan_changes;
+
+    #[test]
+    fn overwrite_error_policy_signal_is_full_refresh() {
+        let err = ChangeError::UnsupportedOperation {
+            snapshot_id: 1,
+            op: "overwrite".to_string(),
+        };
+        assert_eq!(
+            policy_signal_from_change_error(&err),
+            IcebergChangePolicySignal::FullRefresh {
+                reason: "insert overwrite requires full refresh".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn equality_delete_policy_signal_is_unsupported() {
+        let err = ChangeError::EqualityDeleteUnsupported { snapshot_id: 2 };
+        assert_eq!(
+            policy_signal_from_change_error(&err),
+            IcebergChangePolicySignal::Unsupported {
+                reason: "equality delete is not supported by IVM".to_string(),
+            }
+        );
+    }
 
     fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {
         build_catalog_entry(
