@@ -305,6 +305,7 @@ pub(crate) fn create_mv(
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: Default::default(),
+        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
         created_at_ms: now_ms(),
         storage_engine: ManagedMvStorageEngine::ManagedLake,
         iceberg_table_identifier: None,

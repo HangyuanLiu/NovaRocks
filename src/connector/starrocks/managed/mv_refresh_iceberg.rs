@@ -134,6 +134,7 @@ pub(crate) fn create_iceberg_mv(
         mv_id,
         select_sql: stmt.select_sql.clone(),
         base_table_refs: base_refs,
+        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
         iceberg_table_identifier: format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}"),
         created_at_ms: now_ms(),
     })?;

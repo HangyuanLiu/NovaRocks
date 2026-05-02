@@ -455,8 +455,8 @@ pub(crate) fn classify_lineage(
 /// current snapshot (inclusive), classifies each snapshot operation,
 /// and assembles `IcebergChangeBatch { inserts, deletes }`.
 ///
-/// The `_pk_columns` parameter is reserved for PR-3 (delete reverse
-/// projection); it is intentionally unused in PR-2.
+/// The `_pk_columns` parameter is reserved for future delete-side row-id
+/// computation; snapshot lineage planning itself does not need it yet.
 pub(crate) fn plan_changes(
     table: &iceberg::table::Table,
     previous_snapshot_id: i64,
@@ -497,13 +497,13 @@ pub(crate) fn plan_changes(
     })
 }
 
-/// Top-level PR-3 entry: take an `IcebergChangeBatch`, produce a
+/// Top-level entry: take an `IcebergChangeBatch`, produce a
 /// `MaterializedChanges` whose `inserts` and `deletes` branches each
 /// hold the result of running the MV's SELECT statement against the
 /// relevant subset of base-table rows.
 ///
-/// The `_pk_columns` parameter is reserved for PR-4 (delete-side
-/// row-id computation when AggregateApplyChanges lands).
+/// The `_pk_columns` parameter is reserved for future delete-side row-id
+/// computation when aggregate apply-changes needs stable row identity.
 pub(crate) fn materialize_changes(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     current_database: &str,
@@ -511,6 +511,7 @@ pub(crate) fn materialize_changes(
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     base_table: &iceberg::table::Table,
     batch: IcebergChangeBatch,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     _pk_columns: &[String],
 ) -> Result<MaterializedChanges, String> {
     let inserts = if batch.inserts.is_empty() {
@@ -533,22 +534,23 @@ pub(crate) fn materialize_changes(
     let deletes = if batch.deletes.is_empty() {
         crate::engine::QueryResult::empty()
     } else {
-        let factory = build_factory_for_table(base_table)?;
+        let factory = build_factory_for_table(base_table, object_store_config)?;
         let size_lookup = |path: &str| -> Option<u64> {
-            // For PR-3 we don't carry the per-data-file size index across
-            // the boundary; iceberg-rust's parquet reader reads metadata
-            // by HEAD when we pass `None`. Best-effort optimization is
-            // PR-4 territory.
+            // We do not currently carry the per-data-file size index across
+            // this boundary; the parquet reader reads metadata by HEAD when
+            // we pass `None`. This is only an optimization opportunity.
             let _ = path;
             None
         };
-        let deleted_rows = crate::connector::iceberg::scan_deletes::scan_deletes(
-            &batch.deletes,
-            &factory,
-            base_table.file_io(),
-            size_lookup,
-        )
-        .map_err(|e| e.to_string())?;
+        let deleted_rows =
+            crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
+                &batch.deletes,
+                &factory,
+                base_table.file_io(),
+                size_lookup,
+                |path| normalize_delete_projection_path(path, object_store_config),
+            )
+            .map_err(|e| e.to_string())?;
         crate::engine::mv_flow::execute_query_for_mv_incremental_deletes(
             state,
             current_database,
@@ -573,15 +575,75 @@ pub(crate) fn materialize_changes(
 /// when the catalog has cloud properties).
 fn build_factory_for_table(
     table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
-    let _ = table; // Per PR-3 scope: local-FS only — same constraint as
-    // execute_query_for_mv_incremental_refresh which
-    // rejects multi-file local reads. PR-4 wires cloud.
-    // Build a local-FS operator rooted at "/" so absolute file paths work.
-    let operator = crate::fs::opendal::build_fs_operator("/")
-        .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?;
+    let location = table.metadata().location();
+    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(location))
+        .map_err(|e| format!("classify iceberg delete reverse projection path: {e}"))?;
+    let operator = match scheme {
+        crate::fs::path::ScanPathScheme::Local => crate::fs::opendal::build_fs_operator("/")
+            .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?,
+        crate::fs::path::ScanPathScheme::Oss => {
+            let cfg = object_store_config.ok_or_else(|| {
+                format!(
+                    "missing object store config for delete reverse projection: table_location={location}"
+                )
+            })?;
+            crate::fs::oss::build_oss_operator(cfg).map_err(|e| {
+                format!("build object-store operator for delete reverse projection: {e}")
+            })?
+        }
+        crate::fs::path::ScanPathScheme::Hdfs => {
+            let paths = vec![location.to_string()];
+            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths)
+                .map_err(|e| format!("resolve hdfs path for delete reverse projection: {e}"))?;
+            crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
+                .map_err(|e| format!("build hdfs operator for delete reverse projection: {e}"))?
+        }
+    };
     crate::fs::opendal::OpendalRangeReaderFactory::from_operator(operator)
         .map_err(|e| format!("build opendal range reader factory: {e}"))
+}
+
+fn normalize_delete_projection_path(
+    path: &str,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<String, ChangeError> {
+    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(path)).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "classify iceberg delete reverse projection path {path}: {e}"
+        ))
+    })?;
+    match scheme {
+        crate::fs::path::ScanPathScheme::Local => {
+            Ok(path.strip_prefix("file://").unwrap_or(path).to_string())
+        }
+        crate::fs::path::ScanPathScheme::Oss => {
+            let cfg = object_store_config.ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "missing object store config for delete reverse projection path {path}"
+                ))
+            })?;
+            crate::fs::oss::normalize_oss_path(path, &cfg.bucket, &cfg.root).map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize object-store delete reverse projection path {path}: {e}"
+                ))
+            })
+        }
+        crate::fs::path::ScanPathScheme::Hdfs => {
+            let paths = vec![path.to_string()];
+            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths).map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize hdfs delete reverse projection path {path}: {e}"
+                ))
+            })?;
+            resolved.paths.into_iter().next().ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize hdfs delete reverse projection path {path}: empty result"
+                ))
+            })
+        }
+    }
 }
 
 /// Async file collection for one `LineagePlan`. Loads each snapshot's
@@ -769,12 +831,16 @@ mod tests {
 
     use iceberg::spec::{Operation, Snapshot, Summary};
 
-    use super::{ChangeError, LineageAction, classify_snapshot, validate_replace_snapshot};
+    use super::{
+        ChangeError, LineageAction, classify_snapshot, normalize_delete_projection_path,
+        validate_replace_snapshot,
+    };
 
     use crate::connector::iceberg::catalog::registry::{
         IcebergCatalogEntry, build_catalog_entry, create_namespace, create_table, insert_rows,
         load_table,
     };
+    use crate::fs::object_store::ObjectStoreConfig;
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
     use super::plan_changes;
@@ -839,6 +905,43 @@ mod tests {
             ("added-data-files", added_files.to_string()),
             ("deleted-data-files", deleted_files.to_string()),
         ]
+    }
+
+    fn test_object_store_config() -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "lake".to_string(),
+            root: "warehouse".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_uses_object_store_config_for_s3_uri() {
+        let cfg = test_object_store_config();
+        let path = normalize_delete_projection_path(
+            "s3://lake/warehouse/db/orders/data.parquet",
+            Some(&cfg),
+        )
+        .expect("normalize");
+        assert_eq!(path, "db/orders/data.parquet");
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_rejects_s3_uri_without_object_store_config() {
+        let err =
+            normalize_delete_projection_path("s3://lake/warehouse/db/orders/data.parquet", None)
+                .expect_err("must reject");
+        assert!(format!("{err}").contains("missing object store config"));
     }
 
     #[test]

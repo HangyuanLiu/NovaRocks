@@ -24,7 +24,8 @@ use crate::connector::starrocks::managed::ddl::{
 };
 use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, BeginMvRefreshRequest, IcebergTableRef, ManagedPartitionState,
-    ManagedTableKind, StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
+    ManagedTableKind, SqliteMetadataStore, StageMvRefreshRequest, StagedMvRefresh,
+    UpdateMvRefreshMetadataRequest,
 };
 use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
@@ -179,7 +180,7 @@ pub(crate) fn refresh_mv(
                 &loaded.table,
                 previous_snapshot_id,
                 current_snapshot_id,
-                &[],
+                &mv_row.primary_key_columns,
             )?;
             if !batch.deletes.is_empty() {
                 return Err(format!(
@@ -233,7 +234,10 @@ pub(crate) fn refresh_mv(
                 select_sql: &mv_row.select_sql,
                 base_ref,
                 base_table: &loaded.table,
+                object_store_config: loaded.object_store_config.as_ref(),
                 shape,
+                primary_key_columns: &mv_row.primary_key_columns,
+                previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
             })
@@ -331,7 +335,10 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     select_sql: &'a str,
     base_ref: &'a IcebergTableRef,
     base_table: &'a iceberg::table::Table,
+    object_store_config: Option<&'a crate::fs::object_store::ObjectStoreConfig>,
     shape: &'a super::mv_shape::AggregateMvShape,
+    primary_key_columns: &'a [String],
+    previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
 }
@@ -346,9 +353,10 @@ fn refresh_aggregate_mv_incremental(
         &state_sql,
         ctx.base_ref,
         ctx.base_table,
+        ctx.object_store_config,
         ctx.previous_snapshot_id,
         ctx.current_snapshot_id,
-        &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
+        ctx.primary_key_columns,
     )?;
 
     if change_stream.previous_snapshot_id != ctx.previous_snapshot_id
@@ -365,14 +373,19 @@ fn refresh_aggregate_mv_incremental(
 
     // Empty-input early return: nothing to merge, just advance lineage.
     if change_stream.is_empty() {
-        // The refresh metadata write is what advances the lineage marker.
-        // PR-3 doesn't yet have a no-op write path that touches metadata
-        // without writing chunks; defer to PR-4.
-        return Err(
-            "aggregate MV incremental refresh: no inserts and no deletes; \
-             lineage-advance-only path not yet implemented in PR-3 — defer to PR-4"
-                .to_string(),
-        );
+        let metadata_store =
+            ctx.state.metadata_store.as_ref().ok_or_else(|| {
+                "managed lake mv refresh requires sqlite metadata store".to_string()
+            })?;
+        advance_mv_refresh_metadata_without_writes(
+            metadata_store,
+            ctx.table_id,
+            ctx.base_ref,
+            ctx.current_snapshot_id,
+            ctx.previous_refresh_rows,
+        )?;
+        refresh_managed_catalog(ctx.state)?;
+        return Ok(StatementResult::Ok);
     }
 
     // Build the layout early (cheap: parse + analyze only, no SQL execution) so we can
@@ -438,6 +451,20 @@ fn refresh_aggregate_mv_incremental(
     )?;
     refresh_managed_catalog(ctx.state)?;
     Ok(StatementResult::Ok)
+}
+
+fn advance_mv_refresh_metadata_without_writes(
+    metadata_store: &SqliteMetadataStore,
+    table_id: i64,
+    base_ref: &IcebergTableRef,
+    current_snapshot_id: i64,
+    last_refresh_rows: i64,
+) -> Result<(), String> {
+    metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
+        table_id,
+        last_refresh_rows,
+        snapshots: single_snapshot_map(base_ref, current_snapshot_id),
+    })
 }
 
 pub(crate) fn refresh_mv_full_with_executor<F>(
@@ -967,6 +994,37 @@ mod tests {
     }
 
     #[test]
+    fn advance_empty_change_stream_updates_metadata_without_writing() {
+        let (_dir, store) = seed_mv_refresh_store();
+        let base_ref = IcebergTableRef {
+            catalog: "missing_catalog".to_string(),
+            namespace: "ns".to_string(),
+            table: "orders".to_string(),
+        };
+        let snapshots = single_snapshot_map(&base_ref, 42);
+        store
+            .begin_mv_refresh(BeginMvRefreshRequest {
+                table_id: 10,
+                target_snapshots: snapshots.clone(),
+            })
+            .expect("begin refresh");
+
+        advance_mv_refresh_metadata_without_writes(&store, 10, &base_ref, 42, 17)
+            .expect("advance metadata");
+
+        let snapshot = store.load_snapshot().expect("load snapshot").managed;
+        let mv = snapshot
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv row");
+        assert_eq!(mv.last_refresh_rows, Some(17));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+        assert!(!mv.refresh_in_progress);
+        assert!(mv.refresh_target_snapshots.is_empty());
+    }
+
+    #[test]
     fn refresh_mv_full_cleans_staged_partition_when_executor_fails() {
         // Covered by integration-style engine/mysql tests once mv refresh is wired.
         // Keep this module-level smoke test minimal so the file always participates
@@ -1123,7 +1181,7 @@ mod tests {
 
     #[test]
     fn aggregate_mv_incremental_refresh_handles_base_delete() {
-        // End-to-end PR-3 deliverable test. Builds a real iceberg base
+        // End-to-end delete-bearing aggregate IVM test. Builds a real iceberg base
         // table (3 rows over (id, customer, amount)), creates a
         // managed-lake aggregate MV (count + sum grouped by customer),
         // populates the MV via a full REFRESH, then DELETEs one base row
@@ -1444,6 +1502,150 @@ mod tests {
         drop(engine);
     }
 
+    #[test]
+    fn aggregate_mv_incremental_refresh_handles_s3_v3_row_lineage_base_delete() {
+        // Same delete-bearing aggregate IVM path as
+        // `aggregate_mv_incremental_refresh_handles_v3_row_lineage_base_delete`,
+        // but the base Iceberg table itself lives in the MinIO-backed S3 catalog.
+        // This covers object-store path normalization in delete reverse projection.
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_warehouse = unique_s3_iceberg_warehouse("mv_s3_v3_delete");
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        session
+            .execute_in_database(
+                &create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse),
+                "default",
+            )
+            .expect("create s3 iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create s3 row-lineage iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed s3 iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "s3 row-lineage MV state after full refresh must reflect the seeded base rows"
+        );
+
+        session
+            .execute_in_database("delete from ice.ns.orders where id = 1", "default")
+            .expect("delete s3 base row id=1 (writes puffin dv)");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, s3 DV-bearing) refresh materialized view: {err}");
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "s3 row-lineage MV state after DV-bearing incremental refresh must retract the deleted row"
+        );
+
+        drop(engine);
+    }
+
     /// Read the managed-lake aggregate MV's visible state as
     /// `(customer, c, s)` rows sorted by customer. Used by the
     /// end-to-end `aggregate_mv_incremental_refresh_handles_base_delete`
@@ -1543,6 +1745,45 @@ enable_path_style_access = true
         )
         .expect("write standalone config");
         Some((dir, config_path))
+    }
+
+    fn s3_test_value(primary: &str, fallback: &str, default: &str) -> String {
+        std::env::var(primary)
+            .or_else(|_| std::env::var(fallback))
+            .unwrap_or_else(|_| default.to_string())
+    }
+
+    fn unique_s3_iceberg_warehouse(prefix: &str) -> String {
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root =
+            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let run_id = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        if root.trim_matches('/').is_empty() {
+            format!("s3://{bucket}/{run_id}")
+        } else {
+            format!("s3://{}/{}/{}", bucket, root.trim_matches('/'), run_id)
+        }
+    }
+
+    fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> String {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let access_key_id = s3_test_value("AWS_S3_ACCESS_KEY_ID", "MINIO_ROOT_USER", "admin");
+        let access_key_secret = s3_test_value(
+            "AWS_S3_SECRET_ACCESS_KEY",
+            "MINIO_ROOT_PASSWORD",
+            "admin123",
+        );
+        format!(
+            r#"create external catalog {catalog_name} properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{warehouse_uri}","aws.s3.endpoint"="{endpoint}","aws.s3.access_key"="{access_key_id}","aws.s3.secret_key"="{access_key_secret}","aws.s3.enable_path_style_access"="true","aws.s3.region"="us-east-1")"#
+        )
     }
 
     #[test]
@@ -1733,6 +1974,7 @@ enable_path_style_access = true
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -1856,6 +2098,7 @@ enable_path_style_access = true
                 last_refresh_ms: None,
                 last_refresh_rows: None,
                 last_refresh_snapshots: BTreeMap::new(),
+                primary_key_columns: Vec::new(),
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,

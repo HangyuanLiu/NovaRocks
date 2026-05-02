@@ -44,11 +44,15 @@ const FILE_PATH_COLUMN: &str = "file_path";
 const POS_COLUMN: &str = "pos";
 
 /// Strip the `file://` URL scheme so the path can be passed to a local-FS
-/// opendal operator (which expects bare filesystem paths). Other schemes
-/// (s3://, hdfs://, …) are returned unchanged because PR-3 only supports
-/// the local-FS path; cloud handling is PR-4.
+/// opendal operator (which expects bare filesystem paths). Object-store and
+/// HDFS callers use `scan_deletes_with_path_normalizer` to translate full
+/// Iceberg URIs into paths relative to the matching OpenDAL operator.
 fn normalize_local_fs_path(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
+}
+
+fn normalize_local_fs_path_owned(path: &str) -> Result<String, ChangeError> {
+    Ok(normalize_local_fs_path(path).to_string())
 }
 
 // TODO(ivm-phase-2 follow-up): every failure path here funnels into
@@ -69,6 +73,21 @@ pub(crate) fn read_delete_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
+    read_delete_positions_per_data_file_with_path_normalizer(
+        delete_files,
+        factory,
+        &normalize_local_fs_path_owned,
+    )
+}
+
+fn read_delete_positions_per_data_file_with_path_normalizer<N>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: &N,
+) -> Result<HashMap<String, RoaringTreemap>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
     use crate::cache::CachedRangeReader;
     use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
     use arrow::array::{Int64Array, StringArray};
@@ -81,11 +100,9 @@ pub(crate) fn read_delete_positions_per_data_file(
         } else {
             None
         };
+        let delete_file_path = normalize_path(&delete_file.delete_file_path)?;
         let reader = factory
-            .open_with_len(
-                normalize_local_fs_path(&delete_file.delete_file_path),
-                length,
-            )
+            .open_with_len(&delete_file_path, length)
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "open iceberg position-delete file {} failed: {e}",
@@ -252,6 +269,25 @@ pub(crate) fn read_data_file_at_positions(
     positions: &RoaringTreemap,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
 ) -> Result<Vec<RecordBatch>, ChangeError> {
+    read_data_file_at_positions_with_path_normalizer(
+        data_file_path,
+        data_file_size,
+        positions,
+        factory,
+        &normalize_local_fs_path_owned,
+    )
+}
+
+fn read_data_file_at_positions_with_path_normalizer<N>(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    positions: &RoaringTreemap,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: &N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
     use crate::cache::CachedRangeReader;
     use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
 
@@ -259,8 +295,9 @@ pub(crate) fn read_data_file_at_positions(
         return Ok(Vec::new());
     }
 
+    let normalized_data_file_path = normalize_path(data_file_path)?;
     let reader = factory
-        .open_with_len(normalize_local_fs_path(data_file_path), data_file_size)
+        .open_with_len(&normalized_data_file_path, data_file_size)
         .map_err(|e| {
             ChangeError::InternalInconsistency(format!(
                 "open iceberg data file {data_file_path} for delete reverse projection: {e}"
@@ -377,6 +414,26 @@ pub(crate) fn scan_deletes<F>(
 where
     F: Fn(&str) -> Option<u64>,
 {
+    scan_deletes_with_path_normalizer(
+        delete_files,
+        factory,
+        file_io,
+        data_file_size_lookup,
+        normalize_local_fs_path_owned,
+    )
+}
+
+pub(crate) fn scan_deletes_with_path_normalizer<F, N>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
+    data_file_size_lookup: F,
+    normalize_path: N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    F: Fn(&str) -> Option<u64>,
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
     use crate::connector::iceberg::catalog::registry::block_on_iceberg;
     use iceberg::spec::DataFileFormat;
 
@@ -389,7 +446,11 @@ where
         .cloned()
         .partition(|r| r.file_format == DataFileFormat::Parquet);
 
-    let mut positions_per_file = read_delete_positions_per_data_file(&parquet_dels, factory)?;
+    let mut positions_per_file = read_delete_positions_per_data_file_with_path_normalizer(
+        &parquet_dels,
+        factory,
+        &normalize_path,
+    )?;
     if !puffin_dels.is_empty() {
         let dv_positions = block_on_iceberg(read_dv_positions_per_data_file(&puffin_dels, file_io))
             .map_err(|e| {
@@ -410,7 +471,13 @@ where
     for data_file_path in data_file_paths {
         let positions = &positions_per_file[data_file_path];
         let size = data_file_size_lookup(data_file_path);
-        let batches = read_data_file_at_positions(data_file_path, size, positions, factory)?;
+        let batches = read_data_file_at_positions_with_path_normalizer(
+            data_file_path,
+            size,
+            positions,
+            factory,
+            &normalize_path,
+        )?;
         out.extend(batches);
     }
     Ok(out)
@@ -431,6 +498,7 @@ mod tests {
     use super::{
         FILE_PATH_COLUMN, POS_COLUMN, positions_to_row_selection, read_data_file_at_positions,
         read_delete_positions_per_data_file, read_dv_positions_per_data_file, scan_deletes,
+        scan_deletes_with_path_normalizer,
     };
     use crate::connector::iceberg::changes::PositionDeleteRef;
     use crate::connector::iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
@@ -626,6 +694,54 @@ mod tests {
         .expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn scan_deletes_projects_object_store_paths_with_normalizer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table_dir = dir.path().join("warehouse/db/orders");
+        fs::create_dir_all(&table_dir).expect("create table dir");
+        let data_path = table_dir.join("data.parquet");
+        write_data_parquet(&data_path, &[10, 20, 30, 40], &["a", "b", "c", "d"]);
+        let delete_path = table_dir.join("deletes.parquet");
+        let data_uri = "s3://lake/warehouse/db/orders/data.parquet";
+        write_delete_parquet(&delete_path, &[data_uri, data_uri], &[0, 2]);
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: "s3://lake/warehouse/db/orders/deletes.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: Some(2),
+            referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }];
+
+        let batches = scan_deletes_with_path_normalizer(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| {
+                path.strip_prefix("s3://lake/")
+                    .map(|relative| relative.to_string())
+                    .ok_or_else(|| {
+                        crate::connector::iceberg::changes::ChangeError::InternalInconsistency(
+                            format!("unexpected object-store path: {path}"),
+                        )
+                    })
+            },
+        )
+        .expect("ok");
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+        let id = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id col");
+        assert_eq!(id.value(0), 10);
+        assert_eq!(id.value(1), 30);
     }
 
     #[test]

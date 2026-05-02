@@ -64,6 +64,7 @@ pub(crate) fn materialize_iceberg_change_stream(
     select_sql: &str,
     base_ref: &IcebergTableRef,
     base_table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     previous_snapshot_id: i64,
     expected_current_snapshot_id: i64,
     pk_columns: &[String],
@@ -81,6 +82,7 @@ pub(crate) fn materialize_iceberg_change_stream(
         base_ref,
         base_table,
         batch,
+        object_store_config,
         pk_columns,
     )?;
     Ok(IvmChangeStream::from_materialized(materialized))

@@ -55,6 +55,7 @@ pub(crate) struct IcebergLoadedTable {
     pub logical_types: HashMap<String, SqlType>,
     pub key_desc: Option<TableKeyDesc>,
     pub column_aggregations: HashMap<String, ColumnAggregation>,
+    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
 }
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
@@ -463,6 +464,7 @@ pub(crate) fn load_table(
         logical_types,
         key_desc,
         column_aggregations,
+        object_store_config: entry.s3_config.clone(),
     };
 
     // Cache the loaded table

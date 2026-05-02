@@ -1538,6 +1538,7 @@ mod tests {
         StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
         StatementResult, dispatch_statement, register_connector_backends,
     };
+    use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
@@ -3022,6 +3023,7 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
+        let _runtime_guard = lock_runtime_test_state();
         use crate::connector::starrocks as starrocks_connector;
         use starrocks_connector::managed::store::{
             ManagedIndexState, ManagedPartitionState, SqliteMetadataStore, StoredManagedIndex,
@@ -3123,6 +3125,7 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_reopen_keeps_truncated_managed_table_empty() {
+        let _runtime_guard = lock_runtime_test_state();
         let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
             return;
         };
@@ -3161,6 +3164,7 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
+        let _runtime_guard = lock_runtime_test_state();
         use crate::connector::starrocks as starrocks_connector;
         use starrocks_connector::managed::store::{
             ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,

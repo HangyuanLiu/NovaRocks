@@ -51,7 +51,10 @@ where
         if path.is_empty() {
             return Err("scan path is empty".to_string());
         }
-        let current = if path.starts_with("oss://") || path.starts_with("s3://") {
+        let current = if path.starts_with("oss://")
+            || path.starts_with("s3://")
+            || path.starts_with("s3a://")
+        {
             ScanPathScheme::Oss
         } else if path.starts_with("hdfs://") {
             ScanPathScheme::Hdfs
@@ -178,5 +181,12 @@ mod tests {
         let scheme = classify_scan_paths(["hdfs://nn-1:9000/user/hive/a.parquet"])
             .expect("classify hdfs URI path");
         assert_eq!(scheme, ScanPathScheme::Hdfs);
+    }
+
+    #[test]
+    fn classify_scan_paths_accepts_s3a_uri_as_object_store() {
+        let scheme = classify_scan_paths(["s3a://bucket/warehouse/t/data.parquet"])
+            .expect("classify s3a URI path");
+        assert_eq!(scheme, ScanPathScheme::Oss);
     }
 }
