@@ -5,7 +5,10 @@ use crate::connector::iceberg::catalog::load_table;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::connector::starrocks::managed::ivm_change_stream::{
-    materialize_iceberg_change_stream, plan_iceberg_change_batch_for_ivm,
+    materialize_iceberg_change_batch, plan_iceberg_change_batch_for_ivm,
+};
+use crate::connector::starrocks::managed::mv_refresh_strategy::{
+    MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
 };
 use crate::engine::mv_flow::{
     analyze_visible_output_types, execute_query_for_mv_incremental_refresh,
@@ -33,37 +36,6 @@ use crate::connector::starrocks::managed::txn::{
     write_chunks_into_managed_partition_for_aggregate_mv_upsert,
     write_chunks_into_managed_partition_for_mv_refresh,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MvRefreshStrategy {
-    Full,
-    NoOp {
-        current_snapshot_id: i64,
-    },
-    Incremental {
-        previous_snapshot_id: i64,
-        current_snapshot_id: i64,
-    },
-}
-
-fn choose_refresh_strategy(
-    previous_snapshot_id: Option<i64>,
-    current_snapshot_id: Option<i64>,
-) -> Result<MvRefreshStrategy, String> {
-    match (previous_snapshot_id, current_snapshot_id) {
-        (None, _) => Ok(MvRefreshStrategy::Full),
-        (Some(previous), Some(current)) if previous == current => Ok(MvRefreshStrategy::NoOp {
-            current_snapshot_id: current,
-        }),
-        (Some(previous), Some(current)) => Ok(MvRefreshStrategy::Incremental {
-            previous_snapshot_id: previous,
-            current_snapshot_id: current,
-        }),
-        (Some(previous), None) => Err(format!(
-            "cannot incrementally refresh materialized view: Iceberg snapshot {previous} is no longer reachable"
-        )),
-    }
-}
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
@@ -146,10 +118,10 @@ pub(crate) fn refresh_mv(
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
-    let strategy = choose_refresh_strategy(previous_snapshot_id, current_snapshot_id)?;
+    let strategy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
     if matches!(
         strategy,
-        MvRefreshStrategy::Full | MvRefreshStrategy::Incremental { .. }
+        MvRefreshPolicy::FullRefresh { .. } | MvRefreshPolicy::Incremental { .. }
     ) {
         let target_snapshots = current_snapshot_id
             .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
@@ -176,12 +148,43 @@ pub(crate) fn refresh_mv(
             Ok(StatementResult::Ok)
         },
         |previous_snapshot_id, current_snapshot_id| {
-            let batch = plan_iceberg_change_batch_for_ivm(
+            let batch = match plan_iceberg_change_batch_for_ivm(
                 &loaded.table,
                 previous_snapshot_id,
                 current_snapshot_id,
                 &mv_row.primary_key_columns,
-            )?;
+            ) {
+                Ok(batch) => batch,
+                Err(err) => match policy_from_change_error(err) {
+                    MvRefreshPolicy::FullRefresh { reason, .. } => {
+                        tracing::info!(
+                            target: "mv_refresh",
+                            mv = %format!("{}.{}", db_name, mv_name),
+                            base = %base_ref.fqn(),
+                            snapshot_from = previous_snapshot_id,
+                            snapshot_to = current_snapshot_id,
+                            reason = %reason,
+                            "mv_refresh fall-back to Full from projection incremental planner"
+                        );
+                        return refresh_mv_full_with_executor(
+                            state,
+                            &db_name,
+                            &mv_name,
+                            run_mv_select_and_chunks,
+                        );
+                    }
+                    MvRefreshPolicy::Unsupported { reason } => {
+                        return Err(format!(
+                            "iceberg materialized view refresh unsupported: {reason}"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "iceberg materialized view refresh produced invalid policy from change planner: {other:?}"
+                        ));
+                    }
+                },
+            };
             if !batch.deletes.is_empty() {
                 return Err(format!(
                     "iceberg materialized view incremental refresh does not yet support \
@@ -226,6 +229,38 @@ pub(crate) fn refresh_mv(
             Ok(StatementResult::Ok)
         },
         |shape, previous_snapshot_id, current_snapshot_id| {
+            let change_batch = match plan_iceberg_change_batch_for_ivm(
+                &loaded.table,
+                previous_snapshot_id,
+                current_snapshot_id,
+                &mv_row.primary_key_columns,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => match policy_from_change_error(err) {
+                    MvRefreshPolicy::FullRefresh { reason, .. } => {
+                        tracing::info!(
+                            target: "mv_refresh",
+                            mv = %format!("{}.{}", db_name, mv_name),
+                            base = %base_ref.fqn(),
+                            snapshot_from = previous_snapshot_id,
+                            snapshot_to = current_snapshot_id,
+                            reason = %reason,
+                            "mv_refresh fall-back to Full from aggregate incremental planner"
+                        );
+                        return refresh_aggregate_mv_full(state, &db_name, &mv_name, shape);
+                    }
+                    MvRefreshPolicy::Unsupported { reason } => {
+                        return Err(format!(
+                            "iceberg materialized view refresh unsupported: {reason}"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "iceberg materialized view refresh produced invalid policy from change planner: {other:?}"
+                        ));
+                    }
+                },
+            };
             refresh_aggregate_mv_incremental(AggregateMvIncrementalRefreshContext {
                 state,
                 database: &db_name,
@@ -237,6 +272,7 @@ pub(crate) fn refresh_mv(
                 object_store_config: loaded.object_store_config.as_ref(),
                 shape,
                 primary_key_columns: &mv_row.primary_key_columns,
+                change_batch,
                 previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
@@ -253,7 +289,7 @@ fn dispatch_mv_refresh_strategy<
     AggregateIncremental,
 >(
     mv_shape: &super::mv_shape::IncrementalMvShape,
-    strategy: MvRefreshStrategy,
+    strategy: MvRefreshPolicy,
     projection_full: ProjectionFull,
     aggregate_full: AggregateFull,
     no_op: NoOp,
@@ -269,32 +305,37 @@ where
         FnOnce(&super::mv_shape::AggregateMvShape, i64, i64) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
-        (super::mv_shape::IncrementalMvShape::ProjectionFilter(_), MvRefreshStrategy::Full) => {
-            projection_full()
-        }
-        (super::mv_shape::IncrementalMvShape::Aggregate(shape), MvRefreshStrategy::Full) => {
-            aggregate_full(shape)
-        }
+        (
+            super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
+            MvRefreshPolicy::FullRefresh { .. },
+        ) => projection_full(),
+        (
+            super::mv_shape::IncrementalMvShape::Aggregate(shape),
+            MvRefreshPolicy::FullRefresh { .. },
+        ) => aggregate_full(shape),
         (
             _,
-            MvRefreshStrategy::NoOp {
+            MvRefreshPolicy::NoOp {
                 current_snapshot_id,
             },
         ) => no_op(current_snapshot_id),
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
             },
         ) => projection_incremental(previous_snapshot_id, current_snapshot_id),
         (
             super::mv_shape::IncrementalMvShape::Aggregate(shape),
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
             },
         ) => aggregate_incremental(shape, previous_snapshot_id, current_snapshot_id),
+        (_, MvRefreshPolicy::Unsupported { reason }) => Err(format!(
+            "iceberg materialized view refresh unsupported: {reason}"
+        )),
     }
 }
 
@@ -338,6 +379,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     object_store_config: Option<&'a crate::fs::object_store::ObjectStoreConfig>,
     shape: &'a super::mv_shape::AggregateMvShape,
     primary_key_columns: &'a [String],
+    change_batch: crate::connector::iceberg::changes::IcebergChangeBatch,
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
@@ -347,15 +389,14 @@ fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
     let state_sql = super::mv_shape::rewrite_select_sql_for_state(ctx.select_sql, ctx.shape)?;
-    let change_stream = materialize_iceberg_change_stream(
+    let change_stream = materialize_iceberg_change_batch(
         ctx.state,
         ctx.database,
         &state_sql,
         ctx.base_ref,
         ctx.base_table,
+        ctx.change_batch,
         ctx.object_store_config,
-        ctx.previous_snapshot_id,
-        ctx.current_snapshot_id,
         ctx.primary_key_columns,
     )?;
 
@@ -930,6 +971,9 @@ mod tests {
         patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
         table_columns_from_physical_columns,
     };
+    use crate::connector::starrocks::managed::mv_refresh_strategy::{
+        FullRefreshReason, UnsupportedRefreshReason,
+    };
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
@@ -953,16 +997,22 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_without_previous_snapshot_uses_full_refresh() {
-        let strategy = choose_refresh_strategy(None, Some(10)).expect("strategy");
-        assert_eq!(strategy, MvRefreshStrategy::Full);
+        let strategy = choose_snapshot_refresh_policy(None, Some(10)).expect("strategy");
+        assert_eq!(
+            strategy,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(10),
+                reason: FullRefreshReason::InitialRefresh,
+            }
+        );
     }
 
     #[test]
     fn choose_refresh_strategy_for_same_snapshot_is_no_op() {
-        let strategy = choose_refresh_strategy(Some(10), Some(10)).expect("strategy");
+        let strategy = choose_snapshot_refresh_policy(Some(10), Some(10)).expect("strategy");
         assert_eq!(
             strategy,
-            MvRefreshStrategy::NoOp {
+            MvRefreshPolicy::NoOp {
                 current_snapshot_id: 10
             }
         );
@@ -970,10 +1020,10 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_for_advanced_snapshot_is_incremental() {
-        let strategy = choose_refresh_strategy(Some(10), Some(12)).expect("strategy");
+        let strategy = choose_snapshot_refresh_policy(Some(10), Some(12)).expect("strategy");
         assert_eq!(
             strategy,
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id: 10,
                 current_snapshot_id: 12,
             }
@@ -982,14 +1032,46 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_rejects_unreachable_previous_snapshot() {
-        let err = choose_refresh_strategy(Some(10), None).expect_err("strategy should fail");
+        let err = choose_snapshot_refresh_policy(Some(10), None).expect_err("strategy should fail");
         assert!(
             err.contains("10"),
             "expected error to contain previous snapshot id, got `{err}`"
         );
         assert!(
-            err.contains("no longer reachable"),
-            "expected error to describe unreachable snapshot, got `{err}`"
+            err.contains("no current snapshot"),
+            "expected error to describe missing current snapshot, got `{err}`"
+        );
+    }
+
+    #[test]
+    fn overwrite_change_error_routes_projection_mv_to_full_refresh_policy() {
+        let policy = policy_from_change_error(
+            crate::connector::iceberg::changes::ChangeError::UnsupportedOperation {
+                snapshot_id: 99,
+                op: "overwrite".to_string(),
+            },
+        );
+        assert_eq!(
+            policy,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(99),
+                reason: FullRefreshReason::InsertOverwrite { snapshot_id: 99 },
+            }
+        );
+    }
+
+    #[test]
+    fn equality_delete_change_error_stays_unsupported_policy() {
+        let policy = policy_from_change_error(
+            crate::connector::iceberg::changes::ChangeError::EqualityDeleteUnsupported {
+                snapshot_id: 101,
+            },
+        );
+        assert_eq!(
+            policy,
+            MvRefreshPolicy::Unsupported {
+                reason: UnsupportedRefreshReason::EqualityDelete { snapshot_id: 101 },
+            }
         );
     }
 
@@ -1042,7 +1124,10 @@ mod tests {
 
         let result = dispatch_mv_refresh_strategy(
             &mv_shape,
-            MvRefreshStrategy::Full,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(12),
+                reason: FullRefreshReason::InitialRefresh,
+            },
             || {
                 projection_full_called.set(true);
                 Err("projection full executor should not run".to_string())
