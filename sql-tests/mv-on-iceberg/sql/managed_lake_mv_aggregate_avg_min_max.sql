@@ -1,3 +1,4 @@
+-- @sequential=true
 -- @order_sensitive=true
 -- @tags=write_path,managed_lake,mv,iceberg,aggregate,avg,min,max
 -- Test Objective:

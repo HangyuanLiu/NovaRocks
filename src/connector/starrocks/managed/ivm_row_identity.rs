@@ -6,6 +6,7 @@ pub(crate) enum BaseRowIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum BaseRowChangeKind {
     Insert,
     Delete,
@@ -13,11 +14,13 @@ pub(crate) enum BaseRowChangeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct BaseRowChange {
     pub(crate) identity: BaseRowIdentity,
     pub(crate) kind: BaseRowChangeKind,
 }
 
+#[allow(dead_code)]
 pub(crate) fn normalize_insert_delete_pairs(
     inserts: impl IntoIterator<Item = BaseRowIdentity>,
     deletes: impl IntoIterator<Item = BaseRowIdentity>,

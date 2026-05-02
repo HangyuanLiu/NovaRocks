@@ -1,0 +1,14 @@
+-- query 3
+customer	c	s
+A	2	30
+B	1	30
+
+-- query 6
+customer	c	s
+A	3	130
+B	1	30
+
+-- query 9
+customer	c	s
+A	2	320
+B	1	130

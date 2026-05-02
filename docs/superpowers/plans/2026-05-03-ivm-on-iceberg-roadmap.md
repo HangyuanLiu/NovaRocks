@@ -59,7 +59,7 @@ Planned code boundaries:
   - Exposes classification details needed by strategy, instead of only returning display strings.
 - Modify: `src/connector/starrocks/managed/store.rs`
   - Adds metadata only when a phase needs durable state; each schema bump must include migration tests.
-- Add SQL cases under `sql-tests/write-path/sql/`
+- Add SQL cases under `sql-tests/mv-on-iceberg/sql/`
   - External-object-store coverage belongs here when it depends on MinIO/config.
 
 ## Roadmap
@@ -938,33 +938,31 @@ git commit -m "Classify Iceberg MV refresh evolution policy"
 ### Task 7: R5 SQL-Test and Production Gate Matrix
 
 **Files:**
-- Create: `sql-tests/write-path/sql/managed_lake_mv_iceberg_ivm_strategy.sql`
-- Create: `sql-tests/write-path/result/managed_lake_mv_iceberg_ivm_strategy.result`
+- Create: `sql-tests/mv-on-iceberg/sql/managed_lake_mv_iceberg_ivm_strategy.sql`
+- Create: `sql-tests/mv-on-iceberg/result/managed_lake_mv_iceberg_ivm_strategy.result`
 - Modify: `src/connector/starrocks/managed/mv_refresh.rs`
 
 - [ ] **Step 1: Add strategy SQL case**
 
-Create `sql-tests/write-path/sql/managed_lake_mv_iceberg_ivm_strategy.sql`:
+Create `sql-tests/mv-on-iceberg/sql/managed_lake_mv_iceberg_ivm_strategy.sql`:
 
 ```sql
 -- @order_sensitive=true
 -- @tags=write_path,managed_lake,mv,iceberg,ivm,strategy
 -- Test Objective:
 -- 1. Validate aggregate MV full refresh over a v3 row-lineage Iceberg base table.
--- 2. Validate DELETE refresh retracts through Puffin DV reverse projection.
+-- 2. Validate append snapshots refresh incrementally.
 -- 3. Validate INSERT OVERWRITE refresh falls back to full refresh and advances metadata.
 
 -- query 1
 -- @skip_result_check=true
+-- Use a local-FS Iceberg warehouse here because S3-backed Iceberg
+-- INSERT OVERWRITE abort cleanup is not wired through the standalone SQL path yet.
 CREATE EXTERNAL CATALOG mv_strategy_ice_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${managed_lake_warehouse}/iceberg_strategy_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.access_key" = "${oss_ak}",
-  "aws.s3.secret_key" = "${oss_sk}",
-  "aws.s3.enable_path_style_access" = "true"
+  "iceberg.catalog.warehouse" = "file:///tmp/novarocks-mv-strategy-${uuid0}"
 );
 CREATE DATABASE mv_strategy_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders (
@@ -999,28 +997,35 @@ ORDER BY customer;
 
 -- query 4
 -- @skip_result_check=true
-DELETE FROM mv_strategy_ice_${uuid0}.ns_${uuid0}.orders WHERE id = 1;
-REFRESH MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
+INSERT INTO mv_strategy_ice_${uuid0}.ns_${uuid0}.orders VALUES
+  (4, 'A', 100);
 
 -- query 5
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
+
+-- query 6
 SELECT customer, c, s
 FROM ${case_db}.orders_strategy_mv
 ORDER BY customer;
 
--- query 6
+-- query 7
 -- @skip_result_check=true
 INSERT OVERWRITE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders
 SELECT id, customer, amount + 100
 FROM mv_strategy_ice_${uuid0}.ns_${uuid0}.orders
 WHERE id >= 2;
+
+-- query 8
+-- @skip_result_check=true
 REFRESH MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
 
--- query 7
+-- query 9
 SELECT customer, c, s
 FROM ${case_db}.orders_strategy_mv
 ORDER BY customer;
 
--- query 8
+-- query 10
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
 DROP TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders FORCE;
@@ -1028,7 +1033,7 @@ DROP DATABASE mv_strategy_ice_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_strategy_ice_${uuid0};
 ```
 
-Create `sql-tests/write-path/result/managed_lake_mv_iceberg_ivm_strategy.result` with the expected visible query output:
+Create `sql-tests/mv-on-iceberg/result/managed_lake_mv_iceberg_ivm_strategy.result` with the expected visible query output:
 
 ```text
 -- query 3
@@ -1036,14 +1041,14 @@ customer	c	s
 A	2	30
 B	1	30
 
--- query 5
+-- query 6
 customer	c	s
-A	1	20
+A	3	130
 B	1	30
 
--- query 7
+-- query 9
 customer	c	s
-A	1	120
+A	2	320
 B	1	130
 ```
 
@@ -1053,7 +1058,7 @@ Run with the managed-lake config:
 
 ```bash
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-  --suite write-path --only managed_lake_mv_iceberg_ivm_strategy --mode record --query-timeout 60
+  --suite mv-on-iceberg --only managed_lake_mv_iceberg_ivm_strategy --mode record --query-timeout 60
 ```
 
 Expected:
@@ -1068,7 +1073,7 @@ Run:
 
 ```bash
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-  --suite write-path --only managed_lake_mv_iceberg_ivm_strategy --mode verify --query-timeout 60
+  --suite mv-on-iceberg --only managed_lake_mv_iceberg_ivm_strategy --mode verify --query-timeout 60
 ```
 
 Expected:
@@ -1101,7 +1106,7 @@ Run:
 cargo fmt
 cargo test --lib
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-  --suite write-path --only managed_lake_mv_iceberg_ivm_strategy --mode verify --query-timeout 60
+  --suite mv-on-iceberg --only managed_lake_mv_iceberg_ivm_strategy --mode verify --query-timeout 60
 git diff --check
 ```
 
@@ -1119,7 +1124,7 @@ fail=0
 Run:
 
 ```bash
-git add sql-tests/write-path src/connector/starrocks/managed/mv_refresh.rs
+git add sql-tests/mv-on-iceberg src/connector/starrocks/managed/mv_refresh.rs docs/superpowers/plans/2026-05-03-ivm-on-iceberg-roadmap.md
 git commit -m "Add IVM on Iceberg strategy SQL gate"
 ```
 

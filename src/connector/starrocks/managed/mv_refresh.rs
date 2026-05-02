@@ -121,9 +121,18 @@ pub(crate) fn refresh_mv(
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
-    let strategy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
+    let policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
+    tracing::info!(
+        target: "mv_refresh",
+        mv = %format!("{}.{}", db_name, mv_name),
+        base = %base_ref.fqn(),
+        previous_snapshot_id = ?previous_snapshot_id,
+        current_snapshot_id = ?current_snapshot_id,
+        policy = ?policy,
+        "selected materialized view refresh policy"
+    );
     if matches!(
-        strategy,
+        policy,
         MvRefreshPolicy::FullRefresh { .. } | MvRefreshPolicy::Incremental { .. }
     ) {
         let target_snapshots = current_snapshot_id
@@ -137,7 +146,7 @@ pub(crate) fn refresh_mv(
 
     dispatch_mv_refresh_strategy(
         &mv_shape,
-        strategy,
+        policy,
         || refresh_mv_full_with_executor(state, &db_name, &mv_name, run_mv_select_and_chunks),
         |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
         |current_snapshot_id| {
