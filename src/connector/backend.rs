@@ -12,8 +12,9 @@ use arrow::record_batch::RecordBatch;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::{ColumnDef, TableDef};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, Literal,
-    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
+    AlterIcebergPartitionSpecStmt, CreateMaterializedViewStmt, DropMaterializedViewStmt,
+    IcebergPartitionFieldExpr, Literal, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
+    TableColumnDef, TableKeyDesc,
 };
 
 /// Request to create a table. Unified shape across all catalog backends;
@@ -52,6 +53,18 @@ pub(crate) trait CatalogBackend: Send + Sync {
     fn drop_namespace(&self, catalog: &str, namespace: &str, force: bool) -> Result<(), String>;
 
     fn create_table(&self, req: CreateTableRequest) -> Result<(), String>;
+    fn alter_iceberg_partition_spec(
+        &self,
+        _catalog: &str,
+        _namespace: &str,
+        _table: &str,
+        _stmt: AlterIcebergPartitionSpecStmt,
+    ) -> Result<(), String> {
+        Err(format!(
+            "{} backend does not support Iceberg partition evolution DDL",
+            self.name()
+        ))
+    }
     fn drop_table(
         &self,
         catalog: &str,

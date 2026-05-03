@@ -75,6 +75,17 @@ impl CatalogBackend for IcebergCatalogBackend {
         )
     }
 
+    fn alter_iceberg_partition_spec(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+    ) -> Result<(), String> {
+        let entry = self.entry(catalog)?;
+        super::registry::alter_partition_spec(&entry, namespace, table, stmt)
+    }
+
     fn drop_table(
         &self,
         catalog: &str,

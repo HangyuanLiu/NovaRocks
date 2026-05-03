@@ -50,7 +50,8 @@ use self::statement::{
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_alter_iceberg_schema,
+    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
+    parse_alter_partition_column_sql,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -534,6 +535,12 @@ impl StandaloneSession {
             );
         }
 
+        // ALTER TABLE ... ADD/DROP PARTITION COLUMN ...
+        if looks_like_alter_partition_column(&normalized) {
+            let stmt = parse_alter_partition_column_sql(&normalized)?;
+            return self.handle_alter_partition_spec(stmt, current_catalog, current_database);
+        }
+
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -711,6 +718,51 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )?;
+        Ok(StatementResult::Ok)
+    }
+
+    /// Handle ALTER TABLE ... ADD/DROP PARTITION COLUMN ...
+    fn handle_alter_partition_spec(
+        &self,
+        stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let table_name = match &stmt {
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table,
+                ..
+            }
+            | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                table,
+                ..
+            } => table,
+        };
+        let target = crate::engine::backend_resolver::resolve_table_target(
+            &self.inner,
+            table_name,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "ALTER TABLE ADD/DROP PARTITION COLUMN only supports iceberg backends, got `{}`",
+                target.backend_name
+            ));
+        }
+        let backend = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read")
+            .catalog_backend(target.backend_name)?;
+        backend.alter_iceberg_partition_spec(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            stmt,
+        )?;
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
     }
 
@@ -3666,6 +3718,71 @@ enable_path_style_access = true
             .metadata()
             .current_snapshot()
             .map(|s| s.snapshot_id())
+    }
+
+    fn current_iceberg_default_spec_fields(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Vec<(String, iceberg::spec::Transform)> {
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get(catalog).expect("entry");
+        entry.invalidate_table_cache(namespace, table);
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
+        loaded
+            .table
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| (field.name.clone(), field.transform.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn iceberg_alter_partition_spec_accepts_add_and_drop() {
+        let warehouse = TempDir::new().expect("warehouse tempdir");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database(
+                r#"create table ice.db1.t_evolved
+                   (id bigint, ts datetime)
+                   partition by month(ts)
+                   tblproperties("format-version"="2")"#,
+                "default",
+            )
+            .expect("create partitioned table");
+        assert_eq!(
+            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
+            vec![("ts_month".to_string(), iceberg::spec::Transform::Month)]
+        );
+
+        session
+            .execute_in_database(
+                "alter table ice.db1.t_evolved drop partition column month(ts)",
+                "default",
+            )
+            .expect("drop partition column");
+        assert_eq!(
+            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
+            Vec::<(String, iceberg::spec::Transform)>::new()
+        );
+
+        session
+            .execute_in_database(
+                "alter table ice.db1.t_evolved add partition column bucket(id, 8)",
+                "default",
+            )
+            .expect("add partition column");
+        assert_eq!(
+            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
+            vec![(
+                "id_bucket_8".to_string(),
+                iceberg::spec::Transform::Bucket(8)
+            )]
+        );
     }
 
     fn current_iceberg_row_lineage(

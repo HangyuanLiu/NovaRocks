@@ -360,6 +360,58 @@ pub(crate) fn create_table(
     Ok(())
 }
 
+pub(crate) fn alter_partition_spec(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+) -> Result<(), String> {
+    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+
+    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let table_name = normalize_identifier(table_name)?;
+    let catalog = build_hadoop_catalog(entry)?;
+    let ident = TableIdent::new(namespace, table_name.clone());
+    let table = block_on_iceberg(async { catalog.load_table(&ident).await })
+        .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
+        .map_err(|e| format!("load iceberg table {ident}: {e}"))?;
+    let metadata = table.metadata();
+    let base_default_spec_id = metadata.default_partition_spec_id();
+    let schema = metadata.current_schema();
+    let current = metadata.default_partition_spec();
+    let change = match &stmt {
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            field,
+            ..
+        } => crate::connector::iceberg::partition_spec::PartitionSpecChange::Add(field),
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            field,
+            ..
+        } => crate::connector::iceberg::partition_spec::PartitionSpecChange::Drop(field),
+    };
+    let evolved = crate::connector::iceberg::partition_spec::build_evolved_partition_spec(
+        schema.as_ref(),
+        current,
+        change,
+    )?;
+
+    let commit = TableCommit::builder()
+        .ident(ident.clone())
+        .requirements(vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: base_default_spec_id,
+        }])
+        .updates(vec![
+            TableUpdate::AddSpec { spec: evolved },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ])
+        .build();
+    block_on_iceberg(async { catalog.update_table(commit).await })
+        .map_err(|e| format!("alter iceberg partition spec runtime failed: {e}"))?
+        .map_err(|e| format!("alter iceberg partition spec failed: {e}"))?;
+    entry.invalidate_table_cache(namespace_name, &table_name);
+    Ok(())
+}
+
 pub(crate) fn drop_table(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,

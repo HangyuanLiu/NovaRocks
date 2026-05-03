@@ -25,7 +25,6 @@ pub(crate) fn build_initial_partition_spec(
     Ok(Some(builder.build()))
 }
 
-#[allow(dead_code)]
 pub(crate) fn build_evolved_partition_spec(
     schema: &Schema,
     current: &PartitionSpecRef,
@@ -80,7 +79,6 @@ pub(crate) fn build_evolved_partition_spec(
     Ok(builder.build())
 }
 
-#[allow(dead_code)]
 pub(crate) enum PartitionSpecChange<'a> {
     Add(&'a IcebergPartitionFieldExpr),
     Drop(&'a IcebergPartitionFieldExpr),
