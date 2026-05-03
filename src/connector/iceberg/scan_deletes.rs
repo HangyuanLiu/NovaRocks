@@ -47,10 +47,12 @@ const POS_COLUMN: &str = "pos";
 /// opendal operator (which expects bare filesystem paths). Object-store and
 /// HDFS callers use `scan_deletes_with_path_normalizer` to translate full
 /// Iceberg URIs into paths relative to the matching OpenDAL operator.
+#[cfg(test)]
 fn normalize_local_fs_path(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
 }
 
+#[cfg(test)]
 fn normalize_local_fs_path_owned(path: &str) -> Result<String, ChangeError> {
     Ok(normalize_local_fs_path(path).to_string())
 }
@@ -69,6 +71,7 @@ fn normalize_local_fs_path_owned(path: &str) -> Result<String, ChangeError> {
 /// Equivalent to `iceberg::position_delete::load_position_deletes` run
 /// once per distinct `data_file_path`, but reads each delete file only
 /// once.
+#[cfg(test)]
 pub(crate) fn read_delete_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
@@ -263,6 +266,7 @@ fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection
 ///
 /// `data_file_path` is in iceberg's path format (e.g. `file:///...` or
 /// `s3://...`). The `factory` knows how to dispatch.
+#[cfg(test)]
 pub(crate) fn read_data_file_at_positions(
     data_file_path: &str,
     data_file_size: Option<u64>,
@@ -405,6 +409,7 @@ pub(crate) async fn read_dv_positions_per_data_file(
 /// must use `tokio::task::spawn_blocking` (see the test
 /// `scan_deletes_merges_v2_parquet_and_v3_puffin_against_same_data_file`
 /// for the pattern).
+#[cfg(test)]
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,

@@ -1,7 +1,8 @@
 -- @sequential=true
 -- Test Objective:
 -- 1. Validate an MV over an isolated Iceberg catalog can refresh before and after the external base table is dropped and recreated.
--- 2. Document current NovaRocks post-recreate behavior: refresh succeeds but old MV rows remain visible until table identity invalidation is implemented.
+-- 2. Validate StarRocks-compatible MV syntax around PARTITION BY, WITH SYNC MODE, 3-part MV names, and information_schema status.
+-- 3. Validate a recreated Iceberg base table invalidates prior MV state instead of keeping stale rows.
 -- Source: adapted from dev/test/sql/test_materialized_view/T/test_mv_with_iceberg_recreate.
 
 -- query 1
@@ -57,6 +58,7 @@ use db_${uuid0};
 
 -- query 10
 CREATE MATERIALIZED VIEW test_mv1
+PARTITION BY dt
 DISTRIBUTED BY HASH(dt) BUCKETS 2
 REFRESH DEFERRED MANUAL AS SELECT dt, sum(col_int) AS s
 FROM mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0}  GROUP BY dt;
@@ -140,38 +142,42 @@ set catalog default_catalog;
 
 -- query 28
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW db_${uuid0}.test_mv1;
+REFRESH MATERIALIZED VIEW default_catalog.db_${uuid0}.test_mv1 WITH SYNC MODE;
 
 -- query 29
 -- @result_contains=test_mv1
 SHOW MATERIALIZED VIEWS FROM db_${uuid0};
 
 -- query 30
+SELECT table_name, is_active, inactive_reason
+FROM information_schema.materialized_views
+WHERE table_schema = 'db_${uuid0}' AND table_name = 'test_mv1'
+ORDER BY table_name;
+
+-- query 31
 -- @result_not_contains=test_mv1
 USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 SET enable_materialized_view_rewrite = true;
 EXPLAIN SELECT dt,sum(col_int) FROM mv_ice_tbl_${uuid0} WHERE dt='2023-12-01' GROUP BY dt;
 
--- query 31
+-- query 32
 USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 SELECT dt,sum(col_int) FROM mv_ice_tbl_${uuid0} WHERE dt>='2023-12-03' GROUP BY dt order by dt;
 
--- query 32
--- Current behavior: refresh after external table recreate appends to the
--- existing MV state instead of invalidating/replacing it.
+-- query 33
 select * from db_${uuid0}.test_mv1 order by 1, 2;
 
--- query 33
+-- query 34
 admin set frontend config('enable_mv_automatic_active_check'='true');
 
--- query 34
+-- query 35
 drop table mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} force;
 
--- query 35
+-- query 36
 drop materialized view db_${uuid0}.test_mv1;
 
--- query 36
+-- query 37
 drop database mv_iceberg_${uuid0}.mv_ice_db_${uuid0} force;
 
--- query 37
+-- query 38
 drop catalog mv_iceberg_${uuid0};

@@ -31,6 +31,7 @@
 use super::dispatch::ScanDispatchState;
 use super::types::{PushResult, ScanAsyncState, ScanRuntimeFilterProbe};
 use crate::common::failpoint;
+use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
@@ -220,6 +221,7 @@ struct IcebergVirtualState {
 ///   when only one of them is active.
 struct IcebergDeleteFilterState {
     deleted: RoaringTreemap,
+    equality_deletes: Vec<EqualityDeleteSet>,
     next_row_offset: i64,
 }
 
@@ -653,11 +655,20 @@ impl ScanAsyncRunner {
         if delete_files.is_empty() {
             return Ok(None);
         }
-        let Some(deleted) = self.scan.load_iceberg_position_deletes(morsel)? else {
+        let deleted = self
+            .scan
+            .load_iceberg_position_deletes(morsel)?
+            .unwrap_or_default();
+        let equality_deletes = self
+            .scan
+            .load_iceberg_equality_deletes(morsel)?
+            .unwrap_or_default();
+        if deleted.is_empty() && equality_deletes.is_empty() {
             return Ok(None);
-        };
+        }
         Ok(Some(IcebergDeleteFilterState {
             deleted,
+            equality_deletes,
             next_row_offset: 0,
         }))
     }
@@ -694,19 +705,22 @@ impl ScanAsyncRunner {
         let start = state.next_row_offset;
         state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
 
-        // Build the boolean keep mask for the chunk. In the common case
-        // (no row deleted) we can short-circuit and hand the chunk back
-        // untouched.
+        // Build the boolean keep mask for the chunk. In the common case (no
+        // row deleted) we can short-circuit and hand the chunk back untouched.
         let mut mask_values = Vec::with_capacity(row_count);
-        let mut kept_count = 0usize;
         for offset in 0..row_count as i64 {
             let pos = start + offset;
             let keep = pos < 0 || !state.deleted.contains(pos as u64);
-            if keep {
-                kept_count += 1;
-            }
             mask_values.push(keep);
         }
+        if let Some(equality_keep) =
+            equality_delete_keep_mask(&chunk.batch, &state.equality_deletes)?
+        {
+            for (keep, equality_keep) in mask_values.iter_mut().zip(equality_keep) {
+                *keep = *keep && equality_keep;
+            }
+        }
+        let kept_count = mask_values.iter().filter(|keep| **keep).count();
 
         if kept_count == row_count {
             // Chunk is untouched — return the original chunk but still feed

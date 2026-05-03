@@ -95,6 +95,7 @@ pub async fn write_position_delete_files(
             null_value_counts: HashMap::new(),
             key_metadata: None,
             referenced_data_file: Some(group.referenced_data_file),
+            equality_ids: None,
         });
     }
     Ok(out)

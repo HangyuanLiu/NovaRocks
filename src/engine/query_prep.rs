@@ -14,6 +14,15 @@ use crate::sql::parser::query_refs::{
     extract_table_names_from_query, extract_three_part_table_refs,
 };
 
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergFileForQuery {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) record_count: Option<i64>,
+    pub(crate) first_row_id: Option<i64>,
+    pub(crate) data_sequence_number: Option<i64>,
+}
+
 pub(crate) fn add_files(
     state: &Arc<StandaloneState>,
     sql: &str,
@@ -169,7 +178,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
     catalog_name: &str,
     namespace: &str,
     table_name: &str,
-    data_files: Vec<(String, i64, Option<i64>)>,
+    data_files: Vec<IcebergFileForQuery>,
 ) -> Result<TableDef, String> {
     let entry = {
         let registry = state
@@ -179,6 +188,20 @@ pub(crate) fn build_iceberg_table_def_with_files(
         registry.get(catalog_name)?
     };
     let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table_name)?;
+    let data_files = data_files
+        .into_iter()
+        .map(
+            |file| crate::connector::iceberg::catalog::registry::DataFileWithStats {
+                path: file.path,
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: None,
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files: vec![],
+            },
+        )
+        .collect();
     crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry, namespace, table_name, loaded, data_files,
     )

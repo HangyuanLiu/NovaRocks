@@ -53,6 +53,7 @@ const POS_COLUMN: &str = "pos";
 pub struct IcebergDeleteFileSpec {
     pub path: String,
     pub file_format: THdfsFileFormat,
+    pub file_content: TIcebergFileContent,
     pub length: Option<u64>,
     pub content_offset: Option<i64>,
     pub content_size_in_bytes: Option<i64>,
@@ -77,12 +78,7 @@ pub fn convert_scan_range_delete_files(
         })?;
         match file_content {
             TIcebergFileContent::POSITION_DELETES => {}
-            TIcebergFileContent::EQUALITY_DELETES => {
-                return Err(format!(
-                    "{scan_node_label} does not yet support iceberg equality-delete files; \
-                     only POSITION_DELETES is supported on the reader side"
-                ));
-            }
+            TIcebergFileContent::EQUALITY_DELETES => {}
             other => {
                 return Err(format!(
                     "{scan_node_label} received unexpected iceberg delete file_content {other:?}"
@@ -114,6 +110,7 @@ pub fn convert_scan_range_delete_files(
         out.push(IcebergDeleteFileSpec {
             path,
             file_format,
+            file_content,
             length,
             content_offset: None,
             content_size_in_bytes: None,
@@ -133,6 +130,9 @@ pub fn load_position_deletes(
 ) -> Result<RoaringTreemap, String> {
     let mut deleted = RoaringTreemap::new();
     for spec in specs {
+        if spec.file_content != TIcebergFileContent::POSITION_DELETES {
+            continue;
+        }
         accumulate_deletes_from_file(spec, data_file_path, factory, &mut deleted)?;
     }
     Ok(deleted)
@@ -364,6 +364,33 @@ mod tests {
         OpendalRangeReaderFactory::from_operator(op).expect("factory")
     }
 
+    fn scan_range_with_delete_file(
+        path: &str,
+        file_content: TIcebergFileContent,
+    ) -> THdfsScanRange {
+        let mut range = THdfsScanRange::default();
+        range.delete_files = Some(vec![crate::plan_nodes::TIcebergDeleteFile::new(
+            Some(path.to_string()),
+            Some(THdfsFileFormat::PARQUET),
+            Some(file_content),
+            Some(128_i64),
+        )]);
+        range
+    }
+
+    #[test]
+    fn accepts_equality_delete_descriptors_for_reader_filtering() {
+        let range = scan_range_with_delete_file(
+            "s3://bucket/eq-delete.parquet",
+            TIcebergFileContent::EQUALITY_DELETES,
+        );
+
+        let specs = convert_scan_range_delete_files("HDFS_SCAN_NODE 7", &range).unwrap();
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file_content, TIcebergFileContent::EQUALITY_DELETES);
+    }
+
     #[test]
     fn collects_positions_for_matching_file() {
         let dir = temp_dir_for("collects");
@@ -382,6 +409,7 @@ mod tests {
         let spec = IcebergDeleteFileSpec {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
             file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::POSITION_DELETES,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -401,6 +429,7 @@ mod tests {
         let spec = IcebergDeleteFileSpec {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
             file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::POSITION_DELETES,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
@@ -422,6 +451,7 @@ mod tests {
             IcebergDeleteFileSpec {
                 path: del_a.file_name().unwrap().to_string_lossy().to_string(),
                 file_format: THdfsFileFormat::PARQUET,
+                file_content: TIcebergFileContent::POSITION_DELETES,
                 length: None,
                 content_offset: None,
                 content_size_in_bytes: None,
@@ -429,6 +459,7 @@ mod tests {
             IcebergDeleteFileSpec {
                 path: del_b.file_name().unwrap().to_string_lossy().to_string(),
                 file_format: THdfsFileFormat::PARQUET,
+                file_content: TIcebergFileContent::POSITION_DELETES,
                 length: None,
                 content_offset: None,
                 content_size_in_bytes: None,
@@ -445,6 +476,7 @@ mod tests {
         let spec = IcebergDeleteFileSpec {
             path: "irrelevant".to_string(),
             file_format: THdfsFileFormat::ORC,
+            file_content: TIcebergFileContent::POSITION_DELETES,
             length: None,
             content_offset: None,
             content_size_in_bytes: None,

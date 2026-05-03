@@ -532,6 +532,13 @@ pub(crate) fn execute_insert_statement(
 // ADD FILES SQL parsing
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AddEqualityDeleteStmt {
+    pub(crate) table: ObjectName,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Literal>>,
+}
+
 /// Check if SQL looks like ALTER TABLE ... ADD FILES FROM ...
 pub(crate) fn looks_like_add_files(sql: &str) -> bool {
     let upper = sql.trim().to_ascii_uppercase();
@@ -568,4 +575,107 @@ pub(crate) fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), St
     }
 
     Ok((table_parts, path))
+}
+
+/// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...
+pub(crate) fn looks_like_add_equality_delete(sql: &str) -> bool {
+    let upper = sql.trim().to_ascii_uppercase();
+    upper.starts_with("ALTER TABLE") && upper.contains("ADD EQUALITY DELETE")
+}
+
+/// Parse: ALTER TABLE [catalog.db.]table ADD EQUALITY DELETE (k1, k2) VALUES (...)
+pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDeleteStmt, String> {
+    const ALTER_TABLE: &str = "ALTER TABLE";
+    const ADD_EQ_DELETE: &str = "ADD EQUALITY DELETE";
+    const VALUES: &str = "VALUES";
+
+    let upper = sql.to_ascii_uppercase();
+    let alter_idx = upper.find(ALTER_TABLE).ok_or("missing ALTER TABLE")?;
+    let add_idx = upper
+        .find(ADD_EQ_DELETE)
+        .ok_or("missing ADD EQUALITY DELETE")?;
+    let values_idx = upper[add_idx + ADD_EQ_DELETE.len()..]
+        .find(VALUES)
+        .map(|idx| add_idx + ADD_EQ_DELETE.len() + idx)
+        .ok_or("missing VALUES")?;
+
+    let table_str = sql[alter_idx + ALTER_TABLE.len()..add_idx].trim();
+    let table_parts = table_str
+        .split('.')
+        .map(normalize_identifier)
+        .collect::<Result<Vec<_>, _>>()?;
+    if table_parts.is_empty() {
+        return Err("ADD EQUALITY DELETE requires a table name".to_string());
+    }
+
+    let columns_part = sql[add_idx + ADD_EQ_DELETE.len()..values_idx].trim();
+    let columns_inner = columns_part
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| "ADD EQUALITY DELETE requires columns in parentheses".to_string())?;
+    let columns = columns_inner
+        .split(',')
+        .map(normalize_identifier)
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.is_empty() {
+        return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
+    }
+
+    let values_part = sql[values_idx + VALUES.len()..]
+        .trim()
+        .trim_end_matches(';');
+    if values_part.is_empty() {
+        return Err("ADD EQUALITY DELETE VALUES requires at least one row".to_string());
+    }
+    let fake_sql = format!(
+        "INSERT INTO __eq_delete ({}) VALUES {values_part}",
+        columns.join(", ")
+    );
+    let stmt = crate::sql::parser::parse_normalized_sql_raw(&fake_sql)
+        .map_err(|e| format!("parse ADD EQUALITY DELETE VALUES: {e}"))?;
+    let insert = match stmt {
+        sqlparser::ast::Statement::Insert(insert) => insert,
+        other => {
+            return Err(format!(
+                "internal ADD EQUALITY DELETE VALUES parser expected INSERT, got {other:?}"
+            ));
+        }
+    };
+    let converted = convert_sqlparser_insert_to_custom(&insert)?;
+    let rows = match converted.source {
+        InsertSource::Values(rows) => rows,
+        other => {
+            return Err(format!(
+                "ADD EQUALITY DELETE expects literal VALUES rows, got {other:?}"
+            ));
+        }
+    };
+    Ok(AddEqualityDeleteStmt {
+        table: ObjectName { parts: table_parts },
+        columns,
+        rows,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sql::parser::ast::Literal;
+
+    #[test]
+    fn parse_add_equality_delete_values_statement() {
+        let stmt = super::parse_add_equality_delete_sql(
+            "ALTER TABLE ice.db.orders ADD EQUALITY DELETE (id, category) VALUES (2, 'B'), (4, 'A')",
+        )
+        .expect("parse");
+
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+        assert_eq!(stmt.columns, vec!["id", "category"]);
+        assert_eq!(
+            stmt.rows,
+            vec![
+                vec![Literal::Int(2), Literal::String("B".to_string())],
+                vec![Literal::Int(4), Literal::String("A".to_string())],
+            ]
+        );
+    }
 }

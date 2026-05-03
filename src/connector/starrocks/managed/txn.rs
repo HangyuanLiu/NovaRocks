@@ -183,6 +183,7 @@ pub(crate) struct MvRefreshWriteMetadata {
     pub(crate) table_id: i64,
     pub(crate) previous_refresh_rows: i64,
     pub(crate) snapshots: BTreeMap<String, i64>,
+    pub(crate) table_uuids: BTreeMap<String, String>,
 }
 
 pub(crate) fn load_insert_plan(
@@ -529,6 +530,7 @@ fn write_chunks_into_managed_partition_inner(
                     table_id: metadata.table_id,
                     last_refresh_rows,
                     snapshots: metadata.snapshots,
+                    table_uuids: metadata.table_uuids,
                 },
             )?;
         }
@@ -1234,6 +1236,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 3,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             },
         )
         .expect("write");
@@ -1341,6 +1344,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 7,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             },
         )
         .expect("write");
@@ -1393,6 +1397,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 0,
                 snapshots: BTreeMap::new(),
+                table_uuids: Default::default(),
             },
         )
         .expect("aggregate upsert");
@@ -1642,6 +1647,7 @@ mod mv_target_tests {
                 last_refresh_ms: None,
                 last_refresh_rows: Some(1),
                 last_refresh_snapshots: BTreeMap::new(),
+                last_refresh_table_uuids: Default::default(),
                 primary_key_columns: Vec::new(),
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -2105,6 +2111,7 @@ mod mv_target_tests {
                     last_refresh_ms: None,
                     last_refresh_rows: Some(0),
                     last_refresh_snapshots: std::collections::BTreeMap::new(),
+                    last_refresh_table_uuids: Default::default(),
                     primary_key_columns: Vec::new(),
                     created_at_ms: 1,
                     storage_engine: ManagedMvStorageEngine::ManagedLake,

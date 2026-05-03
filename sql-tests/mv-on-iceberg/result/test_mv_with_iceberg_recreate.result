@@ -1,10 +1,11 @@
 -- query 19
 
--- query 32
-dt	s
-2023-12-01	8000
-2023-12-02	4000
-2023-12-03	4002
-2023-12-04	4002
+-- query 30
+TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
+test_mv1	1	NULL
 
 -- query 33
+dt	s
+2023-12-01	4000
+
+-- query 34

@@ -390,7 +390,7 @@ async fn write_overwrite_deletes_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_added_data_manifest(
+pub(super) async fn write_added_data_manifest(
     file_io: &FileIO,
     out_path: &str,
     written: &[WrittenFile],
@@ -429,7 +429,7 @@ async fn write_added_data_manifest(
     Ok(manifest_file)
 }
 
-fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, String> {
+pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, String> {
     use iceberg::spec::DataFileBuilder;
     let mut builder = DataFileBuilder::default();
     builder

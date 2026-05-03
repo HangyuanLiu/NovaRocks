@@ -25,7 +25,7 @@ use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use iceberg::spec::FormatVersion;
 use iceberg::table::Table;
 
-use super::types::IcebergWriteMode;
+use super::types::{IcebergSqlDeleteStrategy, IcebergWriteMode};
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
     props
@@ -57,6 +57,18 @@ fn classify_iceberg_write_mode_from_metadata(
 pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
     ensure_no_variant_columns(table)?;
     Ok(classify_iceberg_write_mode(table))
+}
+
+pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
+    let write_mode = ensure_iceberg_write_supported(table)?;
+    Ok(sql_delete_strategy_from_write_mode(write_mode))
+}
+
+fn sql_delete_strategy_from_write_mode(write_mode: IcebergWriteMode) -> IcebergSqlDeleteStrategy {
+    match write_mode {
+        IcebergWriteMode::LegacyPositionDeletes => IcebergSqlDeleteStrategy::PositionDeleteFiles,
+        IcebergWriteMode::RowLineageV3 => IcebergSqlDeleteStrategy::DeletionVectors,
+    }
 }
 
 fn ensure_no_variant_columns(table: &Table) -> Result<(), String> {
@@ -112,10 +124,9 @@ pub fn ensure_single_partition_spec(table: &Table) -> Result<(), String> {
     Ok(())
 }
 
-/// DELETE writes position-delete files; the existing scan reader (see
-/// `iceberg/position_delete.rs`) does not support reading equality-delete
-/// files, so a table that already has equality deletes attached to its current
-/// snapshot would become unreadable after the new snapshot lands.
+/// INSERT OVERWRITE rewrites data manifests without fully reconciling existing
+/// equality-delete manifests yet. Row-level DELETE has its own visibility
+/// planner; keep this guard scoped to overwrite-style write planning.
 ///
 /// Best-effort check via the snapshot summary's `total-equality-deletes`
 /// property. When absent, we accept (no manifest walk yet — that belongs to
@@ -134,9 +145,9 @@ pub fn ensure_no_equality_deletes(table: &Table) -> Result<(), String> {
     if n > 0 {
         return Err(
             "iceberg table has equality-delete files in its current snapshot; \
-             phase 1 reader does not support equality deletes (see \
-             iceberg/position_delete.rs). Compact away the equality \
-             deletes before issuing DELETE."
+             INSERT OVERWRITE planning does not yet reconcile existing \
+             equality-delete manifests. Compact away the equality deletes \
+             before issuing INSERT OVERWRITE."
                 .to_string(),
         );
     }
@@ -249,6 +260,22 @@ mod tests {
         assert_eq!(
             classify_iceberg_write_mode_from_metadata(FormatVersion::V2, &props),
             IcebergWriteMode::LegacyPositionDeletes
+        );
+    }
+
+    #[test]
+    fn sql_delete_strategy_keeps_v2_on_position_delete_files() {
+        assert_eq!(
+            sql_delete_strategy_from_write_mode(IcebergWriteMode::LegacyPositionDeletes),
+            IcebergSqlDeleteStrategy::PositionDeleteFiles
+        );
+    }
+
+    #[test]
+    fn sql_delete_strategy_uses_deletion_vectors_for_row_lineage_v3() {
+        assert_eq!(
+            sql_delete_strategy_from_write_mode(IcebergWriteMode::RowLineageV3),
+            IcebergSqlDeleteStrategy::DeletionVectors
         );
     }
 

@@ -144,6 +144,7 @@ pub(crate) struct StoredMaterializedView {
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,
+    pub last_refresh_table_uuids: std::collections::BTreeMap<String, String>,
     pub primary_key_columns: Vec<String>,
     pub created_at_ms: i64,
     pub storage_engine: ManagedMvStorageEngine,
@@ -301,6 +302,7 @@ pub(crate) struct ActivateMvRefreshRequest {
     pub retired_root_path: String,
     pub rows_written: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +310,7 @@ pub(crate) struct UpdateMvRefreshMetadataRequest {
     pub table_id: i64,
     pub last_refresh_rows: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,6 +324,7 @@ pub(crate) struct UpdateMvIcebergRefreshMetadataRequest {
     pub table_id: i64,
     pub last_refresh_rows: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
     pub iceberg_snapshot_id: i64,
 }
 
@@ -875,6 +879,14 @@ impl SqliteMetadataStore {
                             .map_err(|e| format!("serialize mv snapshots failed: {e}"))?,
                     )
                 };
+                let table_uuids_json = if mv.last_refresh_table_uuids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&mv.last_refresh_table_uuids)
+                            .map_err(|e| format!("serialize mv table uuids failed: {e}"))?,
+                    )
+                };
                 let refresh_target_snapshots_json = if mv.refresh_target_snapshots.is_empty() {
                     None
                 } else {
@@ -894,13 +906,14 @@ impl SqliteMetadataStore {
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
+                        last_refresh_table_uuids_json,
                         created_at_ms,
                         storage_engine,
                         iceberg_table_identifier,
                         last_refreshed_iceberg_snapshot_id,
                         refresh_in_progress,
                         refresh_target_snapshots_json
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         mv.mv_id,
                         mv.select_sql,
@@ -910,6 +923,7 @@ impl SqliteMetadataStore {
                         mv.last_refresh_ms,
                         mv.last_refresh_rows,
                         snapshots_json,
+                        table_uuids_json,
                         mv.created_at_ms,
                         mv.storage_engine.as_sql_str(),
                         mv.iceberg_table_identifier,
@@ -1369,15 +1383,29 @@ impl SqliteMetadataStore {
                     .map_err(|e| format!("serialize mv activate snapshots failed: {e}"))?,
             )
         };
+        let table_uuids_json = if req.table_uuids.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&req.table_uuids)
+                    .map_err(|e| format!("serialize mv activate table uuids failed: {e}"))?,
+            )
+        };
         tx.execute(
             "UPDATE materialized_views
              SET last_refresh_ms = strftime('%s','now') * 1000,
                  last_refresh_rows = ?1,
                  last_refresh_snapshots_json = ?2,
+                 last_refresh_table_uuids_json = ?3,
                  refresh_in_progress = 0,
                  refresh_target_snapshots_json = NULL
-             WHERE mv_id = ?3",
-            params![req.rows_written, snapshots_json, req.table_id],
+             WHERE mv_id = ?4",
+            params![
+                req.rows_written,
+                snapshots_json,
+                table_uuids_json,
+                req.table_id
+            ],
         )
         .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
 
@@ -1455,19 +1483,23 @@ impl SqliteMetadataStore {
         let conn = self.connection()?;
         let snapshots_json = serde_json::to_string(&request.snapshots)
             .map_err(|e| format!("serialize iceberg refresh snapshots failed: {e}"))?;
+        let table_uuids_json = serde_json::to_string(&request.table_uuids)
+            .map_err(|e| format!("serialize iceberg refresh table uuids failed: {e}"))?;
         let changed = conn
             .execute(
                 "UPDATE materialized_views
                  SET last_refresh_ms = strftime('%s','now') * 1000,
                      last_refresh_rows = ?1,
                      last_refresh_snapshots_json = ?2,
-                     last_refreshed_iceberg_snapshot_id = ?3,
+                     last_refresh_table_uuids_json = ?3,
+                     last_refreshed_iceberg_snapshot_id = ?4,
                      refresh_in_progress = 0,
                      refresh_target_snapshots_json = NULL
-                 WHERE mv_id = ?4",
+                 WHERE mv_id = ?5",
                 params![
                     request.last_refresh_rows,
                     snapshots_json,
+                    table_uuids_json,
                     request.iceberg_snapshot_id,
                     request.table_id
                 ],
@@ -1502,12 +1534,13 @@ impl SqliteMetadataStore {
                 mv_id, select_sql, refresh_mode, base_table_refs_json,
                 primary_key_columns_json,
                 last_refresh_ms, last_refresh_rows, last_refresh_snapshots_json,
+                last_refresh_table_uuids_json,
                 created_at_ms, storage_engine, iceberg_table_identifier,
                 last_refreshed_iceberg_snapshot_id,
                 refresh_in_progress, refresh_target_snapshots_json
             ) VALUES (
                 ?1, ?2, 'DEFERRED_MANUAL', ?3, ?4,
-                NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
                 ?5, 'iceberg', ?6, NULL,
                 0, NULL
             )",
@@ -2183,6 +2216,7 @@ impl SqliteMetadataStore {
                 last_refresh_ms INTEGER,
                 last_refresh_rows INTEGER,
                 last_refresh_snapshots_json TEXT,
+                last_refresh_table_uuids_json TEXT,
                 created_at_ms INTEGER NOT NULL,
                 storage_engine TEXT NOT NULL DEFAULT 'managed_lake',
                 iceberg_table_identifier TEXT,
@@ -2209,6 +2243,7 @@ impl SqliteMetadataStore {
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
+        ensure_materialized_view_current_columns(&conn)?;
         Ok(())
     }
 
@@ -2511,6 +2546,7 @@ impl SqliteMetadataStore {
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
+                        last_refresh_table_uuids_json,
                         created_at_ms,
                         storage_engine,
                         iceberg_table_identifier,
@@ -2538,11 +2574,16 @@ impl SqliteMetadataStore {
                             Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
                             None => std::collections::BTreeMap::new(),
                         };
+                    let table_uuids: std::collections::BTreeMap<String, String> =
+                        match row.get::<_, Option<String>>(8)? {
+                            Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
+                            None => std::collections::BTreeMap::new(),
+                        };
                     let storage_engine =
-                        ManagedMvStorageEngine::parse_sql_str(&row.get::<_, String>(9)?)
+                        ManagedMvStorageEngine::parse_sql_str(&row.get::<_, String>(10)?)
                             .map_err(invalid_state_sql_error)?;
                     let refresh_target_snapshots: std::collections::BTreeMap<String, i64> =
-                        match row.get::<_, Option<String>>(13)? {
+                        match row.get::<_, Option<String>>(14)? {
                             Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
                             None => std::collections::BTreeMap::new(),
                         };
@@ -2554,12 +2595,13 @@ impl SqliteMetadataStore {
                         last_refresh_ms: row.get(5)?,
                         last_refresh_rows: row.get(6)?,
                         last_refresh_snapshots: snapshots,
+                        last_refresh_table_uuids: table_uuids,
                         primary_key_columns,
-                        created_at_ms: row.get(8)?,
+                        created_at_ms: row.get(9)?,
                         storage_engine,
-                        iceberg_table_identifier: row.get(10)?,
-                        last_refreshed_iceberg_snapshot_id: row.get(11)?,
-                        refresh_in_progress: row.get::<_, i64>(12)? != 0,
+                        iceberg_table_identifier: row.get(11)?,
+                        last_refreshed_iceberg_snapshot_id: row.get(12)?,
+                        refresh_in_progress: row.get::<_, i64>(13)? != 0,
                         refresh_target_snapshots,
                     })
                 })
@@ -2611,16 +2653,30 @@ fn update_mv_refresh_metadata_in_tx(
                 .map_err(|e| format!("serialize mv refresh snapshots failed: {e}"))?,
         )
     };
+    let table_uuids_json = if req.table_uuids.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&req.table_uuids)
+                .map_err(|e| format!("serialize mv refresh table uuids failed: {e}"))?,
+        )
+    };
     let changed = tx
         .execute(
             "UPDATE materialized_views
                  SET last_refresh_ms = strftime('%s','now') * 1000,
                      last_refresh_rows = ?1,
                      last_refresh_snapshots_json = ?2,
+                     last_refresh_table_uuids_json = ?3,
                      refresh_in_progress = 0,
                      refresh_target_snapshots_json = NULL
-             WHERE mv_id = ?3",
-            params![req.last_refresh_rows, snapshots_json, req.table_id],
+             WHERE mv_id = ?4",
+            params![
+                req.last_refresh_rows,
+                snapshots_json,
+                table_uuids_json,
+                req.table_id
+            ],
         )
         .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
     if changed != 1 {
@@ -2761,6 +2817,20 @@ fn migrate_schema_v6_to_v7(conn: &Connection) -> Result<(), String> {
         .map_err(|e| {
             format!("migrate standalone metadata schema v6 to v7 failed setting version: {e}")
         })?;
+    Ok(())
+}
+
+fn ensure_materialized_view_current_columns(conn: &Connection) -> Result<(), String> {
+    if !table_column_exists(conn, "materialized_views", "last_refresh_table_uuids_json")? {
+        conn.execute_batch(
+            "ALTER TABLE materialized_views ADD COLUMN last_refresh_table_uuids_json TEXT;",
+        )
+        .map_err(|e| {
+            format!(
+                "migrate standalone metadata schema v7 failed adding last_refresh_table_uuids_json: {e}"
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -3205,6 +3275,7 @@ mod tests {
             last_refresh_ms: None,
             last_refresh_rows: Some(3),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
             primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -3222,6 +3293,7 @@ mod tests {
                 table_id: 10,
                 last_refresh_rows: 3,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             })
             .expect("update metadata");
 
@@ -3253,6 +3325,7 @@ mod tests {
             last_refresh_ms: Some(1),
             last_refresh_rows: Some(3),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
             primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -3286,6 +3359,7 @@ mod tests {
                 table_id: 10,
                 last_refresh_rows: 4,
                 snapshots: target.clone(),
+                table_uuids: Default::default(),
             })
             .expect("finish refresh");
 
@@ -3314,6 +3388,7 @@ mod tests {
             last_refresh_ms: Some(1),
             last_refresh_rows: Some(2),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
             primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -3336,6 +3411,7 @@ mod tests {
                     table_id: 10,
                     last_refresh_rows: 4,
                     snapshots: snapshots.clone(),
+                    table_uuids: Default::default(),
                 },
             )
             .expect("visible with metadata");
@@ -3773,6 +3849,7 @@ mod tests {
                 "last_refresh_ms",
                 "last_refresh_rows",
                 "last_refresh_snapshots_json",
+                "last_refresh_table_uuids_json",
                 "created_at_ms",
                 "storage_engine",
                 "iceberg_table_identifier",
@@ -4119,6 +4196,7 @@ mod tests {
                     map.insert("iceberg_cat.ns.orders".to_string(), 7_391_842_i64);
                     map
                 },
+                last_refresh_table_uuids: Default::default(),
                 primary_key_columns: vec!["order_id".to_string(), "line_id".to_string()],
                 created_at_ms: 1_699_999_999_000,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -4222,6 +4300,7 @@ mod tests {
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
             primary_key_columns: Vec::new(),
             created_at_ms: 1_700_000_000_000,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -4317,6 +4396,7 @@ mod tests {
                 retired_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20".to_string(),
                 rows_written: 42,
                 snapshots: snapshots_map.clone(),
+                table_uuids: Default::default(),
             })
             .expect("activate");
 

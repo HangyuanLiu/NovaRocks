@@ -116,6 +116,7 @@ mod tests {
             current_snapshot_id: 12,
             inserts: Vec::new(),
             deletes: Vec::new(),
+            equality_deletes: Vec::new(),
         };
 
         let err = validate_change_batch_current_snapshot(&batch, 13).expect_err("mismatch");

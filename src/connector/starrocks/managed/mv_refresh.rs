@@ -11,12 +11,13 @@ use crate::connector::starrocks::managed::mv_apply_policy::{
     MvApplyPolicy, apply_policy_for_change,
 };
 use crate::connector::starrocks::managed::mv_refresh_strategy::{
-    MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
+    FullRefreshReason, MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
 };
 use crate::engine::mv_flow::{
     analyze_visible_output_types, execute_query_for_mv_incremental_refresh,
     execute_query_for_mv_refresh,
 };
+use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -120,8 +121,20 @@ pub(crate) fn refresh_mv(
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
+    let current_table_uuid = loaded.table.metadata().uuid().to_string();
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
-    let policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
+    let mut policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
+    if let Some(previous_uuid) = mv_row.last_refresh_table_uuids.get(&base_ref.fqn())
+        && previous_uuid != &current_table_uuid
+    {
+        policy = MvRefreshPolicy::FullRefresh {
+            target_snapshot_id: current_snapshot_id,
+            reason: FullRefreshReason::BaseTableRecreated {
+                previous_uuid: previous_uuid.clone(),
+                current_uuid: current_table_uuid.clone(),
+            },
+        };
+    }
     tracing::info!(
         target: "mv_refresh",
         mv = %format!("{}.{}", db_name, mv_name),
@@ -151,10 +164,12 @@ pub(crate) fn refresh_mv(
         |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
         |current_snapshot_id| {
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
+            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
             metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
                 table_id: runtime.table.table_id,
                 last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 snapshots,
+                table_uuids,
             })?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
@@ -197,11 +212,12 @@ pub(crate) fn refresh_mv(
                     }
                 },
             };
-            if !batch.deletes.is_empty() {
+            if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
                 return Err(format!(
                     "iceberg materialized view incremental refresh does not yet support \
-                     delete snapshots; {} delete file(s) seen in lineage",
-                    batch.deletes.len()
+                     delete snapshots; {} position-delete file(s), {} equality-delete file(s) seen in lineage",
+                    batch.deletes.len(),
+                    batch.equality_deletes.len()
                 ));
             }
 
@@ -213,7 +229,13 @@ pub(crate) fn refresh_mv(
                 batch
                     .inserts
                     .iter()
-                    .map(|f| (f.path.clone(), f.size, f.record_count))
+                    .map(|f| IcebergFileForQuery {
+                        path: f.path.clone(),
+                        size: f.size,
+                        record_count: f.record_count,
+                        first_row_id: f.first_row_id,
+                        data_sequence_number: f.data_sequence_number,
+                    })
                     .collect(),
             )?;
             let chunks = query_result_to_chunks(result)?;
@@ -227,6 +249,7 @@ pub(crate) fn refresh_mv(
             )?;
             let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
+            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
             write_chunks_into_managed_partition_for_mv_refresh(
                 state,
                 plan,
@@ -235,6 +258,7 @@ pub(crate) fn refresh_mv(
                     table_id: runtime.table.table_id,
                     previous_refresh_rows: previous_rows,
                     snapshots,
+                    table_uuids,
                 },
             )?;
             refresh_managed_catalog(state)?;
@@ -288,6 +312,7 @@ pub(crate) fn refresh_mv(
                 previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
+                current_table_uuid: current_table_uuid.clone(),
             })
         },
     )
@@ -395,6 +420,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
+    current_table_uuid: String,
 }
 
 fn refresh_aggregate_mv_incremental(
@@ -435,6 +461,7 @@ fn refresh_aggregate_mv_incremental(
             ctx.table_id,
             ctx.base_ref,
             ctx.current_snapshot_id,
+            &ctx.current_table_uuid,
             ctx.previous_refresh_rows,
         )?;
         refresh_managed_catalog(ctx.state)?;
@@ -498,6 +525,7 @@ fn refresh_aggregate_mv_incremental(
         PartitionTarget::Active,
     )?;
     let snapshots = single_snapshot_map(ctx.base_ref, ctx.current_snapshot_id);
+    let table_uuids = single_table_uuid_map(ctx.base_ref, &ctx.current_table_uuid);
     write_chunks_into_managed_partition_for_aggregate_mv_upsert(
         ctx.state,
         plan,
@@ -508,6 +536,7 @@ fn refresh_aggregate_mv_incremental(
             // Upsert writes the full merged active aggregate state, not an append delta.
             previous_refresh_rows: 0,
             snapshots,
+            table_uuids,
         },
     )?;
     refresh_managed_catalog(ctx.state)?;
@@ -519,12 +548,14 @@ fn advance_mv_refresh_metadata_without_writes(
     table_id: i64,
     base_ref: &IcebergTableRef,
     current_snapshot_id: i64,
+    current_table_uuid: &str,
     last_refresh_rows: i64,
 ) -> Result<(), String> {
     metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
         table_id,
         last_refresh_rows,
         snapshots: single_snapshot_map(base_ref, current_snapshot_id),
+        table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
     })
 }
 
@@ -652,7 +683,7 @@ where
         }
     };
 
-    let snapshots = collect_current_snapshots_or_cleanup_staged_partition(
+    let base_metadata = collect_current_base_metadata_or_cleanup_staged_partition(
         state,
         metadata_store,
         runtime.table.table_id,
@@ -666,7 +697,8 @@ where
         new_index_id: staged.index_id,
         retired_root_path,
         rows_written,
-        snapshots,
+        snapshots: base_metadata.snapshots,
+        table_uuids: base_metadata.table_uuids,
     }) {
         cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
         return Err(format!("mv refresh activate failed: {err}"));
@@ -859,34 +891,54 @@ pub(crate) fn single_snapshot_map(
     snapshots
 }
 
-fn collect_current_snapshots(
+pub(crate) fn single_table_uuid_map(
+    table_ref: &IcebergTableRef,
+    table_uuid: &str,
+) -> BTreeMap<String, String> {
+    let mut uuids = BTreeMap::new();
+    uuids.insert(table_ref.fqn(), table_uuid.to_string());
+    uuids
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CurrentBaseMetadata {
+    snapshots: BTreeMap<String, i64>,
+    table_uuids: BTreeMap<String, String>,
+}
+
+fn collect_current_base_metadata(
     state: &Arc<StandaloneState>,
     refs: &[IcebergTableRef],
-) -> Result<BTreeMap<String, i64>, String> {
+) -> Result<CurrentBaseMetadata, String> {
     let registry = state
         .iceberg_catalogs
         .read()
         .expect("iceberg registry read lock");
-    let mut snapshots = BTreeMap::new();
+    let mut metadata = CurrentBaseMetadata::default();
     for table_ref in refs {
         let entry = registry.get(&table_ref.catalog)?;
         let loaded = load_table(&entry, &table_ref.namespace, &table_ref.table)?;
+        metadata
+            .table_uuids
+            .insert(table_ref.fqn(), loaded.table.metadata().uuid().to_string());
         if let Some(snapshot) = loaded.table.metadata().current_snapshot() {
-            snapshots.insert(table_ref.fqn(), snapshot.snapshot_id());
+            metadata
+                .snapshots
+                .insert(table_ref.fqn(), snapshot.snapshot_id());
         }
     }
-    Ok(snapshots)
+    Ok(metadata)
 }
 
-fn collect_current_snapshots_or_cleanup_staged_partition(
+fn collect_current_base_metadata_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     refs: &[IcebergTableRef],
-) -> Result<BTreeMap<String, i64>, String> {
-    match collect_current_snapshots(state, refs) {
-        Ok(snapshots) => Ok(snapshots),
+) -> Result<CurrentBaseMetadata, String> {
+    match collect_current_base_metadata(state, refs) {
+        Ok(metadata) => Ok(metadata),
         Err(err) => {
             if let Err(cleanup_err) =
                 cleanup_staged_partition(state, metadata_store, table_id, staged, true)
@@ -968,8 +1020,20 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
             crate::engine::catalog::normalize_identifier(database)?,
             crate::engine::catalog::normalize_identifier(table)?,
         )),
+        [catalog, database, table] => {
+            let catalog = crate::engine::catalog::normalize_identifier(catalog)?;
+            if catalog != "default_catalog" {
+                return Err(format!(
+                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
+                ));
+            }
+            Ok((
+                crate::engine::catalog::normalize_identifier(database)?,
+                crate::engine::catalog::normalize_identifier(table)?,
+            ))
+        }
         _ => Err(format!(
-            "materialized view name must be `<name>` or `<db>.<name>`; got `{}`",
+            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
             name.parts.join(".")
         )),
     }
@@ -1111,7 +1175,7 @@ mod tests {
             })
             .expect("begin refresh");
 
-        advance_mv_refresh_metadata_without_writes(&store, 10, &base_ref, 42, 17)
+        advance_mv_refresh_metadata_without_writes(&store, 10, &base_ref, 42, "uuid-1", 17)
             .expect("advance metadata");
 
         let snapshot = store.load_snapshot().expect("load snapshot").managed;
@@ -1437,6 +1501,152 @@ mod tests {
             ],
             "MV state after delete-bearing incremental refresh must drop \
              count and sum for the affected group; other groups untouched"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn aggregate_mv_incremental_refresh_handles_equality_delete() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="2")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after full refresh must reflect the seeded base rows"
+        );
+
+        session
+            .execute_in_database(
+                "alter table ice.ns.orders add equality delete (id) values (1)",
+                "default",
+            )
+            .expect("add equality delete for base row id=1");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!(
+                "second (incremental, equality-delete-bearing) refresh materialized view: {err}"
+            );
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after equality-delete incremental refresh must retract the deleted row"
         );
 
         drop(engine);
@@ -1923,7 +2133,7 @@ enable_path_style_access = true
             table: "orders".to_string(),
         }];
 
-        let err = collect_current_snapshots_or_cleanup_staged_partition(
+        let err = collect_current_base_metadata_or_cleanup_staged_partition(
             &state, &store, 10, &staged, &refs,
         )
         .expect_err("snapshot collection should fail");
@@ -2079,6 +2289,7 @@ enable_path_style_access = true
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
             primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -2203,6 +2414,7 @@ enable_path_style_access = true
                 last_refresh_ms: None,
                 last_refresh_rows: None,
                 last_refresh_snapshots: BTreeMap::new(),
+                last_refresh_table_uuids: Default::default(),
                 primary_key_columns: Vec::new(),
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,

@@ -81,17 +81,29 @@ impl AbortLog {
     /// no-ops. Best-effort: failures are collected and returned rather than
     /// propagated, so callers always clean up as much as possible.
     pub async fn cleanup(&self, fs: &Operator) -> Vec<CleanupError> {
+        self.cleanup_with_path_mapper(fs, |path| path.to_string())
+            .await
+    }
+
+    /// Delete all registered files after mapping their Iceberg location string
+    /// to the path expected by the supplied OpenDAL operator.
+    pub async fn cleanup_with_path_mapper<F>(&self, fs: &Operator, mapper: F) -> Vec<CleanupError>
+    where
+        F: Fn(&str) -> String,
+    {
         if self.cleared.swap(true, Ordering::SeqCst) {
             return Vec::new();
         }
         let mut errs = Vec::new();
         for p in self.drain_data_files() {
-            if let Err(e) = fs.delete(&p).await {
+            let delete_path = mapper(&p);
+            if let Err(e) = fs.delete(&delete_path).await {
                 errs.push(CleanupError { path: p, source: e });
             }
         }
         for p in self.drain_manifests() {
-            if let Err(e) = fs.delete(&p).await {
+            let delete_path = mapper(&p);
+            if let Err(e) = fs.delete(&delete_path).await {
                 errs.push(CleanupError { path: p, source: e });
             }
         }
@@ -130,6 +142,27 @@ mod tests {
         assert!(fs.stat("a.parquet").await.is_err());
         assert!(fs.stat("b.parquet").await.is_err());
         assert!(fs.stat("m.avro").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_maps_absolute_iceberg_locations_to_operator_paths() {
+        let fs = mem_op();
+        fs.write("warehouse/ns/t/data/file.parquet", b"x".to_vec())
+            .await
+            .unwrap();
+
+        let log = AbortLog::new();
+        log.record_data_file("s3://bucket/warehouse/ns/t/data/file.parquet".into());
+
+        let errs = log
+            .cleanup_with_path_mapper(&fs, |path| {
+                path.strip_prefix("s3://bucket/")
+                    .unwrap_or(path)
+                    .to_string()
+            })
+            .await;
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+        assert!(fs.stat("warehouse/ns/t/data/file.parquet").await.is_err());
     }
 
     #[tokio::test]

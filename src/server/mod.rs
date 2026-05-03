@@ -391,7 +391,6 @@ fn is_session_noop(query: &str) -> bool {
     lower.starts_with("set ")
         || lower.starts_with("show ")
         || lower.starts_with("update ")
-        || lower.starts_with("delete ")
         || lower.starts_with("admin ")
         || lower.starts_with("submit ")
         || lower.starts_with("analyze ")
@@ -541,6 +540,7 @@ fn is_supported_embedded_statement(query: &str) -> bool {
         || head.eq_ignore_ascii_case("create")
         || head.eq_ignore_ascii_case("drop")
         || head.eq_ignore_ascii_case("insert")
+        || head.eq_ignore_ascii_case("delete")
         || head.eq_ignore_ascii_case("explain")
         || head.eq_ignore_ascii_case("truncate")
         || head.eq_ignore_ascii_case("alter")
@@ -894,5 +894,15 @@ mod tests {
             parse_set_group_concat_max_len("SET group_concat_max_len"),
             None
         );
+    }
+
+    #[test]
+    fn delete_is_dispatched_to_embedded_engine_not_session_noop() {
+        let sql = "DELETE FROM ice.ns.orders WHERE id = 1";
+        assert!(
+            !is_session_noop(sql),
+            "DELETE must reach the embedded engine so Iceberg row deletes are committed"
+        );
+        assert!(is_supported_embedded_statement(sql));
     }
 }

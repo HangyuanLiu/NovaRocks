@@ -5,16 +5,19 @@
 -- 1. Validate aggregate MV full refresh over a v3 row-lineage Iceberg base table.
 -- 2. Validate append snapshots refresh incrementally.
 -- 3. Validate INSERT OVERWRITE refresh falls back to full refresh and advances metadata.
+-- 4. Validate S3-backed Iceberg DELETE mutates visible base rows and MV refresh state.
 
 -- query 1
 -- @skip_result_check=true
--- Use a local-FS Iceberg warehouse here because S3-backed Iceberg
--- INSERT OVERWRITE abort cleanup is not wired through the standalone SQL path yet.
 CREATE EXTERNAL CATALOG mv_strategy_ice_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "file:///tmp/novarocks-mv-strategy-${uuid0}"
+  "iceberg.catalog.warehouse" = "${managed_lake_warehouse}/mv_strategy_${uuid0}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "aws.s3.access_key" = "${oss_ak}",
+  "aws.s3.secret_key" = "${oss_sk}",
+  "aws.s3.enable_path_style_access" = "true"
 );
 CREATE DATABASE mv_strategy_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders (
@@ -78,6 +81,24 @@ FROM ${case_db}.orders_strategy_mv
 ORDER BY customer;
 
 -- query 10
+-- @skip_result_check=true
+DELETE FROM mv_strategy_ice_${uuid0}.ns_${uuid0}.orders WHERE id = 2;
+
+-- query 11
+SELECT id, customer, amount
+FROM mv_strategy_ice_${uuid0}.ns_${uuid0}.orders
+ORDER BY id;
+
+-- query 12
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
+
+-- query 13
+SELECT customer, c, s
+FROM ${case_db}.orders_strategy_mv
+ORDER BY customer;
+
+-- query 14
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW ${case_db}.orders_strategy_mv;
 DROP TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders FORCE;

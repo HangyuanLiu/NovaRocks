@@ -110,7 +110,6 @@ impl ScanOp for HdfsScanOp {
         else {
             return Err("hdfs scan received unexpected morsel".to_string());
         };
-
         let ranges = vec![FileScanRange {
             path,
             file_len,
@@ -372,6 +371,7 @@ impl ScanOp for HdfsScanOp {
             .map(|(resolved, original)| IcebergDeleteFileSpec {
                 path: resolved.path.clone(),
                 file_format: original.file_format,
+                file_content: original.file_content,
                 length: original.length,
                 content_offset: original.content_offset,
                 content_size_in_bytes: original.content_size_in_bytes,
@@ -383,6 +383,79 @@ impl ScanOp for HdfsScanOp {
             Ok(None)
         } else {
             Ok(Some(deleted))
+        }
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>>, String>
+    {
+        let ScanMorsel::FileRange {
+            path, delete_files, ..
+        } = morsel
+        else {
+            return Ok(None);
+        };
+        if !delete_files
+            .iter()
+            .any(|file| file.file_content == crate::types::TIcebergFileContent::EQUALITY_DELETES)
+        {
+            return Ok(None);
+        }
+        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
+            Vec::with_capacity(1 + delete_files.len());
+        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            path: path.clone(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        });
+        for del in delete_files {
+            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+                path: del.path.clone(),
+                file_len: del.length.unwrap_or(0),
+                offset: 0,
+                length: del.length.unwrap_or(0),
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+            });
+        }
+        let ctx = crate::fs::scan_context::FileScanContext::build(
+            loader_ranges,
+            None,
+            self.cfg.object_store_config.as_ref(),
+        )?;
+        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(delete_files.iter())
+            .map(|(resolved, original)| IcebergDeleteFileSpec {
+                path: resolved.path.clone(),
+                file_format: original.file_format,
+                file_content: original.file_content,
+                length: original.length,
+                content_offset: original.content_offset,
+                content_size_in_bytes: original.content_size_in_bytes,
+            })
+            .collect();
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &normalized_delete_specs,
+            &ctx.factory,
+        )?;
+        if sets.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sets))
         }
     }
 }

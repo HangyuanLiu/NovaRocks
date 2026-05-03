@@ -24,9 +24,19 @@ pub(crate) enum MvRefreshPolicy {
 #[allow(dead_code)]
 pub(crate) enum FullRefreshReason {
     InitialRefresh,
-    InsertOverwrite { snapshot_id: i64 },
-    LineageExpired { previous_snapshot_id: i64 },
-    SchemaEvolutionSafeFallback { detail: String },
+    InsertOverwrite {
+        snapshot_id: i64,
+    },
+    LineageExpired {
+        previous_snapshot_id: i64,
+    },
+    BaseTableRecreated {
+        previous_uuid: String,
+        current_uuid: String,
+    },
+    SchemaEvolutionSafeFallback {
+        detail: String,
+    },
     MinMaxDeleteRetractUnsupported,
 }
 
@@ -40,6 +50,13 @@ impl std::fmt::Display for FullRefreshReason {
             FullRefreshReason::LineageExpired {
                 previous_snapshot_id,
             } => write!(f, "lineage expired after snapshot {previous_snapshot_id}"),
+            FullRefreshReason::BaseTableRecreated {
+                previous_uuid,
+                current_uuid,
+            } => write!(
+                f,
+                "base table recreated (previous uuid {previous_uuid}, current uuid {current_uuid})"
+            ),
             FullRefreshReason::SchemaEvolutionSafeFallback { detail } => {
                 write!(f, "schema evolution safe fallback: {detail}")
             }

@@ -14,7 +14,9 @@ use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
-use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+use iceberg::spec::{
+    FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type,
+};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -27,7 +29,6 @@ use iceberg::{
     writer::{IcebergWriter, IcebergWriterBuilder},
 };
 use parquet::file::properties::WriterProperties;
-use tokio::runtime::Handle;
 
 use crate::runtime::global_async_runtime::data_block_on;
 
@@ -62,6 +63,7 @@ const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
 const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
 const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
 const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
+const S3_NAMESPACE_MARKER_FILE: &str = ".novarocks_namespace";
 
 impl IcebergCatalogRegistry {
     pub(crate) fn create_catalog(
@@ -121,6 +123,12 @@ impl IcebergCatalogEntry {
         self.s3_config.is_some()
     }
 
+    pub(crate) fn object_store_config(
+        &self,
+    ) -> Option<&crate::fs::object_store::ObjectStoreConfig> {
+        self.s3_config.as_ref()
+    }
+
     pub(crate) fn cloud_properties_map(&self) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         for (key, value) in &self.properties {
@@ -157,11 +165,18 @@ pub(crate) fn create_namespace(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
 ) -> Result<(), String> {
-    let _ns_name = normalize_identifier(namespace_name)?;
-    // For S3 catalogs, namespace creation is a no-op: the directory structure
-    // is created when tables are written. For local catalogs, create the directory.
-    if !entry.is_s3() {
-        let ns_dir = entry.warehouse_path.join(&_ns_name);
+    let ns_name = normalize_identifier(namespace_name)?;
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for namespace create: {e}"))?;
+        let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
+        block_on_iceberg(async {
+            op.write(&marker_key, Vec::<u8>::new())
+                .await
+                .map_err(|e| format!("write namespace marker {marker_key}: {e}"))
+        })??;
+    } else {
+        let ns_dir = entry.warehouse_path.join(&ns_name);
         std::fs::create_dir_all(&ns_dir).map_err(|e| {
             format!(
                 "create namespace directory {} failed: {e}",
@@ -180,11 +195,12 @@ pub(crate) fn namespace_exists(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
-        let (_, root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
+        let ns_prefix = s3_namespace_prefix(entry, &ns_name)?;
+        let marker_key = format!("{ns_prefix}{S3_NAMESPACE_MARKER_FILE}");
         block_on_iceberg(async {
+            if op.stat(&marker_key).await.is_ok() {
+                return Ok(true);
+            }
             match op.list(&ns_prefix).await {
                 Ok(entries) => Ok(!entries.is_empty()),
                 Err(_) => Ok(false),
@@ -202,10 +218,17 @@ pub(crate) fn drop_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if entry.is_s3() {
-        // For S3 catalogs, dropping a namespace is a no-op
-        // (we don't recursively delete S3 directories here)
-        Ok(())
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for namespace drop: {e}"))?;
+        let marker_key = s3_namespace_marker_key(entry, &ns_name)?;
+        block_on_iceberg(async {
+            match op.delete(&marker_key).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(format!("delete namespace marker {marker_key}: {err}")),
+            }
+        })?
     } else {
         let ns_dir = entry.warehouse_path.join(&ns_name);
         if ns_dir.exists() {
@@ -215,6 +238,38 @@ pub(crate) fn drop_namespace(
         }
         Ok(())
     }
+}
+
+fn s3_namespace_prefix(entry: &IcebergCatalogEntry, ns_name: &str) -> Result<String, String> {
+    let (_, root_prefix) =
+        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    let root = root_prefix.trim_matches('/');
+    if root.is_empty() {
+        Ok(format!("{ns_name}/"))
+    } else {
+        Ok(format!("{root}/{ns_name}/"))
+    }
+}
+
+fn s3_namespace_marker_key(entry: &IcebergCatalogEntry, ns_name: &str) -> Result<String, String> {
+    Ok(format!(
+        "{}{}",
+        s3_namespace_prefix(entry, ns_name)?,
+        S3_NAMESPACE_MARKER_FILE
+    ))
+}
+
+fn s3_table_prefix(
+    entry: &IcebergCatalogEntry,
+    ns_name: &str,
+    table_name: &str,
+) -> Result<String, String> {
+    Ok(format!(
+        "{}{}/",
+        s3_namespace_prefix(entry, ns_name)?,
+        table_name.trim_matches('/')
+    ))
 }
 
 pub(crate) fn list_tables(
@@ -276,14 +331,16 @@ pub(crate) fn create_table(
 ) -> Result<(), String> {
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
+    entry.invalidate_table_cache(namespace_name, &table_name);
     let schema = build_iceberg_schema(columns)?;
-    let mut all_properties = properties.to_vec();
+    let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     all_properties.extend(build_logical_type_properties(columns)?);
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
     let table_creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
         .properties(all_properties)
+        .format_version(format_version)
         .build();
 
     let catalog = build_hadoop_catalog(entry)?;
@@ -311,13 +368,20 @@ pub(crate) fn drop_table(
         cache.remove(&(ns_name.clone(), tbl_name.clone()));
     }
 
-    if entry.is_s3() {
-        // For S3 catalogs, we don't delete S3 data here.
-        // A proper implementation would use the Iceberg catalog API to purge.
-        tracing::warn!(
-            "drop_table for S3 catalog is a metadata-only operation; S3 data for {ns_name}.{tbl_name} is not deleted"
-        );
-        Ok(())
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for table drop: {e}"))?;
+        let table_prefix = s3_table_prefix(entry, &ns_name, &tbl_name)?;
+        if table_prefix.trim_matches('/').is_empty() {
+            return Err(format!(
+                "refuse to drop S3 iceberg table {ns_name}.{tbl_name}: resolved empty table prefix"
+            ));
+        }
+        block_on_iceberg(async {
+            op.remove_all(&table_prefix)
+                .await
+                .map_err(|e| format!("remove S3 table prefix {table_prefix}: {e}"))
+        })?
     } else {
         let table_dir = entry.warehouse_path.join(&ns_name).join(&tbl_name);
         if table_dir.exists() {
@@ -587,6 +651,40 @@ pub(crate) struct DataFileWithStats {
     pub delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
 }
 
+fn iceberg_delete_applies_to_data_file(
+    delete_file: &crate::sql::catalog::IcebergDeleteFileInfo,
+    data_sequence_number: Option<i64>,
+    data_partition_spec_id: Option<i32>,
+    data_partition_key: Option<&str>,
+) -> bool {
+    if let (Some(delete_sequence), Some(data_sequence)) =
+        (delete_file.sequence_number, data_sequence_number)
+        && delete_sequence <= data_sequence
+    {
+        return false;
+    }
+    if let Some(delete_partition) = delete_file.partition_key.as_deref() {
+        if let (Some(delete_spec_id), Some(data_spec_id)) =
+            (delete_file.partition_spec_id, data_partition_spec_id)
+            && delete_spec_id != data_spec_id
+        {
+            return false;
+        }
+        if data_partition_key != Some(delete_partition) {
+            return false;
+        }
+    }
+    true
+}
+
+fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
+    if partition.fields().is_empty() {
+        None
+    } else {
+        Some(format!("{partition:?}"))
+    }
+}
+
 /// Extract data file paths, sizes, row counts, and per-column statistics from
 /// Iceberg manifest entries.
 ///
@@ -598,7 +696,9 @@ pub(crate) struct DataFileWithStats {
 pub(crate) fn extract_data_files_with_stats(
     table: &iceberg::table::Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    use crate::sql::catalog::{IcebergDeleteFileFormat, IcebergDeleteFileInfo};
+    use crate::sql::catalog::{
+        IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+    };
     use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
     let metadata = table.metadata();
@@ -638,6 +738,7 @@ pub(crate) fn extract_data_files_with_stats(
                 .await
                 .map_err(|e| format!("load manifest: {e}"))?;
 
+            let partition_spec_id = manifest_file.partition_spec_id;
             for entry in manifest.entries() {
                 if entry.status == ManifestStatus::Deleted {
                     continue;
@@ -677,12 +778,21 @@ pub(crate) fn extract_data_files_with_stats(
                         let info = IcebergDeleteFileInfo {
                             path: df.file_path().to_string(),
                             file_format,
+                            file_content: IcebergDeleteFileContent::Position,
                             length: Some(
                                 i64::try_from(df.file_size_in_bytes())
                                     .map_err(|_| format!("delete file too large: {}", df.file_path()))?,
                             ),
                             content_offset,
                             content_size_in_bytes,
+                            sequence_number: Some(
+                                entry
+                                    .sequence_number()
+                                    .unwrap_or(manifest_file.sequence_number),
+                            ),
+                            partition_spec_id: Some(partition_spec_id),
+                            partition_key: iceberg_partition_key(df.partition()),
+                            equality_column_names: Vec::new(),
                         };
                         if let Some(referenced) = df.referenced_data_file() {
                             delete_files_by_data_path
@@ -694,10 +804,56 @@ pub(crate) fn extract_data_files_with_stats(
                         }
                     }
                     DataContentType::EqualityDeletes => {
-                        return Err(format!(
-                            "iceberg equality-delete files are not supported by standalone SELECT: {}",
-                            df.file_path()
-                        ));
+                        if df.file_format() != DataFileFormat::Parquet {
+                            return Err(format!(
+                                "unsupported iceberg equality-delete file format {:?}: {}",
+                                df.file_format(),
+                                df.file_path()
+                            ));
+                        }
+                        let equality_ids = df.equality_ids().ok_or_else(|| {
+                            format!(
+                                "iceberg equality-delete file {} missing equality_ids",
+                                df.file_path()
+                            )
+                        })?;
+                        if equality_ids.is_empty() {
+                            return Err(format!(
+                                "iceberg equality-delete file {} has empty equality_ids",
+                                df.file_path()
+                            ));
+                        }
+                        let equality_column_names = equality_ids
+                            .iter()
+                            .map(|id| {
+                                field_id_to_name.get(id).cloned().ok_or_else(|| {
+                                    format!(
+                                        "iceberg equality-delete file {} references unknown field id {}",
+                                        df.file_path(),
+                                        id
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let info = IcebergDeleteFileInfo {
+                            path: df.file_path().to_string(),
+                            file_format: IcebergDeleteFileFormat::Parquet,
+                            file_content: IcebergDeleteFileContent::Equality,
+                            length: Some(i64::try_from(df.file_size_in_bytes()).map_err(
+                                |_| format!("delete file too large: {}", df.file_path()),
+                            )?),
+                            content_offset: None,
+                            content_size_in_bytes: None,
+                            sequence_number: Some(
+                                entry
+                                    .sequence_number()
+                                    .unwrap_or(manifest_file.sequence_number),
+                            ),
+                            partition_spec_id: Some(partition_spec_id),
+                            partition_key: iceberg_partition_key(df.partition()),
+                            equality_column_names,
+                        };
+                        global_delete_files.push(info);
                     }
                     DataContentType::Data => {}
                 }
@@ -813,11 +969,24 @@ pub(crate) fn extract_data_files_with_stats(
                         .sequence_number()
                         .unwrap_or(manifest_file.sequence_number),
                 );
+                let data_partition_spec_id = Some(manifest_file.partition_spec_id);
+                let data_partition_key = iceberg_partition_key(df.partition());
                 let mut delete_files = delete_files_by_data_path
                     .get(&path)
                     .cloned()
                     .unwrap_or_default();
-                delete_files.extend(global_delete_files.clone());
+                delete_files.extend(global_delete_files.iter().filter_map(|delete_file| {
+                    if iceberg_delete_applies_to_data_file(
+                        delete_file,
+                        data_sequence_number,
+                        data_partition_spec_id,
+                        data_partition_key.as_deref(),
+                    ) {
+                        Some(delete_file.clone())
+                    } else {
+                        None
+                    }
+                }));
 
                 results.push(DataFileWithStats {
                     path,
@@ -975,9 +1144,6 @@ pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,
 {
-    if let Ok(handle) = Handle::try_current() {
-        return Ok(handle.block_on(future));
-    }
     data_block_on(future)
 }
 
@@ -1522,6 +1688,30 @@ fn parse_time_literal_to_micros(value: &str) -> Result<i64, String> {
         + i64::from(time.nanosecond() / 1_000))
 }
 
+fn extract_table_format_version_property(
+    properties: &[(String, String)],
+) -> Result<(FormatVersion, Vec<(String, String)>), String> {
+    let mut format_version = FormatVersion::V2;
+    let mut remaining = Vec::with_capacity(properties.len());
+    for (key, value) in properties {
+        if key.eq_ignore_ascii_case("format-version") {
+            format_version = match value.trim() {
+                "1" => FormatVersion::V1,
+                "2" => FormatVersion::V2,
+                "3" => FormatVersion::V3,
+                other => {
+                    return Err(format!(
+                        "unsupported iceberg format-version `{other}`; expected 1, 2, or 3"
+                    ));
+                }
+            };
+        } else {
+            remaining.push((key.clone(), value.clone()));
+        }
+    }
+    Ok((format_version, remaining))
+}
+
 fn build_logical_type_properties(
     columns: &[TableColumnDef],
 ) -> Result<Vec<(String, String)>, String> {
@@ -1886,6 +2076,40 @@ mod data_file_with_stats_tests {
         assert_eq!(
             f.data_sequence_number, None,
             "data_sequence_number should be None for non-Iceberg sources"
+        );
+    }
+}
+
+#[cfg(test)]
+mod table_property_tests {
+    use super::*;
+
+    #[test]
+    fn format_version_property_becomes_table_creation_field() {
+        let props = vec![
+            ("format-version".to_string(), "3".to_string()),
+            ("write.row-lineage".to_string(), "true".to_string()),
+        ];
+        let (format_version, remaining) =
+            extract_table_format_version_property(&props).expect("extract");
+
+        assert_eq!(format_version, FormatVersion::V3);
+        assert_eq!(
+            remaining,
+            vec![("write.row-lineage".to_string(), "true".to_string())]
+        );
+    }
+
+    #[test]
+    fn invalid_format_version_is_rejected() {
+        let err = extract_table_format_version_property(&[(
+            "format-version".to_string(),
+            "9".to_string(),
+        )])
+        .expect_err("format-version=9 should fail");
+        assert!(
+            err.contains("unsupported iceberg format-version"),
+            "error was: {err}"
         );
     }
 }

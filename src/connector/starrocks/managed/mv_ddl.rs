@@ -146,6 +146,7 @@ pub(crate) fn create_mv(
     })?;
 
     let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
+    validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
@@ -305,6 +306,7 @@ pub(crate) fn create_mv(
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: Default::default(),
+        last_refresh_table_uuids: Default::default(),
         primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
         created_at_ms: now_ms(),
         storage_engine: ManagedMvStorageEngine::ManagedLake,
@@ -852,11 +854,45 @@ pub(crate) fn resolve_mv_name(
             normalize_identifier(database)?,
             normalize_identifier(table)?,
         )),
+        [catalog, database, table] => {
+            let catalog = normalize_identifier(catalog)?;
+            if catalog != "default_catalog" {
+                return Err(format!(
+                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
+                ));
+            }
+            Ok((
+                normalize_identifier(database)?,
+                normalize_identifier(table)?,
+            ))
+        }
         _ => Err(format!(
-            "materialized view name must be `<name>` or `<db>.<name>`; got `{}`",
+            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
             name.parts.join(".")
         )),
     }
+}
+
+pub(crate) fn validate_mv_partition_columns(
+    partition_by: Option<&[String]>,
+    output_columns: &[OutputColumn],
+) -> Result<(), String> {
+    let Some(partition_by) = partition_by else {
+        return Ok(());
+    };
+    let output_names = output_columns
+        .iter()
+        .map(|column| normalize_identifier(&column.name))
+        .collect::<Result<HashSet<_>, _>>()?;
+    for column in partition_by {
+        let normalized = normalize_identifier(column)?;
+        if !output_names.contains(&normalized) {
+            return Err(format!(
+                "materialized view PARTITION BY column `{column}` must be an output column"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_table_refs_from_query(

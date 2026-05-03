@@ -37,8 +37,9 @@ use iceberg::{NamespaceIdent, TableIdent};
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_single_partition_spec, run_iceberg_commit,
+    CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile,
+    ensure_iceberg_write_supported, ensure_no_equality_deletes, ensure_single_partition_spec,
+    run_iceberg_commit,
 };
 use crate::connector::starrocks::managed::mv_refresh::query_result_to_chunks;
 use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
@@ -153,7 +154,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     }
 
     // 6. Build the OpenDAL Operator + FileIO.
-    let fs = build_opendal_for_table(&table)?;
+    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
     let file_io = table.file_io().clone();
 
     // 7. Drive commit + abort cleanup on failure.
@@ -162,8 +163,9 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             collector: collector.clone(),
             catalog: catalog.clone(),
             table,
-            fs,
+            fs: abort_cleanup.fs,
             file_io,
+            cleanup_path_mapper: abort_cleanup.path_mapper,
         })
         .await
     })??;
@@ -202,7 +204,10 @@ fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
 }
 
-fn data_file_to_written_file(df: &DataFile, partition_spec_id: i32) -> Result<WrittenFile, String> {
+pub(crate) fn data_file_to_written_file(
+    df: &DataFile,
+    partition_spec_id: i32,
+) -> Result<WrittenFile, String> {
     Ok(WrittenFile {
         path: df.file_path().to_string(),
         format: df.file_format(),
@@ -217,6 +222,7 @@ fn data_file_to_written_file(df: &DataFile, partition_spec_id: i32) -> Result<Wr
         null_value_counts: df.null_value_counts().clone(),
         key_metadata: df.key_metadata().map(|s| s.to_vec()),
         referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
+        equality_ids: df.equality_ids(),
     })
 }
 
@@ -259,43 +265,44 @@ fn run_select_to_chunks(
     query_result_to_chunks(result)
 }
 
-/// Build an OpenDAL `Operator` rooted such that absolute paths returned by
-/// `iceberg::DataFileWriter` (e.g. `file:///.../data/...parquet`) can be
-/// passed to `Operator::delete` during abort cleanup.
-///
-/// For local-FS catalogs we use `services::Fs` rooted at `/` so absolute
-/// paths work. For S3 catalogs we re-use the FileIO config from the table
-/// itself (which already routes to the right bucket / endpoint / creds).
-fn build_opendal_for_table(table: &iceberg::table::Table) -> Result<opendal::Operator, String> {
-    let location = table.metadata().location();
-    if location.starts_with("s3://") || location.starts_with("s3a://") {
-        // For S3-backed tables we reuse the FileIO's underlying operator via
-        // a thin wrapper — but iceberg-rust's FileIO does not currently expose
-        // the inner Operator. Phase 1 only ships local FS commit-cleanup; for
-        // S3 we report a clear error so deployments don't silently leak files
-        // on commit failure. (Operator construction parity with the catalog's
-        // S3 config can be added in a follow-up.)
-        return Err(
-            "phase 1 abort cleanup on S3-backed iceberg tables is not yet wired up; \
-             use a local-FS catalog for INSERT/OVERWRITE/DELETE flows that may need \
-             abort cleanup, or extend build_opendal_for_table to mirror the catalog's \
-             S3 config."
-                .to_string(),
-        );
-    }
-    let builder = opendal::services::Fs::default().root("/");
-    opendal::Operator::new(builder)
-        .map_err(|e| format!("build local-FS operator failed: {e}"))?
-        .finish()
-        .pipe(Ok)
+pub(crate) struct AbortCleanupOperator {
+    pub(crate) fs: opendal::Operator,
+    pub(crate) path_mapper: Option<CleanupPathMapper>,
 }
 
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
+pub(crate) fn build_abort_cleanup_for_catalog_entry(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+) -> Result<AbortCleanupOperator, String> {
+    if let Some(s3_config) = entry.object_store_config() {
+        let fs = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for iceberg abort cleanup: {e}"))?;
+        let bucket = s3_config.bucket.clone();
+        let mapper: CleanupPathMapper = Arc::new(move |path| {
+            crate::connector::iceberg::catalog::add_files::parse_s3_path(path)
+                .ok()
+                .and_then(|(actual_bucket, key)| {
+                    if actual_bucket == bucket {
+                        Some(key)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| path.to_string())
+        });
+        return Ok(AbortCleanupOperator {
+            fs,
+            path_mapper: Some(mapper),
+        });
     }
+
+    let builder = opendal::services::Fs::default().root("/");
+    let fs = opendal::Operator::new(builder)
+        .map_err(|e| format!("build local-FS operator failed: {e}"))?
+        .finish();
+    let mapper: CleanupPathMapper =
+        Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
+    Ok(AbortCleanupOperator {
+        fs,
+        path_mapper: Some(mapper),
+    })
 }
-impl<T: Sized> Pipe for T {}

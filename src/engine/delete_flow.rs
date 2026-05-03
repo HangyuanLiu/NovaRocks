@@ -25,15 +25,15 @@
 //!    `AND` / `OR` against primitive columns (int / long / string / bool).
 //!    Other expressions are rejected with an explicit error.
 //! 4. Build a [`TableScan`] with `_file`, `_pos`, and the primitive columns
-//!    referenced by the WHERE expression. The iceberg `Predicate` is still
-//!    passed into planning for manifest pruning.
-//! 5. Drain the resulting Arrow stream, group `(file_path, pos)` pairs by
-//!    `file_path`, and write one v2 position-delete Parquet file per group
-//!    via [`write_position_delete_files`].
+//!    referenced by the WHERE expression.
+//! 5. Drain the resulting Arrow stream, apply existing delete visibility,
+//!    group `(file_path, pos)` pairs by `file_path`, and write one v2
+//!    position-delete Parquet file per group via
+//!    [`write_position_delete_files`].
 //! 6. Inject the resulting [`WrittenFile`]s into [`IcebergCommitCollector`]
 //!    and dispatch to [`run_iceberg_commit`] (`op_kind = RowDelta`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
@@ -47,9 +47,9 @@ use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, IcebergWriteMode, PositionDeleteGroup, RunInput,
-    ensure_iceberg_write_supported, ensure_no_equality_deletes, ensure_single_partition_spec,
-    run_iceberg_commit, write_position_delete_files,
+    CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
+    classify_sql_delete_strategy, ensure_single_partition_spec, run_iceberg_commit,
+    write_position_delete_files,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::{StandaloneState, StatementResult};
@@ -89,22 +89,29 @@ pub(crate) fn execute_delete_statement(
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
     // 3. Validation.
-    let write_mode = ensure_iceberg_write_supported(&table)?;
+    let delete_strategy = classify_sql_delete_strategy(&table)?;
     ensure_single_partition_spec(&table)?;
-    ensure_no_equality_deletes(&table)?;
 
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
     //    early. The bound `Predicate` is also used for manifest-level pruning
     //    inside [`scan_for_position_deletes`].
     let schema = table.metadata().current_schema();
     let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
+    let existing_deletes_by_file =
+        load_existing_delete_visibility_by_data_file(&table, entry.object_store_config())?;
 
     // 5. Scan data files and collect (file, pos) pairs. This path still reads
     //    every physical row and applies the original sqlparser WHERE AST per
     //    row so the currently supported DELETE semantics stay unchanged while
-    //    manifest pruning remains available through the iceberg Predicate.
+    //    existing row-level deletes remain visible to the write-side planner.
     let groups = block_on_iceberg(async {
-        scan_for_position_deletes(&table, predicate, &stmt.where_clause).await
+        scan_for_position_deletes(
+            &table,
+            predicate,
+            &stmt.where_clause,
+            &existing_deletes_by_file,
+        )
+        .await
     })??;
 
     // Empty result → no rows match the WHERE; return Ok without commit.
@@ -120,8 +127,8 @@ pub(crate) fn execute_delete_statement(
     );
     let file_io = table.file_io().clone();
 
-    match write_mode {
-        IcebergWriteMode::LegacyPositionDeletes => {
+    match delete_strategy {
+        IcebergSqlDeleteStrategy::PositionDeleteFiles => {
             // 6. Write v2 Parquet position-delete files into staging.
             let written = block_on_iceberg(async {
                 write_position_delete_files(
@@ -148,19 +155,21 @@ pub(crate) fn execute_delete_statement(
                 collector.inject_written_file(wf);
             }
 
-            let fs = build_local_fs_operator()?;
+            let abort_cleanup =
+                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
             let _outcome = block_on_iceberg(async {
                 run_iceberg_commit(RunInput {
                     collector: collector.clone(),
                     catalog: catalog.clone(),
                     table,
-                    fs,
+                    fs: abort_cleanup.fs,
                     file_io,
+                    cleanup_path_mapper: abort_cleanup.path_mapper,
                 })
                 .await
             })??;
         }
-        IcebergWriteMode::RowLineageV3 => {
+        IcebergSqlDeleteStrategy::DeletionVectors => {
             // 6/7. Inject the grouped DELETE positions and let RowDeltaDvCommit
             //      build the merged Puffin deletion vectors at commit time.
             let collector = Arc::new(IcebergCommitCollector::new(
@@ -177,14 +186,16 @@ pub(crate) fn execute_delete_statement(
                 collector.inject_delete_group(group);
             }
 
-            let fs = build_local_fs_operator()?;
+            let abort_cleanup =
+                crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
             let _outcome = block_on_iceberg(async {
                 run_iceberg_commit(RunInput {
                     collector: collector.clone(),
                     catalog: catalog.clone(),
                     table,
-                    fs,
+                    fs: abort_cleanup.fs,
                     file_io,
+                    cleanup_path_mapper: abort_cleanup.path_mapper,
                 })
                 .await
             })??;
@@ -412,6 +423,7 @@ async fn scan_for_position_deletes(
     table: &iceberg::table::Table,
     predicate: Predicate,
     where_expr: &sqlast::Expr,
+    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<PositionDeleteGroup>, String> {
     let schema = table.metadata().current_schema();
 
@@ -424,14 +436,14 @@ async fn scan_for_position_deletes(
         select_cols.push(f.name.clone());
     }
 
-    // Pass `predicate` to the scan so manifest pruning still applies. We
-    // strip it on each task below before handing the stream to
-    // ArrowReader so no row_filter / row_selection is applied at decode
-    // time.
+    // Keep `predicate` for validation only. In this standalone path the
+    // sqlparser evaluator below owns row-level matching; pushing the Iceberg
+    // predicate into planning can prune too aggressively for locally-written
+    // overwrite snapshots whose column metrics are incomplete.
+    let _ = predicate;
     let scan = table
         .scan()
         .select(select_cols)
-        .with_filter(predicate)
         .build()
         .map_err(|e| format!("build TableScan failed: {e}"))?;
     let task_stream = scan
@@ -460,42 +472,13 @@ async fn scan_for_position_deletes(
     let mut by_file: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result.map_err(|e| format!("scan stream error: {e}"))?;
-        let file_idx = batch
-            .schema()
-            .index_of("_file")
-            .map_err(|_| "scan batch missing `_file` column".to_string())?;
-        let pos_idx = batch
-            .schema()
-            .index_of("_pos")
-            .map_err(|_| "scan batch missing `_pos` column".to_string())?;
-        // iceberg-rust encodes constant virtual columns (`_file`) as REE
-        // (RunEndEncoded) arrays for memory efficiency. Cast to a plain
-        // primitive type before downcasting — `arrow::compute::cast`
-        // unwraps REE transparently.
-        let file_col = arrow::compute::cast(batch.column(file_idx), &DataType::Utf8)
-            .map_err(|e| format!("cast _file to Utf8 failed: {e}"))?;
-        let pos_col = arrow::compute::cast(batch.column(pos_idx), &DataType::Int64)
-            .map_err(|e| format!("cast _pos to Int64 failed: {e}"))?;
-        let file_arr = file_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| "_file column not Utf8 after cast".to_string())?;
-        let pos_arr = pos_col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "_pos column not Int64 after cast".to_string())?;
-        for i in 0..batch.num_rows() {
-            if file_arr.is_null(i) || pos_arr.is_null(i) {
-                continue;
-            }
-            let matches = evaluate_where_at_row(where_expr, &batch, i, schema.as_ref())?;
-            if !matches {
-                continue;
-            }
-            let path = file_arr.value(i).to_string();
-            let pos = pos_arr.value(i);
-            by_file.entry(path).or_default().push(pos);
-        }
+        collect_position_deletes_from_batch(
+            &batch,
+            where_expr,
+            schema.as_ref(),
+            existing_deletes_by_file,
+            &mut by_file,
+        )?;
     }
 
     Ok(by_file
@@ -505,6 +488,194 @@ async fn scan_for_position_deletes(
             positions,
         })
         .collect())
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExistingDeleteVisibility {
+    deleted_positions: roaring::RoaringTreemap,
+    equality_deletes: Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>,
+}
+
+type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
+
+fn load_existing_delete_visibility_by_data_file(
+    table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<ExistingDeleteVisibilityByDataFile, String> {
+    let data_files =
+        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(table)?;
+    let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
+
+    for data_file in data_files {
+        if data_file.delete_files.is_empty() {
+            continue;
+        }
+
+        let data_file_len = u64::try_from(data_file.size)
+            .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
+        let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
+        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            path: data_file.path.clone(),
+            file_len: data_file_len,
+            offset: 0,
+            length: data_file_len,
+            scan_range_id: -1,
+            first_row_id: data_file.first_row_id,
+            data_sequence_number: data_file.data_sequence_number,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        });
+        for delete_file in &data_file.delete_files {
+            let delete_len_i64 = delete_file.length.unwrap_or(0);
+            let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
+                format!("iceberg delete file size is negative: {}", delete_file.path)
+            })?;
+            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+                path: delete_file.path.clone(),
+                file_len: delete_len,
+                offset: 0,
+                length: delete_len,
+                scan_range_id: -1,
+                first_row_id: None,
+                data_sequence_number: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+            });
+        }
+
+        let ctx = crate::fs::scan_context::FileScanContext::build(
+            loader_ranges,
+            None,
+            object_store_config,
+        )?;
+        let normalized_delete_specs = ctx
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(data_file.delete_files.iter())
+            .map(|(resolved, original)| {
+                let file_format = match original.file_format {
+                    crate::sql::catalog::IcebergDeleteFileFormat::Parquet => {
+                        crate::descriptors::THdfsFileFormat::PARQUET
+                    }
+                    crate::sql::catalog::IcebergDeleteFileFormat::Puffin => {
+                        crate::descriptors::THdfsFileFormat::PARQUET
+                    }
+                };
+                let file_content = match original.file_content {
+                    crate::sql::catalog::IcebergDeleteFileContent::Position => {
+                        crate::types::TIcebergFileContent::POSITION_DELETES
+                    }
+                    crate::sql::catalog::IcebergDeleteFileContent::Equality => {
+                        crate::types::TIcebergFileContent::EQUALITY_DELETES
+                    }
+                };
+                Ok(
+                    crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+                        path: resolved.path.clone(),
+                        file_format,
+                        file_content,
+                        length: original
+                            .length
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                format!("iceberg delete file size is negative: {}", original.path)
+                            })?,
+                        content_offset: original.content_offset,
+                        content_size_in_bytes: original.content_size_in_bytes,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
+            &normalized_delete_specs,
+            &data_file.path,
+            &ctx.factory,
+        )?;
+        let equality_deletes =
+            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+                &normalized_delete_specs,
+                &ctx.factory,
+            )?;
+        if deleted_positions.is_empty() && equality_deletes.is_empty() {
+            continue;
+        }
+        let visibility = ExistingDeleteVisibility {
+            deleted_positions,
+            equality_deletes,
+        };
+        if let Some(resolved_data_file) = ctx.ranges.first()
+            && resolved_data_file.path != data_file.path
+        {
+            out.insert(resolved_data_file.path.clone(), visibility.clone());
+        }
+        out.insert(data_file.path, visibility);
+    }
+
+    Ok(out)
+}
+
+fn collect_position_deletes_from_batch(
+    batch: &RecordBatch,
+    where_expr: &sqlast::Expr,
+    schema: &iceberg::spec::Schema,
+    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
+    by_file: &mut BTreeMap<String, Vec<i64>>,
+) -> Result<(), String> {
+    let file_idx = batch
+        .schema()
+        .index_of("_file")
+        .map_err(|_| "scan batch missing `_file` column".to_string())?;
+    let pos_idx = batch
+        .schema()
+        .index_of("_pos")
+        .map_err(|_| "scan batch missing `_pos` column".to_string())?;
+    let file_col = arrow::compute::cast(batch.column(file_idx), &DataType::Utf8)
+        .map_err(|e| format!("cast _file to Utf8 failed: {e}"))?;
+    let pos_col = arrow::compute::cast(batch.column(pos_idx), &DataType::Int64)
+        .map_err(|e| format!("cast _pos to Int64 failed: {e}"))?;
+    let file_arr = file_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "_file column not Utf8 after cast".to_string())?;
+    let pos_arr = pos_col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| "_pos column not Int64 after cast".to_string())?;
+
+    for i in 0..batch.num_rows() {
+        if file_arr.is_null(i) || pos_arr.is_null(i) {
+            continue;
+        }
+        let path = file_arr.value(i);
+        let visibility = existing_deletes_by_file.get(path);
+        if visibility
+            .map(|state| state.deleted_positions.contains(pos_arr.value(i) as u64))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let equality_deletes = visibility
+            .map(|state| state.equality_deletes.as_slice())
+            .unwrap_or(&[]);
+        if crate::connector::iceberg::equality_delete::equality_delete_row_is_deleted(
+            batch,
+            i,
+            equality_deletes,
+        )? {
+            continue;
+        }
+        let matches = evaluate_where_at_row(where_expr, batch, i, schema)?;
+        if !matches {
+            continue;
+        }
+        by_file
+            .entry(path.to_string())
+            .or_default()
+            .push(pos_arr.value(i));
+    }
+    Ok(())
 }
 
 /// Evaluate a Phase-1 supported WHERE expression against a single row of a
@@ -683,20 +854,210 @@ fn compare_cell_to_datum(
     }
 }
 
-fn build_local_fs_operator() -> Result<opendal::Operator, String> {
-    let builder = opendal::services::Fs::default().root("/");
-    opendal::Operator::new(builder)
-        .map_err(|e| format!("build local-FS operator failed: {e}"))?
-        .finish()
-        .pipe(Ok)
-}
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::fs;
+    use std::sync::Arc;
 
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use parquet::arrow::ArrowWriter;
+    use sqlparser::ast as sqlast;
+
+    use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
+    use crate::descriptors::THdfsFileFormat;
+    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
+    use crate::types::TIcebergFileContent;
+
+    fn temp_dir_for(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "novarocks_delete_flow_tests_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
+        let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("operator");
+        OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    }
+
+    fn write_eq_delete_parquet(path: &std::path::Path) {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+            .expect("delete batch");
+        let file = fs::File::create(path).expect("create delete file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write delete file");
+        writer.close().expect("close delete file");
+    }
+
+    fn iceberg_schema() -> iceberg::spec::Schema {
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "category",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("build iceberg schema")
+    }
+
+    fn delete_where_id_in_2_3() -> sqlast::Expr {
+        sqlast::Expr::InList {
+            expr: Box::new(sqlast::Expr::Identifier(sqlast::Ident::new("id"))),
+            list: vec![
+                sqlast::Expr::Value(sqlast::ValueWithSpan {
+                    value: sqlast::Value::Number("2".to_string(), false),
+                    span: sqlparser::tokenizer::Span::empty(),
+                }),
+                sqlast::Expr::Value(sqlast::ValueWithSpan {
+                    value: sqlast::Value::Number("3".to_string(), false),
+                    span: sqlparser::tokenizer::Span::empty(),
+                }),
+            ],
+            negated: false,
+        }
+    }
+
+    #[test]
+    fn position_delete_collection_skips_rows_hidden_by_equality_deletes() {
+        let dir = temp_dir_for("equality_visibility");
+        let delete_path = dir.join("eq-delete.parquet");
+        write_eq_delete_parquet(&delete_path);
+        let spec = IcebergDeleteFileSpec {
+            path: delete_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let equality_deletes =
+            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+                &[spec],
+                &factory_for_dir(&dir),
+            )
+            .expect("load equality deletes");
+        let mut equality_deletes_by_file = HashMap::new();
+        equality_deletes_by_file.insert(
+            "/warehouse/db/t/data.parquet".to_string(),
+            super::ExistingDeleteVisibility {
+                deleted_positions: roaring::RoaringTreemap::new(),
+                equality_deletes,
+            },
+        );
+        let schema = iceberg_schema();
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_file", DataType::Utf8, false),
+            Field::new("_pos", DataType::Int64, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "/warehouse/db/t/data.parquet",
+                    "/warehouse/db/t/data.parquet",
+                    "/warehouse/db/t/data.parquet",
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("scan batch");
+        let mut by_file = BTreeMap::new();
+
+        super::collect_position_deletes_from_batch(
+            &batch,
+            &delete_where_id_in_2_3(),
+            &schema,
+            &equality_deletes_by_file,
+            &mut by_file,
+        )
+        .expect("collect positions");
+
+        assert_eq!(
+            by_file
+                .get("/warehouse/db/t/data.parquet")
+                .map(Vec::as_slice),
+            Some(&[2][..])
+        );
+    }
+
+    #[test]
+    fn position_delete_collection_skips_rows_hidden_by_position_deletes() {
+        let schema = iceberg_schema();
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_file", DataType::Utf8, false),
+            Field::new("_pos", DataType::Int64, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "/warehouse/db/t/data.parquet",
+                    "/warehouse/db/t/data.parquet",
+                    "/warehouse/db/t/data.parquet",
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("scan batch");
+        let mut deleted_positions = roaring::RoaringTreemap::new();
+        deleted_positions.insert(1);
+        let mut visibility_by_file = HashMap::new();
+        visibility_by_file.insert(
+            "/warehouse/db/t/data.parquet".to_string(),
+            super::ExistingDeleteVisibility {
+                deleted_positions,
+                equality_deletes: Vec::new(),
+            },
+        );
+        let mut by_file = BTreeMap::new();
+
+        super::collect_position_deletes_from_batch(
+            &batch,
+            &delete_where_id_in_2_3(),
+            &schema,
+            &visibility_by_file,
+            &mut by_file,
+        )
+        .expect("collect positions");
+
+        assert_eq!(
+            by_file
+                .get("/warehouse/db/t/data.parquet")
+                .map(Vec::as_slice),
+            Some(&[2][..])
+        );
     }
 }
-impl<T: Sized> Pipe for T {}

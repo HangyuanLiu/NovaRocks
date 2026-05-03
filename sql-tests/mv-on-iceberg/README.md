@@ -7,11 +7,12 @@ Iceberg catalog, so they can evolve independently from the local OLAP-only
 Coverage notes:
 - MV build, refresh, rewrite, and inactive-state behavior over a local
   Hadoop-style Iceberg catalog
-- base-table drop/recreate regression coverage, including the current
-  post-recreate behavior where refresh succeeds but old MV rows remain visible
+- base-table drop/recreate regression coverage, including table-identity
+  invalidation when a recreated Iceberg table reuses the same snapshot id
 - managed-lake materialized views whose base tables live in Iceberg catalogs
 - incremental refresh over append and delete snapshots, including Iceberg v3
   row-lineage / Puffin deletion-vector delete projection
+- aggregate MV retraction over Iceberg equality-delete snapshots
 - aggregate MV IVM coverage for COUNT/SUM/AVG/MIN/MAX and refresh policy
   fallbacks such as INSERT OVERWRITE
 

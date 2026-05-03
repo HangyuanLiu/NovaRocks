@@ -26,6 +26,7 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod generate_series;
+pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
 pub(crate) mod mv_flow;
@@ -48,7 +49,7 @@ use self::statement::{
     convert_sqlparser_insert_to_custom, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
-    execute_truncate_table_statement, looks_like_add_files,
+    execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -523,6 +524,11 @@ impl StandaloneSession {
             return self.handle_drop(drop, current_catalog, current_database);
         }
 
+        // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
+        if looks_like_add_equality_delete(&normalized) {
+            return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
+        }
+
         // ALTER TABLE ... ADD FILES FROM '...'
         if looks_like_add_files(&normalized) {
             return self.handle_add_files(&normalized, current_catalog, current_database);
@@ -549,6 +555,25 @@ impl StandaloneSession {
                         query,
                     )?;
                 }
+                let mut rewritten_three_part_query;
+                let query = if current_catalog.is_none() {
+                    let three_parts = extract_three_part_table_refs(query);
+                    if !three_parts.is_empty() {
+                        register_iceberg_tables_for_query(
+                            &self.inner,
+                            None,
+                            current_database,
+                            query,
+                        )?;
+                        rewritten_three_part_query = query.as_ref().clone();
+                        strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
+                        &rewritten_three_part_query
+                    } else {
+                        query
+                    }
+                } else {
+                    query
+                };
                 let level = forced_explain_level.unwrap_or({
                     if verbose {
                         crate::sql::explain::ExplainLevel::Verbose
@@ -566,6 +591,11 @@ impl StandaloneSession {
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
+                if let Some(result) =
+                    self::information_schema::try_query_materialized_views(&self.inner, query)?
+                {
+                    return Ok(result);
+                }
                 // When current_catalog is an Iceberg catalog, materialize
                 // referenced Iceberg tables into the local catalog first.
                 if current_catalog.is_some() {
@@ -656,6 +686,22 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
+    }
+
+    /// Handle ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
+    fn handle_add_equality_delete(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let stmt = crate::engine::statement::parse_add_equality_delete_sql(sql)?;
+        crate::engine::equality_delete_flow::execute_add_equality_delete_statement(
+            &self.inner,
+            &stmt,
+            current_catalog,
+            current_database,
+        )
     }
 
     /// Handle CREATE CATALOG result.
@@ -749,6 +795,7 @@ impl StandaloneSession {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod delete_flow;
+pub(crate) mod equality_delete_flow;
 pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
@@ -2626,10 +2673,21 @@ enable_path_style_access = true
             "append-only fixture: {:?}",
             batch.deletes
         );
-        let added_files: Vec<(String, i64, Option<i64>)> = batch
+        assert!(
+            batch.equality_deletes.is_empty(),
+            "append-only fixture equality deletes: {:?}",
+            batch.equality_deletes
+        );
+        let added_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
             .inserts
             .iter()
-            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
+                path: f.path.clone(),
+                size: f.size,
+                record_count: f.record_count,
+                first_row_id: f.first_row_id,
+                data_sequence_number: f.data_sequence_number,
+            })
             .collect();
 
         let result = super::mv_flow::execute_query_for_mv_incremental_refresh(
@@ -2828,10 +2886,21 @@ enable_path_style_access = true
             "append-only fixture: {:?}",
             batch.deletes
         );
-        let mut delta_files: Vec<(String, i64, Option<i64>)> = batch
+        assert!(
+            batch.equality_deletes.is_empty(),
+            "append-only fixture equality deletes: {:?}",
+            batch.equality_deletes
+        );
+        let mut delta_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
             .inserts
             .iter()
-            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
+                path: f.path.clone(),
+                size: f.size,
+                record_count: f.record_count,
+                first_row_id: f.first_row_id,
+                data_sequence_number: f.data_sequence_number,
+            })
             .collect();
         let first_delta_file = delta_files
             .first()

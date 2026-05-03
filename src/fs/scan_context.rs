@@ -34,10 +34,9 @@ pub struct FileScanRange {
     /// None for non-row-lineage scans.
     pub data_sequence_number: Option<i64>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
-    /// Iceberg v2 position-delete files attached to this data-file range.
-    /// Empty for v1 or append-only scans. Populated by the HDFS scan lowering
-    /// from `THdfsScanRange.delete_files`; equality-delete entries are
-    /// rejected at lowering.
+    /// Iceberg delete files attached to this data-file range. Empty for v1 or
+    /// append-only scans. Populated by HDFS scan lowering and standalone
+    /// write-side visibility planning.
     pub delete_files: Vec<IcebergDeleteFileSpec>,
 }
 
