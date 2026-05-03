@@ -631,10 +631,8 @@ impl SqliteMetadataStore {
         &self,
         snapshot: &ManagedSnapshot,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin managed snapshot transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "managed snapshot")?;
 
         for table in [
             "materialized_views",
@@ -942,10 +940,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn drop_managed_table(&self, table_id: i64, root_path: &str) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin drop_managed_table transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "drop_managed_table")?;
         let inflight_txn_count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM txns
@@ -1018,10 +1014,8 @@ impl SqliteMetadataStore {
         &self,
         req: StageManagedTruncateRequest,
     ) -> Result<StagedManagedTruncate, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin stage_truncate_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "stage_truncate_partition")?;
         let inflight_txn_count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM txns
@@ -1127,10 +1121,8 @@ impl SqliteMetadataStore {
         new_index_id: i64,
         retired_root_path: &str,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin activate_truncate_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "activate_truncate_partition")?;
         let next_job_id: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
@@ -1184,10 +1176,8 @@ impl SqliteMetadataStore {
         &self,
         req: StageMvRefreshRequest,
     ) -> Result<StagedMvRefresh, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin stage_mv_refresh_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "stage_mv_refresh_partition")?;
 
         // Reject if MV is not active.
         let (table_state, table_kind): (String, String) = tx
@@ -1310,10 +1300,8 @@ impl SqliteMetadataStore {
         &self,
         req: ActivateMvRefreshRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin activate_mv_refresh_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "activate_mv_refresh_partition")?;
 
         let next_job_id: i64 = tx
             .query_row(
@@ -1418,10 +1406,8 @@ impl SqliteMetadataStore {
         &self,
         req: UpdateMvRefreshMetadataRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin update_mv_refresh_metadata transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "update_mv_refresh_metadata")?;
         update_mv_refresh_metadata_in_tx(&tx, &req)
             .map_err(|e| format!("update mv refresh metadata failed: {e}"))?;
         tx.commit()
@@ -1563,10 +1549,8 @@ impl SqliteMetadataStore {
         partition_id: i64,
         root_path: &str,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin enqueue_erase_job_for_partition_root transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "enqueue_erase_job_for_partition_root")?;
         let next_job_id: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
@@ -1600,10 +1584,8 @@ impl SqliteMetadataStore {
         partition_id: i64,
         base_version: i64,
     ) -> Result<PreparedManagedTxn, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin prepare_txn transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "prepare_txn")?;
         let txn_id: i64 = tx
             .query_row(
                 "SELECT next_txn_id FROM global_meta WHERE singleton = 1",
@@ -1647,10 +1629,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn mark_txn_visible(&self, txn_id: i64, commit_version: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin mark_txn_visible transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "mark_txn_visible")?;
         let partition_id: i64 = tx
             .query_row(
                 "SELECT partition_id FROM txns WHERE txn_id = ?1",
@@ -1681,10 +1661,8 @@ impl SqliteMetadataStore {
         commit_version: i64,
         req: UpdateMvRefreshMetadataRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin mark_txn_visible_with_mv_refresh_metadata transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "mark_txn_visible_with_mv_refresh_metadata")?;
         let partition_id: i64 = tx
             .query_row(
                 "SELECT partition_id FROM txns WHERE txn_id = ?1",
@@ -1801,10 +1779,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn purge_retired_table_metadata(&self, table_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin purge_retired_table_metadata transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "purge_retired_table_metadata")?;
         let is_dropping: bool = tx
             .query_row(
                 "SELECT EXISTS(
@@ -1868,10 +1844,8 @@ impl SqliteMetadataStore {
     /// table to be in `DROPPING` state.  Iceberg-backed MVs have no tablets,
     /// partitions, schemas, or indexes so those DELETE statements are omitted.
     pub(crate) fn delete_iceberg_mv_row(&self, table_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin delete_iceberg_mv_row transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "delete_iceberg_mv_row")?;
         tx.execute(
             "DELETE FROM materialized_views WHERE mv_id = ?1",
             params![table_id],
@@ -1885,10 +1859,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn purge_retired_partition_metadata(&self, partition_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin purge_retired_partition_metadata transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "purge_retired_partition_metadata")?;
         let is_retired: bool = tx
             .query_row(
                 "SELECT EXISTS(
@@ -1929,10 +1901,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn delete_creating_partition(&self, partition_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin delete_creating_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "delete_creating_partition")?;
         tx.execute(
             "DELETE FROM tablets WHERE partition_id = ?1",
             params![partition_id],
@@ -2686,6 +2656,14 @@ fn update_mv_refresh_metadata_in_tx(
         ));
     }
     Ok(())
+}
+
+fn begin_write_transaction<'conn>(
+    conn: &'conn mut Connection,
+    name: &str,
+) -> Result<rusqlite::Transaction<'conn>, String> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("begin {name} transaction failed: {e}"))
 }
 
 fn json_to_sql_error(err: serde_json::Error) -> rusqlite::Error {

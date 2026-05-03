@@ -370,7 +370,28 @@ pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
         state,
         plan,
         chunks,
-        VisibleCommitAction::MvRefresh(metadata),
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta: None,
+        },
+    )
+}
+
+pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
+    state: &Arc<StandaloneState>,
+    plan: ManagedInsertPlan,
+    chunks: &[Chunk],
+    metadata: MvRefreshWriteMetadata,
+    row_delta: i64,
+) -> Result<i64, String> {
+    write_chunks_into_managed_partition_inner(
+        state,
+        plan,
+        chunks,
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta: Some(row_delta),
+        },
     )
 }
 
@@ -447,7 +468,10 @@ pub(crate) fn write_chunks_into_managed_partition_for_aggregate_mv_upsert(
 
 enum VisibleCommitAction {
     Plain,
-    MvRefresh(MvRefreshWriteMetadata),
+    MvRefresh {
+        metadata: MvRefreshWriteMetadata,
+        row_delta: Option<i64>,
+    },
 }
 
 fn write_chunks_into_managed_partition_inner(
@@ -513,14 +537,18 @@ fn write_chunks_into_managed_partition_inner(
         VisibleCommitAction::Plain => {
             metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
         }
-        VisibleCommitAction::MvRefresh(metadata) => {
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta,
+        } => {
+            let delta = row_delta.unwrap_or(total_rows);
             let last_refresh_rows = metadata
                 .previous_refresh_rows
-                .checked_add(total_rows)
+                .checked_add(delta)
                 .ok_or_else(|| {
                     format!(
                         "managed-lake mv refresh row count overflow: {} + {}",
-                        metadata.previous_refresh_rows, total_rows
+                        metadata.previous_refresh_rows, delta
                     )
                 })?;
             metadata_store.mark_txn_visible_with_mv_refresh_metadata(

@@ -181,8 +181,12 @@ pub(crate) fn create_mv(
     }
     let mv_shape = super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
     validate_incremental_mv_analyzed_types(&mv_shape, &analysis.resolved_query)?;
-    let storage_layout =
-        build_mv_storage_layout(&mv_shape, distribution, &analysis.output_columns)?;
+    let storage_layout = build_mv_storage_layout(
+        &mv_shape,
+        distribution,
+        &analysis.output_columns,
+        stmt.primary_key.as_deref().unwrap_or(&[]),
+    )?;
     let key_desc = storage_layout.key_desc;
     let physical_columns = storage_layout.physical_columns;
 
@@ -341,6 +345,7 @@ fn build_mv_storage_layout(
     mv_shape: &IncrementalMvShape,
     distribution: &MaterializedViewDistribution,
     output_columns: &[OutputColumn],
+    primary_key_columns: &[String],
 ) -> Result<MvStorageLayout, String> {
     match mv_shape {
         IncrementalMvShape::ProjectionFilter(_) => {
@@ -349,9 +354,18 @@ fn build_mv_storage_layout(
                 .iter()
                 .map(output_column_to_table_column)
                 .collect::<Result<Vec<_>, _>>()?;
+            let key_columns = if primary_key_columns.is_empty() {
+                distribution.hash_columns.clone()
+            } else {
+                projection_mv_primary_key_columns(output_columns, primary_key_columns)?
+            };
             let key_desc = TableKeyDesc {
-                kind: TableKeyKind::Duplicate,
-                columns: distribution.hash_columns.clone(),
+                kind: if primary_key_columns.is_empty() {
+                    TableKeyKind::Duplicate
+                } else {
+                    TableKeyKind::Primary
+                },
+                columns: key_columns,
             };
             let key_column_set = key_desc
                 .columns
@@ -389,6 +403,25 @@ fn build_mv_storage_layout(
             })
         }
     }
+}
+
+fn projection_mv_primary_key_columns(
+    output_columns: &[OutputColumn],
+    primary_key_columns: &[String],
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(primary_key_columns.len());
+    for key in primary_key_columns {
+        let output = output_columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(key))
+            .ok_or_else(|| {
+                format!(
+                    "projection/filter materialized view PRIMARY KEY column `{key}` must appear in the SELECT output"
+                )
+            })?;
+        out.push(output.name.clone());
+    }
+    Ok(out)
 }
 
 fn validate_incremental_mv_analyzed_types(
@@ -1375,6 +1408,92 @@ mod tests {
     }
 
     #[test]
+    fn projection_mv_primary_key_uses_primary_key_storage() {
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW analytics.orders_mv
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PRIMARY KEY (id)
+AS SELECT id, customer, amount
+FROM ice.ns.orders
+WHERE amount > 0",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("projection shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "customer".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "amount".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let layout = build_mv_storage_layout(
+            &mv_shape,
+            stmt.distribution.as_ref().expect("distribution"),
+            &output_columns,
+            stmt.primary_key.as_deref().expect("primary key"),
+        )
+        .expect("layout");
+
+        assert_eq!(layout.key_desc.kind, TableKeyKind::Primary);
+        assert_eq!(layout.key_desc.columns, vec!["id".to_string()]);
+        let id_column = layout
+            .physical_columns
+            .iter()
+            .find(|column| column.column.name == "id")
+            .expect("id column");
+        assert!(id_column.is_key);
+    }
+
+    #[test]
+    fn projection_mv_primary_key_requires_visible_output_column() {
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW analytics.orders_mv
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (id)
+AS SELECT customer, amount
+FROM ice.ns.orders
+WHERE amount > 0",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("projection shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "customer".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "amount".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+
+        let err = build_mv_storage_layout(
+            &mv_shape,
+            stmt.distribution.as_ref().expect("distribution"),
+            &output_columns,
+            stmt.primary_key.as_deref().expect("primary key"),
+        )
+        .expect_err("missing key output should fail");
+
+        assert!(
+            err.contains("PRIMARY KEY column `id` must appear in the SELECT output"),
+            "err={err}"
+        );
+    }
+
+    #[test]
     fn aggregate_mv_physical_schema_has_hidden_row_id_and_state_columns() {
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW analytics.orders_mv
@@ -1404,7 +1523,7 @@ GROUP BY k1",
         ];
         let distribution = stmt.distribution.as_ref().expect("distribution");
         let storage_layout =
-            build_mv_storage_layout(&mv_shape, distribution, &output_columns).expect("layout");
+            build_mv_storage_layout(&mv_shape, distribution, &output_columns, &[]).expect("layout");
 
         assert_eq!(storage_layout.key_desc.kind, TableKeyKind::Primary);
         assert_eq!(
@@ -1524,6 +1643,7 @@ GROUP BY k1",
             &mv_shape,
             stmt.distribution.as_ref().expect("distribution"),
             &output_columns,
+            &[],
         )
         .expect_err("hidden physical column collision should fail");
         assert!(

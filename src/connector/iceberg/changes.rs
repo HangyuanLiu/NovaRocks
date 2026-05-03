@@ -19,9 +19,6 @@ pub(crate) enum ChangeError {
     /// (e.g. `overwrite`, vendor-specific ops).
     UnsupportedOperation { snapshot_id: i64, op: String },
 
-    /// Equality-delete file encountered; only position-deletes are in scope.
-    EqualityDeleteUnsupported { snapshot_id: i64 },
-
     /// Schema evolution between `previous_snapshot` and `current_snapshot`
     /// (or any unsupported schema-related rejection at CREATE time).
     SchemaEvolutionUnsupported { detail: String },
@@ -70,9 +67,6 @@ pub(crate) fn policy_signal_from_change_error(err: &ChangeError) -> IcebergChang
         ChangeError::LineageBroken { .. } => IcebergChangePolicySignal::FullRefresh {
             reason: "previous snapshot is not reachable".to_string(),
         },
-        ChangeError::EqualityDeleteUnsupported { .. } => IcebergChangePolicySignal::Unsupported {
-            reason: "equality delete is not supported by IVM".to_string(),
-        },
         ChangeError::SchemaEvolutionUnsupported { detail } => {
             IcebergChangePolicySignal::Unsupported {
                 reason: format!("schema evolution is not supported by IVM: {detail}"),
@@ -110,10 +104,6 @@ impl std::fmt::Display for ChangeError {
                     )
                 }
             }
-            ChangeError::EqualityDeleteUnsupported { snapshot_id } => write!(
-                f,
-                "iceberg snapshot {snapshot_id} contains equality-delete files; not supported in this phase"
-            ),
             ChangeError::SchemaEvolutionUnsupported { detail } => {
                 write!(f, "iceberg schema evolution not supported: {detail}")
             }
@@ -1161,17 +1151,6 @@ mod tests {
             policy_signal_from_change_error(&err),
             IcebergChangePolicySignal::FullRefresh {
                 reason: "insert overwrite requires full refresh".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn equality_delete_policy_signal_is_unsupported() {
-        let err = ChangeError::EqualityDeleteUnsupported { snapshot_id: 2 };
-        assert_eq!(
-            policy_signal_from_change_error(&err),
-            IcebergChangePolicySignal::Unsupported {
-                reason: "equality delete is not supported by IVM".to_string(),
             }
         );
     }

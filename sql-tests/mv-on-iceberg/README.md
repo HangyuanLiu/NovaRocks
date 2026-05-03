@@ -13,6 +13,8 @@ Coverage notes:
 - incremental refresh over append and delete snapshots, including Iceberg v3
   row-lineage / Puffin deletion-vector delete projection
 - aggregate MV retraction over Iceberg equality-delete snapshots
+- projection/filter MV row deletion over Iceberg position-delete,
+  equality-delete, and v3 row-lineage/Puffin deletion-vector snapshots
 - aggregate MV IVM coverage for COUNT/SUM/AVG/MIN/MAX and refresh policy
   fallbacks such as INSERT OVERWRITE
 

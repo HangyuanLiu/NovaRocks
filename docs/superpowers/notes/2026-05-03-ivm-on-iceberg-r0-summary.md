@@ -9,6 +9,10 @@
 - Aggregate MV incremental refresh for Iceberg append snapshots.
 - Aggregate MV DELETE retract for Iceberg v2 Parquet position deletes.
 - Aggregate MV DELETE retract for Iceberg v3 Puffin deletion vectors.
+- Aggregate MV DELETE retract for Iceberg equality deletes.
+- Projection/filter MV DELETE apply for Iceberg position deletes, equality
+  deletes, and v3 Puffin deletion vectors when the MV has visible primary-key
+  row identity.
 - Object-store delete reverse projection for S3/S3A-style paths through configured catalog credentials.
 - Empty change stream metadata advance without writing data chunks.
 - `_row_id` and `_last_updated_sequence_number` reads on Iceberg v3 row-lineage base tables.
@@ -16,8 +20,8 @@
 ## Explicitly Unsupported
 
 - `INSERT OVERWRITE` incremental bridging.
-- Projection/filter MV DELETE apply.
-- Equality deletes.
+- Projection/filter MV DELETE apply without visible primary-key row identity.
+- Hidden primary-key projection for projection/filter MVs.
 - Schema evolution where the MV uses the changed column.
 - Partition evolution policy.
 - Concurrent refresh on the same MV.

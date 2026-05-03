@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use arrow::array::{ArrayRef, Int8Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
 use crate::connector::iceberg::catalog::load_table;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
@@ -13,11 +17,7 @@ use crate::connector::starrocks::managed::mv_apply_policy::{
 use crate::connector::starrocks::managed::mv_refresh_strategy::{
     FullRefreshReason, MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
 };
-use crate::engine::mv_flow::{
-    analyze_visible_output_types, execute_query_for_mv_incremental_refresh,
-    execute_query_for_mv_refresh,
-};
-use crate::engine::query_prep::IcebergFileForQuery;
+use crate::engine::mv_flow::{analyze_visible_output_types, execute_query_for_mv_refresh};
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -38,7 +38,7 @@ use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
     write_chunks_into_managed_partition,
     write_chunks_into_managed_partition_for_aggregate_mv_upsert,
-    write_chunks_into_managed_partition_for_mv_refresh,
+    write_chunks_into_managed_partition_for_mv_refresh_with_row_delta,
 };
 
 pub(crate) fn refresh_mv(
@@ -157,6 +157,7 @@ pub(crate) fn refresh_mv(
         })?;
     }
 
+    let projection_apply_shape = mv_shape.clone();
     dispatch_mv_refresh_strategy(
         &mv_shape,
         policy,
@@ -212,33 +213,70 @@ pub(crate) fn refresh_mv(
                     }
                 },
             };
-            if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
-                return Err(format!(
-                    "iceberg materialized view incremental refresh does not yet support \
-                     delete snapshots; {} position-delete file(s), {} equality-delete file(s) seen in lineage",
-                    batch.deletes.len(),
-                    batch.equality_deletes.len()
-                ));
+            let has_inserts = !batch.inserts.is_empty();
+            let has_deletes = !batch.deletes.is_empty() || !batch.equality_deletes.is_empty();
+            let apply_policy = apply_policy_for_change(
+                &projection_apply_shape,
+                has_inserts,
+                has_deletes,
+                !mv_row.primary_key_columns.is_empty(),
+            );
+            match apply_policy {
+                MvApplyPolicy::Incremental => {}
+                MvApplyPolicy::FullRefresh { reason } => {
+                    tracing::info!(
+                        target: "mv_refresh",
+                        mv = %format!("{}.{}", db_name, mv_name),
+                        base = %base_ref.fqn(),
+                        snapshot_from = previous_snapshot_id,
+                        snapshot_to = current_snapshot_id,
+                        reason = %reason,
+                        "mv_refresh fall-back to Full from projection apply policy"
+                    );
+                    return refresh_mv_full_with_executor(
+                        state,
+                        &db_name,
+                        &mv_name,
+                        run_mv_select_and_chunks,
+                    );
+                }
+                MvApplyPolicy::Unsupported { reason } => {
+                    return Err(format!(
+                        "iceberg materialized view refresh unsupported: {reason}"
+                    ));
+                }
             }
 
-            let result = execute_query_for_mv_incremental_refresh(
+            let change_stream = materialize_iceberg_change_batch(
                 state,
                 &db_name,
                 &mv_row.select_sql,
                 base_ref,
-                batch
-                    .inserts
-                    .iter()
-                    .map(|f| IcebergFileForQuery {
-                        path: f.path.clone(),
-                        size: f.size,
-                        record_count: f.record_count,
-                        first_row_id: f.first_row_id,
-                        data_sequence_number: f.data_sequence_number,
-                    })
-                    .collect(),
+                &loaded.table,
+                batch,
+                loaded.object_store_config.as_ref(),
+                &mv_row.primary_key_columns,
             )?;
-            let chunks = query_result_to_chunks(result)?;
+            let (insert_result, delete_result) = change_stream.into_results();
+            let (chunks, row_delta) = if has_deletes {
+                let insert_chunks = query_result_to_mv_op_chunks(insert_result, MV_OP_UPSERT)?;
+                let delete_chunks = query_result_to_mv_op_chunks(delete_result, MV_OP_DELETE)?;
+                let insert_rows = chunks_row_count(&insert_chunks)?;
+                let delete_rows = chunks_row_count(&delete_chunks)?;
+                let mut chunks = Vec::with_capacity(insert_chunks.len() + delete_chunks.len());
+                chunks.extend(insert_chunks);
+                chunks.extend(delete_chunks);
+                let row_delta = insert_rows.checked_sub(delete_rows).ok_or_else(|| {
+                    format!(
+                        "projection/filter MV row-count delta overflow: inserts={insert_rows} deletes={delete_rows}"
+                    )
+                })?;
+                (chunks, row_delta)
+            } else {
+                let chunks = query_result_to_chunks(insert_result)?;
+                let row_delta = chunks_row_count(&chunks)?;
+                (chunks, row_delta)
+            };
             let plan = load_insert_plan(
                 state,
                 &crate::engine::ResolvedLocalTableName {
@@ -250,7 +288,7 @@ pub(crate) fn refresh_mv(
             let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
-            write_chunks_into_managed_partition_for_mv_refresh(
+            write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
                 state,
                 plan,
                 &chunks,
@@ -260,6 +298,7 @@ pub(crate) fn refresh_mv(
                     snapshots,
                     table_uuids,
                 },
+                row_delta,
             )?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
@@ -743,6 +782,50 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
         .collect()
 }
 
+const MV_OP_UPSERT: i8 = 0;
+const MV_OP_DELETE: i8 = 1;
+const MV_OP_COLUMN: &str = "__op";
+
+fn query_result_to_mv_op_chunks(result: QueryResult, op: i8) -> Result<Vec<Chunk>, String> {
+    result
+        .chunks
+        .into_iter()
+        .map(|chunk| append_mv_op_column(chunk.batch, op).and_then(record_batch_to_chunk))
+        .collect()
+}
+
+fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String> {
+    let row_count = batch.num_rows();
+    let mut fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    if fields
+        .iter()
+        .any(|field| field.name().eq_ignore_ascii_case(MV_OP_COLUMN))
+    {
+        return Err(format!(
+            "materialized view incremental write result contains reserved column `{MV_OP_COLUMN}`"
+        ));
+    }
+    fields.push(Field::new(MV_OP_COLUMN, DataType::Int8, false));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int8Array::from(vec![op; row_count])) as ArrayRef);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("append MV op column failed: {e}"))
+}
+
+fn chunks_row_count(chunks: &[Chunk]) -> Result<i64, String> {
+    chunks.iter().try_fold(0_i64, |acc, chunk| {
+        let rows = i64::try_from(chunk.len())
+            .map_err(|_| "materialized view refresh row count overflow".to_string())?;
+        acc.checked_add(rows)
+            .ok_or_else(|| "materialized view refresh row count overflow".to_string())
+    })
+}
+
 #[cfg(test)]
 fn query_result_column_to_output_column(
     column: &crate::engine::QueryResultColumn,
@@ -1055,9 +1138,7 @@ mod tests {
         patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
         table_columns_from_physical_columns,
     };
-    use crate::connector::starrocks::managed::mv_refresh_strategy::{
-        FullRefreshReason, UnsupportedRefreshReason,
-    };
+    use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
@@ -1140,21 +1221,6 @@ mod tests {
             MvRefreshPolicy::FullRefresh {
                 target_snapshot_id: Some(99),
                 reason: FullRefreshReason::InsertOverwrite { snapshot_id: 99 },
-            }
-        );
-    }
-
-    #[test]
-    fn equality_delete_change_error_stays_unsupported_policy() {
-        let policy = policy_from_change_error(
-            crate::connector::iceberg::changes::ChangeError::EqualityDeleteUnsupported {
-                snapshot_id: 101,
-            },
-        );
-        assert_eq!(
-            policy,
-            MvRefreshPolicy::Unsupported {
-                reason: UnsupportedRefreshReason::EqualityDelete { snapshot_id: 101 },
             }
         );
     }

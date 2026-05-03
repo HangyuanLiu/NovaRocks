@@ -69,7 +69,6 @@ impl std::fmt::Display for FullRefreshReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UnsupportedRefreshReason {
-    EqualityDelete { snapshot_id: i64 },
     SchemaEvolution { detail: String },
     ReplaceValidationFailed { snapshot_id: i64, reason: String },
     InternalInconsistency { detail: String },
@@ -78,9 +77,6 @@ pub(crate) enum UnsupportedRefreshReason {
 impl std::fmt::Display for UnsupportedRefreshReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnsupportedRefreshReason::EqualityDelete { snapshot_id } => {
-                write!(f, "equality delete in snapshot {snapshot_id}")
-            }
             UnsupportedRefreshReason::SchemaEvolution { detail } => {
                 write!(f, "schema evolution unsupported: {detail}")
             }
@@ -141,12 +137,6 @@ pub(crate) fn policy_from_change_error(err: ChangeError) -> MvRefreshPolicy {
         (IcebergChangePolicySignal::FullRefresh { reason }, _) => MvRefreshPolicy::FullRefresh {
             target_snapshot_id: None,
             reason: FullRefreshReason::SchemaEvolutionSafeFallback { detail: reason },
-        },
-        (
-            IcebergChangePolicySignal::Unsupported { .. },
-            ChangeError::EqualityDeleteUnsupported { snapshot_id },
-        ) => MvRefreshPolicy::Unsupported {
-            reason: UnsupportedRefreshReason::EqualityDelete { snapshot_id },
         },
         (
             IcebergChangePolicySignal::Unsupported { .. },
@@ -269,16 +259,6 @@ mod tests {
             MvRefreshPolicy::FullRefresh {
                 target_snapshot_id: Some(22),
                 reason: FullRefreshReason::InsertOverwrite { snapshot_id: 22 },
-            }
-        );
-    }
-
-    #[test]
-    fn equality_delete_error_maps_to_unsupported() {
-        assert_eq!(
-            policy_from_change_error(ChangeError::EqualityDeleteUnsupported { snapshot_id: 33 }),
-            MvRefreshPolicy::Unsupported {
-                reason: UnsupportedRefreshReason::EqualityDelete { snapshot_id: 33 },
             }
         );
     }
