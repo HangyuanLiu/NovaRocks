@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
@@ -18,20 +17,11 @@ use iceberg::spec::{
     FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::{
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
-    writer::{IcebergWriter, IcebergWriterBuilder},
-};
-use parquet::file::properties::WriterProperties;
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
+use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
@@ -634,32 +624,9 @@ pub(crate) fn insert_rows(
     });
 
     block_on_iceberg(async {
-        let location_generator = DefaultLocationGenerator::new(loaded.table.metadata().clone())
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string()))?;
-        let file_name_prefix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| format!("standalone-{}", duration.as_nanos()))
-            .unwrap_or_else(|_| "standalone".to_string());
-        let file_name_generator = DefaultFileNameGenerator::new(
-            file_name_prefix,
-            None,
-            iceberg::spec::DataFileFormat::Parquet,
-        );
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            loaded.table.metadata().current_schema().clone(),
-        );
-        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_writer_builder,
-            loaded.table.file_io().clone(),
-            location_generator,
-            file_name_generator,
-        );
-        let mut data_file_writer = DataFileWriterBuilder::new(rolling_writer_builder)
-            .build(None)
-            .await?;
-        data_file_writer.write(batch).await?;
-        let data_files = data_file_writer.close().await?;
+        let data_files = write_record_batches_as_data_files(&loaded.table, [batch])
+            .await
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
         let tx = Transaction::new(&loaded.table);
         let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
         tx.commit(&catalog).await
