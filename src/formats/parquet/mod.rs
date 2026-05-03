@@ -1445,10 +1445,16 @@ fn find_matching_field_index(
 ) -> Result<Option<usize>, String> {
     let target_field_id = parse_parquet_field_id(target)?;
     if let Some(target_field_id) = target_field_id {
+        let mut source_has_field_ids = false;
         for (idx, source) in fields.iter().enumerate() {
-            if parse_parquet_field_id(source.as_ref())? == Some(target_field_id) {
+            let source_field_id = parse_parquet_field_id(source.as_ref())?;
+            source_has_field_ids |= source_field_id.is_some();
+            if source_field_id == Some(target_field_id) {
                 return Ok(Some(idx));
             }
+        }
+        if source_has_field_ids {
+            return Ok(None);
         }
     }
     Ok(fields.iter().position(|field| {
@@ -1498,19 +1504,25 @@ fn build_iceberg_root_projection_indices(
     for target in output_schema.fields() {
         let target_field_id = parse_parquet_field_id(target.as_ref())?;
         let idx = if let Some(target_field_id) = target_field_id {
-            root_fields
+            let root_has_field_ids = root_fields
                 .iter()
-                .position(|field| field.get_basic_info().id() == target_field_id)
-                .or_else(|| {
-                    if case_sensitive {
-                        arrow_schema.index_of(target.name()).ok()
-                    } else {
-                        arrow_schema
-                            .fields()
-                            .iter()
-                            .position(|field| field.name().eq_ignore_ascii_case(target.name()))
-                    }
-                })
+                .any(|field| field.get_basic_info().has_id());
+            let field_id_match = root_fields.iter().position(|field| {
+                let info = field.get_basic_info();
+                info.has_id() && info.id() == target_field_id
+            });
+            if field_id_match.is_some() || root_has_field_ids {
+                field_id_match
+            } else {
+                if case_sensitive {
+                    arrow_schema.index_of(target.name()).ok()
+                } else {
+                    arrow_schema
+                        .fields()
+                        .iter()
+                        .position(|field| field.name().eq_ignore_ascii_case(target.name()))
+                }
+            }
         } else if case_sensitive {
             arrow_schema.index_of(target.name()).ok()
         } else {
@@ -1957,7 +1969,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use arrow::array::{Array, Float64Array, Int32Array, StructArray};
+    use arrow::array::{Array, Float64Array, Int32Array, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -2319,6 +2331,50 @@ mod tests {
         assert_eq!(id.value(1), 8);
         assert!(extra.is_null(0));
         assert!(extra.is_null(1));
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_readded_same_name_uses_new_field_id() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("readd_same_name.parquet");
+        let source_schema = Arc::new(Schema::new(vec![
+            field_with_id("id", DataType::Int32, true, 1),
+            field_with_id("note_text", DataType::Utf8, true, 3),
+        ]));
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("old"), Some("dropped")])),
+            ],
+        )
+        .expect("source batch");
+        let file = File::create(&file_path).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&source_schema), None).expect("writer");
+        writer.write(&source_batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let target_schema = Schema::new(vec![
+            field_with_id("id", DataType::Int32, true, 1),
+            field_with_id("note_text", DataType::Utf8, true, 4),
+        ]);
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["id".to_string(), "note_text".to_string()],
+                vec![types::TPrimitiveType::INT, types::TPrimitiveType::VARCHAR],
+                Some(target_schema),
+            ),
+            &file_path,
+        );
+
+        let note_text = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("note_text string");
+        assert!(note_text.is_null(0));
+        assert!(note_text.is_null(1));
     }
 
     #[test]

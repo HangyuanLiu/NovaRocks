@@ -1,0 +1,41 @@
+-- query 2
+id	amount	note_text
+1	10.5	NULL
+2	20.25	NULL
+
+-- query 4
+id	amount	note_text
+1	10.5	NULL
+2	20.25	NULL
+3	30.75	new
+
+-- query 6
+id	total_amount	note_text
+1	10.5	NULL
+2	20.25	NULL
+3	30.75	new
+
+-- query 8
+widened_id	total_amount
+10000000001	10.5
+10000000002	20.25
+10000000003	30.75
+
+-- query 10
+id	total_amount
+1	10.5
+2	20.25
+3	30.75
+
+-- query 13
+id	total_amount	note_text
+1	10.5	NULL
+2	20.25	NULL
+3	30.75	NULL
+
+-- query 15
+id	total_amount	note_text
+1	10.5	NULL
+2	20.25	NULL
+3	30.75	NULL
+4	40.5	fresh
