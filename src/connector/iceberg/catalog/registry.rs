@@ -61,7 +61,7 @@ pub(crate) struct IcebergLoadedTable {
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
 const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
-const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
+pub(crate) const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
 const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 const S3_NAMESPACE_MARKER_FILE: &str = ".novarocks_namespace";
 
@@ -1290,7 +1290,10 @@ fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
         .map_err(|e| format!("build iceberg schema failed: {e}"))
 }
 
-fn iceberg_type_for_sql_type(data_type: &SqlType, next_field_id: &mut i32) -> Result<Type, String> {
+pub(crate) fn iceberg_type_for_sql_type(
+    data_type: &SqlType,
+    next_field_id: &mut i32,
+) -> Result<Type, String> {
     Ok(match data_type {
         SqlType::TinyInt | SqlType::SmallInt | SqlType::Int => Type::Primitive(PrimitiveType::Int),
         SqlType::Float => Type::Primitive(PrimitiveType::Float),
@@ -1808,14 +1811,14 @@ fn parse_column_aggregation_properties(
     Ok(aggregations)
 }
 
-fn logical_type_property_key(column_name: &str) -> Result<String, String> {
+pub(crate) fn logical_type_property_key(column_name: &str) -> Result<String, String> {
     Ok(format!(
         "{LOGICAL_TYPE_PROPERTY_PREFIX}{}",
         normalize_identifier(column_name)?
     ))
 }
 
-fn column_aggregation_property_key(column_name: &str) -> Result<String, String> {
+pub(crate) fn column_aggregation_property_key(column_name: &str) -> Result<String, String> {
     Ok(format!(
         "{COLUMN_AGGREGATION_PROPERTY_PREFIX}{}",
         normalize_identifier(column_name)?
@@ -1860,7 +1863,7 @@ fn parse_column_aggregation(value: &str) -> Option<ColumnAggregation> {
     }
 }
 
-fn logical_type_property_value(data_type: &SqlType) -> Option<String> {
+pub(crate) fn logical_type_property_value(data_type: &SqlType) -> Option<String> {
     match data_type {
         SqlType::TinyInt => Some("tinyint".to_string()),
         SqlType::SmallInt => Some("smallint".to_string()),
