@@ -2648,6 +2648,87 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn iceberg_refresh_load_failure_removes_stale_local_catalog_entry() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert iceberg row");
+        session
+            .query("select id from ice.db1.t")
+            .expect("register iceberg table");
+        assert!(
+            engine
+                .inner
+                .catalog
+                .read()
+                .expect("catalog read")
+                .get("db1", "t")
+                .is_ok(),
+            "local table should be registered before external drop"
+        );
+
+        let entry = {
+            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+            registry.get("ice").expect("catalog entry")
+        };
+        crate::connector::iceberg::catalog::registry::drop_table(&entry, "db1", "t")
+            .expect("drop backing iceberg table");
+
+        let err = session
+            .query("select id from ice.db1.t")
+            .expect_err("dropped backing table should not use stale local table");
+        assert!(err.contains("unknown table"), "err={err}");
+        assert!(
+            engine
+                .inner
+                .catalog
+                .read()
+                .expect("catalog read")
+                .get("db1", "t")
+                .is_err(),
+            "stale local table should be removed after failed refresh"
+        );
+    }
+
+    #[test]
+    fn drop_iceberg_table_removes_stale_local_catalog_entry() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert iceberg row");
+        session
+            .query("select id from ice.db1.t")
+            .expect("register iceberg table");
+        assert!(
+            engine
+                .inner
+                .catalog
+                .read()
+                .expect("catalog read")
+                .get("db1", "t")
+                .is_ok(),
+            "local table should be registered before drop"
+        );
+
+        let drop = session
+            .execute_in_database("drop table ice.db1.t", "default")
+            .expect("drop iceberg table");
+        assert!(matches!(drop, StatementResult::Ok));
+        assert!(
+            engine
+                .inner
+                .catalog
+                .read()
+                .expect("catalog read")
+                .get("db1", "t")
+                .is_err(),
+            "drop table should remove stale local table"
+        );
+    }
+
+    #[test]
     fn execute_mv_incremental_refresh_reads_only_delta_files() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");

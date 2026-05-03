@@ -461,10 +461,24 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
+                crate::engine::query_prep::drop_registered_external_table(
+                    state,
+                    &target.namespace,
+                    &target.table,
+                )?;
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) if if_exists && err.contains("table") => Ok(StatementResult::Ok),
+        Err(err) if if_exists && err.contains("table") => {
+            if target.backend_name == "iceberg" {
+                crate::engine::query_prep::drop_registered_external_table(
+                    state,
+                    &target.namespace,
+                    &target.table,
+                )?;
+            }
+            Ok(StatementResult::Ok)
+        }
         Err(err) => Err(err),
     }
 }

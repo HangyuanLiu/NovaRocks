@@ -1946,6 +1946,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/orders.parquet"),
                     },
@@ -2000,6 +2001,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/lineitem.parquet"),
                     },
@@ -2024,6 +2026,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/supplier.parquet"),
                     },
@@ -2048,6 +2051,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/part.parquet"),
                     },
@@ -2077,6 +2081,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/partsupp.parquet"),
                     },
@@ -2101,6 +2106,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/customer.parquet"),
                     },
@@ -2120,6 +2126,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/nation.parquet"),
                     },

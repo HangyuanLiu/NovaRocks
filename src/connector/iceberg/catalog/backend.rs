@@ -11,7 +11,10 @@ use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, ResolvedTable, TableSink, TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
-use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+use crate::sql::catalog::{
+    ColumnDef, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, S3FileInfo, TableDef,
+    TableStorage,
+};
 use crate::sql::parser::ast::Literal;
 
 use super::registry::{
@@ -144,6 +147,7 @@ fn build_iceberg_table_def_with_data_files(
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
 ) -> Result<TableDef, String> {
+    let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let storage = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
         TableStorage::S3ParquetFiles {
@@ -206,8 +210,53 @@ fn build_iceberg_table_def_with_data_files(
         name: table_name.to_string(),
         columns: loaded.columns,
         iceberg_row_lineage_metadata_columns,
+        iceberg_table,
         storage,
     })
+}
+
+fn build_iceberg_table_info(loaded: &IcebergLoadedTable) -> IcebergTableInfo {
+    IcebergTableInfo {
+        location: loaded.table.metadata().location().to_string(),
+        schema: iceberg_schema_def(loaded.table.metadata().current_schema()),
+    }
+}
+
+fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+    IcebergSchemaDef {
+        fields: schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| iceberg_field_def(field.as_ref()))
+            .collect(),
+    }
+}
+
+fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
+    IcebergSchemaFieldDef {
+        field_id: field.id,
+        name: field.name.clone(),
+        children: iceberg_type_children(field.field_type.as_ref()),
+    }
+}
+
+fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef> {
+    match ty {
+        iceberg::spec::Type::Struct(struct_ty) => struct_ty
+            .fields()
+            .iter()
+            .map(|field| iceberg_field_def(field.as_ref()))
+            .collect(),
+        iceberg::spec::Type::List(list_ty) => {
+            vec![iceberg_field_def(list_ty.element_field.as_ref())]
+        }
+        iceberg::spec::Type::Map(map_ty) => vec![
+            iceberg_field_def(map_ty.key_field.as_ref()),
+            iceberg_field_def(map_ty.value_field.as_ref()),
+        ],
+        iceberg::spec::Type::Primitive(_) => vec![],
+    }
 }
 
 /// Returns true when the table is Iceberg format-version=3 with
@@ -287,5 +336,63 @@ impl TableSink for IcebergTableSink {
 
     fn supports_pipeline_insert(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
+
+    #[test]
+    fn iceberg_schema_def_includes_nested_list_map_field_ids() {
+        let struct_field = Arc::new(NestedField::required(
+            2,
+            "payload",
+            Type::Struct(iceberg::spec::StructType::new(vec![Arc::new(
+                NestedField::optional(3, "inner", Type::Primitive(PrimitiveType::String)),
+            )])),
+        ));
+        let list_field = Arc::new(NestedField::optional(
+            4,
+            "items",
+            Type::List(ListType::new(Arc::new(NestedField::list_element(
+                5,
+                Type::Primitive(PrimitiveType::Int),
+                false,
+            )))),
+        ));
+        let map_field = Arc::new(NestedField::optional(
+            6,
+            "attrs",
+            Type::Map(MapType::new(
+                Arc::new(NestedField::map_key_element(
+                    7,
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::map_value_element(
+                    8,
+                    Type::Primitive(PrimitiveType::Long),
+                    false,
+                )),
+            )),
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![struct_field, list_field, map_field])
+            .build()
+            .expect("schema");
+
+        let def = iceberg_schema_def(&schema);
+
+        assert_eq!(def.fields[0].field_id, 2);
+        assert_eq!(def.fields[0].children[0].field_id, 3);
+        assert_eq!(def.fields[1].field_id, 4);
+        assert_eq!(def.fields[1].children[0].field_id, 5);
+        assert_eq!(def.fields[2].field_id, 6);
+        assert_eq!(def.fields[2].children[0].field_id, 7);
+        assert_eq!(def.fields[2].children[1].field_id, 8);
     }
 }

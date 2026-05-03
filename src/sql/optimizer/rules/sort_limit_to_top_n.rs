@@ -83,6 +83,7 @@ mod tests {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: crate::sql::catalog::TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/t.parquet"),
                     },

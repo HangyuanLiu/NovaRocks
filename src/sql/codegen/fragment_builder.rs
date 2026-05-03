@@ -359,13 +359,18 @@ impl<'a> PlanFragmentBuilder<'a> {
         let physical_layout = self
             .catalog
             .get_physical_layout(&op.database, &op.table.name)?;
-        if let Some(layout) = physical_layout.as_ref() {
-            self.desc_builder.add_table(
-                layout.table_id,
-                &op.database,
-                &op.table.name,
-                op.table.columns.len() as i32,
-            );
+        let scan_table_id = physical_layout
+            .as_ref()
+            .map(|layout| layout.table_id)
+            .or_else(|| {
+                op.table
+                    .iceberg_table
+                    .is_some()
+                    .then_some(synthetic_iceberg_table_id(scan_node_id))
+            });
+        if let Some(table_id) = scan_table_id {
+            self.desc_builder
+                .add_table_for_scan(table_id, &op.database, &op.table);
         }
 
         for (idx, col) in op.table.columns.iter().enumerate() {
@@ -473,13 +478,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             physical_layout,
             alias: op.alias.clone(),
         };
-        self.desc_builder.add_tuple(
-            scan_tuple_id,
-            resolved
-                .physical_layout
-                .as_ref()
-                .map(|layout| layout.table_id),
-        );
+        self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
         let scan_plan_node =
             nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, pushed_conjuncts);
@@ -1925,6 +1924,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable: false,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: None,
             storage: crate::sql::catalog::TableStorage::LocalParquetFile { path },
         };
 
@@ -2691,6 +2691,10 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 }
 
+fn synthetic_iceberg_table_id(scan_node_id: i32) -> i64 {
+    -(scan_node_id as i64)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -2759,13 +2763,15 @@ mod tests {
 
     use super::*;
     use crate::plan_nodes;
-    use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-        IcebergDeleteFileInfo, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+        IcebergDeleteFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+        ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     };
     use crate::sql::optimizer::operator::{
-        Operator, PhysicalDistributionOp, PhysicalScanOp, PhysicalSortOp,
+        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
+        PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
@@ -2802,6 +2808,28 @@ mod tests {
             _table: &str,
         ) -> Result<Option<PhysicalTableLayout>, String> {
             Ok(Some(self.layout.clone()))
+        }
+    }
+
+    struct MixedCatalog {
+        managed_layout: PhysicalTableLayout,
+    }
+
+    impl CatalogProvider for MixedCatalog {
+        fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
+            Err("not used in mixed scan builder tests".to_string())
+        }
+
+        fn get_physical_layout(
+            &self,
+            _database: &str,
+            table: &str,
+        ) -> Result<Option<PhysicalTableLayout>, String> {
+            if table == "managed_t" {
+                Ok(Some(self.managed_layout.clone()))
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -2876,6 +2904,7 @@ mod tests {
                         nullable: false,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile { path },
                 },
                 alias: None,
@@ -2901,6 +2930,7 @@ mod tests {
                         nullable: false,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
@@ -2912,6 +2942,75 @@ mod tests {
                 required_columns: None,
             }),
             children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn iceberg_scan_plan() -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: Some(IcebergTableInfo {
+                        location: "file:///warehouse/ice_t".to_string(),
+                        schema: IcebergSchemaDef {
+                            fields: vec![IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                children: vec![],
+                            }],
+                        },
+                    }),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn mixed_managed_iceberg_join_plan() -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![(
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: Some("ice_t".to_string()),
+                            column: "id".to_string(),
+                        },
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: Some("managed_t".to_string()),
+                            column: "id".to_string(),
+                        },
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                )],
+                other_condition: None,
+                distribution: JoinDistribution::Colocate,
+            }),
+            children: vec![iceberg_scan_plan(), managed_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
         }
@@ -3148,5 +3247,106 @@ mod tests {
         assert_eq!(internal.version, "7");
         assert_eq!(internal.db_name, "default");
         assert_eq!(internal.table_name.as_deref(), Some("managed_t"));
+    }
+
+    #[test]
+    fn non_managed_iceberg_scan_uses_synthetic_descriptor_table_id() {
+        let build = PlanFragmentBuilder::build(&iceberg_scan_plan(), &DummyCatalog, "default")
+            .expect("build");
+        assert_eq!(build.fragment_results.len(), 1);
+        let root = build.fragment_results.first().expect("root fragment");
+        let scan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let synthetic_table_id = synthetic_iceberg_table_id(scan_node.node_id);
+        let tuple_desc = root
+            .desc_tbl
+            .tuple_descriptors
+            .iter()
+            .find(|tuple| tuple.id == Some(1))
+            .expect("scan tuple descriptor");
+        assert_eq!(tuple_desc.table_id, Some(synthetic_table_id));
+
+        let table_desc = root
+            .desc_tbl
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors")
+            .iter()
+            .find(|table| table.id == synthetic_table_id)
+            .expect("synthetic iceberg table descriptor");
+        assert_eq!(
+            table_desc.table_type,
+            crate::types::TTableType::ICEBERG_TABLE
+        );
+        assert_eq!(
+            table_desc
+                .iceberg_table
+                .as_ref()
+                .and_then(|table| table.iceberg_schema.as_ref())
+                .and_then(|schema| schema.fields.as_ref())
+                .and_then(|fields| fields.first())
+                .and_then(|field| field.field_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn mixed_managed_and_iceberg_scan_table_ids_do_not_collide() {
+        let catalog = MixedCatalog {
+            managed_layout: PhysicalTableLayout {
+                db_id: 11,
+                table_id: 1,
+                schema_id: 33,
+                tablets: vec![ManagedTabletRef {
+                    tablet_id: 101,
+                    partition_id: 201,
+                    version: 7,
+                }],
+            },
+        };
+
+        let build =
+            PlanFragmentBuilder::build(&mixed_managed_iceberg_join_plan(), &catalog, "default")
+                .expect("build");
+        let root = build.fragment_results.first().expect("root fragment");
+        let tuple_descs = &root.desc_tbl.tuple_descriptors;
+        let iceberg_table_id = tuple_descs
+            .iter()
+            .find(|tuple| tuple.id == Some(1))
+            .and_then(|tuple| tuple.table_id)
+            .expect("iceberg tuple table id");
+        let managed_table_id = tuple_descs
+            .iter()
+            .find(|tuple| tuple.id == Some(2))
+            .and_then(|tuple| tuple.table_id)
+            .expect("managed tuple table id");
+        assert_ne!(iceberg_table_id, managed_table_id);
+        assert_eq!(managed_table_id, 1);
+
+        let table_descs = root
+            .desc_tbl
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors");
+        let iceberg_desc = table_descs
+            .iter()
+            .find(|table| table.id == iceberg_table_id)
+            .expect("iceberg table descriptor");
+        assert_eq!(
+            iceberg_desc.table_type,
+            crate::types::TTableType::ICEBERG_TABLE
+        );
+        let managed_desc = table_descs
+            .iter()
+            .find(|table| table.id == managed_table_id)
+            .expect("managed table descriptor");
+        assert_eq!(
+            managed_desc.table_type,
+            crate::types::TTableType::OLAP_TABLE
+        );
     }
 }
