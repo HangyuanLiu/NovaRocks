@@ -51,6 +51,8 @@ const FIELD_ID_POS: i32 = 2147483545;
 /// Group of position-delete tuples that all reference the same data file.
 pub struct PositionDeleteGroup {
     pub referenced_data_file: String,
+    pub partition_spec_id: i32,
+    pub partition_values: iceberg::spec::Struct,
     /// Sorted in ascending `pos` order (the writer enforces this).
     pub positions: Vec<i64>,
 }
@@ -62,7 +64,6 @@ pub struct PositionDeleteGroup {
 pub async fn write_position_delete_files(
     file_io: &FileIO,
     staging_dir: &str,
-    partition_spec_id: i32,
     groups: Vec<PositionDeleteGroup>,
 ) -> Result<Vec<WrittenFile>, String> {
     let mut out = Vec::with_capacity(groups.len());
@@ -85,8 +86,8 @@ pub async fn write_position_delete_files(
             path,
             format: DataFileFormat::Parquet,
             content: DataContentType::PositionDeletes,
-            partition_values: iceberg::spec::Struct::empty(),
-            partition_spec_id,
+            partition_values: group.partition_values,
+            partition_spec_id: group.partition_spec_id,
             record_count: n as u64,
             file_size_in_bytes: file_size,
             split_offsets: vec![],

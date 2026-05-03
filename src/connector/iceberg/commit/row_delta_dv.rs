@@ -627,14 +627,20 @@ mod tests {
         let groups = vec![
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/data.parquet".to_string(),
+                partition_spec_id: 0,
+                partition_values: iceberg::spec::Struct::empty(),
                 positions: vec![1, 2],
             },
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/data.parquet".to_string(),
+                partition_spec_id: 0,
+                partition_values: iceberg::spec::Struct::empty(),
                 positions: vec![3],
             },
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/empty.parquet".to_string(),
+                partition_spec_id: 0,
+                partition_values: iceberg::spec::Struct::empty(),
                 positions: vec![],
             },
         ];
@@ -651,6 +657,8 @@ mod tests {
     fn groups_to_vectors_rejects_negative_positions() {
         let groups = vec![PositionDeleteGroup {
             referenced_data_file: "file:///x/data.parquet".to_string(),
+            partition_spec_id: 0,
+            partition_values: iceberg::spec::Struct::empty(),
             positions: vec![1, -1],
         }];
         let err = groups_to_vectors(&groups).unwrap_err();

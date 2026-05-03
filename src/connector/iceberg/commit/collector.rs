@@ -403,6 +403,8 @@ mod tests {
         );
         collector.inject_delete_group(PositionDeleteGroup {
             referenced_data_file: "file:///tmp/data.parquet".to_string(),
+            partition_spec_id: 0,
+            partition_values: iceberg::spec::Struct::empty(),
             positions: vec![1, 3, 5],
         });
         let groups = collector.take_delete_groups();
