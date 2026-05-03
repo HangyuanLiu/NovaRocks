@@ -1643,6 +1643,16 @@ mod tests {
         file
     }
 
+    #[test]
+    fn alter_iceberg_schema_dispatches_before_generic_sqlparser() {
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("engine");
+        let err = engine
+            .session()
+            .execute("ALTER TABLE missing.db.t ADD COLUMN c INT")
+            .expect_err("unknown catalog");
+        assert!(err.contains("unknown catalog"));
+    }
+
     fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
         let stripped = endpoint
             .split_once("://")

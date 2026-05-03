@@ -180,6 +180,67 @@ mod tests {
     }
 
     #[test]
+    fn reserved_column_changes_are_rejected() {
+        let err = apply_change_to_schema_for_test(
+            &schema(),
+            2,
+            &IcebergSchemaChange::DropColumn {
+                name: "_row_id".to_string(),
+            },
+        )
+        .expect_err("reserved");
+        assert!(err.contains("reserved column"));
+    }
+
+    #[test]
+    fn drop_rejects_equality_delete_dependency_by_name() {
+        let deps = vec!["id".to_string()];
+        let err = reject_drop_dependencies_for_test("id", &deps, &[]).expect_err("drop dependency");
+        assert!(err.contains("equality-delete"));
+    }
+
+    #[test]
+    fn drop_rejects_managed_mv_explicit_column_dependency() {
+        let mv_sqls = vec!["SELECT id FROM ice.ns.orders".to_string()];
+        let err =
+            reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect_err("drop dependency");
+        assert!(err.contains("materialized view"));
+    }
+
+    #[test]
+    fn drop_allows_managed_mv_unrelated_column_dependency() {
+        let mv_sqls = vec!["SELECT v FROM ice.ns.orders".to_string()];
+        reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect("unrelated column");
+    }
+
+    #[test]
+    fn drop_rejects_managed_mv_select_wildcard_dependency() {
+        let mv_sqls = vec!["SELECT * FROM ice.ns.orders".to_string()];
+        let err =
+            reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect_err("drop dependency");
+        assert!(err.contains("materialized view"));
+    }
+
+    #[test]
+    fn drop_rejects_managed_mv_qualified_wildcard_dependency() {
+        for sql in [
+            "SELECT o.* FROM ice.ns.orders o",
+            "SELECT orders.* FROM ice.ns.orders",
+        ] {
+            let mv_sqls = vec![sql.to_string()];
+            let err = reject_drop_dependencies_for_test("id", &[], &mv_sqls)
+                .expect_err("drop dependency");
+            assert!(err.contains("materialized view"));
+        }
+    }
+
+    #[test]
+    fn drop_allows_managed_mv_count_star_without_column_token() {
+        let mv_sqls = vec!["SELECT COUNT(*) FROM ice.ns.orders".to_string()];
+        reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect("count star");
+    }
+
+    #[test]
     fn add_column_sets_logical_type_property_only_when_needed() {
         let tinyint = build_property_updates_for_test(
             &HashMap::new(),
@@ -315,7 +376,7 @@ mod tests {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -451,6 +512,276 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn reject_drop_dependencies_for_test(
+    column: &str,
+    equality_delete_columns: &[String],
+    mv_sqls: &[String],
+) -> Result<(), String> {
+    let target = ManagedMvTarget::new("ice", "ns", "orders")?;
+    let mv_dependencies = mv_sqls
+        .iter()
+        .map(|sql| ManagedMvDependency {
+            select_sql: sql.clone(),
+            target: target.clone(),
+        })
+        .collect::<Vec<_>>();
+    reject_drop_dependencies(column, equality_delete_columns, &mv_dependencies)
+}
+
+fn reject_drop_dependencies(
+    column: &str,
+    equality_delete_columns: &[String],
+    mv_dependencies: &[ManagedMvDependency],
+) -> Result<(), String> {
+    let normalized = normalize_identifier(column)?;
+    if equality_delete_columns
+        .iter()
+        .any(|c| normalize_identifier(c).ok().as_deref() == Some(normalized.as_str()))
+    {
+        return Err(format!(
+            "DROP COLUMN `{column}` is blocked because an Iceberg equality-delete file references it"
+        ));
+    }
+    for dependency in mv_dependencies {
+        if managed_mv_depends_on_column(dependency, &normalized) {
+            return Err(format!(
+                "DROP COLUMN `{column}` is blocked because a managed materialized view references it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ManagedMvDependency {
+    select_sql: String,
+    target: ManagedMvTarget,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedMvTarget {
+    catalog: String,
+    namespace: String,
+    table: String,
+}
+
+impl ManagedMvTarget {
+    fn new(catalog: &str, namespace: &str, table: &str) -> Result<Self, String> {
+        Ok(Self {
+            catalog: normalize_identifier(catalog)?,
+            namespace: normalize_identifier(namespace)?,
+            table: normalize_identifier(table)?,
+        })
+    }
+
+    fn from_backend(
+        target: &crate::engine::backend_resolver::TargetBackend,
+    ) -> Result<Self, String> {
+        Self::new(&target.catalog, &target.namespace, &target.table)
+    }
+}
+
+fn managed_mv_depends_on_column(
+    dependency: &ManagedMvDependency,
+    normalized_identifier: &str,
+) -> bool {
+    sql_mentions_identifier(&dependency.select_sql, normalized_identifier)
+        || sql_projects_target_wildcard(&dependency.select_sql, &dependency.target)
+}
+
+fn sql_mentions_identifier(sql: &str, normalized_identifier: &str) -> bool {
+    sql.split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .filter(|token| !token.is_empty())
+        .any(|token| token.eq_ignore_ascii_case(normalized_identifier))
+}
+
+fn sql_projects_target_wildcard(sql: &str, target: &ManagedMvTarget) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(statement) = crate::sql::parser::parse_normalized_sql_raw(&normalized) else {
+        return false;
+    };
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return false;
+    };
+    query_projects_target_wildcard(&query, target)
+}
+
+fn query_projects_target_wildcard(query: &sqlparser::ast::Query, target: &ManagedMvTarget) -> bool {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            if query_projects_target_wildcard(&cte.query, target) {
+                return true;
+            }
+        }
+    }
+    set_expr_projects_target_wildcard(query.body.as_ref(), target)
+}
+
+fn set_expr_projects_target_wildcard(
+    set_expr: &sqlparser::ast::SetExpr,
+    target: &ManagedMvTarget,
+) -> bool {
+    match set_expr {
+        sqlparser::ast::SetExpr::Select(select) => select_projects_target_wildcard(select, target),
+        sqlparser::ast::SetExpr::Query(query) => query_projects_target_wildcard(query, target),
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            set_expr_projects_target_wildcard(left, target)
+                || set_expr_projects_target_wildcard(right, target)
+        }
+        _ => false,
+    }
+}
+
+fn select_projects_target_wildcard(
+    select: &sqlparser::ast::Select,
+    target: &ManagedMvTarget,
+) -> bool {
+    let mut target_qualifiers = HashSet::new();
+    for table_with_joins in &select.from {
+        if collect_target_qualifiers_from_table_with_joins(
+            table_with_joins,
+            target,
+            &mut target_qualifiers,
+        ) {
+            return true;
+        }
+    }
+
+    select.projection.iter().any(|item| match item {
+        sqlparser::ast::SelectItem::Wildcard(_) => !target_qualifiers.is_empty(),
+        sqlparser::ast::SelectItem::QualifiedWildcard(kind, _) => {
+            qualified_wildcard_matches_target(kind, &target_qualifiers)
+        }
+        _ => false,
+    })
+}
+
+fn collect_target_qualifiers_from_table_with_joins(
+    table_with_joins: &sqlparser::ast::TableWithJoins,
+    target: &ManagedMvTarget,
+    qualifiers: &mut HashSet<String>,
+) -> bool {
+    if collect_target_qualifiers_from_factor(&table_with_joins.relation, target, qualifiers) {
+        return true;
+    }
+    for join in &table_with_joins.joins {
+        if collect_target_qualifiers_from_factor(&join.relation, target, qualifiers) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_target_qualifiers_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    target: &ManagedMvTarget,
+    qualifiers: &mut HashSet<String>,
+) -> bool {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+            if object_name_matches_target(name, target) {
+                qualifiers.extend(object_name_qualifier_keys(name));
+                if let Some(alias) = alias
+                    && let Ok(normalized) = normalize_identifier(&alias.name.value)
+                {
+                    qualifiers.insert(normalized);
+                }
+            }
+            false
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            query_projects_target_wildcard(subquery, target)
+        }
+        sqlparser::ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_target_qualifiers_from_table_with_joins(table_with_joins, target, qualifiers),
+        sqlparser::ast::TableFactor::Pivot { table, .. }
+        | sqlparser::ast::TableFactor::Unpivot { table, .. }
+        | sqlparser::ast::TableFactor::MatchRecognize { table, .. } => {
+            collect_target_qualifiers_from_factor(table, target, qualifiers)
+        }
+        _ => false,
+    }
+}
+
+fn qualified_wildcard_matches_target(
+    kind: &sqlparser::ast::SelectItemQualifiedWildcardKind,
+    target_qualifiers: &HashSet<String>,
+) -> bool {
+    match kind {
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+            object_name_qualifier_keys(name)
+                .into_iter()
+                .any(|key| target_qualifiers.contains(&key))
+        }
+        sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) => expr_qualifier_keys(expr)
+            .into_iter()
+            .any(|key| target_qualifiers.contains(&key)),
+    }
+}
+
+fn expr_qualifier_keys(expr: &sqlparser::ast::Expr) -> Vec<String> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => normalize_identifier(&ident.value)
+            .map(|name| vec![name])
+            .unwrap_or_default(),
+        sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+            let parts = idents
+                .iter()
+                .map(|ident| normalize_identifier(&ident.value))
+                .collect::<Result<Vec<_>, _>>();
+            parts
+                .map(|parts| qualifier_keys_from_parts(&parts))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn object_name_matches_target(name: &sqlparser::ast::ObjectName, target: &ManagedMvTarget) -> bool {
+    let parts = normalized_object_name_parts(name);
+    match parts.as_deref() {
+        Some([catalog, namespace, table]) => {
+            catalog == &target.catalog && namespace == &target.namespace && table == &target.table
+        }
+        Some([namespace, table]) => namespace == &target.namespace && table == &target.table,
+        Some([table]) => table == &target.table,
+        _ => false,
+    }
+}
+
+fn object_name_qualifier_keys(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    normalized_object_name_parts(name)
+        .map(|parts| qualifier_keys_from_parts(&parts))
+        .unwrap_or_default()
+}
+
+fn qualifier_keys_from_parts(parts: &[String]) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !parts.is_empty() {
+        keys.push(parts.join("."));
+        if parts.len() >= 2 {
+            keys.push(parts[parts.len() - 2..].join("."));
+        }
+        keys.push(parts[parts.len() - 1].clone());
+    }
+    keys
+}
+
+fn normalized_object_name_parts(name: &sqlparser::ast::ObjectName) -> Option<Vec<String>> {
+    name.0
+        .iter()
+        .map(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => normalize_identifier(&ident.value),
+            _ => Err("unsupported object name part".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
 }
 
 fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
@@ -705,9 +1036,68 @@ pub(crate) fn alter_table_schema(
 }
 
 fn protect_schema_change(
-    _state: &Arc<StandaloneState>,
-    _target: &crate::engine::backend_resolver::TargetBackend,
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
     change: &IcebergSchemaChange,
 ) -> Result<(), String> {
-    reject_reserved_change(change)
+    reject_reserved_change(change)?;
+    let IcebergSchemaChange::DropColumn { name } = change else {
+        return Ok(());
+    };
+
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+        &entry,
+        &target.namespace,
+        &target.table,
+    )?;
+    let metadata = loaded.table.metadata();
+    build_updated_schema(metadata.current_schema(), metadata.last_column_id(), change)?;
+    build_property_updates(metadata.properties(), change)?;
+
+    let equality_delete_columns =
+        crate::connector::iceberg::catalog::registry::current_equality_delete_column_names(
+            &loaded.table,
+        )?;
+
+    let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
+    reject_drop_dependencies(name, &equality_delete_columns, &mv_dependencies)
+}
+
+fn managed_mv_dependencies_for_target(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+) -> Result<Vec<ManagedMvDependency>, String> {
+    let Some(store) = state.metadata_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let snapshot = store.load_snapshot()?.managed;
+    let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    let target_key_lower = target_key.to_ascii_lowercase();
+    let target = ManagedMvTarget::from_backend(target)?;
+    Ok(snapshot
+        .materialized_views
+        .into_iter()
+        .filter(|mv| {
+            mv.base_table_refs.iter().any(|base| {
+                base.catalog.eq_ignore_ascii_case(&target.catalog)
+                    && base.namespace.eq_ignore_ascii_case(&target.namespace)
+                    && base.table.eq_ignore_ascii_case(&target.table)
+            }) || mv
+                .select_sql
+                .to_ascii_lowercase()
+                .contains(&target_key_lower)
+        })
+        .map(|mv| ManagedMvDependency {
+            select_sql: mv.select_sql,
+            target: target.clone(),
+        })
+        .collect())
 }
