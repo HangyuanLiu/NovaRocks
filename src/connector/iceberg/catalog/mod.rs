@@ -17,3 +17,12 @@ pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, insert_rows,
     load_table, namespace_exists, register_existing_table,
 };
+
+pub(crate) fn alter_table_schema(
+    _state: &std::sync::Arc<crate::engine::StandaloneState>,
+    _stmt: &crate::engine::statement::AlterIcebergSchemaStmt,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
+) -> Result<(), String> {
+    Err("Iceberg schema evolution is not implemented".to_string())
+}

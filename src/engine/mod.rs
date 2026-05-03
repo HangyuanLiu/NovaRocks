@@ -50,6 +50,7 @@ use self::statement::{
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
+    looks_like_alter_iceberg_schema,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -524,6 +525,15 @@ impl StandaloneSession {
             return self.handle_drop(drop, current_catalog, current_database);
         }
 
+        // ALTER TABLE ... ADD/DROP/RENAME/MODIFY COLUMN
+        if looks_like_alter_iceberg_schema(&normalized) {
+            return self.handle_alter_iceberg_schema(
+                &normalized,
+                current_catalog,
+                current_database,
+            );
+        }
+
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -686,6 +696,22 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
+    }
+
+    fn handle_alter_iceberg_schema(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let stmt = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
+        crate::connector::iceberg::catalog::alter_table_schema(
+            &self.inner,
+            &stmt,
+            current_catalog,
+            current_database,
+        )?;
+        Ok(StatementResult::Ok)
     }
 
     /// Handle ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)

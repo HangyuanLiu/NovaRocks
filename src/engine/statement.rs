@@ -16,8 +16,11 @@ use crate::engine::{
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
 use crate::sql::parser::ast::{
-    CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
+    CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName, SqlType,
 };
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
 use super::generate_series::parse_generate_series_function_expr;
 use super::sql_expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
@@ -539,6 +542,32 @@ pub(crate) struct AddEqualityDeleteStmt {
     pub(crate) rows: Vec<Vec<Literal>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AlterIcebergSchemaStmt {
+    pub(crate) table: ObjectName,
+    pub(crate) change: IcebergSchemaChange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergSchemaChange {
+    AddColumn {
+        name: String,
+        data_type: SqlType,
+        default_null: bool,
+    },
+    DropColumn {
+        name: String,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    ModifyColumn {
+        name: String,
+        new_type: SqlType,
+    },
+}
+
 /// Check if SQL looks like ALTER TABLE ... ADD FILES FROM ...
 pub(crate) fn looks_like_add_files(sql: &str) -> bool {
     let upper = sql.trim().to_ascii_uppercase();
@@ -575,6 +604,135 @@ pub(crate) fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), St
     }
 
     Ok((table_parts, path))
+}
+
+pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let dialect = crate::sql::parser::dialect::StarRocksDialect;
+    let Ok(mut parser) = Parser::new(&dialect).try_with_sql(&normalized) else {
+        return false;
+    };
+
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+
+    if parser.parse_keyword(Keyword::ADD) {
+        return parser.parse_keyword(Keyword::COLUMN);
+    }
+    if parser.parse_keyword(Keyword::DROP) {
+        return parser.parse_keyword(Keyword::COLUMN);
+    }
+    if parser.parse_keyword(Keyword::RENAME) {
+        return parser.parse_keyword(Keyword::COLUMN);
+    }
+    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "MODIFY") {
+        parser.next_token();
+        return parser.parse_keyword(Keyword::COLUMN);
+    }
+    false
+}
+
+pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSchemaStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let dialect = crate::sql::parser::dialect::StarRocksDialect;
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE schema DDL: {e}"))?;
+
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+
+    let change = if parser.parse_keywords(&[Keyword::ADD, Keyword::COLUMN]) {
+        parse_add_column_change(&mut parser)?
+    } else if parser.parse_keywords(&[Keyword::DROP, Keyword::COLUMN]) {
+        let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+        IcebergSchemaChange::DropColumn { name }
+    } else if parser.parse_keywords(&[Keyword::RENAME, Keyword::COLUMN]) {
+        let old_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+        parser
+            .expect_keyword(Keyword::TO)
+            .map_err(|e| e.to_string())?;
+        let new_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+        IcebergSchemaChange::RenameColumn { old_name, new_name }
+    } else if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "MODIFY") {
+        parser.next_token();
+        parser
+            .expect_keyword(Keyword::COLUMN)
+            .map_err(|e| e.to_string())?;
+        let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+        let new_type = crate::sql::parser::dialect::convert_sql_type(
+            parser.parse_data_type().map_err(|e| e.to_string())?,
+        )?;
+        IcebergSchemaChange::ModifyColumn { name, new_type }
+    } else {
+        return Err("unsupported ALTER TABLE schema evolution clause".to_string());
+    };
+
+    if parser.peek_token_ref().token == Token::SemiColon {
+        parser.next_token();
+    }
+    if parser.peek_token_ref().token != Token::EOF {
+        return Err(format!(
+            "unsupported trailing ALTER TABLE schema tokens starting at {}",
+            parser.peek_token_ref().token
+        ));
+    }
+
+    Ok(AlterIcebergSchemaStmt { table, change })
+}
+
+fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChange, String> {
+    let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+    let data_type = crate::sql::parser::dialect::convert_sql_type(
+        parser.parse_data_type().map_err(|e| e.to_string())?,
+    )?;
+    let mut default_null = false;
+    let mut seen_null = false;
+    let mut seen_default_null = false;
+    loop {
+        if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
+            return Err(
+                "ADD COLUMN NOT NULL is not supported for Iceberg schema evolution".to_string(),
+            );
+        }
+        if parser.parse_keyword(Keyword::NULL) {
+            if seen_null {
+                return Err("duplicate NULL clause in ADD COLUMN".to_string());
+            }
+            seen_null = true;
+            continue;
+        }
+        if parser.parse_keyword(Keyword::DEFAULT) {
+            if parser.parse_keyword(Keyword::NULL) {
+                if seen_default_null {
+                    return Err("duplicate DEFAULT NULL clause in ADD COLUMN".to_string());
+                }
+                seen_default_null = true;
+                default_null = true;
+                continue;
+            }
+            return Err("ADD COLUMN default values other than NULL are not supported".to_string());
+        }
+        break;
+    }
+    Ok(IcebergSchemaChange::AddColumn {
+        name,
+        data_type,
+        default_null,
+    })
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...
@@ -677,5 +835,127 @@ mod tests {
                 vec![Literal::Int(4), Literal::String("A".to_string())],
             ]
         );
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_default_null() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT NULL",
+        )
+        .expect("parse");
+
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+        assert_eq!(
+            stmt.change,
+            super::IcebergSchemaChange::AddColumn {
+                name: "discount".to_string(),
+                data_type: crate::sql::parser::ast::SqlType::Int,
+                default_null: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_drop_rename_modify() {
+        let drop_stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE ice.db.orders DROP COLUMN old_col")
+                .expect("drop");
+        assert_eq!(
+            drop_stmt.change,
+            super::IcebergSchemaChange::DropColumn {
+                name: "old_col".to_string(),
+            }
+        );
+
+        let rename_stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders RENAME COLUMN old_col TO new_col",
+        )
+        .expect("rename");
+        assert_eq!(
+            rename_stmt.change,
+            super::IcebergSchemaChange::RenameColumn {
+                old_name: "old_col".to_string(),
+                new_name: "new_col".to_string(),
+            }
+        );
+
+        let modify_stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders MODIFY COLUMN id BIGINT",
+        )
+        .expect("modify");
+        assert_eq!(
+            modify_stmt.change,
+            super::IcebergSchemaChange::ModifyColumn {
+                name: "id".to_string(),
+                new_type: crate::sql::parser::ast::SqlType::BigInt,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_rejects_unsupported_add_forms() {
+        let not_null = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT NOT NULL",
+        )
+        .expect_err("not null should fail");
+        assert!(not_null.contains("ADD COLUMN NOT NULL is not supported"));
+
+        let non_null_default = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 1",
+        )
+        .expect_err("non-null default should fail");
+        assert!(non_null_default.contains("default values other than NULL"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_probe_matches_only_schema_clauses() {
+        for sql in [
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT",
+            "ALTER TABLE ice.db.orders DROP COLUMN old_col",
+            "ALTER TABLE ice.db.orders RENAME COLUMN old_col TO new_col",
+            "ALTER TABLE ice.db.orders MODIFY COLUMN id BIGINT",
+        ] {
+            assert!(
+                super::looks_like_alter_iceberg_schema(sql),
+                "expected schema DDL probe to match {sql}"
+            );
+        }
+
+        for sql in [
+            "ALTER TABLE ice.db.orders ADD FILES FROM 's3://bucket/path'",
+            "ALTER TABLE ice.db.orders ADD EQUALITY DELETE (id) VALUES (1)",
+            "ALTER TABLE ice.db.orders SET COMMENT = 'ADD COLUMN c INT'",
+            "ALTER TABLE ice.db.orders /* ADD COLUMN c INT */ ADD FILES FROM 's3://bucket/path'",
+            "ALTER TABLE ice.db.orders ADD PARTITION p1 VALUES LESS THAN (10)",
+        ] {
+            assert!(
+                !super::looks_like_alter_iceberg_schema(sql),
+                "expected schema DDL probe not to match {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_rejects_trailing_unsupported_syntax() {
+        let err = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN c INT COMMENT 'x'",
+        )
+        .expect_err("comment should fail");
+        assert!(err.contains("unsupported trailing ALTER TABLE schema tokens"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_rejects_duplicate_add_column_attributes() {
+        let duplicate_null = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN c INT NULL NULL",
+        )
+        .expect_err("duplicate null should fail");
+        assert!(duplicate_null.contains("duplicate NULL"));
+
+        let duplicate_default = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN c INT DEFAULT NULL DEFAULT NULL",
+        )
+        .expect_err("duplicate default should fail");
+        assert!(duplicate_default.contains("duplicate DEFAULT NULL"));
     }
 }
