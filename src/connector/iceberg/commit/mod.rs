@@ -56,6 +56,8 @@ pub use types::{
     CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergWriteMode, WrittenFile,
 };
 pub use validation::{
-    classify_iceberg_write_mode, classify_sql_delete_strategy, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_single_partition_spec, match_select_schema_to_table,
+    classify_iceberg_write_mode, classify_sql_delete_strategy,
+    ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,
+    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
+    ensure_single_partition_spec, match_select_schema_to_table,
 };
