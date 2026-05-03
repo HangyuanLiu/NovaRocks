@@ -1,0 +1,14 @@
+-- query 3
+customer	amount
+A	10
+A	20
+B	30
+
+-- query 6
+customer	amount
+A	20
+B	30
+
+-- query 9
+customer	amount
+B	30

@@ -27,12 +27,23 @@ pub enum IcebergDeleteFileFormat {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IcebergDeleteFileContent {
+    Position,
+    Equality,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergDeleteFileInfo {
     pub path: String,
     pub file_format: IcebergDeleteFileFormat,
+    pub file_content: IcebergDeleteFileContent,
     pub length: Option<i64>,
     pub content_offset: Option<i64>,
     pub content_size_in_bytes: Option<i64>,
+    pub sequence_number: Option<i64>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
+    pub equality_column_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

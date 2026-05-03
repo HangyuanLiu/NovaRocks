@@ -183,6 +183,7 @@ pub(crate) struct MvRefreshWriteMetadata {
     pub(crate) table_id: i64,
     pub(crate) previous_refresh_rows: i64,
     pub(crate) snapshots: BTreeMap<String, i64>,
+    pub(crate) table_uuids: BTreeMap<String, String>,
 }
 
 pub(crate) fn load_insert_plan(
@@ -369,7 +370,28 @@ pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
         state,
         plan,
         chunks,
-        VisibleCommitAction::MvRefresh(metadata),
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta: None,
+        },
+    )
+}
+
+pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
+    state: &Arc<StandaloneState>,
+    plan: ManagedInsertPlan,
+    chunks: &[Chunk],
+    metadata: MvRefreshWriteMetadata,
+    row_delta: i64,
+) -> Result<i64, String> {
+    write_chunks_into_managed_partition_inner(
+        state,
+        plan,
+        chunks,
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta: Some(row_delta),
+        },
     )
 }
 
@@ -446,7 +468,10 @@ pub(crate) fn write_chunks_into_managed_partition_for_aggregate_mv_upsert(
 
 enum VisibleCommitAction {
     Plain,
-    MvRefresh(MvRefreshWriteMetadata),
+    MvRefresh {
+        metadata: MvRefreshWriteMetadata,
+        row_delta: Option<i64>,
+    },
 }
 
 fn write_chunks_into_managed_partition_inner(
@@ -512,14 +537,18 @@ fn write_chunks_into_managed_partition_inner(
         VisibleCommitAction::Plain => {
             metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
         }
-        VisibleCommitAction::MvRefresh(metadata) => {
+        VisibleCommitAction::MvRefresh {
+            metadata,
+            row_delta,
+        } => {
+            let delta = row_delta.unwrap_or(total_rows);
             let last_refresh_rows = metadata
                 .previous_refresh_rows
-                .checked_add(total_rows)
+                .checked_add(delta)
                 .ok_or_else(|| {
                     format!(
                         "managed-lake mv refresh row count overflow: {} + {}",
-                        metadata.previous_refresh_rows, total_rows
+                        metadata.previous_refresh_rows, delta
                     )
                 })?;
             metadata_store.mark_txn_visible_with_mv_refresh_metadata(
@@ -529,6 +558,7 @@ fn write_chunks_into_managed_partition_inner(
                     table_id: metadata.table_id,
                     last_refresh_rows,
                     snapshots: metadata.snapshots,
+                    table_uuids: metadata.table_uuids,
                 },
             )?;
         }
@@ -1234,6 +1264,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 3,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             },
         )
         .expect("write");
@@ -1341,6 +1372,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 7,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             },
         )
         .expect("write");
@@ -1393,6 +1425,7 @@ mod mv_target_tests {
                 table_id: 10,
                 previous_refresh_rows: 0,
                 snapshots: BTreeMap::new(),
+                table_uuids: Default::default(),
             },
         )
         .expect("aggregate upsert");
@@ -1642,6 +1675,8 @@ mod mv_target_tests {
                 last_refresh_ms: None,
                 last_refresh_rows: Some(1),
                 last_refresh_snapshots: BTreeMap::new(),
+                last_refresh_table_uuids: Default::default(),
+                primary_key_columns: Vec::new(),
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,
@@ -2104,6 +2139,8 @@ mod mv_target_tests {
                     last_refresh_ms: None,
                     last_refresh_rows: Some(0),
                     last_refresh_snapshots: std::collections::BTreeMap::new(),
+                    last_refresh_table_uuids: Default::default(),
+                    primary_key_columns: Vec::new(),
                     created_at_ms: 1,
                     storage_engine: ManagedMvStorageEngine::ManagedLake,
                     iceberg_table_identifier: None,

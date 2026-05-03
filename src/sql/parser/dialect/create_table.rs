@@ -19,6 +19,7 @@ use crate::sql::parser::ast::{
 /// [PARTITION BY ...]
 /// [DISTRIBUTED BY HASH(...) [BUCKETS n]]
 /// [PROPERTIES (...)]
+/// [TBLPROPERTIES (...)]
 pub(crate) fn parse_create_table_statement(
     parser: &mut Parser<'_>,
 ) -> Result<CreateTableStmt, String> {
@@ -77,15 +78,19 @@ pub(crate) fn parse_create_table_statement(
             parser.next_token(); // COMMENT
             parser.next_token(); // string
         } else if peek_word_eq(parser, 0, "PARTITION") {
-            skip_until_keyword_or_eof(parser, &["DISTRIBUTED", "ORDER", "PROPERTIES"]);
+            skip_until_keyword_or_eof(
+                parser,
+                &["DISTRIBUTED", "ORDER", "PROPERTIES", "TBLPROPERTIES"],
+            );
         } else if peek_word_eq(parser, 0, "DISTRIBUTED") {
             bucket_count = parse_bucket_count(parser)?;
         } else if parser.parse_keyword(Keyword::ORDER) {
             // ORDER BY (...)
             let _ = parser.parse_keyword(Keyword::BY);
             skip_parenthesized(parser);
-        } else if peek_word_eq(parser, 0, "PROPERTIES") {
-            parser.next_token(); // PROPERTIES
+        } else if peek_word_eq(parser, 0, "PROPERTIES") || peek_word_eq(parser, 0, "TBLPROPERTIES")
+        {
+            parser.next_token(); // PROPERTIES / TBLPROPERTIES
             properties = parse_kv_properties_vec(parser)?;
         } else {
             // Skip unknown token
@@ -110,6 +115,7 @@ fn parse_bucket_count(parser: &mut Parser<'_>) -> Result<Option<u32>, String> {
             || parser.peek_token_ref().token == Token::SemiColon
             || peek_word_eq(parser, 0, "ORDER")
             || peek_word_eq(parser, 0, "PROPERTIES")
+            || peek_word_eq(parser, 0, "TBLPROPERTIES")
         {
             return Ok(None);
         }
@@ -478,5 +484,24 @@ mod tests {
         assert_eq!(columns.len(), 2);
         assert!(!columns[0].nullable);
         assert!(columns[1].nullable);
+    }
+
+    #[test]
+    fn create_table_parser_preserves_tblproperties() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                r#"create table tbl (id bigint) partition by(id) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+            )
+            .expect("parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+        let CreateTableKind::Iceberg { properties, .. } = stmt.kind;
+        assert_eq!(
+            properties,
+            vec![
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ]
+        );
     }
 }

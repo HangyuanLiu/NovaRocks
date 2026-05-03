@@ -53,6 +53,9 @@ pub fn written_file_to_iceberg_data_file(
     if let Some(ref_path) = &f.referenced_data_file {
         builder.referenced_data_file(Some(ref_path.clone()));
     }
+    if let Some(equality_ids) = &f.equality_ids {
+        builder.equality_ids(Some(equality_ids.clone()));
+    }
     if !f.column_sizes.is_empty() {
         builder.column_sizes(f.column_sizes.clone());
     }

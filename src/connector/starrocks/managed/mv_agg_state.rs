@@ -241,6 +241,7 @@ pub(crate) fn build_aggregate_mv_layout(
 /// Used by the refresh dispatch to decide whether to fall back to a full
 /// refresh when the incremental change batch contains DELETE files (MIN/MAX
 /// state has no closed-form retract — see `negate_aggregate_state_chunks`).
+#[allow(dead_code)]
 pub(crate) fn layout_has_min_or_max(layout: &AggregateMvLayout) -> bool {
     layout.state_columns.iter().any(|col| {
         matches!(

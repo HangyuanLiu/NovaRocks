@@ -77,10 +77,20 @@ impl IcebergCommitAction for RowDeltaCommit {
             });
         }
         for f in &written {
-            if f.content != DataContentType::PositionDeletes {
+            if f.content != DataContentType::PositionDeletes
+                && f.content != DataContentType::EqualityDeletes
+            {
                 return Err(format!(
-                    "RowDeltaCommit received {:?} content; expected PositionDeletes only",
+                    "RowDeltaCommit received {:?} content; expected delete-file content",
                     f.content
+                ));
+            }
+            if f.content == DataContentType::EqualityDeletes
+                && f.equality_ids.as_ref().is_none_or(Vec::is_empty)
+            {
+                return Err(format!(
+                    "RowDeltaCommit received equality-delete file {} without equality_ids",
+                    f.path
                 ));
             }
         }
@@ -335,6 +345,9 @@ fn written_file_to_iceberg_data_file_minimal(
     if let Some(ref_path) = &f.referenced_data_file {
         builder.referenced_data_file(Some(ref_path.clone()));
     }
+    if let Some(equality_ids) = &f.equality_ids {
+        builder.equality_ids(Some(equality_ids.clone()));
+    }
     if !f.column_sizes.is_empty() {
         builder.column_sizes(f.column_sizes.clone());
     }
@@ -351,20 +364,88 @@ fn written_file_to_iceberg_data_file_minimal(
 
 fn row_delta_summary(written: &[WrittenFile]) -> HashMap<String, String> {
     let mut p = HashMap::new();
-    let total_records: u64 = written.iter().map(|f| f.record_count).sum();
+    let position_files = written
+        .iter()
+        .filter(|f| f.content == DataContentType::PositionDeletes)
+        .count();
+    let equality_files = written
+        .iter()
+        .filter(|f| f.content == DataContentType::EqualityDeletes)
+        .count();
+    let position_records: u64 = written
+        .iter()
+        .filter(|f| f.content == DataContentType::PositionDeletes)
+        .map(|f| f.record_count)
+        .sum();
+    let equality_records: u64 = written
+        .iter()
+        .filter(|f| f.content == DataContentType::EqualityDeletes)
+        .map(|f| f.record_count)
+        .sum();
     let total_size: u64 = written.iter().map(|f| f.file_size_in_bytes).sum();
-    p.insert(
-        "added-position-delete-files".to_string(),
-        written.len().to_string(),
-    );
-    p.insert(
-        "added-position-deletes".to_string(),
-        total_records.to_string(),
-    );
+    if position_files > 0 {
+        p.insert(
+            "added-position-delete-files".to_string(),
+            position_files.to_string(),
+        );
+        p.insert(
+            "added-position-deletes".to_string(),
+            position_records.to_string(),
+        );
+    }
+    if equality_files > 0 {
+        p.insert(
+            "added-equality-delete-files".to_string(),
+            equality_files.to_string(),
+        );
+        p.insert(
+            "added-equality-deletes".to_string(),
+            equality_records.to_string(),
+        );
+        p.insert(
+            "total-equality-deletes".to_string(),
+            equality_records.to_string(),
+        );
+    }
+    p.insert("added-delete-files".to_string(), written.len().to_string());
     p.insert("added-files-size".to_string(), total_size.to_string());
     p
 }
 
 fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iceberg::spec::{DataContentType, DataFileFormat, Struct};
+
+    use super::*;
+
+    #[test]
+    fn equality_delete_written_file_preserves_equality_ids() {
+        let file = WrittenFile {
+            path: "s3://bucket/table/data/eq-delete.parquet".to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::EqualityDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 2,
+            file_size_in_bytes: 128,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: Some(vec![1, 2]),
+        };
+
+        let df = written_file_to_iceberg_data_file_minimal(&file).expect("data file");
+
+        assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
+        assert_eq!(df.equality_ids(), Some(vec![1, 2]));
+    }
 }

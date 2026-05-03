@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::engine::catalog::{InMemoryCatalog, normalize_identifier};
+use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult, execute_query};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
@@ -279,7 +280,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     current_database: &str,
     sql: &str,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
-    delta_files: Vec<(String, i64, Option<i64>)>,
+    delta_files: Vec<IcebergFileForQuery>,
 ) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -392,7 +393,13 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
         })
         .sum();
     let total_rows: Option<i64> = Some(deleted_rows.iter().map(|b| b.num_rows() as i64).sum());
-    let delete_files = vec![(format!("file://{}", path.display()), total_size, total_rows)];
+    let delete_files = vec![IcebergFileForQuery {
+        path: format!("file://{}", path.display()),
+        size: total_size,
+        record_count: total_rows,
+        first_row_id: Some(0),
+        data_sequence_number: Some(0),
+    }];
 
     let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
         state,

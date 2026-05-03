@@ -1,16 +1,23 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use arrow::array::{ArrayRef, Int8Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
 use crate::connector::iceberg::catalog::load_table;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::connector::starrocks::managed::ivm_change_stream::{
-    materialize_iceberg_change_stream, plan_iceberg_change_batch_for_ivm,
+    materialize_iceberg_change_batch, plan_iceberg_change_batch_for_ivm,
 };
-use crate::engine::mv_flow::{
-    analyze_visible_output_types, execute_query_for_mv_incremental_refresh,
-    execute_query_for_mv_refresh,
+use crate::connector::starrocks::managed::mv_apply_policy::{
+    MvApplyPolicy, apply_policy_for_change,
 };
+use crate::connector::starrocks::managed::mv_refresh_strategy::{
+    FullRefreshReason, MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
+};
+use crate::engine::mv_flow::{analyze_visible_output_types, execute_query_for_mv_refresh};
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -24,45 +31,15 @@ use crate::connector::starrocks::managed::ddl::{
 };
 use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, BeginMvRefreshRequest, IcebergTableRef, ManagedPartitionState,
-    ManagedTableKind, StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
+    ManagedTableKind, SqliteMetadataStore, StageMvRefreshRequest, StagedMvRefresh,
+    UpdateMvRefreshMetadataRequest,
 };
 use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
     write_chunks_into_managed_partition,
     write_chunks_into_managed_partition_for_aggregate_mv_upsert,
-    write_chunks_into_managed_partition_for_mv_refresh,
+    write_chunks_into_managed_partition_for_mv_refresh_with_row_delta,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MvRefreshStrategy {
-    Full,
-    NoOp {
-        current_snapshot_id: i64,
-    },
-    Incremental {
-        previous_snapshot_id: i64,
-        current_snapshot_id: i64,
-    },
-}
-
-fn choose_refresh_strategy(
-    previous_snapshot_id: Option<i64>,
-    current_snapshot_id: Option<i64>,
-) -> Result<MvRefreshStrategy, String> {
-    match (previous_snapshot_id, current_snapshot_id) {
-        (None, _) => Ok(MvRefreshStrategy::Full),
-        (Some(previous), Some(current)) if previous == current => Ok(MvRefreshStrategy::NoOp {
-            current_snapshot_id: current,
-        }),
-        (Some(previous), Some(current)) => Ok(MvRefreshStrategy::Incremental {
-            previous_snapshot_id: previous,
-            current_snapshot_id: current,
-        }),
-        (Some(previous), None) => Err(format!(
-            "cannot incrementally refresh materialized view: Iceberg snapshot {previous} is no longer reachable"
-        )),
-    }
-}
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
@@ -144,11 +121,32 @@ pub(crate) fn refresh_mv(
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
+    let current_table_uuid = loaded.table.metadata().uuid().to_string();
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
-    let strategy = choose_refresh_strategy(previous_snapshot_id, current_snapshot_id)?;
+    let mut policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
+    if let Some(previous_uuid) = mv_row.last_refresh_table_uuids.get(&base_ref.fqn())
+        && previous_uuid != &current_table_uuid
+    {
+        policy = MvRefreshPolicy::FullRefresh {
+            target_snapshot_id: current_snapshot_id,
+            reason: FullRefreshReason::BaseTableRecreated {
+                previous_uuid: previous_uuid.clone(),
+                current_uuid: current_table_uuid.clone(),
+            },
+        };
+    }
+    tracing::info!(
+        target: "mv_refresh",
+        mv = %format!("{}.{}", db_name, mv_name),
+        base = %base_ref.fqn(),
+        previous_snapshot_id = ?previous_snapshot_id,
+        current_snapshot_id = ?current_snapshot_id,
+        policy = ?policy,
+        "selected materialized view refresh policy"
+    );
     if matches!(
-        strategy,
-        MvRefreshStrategy::Full | MvRefreshStrategy::Incremental { .. }
+        policy,
+        MvRefreshPolicy::FullRefresh { .. } | MvRefreshPolicy::Incremental { .. }
     ) {
         let target_snapshots = current_snapshot_id
             .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
@@ -159,59 +157,147 @@ pub(crate) fn refresh_mv(
         })?;
     }
 
+    let projection_apply_shape = mv_shape.clone();
+    let projection_full_primary_key_columns = mv_row.primary_key_columns.clone();
     dispatch_mv_refresh_strategy(
         &mv_shape,
-        strategy,
-        || refresh_mv_full_with_executor(state, &db_name, &mv_name, run_mv_select_and_chunks),
+        policy,
+        || {
+            refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
+                run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
+            })
+        },
         |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
         |current_snapshot_id| {
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
+            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
             metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
                 table_id: runtime.table.table_id,
                 last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 snapshots,
+                table_uuids,
             })?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         },
         |previous_snapshot_id, current_snapshot_id| {
-            let batch = plan_iceberg_change_batch_for_ivm(
+            let batch = match plan_iceberg_change_batch_for_ivm(
                 &loaded.table,
                 previous_snapshot_id,
                 current_snapshot_id,
-                &[],
-            )?;
-            if !batch.deletes.is_empty() {
-                return Err(format!(
-                    "iceberg materialized view incremental refresh does not yet support \
-                     delete snapshots; {} delete file(s) seen in lineage",
-                    batch.deletes.len()
-                ));
+                &mv_row.primary_key_columns,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => match policy_from_change_error(err) {
+                    MvRefreshPolicy::FullRefresh { reason, .. } => {
+                        tracing::info!(
+                            target: "mv_refresh",
+                            mv = %format!("{}.{}", db_name, mv_name),
+                            base = %base_ref.fqn(),
+                            snapshot_from = previous_snapshot_id,
+                            snapshot_to = current_snapshot_id,
+                            reason = %reason,
+                            "mv_refresh fall-back to Full from projection incremental planner"
+                        );
+                        let primary_key_columns = mv_row.primary_key_columns.clone();
+                        return refresh_mv_full_with_executor(
+                            state,
+                            &db_name,
+                            &mv_name,
+                            move |ctx| {
+                                run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
+                            },
+                        );
+                    }
+                    MvRefreshPolicy::Unsupported { reason } => {
+                        return Err(format!(
+                            "iceberg materialized view refresh unsupported: {reason}"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "iceberg materialized view refresh produced invalid policy from change planner: {other:?}"
+                        ));
+                    }
+                },
+            };
+            let has_inserts = !batch.inserts.is_empty();
+            let has_deletes = !batch.deletes.is_empty() || !batch.equality_deletes.is_empty();
+            let apply_policy = apply_policy_for_change(
+                &projection_apply_shape,
+                has_inserts,
+                has_deletes,
+                !mv_row.primary_key_columns.is_empty(),
+            );
+            match apply_policy {
+                MvApplyPolicy::Incremental => {}
+                MvApplyPolicy::FullRefresh { reason } => {
+                    tracing::info!(
+                        target: "mv_refresh",
+                        mv = %format!("{}.{}", db_name, mv_name),
+                        base = %base_ref.fqn(),
+                        snapshot_from = previous_snapshot_id,
+                        snapshot_to = current_snapshot_id,
+                        reason = %reason,
+                        "mv_refresh fall-back to Full from projection apply policy"
+                    );
+                    let primary_key_columns = mv_row.primary_key_columns.clone();
+                    return refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
+                        run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
+                    });
+                }
+                MvApplyPolicy::Unsupported { reason } => {
+                    return Err(format!(
+                        "iceberg materialized view refresh unsupported: {reason}"
+                    ));
+                }
             }
 
-            let result = execute_query_for_mv_incremental_refresh(
+            let select_sql =
+                projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
+            let change_stream = materialize_iceberg_change_batch(
                 state,
                 &db_name,
-                &mv_row.select_sql,
+                &select_sql,
                 base_ref,
-                batch
-                    .inserts
-                    .iter()
-                    .map(|f| (f.path.clone(), f.size, f.record_count))
-                    .collect(),
+                &loaded.table,
+                batch,
+                loaded.object_store_config.as_ref(),
+                &mv_row.primary_key_columns,
             )?;
-            let chunks = query_result_to_chunks(result)?;
-            let plan = load_insert_plan(
-                state,
-                &crate::engine::ResolvedLocalTableName {
-                    database: db_name.clone(),
-                    table: mv_name.clone(),
-                },
-                PartitionTarget::Active,
-            )?;
+            let (insert_result, delete_result) = change_stream.into_results();
+            let (chunks, row_delta) = if has_deletes {
+                let insert_chunks = query_result_to_mv_op_chunks(insert_result, MV_OP_UPSERT)?;
+                let delete_chunks = query_result_to_mv_op_chunks(delete_result, MV_OP_DELETE)?;
+                let insert_rows = chunks_row_count(&insert_chunks)?;
+                let delete_rows = chunks_row_count(&delete_chunks)?;
+                let mut chunks = Vec::with_capacity(insert_chunks.len() + delete_chunks.len());
+                chunks.extend(insert_chunks);
+                chunks.extend(delete_chunks);
+                let row_delta = insert_rows.checked_sub(delete_rows).ok_or_else(|| {
+                    format!(
+                        "projection/filter MV row-count delta overflow: inserts={insert_rows} deletes={delete_rows}"
+                    )
+                })?;
+                (chunks, row_delta)
+            } else {
+                let chunks = query_result_to_chunks(insert_result)?;
+                let row_delta = chunks_row_count(&chunks)?;
+                (chunks, row_delta)
+            };
+            let resolved_mv = crate::engine::ResolvedLocalTableName {
+                database: db_name.clone(),
+                table: mv_name.clone(),
+            };
+            let plan = if mv_row.primary_key_columns.is_empty() {
+                load_insert_plan(state, &resolved_mv, PartitionTarget::Active)
+            } else {
+                load_physical_insert_plan(state, &resolved_mv, PartitionTarget::Active)
+            }?;
             let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            write_chunks_into_managed_partition_for_mv_refresh(
+            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+            write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
                 state,
                 plan,
                 &chunks,
@@ -219,12 +305,46 @@ pub(crate) fn refresh_mv(
                     table_id: runtime.table.table_id,
                     previous_refresh_rows: previous_rows,
                     snapshots,
+                    table_uuids,
                 },
+                row_delta,
             )?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         },
         |shape, previous_snapshot_id, current_snapshot_id| {
+            let change_batch = match plan_iceberg_change_batch_for_ivm(
+                &loaded.table,
+                previous_snapshot_id,
+                current_snapshot_id,
+                &mv_row.primary_key_columns,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => match policy_from_change_error(err) {
+                    MvRefreshPolicy::FullRefresh { reason, .. } => {
+                        tracing::info!(
+                            target: "mv_refresh",
+                            mv = %format!("{}.{}", db_name, mv_name),
+                            base = %base_ref.fqn(),
+                            snapshot_from = previous_snapshot_id,
+                            snapshot_to = current_snapshot_id,
+                            reason = %reason,
+                            "mv_refresh fall-back to Full from aggregate incremental planner"
+                        );
+                        return refresh_aggregate_mv_full(state, &db_name, &mv_name, shape);
+                    }
+                    MvRefreshPolicy::Unsupported { reason } => {
+                        return Err(format!(
+                            "iceberg materialized view refresh unsupported: {reason}"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "iceberg materialized view refresh produced invalid policy from change planner: {other:?}"
+                        ));
+                    }
+                },
+            };
             refresh_aggregate_mv_incremental(AggregateMvIncrementalRefreshContext {
                 state,
                 database: &db_name,
@@ -233,9 +353,14 @@ pub(crate) fn refresh_mv(
                 select_sql: &mv_row.select_sql,
                 base_ref,
                 base_table: &loaded.table,
+                object_store_config: loaded.object_store_config.as_ref(),
                 shape,
+                primary_key_columns: &mv_row.primary_key_columns,
+                change_batch,
+                previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
+                current_table_uuid: current_table_uuid.clone(),
             })
         },
     )
@@ -249,7 +374,7 @@ fn dispatch_mv_refresh_strategy<
     AggregateIncremental,
 >(
     mv_shape: &super::mv_shape::IncrementalMvShape,
-    strategy: MvRefreshStrategy,
+    strategy: MvRefreshPolicy,
     projection_full: ProjectionFull,
     aggregate_full: AggregateFull,
     no_op: NoOp,
@@ -265,32 +390,37 @@ where
         FnOnce(&super::mv_shape::AggregateMvShape, i64, i64) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
-        (super::mv_shape::IncrementalMvShape::ProjectionFilter(_), MvRefreshStrategy::Full) => {
-            projection_full()
-        }
-        (super::mv_shape::IncrementalMvShape::Aggregate(shape), MvRefreshStrategy::Full) => {
-            aggregate_full(shape)
-        }
+        (
+            super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
+            MvRefreshPolicy::FullRefresh { .. },
+        ) => projection_full(),
+        (
+            super::mv_shape::IncrementalMvShape::Aggregate(shape),
+            MvRefreshPolicy::FullRefresh { .. },
+        ) => aggregate_full(shape),
         (
             _,
-            MvRefreshStrategy::NoOp {
+            MvRefreshPolicy::NoOp {
                 current_snapshot_id,
             },
         ) => no_op(current_snapshot_id),
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
             },
         ) => projection_incremental(previous_snapshot_id, current_snapshot_id),
         (
             super::mv_shape::IncrementalMvShape::Aggregate(shape),
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
             },
         ) => aggregate_incremental(shape, previous_snapshot_id, current_snapshot_id),
+        (_, MvRefreshPolicy::Unsupported { reason }) => Err(format!(
+            "iceberg materialized view refresh unsupported: {reason}"
+        )),
     }
 }
 
@@ -331,24 +461,29 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     select_sql: &'a str,
     base_ref: &'a IcebergTableRef,
     base_table: &'a iceberg::table::Table,
+    object_store_config: Option<&'a crate::fs::object_store::ObjectStoreConfig>,
     shape: &'a super::mv_shape::AggregateMvShape,
+    primary_key_columns: &'a [String],
+    change_batch: crate::connector::iceberg::changes::IcebergChangeBatch,
+    previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
+    current_table_uuid: String,
 }
 
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
     let state_sql = super::mv_shape::rewrite_select_sql_for_state(ctx.select_sql, ctx.shape)?;
-    let change_stream = materialize_iceberg_change_stream(
+    let change_stream = materialize_iceberg_change_batch(
         ctx.state,
         ctx.database,
         &state_sql,
         ctx.base_ref,
         ctx.base_table,
-        ctx.previous_snapshot_id,
-        ctx.current_snapshot_id,
-        &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
+        ctx.change_batch,
+        ctx.object_store_config,
+        ctx.primary_key_columns,
     )?;
 
     if change_stream.previous_snapshot_id != ctx.previous_snapshot_id
@@ -365,43 +500,57 @@ fn refresh_aggregate_mv_incremental(
 
     // Empty-input early return: nothing to merge, just advance lineage.
     if change_stream.is_empty() {
-        // The refresh metadata write is what advances the lineage marker.
-        // PR-3 doesn't yet have a no-op write path that touches metadata
-        // without writing chunks; defer to PR-4.
-        return Err(
-            "aggregate MV incremental refresh: no inserts and no deletes; \
-             lineage-advance-only path not yet implemented in PR-3 — defer to PR-4"
-                .to_string(),
-        );
+        let metadata_store =
+            ctx.state.metadata_store.as_ref().ok_or_else(|| {
+                "managed lake mv refresh requires sqlite metadata store".to_string()
+            })?;
+        advance_mv_refresh_metadata_without_writes(
+            metadata_store,
+            ctx.table_id,
+            ctx.base_ref,
+            ctx.current_snapshot_id,
+            &ctx.current_table_uuid,
+            ctx.previous_refresh_rows,
+        )?;
+        refresh_managed_catalog(ctx.state)?;
+        return Ok(StatementResult::Ok);
     }
 
-    // Build the layout early (cheap: parse + analyze only, no SQL execution) so we can
-    // inspect the aggregate functions before deciding how to handle DELETE files.
-    // The rewritten state SQL (AVG → SUM + COUNT) produces state-shaped columns whose count
-    // does not match shape.visible_outputs. Sourcing types from the analyzer avoids this mismatch.
+    let apply_policy = apply_policy_for_change(
+        &super::mv_shape::IncrementalMvShape::Aggregate(ctx.shape.clone()),
+        change_stream.inserts.row_count() > 0,
+        change_stream.deletes.row_count() > 0,
+        false,
+    );
+    match apply_policy {
+        MvApplyPolicy::Incremental => {}
+        MvApplyPolicy::FullRefresh { reason } => {
+            tracing::info!(
+                target: "mv_refresh",
+                mv = %format!("{}.{}", ctx.database, ctx.mv_name),
+                base = %ctx.base_ref.fqn(),
+                snapshot_from = ctx.previous_snapshot_id,
+                snapshot_to = ctx.current_snapshot_id,
+                delete_rows = change_stream.deletes.row_count(),
+                reason = %reason,
+                "mv_refresh fall-back to Full from apply policy"
+            );
+            return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+        }
+        MvApplyPolicy::Unsupported { reason } => {
+            return Err(format!(
+                "iceberg materialized view refresh unsupported: {reason}"
+            ));
+        }
+    }
+
+    // The rewritten state SQL (AVG -> SUM + COUNT) produces state-shaped columns whose
+    // count does not match shape.visible_outputs. Sourcing types from the analyzer
+    // avoids this mismatch before materializing state chunks.
     let visible_output_columns =
         analyze_visible_output_types(ctx.state, ctx.database, ctx.select_sql)?;
     let layout =
         super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
-
-    // MIN/MAX state has no closed-form retract: negate_aggregate_state_chunks panics on
-    // MIN/MAX columns. When DELETE files appear in the change batch and the layout includes
-    // any MIN or MAX aggregate, fall back to a full refresh instead of attempting a partial
-    // retract that cannot be expressed as state arithmetic.
-    if change_stream.deletes.row_count() > 0 && super::mv_agg_state::layout_has_min_or_max(&layout)
-    {
-        tracing::info!(
-            target: "mv_refresh",
-            mv = %format!("{}.{}", ctx.database, ctx.mv_name),
-            base = %ctx.base_ref.fqn(),
-            snapshot_from = ctx.previous_snapshot_id,
-            snapshot_to = ctx.current_snapshot_id,
-            delete_rows = change_stream.deletes.row_count(),
-            reason = "min_max_with_deletes",
-            "mv_refresh fall-back to Full: MIN/MAX aggregate cannot retract DELETE state"
-        );
-        return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
-    }
 
     let (inserts, deletes) = change_stream.into_results();
     let insert_delta =
@@ -424,6 +573,7 @@ fn refresh_aggregate_mv_incremental(
         PartitionTarget::Active,
     )?;
     let snapshots = single_snapshot_map(ctx.base_ref, ctx.current_snapshot_id);
+    let table_uuids = single_table_uuid_map(ctx.base_ref, &ctx.current_table_uuid);
     write_chunks_into_managed_partition_for_aggregate_mv_upsert(
         ctx.state,
         plan,
@@ -434,10 +584,27 @@ fn refresh_aggregate_mv_incremental(
             // Upsert writes the full merged active aggregate state, not an append delta.
             previous_refresh_rows: 0,
             snapshots,
+            table_uuids,
         },
     )?;
     refresh_managed_catalog(ctx.state)?;
     Ok(StatementResult::Ok)
+}
+
+fn advance_mv_refresh_metadata_without_writes(
+    metadata_store: &SqliteMetadataStore,
+    table_id: i64,
+    base_ref: &IcebergTableRef,
+    current_snapshot_id: i64,
+    current_table_uuid: &str,
+    last_refresh_rows: i64,
+) -> Result<(), String> {
+    metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
+        table_id,
+        last_refresh_rows,
+        snapshots: single_snapshot_map(base_ref, current_snapshot_id),
+        table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
+    })
 }
 
 pub(crate) fn refresh_mv_full_with_executor<F>(
@@ -564,7 +731,7 @@ where
         }
     };
 
-    let snapshots = collect_current_snapshots_or_cleanup_staged_partition(
+    let base_metadata = collect_current_base_metadata_or_cleanup_staged_partition(
         state,
         metadata_store,
         runtime.table.table_id,
@@ -578,7 +745,8 @@ where
         new_index_id: staged.index_id,
         retired_root_path,
         rows_written,
-        snapshots,
+        snapshots: base_metadata.snapshots,
+        table_uuids: base_metadata.table_uuids,
     }) {
         cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
         return Err(format!("mv refresh activate failed: {err}"));
@@ -601,6 +769,56 @@ fn run_mv_select_and_chunks(ctx: MvRefreshContext) -> Result<Vec<Chunk>, String>
     query_result_to_chunks(result)
 }
 
+fn run_projection_mv_select_and_chunks(
+    ctx: MvRefreshContext,
+    primary_key_columns: &[String],
+) -> Result<Vec<Chunk>, String> {
+    let select_sql = projection_mv_physical_select_sql(&ctx.select_sql, primary_key_columns)?;
+    let result: QueryResult = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &select_sql)?;
+    query_result_to_chunks(result)
+}
+
+fn projection_mv_physical_select_sql(
+    select_sql: &str,
+    primary_key_columns: &[String],
+) -> Result<String, String> {
+    if primary_key_columns.is_empty() {
+        return Ok(select_sql.to_string());
+    }
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("projection MV physical SELECT normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("projection MV physical SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("projection MV physical SELECT expects a SELECT query".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("projection MV physical SELECT expects a SELECT body".to_string());
+    };
+
+    let mut projection = Vec::with_capacity(
+        primary_key_columns
+            .len()
+            .saturating_add(select.projection.len()),
+    );
+    for key in primary_key_columns {
+        projection.push(hidden_primary_key_select_item(key)?);
+    }
+    projection.extend(std::mem::take(&mut select.projection));
+    select.projection = projection;
+    Ok(stmt.to_string())
+}
+
+fn hidden_primary_key_select_item(key: &str) -> Result<sqlparser::ast::SelectItem, String> {
+    use sqlparser::ast::{Expr, Ident, SelectItem};
+    let hidden_name = super::mv_ddl::projection_mv_hidden_pk_column_name(key)?;
+    Ok(SelectItem::ExprWithAlias {
+        expr: Expr::Identifier(Ident::new(key)),
+        alias: Ident::new(hidden_name),
+    })
+}
+
 /// Run the MV SELECT against the base table and return the resulting chunks.
 /// Wrapper around `run_mv_select_and_chunks` for use by the iceberg refresh path.
 pub(crate) fn run_mv_full_select_chunks(
@@ -621,6 +839,50 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
         .into_iter()
         .map(|chunk| record_batch_to_chunk(chunk.batch))
         .collect()
+}
+
+const MV_OP_UPSERT: i8 = 0;
+const MV_OP_DELETE: i8 = 1;
+const MV_OP_COLUMN: &str = "__op";
+
+fn query_result_to_mv_op_chunks(result: QueryResult, op: i8) -> Result<Vec<Chunk>, String> {
+    result
+        .chunks
+        .into_iter()
+        .map(|chunk| append_mv_op_column(chunk.batch, op).and_then(record_batch_to_chunk))
+        .collect()
+}
+
+fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String> {
+    let row_count = batch.num_rows();
+    let mut fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    if fields
+        .iter()
+        .any(|field| field.name().eq_ignore_ascii_case(MV_OP_COLUMN))
+    {
+        return Err(format!(
+            "materialized view incremental write result contains reserved column `{MV_OP_COLUMN}`"
+        ));
+    }
+    fields.push(Field::new(MV_OP_COLUMN, DataType::Int8, false));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int8Array::from(vec![op; row_count])) as ArrayRef);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("append MV op column failed: {e}"))
+}
+
+fn chunks_row_count(chunks: &[Chunk]) -> Result<i64, String> {
+    chunks.iter().try_fold(0_i64, |acc, chunk| {
+        let rows = i64::try_from(chunk.len())
+            .map_err(|_| "materialized view refresh row count overflow".to_string())?;
+        acc.checked_add(rows)
+            .ok_or_else(|| "materialized view refresh row count overflow".to_string())
+    })
 }
 
 #[cfg(test)]
@@ -771,34 +1033,54 @@ pub(crate) fn single_snapshot_map(
     snapshots
 }
 
-fn collect_current_snapshots(
+pub(crate) fn single_table_uuid_map(
+    table_ref: &IcebergTableRef,
+    table_uuid: &str,
+) -> BTreeMap<String, String> {
+    let mut uuids = BTreeMap::new();
+    uuids.insert(table_ref.fqn(), table_uuid.to_string());
+    uuids
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CurrentBaseMetadata {
+    snapshots: BTreeMap<String, i64>,
+    table_uuids: BTreeMap<String, String>,
+}
+
+fn collect_current_base_metadata(
     state: &Arc<StandaloneState>,
     refs: &[IcebergTableRef],
-) -> Result<BTreeMap<String, i64>, String> {
+) -> Result<CurrentBaseMetadata, String> {
     let registry = state
         .iceberg_catalogs
         .read()
         .expect("iceberg registry read lock");
-    let mut snapshots = BTreeMap::new();
+    let mut metadata = CurrentBaseMetadata::default();
     for table_ref in refs {
         let entry = registry.get(&table_ref.catalog)?;
         let loaded = load_table(&entry, &table_ref.namespace, &table_ref.table)?;
+        metadata
+            .table_uuids
+            .insert(table_ref.fqn(), loaded.table.metadata().uuid().to_string());
         if let Some(snapshot) = loaded.table.metadata().current_snapshot() {
-            snapshots.insert(table_ref.fqn(), snapshot.snapshot_id());
+            metadata
+                .snapshots
+                .insert(table_ref.fqn(), snapshot.snapshot_id());
         }
     }
-    Ok(snapshots)
+    Ok(metadata)
 }
 
-fn collect_current_snapshots_or_cleanup_staged_partition(
+fn collect_current_base_metadata_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     refs: &[IcebergTableRef],
-) -> Result<BTreeMap<String, i64>, String> {
-    match collect_current_snapshots(state, refs) {
-        Ok(snapshots) => Ok(snapshots),
+) -> Result<CurrentBaseMetadata, String> {
+    match collect_current_base_metadata(state, refs) {
+        Ok(metadata) => Ok(metadata),
         Err(err) => {
             if let Err(cleanup_err) =
                 cleanup_staged_partition(state, metadata_store, table_id, staged, true)
@@ -880,8 +1162,20 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
             crate::engine::catalog::normalize_identifier(database)?,
             crate::engine::catalog::normalize_identifier(table)?,
         )),
+        [catalog, database, table] => {
+            let catalog = crate::engine::catalog::normalize_identifier(catalog)?;
+            if catalog != "default_catalog" {
+                return Err(format!(
+                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
+                ));
+            }
+            Ok((
+                crate::engine::catalog::normalize_identifier(database)?,
+                crate::engine::catalog::normalize_identifier(table)?,
+            ))
+        }
         _ => Err(format!(
-            "materialized view name must be `<name>` or `<db>.<name>`; got `{}`",
+            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
             name.parts.join(".")
         )),
     }
@@ -903,6 +1197,7 @@ mod tests {
         patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
         table_columns_from_physical_columns,
     };
+    use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
@@ -926,16 +1221,22 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_without_previous_snapshot_uses_full_refresh() {
-        let strategy = choose_refresh_strategy(None, Some(10)).expect("strategy");
-        assert_eq!(strategy, MvRefreshStrategy::Full);
+        let strategy = choose_snapshot_refresh_policy(None, Some(10)).expect("strategy");
+        assert_eq!(
+            strategy,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(10),
+                reason: FullRefreshReason::InitialRefresh,
+            }
+        );
     }
 
     #[test]
     fn choose_refresh_strategy_for_same_snapshot_is_no_op() {
-        let strategy = choose_refresh_strategy(Some(10), Some(10)).expect("strategy");
+        let strategy = choose_snapshot_refresh_policy(Some(10), Some(10)).expect("strategy");
         assert_eq!(
             strategy,
-            MvRefreshStrategy::NoOp {
+            MvRefreshPolicy::NoOp {
                 current_snapshot_id: 10
             }
         );
@@ -943,10 +1244,10 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_for_advanced_snapshot_is_incremental() {
-        let strategy = choose_refresh_strategy(Some(10), Some(12)).expect("strategy");
+        let strategy = choose_snapshot_refresh_policy(Some(10), Some(12)).expect("strategy");
         assert_eq!(
             strategy,
-            MvRefreshStrategy::Incremental {
+            MvRefreshPolicy::Incremental {
                 previous_snapshot_id: 10,
                 current_snapshot_id: 12,
             }
@@ -955,15 +1256,63 @@ mod tests {
 
     #[test]
     fn choose_refresh_strategy_rejects_unreachable_previous_snapshot() {
-        let err = choose_refresh_strategy(Some(10), None).expect_err("strategy should fail");
+        let err = choose_snapshot_refresh_policy(Some(10), None).expect_err("strategy should fail");
         assert!(
             err.contains("10"),
             "expected error to contain previous snapshot id, got `{err}`"
         );
         assert!(
-            err.contains("no longer reachable"),
-            "expected error to describe unreachable snapshot, got `{err}`"
+            err.contains("no current snapshot"),
+            "expected error to describe missing current snapshot, got `{err}`"
         );
+    }
+
+    #[test]
+    fn overwrite_change_error_routes_projection_mv_to_full_refresh_policy() {
+        let policy = policy_from_change_error(
+            crate::connector::iceberg::changes::ChangeError::UnsupportedOperation {
+                snapshot_id: 99,
+                op: "overwrite".to_string(),
+            },
+        );
+        assert_eq!(
+            policy,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(99),
+                reason: FullRefreshReason::InsertOverwrite { snapshot_id: 99 },
+            }
+        );
+    }
+
+    #[test]
+    fn advance_empty_change_stream_updates_metadata_without_writing() {
+        let (_dir, store) = seed_mv_refresh_store();
+        let base_ref = IcebergTableRef {
+            catalog: "missing_catalog".to_string(),
+            namespace: "ns".to_string(),
+            table: "orders".to_string(),
+        };
+        let snapshots = single_snapshot_map(&base_ref, 42);
+        store
+            .begin_mv_refresh(BeginMvRefreshRequest {
+                table_id: 10,
+                target_snapshots: snapshots.clone(),
+            })
+            .expect("begin refresh");
+
+        advance_mv_refresh_metadata_without_writes(&store, 10, &base_ref, 42, "uuid-1", 17)
+            .expect("advance metadata");
+
+        let snapshot = store.load_snapshot().expect("load snapshot").managed;
+        let mv = snapshot
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv row");
+        assert_eq!(mv.last_refresh_rows, Some(17));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+        assert!(!mv.refresh_in_progress);
+        assert!(mv.refresh_target_snapshots.is_empty());
     }
 
     #[test]
@@ -984,7 +1333,10 @@ mod tests {
 
         let result = dispatch_mv_refresh_strategy(
             &mv_shape,
-            MvRefreshStrategy::Full,
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(12),
+                reason: FullRefreshReason::InitialRefresh,
+            },
             || {
                 projection_full_called.set(true);
                 Err("projection full executor should not run".to_string())
@@ -1123,7 +1475,7 @@ mod tests {
 
     #[test]
     fn aggregate_mv_incremental_refresh_handles_base_delete() {
-        // End-to-end PR-3 deliverable test. Builds a real iceberg base
+        // End-to-end delete-bearing aggregate IVM test. Builds a real iceberg base
         // table (3 rows over (id, customer, amount)), creates a
         // managed-lake aggregate MV (count + sum grouped by customer),
         // populates the MV via a full REFRESH, then DELETEs one base row
@@ -1274,6 +1626,152 @@ mod tests {
             ],
             "MV state after delete-bearing incremental refresh must drop \
              count and sum for the affected group; other groups untouched"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn aggregate_mv_incremental_refresh_handles_equality_delete() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="2")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after full refresh must reflect the seeded base rows"
+        );
+
+        session
+            .execute_in_database(
+                "alter table ice.ns.orders add equality delete (id) values (1)",
+                "default",
+            )
+            .expect("add equality delete for base row id=1");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV equality-delete test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!(
+                "second (incremental, equality-delete-bearing) refresh materialized view: {err}"
+            );
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV equality-delete test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after equality-delete incremental refresh must retract the deleted row"
         );
 
         drop(engine);
@@ -1444,6 +1942,150 @@ mod tests {
         drop(engine);
     }
 
+    #[test]
+    fn aggregate_mv_incremental_refresh_handles_s3_v3_row_lineage_base_delete() {
+        // Same delete-bearing aggregate IVM path as
+        // `aggregate_mv_incremental_refresh_handles_v3_row_lineage_base_delete`,
+        // but the base Iceberg table itself lives in the MinIO-backed S3 catalog.
+        // This covers object-store path normalization in delete reverse projection.
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_warehouse = unique_s3_iceberg_warehouse("mv_s3_v3_delete");
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        session
+            .execute_in_database(
+                &create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse),
+                "default",
+            )
+            .expect("create s3 iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create s3 row-lineage iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed s3 iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "s3 row-lineage MV state after full refresh must reflect the seeded base rows"
+        );
+
+        session
+            .execute_in_database("delete from ice.ns.orders where id = 1", "default")
+            .expect("delete s3 base row id=1 (writes puffin dv)");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, s3 DV-bearing) refresh materialized view: {err}");
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "s3 row-lineage MV state after DV-bearing incremental refresh must retract the deleted row"
+        );
+
+        drop(engine);
+    }
+
     /// Read the managed-lake aggregate MV's visible state as
     /// `(customer, c, s)` rows sorted by customer. Used by the
     /// end-to-end `aggregate_mv_incremental_refresh_handles_base_delete`
@@ -1545,6 +2187,45 @@ enable_path_style_access = true
         Some((dir, config_path))
     }
 
+    fn s3_test_value(primary: &str, fallback: &str, default: &str) -> String {
+        std::env::var(primary)
+            .or_else(|_| std::env::var(fallback))
+            .unwrap_or_else(|_| default.to_string())
+    }
+
+    fn unique_s3_iceberg_warehouse(prefix: &str) -> String {
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root =
+            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let run_id = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        if root.trim_matches('/').is_empty() {
+            format!("s3://{bucket}/{run_id}")
+        } else {
+            format!("s3://{}/{}/{}", bucket, root.trim_matches('/'), run_id)
+        }
+    }
+
+    fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> String {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let access_key_id = s3_test_value("AWS_S3_ACCESS_KEY_ID", "MINIO_ROOT_USER", "admin");
+        let access_key_secret = s3_test_value(
+            "AWS_S3_SECRET_ACCESS_KEY",
+            "MINIO_ROOT_PASSWORD",
+            "admin123",
+        );
+        format!(
+            r#"create external catalog {catalog_name} properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{warehouse_uri}","aws.s3.endpoint"="{endpoint}","aws.s3.access_key"="{access_key_id}","aws.s3.secret_key"="{access_key_secret}","aws.s3.enable_path_style_access"="true","aws.s3.region"="us-east-1")"#
+        )
+    }
+
     #[test]
     fn collect_current_snapshots_cleans_staged_partition_on_failure() {
         let (_dir, store) = seed_mv_refresh_store();
@@ -1577,7 +2258,7 @@ enable_path_style_access = true
             table: "orders".to_string(),
         }];
 
-        let err = collect_current_snapshots_or_cleanup_staged_partition(
+        let err = collect_current_base_metadata_or_cleanup_staged_partition(
             &state, &store, 10, &staged, &refs,
         )
         .expect_err("snapshot collection should fail");
@@ -1733,6 +2414,8 @@ enable_path_style_access = true
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -1856,6 +2539,8 @@ enable_path_style_access = true
                 last_refresh_ms: None,
                 last_refresh_rows: None,
                 last_refresh_snapshots: BTreeMap::new(),
+                last_refresh_table_uuids: Default::default(),
+                primary_key_columns: Vec::new(),
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,

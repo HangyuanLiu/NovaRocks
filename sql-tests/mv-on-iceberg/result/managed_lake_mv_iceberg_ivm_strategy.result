@@ -1,0 +1,24 @@
+-- query 3
+customer	c	s
+A	2	30
+B	1	30
+
+-- query 6
+customer	c	s
+A	3	130
+B	1	30
+
+-- query 9
+customer	c	s
+A	2	320
+B	1	130
+
+-- query 11
+id	customer	amount
+3	B	130
+4	A	200
+
+-- query 13
+customer	c	s
+A	1	200
+B	1	130

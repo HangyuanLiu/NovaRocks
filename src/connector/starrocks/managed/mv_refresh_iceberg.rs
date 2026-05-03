@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+use iceberg::Catalog;
+use iceberg::spec::{DataFile, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -18,16 +19,19 @@ use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use parquet::file::properties::WriterProperties;
 
 use crate::connector::iceberg::changes::plan_changes;
+use crate::connector::iceberg::commit::{
+    CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
+};
 use crate::connector::starrocks::managed::mv_ddl::{
     alloc_id, analyze_mv_select, extract_base_table_refs, find_or_create_managed_database, now_ms,
-    resolve_mv_name,
+    resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::connector::starrocks::managed::mv_iceberg_catalog::{
     NOVA_MV_CATALOG_NAME, build_nova_mv_catalog,
 };
 use crate::connector::starrocks::managed::mv_refresh::{
     load_current_iceberg_base_table, query_result_to_chunks, run_mv_full_select_chunks,
-    single_snapshot_map,
+    single_snapshot_map, single_table_uuid_map,
 };
 use crate::connector::starrocks::managed::mv_shape::{
     IncrementalMvShape, classify_incremental_mv_query,
@@ -37,6 +41,7 @@ use crate::connector::starrocks::managed::store::{
     UpdateMvIcebergRefreshMetadataRequest,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
+use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::analysis::OutputColumn;
@@ -63,6 +68,7 @@ pub(crate) fn create_iceberg_mv(
 
     // 1. Analyze and classify shape — phase4a only accepts projection/filter.
     let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
+    validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
     let shape = classify_incremental_mv_query(&stmt.select_query)?;
     if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
@@ -134,6 +140,7 @@ pub(crate) fn create_iceberg_mv(
         mv_id,
         select_sql: stmt.select_sql.clone(),
         base_table_refs: base_refs,
+        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
         iceberg_table_identifier: format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}"),
         created_at_ms: now_ms(),
     })?;
@@ -227,7 +234,27 @@ pub(crate) fn refresh_iceberg_mv(
         .metadata()
         .current_snapshot()
         .map(|s| s.snapshot_id());
+    let current_table_uuid = loaded.table.metadata().uuid().to_string();
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
+
+    if let Some(previous_uuid) = mv_row.last_refresh_table_uuids.get(&base_ref.fqn())
+        && previous_uuid != &current_table_uuid
+    {
+        tracing::info!(
+            "iceberg mv {db_name}.{mv_name}: base table identity changed from {previous_uuid} to {current_table_uuid}; rebuilding with overwrite"
+        );
+        return rebuild_iceberg_mv(
+            state,
+            &cfg,
+            metadata_store,
+            &db_name,
+            &mv_name,
+            &mv_row,
+            base_ref,
+            current_snapshot_id,
+            &current_table_uuid,
+        );
+    }
 
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
@@ -248,6 +275,7 @@ pub(crate) fn refresh_iceberg_mv(
             &mv_row,
             base_ref,
             cur,
+            &current_table_uuid,
         ),
 
         // No-op: base table snapshot has not advanced.
@@ -256,11 +284,13 @@ pub(crate) fn refresh_iceberg_mv(
                 "iceberg mv {db_name}.{mv_name}: base snapshot {cur} unchanged; updating metadata only"
             );
             let snapshots = single_snapshot_map(base_ref, cur);
+            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
             metadata_store.update_mv_iceberg_refresh_metadata(
                 UpdateMvIcebergRefreshMetadataRequest {
                     table_id: mv_row.mv_id,
                     last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                     snapshots,
+                    table_uuids,
                     iceberg_snapshot_id: mv_row.last_refreshed_iceberg_snapshot_id.unwrap_or(0),
                 },
             )?;
@@ -279,6 +309,7 @@ pub(crate) fn refresh_iceberg_mv(
             prev,
             cur,
             &loaded.table,
+            &current_table_uuid,
         ),
 
         // Previous snapshot no longer reachable.
@@ -312,6 +343,7 @@ fn first_refresh_iceberg_mv(
     mv_row: &crate::connector::starrocks::managed::store::StoredMaterializedView,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     base_snapshot_id: i64,
+    current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
     // 1. Run SELECT and collect chunks.
     let chunks = run_mv_full_select_chunks(state, db_name, &mv_row.select_sql)?;
@@ -370,10 +402,12 @@ fn first_refresh_iceberg_mv(
 
     // 4. Persist refresh metadata in SQLite.
     let snapshots = single_snapshot_map(base_ref, base_snapshot_id);
+    let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
     metadata_store.update_mv_iceberg_refresh_metadata(UpdateMvIcebergRefreshMetadataRequest {
         table_id: mv_row.mv_id,
         last_refresh_rows: total_rows,
         snapshots,
+        table_uuids,
         iceberg_snapshot_id: new_snapshot_id,
     })?;
 
@@ -390,6 +424,118 @@ fn first_refresh_iceberg_mv(
          rows={total_rows} iceberg_snapshot={new_snapshot_id}"
     );
     Ok(StatementResult::Ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
+    db_name: &str,
+    mv_name: &str,
+    mv_row: &crate::connector::starrocks::managed::store::StoredMaterializedView,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_snapshot_id: Option<i64>,
+    current_table_uuid: &str,
+) -> Result<StatementResult, String> {
+    let chunks = run_mv_full_select_chunks(state, db_name, &mv_row.select_sql)?;
+    let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
+
+    let catalog = build_nova_mv_catalog(cfg)?;
+    let ident =
+        TableIdent::from_strs([db_name, mv_name]).map_err(|e| format!("table ident: {e}"))?;
+    let new_snapshot_id = data_block_on(async {
+        let table = catalog
+            .load_table(&ident)
+            .await
+            .map_err(|e| format!("load iceberg mv table for rebuild failed: {e}"))?;
+        let data_files = if chunks.iter().all(|c| c.batch.num_rows() == 0) {
+            Vec::new()
+        } else {
+            write_chunks_as_iceberg_data_files(&table, &chunks).await?
+        };
+        commit_overwrite_iceberg_mv(&table, &catalog, cfg, &ident, data_files).await
+    })??;
+
+    let snapshots = base_snapshot_id
+        .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
+        .unwrap_or_default();
+    metadata_store.update_mv_iceberg_refresh_metadata(UpdateMvIcebergRefreshMetadataRequest {
+        table_id: mv_row.mv_id,
+        last_refresh_rows: total_rows,
+        snapshots,
+        table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
+        iceberg_snapshot_id: new_snapshot_id,
+    })?;
+
+    if let Err(e) = update_iceberg_mv_in_catalog(state, cfg, db_name, mv_name) {
+        tracing::warn!(
+            "iceberg mv {db_name}.{mv_name}: catalog update after rebuild failed: {e}; \
+             SELECT may return stale results until server restart"
+        );
+    }
+
+    Ok(StatementResult::Ok)
+}
+
+async fn commit_overwrite_iceberg_mv(
+    table: &iceberg::table::Table,
+    catalog: &Arc<dyn Catalog>,
+    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    ident: &TableIdent,
+    data_files: Vec<DataFile>,
+) -> Result<i64, String> {
+    let metadata = table.metadata();
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let collector = Arc::new(IcebergCommitCollector::new(
+        CommitOpKind::Overwrite,
+        ident.clone(),
+        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        metadata.last_sequence_number(),
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().clone(),
+        staging_dir,
+        crate::common::types::UniqueId { hi: 0, lo: 0 },
+    ));
+    let default_spec_id = metadata.default_partition_spec_id();
+    for df in data_files {
+        collector.inject_written_file(crate::engine::iceberg_writer::data_file_to_written_file(
+            &df,
+            default_spec_id,
+        )?);
+    }
+
+    let object_store_config = cfg.s3.to_object_store_config();
+    let fs = crate::fs::object_store::build_oss_operator(&object_store_config)
+        .map_err(|e| format!("build S3 operator for iceberg mv overwrite cleanup: {e}"))?;
+    let bucket = object_store_config.bucket.clone();
+    let path_mapper: CleanupPathMapper = Arc::new(move |path| {
+        crate::connector::iceberg::catalog::add_files::parse_s3_path(path)
+            .ok()
+            .and_then(|(actual_bucket, key)| {
+                if actual_bucket == bucket {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| path.to_string())
+    });
+
+    run_iceberg_commit(RunInput {
+        collector,
+        catalog: catalog.clone(),
+        table: table.clone(),
+        fs,
+        file_io: table.file_io().clone(),
+        cleanup_path_mapper: Some(path_mapper),
+    })
+    .await
+    .map(|outcome| outcome.new_snapshot_id)
 }
 
 /// Execute the incremental refresh of an iceberg-backed MV.
@@ -418,14 +564,16 @@ fn incremental_refresh_iceberg_mv(
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     base_table: &iceberg::table::Table,
+    current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
     // 1. Plan the change batch.
     let batch = plan_changes(base_table, previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
-    if !batch.deletes.is_empty() {
+    if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
         return Err(format!(
             "iceberg-stored materialized view incremental refresh does not yet support \
-             delete snapshots; {} delete file(s) seen in lineage",
-            batch.deletes.len()
+             delete snapshots; {} position-delete file(s), {} equality-delete file(s) seen in lineage",
+            batch.deletes.len(),
+            batch.equality_deletes.len()
         ));
     }
     if batch.current_snapshot_id != current_snapshot_id {
@@ -436,10 +584,16 @@ fn incremental_refresh_iceberg_mv(
     }
 
     // 2. Run the MV SELECT scoped to the inserts only.
-    let added_files: Vec<(String, i64, Option<i64>)> = batch
+    let added_files: Vec<IcebergFileForQuery> = batch
         .inserts
         .iter()
-        .map(|f| (f.path.clone(), f.size, f.record_count))
+        .map(|f| IcebergFileForQuery {
+            path: f.path.clone(),
+            size: f.size,
+            record_count: f.record_count,
+            first_row_id: f.first_row_id,
+            data_sequence_number: f.data_sequence_number,
+        })
         .collect();
     let chunks = execute_query_for_mv_incremental_refresh(
         state,
@@ -465,6 +619,7 @@ fn incremental_refresh_iceberg_mv(
                 table_id: mv_row.mv_id,
                 last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 snapshots: single_snapshot_map(base_ref, current_snapshot_id),
+                table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
                 iceberg_snapshot_id: mv_row.last_refreshed_iceberg_snapshot_id.unwrap_or(0),
             },
         )?;
@@ -503,6 +658,7 @@ fn incremental_refresh_iceberg_mv(
         table_id: mv_row.mv_id,
         last_refresh_rows: new_total_rows,
         snapshots: single_snapshot_map(base_ref, current_snapshot_id),
+        table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
         iceberg_snapshot_id: new_snapshot_id,
     })?;
 

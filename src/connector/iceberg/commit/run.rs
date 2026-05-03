@@ -42,12 +42,15 @@ use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
 use super::types::{CommitOpKind, CommitOutcome};
 
+pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub struct RunInput {
     pub collector: Arc<IcebergCommitCollector>,
     pub catalog: Arc<dyn Catalog>,
     pub table: Table,
     pub fs: Operator,
     pub file_io: FileIO,
+    pub cleanup_path_mapper: Option<CleanupPathMapper>,
 }
 
 /// Dispatch a commit-action and handle abort/cleanup.
@@ -64,6 +67,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         table,
         fs,
         file_io,
+        cleanup_path_mapper,
     } = input;
 
     let action: Box<dyn IcebergCommitAction> = match collector.op_kind {
@@ -101,7 +105,14 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
                     collector.staging_dir
                 ))
             } else {
-                let cleanup_errors = collector.abort_log.cleanup(&fs).await;
+                let cleanup_errors = if let Some(mapper) = cleanup_path_mapper {
+                    collector
+                        .abort_log
+                        .cleanup_with_path_mapper(&fs, |path| mapper(path))
+                        .await
+                } else {
+                    collector.abort_log.cleanup(&fs).await
+                };
                 for e in &cleanup_errors {
                     tracing::warn!(path = %e.path, source = ?e.source, "abort cleanup error");
                 }

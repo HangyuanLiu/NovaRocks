@@ -9,7 +9,9 @@ use crate::types;
 
 use super::resolve::ResolvedTable;
 
-use crate::sql::catalog::{IcebergDeleteFileFormat, IcebergDeleteFileInfo, TableStorage};
+use crate::sql::catalog::{
+    IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo, TableStorage,
+};
 
 // ---------------------------------------------------------------------------
 // Scan node
@@ -560,10 +562,18 @@ fn build_hdfs_scan_range_params(
     for delete_file in delete_files {
         match delete_file.file_format {
             IcebergDeleteFileFormat::Parquet => {
+                let file_content = match delete_file.file_content {
+                    IcebergDeleteFileContent::Position => {
+                        types::TIcebergFileContent::POSITION_DELETES
+                    }
+                    IcebergDeleteFileContent::Equality => {
+                        types::TIcebergFileContent::EQUALITY_DELETES
+                    }
+                };
                 parquet_delete_files.push(plan_nodes::TIcebergDeleteFile::new(
                     Some(delete_file.path.clone()),
                     Some(descriptors::THdfsFileFormat::PARQUET),
-                    Some(types::TIcebergFileContent::POSITION_DELETES),
+                    Some(file_content),
                     delete_file.length,
                 ));
             }

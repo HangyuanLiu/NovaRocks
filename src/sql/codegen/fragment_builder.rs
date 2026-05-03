@@ -70,6 +70,25 @@ pub(crate) struct ScanTupleOwner {
     pub fragment_id: FragmentId,
 }
 
+fn add_iceberg_equality_delete_required_columns(
+    required: &mut std::collections::HashSet<String>,
+    storage: &crate::sql::catalog::TableStorage,
+) {
+    let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = storage else {
+        return;
+    };
+    for file in files {
+        for delete_file in &file.delete_files {
+            if delete_file.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
+                continue;
+            }
+            for column in &delete_file.equality_column_names {
+                required.insert(column.to_lowercase());
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
@@ -329,10 +348,13 @@ impl<'a> PlanFragmentBuilder<'a> {
         let qualifier = op.alias.as_deref().or(Some(&op.table.name));
 
         // Determine which columns to emit
-        let required: Option<std::collections::HashSet<String>> = op
+        let mut required: Option<std::collections::HashSet<String>> = op
             .required_columns
             .as_ref()
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
+        if let Some(required) = required.as_mut() {
+            add_iceberg_equality_delete_required_columns(required, &op.table.storage);
+        }
 
         let physical_layout = self
             .catalog
@@ -2739,7 +2761,8 @@ mod tests {
     use crate::plan_nodes;
     use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+        CatalogProvider, ColumnDef, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+        IcebergDeleteFileInfo, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     };
     use crate::sql::optimizer::operator::{
         Operator, PhysicalDistributionOp, PhysicalScanOp, PhysicalSortOp,
@@ -2806,6 +2829,39 @@ mod tests {
             output_row_count: 3.0,
             column_statistics: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn equality_delete_columns_are_added_to_required_scan_columns() {
+        let mut required = std::collections::HashSet::from(["id".to_string()]);
+        let storage = TableStorage::S3ParquetFiles {
+            files: vec![crate::sql::catalog::S3FileInfo {
+                path: "s3://bucket/data.parquet".to_string(),
+                size: 1,
+                row_count: Some(1),
+                column_stats: None,
+                first_row_id: None,
+                data_sequence_number: Some(1),
+                delete_files: vec![IcebergDeleteFileInfo {
+                    path: "s3://bucket/eq-delete.parquet".to_string(),
+                    file_format: IcebergDeleteFileFormat::Parquet,
+                    file_content: IcebergDeleteFileContent::Equality,
+                    length: Some(1),
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    sequence_number: Some(2),
+                    partition_spec_id: Some(0),
+                    partition_key: Some("Struct([])".to_string()),
+                    equality_column_names: vec!["category".to_string()],
+                }],
+            }],
+            cloud_properties: BTreeMap::new(),
+        };
+
+        add_iceberg_equality_delete_required_columns(&mut required, &storage);
+
+        assert!(required.contains("id"));
+        assert!(required.contains("category"));
     }
 
     fn scan_plan(path: PathBuf) -> PhysicalPlanNode {

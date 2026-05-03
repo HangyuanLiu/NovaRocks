@@ -132,25 +132,8 @@ pub(crate) fn build_iceberg_table_def_with_files(
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
+    data_files: Vec<super::registry::DataFileWithStats>,
 ) -> Result<TableDef, String> {
-    let data_files = data_files
-        .into_iter()
-        .map(
-            |(path, size, record_count)| super::registry::DataFileWithStats {
-                path,
-                size,
-                record_count,
-                column_stats: None,
-                first_row_id: None,
-                // data_sequence_number is not available from the caller-supplied
-                // (path, size, record_count) tuple; callers that need it should
-                // use extract_data_files_with_stats instead.
-                data_sequence_number: None,
-                delete_files: vec![],
-            },
-        )
-        .collect::<Vec<_>>();
     build_iceberg_table_def_with_data_files(entry, namespace, table_name, loaded, data_files)
 }
 

@@ -19,9 +19,6 @@ pub(crate) enum ChangeError {
     /// (e.g. `overwrite`, vendor-specific ops).
     UnsupportedOperation { snapshot_id: i64, op: String },
 
-    /// Equality-delete file encountered; only position-deletes are in scope.
-    EqualityDeleteUnsupported { snapshot_id: i64 },
-
     /// Schema evolution between `previous_snapshot` and `current_snapshot`
     /// (or any unsupported schema-related rejection at CREATE time).
     SchemaEvolutionUnsupported { detail: String },
@@ -52,6 +49,40 @@ pub(crate) enum ChangeError {
     InternalInconsistency(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum IcebergChangePolicySignal {
+    Incremental,
+    FullRefresh { reason: String },
+    Unsupported { reason: String },
+}
+
+pub(crate) fn policy_signal_from_change_error(err: &ChangeError) -> IcebergChangePolicySignal {
+    match err {
+        ChangeError::UnsupportedOperation { op, .. } if op == "overwrite" => {
+            IcebergChangePolicySignal::FullRefresh {
+                reason: "insert overwrite requires full refresh".to_string(),
+            }
+        }
+        ChangeError::LineageBroken { .. } => IcebergChangePolicySignal::FullRefresh {
+            reason: "previous snapshot is not reachable".to_string(),
+        },
+        ChangeError::SchemaEvolutionUnsupported { detail } => {
+            IcebergChangePolicySignal::Unsupported {
+                reason: format!("schema evolution is not supported by IVM: {detail}"),
+            }
+        }
+        ChangeError::ReplaceValidationFailed { reason, .. } => {
+            IcebergChangePolicySignal::Unsupported {
+                reason: format!("replace snapshot is not a safe compaction: {reason}"),
+            }
+        }
+        other => IcebergChangePolicySignal::Unsupported {
+            reason: other.to_string(),
+        },
+    }
+}
+
 impl std::fmt::Display for ChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,10 +104,6 @@ impl std::fmt::Display for ChangeError {
                     )
                 }
             }
-            ChangeError::EqualityDeleteUnsupported { snapshot_id } => write!(
-                f,
-                "iceberg snapshot {snapshot_id} contains equality-delete files; not supported in this phase"
-            ),
             ChangeError::SchemaEvolutionUnsupported { detail } => {
                 write!(f, "iceberg schema evolution not supported: {detail}")
             }
@@ -116,15 +143,15 @@ impl std::fmt::Display for ChangeError {
 impl std::error::Error for ChangeError {}
 
 /// Reference to a single data file added to the table by an `Append`
-/// snapshot. PR-2 builds these from the snapshot's data manifests; PR-3
-/// will pass the path/size/record_count tuple through to the existing
-/// MV-incremental-refresh executor (which currently consumes
-/// `Vec<(String, i64, Option<i64>)>` directly).
+/// snapshot. Row-lineage metadata is preserved so incremental MV refresh can
+/// expose Iceberg v3 metadata columns while scanning only the appended files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DataFileRef {
     pub path: String,
     pub size: i64,
     pub record_count: Option<i64>,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
 }
 
 /// Reference to a single position-delete file added to the table by a
@@ -154,6 +181,55 @@ pub(crate) struct PositionDeleteRef {
     /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
     /// `file_format == Parquet`.
     pub content_size_in_bytes: Option<i64>,
+}
+
+/// Reference to a single equality-delete file added to the table. Unlike
+/// position deletes, equality deletes do not name row positions; reverse
+/// projection must scan older data files in the same partition and keep rows
+/// whose equality-key tuple appears in the delete file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EqualityDeleteRef {
+    pub delete_file_path: String,
+    pub delete_file_size: i64,
+    pub record_count: Option<i64>,
+    pub equality_ids: Vec<i32>,
+    pub sequence_number: Option<i64>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
+}
+
+fn equality_delete_applies_to_data_file(
+    delete_file: &EqualityDeleteRef,
+    data_sequence_number: Option<i64>,
+    data_partition_spec_id: Option<i32>,
+    data_partition_key: Option<&str>,
+) -> bool {
+    if let (Some(delete_sequence), Some(data_sequence)) =
+        (delete_file.sequence_number, data_sequence_number)
+        && delete_sequence <= data_sequence
+    {
+        return false;
+    }
+    if let Some(delete_partition) = delete_file.partition_key.as_deref() {
+        if let (Some(delete_spec_id), Some(data_spec_id)) =
+            (delete_file.partition_spec_id, data_partition_spec_id)
+            && delete_spec_id != data_spec_id
+        {
+            return false;
+        }
+        if data_partition_key != Some(delete_partition) {
+            return false;
+        }
+    }
+    true
+}
+
+fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
+    if partition.fields().is_empty() {
+        None
+    } else {
+        Some(format!("{partition:?}"))
+    }
 }
 
 impl PositionDeleteRef {
@@ -213,6 +289,7 @@ pub(crate) struct IcebergChangeBatch {
     pub current_snapshot_id: i64,
     pub inserts: Vec<DataFileRef>,
     pub deletes: Vec<PositionDeleteRef>,
+    pub equality_deletes: Vec<EqualityDeleteRef>,
 }
 
 /// Per-row Change action: this row got inserted or deleted relative to
@@ -455,8 +532,8 @@ pub(crate) fn classify_lineage(
 /// current snapshot (inclusive), classifies each snapshot operation,
 /// and assembles `IcebergChangeBatch { inserts, deletes }`.
 ///
-/// The `_pk_columns` parameter is reserved for PR-3 (delete reverse
-/// projection); it is intentionally unused in PR-2.
+/// The `_pk_columns` parameter is reserved for future delete-side row-id
+/// computation; snapshot lineage planning itself does not need it yet.
 pub(crate) fn plan_changes(
     table: &iceberg::table::Table,
     previous_snapshot_id: i64,
@@ -479,31 +556,33 @@ pub(crate) fn plan_changes(
             current_snapshot_id,
             inserts: Vec::new(),
             deletes: Vec::new(),
+            equality_deletes: Vec::new(),
         });
     }
 
     let file_io = table.file_io();
     let collect = collect_files(metadata, file_io, &plan.actions);
-    let (inserts, deletes) = crate::connector::iceberg::catalog::registry::block_on_iceberg(
-        collect,
-    )
-    .map_err(|e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")))??;
+    let (inserts, deletes, equality_deletes) =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(collect).map_err(
+            |e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")),
+        )??;
 
     Ok(IcebergChangeBatch {
         previous_snapshot_id,
         current_snapshot_id,
         inserts,
         deletes,
+        equality_deletes,
     })
 }
 
-/// Top-level PR-3 entry: take an `IcebergChangeBatch`, produce a
+/// Top-level entry: take an `IcebergChangeBatch`, produce a
 /// `MaterializedChanges` whose `inserts` and `deletes` branches each
 /// hold the result of running the MV's SELECT statement against the
 /// relevant subset of base-table rows.
 ///
-/// The `_pk_columns` parameter is reserved for PR-4 (delete-side
-/// row-id computation when AggregateApplyChanges lands).
+/// The `_pk_columns` parameter is reserved for future delete-side row-id
+/// computation when aggregate apply-changes needs stable row identity.
 pub(crate) fn materialize_changes(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     current_database: &str,
@@ -511,15 +590,22 @@ pub(crate) fn materialize_changes(
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     base_table: &iceberg::table::Table,
     batch: IcebergChangeBatch,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     _pk_columns: &[String],
 ) -> Result<MaterializedChanges, String> {
     let inserts = if batch.inserts.is_empty() {
         crate::engine::QueryResult::empty()
     } else {
-        let added_files: Vec<(String, i64, Option<i64>)> = batch
+        let added_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
             .inserts
             .iter()
-            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
+                path: f.path.clone(),
+                size: f.size,
+                record_count: f.record_count,
+                first_row_id: f.first_row_id,
+                data_sequence_number: f.data_sequence_number,
+            })
             .collect();
         crate::engine::mv_flow::execute_query_for_mv_incremental_refresh(
             state,
@@ -530,25 +616,37 @@ pub(crate) fn materialize_changes(
         )?
     };
 
-    let deletes = if batch.deletes.is_empty() {
+    let deletes = if batch.deletes.is_empty() && batch.equality_deletes.is_empty() {
         crate::engine::QueryResult::empty()
     } else {
-        let factory = build_factory_for_table(base_table)?;
+        let factory = build_factory_for_table(base_table, object_store_config)?;
         let size_lookup = |path: &str| -> Option<u64> {
-            // For PR-3 we don't carry the per-data-file size index across
-            // the boundary; iceberg-rust's parquet reader reads metadata
-            // by HEAD when we pass `None`. Best-effort optimization is
-            // PR-4 territory.
+            // We do not currently carry the per-data-file size index across
+            // this boundary; the parquet reader reads metadata by HEAD when
+            // we pass `None`. This is only an optimization opportunity.
             let _ = path;
             None
         };
-        let deleted_rows = crate::connector::iceberg::scan_deletes::scan_deletes(
-            &batch.deletes,
-            &factory,
-            base_table.file_io(),
-            size_lookup,
-        )
-        .map_err(|e| e.to_string())?;
+        let mut deleted_rows = if batch.deletes.is_empty() {
+            Vec::new()
+        } else {
+            crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
+                &batch.deletes,
+                &factory,
+                base_table.file_io(),
+                size_lookup,
+                |path| normalize_delete_projection_path(path, object_store_config),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        if !batch.equality_deletes.is_empty() {
+            deleted_rows.extend(scan_equality_delete_rows_for_table(
+                base_table,
+                &batch.equality_deletes,
+                &factory,
+                object_store_config,
+            )?);
+        }
         crate::engine::mv_flow::execute_query_for_mv_incremental_deletes(
             state,
             current_database,
@@ -566,6 +664,139 @@ pub(crate) fn materialize_changes(
     })
 }
 
+#[derive(Clone, Debug)]
+struct EqualityDeleteDataFileRef {
+    path: String,
+    size: Option<u64>,
+    data_sequence_number: Option<i64>,
+    partition_spec_id: Option<i32>,
+    partition_key: Option<String>,
+}
+
+fn scan_equality_delete_rows_for_table(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data_files = collect_current_data_files_for_equality_delete(table)?;
+    let mut out = Vec::new();
+    for data_file in data_files {
+        let applicable_deletes = equality_deletes
+            .iter()
+            .filter(|delete_file| {
+                equality_delete_applies_to_data_file(
+                    delete_file,
+                    data_file.data_sequence_number,
+                    data_file.partition_spec_id,
+                    data_file.partition_key.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if applicable_deletes.is_empty() {
+            continue;
+        }
+
+        let delete_specs = applicable_deletes
+            .iter()
+            .map(|delete_file| {
+                Ok(
+                    crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+                        path: normalize_delete_projection_path(
+                            &delete_file.delete_file_path,
+                            object_store_config,
+                        )
+                        .map_err(|e| e.to_string())?,
+                        file_format: crate::descriptors::THdfsFileFormat::PARQUET,
+                        file_content: crate::types::TIcebergFileContent::EQUALITY_DELETES,
+                        length: if delete_file.delete_file_size > 0 {
+                            Some(delete_file.delete_file_size as u64)
+                        } else {
+                            None
+                        },
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &delete_specs,
+            factory,
+        )?;
+        out.extend(
+            crate::connector::iceberg::equality_delete::read_data_file_matching_equality_deletes_with_path_normalizer(
+                &data_file.path,
+                data_file.size,
+                &sets,
+                factory,
+                |path| {
+                    normalize_delete_projection_path(path, object_store_config)
+                        .map_err(|e| e.to_string())
+                },
+            )?,
+        );
+    }
+    Ok(out)
+}
+
+fn collect_current_data_files_for_equality_delete(
+    table: &iceberg::table::Table,
+) -> Result<Vec<EqualityDeleteDataFileRef>, String> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    let metadata = table.metadata();
+    let snapshot = metadata.current_snapshot().ok_or_else(|| {
+        "collect equality-delete data files: table has no current snapshot".to_string()
+    })?;
+    let file_io = table.file_io();
+    crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, metadata)
+            .await
+            .map_err(|e| {
+                format!("load manifest list for equality-delete reverse projection: {e}")
+            })?;
+        let mut out = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+                format!(
+                    "load data manifest {} for equality-delete reverse projection: {e}",
+                    manifest_file.manifest_path
+                )
+            })?;
+            for entry in manifest.entries() {
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+                let df = entry.data_file();
+                if df.content_type() != DataContentType::Data {
+                    continue;
+                }
+                out.push(EqualityDeleteDataFileRef {
+                    path: df.file_path().to_string(),
+                    size: Some(df.file_size_in_bytes()),
+                    data_sequence_number: Some(
+                        entry
+                            .sequence_number()
+                            .unwrap_or(manifest_file.sequence_number),
+                    ),
+                    partition_spec_id: Some(manifest_file.partition_spec_id),
+                    partition_key: iceberg_partition_key(df.partition()),
+                });
+            }
+        }
+        Ok(out)
+    })
+    .map_err(|e| format!("collect equality-delete data files runtime: {e}"))?
+}
+
 /// Build a filesystem factory that can read both data files and
 /// position-delete files for the given iceberg base table. We use the
 /// same `OpendalRangeReaderFactory` shape as the HDFS scan path
@@ -573,15 +804,75 @@ pub(crate) fn materialize_changes(
 /// when the catalog has cloud properties).
 fn build_factory_for_table(
     table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
-    let _ = table; // Per PR-3 scope: local-FS only — same constraint as
-    // execute_query_for_mv_incremental_refresh which
-    // rejects multi-file local reads. PR-4 wires cloud.
-    // Build a local-FS operator rooted at "/" so absolute file paths work.
-    let operator = crate::fs::opendal::build_fs_operator("/")
-        .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?;
+    let location = table.metadata().location();
+    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(location))
+        .map_err(|e| format!("classify iceberg delete reverse projection path: {e}"))?;
+    let operator = match scheme {
+        crate::fs::path::ScanPathScheme::Local => crate::fs::opendal::build_fs_operator("/")
+            .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?,
+        crate::fs::path::ScanPathScheme::Oss => {
+            let cfg = object_store_config.ok_or_else(|| {
+                format!(
+                    "missing object store config for delete reverse projection: table_location={location}"
+                )
+            })?;
+            crate::fs::oss::build_oss_operator(cfg).map_err(|e| {
+                format!("build object-store operator for delete reverse projection: {e}")
+            })?
+        }
+        crate::fs::path::ScanPathScheme::Hdfs => {
+            let paths = vec![location.to_string()];
+            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths)
+                .map_err(|e| format!("resolve hdfs path for delete reverse projection: {e}"))?;
+            crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
+                .map_err(|e| format!("build hdfs operator for delete reverse projection: {e}"))?
+        }
+    };
     crate::fs::opendal::OpendalRangeReaderFactory::from_operator(operator)
         .map_err(|e| format!("build opendal range reader factory: {e}"))
+}
+
+fn normalize_delete_projection_path(
+    path: &str,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<String, ChangeError> {
+    let scheme = crate::fs::path::classify_scan_paths(std::iter::once(path)).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "classify iceberg delete reverse projection path {path}: {e}"
+        ))
+    })?;
+    match scheme {
+        crate::fs::path::ScanPathScheme::Local => {
+            Ok(path.strip_prefix("file://").unwrap_or(path).to_string())
+        }
+        crate::fs::path::ScanPathScheme::Oss => {
+            let cfg = object_store_config.ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "missing object store config for delete reverse projection path {path}"
+                ))
+            })?;
+            crate::fs::oss::normalize_oss_path(path, &cfg.bucket, &cfg.root).map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize object-store delete reverse projection path {path}: {e}"
+                ))
+            })
+        }
+        crate::fs::path::ScanPathScheme::Hdfs => {
+            let paths = vec![path.to_string()];
+            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(&paths).map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize hdfs delete reverse projection path {path}: {e}"
+                ))
+            })?;
+            resolved.paths.into_iter().next().ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "normalize hdfs delete reverse projection path {path}: empty result"
+                ))
+            })
+        }
+    }
 }
 
 /// Async file collection for one `LineagePlan`. Loads each snapshot's
@@ -592,11 +883,19 @@ async fn collect_files(
     metadata: &iceberg::spec::TableMetadata,
     file_io: &iceberg::io::FileIO,
     actions: &[LineageAction],
-) -> Result<(Vec<DataFileRef>, Vec<PositionDeleteRef>), ChangeError> {
+) -> Result<
+    (
+        Vec<DataFileRef>,
+        Vec<PositionDeleteRef>,
+        Vec<EqualityDeleteRef>,
+    ),
+    ChangeError,
+> {
     use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
     let mut inserts: Vec<DataFileRef> = Vec::new();
     let mut deletes: Vec<PositionDeleteRef> = Vec::new();
+    let mut equality_deletes: Vec<EqualityDeleteRef> = Vec::new();
 
     for action in actions {
         let snapshot_id = match action {
@@ -626,6 +925,16 @@ async fn collect_files(
                     if manifest_file.added_snapshot_id != snapshot_id {
                         continue;
                     }
+                    let mut next_manifest_first_row_id = manifest_file
+                        .first_row_id
+                        .map(|v| {
+                            i64::try_from(v).map_err(|_| {
+                                ChangeError::InternalInconsistency(format!(
+                                    "manifest first_row_id too large in snapshot {snapshot_id}: {v}"
+                                ))
+                            })
+                        })
+                        .transpose()?;
                     let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
                         ChangeError::InternalInconsistency(format!(
                             "load data manifest {} for snapshot {snapshot_id}: {e}",
@@ -649,11 +958,25 @@ async fn collect_files(
                         if df.content_type() != DataContentType::Data {
                             continue;
                         }
+                        let record_count = i64::try_from(df.record_count()).unwrap_or(i64::MAX);
+                        let first_row_id = df.first_row_id().or(next_manifest_first_row_id);
+                        if let Some(next) = next_manifest_first_row_id.as_mut() {
+                            *next = next.checked_add(record_count).ok_or_else(|| {
+                                ChangeError::InternalInconsistency(format!(
+                                    "first_row_id overflow in manifest {}",
+                                    manifest_file.manifest_path
+                                ))
+                            })?;
+                        }
                         inserts.push(DataFileRef {
                             path: df.file_path().to_string(),
                             size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
-                            record_count: Some(
-                                i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                            record_count: Some(record_count),
+                            first_row_id,
+                            data_sequence_number: Some(
+                                entry
+                                    .sequence_number()
+                                    .unwrap_or(manifest_file.sequence_number),
                             ),
                         });
                     }
@@ -745,7 +1068,41 @@ async fn collect_files(
                                 deletes.push(r);
                             }
                             DataContentType::EqualityDeletes => {
-                                return Err(ChangeError::EqualityDeleteUnsupported { snapshot_id });
+                                if df.file_format() != DataFileFormat::Parquet {
+                                    return Err(ChangeError::InternalInconsistency(format!(
+                                        "equality-delete file in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
+                                        df.file_format(),
+                                        df.file_path()
+                                    )));
+                                }
+                                let equality_ids = df.equality_ids().ok_or_else(|| {
+                                    ChangeError::InternalInconsistency(format!(
+                                        "equality-delete file {} in snapshot {snapshot_id} missing equality_ids",
+                                        df.file_path()
+                                    ))
+                                })?;
+                                if equality_ids.is_empty() {
+                                    return Err(ChangeError::InternalInconsistency(format!(
+                                        "equality-delete file {} in snapshot {snapshot_id} has empty equality_ids",
+                                        df.file_path()
+                                    )));
+                                }
+                                equality_deletes.push(EqualityDeleteRef {
+                                    delete_file_path: df.file_path().to_string(),
+                                    delete_file_size: i64::try_from(df.file_size_in_bytes())
+                                        .unwrap_or(i64::MAX),
+                                    record_count: Some(
+                                        i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                                    ),
+                                    equality_ids,
+                                    sequence_number: Some(
+                                        entry
+                                            .sequence_number()
+                                            .unwrap_or(manifest_file.sequence_number),
+                                    ),
+                                    partition_spec_id: Some(manifest_file.partition_spec_id),
+                                    partition_key: iceberg_partition_key(df.partition()),
+                                });
                             }
                             DataContentType::Data => {
                                 return Err(ChangeError::InternalInconsistency(format!(
@@ -760,7 +1117,7 @@ async fn collect_files(
         }
     }
 
-    Ok((inserts, deletes))
+    Ok((inserts, deletes, equality_deletes))
 }
 
 #[cfg(test)]
@@ -769,15 +1126,98 @@ mod tests {
 
     use iceberg::spec::{Operation, Snapshot, Summary};
 
-    use super::{ChangeError, LineageAction, classify_snapshot, validate_replace_snapshot};
+    use super::{
+        ChangeError, IcebergChangePolicySignal, LineageAction, classify_snapshot,
+        normalize_delete_projection_path, policy_signal_from_change_error,
+        validate_replace_snapshot,
+    };
 
     use crate::connector::iceberg::catalog::registry::{
         IcebergCatalogEntry, build_catalog_entry, create_namespace, create_table, insert_rows,
         load_table,
     };
+    use crate::fs::object_store::ObjectStoreConfig;
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
     use super::plan_changes;
+
+    #[test]
+    fn overwrite_error_policy_signal_is_full_refresh() {
+        let err = ChangeError::UnsupportedOperation {
+            snapshot_id: 1,
+            op: "overwrite".to_string(),
+        };
+        assert_eq!(
+            policy_signal_from_change_error(&err),
+            IcebergChangePolicySignal::FullRefresh {
+                reason: "insert overwrite requires full refresh".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn equality_delete_ref_applies_only_to_older_data_file_in_same_partition() {
+        let delete = super::EqualityDeleteRef {
+            delete_file_path: "/tmp/delete.parquet".to_string(),
+            delete_file_size: 12,
+            record_count: Some(1),
+            equality_ids: vec![1],
+            sequence_number: Some(9),
+            partition_spec_id: Some(3),
+            partition_key: Some("Struct([A])".to_string()),
+        };
+
+        assert!(super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(8),
+            Some(3),
+            Some("Struct([A])")
+        ));
+        assert!(!super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(9),
+            Some(3),
+            Some("Struct([A])")
+        ));
+        assert!(!super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(8),
+            Some(4),
+            Some("Struct([A])")
+        ));
+        assert!(!super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(8),
+            Some(3),
+            Some("Struct([B])")
+        ));
+    }
+
+    #[test]
+    fn unpartitioned_equality_delete_ref_applies_as_global_delete() {
+        let delete = super::EqualityDeleteRef {
+            delete_file_path: "/tmp/delete.parquet".to_string(),
+            delete_file_size: 12,
+            record_count: Some(1),
+            equality_ids: vec![1],
+            sequence_number: Some(9),
+            partition_spec_id: Some(0),
+            partition_key: None,
+        };
+
+        assert!(super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(8),
+            Some(3),
+            Some("Struct([A])")
+        ));
+        assert!(!super::equality_delete_applies_to_data_file(
+            &delete,
+            Some(9),
+            Some(3),
+            Some("Struct([A])")
+        ));
+    }
 
     fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {
         build_catalog_entry(
@@ -839,6 +1279,43 @@ mod tests {
             ("added-data-files", added_files.to_string()),
             ("deleted-data-files", deleted_files.to_string()),
         ]
+    }
+
+    fn test_object_store_config() -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "lake".to_string(),
+            root: "warehouse".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_uses_object_store_config_for_s3_uri() {
+        let cfg = test_object_store_config();
+        let path = normalize_delete_projection_path(
+            "s3://lake/warehouse/db/orders/data.parquet",
+            Some(&cfg),
+        )
+        .expect("normalize");
+        assert_eq!(path, "db/orders/data.parquet");
+    }
+
+    #[test]
+    fn normalize_delete_projection_path_rejects_s3_uri_without_object_store_config() {
+        let err =
+            normalize_delete_projection_path("s3://lake/warehouse/db/orders/data.parquet", None)
+                .expect_err("must reject");
+        assert!(format!("{err}").contains("missing object store config"));
     }
 
     #[test]
@@ -1044,6 +1521,7 @@ mod tests {
         );
         assert!(!batch.inserts.is_empty());
         assert!(batch.deletes.is_empty());
+        assert!(batch.equality_deletes.is_empty());
         let returned_rows: i64 = batch
             .inserts
             .iter()

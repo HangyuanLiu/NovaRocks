@@ -669,12 +669,12 @@ pub fn resolve_oss_operator_and_path_with_config(
 pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String, String> {
     // Expected full path formats:
     // - oss://<bucket>/<key>
-    // - s3://<bucket>/<key> (sometimes used with OSS S3-compat)
+    // - s3://<bucket>/<key> / s3a://<bucket>/<key>
     // - <key> (already relative to bucket)
     // Return value must be path relative to configured OpenDAL root.
     let mut s = full.trim().to_string();
 
-    for scheme in ["oss://", "s3://"] {
+    for scheme in ["oss://", "s3://", "s3a://"] {
         if let Some(rest) = s.strip_prefix(scheme) {
             let (b, key) = rest
                 .split_once('/')
@@ -723,6 +723,17 @@ mod tests {
             "/my-prefix",
         )
         .expect("normalize oss path");
+        assert_eq!(got, "a/b.parquet");
+    }
+
+    #[test]
+    fn normalize_oss_path_accepts_s3a_uri() {
+        let got = normalize_oss_path(
+            "s3a://my-bucket/my-prefix/a/b.parquet",
+            "my-bucket",
+            "my-prefix",
+        )
+        .expect("normalize s3a path");
         assert_eq!(got, "a/b.parquet");
     }
 

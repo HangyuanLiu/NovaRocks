@@ -146,12 +146,13 @@ pub(crate) fn create_mv(
     })?;
 
     let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
+    validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
     // unchanged.
-    if let Some(pk_cols) = stmt.primary_key.as_deref() {
+    let primary_key_base_descriptor = if let Some(pk_cols) = stmt.primary_key.as_deref() {
         if base_refs.len() != 1 {
             return Err(
                 "PRIMARY KEY on materialized view requires exactly one iceberg base table"
@@ -165,7 +166,10 @@ pub(crate) fn create_mv(
             )?;
         let descriptor = descriptor_from_loaded(&loaded);
         validate_ivm_primary_key(pk_cols, &descriptor).map_err(|e| e.to_string())?;
-    }
+        Some(descriptor)
+    } else {
+        None
+    };
 
     let distribution = stmt
         .distribution
@@ -180,8 +184,13 @@ pub(crate) fn create_mv(
     }
     let mv_shape = super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
     validate_incremental_mv_analyzed_types(&mv_shape, &analysis.resolved_query)?;
-    let storage_layout =
-        build_mv_storage_layout(&mv_shape, distribution, &analysis.output_columns)?;
+    let storage_layout = build_mv_storage_layout(
+        &mv_shape,
+        distribution,
+        &analysis.output_columns,
+        stmt.primary_key.as_deref().unwrap_or(&[]),
+        primary_key_base_descriptor.as_ref(),
+    )?;
     let key_desc = storage_layout.key_desc;
     let physical_columns = storage_layout.physical_columns;
 
@@ -305,6 +314,8 @@ pub(crate) fn create_mv(
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: Default::default(),
+        last_refresh_table_uuids: Default::default(),
+        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
         created_at_ms: now_ms(),
         storage_engine: ManagedMvStorageEngine::ManagedLake,
         iceberg_table_identifier: None,
@@ -338,36 +349,54 @@ fn build_mv_storage_layout(
     mv_shape: &IncrementalMvShape,
     distribution: &MaterializedViewDistribution,
     output_columns: &[OutputColumn],
+    primary_key_columns: &[String],
+    base_descriptor: Option<&BaseTableDescriptor>,
 ) -> Result<MvStorageLayout, String> {
     match mv_shape {
         IncrementalMvShape::ProjectionFilter(_) => {
             validate_distribution_columns(distribution, output_columns)?;
-            let table_columns = output_columns
+            let visible_columns = output_columns
                 .iter()
                 .map(output_column_to_table_column)
                 .collect::<Result<Vec<_>, _>>()?;
-            let key_desc = TableKeyDesc {
-                kind: TableKeyKind::Duplicate,
-                columns: distribution.hash_columns.clone(),
+            let key_columns = if primary_key_columns.is_empty() {
+                distribution.hash_columns.clone()
+            } else {
+                projection_mv_key_columns(primary_key_columns)?
             };
-            let key_column_set = key_desc
-                .columns
-                .iter()
-                .map(|column| normalize_identifier(column))
-                .collect::<Result<HashSet<_>, _>>()?;
-            let physical_columns = table_columns
-                .iter()
-                .map(|column| {
-                    let column_name = normalize_identifier(&column.name)?;
-                    Ok(managed_physical_column(
-                        column.name.clone(),
-                        column.data_type.clone(),
-                        column.nullable,
-                        true,
-                        key_column_set.contains(&column_name),
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            let key_desc = TableKeyDesc {
+                kind: if primary_key_columns.is_empty() {
+                    TableKeyKind::Duplicate
+                } else {
+                    TableKeyKind::Primary
+                },
+                columns: key_columns,
+            };
+            let mut physical_columns = Vec::with_capacity(
+                primary_key_columns
+                    .len()
+                    .saturating_add(visible_columns.len()),
+            );
+            if !primary_key_columns.is_empty() {
+                let base = base_descriptor.ok_or_else(|| {
+                    "projection/filter materialized view PRIMARY KEY layout requires base table descriptor"
+                        .to_string()
+                })?;
+                physical_columns.extend(projection_mv_hidden_primary_key_columns(
+                    output_columns,
+                    primary_key_columns,
+                    base,
+                )?);
+            }
+            physical_columns.extend(visible_columns.iter().map(|column| {
+                managed_physical_column(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                    true,
+                    false,
+                )
+            }));
             Ok(MvStorageLayout {
                 key_desc,
                 physical_columns,
@@ -386,6 +415,54 @@ fn build_mv_storage_layout(
             })
         }
     }
+}
+
+pub(crate) fn projection_mv_hidden_pk_column_name(key: &str) -> Result<String, String> {
+    Ok(format!("__mv_pk_{}", normalize_identifier(key)?))
+}
+
+fn projection_mv_key_columns(primary_key_columns: &[String]) -> Result<Vec<String>, String> {
+    primary_key_columns
+        .iter()
+        .map(|key| projection_mv_hidden_pk_column_name(key))
+        .collect()
+}
+
+fn projection_mv_hidden_primary_key_columns(
+    output_columns: &[OutputColumn],
+    primary_key_columns: &[String],
+    base: &BaseTableDescriptor,
+) -> Result<Vec<ManagedPhysicalColumn>, String> {
+    let output_names = output_columns
+        .iter()
+        .map(|column| normalize_identifier(&column.name))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let mut out = Vec::with_capacity(primary_key_columns.len());
+    for key in primary_key_columns {
+        let hidden_name = projection_mv_hidden_pk_column_name(key)?;
+        if output_names.contains(&normalize_identifier(&hidden_name)?) {
+            return Err(format!(
+                "projection/filter materialized view hidden PRIMARY KEY column `{hidden_name}` collides with SELECT output"
+            ));
+        }
+        let base_col = base
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(key))
+            .ok_or_else(|| {
+                format!(
+                    "projection/filter materialized view PRIMARY KEY column `{key}` does not exist on the iceberg base table"
+                )
+            })?;
+        out.push(managed_physical_column(
+            hidden_name,
+            arrow_data_type_to_sql_type(&base_col.data_type)?,
+            base_col.nullable,
+            false,
+            true,
+        ));
+    }
+    Ok(out)
 }
 
 fn validate_incremental_mv_analyzed_types(
@@ -490,6 +567,7 @@ fn validate_unique_aggregate_physical_column_names(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BaseColumnDescriptor {
     pub name: String,
+    pub data_type: DataType,
     /// Uppercased SQL type as the analyzer/iceberg-schema mapper produced
     /// it (e.g. `BIGINT`, `STRING`, `DECIMAL(18,2)`, `ARRAY<STRING>`).
     pub sql_type: String,
@@ -604,6 +682,7 @@ pub(crate) fn descriptor_from_loaded(
         .iter()
         .map(|col| BaseColumnDescriptor {
             name: col.name.clone(),
+            data_type: col.data_type.clone(),
             sql_type: arrow_data_type_pk_head(&col.data_type),
             nullable: col.nullable,
         })
@@ -851,11 +930,45 @@ pub(crate) fn resolve_mv_name(
             normalize_identifier(database)?,
             normalize_identifier(table)?,
         )),
+        [catalog, database, table] => {
+            let catalog = normalize_identifier(catalog)?;
+            if catalog != "default_catalog" {
+                return Err(format!(
+                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
+                ));
+            }
+            Ok((
+                normalize_identifier(database)?,
+                normalize_identifier(table)?,
+            ))
+        }
         _ => Err(format!(
-            "materialized view name must be `<name>` or `<db>.<name>`; got `{}`",
+            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
             name.parts.join(".")
         )),
     }
+}
+
+pub(crate) fn validate_mv_partition_columns(
+    partition_by: Option<&[String]>,
+    output_columns: &[OutputColumn],
+) -> Result<(), String> {
+    let Some(partition_by) = partition_by else {
+        return Ok(());
+    };
+    let output_names = output_columns
+        .iter()
+        .map(|column| normalize_identifier(&column.name))
+        .collect::<Result<HashSet<_>, _>>()?;
+    for column in partition_by {
+        let normalized = normalize_identifier(column)?;
+        if !output_names.contains(&normalized) {
+            return Err(format!(
+                "materialized view PARTITION BY column `{column}` must be an output column"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_table_refs_from_query(
@@ -1338,6 +1451,118 @@ mod tests {
     }
 
     #[test]
+    fn projection_mv_primary_key_uses_primary_key_storage() {
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW analytics.orders_mv
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PRIMARY KEY (id)
+AS SELECT id, customer, amount
+FROM ice.ns.orders
+WHERE amount > 0",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("projection shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "customer".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "amount".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let layout = build_mv_storage_layout(
+            &mv_shape,
+            stmt.distribution.as_ref().expect("distribution"),
+            &output_columns,
+            stmt.primary_key.as_deref().expect("primary key"),
+            Some(&descriptor(
+                2,
+                &[
+                    ("id", "BIGINT", false),
+                    ("customer", "STRING", true),
+                    ("amount", "BIGINT", true),
+                ],
+            )),
+        )
+        .expect("layout");
+
+        assert_eq!(layout.key_desc.kind, TableKeyKind::Primary);
+        assert_eq!(layout.key_desc.columns, vec!["__mv_pk_id".to_string()]);
+        let hidden_key = &layout.physical_columns[0];
+        assert_eq!(hidden_key.column.name, "__mv_pk_id");
+        assert!(!hidden_key.visible);
+        assert!(hidden_key.is_key);
+        let id_column = layout
+            .physical_columns
+            .iter()
+            .find(|column| column.column.name == "id")
+            .expect("id column");
+        assert!(id_column.visible);
+        assert!(!id_column.is_key);
+    }
+
+    #[test]
+    fn projection_mv_primary_key_missing_output_becomes_hidden_key_column() {
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW analytics.orders_mv
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (id)
+AS SELECT customer, amount
+FROM ice.ns.orders
+WHERE amount > 0",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("projection shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "customer".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "amount".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+
+        let layout = build_mv_storage_layout(
+            &mv_shape,
+            stmt.distribution.as_ref().expect("distribution"),
+            &output_columns,
+            stmt.primary_key.as_deref().expect("primary key"),
+            Some(&descriptor(
+                2,
+                &[
+                    ("id", "BIGINT", false),
+                    ("customer", "STRING", true),
+                    ("amount", "BIGINT", true),
+                ],
+            )),
+        )
+        .expect("layout");
+
+        assert_eq!(layout.key_desc.kind, TableKeyKind::Primary);
+        assert_eq!(layout.key_desc.columns, vec!["__mv_pk_id".to_string()]);
+        assert_eq!(layout.physical_columns[0].column.name, "__mv_pk_id");
+        assert!(!layout.physical_columns[0].visible);
+        assert!(layout.physical_columns[0].is_key);
+        assert_eq!(layout.physical_columns[1].column.name, "customer");
+        assert!(layout.physical_columns[1].visible);
+        assert_eq!(layout.physical_columns[2].column.name, "amount");
+        assert!(layout.physical_columns[2].visible);
+    }
+
+    #[test]
     fn aggregate_mv_physical_schema_has_hidden_row_id_and_state_columns() {
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW analytics.orders_mv
@@ -1367,7 +1592,8 @@ GROUP BY k1",
         ];
         let distribution = stmt.distribution.as_ref().expect("distribution");
         let storage_layout =
-            build_mv_storage_layout(&mv_shape, distribution, &output_columns).expect("layout");
+            build_mv_storage_layout(&mv_shape, distribution, &output_columns, &[], None)
+                .expect("layout");
 
         assert_eq!(storage_layout.key_desc.kind, TableKeyKind::Primary);
         assert_eq!(
@@ -1487,6 +1713,8 @@ GROUP BY k1",
             &mv_shape,
             stmt.distribution.as_ref().expect("distribution"),
             &output_columns,
+            &[],
+            None,
         )
         .expect_err("hidden physical column collision should fail");
         assert!(
@@ -1544,10 +1772,28 @@ GROUP BY k1",
                 .iter()
                 .map(|(n, t, nullable)| super::BaseColumnDescriptor {
                     name: (*n).to_string(),
+                    data_type: descriptor_data_type(t),
                     sql_type: (*t).to_string(),
                     nullable: *nullable,
                 })
                 .collect(),
+        }
+    }
+
+    fn descriptor_data_type(sql_type: &str) -> DataType {
+        let head = sql_type
+            .split(['(', '<'])
+            .next()
+            .unwrap_or(sql_type)
+            .to_ascii_uppercase();
+        match head.as_str() {
+            "BIGINT" => DataType::Int64,
+            "INT" | "INTEGER" => DataType::Int32,
+            "STRING" | "VARCHAR" | "CHAR" => DataType::Utf8,
+            "DECIMAL" => DataType::Decimal128(18, 2),
+            "DOUBLE" => DataType::Float64,
+            "ARRAY" => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            other => panic!("unsupported descriptor test type {other}"),
         }
     }
 

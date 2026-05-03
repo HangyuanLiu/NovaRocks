@@ -169,7 +169,10 @@ impl IcebergCommitCollector {
             crate::types::TIcebergFileContent::DATA => DataContentType::Data,
             crate::types::TIcebergFileContent::POSITION_DELETES => DataContentType::PositionDeletes,
             crate::types::TIcebergFileContent::EQUALITY_DELETES => {
-                return Err("phase 1 does not produce equality-delete files".to_string());
+                return Err(
+                    "IcebergSink commit info cannot carry equality_ids for equality-delete files"
+                        .to_string(),
+                );
             }
             other => {
                 return Err(format!(
@@ -198,6 +201,7 @@ impl IcebergCommitCollector {
             null_value_counts: Default::default(),
             key_metadata: None,
             referenced_data_file: df.referenced_data_file,
+            equality_ids: None,
         })
     }
 

@@ -37,6 +37,12 @@ pub enum IcebergWriteMode {
     RowLineageV3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergSqlDeleteStrategy {
+    PositionDeleteFiles,
+    DeletionVectors,
+}
+
 /// Metadata about a single Parquet file produced by `IcebergSink` during a
 /// pipeline run. Mirrors the subset of `TIcebergDataFile` we need for commit
 /// and abort flows. Constructed from `TSinkCommitInfo` after pipeline finish.
@@ -56,6 +62,8 @@ pub struct WrittenFile {
     pub key_metadata: Option<Vec<u8>>,
     /// Set only for content == PositionDeletes.
     pub referenced_data_file: Option<String>,
+    /// Set only for content == EqualityDeletes.
+    pub equality_ids: Option<Vec<i32>>,
 }
 
 /// Result returned by a successful commit action.
@@ -87,6 +95,7 @@ mod tests {
             null_value_counts: Default::default(),
             key_metadata: None,
             referenced_data_file: None,
+            equality_ids: None,
         };
         assert_eq!(f.record_count, 100);
         assert_eq!(f.content, DataContentType::Data);

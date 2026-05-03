@@ -955,6 +955,7 @@ mod tests {
                 table: TableDef {
                     name: "t3".to_string(),
                     columns: vec![column.clone()],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
                     storage: TableStorage::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
@@ -998,6 +999,7 @@ mod tests {
                 table: TableDef {
                     name: "all_t0".to_string(),
                     columns: vec![column.clone()],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
                     storage: TableStorage::S3ParquetFiles {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::descriptors;
@@ -240,6 +241,13 @@ pub trait ScanOp: Send + Sync {
         &self,
         _morsel: &ScanMorsel,
     ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        Ok(None)
+    }
+
+    fn load_iceberg_equality_deletes(
+        &self,
+        _morsel: &ScanMorsel,
+    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
         Ok(None)
     }
 }
@@ -505,6 +513,13 @@ impl ScanNode {
         morsel: &ScanMorsel,
     ) -> Result<Option<roaring::RoaringTreemap>, String> {
         self.op.load_iceberg_position_deletes(morsel)
+    }
+
+    pub fn load_iceberg_equality_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
+        self.op.load_iceberg_equality_deletes(morsel)
     }
 }
 

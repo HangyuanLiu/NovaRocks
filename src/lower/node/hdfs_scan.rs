@@ -721,6 +721,7 @@ pub(crate) fn lower_hdfs_scan_node(
             iceberg_delete_files.push(IcebergDeleteFileSpec {
                 path,
                 file_format: descriptors::THdfsFileFormat::UNKNOWN,
+                file_content: crate::types::TIcebergFileContent::POSITION_DELETES,
                 length: None,
                 content_offset: Some(offset),
                 content_size_in_bytes: Some(size),

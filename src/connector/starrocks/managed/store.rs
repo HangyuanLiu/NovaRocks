@@ -144,6 +144,8 @@ pub(crate) struct StoredMaterializedView {
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,
+    pub last_refresh_table_uuids: std::collections::BTreeMap<String, String>,
+    pub primary_key_columns: Vec<String>,
     pub created_at_ms: i64,
     pub storage_engine: ManagedMvStorageEngine,
     pub iceberg_table_identifier: Option<String>,
@@ -300,6 +302,7 @@ pub(crate) struct ActivateMvRefreshRequest {
     pub retired_root_path: String,
     pub rows_written: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +310,7 @@ pub(crate) struct UpdateMvRefreshMetadataRequest {
     pub table_id: i64,
     pub last_refresh_rows: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +324,7 @@ pub(crate) struct UpdateMvIcebergRefreshMetadataRequest {
     pub table_id: i64,
     pub last_refresh_rows: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub table_uuids: std::collections::BTreeMap<String, String>,
     pub iceberg_snapshot_id: i64,
 }
 
@@ -328,6 +333,7 @@ pub(crate) struct InsertIcebergMvRowRequest {
     pub mv_id: i64,
     pub select_sql: String,
     pub base_table_refs: Vec<IcebergTableRef>,
+    pub primary_key_columns: Vec<String>,
     pub iceberg_table_identifier: String,
     pub created_at_ms: i64,
 }
@@ -625,10 +631,8 @@ impl SqliteMetadataStore {
         &self,
         snapshot: &ManagedSnapshot,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin managed snapshot transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "managed snapshot")?;
 
         for table in [
             "materialized_views",
@@ -857,12 +861,28 @@ impl SqliteMetadataStore {
             for mv in &snapshot.materialized_views {
                 let base_json = serde_json::to_string(&mv.base_table_refs)
                     .map_err(|e| format!("serialize mv base refs failed: {e}"))?;
+                let primary_key_columns_json = if mv.primary_key_columns.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&mv.primary_key_columns)
+                            .map_err(|e| format!("serialize mv primary key columns failed: {e}"))?,
+                    )
+                };
                 let snapshots_json = if mv.last_refresh_snapshots.is_empty() {
                     None
                 } else {
                     Some(
                         serde_json::to_string(&mv.last_refresh_snapshots)
                             .map_err(|e| format!("serialize mv snapshots failed: {e}"))?,
+                    )
+                };
+                let table_uuids_json = if mv.last_refresh_table_uuids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&mv.last_refresh_table_uuids)
+                            .map_err(|e| format!("serialize mv table uuids failed: {e}"))?,
                     )
                 };
                 let refresh_target_snapshots_json = if mv.refresh_target_snapshots.is_empty() {
@@ -880,24 +900,28 @@ impl SqliteMetadataStore {
                         select_sql,
                         refresh_mode,
                         base_table_refs_json,
+                        primary_key_columns_json,
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
+                        last_refresh_table_uuids_json,
                         created_at_ms,
                         storage_engine,
                         iceberg_table_identifier,
                         last_refreshed_iceberg_snapshot_id,
                         refresh_in_progress,
                         refresh_target_snapshots_json
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         mv.mv_id,
                         mv.select_sql,
                         mv.refresh_mode.as_sql_str(),
                         base_json,
+                        primary_key_columns_json,
                         mv.last_refresh_ms,
                         mv.last_refresh_rows,
                         snapshots_json,
+                        table_uuids_json,
                         mv.created_at_ms,
                         mv.storage_engine.as_sql_str(),
                         mv.iceberg_table_identifier,
@@ -916,10 +940,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn drop_managed_table(&self, table_id: i64, root_path: &str) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin drop_managed_table transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "drop_managed_table")?;
         let inflight_txn_count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM txns
@@ -992,10 +1014,8 @@ impl SqliteMetadataStore {
         &self,
         req: StageManagedTruncateRequest,
     ) -> Result<StagedManagedTruncate, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin stage_truncate_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "stage_truncate_partition")?;
         let inflight_txn_count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM txns
@@ -1101,10 +1121,8 @@ impl SqliteMetadataStore {
         new_index_id: i64,
         retired_root_path: &str,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin activate_truncate_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "activate_truncate_partition")?;
         let next_job_id: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
@@ -1158,10 +1176,8 @@ impl SqliteMetadataStore {
         &self,
         req: StageMvRefreshRequest,
     ) -> Result<StagedMvRefresh, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin stage_mv_refresh_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "stage_mv_refresh_partition")?;
 
         // Reject if MV is not active.
         let (table_state, table_kind): (String, String) = tx
@@ -1284,10 +1300,8 @@ impl SqliteMetadataStore {
         &self,
         req: ActivateMvRefreshRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin activate_mv_refresh_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "activate_mv_refresh_partition")?;
 
         let next_job_id: i64 = tx
             .query_row(
@@ -1357,15 +1371,29 @@ impl SqliteMetadataStore {
                     .map_err(|e| format!("serialize mv activate snapshots failed: {e}"))?,
             )
         };
+        let table_uuids_json = if req.table_uuids.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&req.table_uuids)
+                    .map_err(|e| format!("serialize mv activate table uuids failed: {e}"))?,
+            )
+        };
         tx.execute(
             "UPDATE materialized_views
              SET last_refresh_ms = strftime('%s','now') * 1000,
                  last_refresh_rows = ?1,
                  last_refresh_snapshots_json = ?2,
+                 last_refresh_table_uuids_json = ?3,
                  refresh_in_progress = 0,
                  refresh_target_snapshots_json = NULL
-             WHERE mv_id = ?3",
-            params![req.rows_written, snapshots_json, req.table_id],
+             WHERE mv_id = ?4",
+            params![
+                req.rows_written,
+                snapshots_json,
+                table_uuids_json,
+                req.table_id
+            ],
         )
         .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
 
@@ -1378,10 +1406,8 @@ impl SqliteMetadataStore {
         &self,
         req: UpdateMvRefreshMetadataRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin update_mv_refresh_metadata transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "update_mv_refresh_metadata")?;
         update_mv_refresh_metadata_in_tx(&tx, &req)
             .map_err(|e| format!("update mv refresh metadata failed: {e}"))?;
         tx.commit()
@@ -1443,19 +1469,23 @@ impl SqliteMetadataStore {
         let conn = self.connection()?;
         let snapshots_json = serde_json::to_string(&request.snapshots)
             .map_err(|e| format!("serialize iceberg refresh snapshots failed: {e}"))?;
+        let table_uuids_json = serde_json::to_string(&request.table_uuids)
+            .map_err(|e| format!("serialize iceberg refresh table uuids failed: {e}"))?;
         let changed = conn
             .execute(
                 "UPDATE materialized_views
                  SET last_refresh_ms = strftime('%s','now') * 1000,
                      last_refresh_rows = ?1,
                      last_refresh_snapshots_json = ?2,
-                     last_refreshed_iceberg_snapshot_id = ?3,
+                     last_refresh_table_uuids_json = ?3,
+                     last_refreshed_iceberg_snapshot_id = ?4,
                      refresh_in_progress = 0,
                      refresh_target_snapshots_json = NULL
-                 WHERE mv_id = ?4",
+                 WHERE mv_id = ?5",
                 params![
                     request.last_refresh_rows,
                     snapshots_json,
+                    table_uuids_json,
                     request.iceberg_snapshot_id,
                     request.table_id
                 ],
@@ -1477,23 +1507,34 @@ impl SqliteMetadataStore {
         let conn = self.connection()?;
         let base_refs_json = serde_json::to_string(&request.base_table_refs)
             .map_err(|e| format!("serialize base_table_refs failed: {e}"))?;
+        let primary_key_columns_json = if request.primary_key_columns.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&request.primary_key_columns)
+                    .map_err(|e| format!("serialize primary_key_columns failed: {e}"))?,
+            )
+        };
         conn.execute(
             "INSERT INTO materialized_views(
                 mv_id, select_sql, refresh_mode, base_table_refs_json,
+                primary_key_columns_json,
                 last_refresh_ms, last_refresh_rows, last_refresh_snapshots_json,
+                last_refresh_table_uuids_json,
                 created_at_ms, storage_engine, iceberg_table_identifier,
                 last_refreshed_iceberg_snapshot_id,
                 refresh_in_progress, refresh_target_snapshots_json
             ) VALUES (
-                ?1, ?2, 'DEFERRED_MANUAL', ?3,
-                NULL, NULL, NULL,
-                ?4, 'iceberg', ?5, NULL,
+                ?1, ?2, 'DEFERRED_MANUAL', ?3, ?4,
+                NULL, NULL, NULL, NULL,
+                ?5, 'iceberg', ?6, NULL,
                 0, NULL
             )",
             rusqlite::params![
                 request.mv_id,
                 request.select_sql,
                 base_refs_json,
+                primary_key_columns_json,
                 request.created_at_ms,
                 request.iceberg_table_identifier,
             ],
@@ -1508,10 +1549,8 @@ impl SqliteMetadataStore {
         partition_id: i64,
         root_path: &str,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin enqueue_erase_job_for_partition_root transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "enqueue_erase_job_for_partition_root")?;
         let next_job_id: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
@@ -1545,10 +1584,8 @@ impl SqliteMetadataStore {
         partition_id: i64,
         base_version: i64,
     ) -> Result<PreparedManagedTxn, String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin prepare_txn transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "prepare_txn")?;
         let txn_id: i64 = tx
             .query_row(
                 "SELECT next_txn_id FROM global_meta WHERE singleton = 1",
@@ -1592,10 +1629,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn mark_txn_visible(&self, txn_id: i64, commit_version: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin mark_txn_visible transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "mark_txn_visible")?;
         let partition_id: i64 = tx
             .query_row(
                 "SELECT partition_id FROM txns WHERE txn_id = ?1",
@@ -1626,10 +1661,8 @@ impl SqliteMetadataStore {
         commit_version: i64,
         req: UpdateMvRefreshMetadataRequest,
     ) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin mark_txn_visible_with_mv_refresh_metadata transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "mark_txn_visible_with_mv_refresh_metadata")?;
         let partition_id: i64 = tx
             .query_row(
                 "SELECT partition_id FROM txns WHERE txn_id = ?1",
@@ -1746,10 +1779,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn purge_retired_table_metadata(&self, table_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin purge_retired_table_metadata transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "purge_retired_table_metadata")?;
         let is_dropping: bool = tx
             .query_row(
                 "SELECT EXISTS(
@@ -1813,10 +1844,8 @@ impl SqliteMetadataStore {
     /// table to be in `DROPPING` state.  Iceberg-backed MVs have no tablets,
     /// partitions, schemas, or indexes so those DELETE statements are omitted.
     pub(crate) fn delete_iceberg_mv_row(&self, table_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin delete_iceberg_mv_row transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "delete_iceberg_mv_row")?;
         tx.execute(
             "DELETE FROM materialized_views WHERE mv_id = ?1",
             params![table_id],
@@ -1830,10 +1859,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn purge_retired_partition_metadata(&self, partition_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            format!("begin purge_retired_partition_metadata transaction failed: {e}")
-        })?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "purge_retired_partition_metadata")?;
         let is_retired: bool = tx
             .query_row(
                 "SELECT EXISTS(
@@ -1874,10 +1901,8 @@ impl SqliteMetadataStore {
     }
 
     pub(crate) fn delete_creating_partition(&self, partition_id: i64) -> Result<(), String> {
-        let conn = self.connection()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin delete_creating_partition transaction failed: {e}"))?;
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "delete_creating_partition")?;
         tx.execute(
             "DELETE FROM tablets WHERE partition_id = ?1",
             params![partition_id],
@@ -2157,9 +2182,11 @@ impl SqliteMetadataStore {
                 refresh_mode TEXT NOT NULL DEFAULT 'DEFERRED_MANUAL'
                     CHECK (refresh_mode IN ('DEFERRED_MANUAL')),
                 base_table_refs_json TEXT NOT NULL,
+                primary_key_columns_json TEXT,
                 last_refresh_ms INTEGER,
                 last_refresh_rows INTEGER,
                 last_refresh_snapshots_json TEXT,
+                last_refresh_table_uuids_json TEXT,
                 created_at_ms INTEGER NOT NULL,
                 storage_engine TEXT NOT NULL DEFAULT 'managed_lake',
                 iceberg_table_identifier TEXT,
@@ -2186,6 +2213,7 @@ impl SqliteMetadataStore {
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
+        ensure_materialized_view_current_columns(&conn)?;
         Ok(())
     }
 
@@ -2484,9 +2512,11 @@ impl SqliteMetadataStore {
                         select_sql,
                         refresh_mode,
                         base_table_refs_json,
+                        primary_key_columns_json,
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
+                        last_refresh_table_uuids_json,
                         created_at_ms,
                         storage_engine,
                         iceberg_table_identifier,
@@ -2505,16 +2535,25 @@ impl SqliteMetadataStore {
                     let base_json: String = row.get(3)?;
                     let base_table_refs: Vec<IcebergTableRef> =
                         serde_json::from_str(&base_json).map_err(json_to_sql_error)?;
+                    let primary_key_columns: Vec<String> = match row.get::<_, Option<String>>(4)? {
+                        Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
+                        None => Vec::new(),
+                    };
                     let snapshots: std::collections::BTreeMap<String, i64> =
-                        match row.get::<_, Option<String>>(6)? {
+                        match row.get::<_, Option<String>>(7)? {
+                            Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
+                            None => std::collections::BTreeMap::new(),
+                        };
+                    let table_uuids: std::collections::BTreeMap<String, String> =
+                        match row.get::<_, Option<String>>(8)? {
                             Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
                             None => std::collections::BTreeMap::new(),
                         };
                     let storage_engine =
-                        ManagedMvStorageEngine::parse_sql_str(&row.get::<_, String>(8)?)
+                        ManagedMvStorageEngine::parse_sql_str(&row.get::<_, String>(10)?)
                             .map_err(invalid_state_sql_error)?;
                     let refresh_target_snapshots: std::collections::BTreeMap<String, i64> =
-                        match row.get::<_, Option<String>>(12)? {
+                        match row.get::<_, Option<String>>(14)? {
                             Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
                             None => std::collections::BTreeMap::new(),
                         };
@@ -2523,14 +2562,16 @@ impl SqliteMetadataStore {
                         select_sql: row.get(1)?,
                         refresh_mode,
                         base_table_refs,
-                        last_refresh_ms: row.get(4)?,
-                        last_refresh_rows: row.get(5)?,
+                        last_refresh_ms: row.get(5)?,
+                        last_refresh_rows: row.get(6)?,
                         last_refresh_snapshots: snapshots,
-                        created_at_ms: row.get(7)?,
+                        last_refresh_table_uuids: table_uuids,
+                        primary_key_columns,
+                        created_at_ms: row.get(9)?,
                         storage_engine,
-                        iceberg_table_identifier: row.get(9)?,
-                        last_refreshed_iceberg_snapshot_id: row.get(10)?,
-                        refresh_in_progress: row.get::<_, i64>(11)? != 0,
+                        iceberg_table_identifier: row.get(11)?,
+                        last_refreshed_iceberg_snapshot_id: row.get(12)?,
+                        refresh_in_progress: row.get::<_, i64>(13)? != 0,
                         refresh_target_snapshots,
                     })
                 })
@@ -2582,16 +2623,30 @@ fn update_mv_refresh_metadata_in_tx(
                 .map_err(|e| format!("serialize mv refresh snapshots failed: {e}"))?,
         )
     };
+    let table_uuids_json = if req.table_uuids.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&req.table_uuids)
+                .map_err(|e| format!("serialize mv refresh table uuids failed: {e}"))?,
+        )
+    };
     let changed = tx
         .execute(
             "UPDATE materialized_views
                  SET last_refresh_ms = strftime('%s','now') * 1000,
                      last_refresh_rows = ?1,
                      last_refresh_snapshots_json = ?2,
+                     last_refresh_table_uuids_json = ?3,
                      refresh_in_progress = 0,
                      refresh_target_snapshots_json = NULL
-             WHERE mv_id = ?3",
-            params![req.last_refresh_rows, snapshots_json, req.table_id],
+             WHERE mv_id = ?4",
+            params![
+                req.last_refresh_rows,
+                snapshots_json,
+                table_uuids_json,
+                req.table_id
+            ],
         )
         .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
     if changed != 1 {
@@ -2601,6 +2656,14 @@ fn update_mv_refresh_metadata_in_tx(
         ));
     }
     Ok(())
+}
+
+fn begin_write_transaction<'conn>(
+    conn: &'conn mut Connection,
+    name: &str,
+) -> Result<rusqlite::Transaction<'conn>, String> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("begin {name} transaction failed: {e}"))
 }
 
 fn json_to_sql_error(err: serde_json::Error) -> rusqlite::Error {
@@ -2709,6 +2772,12 @@ fn migrate_schema_v6_to_v7(conn: &Connection) -> Result<(), String> {
         count > 0
     };
     if mv_table_exists {
+        if !table_column_exists(conn, "materialized_views", "primary_key_columns_json")? {
+            conn.execute_batch(
+                "ALTER TABLE materialized_views ADD COLUMN primary_key_columns_json TEXT;",
+            )
+            .map_err(|e| format!("migrate standalone metadata schema v6 to v7 failed adding primary_key_columns_json: {e}"))?;
+        }
         if !table_column_exists(conn, "materialized_views", "refresh_in_progress")? {
             conn.execute_batch(
                 "ALTER TABLE materialized_views ADD COLUMN refresh_in_progress INTEGER NOT NULL DEFAULT 0;",
@@ -2726,6 +2795,20 @@ fn migrate_schema_v6_to_v7(conn: &Connection) -> Result<(), String> {
         .map_err(|e| {
             format!("migrate standalone metadata schema v6 to v7 failed setting version: {e}")
         })?;
+    Ok(())
+}
+
+fn ensure_materialized_view_current_columns(conn: &Connection) -> Result<(), String> {
+    if !table_column_exists(conn, "materialized_views", "last_refresh_table_uuids_json")? {
+        conn.execute_batch(
+            "ALTER TABLE materialized_views ADD COLUMN last_refresh_table_uuids_json TEXT;",
+        )
+        .map_err(|e| {
+            format!(
+                "migrate standalone metadata schema v7 failed adding last_refresh_table_uuids_json: {e}"
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -3170,6 +3253,8 @@ mod tests {
             last_refresh_ms: None,
             last_refresh_rows: Some(3),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -3186,6 +3271,7 @@ mod tests {
                 table_id: 10,
                 last_refresh_rows: 3,
                 snapshots: snapshots.clone(),
+                table_uuids: Default::default(),
             })
             .expect("update metadata");
 
@@ -3217,6 +3303,8 @@ mod tests {
             last_refresh_ms: Some(1),
             last_refresh_rows: Some(3),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -3249,6 +3337,7 @@ mod tests {
                 table_id: 10,
                 last_refresh_rows: 4,
                 snapshots: target.clone(),
+                table_uuids: Default::default(),
             })
             .expect("finish refresh");
 
@@ -3277,6 +3366,8 @@ mod tests {
             last_refresh_ms: Some(1),
             last_refresh_rows: Some(2),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -3298,6 +3389,7 @@ mod tests {
                     table_id: 10,
                     last_refresh_rows: 4,
                     snapshots: snapshots.clone(),
+                    table_uuids: Default::default(),
                 },
             )
             .expect("visible with metadata");
@@ -3731,9 +3823,11 @@ mod tests {
                 "select_sql",
                 "refresh_mode",
                 "base_table_refs_json",
+                "primary_key_columns_json",
                 "last_refresh_ms",
                 "last_refresh_rows",
                 "last_refresh_snapshots_json",
+                "last_refresh_table_uuids_json",
                 "created_at_ms",
                 "storage_engine",
                 "iceberg_table_identifier",
@@ -4080,6 +4174,8 @@ mod tests {
                     map.insert("iceberg_cat.ns.orders".to_string(), 7_391_842_i64);
                     map
                 },
+                last_refresh_table_uuids: Default::default(),
+                primary_key_columns: vec!["order_id".to_string(), "line_id".to_string()],
                 created_at_ms: 1_699_999_999_000,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,
@@ -4182,6 +4278,8 @@ mod tests {
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: std::collections::BTreeMap::new(),
+            last_refresh_table_uuids: Default::default(),
+            primary_key_columns: Vec::new(),
             created_at_ms: 1_700_000_000_000,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
@@ -4276,6 +4374,7 @@ mod tests {
                 retired_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20".to_string(),
                 rows_written: 42,
                 snapshots: snapshots_map.clone(),
+                table_uuids: Default::default(),
             })
             .expect("activate");
 
@@ -4515,6 +4614,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     table: "orders".to_string(),
                 }],
+                primary_key_columns: vec!["order_id".to_string()],
                 iceberg_table_identifier: "__nova_mv__.analytics.mv_orders".to_string(),
                 created_at_ms: 1_700_000_000_000,
             })
@@ -4529,6 +4629,10 @@ mod tests {
         assert!(
             before.materialized_views.iter().any(|mv| mv.mv_id == 1),
             "materialized_views row must exist before delete"
+        );
+        assert_eq!(
+            before.materialized_views[0].primary_key_columns,
+            vec!["order_id".to_string()]
         );
 
         // Call the function under test.

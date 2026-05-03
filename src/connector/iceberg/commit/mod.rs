@@ -26,6 +26,7 @@ mod abort;
 mod action;
 mod collector;
 mod data_file;
+mod equality_delete_writer;
 mod fast_append;
 mod helpers;
 mod overwrite;
@@ -40,6 +41,7 @@ mod validation;
 pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
+pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub use overwrite::OverwriteCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
@@ -49,9 +51,11 @@ pub use puffin_dv::{
 };
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
-pub use run::{RunInput, run_iceberg_commit};
-pub use types::{CommitOpKind, CommitOutcome, IcebergWriteMode, WrittenFile};
+pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub use types::{
+    CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergWriteMode, WrittenFile,
+};
 pub use validation::{
-    classify_iceberg_write_mode, ensure_iceberg_write_supported, ensure_no_equality_deletes,
-    ensure_single_partition_spec, match_select_schema_to_table,
+    classify_iceberg_write_mode, classify_sql_delete_strategy, ensure_iceberg_write_supported,
+    ensure_no_equality_deletes, ensure_single_partition_spec, match_select_schema_to_table,
 };

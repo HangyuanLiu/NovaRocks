@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::changes::{
-    IcebergChangeBatch, MaterializedChanges, materialize_changes, plan_changes,
+    ChangeError, IcebergChangeBatch, MaterializedChanges, materialize_changes, plan_changes,
 };
 use crate::connector::starrocks::managed::store::IcebergTableRef;
 use crate::engine::{QueryResult, StandaloneState};
@@ -50,30 +50,24 @@ pub(crate) fn plan_iceberg_change_batch_for_ivm(
     previous_snapshot_id: i64,
     expected_current_snapshot_id: i64,
     pk_columns: &[String],
-) -> Result<IcebergChangeBatch, String> {
-    let batch =
-        plan_changes(base_table, previous_snapshot_id, pk_columns).map_err(|e| e.to_string())?;
-    validate_change_batch_current_snapshot(&batch, expected_current_snapshot_id)?;
+) -> Result<IcebergChangeBatch, ChangeError> {
+    let batch = plan_changes(base_table, previous_snapshot_id, pk_columns)?;
+    validate_change_batch_current_snapshot(&batch, expected_current_snapshot_id)
+        .map_err(ChangeError::InternalInconsistency)?;
     Ok(batch)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn materialize_iceberg_change_stream(
+pub(crate) fn materialize_iceberg_change_batch(
     state: &Arc<StandaloneState>,
     current_database: &str,
     select_sql: &str,
     base_ref: &IcebergTableRef,
     base_table: &iceberg::table::Table,
-    previous_snapshot_id: i64,
-    expected_current_snapshot_id: i64,
+    batch: IcebergChangeBatch,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     pk_columns: &[String],
 ) -> Result<IvmChangeStream, String> {
-    let batch = plan_iceberg_change_batch_for_ivm(
-        base_table,
-        previous_snapshot_id,
-        expected_current_snapshot_id,
-        pk_columns,
-    )?;
     let materialized = materialize_changes(
         state,
         current_database,
@@ -81,6 +75,7 @@ pub(crate) fn materialize_iceberg_change_stream(
         base_ref,
         base_table,
         batch,
+        object_store_config,
         pk_columns,
     )?;
     Ok(IvmChangeStream::from_materialized(materialized))
@@ -121,6 +116,7 @@ mod tests {
             current_snapshot_id: 12,
             inserts: Vec::new(),
             deletes: Vec::new(),
+            equality_deletes: Vec::new(),
         };
 
         let err = validate_change_batch_current_snapshot(&batch, 13).expect_err("mismatch");

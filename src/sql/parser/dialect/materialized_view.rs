@@ -1,7 +1,7 @@
 //! Parsing for `CREATE / DROP / REFRESH / SHOW MATERIALIZED VIEW[S]` statements.
 //!
-//! Only the Phase 1 subset is accepted; unsupported clauses (PARTITION BY,
-//! ORDER BY, REFRESH ASYNC/IMMEDIATE, missing DISTRIBUTED BY) are rejected
+//! Only the Phase 1 subset is accepted; unsupported clauses (ORDER BY,
+//! REFRESH ASYNC/IMMEDIATE, missing DISTRIBUTED BY) are rejected
 //! with an explicit error so that users pasting StarRocks DDL see a clear
 //! signal rather than silent fallthrough.
 
@@ -25,7 +25,7 @@ pub(crate) fn looks_like_create_materialized_view(parser: &Parser<'_>) -> bool {
 
 /// Parse `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name>
 ///   [COMMENT '...']
-///   [PARTITION BY ...]           -- rejected
+///   [PARTITION BY col[, ...]]    -- parsed and retained
 ///   DISTRIBUTED BY HASH(col, ...) [BUCKETS n]
 ///   [REFRESH DEFERRED MANUAL]    -- IMMEDIATE / ASYNC rejected
 ///   [ORDER BY ...]               -- rejected
@@ -52,10 +52,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             .map_err(|e| format!("parse MV comment failed: {e}"))?;
     }
 
-    // Reject PARTITION BY up-front.
-    if parser.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
-        return Err("PARTITION BY is not supported on materialized views yet".to_string());
-    }
+    let partition_by = parse_partition_by(parser)?;
 
     // Required DISTRIBUTED BY clause.
     let distribution = parse_distributed_by(parser)?;
@@ -138,6 +135,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
         CreateMaterializedViewStmt {
             name,
             if_not_exists,
+            partition_by,
             distribution,
             refresh_manual_explicit,
             select_sql,
@@ -146,6 +144,47 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             primary_key,
         },
     ))
+}
+
+fn parse_partition_by(parser: &mut Parser<'_>) -> Result<Option<Vec<String>>, String> {
+    if !parser.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
+        return Ok(None);
+    }
+
+    let mut columns = Vec::new();
+    if parser.consume_token(&Token::LParen) {
+        loop {
+            if parser.consume_token(&Token::RParen) {
+                break;
+            }
+            let ident = parser
+                .parse_identifier()
+                .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
+            columns.push(ident.value);
+            if parser.consume_token(&Token::RParen) {
+                break;
+            }
+            parser
+                .expect_token(&Token::Comma)
+                .map_err(|e| format!("expected , or ) in PARTITION BY column list: {e}"))?;
+        }
+    } else {
+        let ident = parser
+            .parse_identifier()
+            .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
+        columns.push(ident.value);
+        while parser.consume_token(&Token::Comma) {
+            let ident = parser
+                .parse_identifier()
+                .map_err(|e| format!("parse PARTITION BY column failed: {e}"))?;
+            columns.push(ident.value);
+        }
+    }
+
+    if columns.is_empty() {
+        return Err("PARTITION BY requires at least one column".to_string());
+    }
+    Ok(Some(columns))
 }
 
 fn parse_distributed_by(
@@ -289,9 +328,9 @@ pub(crate) fn looks_like_refresh_materialized_view(parser: &Parser<'_>) -> bool 
         && peek_word_eq(parser, 2, "VIEW")
 }
 
-/// Parse `REFRESH MATERIALIZED VIEW <name>`.
+/// Parse `REFRESH MATERIALIZED VIEW <name> [WITH SYNC MODE]`.
 ///
-/// Rejects `PARTITION START(...) END(...)` and `WITH {SYNC|ASYNC} MODE`
+/// Rejects `PARTITION START(...) END(...)` and `WITH ASYNC MODE`
 /// because Phase 1 only supports whole-MV synchronous refresh.
 pub(crate) fn parse_refresh_materialized_view(
     parser: &mut Parser<'_>,
@@ -315,9 +354,22 @@ pub(crate) fn parse_refresh_materialized_view(
         );
     }
     if parser.parse_keyword(Keyword::WITH) {
-        return Err(
-            "REFRESH MATERIALIZED VIEW ... WITH {SYNC|ASYNC} MODE is not supported yet".to_string(),
-        );
+        if peek_word_eq(parser, 0, "ASYNC") {
+            parser.next_token();
+            return Err(
+                "REFRESH MATERIALIZED VIEW ... WITH ASYNC MODE is not supported yet".to_string(),
+            );
+        }
+        if !peek_word_eq(parser, 0, "SYNC") {
+            return Err(
+                "expected SYNC or ASYNC after REFRESH MATERIALIZED VIEW ... WITH".to_string(),
+            );
+        }
+        parser.next_token();
+        if !peek_word_eq(parser, 0, "MODE") {
+            return Err("expected MODE after REFRESH MATERIALIZED VIEW ... WITH SYNC".to_string());
+        }
+        parser.next_token();
     }
 
     Ok(Statement::RefreshMaterializedView(
@@ -431,18 +483,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_create_mv_rejects_partition_by() {
-        let err = crate::sql::parser::parse_sql(
+    fn parse_create_mv_accepts_simple_partition_by() {
+        let stmt = parse_one(
             "CREATE MATERIALIZED VIEW mv1 \
              PARTITION BY k1 \
              DISTRIBUTED BY HASH(k1) BUCKETS 1 \
              AS SELECT k1 FROM iceberg_cat.ns.orders",
-        )
-        .expect_err("should reject");
-        assert!(
-            err.to_lowercase().contains("partition by"),
-            "unexpected err: {err}"
         );
+        let mv = match stmt {
+            Statement::CreateMaterializedView(mv) => mv,
+            other => panic!("unexpected stmt: {other:?}"),
+        };
+        assert_eq!(mv.partition_by, Some(vec!["k1".to_string()]));
     }
 
     #[test]
@@ -544,6 +596,17 @@ mod tests {
                 || err.to_lowercase().contains("not supported"),
             "err={err}"
         );
+    }
+
+    #[test]
+    fn parse_refresh_mv_accepts_sync_modifier() {
+        let stmt = parse_one("REFRESH MATERIALIZED VIEW mv1 WITH SYNC MODE");
+        match stmt {
+            Statement::RefreshMaterializedView(r) => {
+                assert_eq!(r.name.parts, vec!["mv1"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
