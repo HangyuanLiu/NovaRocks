@@ -1495,6 +1495,7 @@ mod tests {
             }],
             None,
             &[],
+            &[],
         )
         .expect("table");
         insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
@@ -1635,6 +1636,7 @@ mod tests {
                 aggregation: None,
             }],
             None,
+            &[],
             &[],
         )
         .expect("table");

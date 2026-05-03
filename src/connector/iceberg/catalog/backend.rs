@@ -70,6 +70,7 @@ impl CatalogBackend for IcebergCatalogBackend {
             &req.table,
             &req.columns,
             req.key_desc.as_ref(),
+            &req.partition_fields,
             &req.properties,
         )
     }

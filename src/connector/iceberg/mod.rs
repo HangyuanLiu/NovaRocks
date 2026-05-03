@@ -21,6 +21,7 @@ pub mod commit;
 pub mod equality_delete;
 mod jvm;
 pub mod metadata;
+pub(crate) mod partition_spec;
 pub mod position_delete;
 pub mod scan_deletes;
 pub mod schema;

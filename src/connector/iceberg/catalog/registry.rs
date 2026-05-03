@@ -327,12 +327,17 @@ pub(crate) fn create_table(
     table_name: &str,
     columns: &[TableColumnDef],
     key_desc: Option<&TableKeyDesc>,
+    partition_fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
     properties: &[(String, String)],
 ) -> Result<(), String> {
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
     entry.invalidate_table_cache(namespace_name, &table_name);
     let schema = build_iceberg_schema(columns)?;
+    let partition_spec = crate::connector::iceberg::partition_spec::build_initial_partition_spec(
+        &schema,
+        partition_fields,
+    )?;
     let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     all_properties.extend(build_logical_type_properties(columns)?);
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
@@ -340,8 +345,12 @@ pub(crate) fn create_table(
         .name(table_name)
         .schema(schema)
         .properties(all_properties)
-        .format_version(format_version)
-        .build();
+        .format_version(format_version);
+    let table_creation = if let Some(spec) = partition_spec {
+        table_creation.partition_spec(spec).build()
+    } else {
+        table_creation.build()
+    };
 
     let catalog = build_hadoop_catalog(entry)?;
     let _ = block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });

@@ -12,8 +12,8 @@ use arrow::record_batch::RecordBatch;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::{ColumnDef, TableDef};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, Literal, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, Literal,
+    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
 };
 
 /// Request to create a table. Unified shape across all catalog backends;
@@ -27,6 +27,7 @@ pub(crate) struct CreateTableRequest {
     pub columns: Vec<TableColumnDef>,
     pub key_desc: Option<TableKeyDesc>,
     pub bucket_count: Option<u32>,
+    pub partition_fields: Vec<IcebergPartitionFieldExpr>,
     pub properties: Vec<(String, String)>,
 }
 

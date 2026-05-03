@@ -79,6 +79,11 @@ impl CatalogBackend for ManagedLakeBackend {
     }
 
     fn create_table(&self, req: CreateTableRequest) -> Result<(), String> {
+        if !req.partition_fields.is_empty() {
+            return Err(
+                "managed-lake CREATE TABLE does not support Iceberg PARTITION BY".to_string(),
+            );
+        }
         let state = self.state()?;
         super::ddl::create_managed_table(
             state.as_ref(),

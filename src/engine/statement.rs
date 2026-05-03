@@ -325,7 +325,6 @@ pub(crate) fn execute_create_table_statement(
             partition_fields,
             properties,
         } => {
-            let _ = partition_fields;
             if current_catalog.is_none()
                 && stmt.name.parts.len() <= 2
                 && state.managed_lake_config.is_none()
@@ -354,6 +353,7 @@ pub(crate) fn execute_create_table_statement(
                 columns,
                 key_desc,
                 bucket_count,
+                partition_fields,
                 properties,
             })?;
             if target.backend_name == "iceberg" {
