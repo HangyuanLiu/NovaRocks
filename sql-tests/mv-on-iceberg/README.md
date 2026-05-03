@@ -15,6 +15,8 @@ Coverage notes:
 - aggregate MV retraction over Iceberg equality-delete snapshots
 - projection/filter MV row deletion over Iceberg position-delete,
   equality-delete, and v3 row-lineage/Puffin deletion-vector snapshots
+- projection/filter MV hidden primary-key projection when PK columns are not
+  part of the user-visible MV output
 - aggregate MV IVM coverage for COUNT/SUM/AVG/MIN/MAX and refresh policy
   fallbacks such as INSERT OVERWRITE
 

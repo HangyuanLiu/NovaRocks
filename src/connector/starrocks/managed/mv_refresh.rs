@@ -158,10 +158,15 @@ pub(crate) fn refresh_mv(
     }
 
     let projection_apply_shape = mv_shape.clone();
+    let projection_full_primary_key_columns = mv_row.primary_key_columns.clone();
     dispatch_mv_refresh_strategy(
         &mv_shape,
         policy,
-        || refresh_mv_full_with_executor(state, &db_name, &mv_name, run_mv_select_and_chunks),
+        || {
+            refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
+                run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
+            })
+        },
         |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
         |current_snapshot_id| {
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
@@ -194,11 +199,14 @@ pub(crate) fn refresh_mv(
                             reason = %reason,
                             "mv_refresh fall-back to Full from projection incremental planner"
                         );
+                        let primary_key_columns = mv_row.primary_key_columns.clone();
                         return refresh_mv_full_with_executor(
                             state,
                             &db_name,
                             &mv_name,
-                            run_mv_select_and_chunks,
+                            move |ctx| {
+                                run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
+                            },
                         );
                     }
                     MvRefreshPolicy::Unsupported { reason } => {
@@ -233,12 +241,10 @@ pub(crate) fn refresh_mv(
                         reason = %reason,
                         "mv_refresh fall-back to Full from projection apply policy"
                     );
-                    return refresh_mv_full_with_executor(
-                        state,
-                        &db_name,
-                        &mv_name,
-                        run_mv_select_and_chunks,
-                    );
+                    let primary_key_columns = mv_row.primary_key_columns.clone();
+                    return refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
+                        run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
+                    });
                 }
                 MvApplyPolicy::Unsupported { reason } => {
                     return Err(format!(
@@ -247,10 +253,12 @@ pub(crate) fn refresh_mv(
                 }
             }
 
+            let select_sql =
+                projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
             let change_stream = materialize_iceberg_change_batch(
                 state,
                 &db_name,
-                &mv_row.select_sql,
+                &select_sql,
                 base_ref,
                 &loaded.table,
                 batch,
@@ -277,14 +285,15 @@ pub(crate) fn refresh_mv(
                 let row_delta = chunks_row_count(&chunks)?;
                 (chunks, row_delta)
             };
-            let plan = load_insert_plan(
-                state,
-                &crate::engine::ResolvedLocalTableName {
-                    database: db_name.clone(),
-                    table: mv_name.clone(),
-                },
-                PartitionTarget::Active,
-            )?;
+            let resolved_mv = crate::engine::ResolvedLocalTableName {
+                database: db_name.clone(),
+                table: mv_name.clone(),
+            };
+            let plan = if mv_row.primary_key_columns.is_empty() {
+                load_insert_plan(state, &resolved_mv, PartitionTarget::Active)
+            } else {
+                load_physical_insert_plan(state, &resolved_mv, PartitionTarget::Active)
+            }?;
             let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
@@ -758,6 +767,56 @@ fn run_mv_select_and_chunks(ctx: MvRefreshContext) -> Result<Vec<Chunk>, String>
     let result: QueryResult =
         execute_query_for_mv_refresh(&ctx.state, &ctx.database, &ctx.select_sql)?;
     query_result_to_chunks(result)
+}
+
+fn run_projection_mv_select_and_chunks(
+    ctx: MvRefreshContext,
+    primary_key_columns: &[String],
+) -> Result<Vec<Chunk>, String> {
+    let select_sql = projection_mv_physical_select_sql(&ctx.select_sql, primary_key_columns)?;
+    let result: QueryResult = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &select_sql)?;
+    query_result_to_chunks(result)
+}
+
+fn projection_mv_physical_select_sql(
+    select_sql: &str,
+    primary_key_columns: &[String],
+) -> Result<String, String> {
+    if primary_key_columns.is_empty() {
+        return Ok(select_sql.to_string());
+    }
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("projection MV physical SELECT normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("projection MV physical SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("projection MV physical SELECT expects a SELECT query".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("projection MV physical SELECT expects a SELECT body".to_string());
+    };
+
+    let mut projection = Vec::with_capacity(
+        primary_key_columns
+            .len()
+            .saturating_add(select.projection.len()),
+    );
+    for key in primary_key_columns {
+        projection.push(hidden_primary_key_select_item(key)?);
+    }
+    projection.extend(std::mem::take(&mut select.projection));
+    select.projection = projection;
+    Ok(stmt.to_string())
+}
+
+fn hidden_primary_key_select_item(key: &str) -> Result<sqlparser::ast::SelectItem, String> {
+    use sqlparser::ast::{Expr, Ident, SelectItem};
+    let hidden_name = super::mv_ddl::projection_mv_hidden_pk_column_name(key)?;
+    Ok(SelectItem::ExprWithAlias {
+        expr: Expr::Identifier(Ident::new(key)),
+        alias: Ident::new(hidden_name),
+    })
 }
 
 /// Run the MV SELECT against the base table and return the resulting chunks.

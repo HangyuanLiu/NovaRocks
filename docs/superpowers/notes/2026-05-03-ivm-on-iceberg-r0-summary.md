@@ -11,8 +11,10 @@
 - Aggregate MV DELETE retract for Iceberg v3 Puffin deletion vectors.
 - Aggregate MV DELETE retract for Iceberg equality deletes.
 - Projection/filter MV DELETE apply for Iceberg position deletes, equality
-  deletes, and v3 Puffin deletion vectors when the MV has visible primary-key
-  row identity.
+  deletes, and v3 Puffin deletion vectors when the MV has PRIMARY KEY row
+  identity.
+- Projection/filter MV hidden primary-key projection for delete apply when
+  PRIMARY KEY columns are not part of the user-visible SELECT output.
 - Object-store delete reverse projection for S3/S3A-style paths through configured catalog credentials.
 - Empty change stream metadata advance without writing data chunks.
 - `_row_id` and `_last_updated_sequence_number` reads on Iceberg v3 row-lineage base tables.
@@ -20,8 +22,7 @@
 ## Explicitly Unsupported
 
 - `INSERT OVERWRITE` incremental bridging.
-- Projection/filter MV DELETE apply without visible primary-key row identity.
-- Hidden primary-key projection for projection/filter MVs.
+- Projection/filter MV DELETE apply without PRIMARY KEY row identity.
 - Schema evolution where the MV uses the changed column.
 - Partition evolution policy.
 - Concurrent refresh on the same MV.
