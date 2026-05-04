@@ -15,6 +15,7 @@ pub(crate) struct MetadataSnapshot {
     pub iceberg_catalogs: Vec<StoredIcebergCatalog>,
     pub iceberg_namespaces: Vec<StoredIcebergNamespace>,
     pub iceberg_tables: Vec<StoredIcebergTable>,
+    pub iceberg_optimize_jobs: Vec<StoredIcebergOptimizeJob>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -529,6 +530,59 @@ pub(crate) struct StoredIcebergTable {
     pub table: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergOptimizeJobState {
+    Pending,
+    Running,
+    Finished,
+    Failed,
+}
+
+impl IcebergOptimizeJobState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Running => "RUNNING",
+            Self::Finished => "FINISHED",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "RUNNING" => Ok(Self::Running),
+            "FINISHED" => Ok(Self::Finished),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(format!("unknown iceberg optimize job state `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IcebergOptimizeJobOutcome {
+    pub rewritten_data_files: i64,
+    pub deleted_data_files: i64,
+    pub added_data_files: i64,
+    pub output_record_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredIcebergOptimizeJob {
+    pub id: i64,
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub base_snapshot_id: i64,
+    pub state: IcebergOptimizeJobState,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub error_message: Option<String>,
+    pub outcome: Option<IcebergOptimizeJobOutcome>,
+}
+
 impl SqliteMetadataStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
@@ -618,12 +672,15 @@ impl SqliteMetadataStore {
                 .map_err(|e| format!("read iceberg_tables failed: {e}"))?
         };
 
+        let iceberg_optimize_jobs = load_iceberg_optimize_jobs(&conn, None)?;
+
         Ok(MetadataSnapshot {
             local_databases,
             managed,
             iceberg_catalogs,
             iceberg_namespaces,
             iceberg_tables,
+            iceberg_optimize_jobs,
         })
     }
 
@@ -1992,6 +2049,218 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn create_iceberg_optimize_job(
+        &self,
+        catalog_name: &str,
+        namespace_name: &str,
+        table_name: &str,
+        base_snapshot_id: i64,
+        now_ms: i64,
+    ) -> Result<StoredIcebergOptimizeJob, String> {
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "create_iceberg_optimize_job")?;
+        let active_job_id = tx
+            .query_row(
+                "SELECT id
+                 FROM iceberg_optimize_jobs
+                 WHERE catalog_name = ?1
+                   AND namespace_name = ?2
+                   AND table_name = ?3
+                   AND state IN ('PENDING', 'RUNNING')
+                 ORDER BY id
+                 LIMIT 1",
+                params![catalog_name, namespace_name, table_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| format!("check active iceberg optimize job failed: {e}"))?;
+        if let Some(active_job_id) = active_job_id {
+            return Err(format!(
+                "active optimize job {active_job_id} already exists for iceberg table {catalog_name}.{namespace_name}.{table_name}"
+            ));
+        }
+        let id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM iceberg_optimize_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("allocate iceberg optimize job id failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO iceberg_optimize_jobs(
+                id,
+                catalog_name,
+                namespace_name,
+                table_name,
+                base_snapshot_id,
+                state,
+                created_at_ms,
+                updated_at_ms,
+                started_at_ms,
+                finished_at_ms,
+                error_message,
+                outcome_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', ?6, ?6, NULL, NULL, NULL, NULL)",
+            params![
+                id,
+                catalog_name,
+                namespace_name,
+                table_name,
+                base_snapshot_id,
+                now_ms,
+            ],
+        )
+        .map_err(|e| format!("insert iceberg optimize job failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit create_iceberg_optimize_job failed: {e}"))?;
+        Ok(StoredIcebergOptimizeJob {
+            id,
+            catalog: catalog_name.to_string(),
+            namespace: namespace_name.to_string(),
+            table: table_name.to_string(),
+            base_snapshot_id,
+            state: IcebergOptimizeJobState::Pending,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error_message: None,
+            outcome: None,
+        })
+    }
+
+    pub(crate) fn list_pending_iceberg_optimize_jobs(
+        &self,
+    ) -> Result<Vec<StoredIcebergOptimizeJob>, String> {
+        let conn = self.connection()?;
+        query_iceberg_optimize_jobs(
+            &conn,
+            "SELECT
+                id,
+                catalog_name,
+                namespace_name,
+                table_name,
+                base_snapshot_id,
+                state,
+                created_at_ms,
+                updated_at_ms,
+                started_at_ms,
+                finished_at_ms,
+                error_message,
+                outcome_json
+             FROM iceberg_optimize_jobs
+             WHERE state = 'PENDING'
+             ORDER BY id",
+            [],
+        )
+    }
+
+    pub(crate) fn claim_iceberg_optimize_job(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+    ) -> Result<StoredIcebergOptimizeJob, String> {
+        let mut conn = self.connection()?;
+        let tx = begin_write_transaction(&mut conn, "claim_iceberg_optimize_job")?;
+        let changed = tx
+            .execute(
+                "UPDATE iceberg_optimize_jobs
+                 SET state = 'RUNNING',
+                     updated_at_ms = ?2,
+                     started_at_ms = ?2,
+                     error_message = NULL
+                 WHERE id = ?1 AND state = 'PENDING'",
+                params![job_id, now_ms],
+            )
+            .map_err(|e| format!("claim iceberg optimize job failed: {e}"))?;
+        if changed != 1 {
+            return Err(format!("iceberg optimize job {job_id} is not pending"));
+        }
+        let job = load_iceberg_optimize_job_by_id(&tx, job_id)?;
+        tx.commit()
+            .map_err(|e| format!("commit claim_iceberg_optimize_job failed: {e}"))?;
+        Ok(job)
+    }
+
+    pub(crate) fn finish_iceberg_optimize_job(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        outcome: IcebergOptimizeJobOutcome,
+    ) -> Result<StoredIcebergOptimizeJob, String> {
+        let conn = self.connection()?;
+        let outcome_json = serde_json::to_string(&outcome)
+            .map_err(|e| format!("serialize iceberg optimize outcome failed: {e}"))?;
+        let changed = conn
+            .execute(
+                "UPDATE iceberg_optimize_jobs
+                 SET state = 'FINISHED',
+                     updated_at_ms = ?2,
+                     finished_at_ms = ?2,
+                     error_message = NULL,
+                     outcome_json = ?3
+                 WHERE id = ?1 AND state = 'RUNNING'",
+                params![job_id, now_ms, outcome_json],
+            )
+            .map_err(|e| format!("finish iceberg optimize job failed: {e}"))?;
+        if changed != 1 {
+            return Err(format!("iceberg optimize job {job_id} is not running"));
+        }
+        load_iceberg_optimize_job_by_id(&conn, job_id)
+    }
+
+    pub(crate) fn fail_iceberg_optimize_job(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        error_message: &str,
+    ) -> Result<StoredIcebergOptimizeJob, String> {
+        let conn = self.connection()?;
+        let changed = conn
+            .execute(
+                "UPDATE iceberg_optimize_jobs
+                 SET state = 'FAILED',
+                     updated_at_ms = ?2,
+                     finished_at_ms = ?2,
+                     error_message = ?3,
+                     outcome_json = NULL
+                 WHERE id = ?1 AND state IN ('PENDING', 'RUNNING')",
+                params![job_id, now_ms, error_message],
+            )
+            .map_err(|e| format!("fail iceberg optimize job failed: {e}"))?;
+        if changed != 1 {
+            return Err(format!("iceberg optimize job {job_id} is not active"));
+        }
+        load_iceberg_optimize_job_by_id(&conn, job_id)
+    }
+
+    pub(crate) fn fail_running_iceberg_optimize_jobs_on_startup(
+        &self,
+        now_ms: i64,
+    ) -> Result<usize, String> {
+        let conn = self.connection()?;
+        let changed = conn
+            .execute(
+                "UPDATE iceberg_optimize_jobs
+                 SET state = 'FAILED',
+                     updated_at_ms = ?1,
+                     finished_at_ms = ?1,
+                     error_message = 'Iceberg optimize job was running during metadata store startup',
+                     outcome_json = NULL
+                 WHERE state = 'RUNNING'",
+                params![now_ms],
+            )
+            .map_err(|e| format!("fail running iceberg optimize jobs on startup failed: {e}"))?;
+        Ok(changed)
+    }
+
+    pub(crate) fn show_iceberg_optimize_jobs(
+        &self,
+    ) -> Result<Vec<StoredIcebergOptimizeJob>, String> {
+        let conn = self.connection()?;
+        load_iceberg_optimize_jobs(&conn, None)
+    }
+
     pub(crate) fn delete_iceberg_namespace(
         &self,
         catalog_name: &str,
@@ -2068,6 +2337,7 @@ impl SqliteMetadataStore {
             && current_version != 5
             && current_version != 6
             && current_version != 7
+            && current_version != 8
         {
             return Err(format!(
                 "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
@@ -2081,6 +2351,13 @@ impl SqliteMetadataStore {
         }
         if current_version == 4 || current_version == 5 || current_version == 6 {
             migrate_schema_v6_to_v7(&conn)?;
+        }
+        if current_version == 4
+            || current_version == 5
+            || current_version == 6
+            || current_version == 7
+        {
+            migrate_schema_v7_to_v8(&conn)?;
         }
         conn.execute_batch(
             "
@@ -2209,7 +2486,25 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 7;
+            CREATE TABLE IF NOT EXISTS iceberg_optimize_jobs (
+                id INTEGER PRIMARY KEY,
+                catalog_name TEXT NOT NULL,
+                namespace_name TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                base_snapshot_id INTEGER NOT NULL,
+                state TEXT NOT NULL
+                    CHECK (state IN ('PENDING', 'RUNNING', 'FINISHED', 'FAILED')),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                started_at_ms INTEGER,
+                finished_at_ms INTEGER,
+                error_message TEXT,
+                outcome_json TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_iceberg_optimize_jobs_active_table
+                ON iceberg_optimize_jobs(catalog_name, namespace_name, table_name)
+                WHERE state IN ('PENDING', 'RUNNING');
+            PRAGMA user_version = 8;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -2611,6 +2906,124 @@ impl SqliteMetadataStore {
     }
 }
 
+fn load_iceberg_optimize_jobs(
+    conn: &Connection,
+    state: Option<IcebergOptimizeJobState>,
+) -> Result<Vec<StoredIcebergOptimizeJob>, String> {
+    match state {
+        Some(state) => query_iceberg_optimize_jobs(
+            conn,
+            "SELECT
+                id,
+                catalog_name,
+                namespace_name,
+                table_name,
+                base_snapshot_id,
+                state,
+                created_at_ms,
+                updated_at_ms,
+                started_at_ms,
+                finished_at_ms,
+                error_message,
+                outcome_json
+             FROM iceberg_optimize_jobs
+             WHERE state = ?1
+             ORDER BY id",
+            params![state.as_sql_str()],
+        ),
+        None => query_iceberg_optimize_jobs(
+            conn,
+            "SELECT
+                id,
+                catalog_name,
+                namespace_name,
+                table_name,
+                base_snapshot_id,
+                state,
+                created_at_ms,
+                updated_at_ms,
+                started_at_ms,
+                finished_at_ms,
+                error_message,
+                outcome_json
+             FROM iceberg_optimize_jobs
+             ORDER BY id",
+            [],
+        ),
+    }
+}
+
+fn load_iceberg_optimize_job_by_id(
+    conn: &Connection,
+    job_id: i64,
+) -> Result<StoredIcebergOptimizeJob, String> {
+    query_iceberg_optimize_jobs(
+        conn,
+        "SELECT
+            id,
+            catalog_name,
+            namespace_name,
+            table_name,
+            base_snapshot_id,
+            state,
+            created_at_ms,
+            updated_at_ms,
+            started_at_ms,
+            finished_at_ms,
+            error_message,
+            outcome_json
+         FROM iceberg_optimize_jobs
+         WHERE id = ?1",
+        params![job_id],
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| format!("iceberg optimize job {job_id} not found"))
+}
+
+fn query_iceberg_optimize_jobs<P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<StoredIcebergOptimizeJob>, String>
+where
+    P: rusqlite::Params,
+{
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("prepare iceberg optimize jobs query failed: {e}"))?;
+    let rows = stmt
+        .query_map(params, iceberg_optimize_job_from_row)
+        .map_err(|e| format!("query iceberg optimize jobs failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read iceberg optimize jobs failed: {e}"))
+}
+
+fn iceberg_optimize_job_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredIcebergOptimizeJob> {
+    let state = IcebergOptimizeJobState::from_sql_str(&row.get::<_, String>(5)?)
+        .map_err(invalid_state_sql_error)?;
+    let outcome = match row.get::<_, Option<String>>(11)? {
+        Some(json) => Some(serde_json::from_str(&json).map_err(json_to_sql_error)?),
+        None => None,
+    };
+    Ok(StoredIcebergOptimizeJob {
+        id: row.get(0)?,
+        catalog: row.get(1)?,
+        namespace: row.get(2)?,
+        table: row.get(3)?,
+        base_snapshot_id: row.get(4)?,
+        state,
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+        started_at_ms: row.get(8)?,
+        finished_at_ms: row.get(9)?,
+        error_message: row.get(10)?,
+        outcome,
+    })
+}
+
 fn update_mv_refresh_metadata_in_tx(
     tx: &rusqlite::Transaction<'_>,
     req: &UpdateMvRefreshMetadataRequest,
@@ -2798,6 +3211,34 @@ fn migrate_schema_v6_to_v7(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn migrate_schema_v7_to_v8(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS iceberg_optimize_jobs (
+            id INTEGER PRIMARY KEY,
+            catalog_name TEXT NOT NULL,
+            namespace_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            base_snapshot_id INTEGER NOT NULL,
+            state TEXT NOT NULL
+                CHECK (state IN ('PENDING', 'RUNNING', 'FINISHED', 'FAILED')),
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            started_at_ms INTEGER,
+            finished_at_ms INTEGER,
+            error_message TEXT,
+            outcome_json TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_iceberg_optimize_jobs_active_table
+            ON iceberg_optimize_jobs(catalog_name, namespace_name, table_name)
+            WHERE state IN ('PENDING', 'RUNNING');
+        PRAGMA user_version = 8;
+        ",
+    )
+    .map_err(|e| format!("migrate standalone metadata schema v7 to v8 failed: {e}"))?;
+    Ok(())
+}
+
 fn ensure_materialized_view_current_columns(conn: &Connection) -> Result<(), String> {
     if !table_column_exists(conn, "materialized_views", "last_refresh_table_uuids_json")? {
         conn.execute_batch(
@@ -2951,11 +3392,12 @@ mod tests {
     use prost::Message;
 
     use super::{
-        ActivateMvRefreshRequest, BeginMvRefreshRequest, IcebergTableRef,
-        InsertIcebergMvRowRequest, ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta,
-        ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedPartitionState,
-        ManagedSnapshot, ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
-        StageManagedTruncateRequest, StageMvRefreshRequest, StoredManagedColumn,
+        ActivateMvRefreshRequest, BeginMvRefreshRequest, IcebergOptimizeJobOutcome,
+        IcebergOptimizeJobState, IcebergTableRef, InsertIcebergMvRowRequest, ManagedEraseJobKind,
+        ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode,
+        ManagedMvStorageEngine, ManagedPartitionState, ManagedSnapshot, ManagedTableKind,
+        ManagedTableState, ManagedTxnState, SqliteMetadataStore, StageManagedTruncateRequest,
+        StageMvRefreshRequest, StoredIcebergOptimizeJob, StoredManagedColumn,
         StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
         StoredMaterializedView, UpdateMvRefreshMetadataRequest,
@@ -3787,7 +4229,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         // `tables` must have the new `kind` column with the expected default and check.
         let kind_col_exists: i64 = conn
@@ -3848,7 +4290,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let cols: Vec<(String, String, i64)> = {
             let mut stmt = conn
@@ -3995,7 +4437,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let visible_col_exists: i64 = conn
             .query_row(
@@ -4462,7 +4904,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let cols: Vec<(String, String, i64)> = {
             let mut stmt = conn
@@ -4536,7 +4978,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let storage_engine: String = conn
             .query_row(
@@ -4659,5 +5101,207 @@ mod tests {
             )
             .expect("count tables");
         assert_eq!(table_count, 0, "tables row must be deleted");
+    }
+
+    #[test]
+    fn iceberg_optimize_job_lifecycle_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("standalone.sqlite");
+        let store = SqliteMetadataStore::open(&db_path).expect("open store");
+
+        let created = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 101, 1_000)
+            .expect("create optimize job");
+        assert_eq!(created.id, 1);
+        assert_eq!(created.catalog, "ice");
+        assert_eq!(created.namespace, "ns");
+        assert_eq!(created.table, "orders");
+        assert_eq!(created.base_snapshot_id, 101);
+        assert_eq!(created.state, IcebergOptimizeJobState::Pending);
+        assert_eq!(created.created_at_ms, 1_000);
+        assert_eq!(created.updated_at_ms, 1_000);
+        assert!(created.started_at_ms.is_none());
+        assert!(created.finished_at_ms.is_none());
+        assert!(created.error_message.is_none());
+        assert!(created.outcome.is_none());
+
+        assert_eq!(
+            store.list_pending_iceberg_optimize_jobs().expect("pending"),
+            vec![created.clone()]
+        );
+
+        let running = store
+            .claim_iceberg_optimize_job(created.id, 2_000)
+            .expect("claim optimize job");
+        assert_eq!(running.state, IcebergOptimizeJobState::Running);
+        assert_eq!(running.started_at_ms, Some(2_000));
+        assert_eq!(running.updated_at_ms, 2_000);
+        assert!(
+            store
+                .list_pending_iceberg_optimize_jobs()
+                .expect("pending after claim")
+                .is_empty()
+        );
+
+        let outcome = IcebergOptimizeJobOutcome {
+            rewritten_data_files: 3,
+            deleted_data_files: 5,
+            added_data_files: 2,
+            output_record_count: 1_234,
+        };
+        let finished = store
+            .finish_iceberg_optimize_job(created.id, 3_000, outcome.clone())
+            .expect("finish optimize job");
+        assert_eq!(finished.state, IcebergOptimizeJobState::Finished);
+        assert_eq!(finished.finished_at_ms, Some(3_000));
+        assert_eq!(finished.updated_at_ms, 3_000);
+        assert_eq!(finished.outcome, Some(outcome.clone()));
+        assert!(finished.error_message.is_none());
+
+        let reloaded = SqliteMetadataStore::open(&db_path).expect("reopen store");
+        let snapshot = reloaded.load_snapshot().expect("load snapshot");
+        assert_eq!(snapshot.iceberg_optimize_jobs, vec![finished.clone()]);
+        assert_eq!(
+            reloaded.show_iceberg_optimize_jobs().expect("show jobs"),
+            vec![finished]
+        );
+    }
+
+    #[test]
+    fn iceberg_optimize_rejects_active_job_for_same_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        let first = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 101, 1_000)
+            .expect("create first job");
+        let err = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 102, 1_100)
+            .expect_err("second pending job should be rejected");
+        assert!(err.contains("active optimize job"), "err={err}");
+
+        store
+            .claim_iceberg_optimize_job(first.id, 2_000)
+            .expect("claim first job");
+        let err = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 103, 2_100)
+            .expect_err("second running job should be rejected");
+        assert!(err.contains("active optimize job"), "err={err}");
+
+        store
+            .fail_iceberg_optimize_job(first.id, 3_000, "worker failed")
+            .expect("fail first job");
+        let second = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 104, 4_000)
+            .expect("create after terminal state");
+        assert_eq!(second.id, 2);
+        assert_eq!(second.state, IcebergOptimizeJobState::Pending);
+
+        let other_table = store
+            .create_iceberg_optimize_job("ice", "ns", "lineitem", 201, 4_100)
+            .expect("create job for another table");
+        assert_eq!(other_table.id, 3);
+    }
+
+    #[test]
+    fn iceberg_optimize_rejects_invalid_state_transitions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        let pending = store
+            .create_iceberg_optimize_job("ice", "ns", "orders", 101, 1_000)
+            .expect("create pending job");
+        let outcome = IcebergOptimizeJobOutcome {
+            rewritten_data_files: 1,
+            deleted_data_files: 1,
+            added_data_files: 1,
+            output_record_count: 10,
+        };
+        let err = store
+            .finish_iceberg_optimize_job(pending.id, 1_500, outcome.clone())
+            .expect_err("pending job should not finish");
+        assert!(err.contains("not running"), "err={err}");
+
+        let running = store
+            .claim_iceberg_optimize_job(pending.id, 2_000)
+            .expect("claim pending job");
+        let err = store
+            .claim_iceberg_optimize_job(running.id, 2_100)
+            .expect_err("running job should not claim again");
+        assert!(err.contains("not pending"), "err={err}");
+
+        let failed = store
+            .fail_iceberg_optimize_job(running.id, 3_000, "worker failed")
+            .expect("fail running job");
+        let err = store
+            .finish_iceberg_optimize_job(failed.id, 4_000, outcome)
+            .expect_err("failed job should not finish");
+        assert!(err.contains("not running"), "err={err}");
+        let err = store
+            .fail_iceberg_optimize_job(failed.id, 4_100, "fail again")
+            .expect_err("failed job should not fail again");
+        assert!(err.contains("not active"), "err={err}");
+    }
+
+    #[test]
+    fn iceberg_optimize_startup_marks_running_jobs_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        let pending = store
+            .create_iceberg_optimize_job("ice", "ns", "pending_orders", 101, 1_000)
+            .expect("create pending job");
+        let running = store
+            .create_iceberg_optimize_job("ice", "ns", "running_orders", 201, 1_000)
+            .expect("create running job");
+        store
+            .claim_iceberg_optimize_job(running.id, 2_000)
+            .expect("claim running job");
+
+        let failed_count = store
+            .fail_running_iceberg_optimize_jobs_on_startup(9_000)
+            .expect("fail running jobs");
+        assert_eq!(failed_count, 1);
+
+        let jobs = store.show_iceberg_optimize_jobs().expect("show jobs");
+        assert_eq!(
+            jobs,
+            vec![
+                StoredIcebergOptimizeJob {
+                    id: pending.id,
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "pending_orders".to_string(),
+                    base_snapshot_id: 101,
+                    state: IcebergOptimizeJobState::Pending,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                    error_message: None,
+                    outcome: None,
+                },
+                StoredIcebergOptimizeJob {
+                    id: running.id,
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "running_orders".to_string(),
+                    base_snapshot_id: 201,
+                    state: IcebergOptimizeJobState::Failed,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 9_000,
+                    started_at_ms: Some(2_000),
+                    finished_at_ms: Some(9_000),
+                    error_message: Some(
+                        "Iceberg optimize job was running during metadata store startup"
+                            .to_string()
+                    ),
+                    outcome: None,
+                },
+            ]
+        );
     }
 }
