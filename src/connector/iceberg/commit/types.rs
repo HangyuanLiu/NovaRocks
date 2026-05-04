@@ -29,6 +29,9 @@ pub enum CommitOpKind {
     /// rewrites touched delete manifests instead of producing v2 Parquet
     /// position-delete files.
     RowDeltaDv,
+    /// Iceberg OPTIMIZE whole-table rewrite: replaces all current live data
+    /// files with compacted data files and drops all current delete files.
+    RewriteDataFiles,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +106,18 @@ mod tests {
 
     #[test]
     fn op_kind_variants_are_distinct() {
+        let variants = [
+            CommitOpKind::FastAppend,
+            CommitOpKind::Overwrite,
+            CommitOpKind::RowDelta,
+            CommitOpKind::RowDeltaDv,
+            CommitOpKind::RewriteDataFiles,
+        ];
+        for (idx, left) in variants.iter().enumerate() {
+            for right in variants.iter().skip(idx + 1) {
+                assert_ne!(left, right);
+            }
+        }
         assert_ne!(CommitOpKind::FastAppend, CommitOpKind::Overwrite);
         assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDelta);
         assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDelta);

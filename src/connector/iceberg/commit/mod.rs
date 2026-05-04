@@ -32,6 +32,7 @@ mod helpers;
 mod overwrite;
 mod position_delete_writer;
 mod puffin_dv;
+mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
@@ -49,6 +50,7 @@ pub use puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
+pub use rewrite_data_files::{RewriteDataFilesCommit, count_current_live_files};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};

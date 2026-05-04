@@ -1291,7 +1291,7 @@ mod tests {
         let mut props = replace_props(total_records, added_files, deleted_files);
         props.extend([
             ("added-delete-files", added_delete_files.to_string()),
-            ("deleted-delete-files", deleted_delete_files.to_string()),
+            ("removed-delete-files", deleted_delete_files.to_string()),
         ]);
         props
     }
@@ -1395,6 +1395,21 @@ mod tests {
     fn classify_lineage_skips_delete_eliminating_replace_compaction() {
         let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
         let owned = replace_props_with_delete_counts(100, 3, 5, 0, 2);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_rewrite_after_delete_elimination() {
+        let parent = snap(1, None, Operation::Delete, &[("total-records", "18")], 0);
+        let mut owned = replace_props_with_delete_counts(18, 2, 1, 0, 2);
+        owned.extend([
+            ("added-records", "18".to_string()),
+            ("deleted-records", "23".to_string()),
+        ]);
         let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let s = snap(2, Some(1), Operation::Replace, &props, 0);
 

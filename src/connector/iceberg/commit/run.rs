@@ -38,6 +38,7 @@ use super::action::{CommitCtx, IcebergCommitAction};
 use super::collector::IcebergCommitCollector;
 use super::fast_append::FastAppendCommit;
 use super::overwrite::OverwriteCommit;
+use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
 use super::types::{CommitOpKind, CommitOutcome};
@@ -75,6 +76,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::Overwrite => Box::new(OverwriteCommit),
         CommitOpKind::RowDelta => Box::new(RowDeltaCommit),
         CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
+        CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
     };
 
     let ctx = CommitCtx {
@@ -201,5 +203,11 @@ mod tests {
             "FastAppend commit failed: connection reset by peer"
         ));
         assert!(is_commit_unknown_message("unexpected error"));
+    }
+
+    #[test]
+    fn run_dispatch_accepts_rewrite_data_files_variant() {
+        let _ = CommitOpKind::RewriteDataFiles;
+        let _ = std::any::type_name::<crate::connector::iceberg::commit::RewriteDataFilesCommit>();
     }
 }

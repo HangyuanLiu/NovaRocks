@@ -905,7 +905,7 @@ fn replace_props_with_delete_counts(
         ("total-records".to_string(), total_records.to_string()),
         ("added-data-files".to_string(), added_data_files.to_string()),
         ("deleted-data-files".to_string(), deleted_data_files.to_string()),
-        ("deleted-delete-files".to_string(), deleted_delete_files.to_string()),
+        ("removed-delete-files".to_string(), deleted_delete_files.to_string()),
         ("added-delete-files".to_string(), added_delete_files.to_string()),
     ]
 }
@@ -934,7 +934,7 @@ Ensure `validate_replace_snapshot` only rejects:
 // - schema id unchanged
 ```
 
-Do not require `added-delete-files > 0`; delete-eliminating compaction must allow `added-delete-files = 0` and `deleted-delete-files > 0`.
+Do not require `added-delete-files > 0`; delete-eliminating compaction must allow `added-delete-files = 0` and `removed-delete-files > 0`.
 
 - [ ] **Step 4: Run change-planning tests**
 
@@ -1081,7 +1081,7 @@ fn rewrite_summary(
     p.insert("deleted-records".to_string(), deleted_records.to_string());
     p.insert("deleted-data-files".to_string(), deleted_data_files.to_string());
     p.insert(
-        "deleted-delete-files".to_string(),
+        "removed-delete-files".to_string(),
         deleted_delete_files.to_string(),
     );
     let total_records = added_records;
@@ -1099,7 +1099,7 @@ fn rewrite_summary_reports_replace_compaction_counts() {
     assert_eq!(summary.get("total-records").unwrap(), "7");
     assert_eq!(summary.get("added-data-files").unwrap(), "1");
     assert_eq!(summary.get("deleted-data-files").unwrap(), "3");
-    assert_eq!(summary.get("deleted-delete-files").unwrap(), "2");
+    assert_eq!(summary.get("removed-delete-files").unwrap(), "2");
 }
 ```
 
