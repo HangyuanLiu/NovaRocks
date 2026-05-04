@@ -72,21 +72,46 @@ pub(crate) struct ScanTupleOwner {
 
 fn add_iceberg_equality_delete_required_columns(
     required: &mut std::collections::HashSet<String>,
-    storage: &crate::sql::catalog::TableStorage,
-) {
-    let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = storage else {
-        return;
+    table: &crate::sql::catalog::TableDef,
+) -> Result<(), String> {
+    let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = &table.storage else {
+        return Ok(());
     };
+    let field_id_to_name: HashMap<i32, String> = table
+        .iceberg_table
+        .as_ref()
+        .map(|iceberg| {
+            iceberg
+                .schema
+                .fields
+                .iter()
+                .map(|field| (field.field_id, field.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     for file in files {
         for delete_file in &file.delete_files {
             if delete_file.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
                 continue;
             }
-            for column in &delete_file.equality_column_names {
+            if delete_file.equality_field_ids.is_empty() {
+                for column in &delete_file.equality_column_names {
+                    required.insert(column.to_lowercase());
+                }
+                continue;
+            }
+            for field_id in &delete_file.equality_field_ids {
+                let column = field_id_to_name.get(field_id).ok_or_else(|| {
+                    format!(
+                        "iceberg equality-delete file {} references unknown field id {} in table {}",
+                        delete_file.path, field_id, table.name
+                    )
+                })?;
                 required.insert(column.to_lowercase());
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +373,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             .as_ref()
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
         if let Some(required) = required.as_mut() {
-            add_iceberg_equality_delete_required_columns(required, &op.table.storage);
+            add_iceberg_equality_delete_required_columns(required, &op.table)?;
         }
 
         let physical_layout = self
@@ -2949,39 +2974,129 @@ mod tests {
         }
     }
 
-    #[test]
-    fn equality_delete_columns_are_added_to_required_scan_columns() {
-        let mut required = std::collections::HashSet::from(["id".to_string()]);
-        let storage = TableStorage::S3ParquetFiles {
-            files: vec![crate::sql::catalog::S3FileInfo {
-                path: "s3://bucket/data.parquet".to_string(),
-                size: 1,
-                row_count: Some(1),
-                column_stats: None,
-                first_row_id: None,
-                data_sequence_number: Some(1),
-                delete_files: vec![IcebergDeleteFileInfo {
-                    path: "s3://bucket/eq-delete.parquet".to_string(),
-                    file_format: IcebergDeleteFileFormat::Parquet,
-                    file_content: IcebergDeleteFileContent::Equality,
-                    length: Some(1),
-                    content_offset: None,
-                    content_size_in_bytes: None,
-                    sequence_number: Some(2),
-                    partition_spec_id: Some(0),
-                    partition_key: Some("Struct([])".to_string()),
-                    equality_column_names: vec!["category".to_string()],
+    fn table_with_delete_files(
+        delete_files: Vec<IcebergDeleteFileInfo>,
+        iceberg_schema_fields: Vec<IcebergSchemaFieldDef>,
+    ) -> TableDef {
+        TableDef {
+            name: "ice_t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "category".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: Some(IcebergTableInfo {
+                location: "file:///warehouse/ice_t".to_string(),
+                schema: IcebergSchemaDef {
+                    fields: iceberg_schema_fields,
+                },
+            }),
+            storage: TableStorage::S3ParquetFiles {
+                files: vec![crate::sql::catalog::S3FileInfo {
+                    path: "s3://bucket/data.parquet".to_string(),
+                    size: 1,
+                    row_count: Some(1),
+                    column_stats: None,
+                    first_row_id: None,
+                    data_sequence_number: Some(1),
+                    delete_files,
+                    manifest_path: None,
+                    partition_values: vec![],
                 }],
-                manifest_path: None,
-                partition_values: vec![],
-            }],
-            cloud_properties: BTreeMap::new(),
-        };
+                cloud_properties: BTreeMap::new(),
+            },
+        }
+    }
 
-        add_iceberg_equality_delete_required_columns(&mut required, &storage);
+    fn equality_delete_file(
+        equality_column_names: Vec<String>,
+        equality_field_ids: Vec<i32>,
+    ) -> IcebergDeleteFileInfo {
+        IcebergDeleteFileInfo {
+            path: "s3://bucket/eq-delete.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Equality,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(2),
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            equality_column_names,
+            equality_field_ids,
+        }
+    }
+
+    #[test]
+    fn equality_delete_field_ids_are_resolved_to_required_scan_columns() {
+        let mut required = std::collections::HashSet::from(["id".to_string()]);
+        let table = table_with_delete_files(
+            vec![equality_delete_file(Vec::new(), vec![3])],
+            vec![
+                IcebergSchemaFieldDef {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    children: vec![],
+                },
+                IcebergSchemaFieldDef {
+                    field_id: 3,
+                    name: "category".to_string(),
+                    children: vec![],
+                },
+            ],
+        );
+
+        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("resolve ids");
 
         assert!(required.contains("id"));
         assert!(required.contains("category"));
+    }
+
+    #[test]
+    fn equality_delete_column_names_are_legacy_fallback_for_required_scan_columns() {
+        let mut required = std::collections::HashSet::from(["id".to_string()]);
+        let table = table_with_delete_files(
+            vec![equality_delete_file(
+                vec!["category".to_string()],
+                Vec::new(),
+            )],
+            vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "id".to_string(),
+                children: vec![],
+            }],
+        );
+
+        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("legacy names");
+
+        assert!(required.contains("id"));
+        assert!(required.contains("category"));
+    }
+
+    #[test]
+    fn equality_delete_unknown_field_id_is_planning_error() {
+        let mut required = std::collections::HashSet::from(["id".to_string()]);
+        let table = table_with_delete_files(
+            vec![equality_delete_file(Vec::new(), vec![99])],
+            vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "id".to_string(),
+                children: vec![],
+            }],
+        );
+
+        let err = add_iceberg_equality_delete_required_columns(&mut required, &table)
+            .expect_err("unknown field id");
+
+        assert!(err.contains("unknown field id 99"), "{err}");
     }
 
     fn scan_plan(path: PathBuf) -> PhysicalPlanNode {

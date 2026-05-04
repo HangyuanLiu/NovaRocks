@@ -918,9 +918,9 @@ fn read_delete_to_catalog_delete(
             IcebergDeleteFileFormat::Puffin
         }
     };
-    let (file_content, equality_column_names) = match delete_file.kind {
+    let (file_content, equality_column_names, equality_field_ids) = match delete_file.kind {
         crate::connector::iceberg::read::IcebergReadDeleteKind::Position => {
-            (IcebergDeleteFileContent::Position, Vec::new())
+            (IcebergDeleteFileContent::Position, Vec::new(), Vec::new())
         }
         crate::connector::iceberg::read::IcebergReadDeleteKind::Equality { equality_field_ids } => {
             if file_format != IcebergDeleteFileFormat::Parquet {
@@ -931,10 +931,8 @@ fn read_delete_to_catalog_delete(
             }
             (
                 IcebergDeleteFileContent::Equality,
-                equality_field_ids
-                    .into_iter()
-                    .map(|field_id| field_id.to_string())
-                    .collect(),
+                Vec::new(),
+                equality_field_ids,
             )
         }
     };
@@ -950,6 +948,7 @@ fn read_delete_to_catalog_delete(
         partition_spec_id: delete_file.partition_spec_id,
         partition_key: delete_file.partition_key,
         equality_column_names,
+        equality_field_ids,
     })
 }
 
@@ -2014,7 +2013,7 @@ mod read_delete_conversion_tests {
     }
 
     #[test]
-    fn parquet_equality_delete_string_encodes_field_ids() {
+    fn parquet_equality_delete_carries_explicit_field_ids() {
         let delete_file = read_delete(
             IcebergReadDeleteFormat::Parquet,
             IcebergReadDeleteKind::Equality {
@@ -2029,10 +2028,8 @@ mod read_delete_conversion_tests {
             catalog_delete.file_content,
             IcebergDeleteFileContent::Equality
         );
-        assert_eq!(
-            catalog_delete.equality_column_names,
-            vec!["3".to_string(), "1".to_string()]
-        );
+        assert_eq!(catalog_delete.equality_field_ids, vec![3, 1]);
+        assert!(catalog_delete.equality_column_names.is_empty());
     }
 
     #[test]
@@ -2053,6 +2050,7 @@ mod read_delete_conversion_tests {
         );
         assert_eq!(catalog_delete.content_offset, Some(64));
         assert_eq!(catalog_delete.content_size_in_bytes, Some(512));
+        assert!(catalog_delete.equality_field_ids.is_empty());
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub struct IcebergDeleteFileInfo {
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
     pub equality_column_names: Vec<String>,
+    pub equality_field_ids: Vec<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
