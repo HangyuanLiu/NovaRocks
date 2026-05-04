@@ -1257,6 +1257,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/orders.parquet"),
                     },
@@ -1290,6 +1291,7 @@ mod tests {
                         nullable: true,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/maps.parquet"),
                     },

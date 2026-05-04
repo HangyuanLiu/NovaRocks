@@ -192,7 +192,37 @@ pub fn placeholder_variables(
         variables.insert(format!("uuid{}", idx), value.clone());
         variables.insert(format!("suite_uuid{}", idx), value);
     }
+    substitute_known_variable_values(&mut variables);
     variables
+}
+
+fn substitute_known_variable_values(variables: &mut HashMap<String, String>) {
+    let Ok(placeholder_re) = Regex::new(r"\$\{([A-Za-z0-9_.-]+)\}") else {
+        return;
+    };
+    let snapshot = variables.clone();
+    for (current_key, value) in variables.iter_mut() {
+        if !value.contains("${") {
+            continue;
+        }
+        let mut substituted = String::with_capacity(value.len());
+        let mut last = 0usize;
+        for captures in placeholder_re.captures_iter(value) {
+            let matched = captures.get(0).expect("placeholder match");
+            let key = captures.get(1).expect("placeholder key").as_str();
+            substituted.push_str(&value[last..matched.start()]);
+            if key == current_key {
+                substituted.push_str(matched.as_str());
+            } else if let Some(replacement) = snapshot.get(key) {
+                substituted.push_str(replacement);
+            } else {
+                substituted.push_str(matched.as_str());
+            }
+            last = matched.end();
+        }
+        substituted.push_str(&value[last..]);
+        *value = substituted;
+    }
 }
 
 pub fn stable_hash_hex(input: &str) -> String {
@@ -452,4 +482,31 @@ pub fn list_sql_files(sql_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_variables_substitute_config_env_values_after_run_ids_exist() {
+        let mut runner_config = RunnerConfig::default();
+        runner_config.values.insert(
+            "iceberg_catalog_warehouse".to_string(),
+            "/tmp/novarocks-sql-tests/${suite_uuid0}/${run_id}/".to_string(),
+        );
+
+        let variables = placeholder_variables(&runner_config, "iceberg");
+        let warehouse = variables
+            .get("iceberg_catalog_warehouse")
+            .expect("warehouse");
+        let suite_uuid0 = variables.get("suite_uuid0").expect("suite uuid");
+        let run_id = variables.get("run_id").expect("run id");
+
+        assert_eq!(
+            warehouse,
+            &format!("/tmp/novarocks-sql-tests/{suite_uuid0}/{run_id}/")
+        );
+        assert!(!warehouse.contains("${"));
+    }
 }

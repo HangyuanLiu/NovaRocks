@@ -2765,6 +2765,7 @@ enable_path_style_access = true
                             path: std::path::PathBuf::from("/unused/for/analysis"),
                         },
                         iceberg_row_lineage_metadata_columns: vec![],
+                        iceberg_table: None,
                     },
                 )
                 .expect("register orders table");

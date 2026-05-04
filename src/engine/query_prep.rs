@@ -122,14 +122,21 @@ fn register_external_tables_for_query_impl(
             continue;
         };
         if target.backend_name != "iceberg" {
-            continue;
-        }
-        if !force_refresh {
             let local = state.catalog.read().expect("catalog read lock");
-            if local.get(&target.namespace, &target.table).is_ok() {
+            if !force_refresh && local.get(&target.namespace, &target.table).is_ok() {
                 continue;
             }
+            continue;
         }
+        {
+            let registry = state
+                .iceberg_catalogs
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+            let entry = registry.get(&target.catalog)?;
+            entry.invalidate_table_cache(&target.namespace, &target.table);
+        }
+        drop_registered_external_table(state, &target.namespace, &target.table)?;
 
         let resolved = match catalog.load_table(&target.catalog, &target.namespace, &target.table) {
             Ok(resolved) => resolved,
@@ -171,6 +178,22 @@ fn register_external_table(
     guard
         .register(namespace, table_def)
         .map_err(|e| format!("register external table: {e}"))
+}
+
+pub(crate) fn drop_registered_external_table(
+    state: &Arc<StandaloneState>,
+    namespace: &str,
+    table: &str,
+) -> Result<(), String> {
+    let mut guard = state
+        .catalog
+        .write()
+        .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+    match guard.drop_table(namespace, table) {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("unknown") => Ok(()),
+        Err(err) => Err(format!("drop registered external table: {err}")),
+    }
 }
 
 pub(crate) fn build_iceberg_table_def_with_files(

@@ -46,6 +46,24 @@ pub struct IcebergDeleteFileInfo {
     pub equality_column_names: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergSchemaFieldDef {
+    pub field_id: i32,
+    pub name: String,
+    pub children: Vec<IcebergSchemaFieldDef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergSchemaDef {
+    pub fields: Vec<IcebergSchemaFieldDef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergTableInfo {
+    pub location: String,
+    pub schema: IcebergSchemaDef,
+}
+
 #[derive(Clone, Debug)]
 pub struct S3FileInfo {
     pub path: String,
@@ -104,6 +122,7 @@ pub struct TableDef {
     /// scope as resolvable pseudo-columns but **not** into `SELECT *`
     /// expansion.
     pub iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
+    pub iceberg_table: Option<IcebergTableInfo>,
     pub storage: TableStorage,
 }
 
@@ -117,5 +136,46 @@ pub trait CatalogProvider {
         _table: &str,
     ) -> Result<Option<PhysicalTableLayout>, String> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_def_can_carry_iceberg_schema_metadata() {
+        let table = TableDef {
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "order_id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: Some(IcebergTableInfo {
+                location: "file:///tmp/orders".to_string(),
+                schema: IcebergSchemaDef {
+                    fields: vec![IcebergSchemaFieldDef {
+                        field_id: 10,
+                        name: "order_id".to_string(),
+                        children: vec![IcebergSchemaFieldDef {
+                            field_id: 11,
+                            name: "nested".to_string(),
+                            children: vec![],
+                        }],
+                    }],
+                },
+            }),
+            storage: TableStorage::S3ParquetFiles {
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+            },
+        };
+
+        let iceberg = table.iceberg_table.expect("iceberg table metadata");
+        assert_eq!(iceberg.location, "file:///tmp/orders");
+        assert_eq!(iceberg.schema.fields[0].field_id, 10);
+        assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
     }
 }

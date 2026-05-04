@@ -6,6 +6,7 @@ pub(crate) mod backend;
 pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
 pub(crate) mod s3_storage;
+pub(crate) mod schema_update;
 
 // Re-export the same surface the previous `standalone::iceberg::*` module
 // offered, so callers only need to update the module prefix, not each
@@ -17,3 +18,4 @@ pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, insert_rows,
     load_table, namespace_exists, register_existing_table,
 };
+pub(crate) use schema_update::alter_table_schema;

@@ -2,6 +2,7 @@ use arrow::datatypes::DataType;
 use std::collections::BTreeSet;
 
 use crate::descriptors;
+use crate::sql::catalog::{IcebergSchemaDef, IcebergSchemaFieldDef, TableDef};
 use crate::types;
 
 use super::type_infer::arrow_type_to_type_desc;
@@ -110,6 +111,87 @@ impl DescriptorTableBuilder {
         ));
     }
 
+    pub fn add_table_for_scan(
+        &mut self,
+        table_id: types::TTableId,
+        db_name: &str,
+        table: &TableDef,
+    ) {
+        if let Some(iceberg) = table.iceberg_table.as_ref() {
+            self.add_iceberg_table(table_id, db_name, table, iceberg);
+        } else {
+            self.add_table(table_id, db_name, &table.name, table.columns.len() as i32);
+        }
+    }
+
+    fn add_iceberg_table(
+        &mut self,
+        table_id: types::TTableId,
+        db_name: &str,
+        table: &TableDef,
+        iceberg: &crate::sql::catalog::IcebergTableInfo,
+    ) {
+        if !self.table_ids.insert(table_id) {
+            return;
+        }
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| {
+                let type_desc = arrow_type_to_type_desc(&column.data_type).ok();
+                descriptors::TColumn::new(
+                    column.name.clone(),
+                    None::<types::TColumnType>,
+                    None::<types::TAggregationType>,
+                    None::<bool>,
+                    Some(column.nullable),
+                    None::<String>,
+                    None::<bool>,
+                    None::<crate::exprs::TExpr>,
+                    None::<bool>,
+                    None::<i32>,
+                    None::<bool>,
+                    None::<types::TAggStateDesc>,
+                    None::<i32>,
+                    type_desc,
+                    None::<crate::exprs::TExpr>,
+                )
+            })
+            .collect::<Vec<_>>();
+        let iceberg_table = descriptors::TIcebergTable::new(
+            Some(iceberg.location.clone()),
+            Some(columns),
+            Some(to_thrift_iceberg_schema(&iceberg.schema)),
+            None::<Vec<String>>,
+            None::<descriptors::TCompressedPartitionMap>,
+            None::<std::collections::BTreeMap<i64, descriptors::THdfsPartition>>,
+            None::<descriptors::TIcebergSchema>,
+            None::<Vec<descriptors::TIcebergPartitionInfo>>,
+            None::<descriptors::TSortOrder>,
+        );
+        self.tables.push(descriptors::TTableDescriptor::new(
+            table_id,
+            types::TTableType::ICEBERG_TABLE,
+            table.columns.len() as i32,
+            0,
+            table.name.clone(),
+            db_name.to_string(),
+            None::<descriptors::TMySQLTable>,
+            None::<descriptors::TOlapTable>,
+            None::<descriptors::TSchemaTable>,
+            None::<descriptors::TBrokerTable>,
+            None::<descriptors::TEsTable>,
+            None::<descriptors::TJDBCTable>,
+            None::<descriptors::THdfsTable>,
+            Some(iceberg_table),
+            None::<descriptors::THudiTable>,
+            None::<descriptors::TDeltaLakeTable>,
+            None::<descriptors::TFileTable>,
+            None::<descriptors::TTableFunctionTable>,
+            None::<descriptors::TPaimonTable>,
+        ));
+    }
+
     /// Mark all slots belonging to the given tuple as nullable.
     /// Used for outer/anti join nullable side columns.
     pub fn widen_tuple_nullable(&mut self, tuple_id: types::TTupleId) {
@@ -131,5 +213,104 @@ impl DescriptorTableBuilder {
             },
             None::<bool>,
         )
+    }
+}
+
+fn to_thrift_iceberg_schema(schema: &IcebergSchemaDef) -> descriptors::TIcebergSchema {
+    descriptors::TIcebergSchema::new(Some(
+        schema
+            .fields
+            .iter()
+            .map(to_thrift_iceberg_schema_field)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn to_thrift_iceberg_schema_field(
+    field: &IcebergSchemaFieldDef,
+) -> descriptors::TIcebergSchemaField {
+    descriptors::TIcebergSchemaField::new(
+        Some(field.field_id),
+        Some(field.name.clone()),
+        (!field.children.is_empty()).then(|| {
+            field
+                .children
+                .iter()
+                .map(to_thrift_iceberg_schema_field)
+                .map(Box::new)
+                .collect::<Vec<_>>()
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableStorage};
+
+    #[test]
+    fn descriptor_builder_emits_iceberg_schema_field_ids() {
+        let table = TableDef {
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "order_id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: Some(IcebergTableInfo {
+                location: "file:///warehouse/orders".to_string(),
+                schema: IcebergSchemaDef {
+                    fields: vec![IcebergSchemaFieldDef {
+                        field_id: 7,
+                        name: "order_id".to_string(),
+                        children: vec![IcebergSchemaFieldDef {
+                            field_id: 8,
+                            name: "nested".to_string(),
+                            children: vec![],
+                        }],
+                    }],
+                },
+            }),
+            storage: TableStorage::S3ParquetFiles {
+                files: vec![],
+                cloud_properties: Default::default(),
+            },
+        };
+        let mut builder = DescriptorTableBuilder::new();
+
+        builder.add_table_for_scan(42, "db1", &table);
+        let desc = builder.build();
+
+        let table_desc = desc
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors")
+            .iter()
+            .find(|desc| desc.id == 42)
+            .expect("iceberg table descriptor");
+        assert_eq!(table_desc.table_type, types::TTableType::ICEBERG_TABLE);
+        let iceberg = table_desc.iceberg_table.as_ref().expect("iceberg table");
+        assert_eq!(
+            iceberg.location.as_deref(),
+            Some("file:///warehouse/orders")
+        );
+        let schema_field = &iceberg
+            .iceberg_schema
+            .as_ref()
+            .expect("iceberg schema")
+            .fields
+            .as_ref()
+            .expect("schema fields")[0];
+        assert_eq!(schema_field.field_id, Some(7));
+        assert_eq!(
+            schema_field.children.as_ref().expect("children")[0].field_id,
+            Some(8)
+        );
+        assert!(
+            schema_field.children.as_ref().expect("children")[0]
+                .children
+                .is_none()
+        );
     }
 }

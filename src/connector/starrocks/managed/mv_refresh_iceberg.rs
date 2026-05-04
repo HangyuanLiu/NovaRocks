@@ -166,6 +166,7 @@ pub(crate) fn create_iceberg_mv(
                 name: mv_name.clone(),
                 columns,
                 iceberg_row_lineage_metadata_columns: vec![],
+                iceberg_table: None,
                 storage: TableStorage::S3ParquetFiles {
                     files: vec![],
                     cloud_properties: Default::default(),
@@ -1080,6 +1081,7 @@ fn update_iceberg_mv_in_catalog(
         name: mv_name.to_string(),
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
+        iceberg_table: None,
         storage,
     };
 
