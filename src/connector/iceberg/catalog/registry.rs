@@ -14,7 +14,8 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{
-    FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type,
+    FormatVersion, ListType, Literal as IcebergLiteral, MapType, NestedField, PrimitiveLiteral,
+    PrimitiveType, Schema, StructType, TableMetadata, Transform, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
@@ -37,6 +38,8 @@ pub(crate) struct IcebergCatalogEntry {
     s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     pub(crate) warehouse_path: PathBuf,
     table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
+    data_files_cache:
+        Arc<std::sync::RwLock<HashMap<(String, String, Option<i64>), Vec<DataFileWithStats>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,10 +147,47 @@ impl IcebergCatalogEntry {
         if let (Ok(ns), Ok(tbl)) = (
             normalize_identifier(namespace_name),
             normalize_identifier(table_name),
-        ) && let Ok(mut cache) = self.table_cache.write()
-        {
-            cache.remove(&(ns, tbl));
+        ) {
+            if let Ok(mut cache) = self.table_cache.write() {
+                cache.remove(&(ns.clone(), tbl.clone()));
+            }
+            if let Ok(mut cache) = self.data_files_cache.write() {
+                cache
+                    .retain(|(cached_ns, cached_tbl, _), _| cached_ns != &ns || cached_tbl != &tbl);
+            }
         }
+    }
+
+    pub(crate) fn cached_data_files(
+        &self,
+        namespace_name: &str,
+        table_name: &str,
+        snapshot_id: Option<i64>,
+    ) -> Result<Option<Vec<DataFileWithStats>>, String> {
+        let ns = normalize_identifier(namespace_name)?;
+        let tbl = normalize_identifier(table_name)?;
+        let cache = self
+            .data_files_cache
+            .read()
+            .map_err(|e| format!("iceberg data-file cache lock: {e}"))?;
+        Ok(cache.get(&(ns, tbl, snapshot_id)).cloned())
+    }
+
+    pub(crate) fn cache_data_files(
+        &self,
+        namespace_name: &str,
+        table_name: &str,
+        snapshot_id: Option<i64>,
+        data_files: Vec<DataFileWithStats>,
+    ) -> Result<(), String> {
+        let ns = normalize_identifier(namespace_name)?;
+        let tbl = normalize_identifier(table_name)?;
+        let mut cache = self
+            .data_files_cache
+            .write()
+            .map_err(|e| format!("iceberg data-file cache lock: {e}"))?;
+        cache.insert((ns, tbl, snapshot_id), data_files);
+        Ok(())
     }
 }
 
@@ -410,14 +450,7 @@ pub(crate) fn drop_table(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    // Remove from cache
-    {
-        let mut cache = entry
-            .table_cache
-            .write()
-            .map_err(|e| format!("table cache lock: {e}"))?;
-        cache.remove(&(ns_name.clone(), tbl_name.clone()));
-    }
+    entry.invalidate_table_cache(&ns_name, &tbl_name);
 
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -634,17 +667,7 @@ pub(crate) fn insert_rows(
     .map_err(|e| format!("insert iceberg rows runtime failed: {e}"))?
     .map_err(|e| format!("insert iceberg rows failed: {e}"))?;
 
-    // Invalidate cache after insert
-    {
-        let mut cache = entry
-            .table_cache
-            .write()
-            .map_err(|e| format!("table cache lock: {e}"))?;
-        cache.remove(&(
-            normalize_identifier(namespace_name)?,
-            normalize_identifier(table_name)?,
-        ));
-    }
+    entry.invalidate_table_cache(namespace_name, table_name);
 
     Ok(())
 }
@@ -665,6 +688,7 @@ fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Re
 }
 
 /// Result of extracting data files with column-level statistics from Iceberg manifests.
+#[derive(Clone)]
 pub(crate) struct DataFileWithStats {
     pub path: String,
     pub size: i64,
@@ -672,6 +696,8 @@ pub(crate) struct DataFileWithStats {
     pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
     pub partition_spec_id: Option<i32>,
     pub partition_values: Option<iceberg::spec::Struct>,
+    pub manifest_path: Option<String>,
+    pub partition_field_values: Vec<crate::sql::catalog::IcebergPartitionFieldValue>,
     /// Iceberg v3 row-lineage: first row id assigned to this data file.
     pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
@@ -712,6 +738,74 @@ fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
         None
     } else {
         Some(format!("{partition:?}"))
+    }
+}
+
+fn iceberg_partition_field_values(
+    metadata: &TableMetadata,
+    spec_id: i32,
+    partition: &iceberg::spec::Struct,
+) -> Result<Vec<crate::sql::catalog::IcebergPartitionFieldValue>, String> {
+    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
+        return Err(format!(
+            "iceberg table metadata missing partition spec id {spec_id}"
+        ));
+    };
+    let schema = metadata.current_schema();
+    let mut values = Vec::with_capacity(spec.fields().len());
+    for (idx, field) in spec.fields().iter().enumerate() {
+        let source_column = schema
+            .field_by_id(field.source_id)
+            .map(|source| source.name.clone())
+            .unwrap_or_else(|| format!("#{}", field.source_id));
+        let value = partition
+            .fields()
+            .get(idx)
+            .and_then(|literal| literal.as_ref())
+            .and_then(iceberg_partition_value_from_literal);
+        values.push(crate::sql::catalog::IcebergPartitionFieldValue {
+            source_column,
+            field_name: field.name.clone(),
+            transform: iceberg_partition_transform_name(&field.transform),
+            value,
+        });
+    }
+    Ok(values)
+}
+
+fn iceberg_partition_transform_name(transform: &Transform) -> String {
+    match transform {
+        Transform::Identity => "identity".to_string(),
+        other => format!("{:?}", other).to_ascii_lowercase(),
+    }
+}
+
+fn iceberg_partition_value_from_literal(
+    literal: &IcebergLiteral,
+) -> Option<crate::sql::catalog::IcebergPartitionValue> {
+    let IcebergLiteral::Primitive(value) = literal else {
+        return None;
+    };
+    match value {
+        PrimitiveLiteral::Boolean(v) => {
+            Some(crate::sql::catalog::IcebergPartitionValue::Boolean(*v))
+        }
+        PrimitiveLiteral::Int(v) => Some(crate::sql::catalog::IcebergPartitionValue::Int32(*v)),
+        PrimitiveLiteral::Long(v) => Some(crate::sql::catalog::IcebergPartitionValue::Int64(*v)),
+        PrimitiveLiteral::Float(v) => Some(crate::sql::catalog::IcebergPartitionValue::Float(v.0)),
+        PrimitiveLiteral::Double(v) => {
+            Some(crate::sql::catalog::IcebergPartitionValue::Double(v.0))
+        }
+        PrimitiveLiteral::String(v) => Some(crate::sql::catalog::IcebergPartitionValue::String(
+            v.clone(),
+        )),
+        PrimitiveLiteral::Binary(v) => Some(crate::sql::catalog::IcebergPartitionValue::Binary(
+            v.clone(),
+        )),
+        PrimitiveLiteral::Int128(_)
+        | PrimitiveLiteral::UInt128(_)
+        | PrimitiveLiteral::AboveMax
+        | PrimitiveLiteral::BelowMin => None,
     }
 }
 
@@ -1059,6 +1153,11 @@ pub(crate) fn extract_data_files_with_stats(
                 );
                 let data_partition_spec_id = Some(manifest_file.partition_spec_id);
                 let data_partition_key = iceberg_partition_key(df.partition());
+                let partition_field_values = iceberg_partition_field_values(
+                    metadata,
+                    manifest_file.partition_spec_id,
+                    df.partition(),
+                )?;
                 let mut delete_files = delete_files_by_data_path
                     .get(&path)
                     .cloned()
@@ -1083,6 +1182,8 @@ pub(crate) fn extract_data_files_with_stats(
                     column_stats,
                     partition_spec_id: Some(manifest_file.partition_spec_id),
                     partition_values: Some(df.partition().clone()),
+                    manifest_path: Some(manifest_file.manifest_path.clone()),
+                    partition_field_values,
                     first_row_id,
                     data_sequence_number,
                     delete_files,
@@ -1199,6 +1300,7 @@ pub(crate) fn build_catalog_entry(
         s3_config,
         warehouse_path,
         table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        data_files_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
     };
 
     Ok(entry)
@@ -2130,7 +2232,26 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod data_file_with_stats_tests {
-    use super::DataFileWithStats;
+    use super::{DataFileWithStats, IcebergCatalogEntry};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    fn data_file(path: &str) -> DataFileWithStats {
+        DataFileWithStats {
+            path: path.to_string(),
+            size: 1024,
+            record_count: Some(100),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_values: None,
+            manifest_path: None,
+            partition_field_values: vec![],
+            first_row_id: Some(7),
+            data_sequence_number: Some(42),
+            delete_files: vec![],
+        }
+    }
 
     /// Regression test: data_sequence_number must be threaded from the
     /// DataFileWithStats struct through to S3FileInfo.  The full
@@ -2139,17 +2260,7 @@ mod data_file_with_stats_tests {
     /// struct plumbing so a future refactor cannot drop the field silently.
     #[test]
     fn data_file_with_stats_carries_data_sequence_number() {
-        let f = DataFileWithStats {
-            path: "s3://bucket/data/part-0.parquet".to_string(),
-            size: 1024,
-            record_count: Some(100),
-            column_stats: None,
-            partition_spec_id: None,
-            partition_values: None,
-            first_row_id: Some(7),
-            data_sequence_number: Some(42),
-            delete_files: vec![],
-        };
+        let f = data_file("s3://bucket/data/part-0.parquet");
         assert_eq!(
             f.data_sequence_number,
             Some(42),
@@ -2159,20 +2270,67 @@ mod data_file_with_stats_tests {
 
     #[test]
     fn data_file_with_stats_data_sequence_number_none_for_non_iceberg() {
-        let f = DataFileWithStats {
-            path: "/local/data.parquet".to_string(),
-            size: 512,
-            record_count: None,
-            column_stats: None,
-            partition_spec_id: None,
-            partition_values: None,
-            first_row_id: None,
-            data_sequence_number: None,
-            delete_files: vec![],
+        let f = {
+            let mut f = data_file("/local/data.parquet");
+            f.record_count = None;
+            f.size = 512;
+            f.first_row_id = None;
+            f.data_sequence_number = None;
+            f
         };
         assert_eq!(
             f.data_sequence_number, None,
             "data_sequence_number should be None for non-Iceberg sources"
+        );
+    }
+
+    #[test]
+    fn data_file_cache_is_snapshot_scoped_and_table_invalidation_clears_it() {
+        let entry = IcebergCatalogEntry {
+            warehouse_uri: "file:///tmp/warehouse".to_string(),
+            properties: vec![],
+            s3_config: None,
+            warehouse_path: PathBuf::from("/tmp/warehouse"),
+            table_cache: Arc::new(RwLock::new(HashMap::new())),
+            data_files_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        entry
+            .cache_data_files("Db1", "Tbl1", Some(7), vec![data_file("file:///a.parquet")])
+            .expect("cache snapshot 7");
+        entry
+            .cache_data_files("Db1", "Tbl1", Some(8), vec![data_file("file:///b.parquet")])
+            .expect("cache snapshot 8");
+
+        assert_eq!(
+            entry
+                .cached_data_files("db1", "tbl1", Some(7))
+                .expect("read snapshot 7")
+                .expect("snapshot 7 cached")[0]
+                .path,
+            "file:///a.parquet"
+        );
+        assert_eq!(
+            entry
+                .cached_data_files("db1", "tbl1", Some(8))
+                .expect("read snapshot 8")
+                .expect("snapshot 8 cached")[0]
+                .path,
+            "file:///b.parquet"
+        );
+
+        entry.invalidate_table_cache("db1", "tbl1");
+
+        assert!(
+            entry
+                .cached_data_files("db1", "tbl1", Some(7))
+                .expect("read invalidated snapshot 7")
+                .is_none()
+        );
+        assert!(
+            entry
+                .cached_data_files("db1", "tbl1", Some(8))
+                .expect("read invalidated snapshot 8")
+                .is_none()
         );
     }
 }

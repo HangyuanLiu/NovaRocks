@@ -221,6 +221,8 @@ pub(crate) fn build_iceberg_table_def_with_files(
                 column_stats: None,
                 partition_spec_id: None,
                 partition_values: None,
+                manifest_path: None,
+                partition_field_values: vec![],
                 first_row_id: file.first_row_id,
                 data_sequence_number: file.data_sequence_number,
                 delete_files: vec![],

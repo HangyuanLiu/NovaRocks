@@ -20,6 +20,25 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum IcebergPartitionValue {
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Float(f32),
+    Double(f64),
+    String(String),
+    Binary(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IcebergPartitionFieldValue {
+    pub source_column: String,
+    pub field_name: String,
+    pub transform: String,
+    pub value: Option<IcebergPartitionValue>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergDeleteFileFormat {
     Parquet,
@@ -82,6 +101,12 @@ pub struct S3FileInfo {
     /// Iceberg position-delete / Puffin deletion-vector files that apply to
     /// this data file. Empty for append-only snapshots and non-Iceberg scans.
     pub delete_files: Vec<IcebergDeleteFileInfo>,
+    /// Data manifest path that contributed this file. None for non-Iceberg
+    /// sources and synthetic test files.
+    pub manifest_path: Option<String>,
+    /// Partition values decoded from the Iceberg DataFile partition struct.
+    /// Currently used for conservative identity-partition pruning.
+    pub partition_values: Vec<IcebergPartitionFieldValue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

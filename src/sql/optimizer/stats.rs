@@ -1402,6 +1402,8 @@ mod tests {
                         first_row_id: None,
                         data_sequence_number: None,
                         delete_files: vec![],
+                        manifest_path: None,
+                        partition_values: vec![],
                     }],
                     cloud_properties: Default::default(),
                 },

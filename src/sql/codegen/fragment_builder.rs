@@ -97,7 +97,7 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     catalog: &'a dyn CatalogProvider,
     current_database: &'a str,
     desc_builder: DescriptorTableBuilder,
-    scan_tables: Vec<(i32, ResolvedTable)>,
+    scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
     next_slot_id: i32,
     next_tuple_id: i32,
@@ -173,13 +173,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let desc_tbl =
             std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new()).build();
 
-        let exec_params = nodes::build_exec_params_multi(
-            &builder
-                .scan_tables
-                .iter()
-                .map(|(id, rt)| (*id, rt.clone()))
-                .collect::<Vec<_>>(),
-        )?;
+        let exec_params = nodes::build_exec_params_multi(&builder.scan_tables)?;
 
         let output_columns = plan
             .output_columns
@@ -346,6 +340,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let mut scope = ExprScope::new();
         let qualifier = op.alias.as_deref().or(Some(&op.table.name));
+        let mut slot_to_column = HashMap::new();
 
         // Determine which columns to emit
         let mut required: Option<std::collections::HashSet<String>> = op
@@ -388,6 +383,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 col.nullable,
                 idx as i32,
             );
+            slot_to_column.insert(slot_id, col.name.clone());
             let binding = ColumnBinding {
                 tuple_id: scan_tuple_id,
                 slot_id,
@@ -480,9 +476,18 @@ impl<'a> PlanFragmentBuilder<'a> {
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
-        let scan_plan_node =
-            nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, pushed_conjuncts);
-        self.scan_tables.push((scan_node_id, resolved));
+        let scan_plan_node = nodes::build_scan_node(
+            scan_node_id,
+            scan_tuple_id,
+            &resolved,
+            pushed_conjuncts.clone(),
+        );
+        self.scan_tables.push(nodes::PlannedScanTable {
+            scan_node_id,
+            resolved,
+            min_max_conjuncts: pushed_conjuncts,
+            slot_to_column,
+        });
 
         // Track tuple -> scan node ownership for runtime filter planning.
         let current_frag = self.current_fragment_id()?;
@@ -518,10 +523,20 @@ impl<'a> PlanFragmentBuilder<'a> {
         if !conjuncts.is_empty() {
             // Push conjuncts onto the first (scan) node if it has none yet
             if let Some(scan) = child.plan_nodes.first_mut() {
+                let scan_node_id = scan.node_id;
+                let extra_conjuncts = conjuncts.clone();
                 if scan.conjuncts.is_none() {
                     scan.conjuncts = Some(conjuncts);
                 } else {
                     scan.conjuncts.as_mut().unwrap().extend(conjuncts);
+                }
+                nodes::append_hdfs_scan_min_max_conjuncts(scan, &extra_conjuncts);
+                if let Some(planned) = self
+                    .scan_tables
+                    .iter_mut()
+                    .find(|planned| planned.scan_node_id == scan_node_id)
+                {
+                    planned.min_max_conjuncts.extend(extra_conjuncts);
                 }
             }
         }
@@ -2763,11 +2778,14 @@ mod tests {
 
     use super::*;
     use crate::plan_nodes;
-    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, SortItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr,
+    };
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-        IcebergDeleteFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-        ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+        CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDeleteFileContent,
+        IcebergDeleteFileFormat, IcebergDeleteFileInfo, IcebergPartitionFieldValue,
+        IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, TableDef, TableStorage,
     };
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
@@ -2852,6 +2870,78 @@ mod tests {
         }
     }
 
+    fn id_eq_literal(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(id_expr()),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(value)),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn iceberg_i32_file(path: &str, min: i32, max: i32) -> S3FileInfo {
+        S3FileInfo {
+            path: path.to_string(),
+            size: 128,
+            row_count: Some(10),
+            column_stats: Some(HashMap::from([(
+                "id".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(0),
+                    column_size: None,
+                    lower_bound: Some(min.to_le_bytes().to_vec()),
+                    upper_bound: Some(max.to_le_bytes().to_vec()),
+                },
+            )])),
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        }
+    }
+
+    fn iceberg_i32_partition_file(path: &str, id: i32) -> S3FileInfo {
+        S3FileInfo {
+            path: path.to_string(),
+            size: 128,
+            row_count: Some(10),
+            column_stats: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            delete_files: vec![],
+            manifest_path: Some(format!("manifest-{id}.avro")),
+            partition_values: vec![IcebergPartitionFieldValue {
+                source_column: "id".to_string(),
+                field_name: "id".to_string(),
+                transform: "identity".to_string(),
+                value: Some(IcebergPartitionValue::Int32(id)),
+            }],
+        }
+    }
+
+    fn iceberg_delete_file(path: &str, length: i64) -> IcebergDeleteFileInfo {
+        IcebergDeleteFileInfo {
+            path: path.to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Position,
+            length: Some(length),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(2),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            equality_column_names: vec![],
+        }
+    }
+
     fn stats() -> Statistics {
         Statistics {
             output_row_count: 3.0,
@@ -2882,6 +2972,8 @@ mod tests {
                     partition_key: Some("Struct([])".to_string()),
                     equality_column_names: vec!["category".to_string()],
                 }],
+                manifest_path: None,
+                partition_values: vec![],
             }],
             cloud_properties: BTreeMap::new(),
         };
@@ -2983,6 +3075,298 @@ mod tests {
             stats: stats(),
             output_columns: output_columns(),
         }
+    }
+
+    fn iceberg_scan_plan_with_file_stats() -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: Some(IcebergTableInfo {
+                        location: "s3://bucket/warehouse/ice_t".to_string(),
+                        schema: IcebergSchemaDef {
+                            fields: vec![IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                children: vec![],
+                            }],
+                        },
+                    }),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![
+                            iceberg_i32_file("s3://bucket/file-1-5.parquet", 1, 5),
+                            iceberg_i32_file("s3://bucket/file-10-20.parquet", 10, 20),
+                        ],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![id_eq_literal(12)],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn iceberg_scan_plan_with_partition_values() -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: Some(IcebergTableInfo {
+                        location: "s3://bucket/warehouse/ice_t".to_string(),
+                        schema: IcebergSchemaDef {
+                            fields: vec![IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                children: vec![],
+                            }],
+                        },
+                    }),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![
+                            iceberg_i32_partition_file("s3://bucket/id-1.parquet", 1),
+                            iceberg_i32_partition_file("s3://bucket/id-12.parquet", 12),
+                        ],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![id_eq_literal(12)],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn iceberg_scan_plan_with_large_file(size: i64) -> PhysicalPlanNode {
+        let mut file = iceberg_i32_file("s3://bucket/large.parquet", 1, 100);
+        file.size = size;
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: Some(IcebergTableInfo {
+                        location: "s3://bucket/warehouse/ice_t".to_string(),
+                        schema: IcebergSchemaDef {
+                            fields: vec![IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                children: vec![],
+                            }],
+                        },
+                    }),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![file],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn iceberg_scan_plan_with_many_delete_files(delete_count: usize) -> PhysicalPlanNode {
+        let mut file = iceberg_i32_file("s3://bucket/delete-heavy.parquet", 1, 100);
+        file.delete_files = (0..delete_count)
+            .map(|idx| iceberg_delete_file(&format!("s3://bucket/delete-{idx}.parquet"), 1))
+            .collect();
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: Some(IcebergTableInfo {
+                        location: "s3://bucket/warehouse/ice_t".to_string(),
+                        schema: IcebergSchemaDef {
+                            fields: vec![IcebergSchemaFieldDef {
+                                field_id: 1,
+                                name: "id".to_string(),
+                                children: vec![],
+                            }],
+                        },
+                    }),
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![file],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    #[test]
+    fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
+        let plan = iceberg_scan_plan_with_file_stats();
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let hdfs = scan.hdfs_scan_node.as_ref().expect("hdfs scan payload");
+
+        assert_eq!(
+            hdfs.min_max_conjuncts.as_ref().map(Vec::len),
+            Some(1),
+            "standalone scan predicates should be available to HDFS min/max pruning"
+        );
+        assert_eq!(hdfs.min_max_tuple_id, hdfs.tuple_id);
+
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&scan.node_id)
+            .expect("scan ranges");
+        assert_eq!(
+            ranges.len(),
+            1,
+            "file-level Iceberg stats should prune the file whose id range cannot contain 12"
+        );
+        let kept_path = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .and_then(|range| range.full_path.as_deref());
+        assert_eq!(kept_path, Some("s3://bucket/file-10-20.parquet"));
+    }
+
+    #[test]
+    fn iceberg_identity_partition_values_prune_scan_ranges() {
+        let plan = iceberg_scan_plan_with_partition_values();
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&scan.node_id)
+            .expect("scan ranges");
+
+        assert_eq!(
+            ranges.len(),
+            1,
+            "identity partition values should prune files before scan range planning"
+        );
+        let kept_path = ranges[0]
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .and_then(|range| range.full_path.as_deref());
+        assert_eq!(kept_path, Some("s3://bucket/id-12.parquet"));
+    }
+
+    #[test]
+    fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
+        let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&scan.node_id)
+            .expect("scan ranges");
+
+        assert_eq!(ranges.len(), 3);
+        let first = ranges[0].scan_range.hdfs_scan_range.as_ref().unwrap();
+        let second = ranges[1].scan_range.hdfs_scan_range.as_ref().unwrap();
+        let third = ranges[2].scan_range.hdfs_scan_range.as_ref().unwrap();
+        assert_eq!(first.offset, Some(0));
+        assert_eq!(first.length, Some(128 * 1024 * 1024));
+        assert_eq!(first.file_length, Some(300 * 1024 * 1024));
+        assert_eq!(second.offset, Some(128 * 1024 * 1024));
+        assert_eq!(second.length, Some(128 * 1024 * 1024));
+        assert_eq!(third.offset, Some(256 * 1024 * 1024));
+        assert_eq!(third.length, Some(44 * 1024 * 1024));
+    }
+
+    #[test]
+    fn iceberg_delete_apply_cost_rejects_too_many_delete_files() {
+        let plan = iceberg_scan_plan_with_many_delete_files(1025);
+
+        let err = match PlanFragmentBuilder::build(&plan, &DummyCatalog, "default") {
+            Ok(_) => panic!("delete-heavy scan should fail fast"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("too many Iceberg delete files"),
+            "unexpected error: {err}"
+        );
     }
 
     fn mixed_managed_iceberg_join_plan() -> PhysicalPlanNode {

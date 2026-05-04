@@ -87,6 +87,30 @@ impl HdfsScanOp {
     fn next_incremental_scan_range_id(&self) -> i32 {
         self.next_scan_range_id.fetch_add(1, Ordering::AcqRel)
     }
+
+    fn ordered_initial_ranges(&self) -> Vec<&FileScanRange> {
+        let mut ranges = self.cfg.ranges.iter().collect::<Vec<_>>();
+        if self.can_reorder_initial_ranges() {
+            ranges.sort_by(|left, right| {
+                right
+                    .length
+                    .cmp(&left.length)
+                    .then_with(|| left.path.cmp(&right.path))
+                    .then_with(|| left.offset.cmp(&right.offset))
+            });
+        }
+        ranges
+    }
+
+    fn can_reorder_initial_ranges(&self) -> bool {
+        !self.row_position_scan
+            && self.cfg.ranges.iter().all(|range| {
+                range.scan_range_id < 0
+                    && range.first_row_id.is_none()
+                    && range.data_sequence_number.is_none()
+                    && range.delete_files.is_empty()
+            })
+    }
 }
 
 impl ScanOp for HdfsScanOp {
@@ -156,7 +180,7 @@ impl ScanOp for HdfsScanOp {
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
         let mut morsels = Vec::with_capacity(self.cfg.ranges.len());
-        for r in &self.cfg.ranges {
+        for r in self.ordered_initial_ranges() {
             morsels.push(ScanMorsel::FileRange {
                 path: r.path.clone(),
                 file_len: r.file_len,
@@ -671,5 +695,73 @@ mod tests {
             }
             other => panic!("unexpected morsel: {:?}", other),
         }
+    }
+
+    #[test]
+    fn build_morsels_prioritizes_large_plain_ranges() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![
+                FileScanRange {
+                    path: "s3://bucket/path/small-a.parquet".to_string(),
+                    file_len: 1024,
+                    offset: 0,
+                    length: 1024,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                },
+                FileScanRange {
+                    path: "s3://bucket/path/large.parquet".to_string(),
+                    file_len: 128 * 1024 * 1024,
+                    offset: 0,
+                    length: 128 * 1024 * 1024,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                },
+                FileScanRange {
+                    path: "s3://bucket/path/small-b.parquet".to_string(),
+                    file_len: 2048,
+                    offset: 0,
+                    length: 2048,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    external_datacache: None,
+                    delete_files: Vec::new(),
+                },
+            ],
+            original_range_count: 3,
+            has_more: false,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let morsels = op.build_morsels().expect("build morsels");
+
+        let paths = morsels
+            .morsels
+            .iter()
+            .map(|morsel| match morsel {
+                ScanMorsel::FileRange { path, .. } => path.as_str(),
+                other => panic!("unexpected morsel: {:?}", other),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "s3://bucket/path/large.parquet",
+                "s3://bucket/path/small-b.parquet",
+                "s3://bucket/path/small-a.parquet",
+            ]
+        );
     }
 }
