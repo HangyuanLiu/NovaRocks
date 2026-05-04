@@ -91,6 +91,7 @@ fn normalize_batch_to_chunk_schema(
     }
     let mut fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
+    let batch_schema = batch.schema();
     for (idx, slot) in chunk_schema.slots().iter().enumerate() {
         let column = batch.column(idx).clone();
         let casted = if column.data_type() == slot.data_type() {
@@ -105,11 +106,17 @@ fn normalize_batch_to_chunk_schema(
                 )
             })?
         };
-        let field = if casted.null_count() > 0 && !slot.nullable() {
+        let mut field = if casted.null_count() > 0 && !slot.nullable() {
             slot.field().clone().with_nullable(true)
         } else {
             slot.field().clone()
         };
+        let source_field = batch_schema.field(idx);
+        if !source_field.metadata().is_empty() {
+            let mut metadata = field.metadata().clone();
+            metadata.extend(source_field.metadata().clone());
+            field = field.with_metadata(metadata);
+        }
         fields.push(field);
         columns.push(casted);
     }
