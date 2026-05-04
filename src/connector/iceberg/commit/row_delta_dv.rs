@@ -30,8 +30,8 @@
 //!    data manifests are kept verbatim.
 //! 3. Writes one single-blob Puffin DV per touched data file via
 //!    [`write_single_deletion_vector_puffin`].
-//! 4. Writes a single new delete manifest (`*-row-delta-dv-added-*.avro`)
-//!    that records the new Puffin DV files with
+//! 4. Writes new delete manifests (`*-row-delta-dv-added-*.avro`), grouped by
+//!    the referenced data file's partition spec, that record the new Puffin DV files with
 //!    `content=PositionDeletes`, `file_format=Puffin`, and the
 //!    `referenced-data-file` / `content_offset` / `content_size_in_bytes`
 //!    fields required by the Iceberg v3 spec.
@@ -42,7 +42,7 @@
 //! 6. Returns an `ActionCommit` with the standard
 //!    `AddSnapshot + SetSnapshotRef` updates and OCC requirements.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -91,7 +91,6 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             groups,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
-            partition_spec: ctx.collector.partition_spec.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
             schema_id: ctx.table.metadata().current_schema_id(),
             row_lineage_first_row_id: ctx.table.metadata().next_row_id(),
@@ -127,7 +126,6 @@ struct RowDeltaDvTxnAction {
     groups: Vec<PositionDeleteGroup>,
     commit_uuid: Uuid,
     file_io: FileIO,
-    partition_spec: PartitionSpecRef,
     schema: SchemaRef,
     schema_id: i32,
     /// `next_row_id` of the base table — DELETE does not advance this, so the
@@ -183,10 +181,14 @@ impl TransactionAction for RowDeltaDvTxnAction {
         }
 
         let mut new_manifests = index.untouched_manifests;
-        if !index.touched_delete_existing.is_empty() {
+        for (idx, (spec_id, files)) in
+            group_live_files_by_partition_spec(index.touched_delete_existing)
+                .into_iter()
+                .enumerate()
+        {
             let path = format!(
-                "{metadata_dir}/{}-row-delta-dv-existing-0.avro",
-                self.commit_uuid
+                "{metadata_dir}/{}-row-delta-dv-existing-{idx}.avro",
+                self.commit_uuid,
             );
             self.abort_handle.record_manifest(path.clone());
             self.manifest_paths_out
@@ -196,8 +198,8 @@ impl TransactionAction for RowDeltaDvTxnAction {
             let mf = write_existing_delete_manifest(
                 &self.file_io,
                 &path,
-                &index.touched_delete_existing,
-                self.partition_spec.clone(),
+                &files,
+                partition_spec_by_id(m, spec_id)?,
                 self.schema.clone(),
                 new_snapshot_id,
             )
@@ -206,28 +208,35 @@ impl TransactionAction for RowDeltaDvTxnAction {
             new_manifests.push(mf);
         }
 
-        let added_path = format!(
-            "{metadata_dir}/{}-row-delta-dv-added-0.avro",
-            self.commit_uuid
-        );
-        self.abort_handle.record_manifest(added_path.clone());
-        self.manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .push(added_path.clone());
-        let added = write_added_dv_manifest(
-            &self.file_io,
-            &added_path,
-            &written_dvs,
-            &index.data_files,
-            self.partition_spec.clone(),
-            self.schema.clone(),
-            new_seq,
-            new_snapshot_id,
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
-        new_manifests.push(added);
+        for (idx, (spec_id, dvs)) in
+            group_written_dvs_by_partition_spec(&written_dvs, &index.data_files)
+                .map_err(to_iceberg_unexpected)?
+                .into_iter()
+                .enumerate()
+        {
+            let added_path = format!(
+                "{metadata_dir}/{}-row-delta-dv-added-{idx}.avro",
+                self.commit_uuid
+            );
+            self.abort_handle.record_manifest(added_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(added_path.clone());
+            let added = write_added_dv_manifest(
+                &self.file_io,
+                &added_path,
+                &dvs,
+                &index.data_files,
+                partition_spec_by_id(m, spec_id)?,
+                self.schema.clone(),
+                new_seq,
+                new_snapshot_id,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(added);
+        }
 
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
@@ -299,6 +308,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
 
 struct LiveFile {
     data_file: DataFile,
+    partition_spec_id: i32,
     snapshot_id: i64,
     sequence_number: i64,
     file_sequence_number: Option<i64>,
@@ -353,6 +363,7 @@ async fn build_snapshot_index(
                         file.file_path().to_string(),
                         LiveFile {
                             data_file: file,
+                            partition_spec_id: mf.partition_spec_id,
                             snapshot_id,
                             sequence_number: seq,
                             file_sequence_number: file_seq,
@@ -406,6 +417,7 @@ async fn build_snapshot_index(
                     } else {
                         keep.push(LiveFile {
                             data_file: file,
+                            partition_spec_id: mf.partition_spec_id,
                             snapshot_id,
                             sequence_number: seq,
                             file_sequence_number: file_seq,
@@ -466,6 +478,51 @@ fn groups_to_vectors(
     Ok(out)
 }
 
+fn partition_spec_by_id(
+    metadata: &iceberg::spec::TableMetadata,
+    spec_id: i32,
+) -> iceberg::Result<PartitionSpecRef> {
+    metadata
+        .partition_spec_by_id(spec_id)
+        .cloned()
+        .ok_or_else(|| {
+            to_iceberg_unexpected(format!(
+                "row-lineage DELETE references unknown partition spec id {spec_id}"
+            ))
+        })
+}
+
+fn group_live_files_by_partition_spec(files: Vec<LiveFile>) -> BTreeMap<i32, Vec<LiveFile>> {
+    let mut grouped = BTreeMap::new();
+    for file in files {
+        grouped
+            .entry(file.partition_spec_id)
+            .or_insert_with(Vec::new)
+            .push(file);
+    }
+    grouped
+}
+
+fn group_written_dvs_by_partition_spec(
+    dvs: &[WrittenPuffinDv],
+    data_files: &HashMap<String, LiveFile>,
+) -> Result<BTreeMap<i32, Vec<WrittenPuffinDv>>, String> {
+    let mut grouped = BTreeMap::new();
+    for dv in dvs {
+        let referenced = data_files.get(&dv.referenced_data_file).ok_or_else(|| {
+            format!(
+                "row-lineage DELETE references data file `{}` which is not in the current snapshot",
+                dv.referenced_data_file
+            )
+        })?;
+        grouped
+            .entry(referenced.partition_spec_id)
+            .or_insert_with(Vec::new)
+            .push(dv.clone());
+    }
+    Ok(grouped)
+}
+
 async fn write_existing_delete_manifest(
     file_io: &FileIO,
     out_path: &str,
@@ -517,7 +574,6 @@ async fn write_added_dv_manifest(
     let output_file = file_io
         .new_output(out_path)
         .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
-    let partition_spec_id = partition_spec.spec_id();
     let builder = ManifestWriterBuilder::new(
         output_file,
         Some(new_snapshot_id),
@@ -533,7 +589,7 @@ async fn write_added_dv_manifest(
                 written.referenced_data_file
             )
         })?;
-        let df = dv_data_file(written, referenced, partition_spec_id)?;
+        let df = dv_data_file(written, referenced)?;
         writer
             .add_file(df, new_seq)
             .map_err(|e| format!("ManifestWriter::add_file failed: {e}"))?;
@@ -546,17 +602,13 @@ async fn write_added_dv_manifest(
     Ok(manifest_file)
 }
 
-fn dv_data_file(
-    written: &WrittenPuffinDv,
-    referenced: &LiveFile,
-    partition_spec_id: i32,
-) -> Result<DataFile, String> {
+fn dv_data_file(written: &WrittenPuffinDv, referenced: &LiveFile) -> Result<DataFile, String> {
     DataFileBuilder::default()
         .content(DataContentType::PositionDeletes)
         .file_path(written.path.clone())
         .file_format(DataFileFormat::Puffin)
         .partition(referenced.data_file.partition().clone())
-        .partition_spec_id(partition_spec_id)
+        .partition_spec_id(referenced.partition_spec_id)
         .record_count(written.cardinality)
         .file_size_in_bytes(written.file_size_in_bytes)
         .referenced_data_file(Some(written.referenced_data_file.clone()))
@@ -663,5 +715,54 @@ mod tests {
         }];
         let err = groups_to_vectors(&groups).unwrap_err();
         assert!(err.contains("non-negative"));
+    }
+
+    #[test]
+    fn group_written_dvs_uses_referenced_data_file_partition_spec() {
+        let data_files = HashMap::from([
+            ("file:///x/old.parquet".to_string(), test_live_file(1)),
+            ("file:///x/new.parquet".to_string(), test_live_file(2)),
+        ]);
+        let dvs = vec![
+            test_written_dv("file:///x/dv-old.puffin", "file:///x/old.parquet"),
+            test_written_dv("file:///x/dv-new.puffin", "file:///x/new.parquet"),
+        ];
+
+        let grouped = group_written_dvs_by_partition_spec(&dvs, &data_files).unwrap();
+
+        assert_eq!(grouped.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(grouped[&1][0].referenced_data_file, "file:///x/old.parquet");
+        assert_eq!(grouped[&2][0].referenced_data_file, "file:///x/new.parquet");
+    }
+
+    fn test_live_file(partition_spec_id: i32) -> LiveFile {
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("file:///x/data-{partition_spec_id}.parquet"))
+            .file_format(DataFileFormat::Parquet)
+            .partition(iceberg::spec::Struct::empty())
+            .partition_spec_id(partition_spec_id)
+            .record_count(1)
+            .file_size_in_bytes(10)
+            .build()
+            .unwrap();
+        LiveFile {
+            data_file,
+            partition_spec_id,
+            snapshot_id: 11,
+            sequence_number: 12,
+            file_sequence_number: Some(13),
+        }
+    }
+
+    fn test_written_dv(path: &str, referenced_data_file: &str) -> WrittenPuffinDv {
+        WrittenPuffinDv {
+            path: path.to_string(),
+            referenced_data_file: referenced_data_file.to_string(),
+            cardinality: 1,
+            content_offset: 4,
+            content_size_in_bytes: 8,
+            file_size_in_bytes: 12,
+        }
     }
 }

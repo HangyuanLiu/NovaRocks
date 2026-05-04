@@ -50,7 +50,6 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
     classify_sql_delete_strategy, run_iceberg_commit, write_position_delete_files,
 };
-use crate::connector::iceberg::partition_spec::spec_count;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::sql::parser::ast::DeleteStmt;
@@ -90,15 +89,6 @@ pub(crate) fn execute_delete_statement(
 
     // 3. Validation.
     let delete_strategy = classify_sql_delete_strategy(&table)?;
-    if matches!(delete_strategy, IcebergSqlDeleteStrategy::DeletionVectors)
-        && spec_count(&table) > 1
-    {
-        return Err(
-            "DELETE with Iceberg v3 deletion vectors on evolved partition specs is not supported yet; use v2 position-delete tables for partition-evolution DELETE coverage"
-                .to_string(),
-        );
-    }
-
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
     //    early. The bound `Predicate` is also used for manifest-level pruning
     //    inside [`scan_for_position_deletes`].
