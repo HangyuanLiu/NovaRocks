@@ -707,40 +707,6 @@ pub(crate) struct DataFileWithStats {
     pub delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
 }
 
-fn iceberg_delete_applies_to_data_file(
-    delete_file: &crate::sql::catalog::IcebergDeleteFileInfo,
-    data_sequence_number: Option<i64>,
-    data_partition_spec_id: Option<i32>,
-    data_partition_key: Option<&str>,
-) -> bool {
-    if let (Some(delete_sequence), Some(data_sequence)) =
-        (delete_file.sequence_number, data_sequence_number)
-        && delete_sequence <= data_sequence
-    {
-        return false;
-    }
-    if let Some(delete_partition) = delete_file.partition_key.as_deref() {
-        if let (Some(delete_spec_id), Some(data_spec_id)) =
-            (delete_file.partition_spec_id, data_partition_spec_id)
-            && delete_spec_id != data_spec_id
-        {
-            return false;
-        }
-        if data_partition_key != Some(delete_partition) {
-            return false;
-        }
-    }
-    true
-}
-
-fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
-    if partition.fields().is_empty() {
-        None
-    } else {
-        Some(format!("{partition:?}"))
-    }
-}
-
 fn iceberg_partition_field_values(
     metadata: &TableMetadata,
     spec_id: i32,
@@ -902,298 +868,89 @@ pub(crate) fn current_equality_delete_column_names(
 pub(crate) fn extract_data_files_with_stats(
     table: &iceberg::table::Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
+    let metadata = table.metadata();
+    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    read_snapshot
+        .files
+        .into_iter()
+        .map(|file| {
+            let partition_field_values =
+                match (file.partition_spec_id, file.partition_values.as_ref()) {
+                    (Some(spec_id), Some(partition_values)) => {
+                        iceberg_partition_field_values(metadata, spec_id, partition_values)?
+                    }
+                    _ => Vec::new(),
+                };
+            let delete_files = file
+                .deletes
+                .into_iter()
+                .map(read_delete_to_catalog_delete)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataFileWithStats {
+                path: file.path,
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: file.column_stats,
+                partition_spec_id: file.partition_spec_id,
+                partition_values: file.partition_values,
+                manifest_path: file.manifest_path,
+                partition_field_values,
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files,
+            })
+        })
+        .collect()
+}
+
+fn read_delete_to_catalog_delete(
+    delete_file: crate::connector::iceberg::read::IcebergReadDeleteFile,
+) -> Result<crate::sql::catalog::IcebergDeleteFileInfo, String> {
     use crate::sql::catalog::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
-    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
-    let metadata = table.metadata();
-    let snapshot = match metadata.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(vec![]),
+    let file_format = match delete_file.file_format {
+        crate::connector::iceberg::read::IcebergReadDeleteFormat::Parquet => {
+            IcebergDeleteFileFormat::Parquet
+        }
+        crate::connector::iceberg::read::IcebergReadDeleteFormat::Puffin => {
+            IcebergDeleteFileFormat::Puffin
+        }
+    };
+    let (file_content, equality_column_names) = match delete_file.kind {
+        crate::connector::iceberg::read::IcebergReadDeleteKind::Position => {
+            (IcebergDeleteFileContent::Position, Vec::new())
+        }
+        crate::connector::iceberg::read::IcebergReadDeleteKind::Equality { equality_field_ids } => {
+            if file_format != IcebergDeleteFileFormat::Parquet {
+                return Err(format!(
+                    "iceberg equality-delete file {} must use Parquet format",
+                    delete_file.path
+                ));
+            }
+            (
+                IcebergDeleteFileContent::Equality,
+                equality_field_ids
+                    .into_iter()
+                    .map(|field_id| field_id.to_string())
+                    .collect(),
+            )
+        }
     };
 
-    // Build a field-id -> column-name map from the current schema.
-    let schema = metadata.current_schema();
-    let field_id_to_name: HashMap<i32, String> = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| (f.id, f.name.clone()))
-        .collect();
-
-    let file_io = table.file_io();
-
-    block_on_iceberg(async {
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, metadata)
-            .await
-            .map_err(|e| format!("load manifest list: {e}"))?;
-
-        let mut delete_files_by_data_path: HashMap<String, Vec<IcebergDeleteFileInfo>> =
-            HashMap::new();
-        let mut global_delete_files: Vec<IcebergDeleteFileInfo> = Vec::new();
-
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Deletes {
-                continue;
-            }
-
-            let manifest = manifest_file
-                .load_manifest(file_io)
-                .await
-                .map_err(|e| format!("load manifest: {e}"))?;
-
-            let partition_spec_id = manifest_file.partition_spec_id;
-            for entry in manifest.entries() {
-                if entry.status == ManifestStatus::Deleted {
-                    continue;
-                }
-                let df = entry.data_file();
-                match df.content_type() {
-                    DataContentType::PositionDeletes => {
-                        let (file_format, content_offset, content_size_in_bytes) = match df
-                            .file_format()
-                        {
-                            DataFileFormat::Parquet => {
-                                (IcebergDeleteFileFormat::Parquet, None, None)
-                            }
-                            DataFileFormat::Puffin => {
-                                let offset = df.content_offset().ok_or_else(|| {
-                                    format!("Puffin DV {} missing content_offset", df.file_path())
-                                })?;
-                                let length = df.content_size_in_bytes().ok_or_else(|| {
-                                    format!(
-                                        "Puffin DV {} missing content_size_in_bytes",
-                                        df.file_path()
-                                    )
-                                })?;
-                                (IcebergDeleteFileFormat::Puffin, Some(offset), Some(length))
-                            }
-                            other => {
-                                return Err(format!(
-                                    "unsupported iceberg delete file format {:?}: {}",
-                                    other,
-                                    df.file_path()
-                                ));
-                            }
-                        };
-                        let info = IcebergDeleteFileInfo {
-                            path: df.file_path().to_string(),
-                            file_format,
-                            file_content: IcebergDeleteFileContent::Position,
-                            length: Some(i64::try_from(df.file_size_in_bytes()).map_err(|_| {
-                                format!("delete file too large: {}", df.file_path())
-                            })?),
-                            content_offset,
-                            content_size_in_bytes,
-                            sequence_number: Some(
-                                entry
-                                    .sequence_number()
-                                    .unwrap_or(manifest_file.sequence_number),
-                            ),
-                            partition_spec_id: Some(partition_spec_id),
-                            partition_key: iceberg_partition_key(df.partition()),
-                            equality_column_names: Vec::new(),
-                        };
-                        if let Some(referenced) = df.referenced_data_file() {
-                            delete_files_by_data_path
-                                .entry(referenced)
-                                .or_default()
-                                .push(info);
-                        } else {
-                            global_delete_files.push(info);
-                        }
-                    }
-                    DataContentType::EqualityDeletes => {
-                        if df.file_format() != DataFileFormat::Parquet {
-                            return Err(format!(
-                                "unsupported iceberg equality-delete file format {:?}: {}",
-                                df.file_format(),
-                                df.file_path()
-                            ));
-                        }
-                        let equality_column_names = equality_delete_column_names_for_field_ids(
-                            df.file_path(),
-                            df.equality_ids(),
-                            &field_id_to_name,
-                        )?;
-                        let info = IcebergDeleteFileInfo {
-                            path: df.file_path().to_string(),
-                            file_format: IcebergDeleteFileFormat::Parquet,
-                            file_content: IcebergDeleteFileContent::Equality,
-                            length: Some(i64::try_from(df.file_size_in_bytes()).map_err(|_| {
-                                format!("delete file too large: {}", df.file_path())
-                            })?),
-                            content_offset: None,
-                            content_size_in_bytes: None,
-                            sequence_number: Some(
-                                entry
-                                    .sequence_number()
-                                    .unwrap_or(manifest_file.sequence_number),
-                            ),
-                            partition_spec_id: Some(partition_spec_id),
-                            partition_key: iceberg_partition_key(df.partition()),
-                            equality_column_names,
-                        };
-                        global_delete_files.push(info);
-                    }
-                    DataContentType::Data => {}
-                }
-            }
-        }
-
-        let mut results = Vec::new();
-
-        for manifest_file in manifest_list.entries() {
-            // Only process data manifests, skip delete manifests.
-            if manifest_file.content != ManifestContentType::Data {
-                continue;
-            }
-
-            let manifest = manifest_file
-                .load_manifest(file_io)
-                .await
-                .map_err(|e| format!("load manifest: {e}"))?;
-
-            let mut next_manifest_first_row_id = manifest_file
-                .first_row_id
-                .map(|v| {
-                    i64::try_from(v).map_err(|_| format!("manifest first_row_id too large: {v}"))
-                })
-                .transpose()?;
-
-            for entry in manifest.entries() {
-                // Skip deleted entries.
-                if entry.status == ManifestStatus::Deleted {
-                    continue;
-                }
-
-                let df = entry.data_file();
-
-                // Only process data files (not delete files).
-                if df.content_type() != DataContentType::Data {
-                    continue;
-                }
-
-                let path = df.file_path().to_string();
-                let size = i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX);
-                let record_count_i64 = i64::try_from(df.record_count())
-                    .map_err(|_| format!("record_count too large for {}", df.file_path()))?;
-                let record_count = Some(record_count_i64);
-                let first_row_id = df.first_row_id().or(next_manifest_first_row_id);
-                if let Some(next) = next_manifest_first_row_id.as_mut() {
-                    *next = next.checked_add(record_count_i64).ok_or_else(|| {
-                        format!(
-                            "first_row_id overflow for manifest {}",
-                            manifest_file.manifest_path
-                        )
-                    })?;
-                }
-
-                // Build per-column stats.
-                let null_counts = df.null_value_counts();
-                let col_sizes = df.column_sizes();
-                let lower = df.lower_bounds();
-                let upper = df.upper_bounds();
-
-                let has_any_stats = !null_counts.is_empty()
-                    || !col_sizes.is_empty()
-                    || !lower.is_empty()
-                    || !upper.is_empty();
-
-                let column_stats = if has_any_stats {
-                    // Collect all field IDs that appear in any stats map.
-                    let mut all_ids = std::collections::HashSet::new();
-                    all_ids.extend(null_counts.keys());
-                    all_ids.extend(col_sizes.keys());
-                    all_ids.extend(lower.keys());
-                    all_ids.extend(upper.keys());
-
-                    let mut stats_map = HashMap::new();
-                    for &fid in &all_ids {
-                        if let Some(col_name) = field_id_to_name.get(&fid) {
-                            let lb = lower
-                                .get(&fid)
-                                .and_then(|d| d.to_bytes().ok())
-                                .map(|b| b.to_vec());
-                            let ub = upper
-                                .get(&fid)
-                                .and_then(|d| d.to_bytes().ok())
-                                .map(|b| b.to_vec());
-                            stats_map.insert(
-                                col_name.clone(),
-                                crate::sql::catalog::IcebergColumnStats {
-                                    null_count: null_counts
-                                        .get(&fid)
-                                        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
-                                    column_size: col_sizes
-                                        .get(&fid)
-                                        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
-                                    lower_bound: lb,
-                                    upper_bound: ub,
-                                },
-                            );
-                        }
-                    }
-                    Some(stats_map)
-                } else {
-                    None
-                };
-
-                // Iceberg v3 row-lineage: the data sequence number comes from
-                // the manifest entry when available, falling back to the
-                // manifest file's own sequence number (the spec allows entries
-                // in a V1/V2 manifest list to inherit the manifest's sequence
-                // number when the per-entry field is absent).
-                let data_sequence_number = Some(
-                    entry
-                        .sequence_number()
-                        .unwrap_or(manifest_file.sequence_number),
-                );
-                let data_partition_spec_id = Some(manifest_file.partition_spec_id);
-                let data_partition_key = iceberg_partition_key(df.partition());
-                let partition_field_values = iceberg_partition_field_values(
-                    metadata,
-                    manifest_file.partition_spec_id,
-                    df.partition(),
-                )?;
-                let mut delete_files = delete_files_by_data_path
-                    .get(&path)
-                    .cloned()
-                    .unwrap_or_default();
-                delete_files.extend(global_delete_files.iter().filter_map(|delete_file| {
-                    if iceberg_delete_applies_to_data_file(
-                        delete_file,
-                        data_sequence_number,
-                        data_partition_spec_id,
-                        data_partition_key.as_deref(),
-                    ) {
-                        Some(delete_file.clone())
-                    } else {
-                        None
-                    }
-                }));
-
-                results.push(DataFileWithStats {
-                    path,
-                    size,
-                    record_count,
-                    column_stats,
-                    partition_spec_id: Some(manifest_file.partition_spec_id),
-                    partition_values: Some(df.partition().clone()),
-                    manifest_path: Some(manifest_file.manifest_path.clone()),
-                    partition_field_values,
-                    first_row_id,
-                    data_sequence_number,
-                    delete_files,
-                });
-            }
-        }
-
-        Ok(results)
+    Ok(IcebergDeleteFileInfo {
+        path: delete_file.path,
+        file_format,
+        file_content,
+        length: delete_file.length,
+        content_offset: delete_file.content_offset,
+        content_size_in_bytes: delete_file.content_size_in_bytes,
+        sequence_number: delete_file.sequence_number,
+        partition_spec_id: delete_file.partition_spec_id,
+        partition_key: delete_file.partition_key,
+        equality_column_names,
     })
-    .map_err(|e| format!("extract data files with stats runtime: {e}"))?
 }
 
 /// Register an existing Iceberg table in the catalog entry by loading it.
@@ -2228,6 +1985,89 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
         .signed_duration_since(epoch)
         .num_microseconds()
         .ok_or_else(|| format!("DATETIME literal `{value}` is out of range"))
+}
+
+#[cfg(test)]
+mod read_delete_conversion_tests {
+    use super::read_delete_to_catalog_delete;
+    use crate::connector::iceberg::read::{
+        IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
+    };
+    use crate::sql::catalog::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
+
+    fn read_delete(
+        file_format: IcebergReadDeleteFormat,
+        kind: IcebergReadDeleteKind,
+    ) -> IcebergReadDeleteFile {
+        IcebergReadDeleteFile {
+            path: "s3://bucket/table/delete-file".to_string(),
+            file_format,
+            kind,
+            length: Some(128),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(7),
+            partition_spec_id: Some(1),
+            partition_key: Some("city=A".to_string()),
+            referenced_data_file: None,
+        }
+    }
+
+    #[test]
+    fn parquet_equality_delete_string_encodes_field_ids() {
+        let delete_file = read_delete(
+            IcebergReadDeleteFormat::Parquet,
+            IcebergReadDeleteKind::Equality {
+                equality_field_ids: vec![3, 1],
+            },
+        );
+
+        let catalog_delete = read_delete_to_catalog_delete(delete_file).expect("convert");
+
+        assert_eq!(catalog_delete.file_format, IcebergDeleteFileFormat::Parquet);
+        assert_eq!(
+            catalog_delete.file_content,
+            IcebergDeleteFileContent::Equality
+        );
+        assert_eq!(
+            catalog_delete.equality_column_names,
+            vec!["3".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn puffin_position_delete_preserves_content_range() {
+        let mut delete_file = read_delete(
+            IcebergReadDeleteFormat::Puffin,
+            IcebergReadDeleteKind::Position,
+        );
+        delete_file.content_offset = Some(64);
+        delete_file.content_size_in_bytes = Some(512);
+
+        let catalog_delete = read_delete_to_catalog_delete(delete_file).expect("convert");
+
+        assert_eq!(catalog_delete.file_format, IcebergDeleteFileFormat::Puffin);
+        assert_eq!(
+            catalog_delete.file_content,
+            IcebergDeleteFileContent::Position
+        );
+        assert_eq!(catalog_delete.content_offset, Some(64));
+        assert_eq!(catalog_delete.content_size_in_bytes, Some(512));
+    }
+
+    #[test]
+    fn puffin_equality_delete_is_rejected() {
+        let delete_file = read_delete(
+            IcebergReadDeleteFormat::Puffin,
+            IcebergReadDeleteKind::Equality {
+                equality_field_ids: vec![3],
+            },
+        );
+
+        let err = read_delete_to_catalog_delete(delete_file).expect_err("reject puffin equality");
+
+        assert!(err.contains("must use Parquet format"));
+    }
 }
 
 #[cfg(test)]
