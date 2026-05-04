@@ -25,8 +25,8 @@ use arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, TimeUnit};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use crate::cache::CachedRangeReader;
 use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
@@ -41,11 +41,10 @@ enum EqualityValue {
     Bool(bool),
     I64(i64),
     U64(u64),
-    F32(u32),
     F64(u64),
     Utf8(String),
     Binary(Vec<u8>),
-    Decimal128(i128, u8, i8),
+    Decimal128(i128, i8),
     Date32(i32),
     Date64(i64),
     Timestamp(i64, TimeUnit),
@@ -53,8 +52,14 @@ enum EqualityValue {
 
 #[derive(Clone, Debug)]
 pub struct EqualityDeleteSet {
-    columns: Vec<String>,
+    columns: Vec<EqualityColumnRef>,
     keys: HashSet<Vec<EqualityValue>>,
+}
+
+#[derive(Clone, Debug)]
+struct EqualityColumnRef {
+    name: String,
+    field_id: Option<i32>,
 }
 
 pub(crate) fn load_equality_delete_sets(
@@ -106,8 +111,8 @@ pub(crate) fn load_equality_delete_sets(
         let columns = schema
             .fields()
             .iter()
-            .map(|field| field.name().to_ascii_lowercase())
-            .collect::<Vec<_>>();
+            .map(|field| equality_column_ref(field.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         let reader = builder.build().map_err(|e| {
             format!(
                 "build iceberg equality-delete reader for {} failed: {e}",
@@ -252,24 +257,75 @@ pub(crate) fn equality_delete_row_is_deleted(
 fn equality_key_for_row(
     batch: &RecordBatch,
     row: usize,
-    columns: &[String],
+    columns: &[EqualityColumnRef],
 ) -> Result<Vec<EqualityValue>, String> {
     let schema = batch.schema();
     let mut key = Vec::with_capacity(columns.len());
     for column in columns {
-        let idx = schema
-            .fields()
-            .iter()
-            .position(|field| field.name().eq_ignore_ascii_case(column))
-            .ok_or_else(|| {
-                format!(
-                    "equality-delete column `{column}` is not available in data batch schema {:?}",
-                    schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-                )
-            })?;
+        let idx = find_equality_column_index(schema.as_ref(), column)?;
         key.push(equality_value(batch.column(idx).as_ref(), row)?);
     }
     Ok(key)
+}
+
+fn equality_column_ref(field: &Field) -> Result<EqualityColumnRef, String> {
+    Ok(EqualityColumnRef {
+        name: field.name().to_ascii_lowercase(),
+        field_id: parse_parquet_field_id(field)?,
+    })
+}
+
+fn find_equality_column_index(
+    schema: &Schema,
+    column: &EqualityColumnRef,
+) -> Result<usize, String> {
+    if let Some(target_field_id) = column.field_id {
+        let mut schema_has_field_ids = false;
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let field_id = parse_parquet_field_id(field.as_ref())?;
+            schema_has_field_ids |= field_id.is_some();
+            if field_id == Some(target_field_id) {
+                return Ok(idx);
+            }
+        }
+        if schema_has_field_ids {
+            return Err(equality_column_missing_error(schema, column));
+        }
+    }
+
+    schema
+        .fields()
+        .iter()
+        .position(|field| field.name().eq_ignore_ascii_case(&column.name))
+        .ok_or_else(|| equality_column_missing_error(schema, column))
+}
+
+fn equality_column_missing_error(schema: &Schema, column: &EqualityColumnRef) -> String {
+    let field_id = column
+        .field_id
+        .map(|id| format!(" field_id={id}"))
+        .unwrap_or_default();
+    format!(
+        "equality-delete column `{}`{} is not available in data batch schema {:?}",
+        column.name,
+        field_id,
+        schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+    )
+}
+
+fn parse_parquet_field_id(field: &Field) -> Result<Option<i32>, String> {
+    let Some(raw) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+        return Ok(None);
+    };
+    raw.parse::<i32>().map(Some).map_err(|e| {
+        format!(
+            "invalid parquet field_id metadata: field={} key={} value={} error={}",
+            field.name(),
+            PARQUET_FIELD_ID_META_KEY,
+            raw,
+            e
+        )
+    })
 }
 
 fn equality_value(array: &dyn Array, row: usize) -> Result<EqualityValue, String> {
@@ -315,7 +371,7 @@ fn equality_value(array: &dyn Array, row: usize) -> Result<EqualityValue, String
         }
         DataType::Float32 => {
             let a = array_as::<Float32Array>(array)?;
-            Ok(EqualityValue::F32(a.value(row).to_bits()))
+            Ok(EqualityValue::F64(f64::from(a.value(row)).to_bits()))
         }
         DataType::Float64 => {
             let a = array_as::<Float64Array>(array)?;
@@ -337,9 +393,9 @@ fn equality_value(array: &dyn Array, row: usize) -> Result<EqualityValue, String
             let a = array_as::<LargeBinaryArray>(array)?;
             Ok(EqualityValue::Binary(a.value(row).to_vec()))
         }
-        DataType::Decimal128(precision, scale) => {
+        DataType::Decimal128(_, scale) => {
             let a = array_as::<Decimal128Array>(array)?;
-            Ok(EqualityValue::Decimal128(a.value(row), *precision, *scale))
+            Ok(EqualityValue::Decimal128(a.value(row), *scale))
         }
         DataType::Date32 => {
             let a = array_as::<Date32Array>(array)?;
@@ -391,10 +447,10 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Decimal128Array, Float32Array, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
     use crate::descriptors::THdfsFileFormat;
@@ -418,6 +474,13 @@ mod tests {
         OpendalRangeReaderFactory::from_operator(op).expect("factory")
     }
 
+    fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(std::collections::HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
+
     fn write_eq_delete_parquet(path: &std::path::Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -431,6 +494,58 @@ mod tests {
             ],
         )
         .expect("record batch");
+        let file = fs::File::create(path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn write_eq_delete_parquet_with_old_field_name(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![field_with_id(
+            "amount",
+            DataType::Int32,
+            false,
+            2,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![20]))])
+                .expect("record batch");
+        let file = fs::File::create(path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn write_float32_eq_delete_parquet(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![field_with_id(
+            "ratio",
+            DataType::Float32,
+            false,
+            1,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float32Array::from(vec![1.5_f32]))],
+        )
+        .expect("record batch");
+        let file = fs::File::create(path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn write_decimal_eq_delete_parquet(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![field_with_id(
+            "amount",
+            DataType::Decimal128(10, 2),
+            false,
+            1,
+        )]));
+        let amount = Decimal128Array::from(vec![1234_i128])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal delete array");
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(amount)]).expect("record batch");
         let file = fs::File::create(path).expect("create");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
         writer.write(&batch).expect("write");
@@ -495,6 +610,147 @@ mod tests {
         let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
 
         assert_eq!(mask, Some(vec![true, false, true, false]));
+    }
+
+    #[test]
+    fn equality_delete_matches_renamed_data_column_by_field_id() {
+        let dir = temp_dir_for("field_id_rename");
+        let delete_path = dir.join("eq-delete-renamed.parquet");
+        write_eq_delete_parquet_with_old_field_name(&delete_path);
+        let spec = IcebergDeleteFileSpec {
+            path: delete_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let sets = super::load_equality_delete_sets(&[spec], &factory_for_dir(&dir)).expect("load");
+
+        let data_schema = Arc::new(Schema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("total_amount", DataType::Int32, false, 2),
+        ]));
+        let data = RecordBatch::try_new(
+            data_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .expect("data batch");
+
+        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+
+        assert_eq!(mask, Some(vec![true, false, true]));
+    }
+
+    #[test]
+    fn equality_delete_rejects_same_name_with_different_field_id() {
+        let dir = temp_dir_for("field_id_readd");
+        let delete_path = dir.join("eq-delete-old-id.parquet");
+        write_eq_delete_parquet_with_old_field_name(&delete_path);
+        let spec = IcebergDeleteFileSpec {
+            path: delete_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let sets = super::load_equality_delete_sets(&[spec], &factory_for_dir(&dir)).expect("load");
+
+        let data_schema = Arc::new(Schema::new(vec![field_with_id(
+            "amount",
+            DataType::Int32,
+            false,
+            3,
+        )]));
+        let data = RecordBatch::try_new(data_schema, vec![Arc::new(Int32Array::from(vec![20]))])
+            .expect("data batch");
+
+        let err = super::equality_delete_keep_mask(&data, &sets).expect_err("field-id mismatch");
+
+        assert!(err.contains("field_id=2"), "{err}");
+    }
+
+    #[test]
+    fn equality_delete_matches_float_promoted_to_double() {
+        let dir = temp_dir_for("float_promotion");
+        let delete_path = dir.join("eq-delete-float.parquet");
+        write_float32_eq_delete_parquet(&delete_path);
+        let spec = IcebergDeleteFileSpec {
+            path: delete_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let sets = super::load_equality_delete_sets(&[spec], &factory_for_dir(&dir)).expect("load");
+
+        let data_schema = Arc::new(Schema::new(vec![field_with_id(
+            "ratio",
+            DataType::Float64,
+            false,
+            1,
+        )]));
+        let data = RecordBatch::try_new(
+            data_schema,
+            vec![Arc::new(Float64Array::from(vec![1.5_f64, 2.5_f64]))],
+        )
+        .expect("data batch");
+
+        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+
+        assert_eq!(mask, Some(vec![false, true]));
+    }
+
+    #[test]
+    fn equality_delete_matches_decimal_precision_promotion() {
+        let dir = temp_dir_for("decimal_precision_promotion");
+        let delete_path = dir.join("eq-delete-decimal.parquet");
+        write_decimal_eq_delete_parquet(&delete_path);
+        let spec = IcebergDeleteFileSpec {
+            path: delete_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            file_format: THdfsFileFormat::PARQUET,
+            file_content: TIcebergFileContent::EQUALITY_DELETES,
+            length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let sets = super::load_equality_delete_sets(&[spec], &factory_for_dir(&dir)).expect("load");
+
+        let data_schema = Arc::new(Schema::new(vec![field_with_id(
+            "amount",
+            DataType::Decimal128(20, 2),
+            false,
+            1,
+        )]));
+        let amounts = Decimal128Array::from(vec![1234_i128, 5678_i128])
+            .with_precision_and_scale(20, 2)
+            .expect("decimal data array");
+        let data = RecordBatch::try_new(data_schema, vec![Arc::new(amounts)]).expect("data batch");
+
+        let mask = super::equality_delete_keep_mask(&data, &sets).expect("mask");
+
+        assert_eq!(mask, Some(vec![false, true]));
     }
 
     #[test]
