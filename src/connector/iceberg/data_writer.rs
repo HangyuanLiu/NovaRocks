@@ -1,8 +1,15 @@
 use std::sync::Arc;
 
+use crate::exec::row_position::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
+use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
-use iceberg::spec::{DataFile, DataFileBuilder, DataFileFormat};
+use iceberg::spec::{
+    DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, SchemaRef, Type,
+};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -12,16 +19,65 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
+type IcebergDataFileWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RowLineageColumns {
+    pub row_ids: arrow::array::Int64Array,
+    pub last_updated_sequence_numbers: arrow::array::Int64Array,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct RowLineageWriteBatch {
+    pub user_batch: arrow::record_batch::RecordBatch,
+    pub lineage: RowLineageColumns,
+}
+
 pub(crate) async fn write_record_batches_as_data_files(
     table: &iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<DataFile>, String> {
     let metadata = table.metadata();
+    let writer_schema = metadata.current_schema().clone();
     let annotated_schema = Arc::new(
-        schema_to_arrow_schema(metadata.current_schema())
+        schema_to_arrow_schema(&writer_schema)
             .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
     );
     let data_file_builder = build_data_file_writer(table)?;
+    write_record_batches_as_data_files_with_writer(
+        table,
+        batches,
+        data_file_builder,
+        annotated_schema,
+    )
+    .await
+}
+
+async fn write_record_batches_as_data_files_with_schema(
+    table: &iceberg::table::Table,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    writer_schema: SchemaRef,
+    annotated_schema: arrow::datatypes::SchemaRef,
+) -> Result<Vec<DataFile>, String> {
+    let data_file_builder = build_data_file_writer_with_schema(table, writer_schema)?;
+    write_record_batches_as_data_files_with_writer(
+        table,
+        batches,
+        data_file_builder,
+        annotated_schema,
+    )
+    .await
+}
+
+async fn write_record_batches_as_data_files_with_writer(
+    table: &iceberg::table::Table,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    data_file_builder: IcebergDataFileWriterBuilder,
+    annotated_schema: arrow::datatypes::SchemaRef,
+) -> Result<Vec<DataFile>, String> {
+    let metadata = table.metadata();
 
     if metadata.default_partition_spec().fields().is_empty() {
         let mut writer = data_file_builder
@@ -137,12 +193,119 @@ fn retag_data_file_partition_spec_id(
     })
 }
 
+#[allow(dead_code)]
+pub(crate) async fn write_row_lineage_batches_as_data_files(
+    table: &iceberg::table::Table,
+    batches: &[RowLineageWriteBatch],
+) -> Result<Vec<iceberg::spec::DataFile>, String> {
+    let writer_schema = build_row_lineage_writer_schema(table.metadata().current_schema())?;
+    let annotated_schema = Arc::new(
+        schema_to_arrow_schema(&writer_schema)
+            .map_err(|e| format!("convert row-lineage iceberg schema to arrow failed: {e}"))?,
+    );
+    let mut enriched = Vec::with_capacity(batches.len());
+    for batch in batches {
+        enriched.push(append_row_lineage_columns(
+            &batch.user_batch,
+            batch.lineage.clone(),
+        )?);
+    }
+    write_record_batches_as_data_files_with_schema(table, enriched, writer_schema, annotated_schema)
+        .await
+}
+
+fn build_row_lineage_writer_schema(current_schema: &SchemaRef) -> Result<SchemaRef, String> {
+    Ok(Arc::new(
+        current_schema
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_fields(vec![
+                NestedField::required(
+                    ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                    ICEBERG_ROW_ID_COL,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::optional(
+                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    ICEBERG_LAST_UPDATED_SEQ_COL,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+            ])
+            .build()
+            .map_err(|e| format!("build row-lineage iceberg schema failed: {e}"))?,
+    ))
+}
+
+pub(crate) fn append_row_lineage_columns(
+    batch: &arrow::record_batch::RecordBatch,
+    lineage: RowLineageColumns,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::ArrayRef;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    if batch.num_rows() != lineage.row_ids.len()
+        || batch.num_rows() != lineage.last_updated_sequence_numbers.len()
+    {
+        return Err(format!(
+            "row-lineage column length mismatch: rows={}, row_ids={}, last_updated={}",
+            batch.num_rows(),
+            lineage.row_ids.len(),
+            lineage.last_updated_sequence_numbers.len()
+        ));
+    }
+    for row in 0..lineage.row_ids.len() {
+        if lineage.row_ids.is_null(row) {
+            return Err(format!(
+                "row-lineage {ICEBERG_ROW_ID_COL} column contains null at row {row}"
+            ));
+        }
+        let row_id = lineage.row_ids.value(row);
+        if row_id < 0 {
+            return Err(format!(
+                "row-lineage {ICEBERG_ROW_ID_COL} column must be non-negative: row={row}, value={row_id}"
+            ));
+        }
+    }
+
+    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(
+        Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+        )])),
+    ));
+    fields.push(Arc::new(
+        Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string(),
+            )]),
+        ),
+    ));
+
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(lineage.row_ids) as ArrayRef);
+    columns.push(Arc::new(lineage.last_updated_sequence_numbers) as ArrayRef);
+    arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("build row-lineage record batch failed: {e}"))
+}
+
 fn build_data_file_writer(
     table: &iceberg::table::Table,
-) -> Result<
-    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>,
-    String,
-> {
+) -> Result<IcebergDataFileWriterBuilder, String> {
+    build_data_file_writer_with_schema(table, table.metadata().current_schema().clone())
+}
+
+fn build_data_file_writer_with_schema(
+    table: &iceberg::table::Table,
+    schema: SchemaRef,
+) -> Result<IcebergDataFileWriterBuilder, String> {
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -150,10 +313,7 @@ fn build_data_file_writer(
         Some(unique_file_suffix()),
         DataFileFormat::Parquet,
     );
-    let parquet_builder = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        table.metadata().current_schema().clone(),
-    );
+    let parquet_builder = ParquetWriterBuilder::new(WriterProperties::default(), schema);
     let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
@@ -202,7 +362,7 @@ fn unique_file_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+    use iceberg::spec::{DataContentType, Struct};
 
     use super::*;
 
@@ -224,6 +384,168 @@ mod tests {
         assert!(
             format!("{data_file:?}").contains("partition_spec_id: 7"),
             "retagged data file should carry the evolved default partition spec id"
+        );
+    }
+
+    #[test]
+    fn append_row_lineage_columns_sets_reserved_field_ids() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        use std::sync::Arc;
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let out = append_row_lineage_columns(
+            &batch,
+            RowLineageColumns {
+                row_ids: Int64Array::from(vec![10, 11]),
+                last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3)]),
+            },
+        )
+        .expect("append");
+        assert_eq!(out.num_columns(), 3);
+        assert_eq!(out.schema().field(1).name(), "_row_id");
+        assert!(!out.schema().field(1).is_nullable());
+        assert_eq!(
+            out.schema()
+                .field(1)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("2147483540")
+        );
+        assert_eq!(
+            out.schema().field(2).name(),
+            "_last_updated_sequence_number"
+        );
+        assert!(out.schema().field(2).is_nullable());
+        assert_eq!(
+            out.schema()
+                .field(2)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("2147483539")
+        );
+    }
+
+    #[test]
+    fn append_row_lineage_columns_rejects_length_mismatch() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let err = append_row_lineage_columns(
+            &batch,
+            RowLineageColumns {
+                row_ids: Int64Array::from(vec![10]),
+                last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3)]),
+            },
+        )
+        .expect_err("length mismatch");
+
+        assert_eq!(
+            err,
+            "row-lineage column length mismatch: rows=2, row_ids=1, last_updated=2"
+        );
+    }
+
+    #[test]
+    fn append_row_lineage_columns_rejects_null_row_ids() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let err = append_row_lineage_columns(
+            &batch,
+            RowLineageColumns {
+                row_ids: Int64Array::from(vec![Some(10), None]),
+                last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3)]),
+            },
+        )
+        .expect_err("null row id");
+
+        assert_eq!(err, "row-lineage _row_id column contains null at row 1");
+    }
+
+    #[test]
+    fn append_row_lineage_columns_rejects_negative_row_ids() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let err = append_row_lineage_columns(
+            &batch,
+            RowLineageColumns {
+                row_ids: Int64Array::from(vec![10, -1]),
+                last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3)]),
+            },
+        )
+        .expect_err("negative row id");
+
+        assert_eq!(
+            err,
+            "row-lineage _row_id column must be non-negative: row=1, value=-1"
+        );
+    }
+
+    #[test]
+    fn enriched_row_lineage_columns_reannotate_with_extended_schema() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let enriched = append_row_lineage_columns(
+            &batch,
+            RowLineageColumns {
+                row_ids: Int64Array::from(vec![10, 11]),
+                last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3)]),
+            },
+        )
+        .expect("append");
+        let extended_schema = build_row_lineage_writer_schema(&iceberg_schema).expect("schema");
+        let annotated_schema = Arc::new(schema_to_arrow_schema(&extended_schema).expect("arrow"));
+        let annotated = annotate_batch(&enriched, &annotated_schema).expect("annotate");
+
+        assert_eq!(annotated.num_columns(), 3);
+        assert_eq!(annotated.schema().field(1).name(), "_row_id");
+        assert_eq!(
+            annotated.schema().field(2).name(),
+            "_last_updated_sequence_number"
         );
     }
 }
