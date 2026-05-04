@@ -51,7 +51,9 @@ use self::statement::{
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    parse_alter_partition_column_sql,
+    looks_like_alter_table_optimize, looks_like_show_alter_table_optimize,
+    parse_alter_partition_column_sql, parse_alter_table_optimize_sql,
+    parse_show_alter_table_optimize_sql,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -454,6 +456,14 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        if looks_like_show_alter_table_optimize(&normalized) {
+            let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
+            return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
+        }
+        if looks_like_alter_table_optimize(&normalized) {
+            let stmt = parse_alter_table_optimize_sql(&normalized)?;
+            return self.handle_alter_table_optimize(stmt, current_catalog, current_database);
+        }
         // For MV DDL (CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW) we must
         // propagate errors from our custom parser rather than falling through to
         // the generic sqlparser-rs path, which would emit confusing diagnostics
@@ -705,6 +715,92 @@ impl StandaloneSession {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
     }
 
+    fn handle_alter_table_optimize(
+        &self,
+        stmt: crate::engine::statement::AlterTableOptimizeStmt,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let Some(store) = self.inner.metadata_store.as_ref() else {
+            return Err("ALTER TABLE OPTIMIZE requires standalone metadata store".to_string());
+        };
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &stmt.table,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "ALTER TABLE OPTIMIZE only supports iceberg backends, got `{}`",
+                target.backend_name
+            ));
+        }
+
+        let entry = {
+            let registry = self
+                .inner
+                .iceberg_catalogs
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+            registry.get(&target.catalog)?
+        };
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+        let loaded = crate::connector::iceberg::catalog::load_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        let base_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+            .ok_or_else(|| {
+                format!(
+                    "ALTER TABLE OPTIMIZE requires iceberg table {}.{}.{} to have a current snapshot",
+                    target.catalog, target.namespace, target.table
+                )
+            })?;
+        store.create_iceberg_optimize_job(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            base_snapshot_id,
+            standalone_now_ms(),
+        )?;
+        Ok(StatementResult::Ok)
+    }
+
+    fn handle_show_alter_table_optimize(
+        &self,
+        stmt: crate::engine::statement::ShowAlterTableOptimizeStmt,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let Some(store) = self.inner.metadata_store.as_ref() else {
+            return Err("SHOW ALTER TABLE OPTIMIZE requires standalone metadata store".to_string());
+        };
+        let mut jobs = store.show_iceberg_optimize_jobs()?;
+        let catalog_filter = stmt.catalog.as_deref().or(current_catalog);
+        let database_filter = stmt.database.as_deref().unwrap_or(current_database);
+        if let Some(catalog) = catalog_filter {
+            jobs.retain(|job| job.catalog == catalog);
+        }
+        jobs.retain(|job| job.namespace == database_filter);
+        if let Some(table_name) = stmt.table_name.as_deref() {
+            jobs.retain(|job| job.table == table_name);
+        }
+        jobs.sort_by_key(|job| (job.created_at_ms, job.id));
+        if stmt.order_by_create_time_desc {
+            jobs.reverse();
+        }
+        if let Some(limit) = stmt.limit {
+            jobs.truncate(limit);
+        }
+        build_show_alter_table_optimize_result(jobs).map(StatementResult::Query)
+    }
+
     fn handle_alter_iceberg_schema(
         &self,
         sql: &str,
@@ -865,6 +961,100 @@ impl StandaloneSession {
             current_catalog,
             current_database,
         )
+    }
+}
+
+fn standalone_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn build_show_alter_table_optimize_result(
+    jobs: Vec<crate::connector::starrocks::managed::store::StoredIcebergOptimizeJob>,
+) -> Result<QueryResult, String> {
+    let column_names = [
+        "JobId",
+        "TableName",
+        "State",
+        "CreateTime",
+        "FinishTime",
+        "Msg",
+        "BaseSnapshotId",
+        "TargetSnapshotId",
+        "InputDataFiles",
+        "OutputDataFiles",
+        "InputDeleteFiles",
+        "OutputDeleteFiles",
+    ];
+    let mut columns = column_names
+        .iter()
+        .map(|_| Vec::with_capacity(jobs.len()))
+        .collect::<Vec<Vec<String>>>();
+    for job in jobs {
+        let outcome = job.outcome.as_ref();
+        columns[0].push(job.id.to_string());
+        columns[1].push(job.table);
+        columns[2].push(iceberg_optimize_state_name(job.state).to_string());
+        columns[3].push(job.created_at_ms.to_string());
+        columns[4].push(
+            job.finished_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        columns[5].push(job.error_message.unwrap_or_default());
+        columns[6].push(job.base_snapshot_id.to_string());
+        columns[7].push(String::new());
+        columns[8].push(
+            outcome
+                .map(|value| value.rewritten_data_files.to_string())
+                .unwrap_or_default(),
+        );
+        columns[9].push(
+            outcome
+                .map(|value| value.added_data_files.to_string())
+                .unwrap_or_default(),
+        );
+        columns[10].push(String::new());
+        columns[11].push(String::new());
+    }
+
+    let fields = column_names
+        .iter()
+        .map(|name| Field::new(*name, DataType::Utf8, false))
+        .collect::<Vec<_>>();
+    let arrays = columns
+        .into_iter()
+        .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|e| format!("build SHOW ALTER TABLE OPTIMIZE result failed: {e}"))?;
+    Ok(QueryResult {
+        columns: column_names
+            .iter()
+            .map(|name| QueryResultColumn {
+                name: (*name).to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                logical_type: None,
+            })
+            .collect(),
+        chunks: vec![record_batch_to_chunk(batch)?],
+    })
+}
+
+fn iceberg_optimize_state_name(
+    state: crate::connector::starrocks::managed::store::IcebergOptimizeJobState,
+) -> &'static str {
+    match state {
+        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Pending => "PENDING",
+        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Running => "RUNNING",
+        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Finished => {
+            "FINISHED"
+        }
+        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Failed => "FAILED",
     }
 }
 
@@ -1660,7 +1850,7 @@ fn stream_load_managed_lake_table(
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
+        QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
         StatementResult, dispatch_statement, register_connector_backends,
     };
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
@@ -1703,6 +1893,125 @@ mod tests {
             .execute("ALTER TABLE missing.db.t ADD COLUMN c INT")
             .expect_err("unknown catalog");
         assert!(err.contains("unknown catalog"));
+    }
+
+    #[test]
+    fn show_alter_table_optimize_reads_persisted_jobs() {
+        let temp = TempDir::new().expect("metadata temp dir");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: None,
+            metadata_db_path: Some(temp.path().join("metadata.db")),
+        })
+        .expect("engine");
+        engine
+            .inner
+            .metadata_store
+            .as_ref()
+            .expect("metadata store")
+            .create_iceberg_optimize_job("ice", "db1", "orders", 123, 1000)
+            .expect("create synthetic optimize job");
+
+        let result = engine
+            .session()
+            .query(
+                "SHOW ALTER TABLE OPTIMIZE FROM db1 WHERE TableName = 'orders' \
+                 ORDER BY CreateTime DESC LIMIT 1",
+            )
+            .expect("show optimize jobs");
+
+        assert_eq!(result.row_count(), 1);
+        let chunk = &result.chunks[0];
+        let table_names = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("table name column");
+        let states = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("state column");
+        assert_eq!(table_names.value(0), "orders");
+        assert_eq!(states.value(0), "PENDING");
+    }
+
+    #[test]
+    fn show_alter_table_optimize_uses_session_catalog_and_database() {
+        let temp = TempDir::new().expect("metadata temp dir");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: None,
+            metadata_db_path: Some(temp.path().join("metadata.db")),
+        })
+        .expect("engine");
+        let store = engine
+            .inner
+            .metadata_store
+            .as_ref()
+            .expect("metadata store");
+        store
+            .create_iceberg_optimize_job("ice1", "db1", "orders", 101, 1_000)
+            .expect("create ice1 db1 job");
+        store
+            .create_iceberg_optimize_job("ice2", "db1", "orders", 102, 2_000)
+            .expect("create ice2 db1 job");
+        store
+            .create_iceberg_optimize_job("ice1", "db2", "orders", 103, 3_000)
+            .expect("create ice1 db2 job");
+
+        let session = engine.session();
+        let current = match session
+            .execute_in_context("SHOW ALTER TABLE OPTIMIZE", Some("ice1"), "db1", None)
+            .expect("show current context")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&current), vec!["1"]);
+
+        let from_db = match session
+            .execute_in_context(
+                "SHOW ALTER TABLE OPTIMIZE FROM db1 ORDER BY CreateTime DESC",
+                Some("ice1"),
+                "db2",
+                None,
+            )
+            .expect("show from db under current catalog")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&from_db), vec!["1"]);
+
+        let explicit_catalog = match session
+            .execute_in_context(
+                "SHOW ALTER TABLE OPTIMIZE FROM ice2.db1",
+                Some("ice1"),
+                "db1",
+                None,
+            )
+            .expect("show explicit catalog")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("SHOW returned ok"),
+        };
+        assert_eq!(optimize_show_job_ids(&explicit_catalog), vec!["2"]);
+    }
+
+    fn optimize_show_job_ids(result: &QueryResult) -> Vec<String> {
+        if result.row_count() == 0 {
+            return Vec::new();
+        }
+        let ids = result.chunks[0]
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("job id column");
+        (0..ids.len())
+            .map(|idx| ids.value(idx).to_string())
+            .collect()
     }
 
     fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
