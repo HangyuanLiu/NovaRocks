@@ -29,6 +29,7 @@ pub(crate) mod generate_series;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
+pub(crate) mod mutation_flow;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -687,6 +688,16 @@ impl StandaloneSession {
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
                 crate::engine::delete_flow::execute_delete_statement(
+                    &self.inner,
+                    &stmt,
+                    current_catalog,
+                    current_database,
+                )
+            }
+            ref update_stmt @ sqlast::Statement::Update(_) => {
+                let stmt =
+                    crate::engine::statement::convert_sqlparser_update_to_custom(update_stmt)?;
+                crate::engine::mutation_flow::execute_update_statement(
                     &self.inner,
                     &stmt,
                     current_catalog,
