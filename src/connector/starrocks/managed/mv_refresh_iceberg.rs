@@ -940,6 +940,8 @@ fn update_iceberg_mv_in_catalog(
                     first_row_id: f.first_row_id,
                     data_sequence_number: f.data_sequence_number,
                     delete_files: f.delete_files,
+                    manifest_path: None,
+                    partition_values: vec![],
                 })
                 .collect(),
             cloud_properties,
@@ -975,6 +977,8 @@ fn update_iceberg_mv_in_catalog(
                     first_row_id: f.first_row_id,
                     data_sequence_number: f.data_sequence_number,
                     delete_files: f.delete_files,
+                    manifest_path: None,
+                    partition_values: vec![],
                 })
                 .collect(),
             // No cloud credentials needed — the file:// scan path reads

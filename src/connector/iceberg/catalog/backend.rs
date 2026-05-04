@@ -131,7 +131,21 @@ impl TableSource for IcebergTableSource {
         let guard = self.registry.read().expect("iceberg catalog read lock");
         let entry = guard.get(&table.catalog)?;
         let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-        let data_files = super::registry::extract_data_files_with_stats(&loaded.table)?;
+        let snapshot_id = loaded.table.metadata().current_snapshot_id();
+        let data_files = if let Some(cached) =
+            entry.cached_data_files(&table.namespace, &table.table, snapshot_id)?
+        {
+            cached
+        } else {
+            let data_files = super::registry::extract_data_files_with_stats(&loaded.table)?;
+            entry.cache_data_files(
+                &table.namespace,
+                &table.table,
+                snapshot_id,
+                data_files.clone(),
+            )?;
+            data_files
+        };
         build_iceberg_table_def_with_data_files(
             &entry,
             &table.namespace,
@@ -173,6 +187,8 @@ fn build_iceberg_table_def_with_data_files(
                     first_row_id: file.first_row_id,
                     data_sequence_number: file.data_sequence_number,
                     delete_files: file.delete_files,
+                    manifest_path: file.manifest_path,
+                    partition_values: file.partition_field_values,
                 })
                 .collect(),
             cloud_properties,
@@ -193,6 +209,8 @@ fn build_iceberg_table_def_with_data_files(
                     first_row_id: file.first_row_id,
                     data_sequence_number: file.data_sequence_number,
                     delete_files: file.delete_files,
+                    manifest_path: file.manifest_path,
+                    partition_values: file.partition_field_values,
                 })
                 .collect(),
             cloud_properties: Default::default(),

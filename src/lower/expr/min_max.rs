@@ -33,6 +33,18 @@ pub(crate) fn parse_min_max_conjunct(
     expr: &exprs::TExpr,
     layout: &Layout,
 ) -> Result<Option<MinMaxPredicate>, String> {
+    parse_min_max_conjunct_with_column_resolver(expr, |slot_ref| {
+        get_column_name_from_slot(slot_ref, layout)
+    })
+}
+
+pub(crate) fn parse_min_max_conjunct_with_column_resolver<F>(
+    expr: &exprs::TExpr,
+    mut resolve_column: F,
+) -> Result<Option<MinMaxPredicate>, String>
+where
+    F: FnMut(&exprs::TSlotRef) -> Result<String, String>,
+{
     if expr.nodes.is_empty() {
         return Ok(None);
     }
@@ -74,7 +86,7 @@ pub(crate) fn parse_min_max_conjunct(
         return Ok(None);
     };
 
-    let column = get_column_name_from_slot(slot_ref, layout)?;
+    let column = resolve_column(slot_ref)?;
     let value = match extract_literal_value(right_node) {
         Ok(value) => value,
         Err(err) => {

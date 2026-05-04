@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::descriptors;
 use crate::exprs;
 use crate::internal_service;
+use crate::lower::expr::parse_min_max_conjunct_with_column_resolver;
 use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
@@ -10,12 +12,25 @@ use crate::types;
 use super::resolve::ResolvedTable;
 
 use crate::sql::catalog::{
-    IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo, TableStorage,
+    IcebergColumnStats, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+    IcebergPartitionValue, S3FileInfo, TableStorage,
 };
 
 // ---------------------------------------------------------------------------
 // Scan node
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedScanTable {
+    pub(crate) scan_node_id: i32,
+    pub(crate) resolved: ResolvedTable,
+    pub(crate) min_max_conjuncts: Vec<exprs::TExpr>,
+    pub(crate) slot_to_column: HashMap<types::TSlotId, String>,
+}
+
+const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
+const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;
+const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 
 pub(crate) fn build_scan_node(
     node_id: i32,
@@ -42,6 +57,12 @@ fn build_hdfs_scan_node(
     node.limit = -1;
     node.row_tuples = vec![scan_tuple_id];
     node.nullable_tuples = vec![];
+    let min_max_conjuncts = if conjuncts.is_empty() {
+        None
+    } else {
+        Some(conjuncts.clone())
+    };
+    let min_max_tuple_id = min_max_conjuncts.as_ref().map(|_| scan_tuple_id);
     node.conjuncts = if conjuncts.is_empty() {
         None
     } else {
@@ -64,8 +85,8 @@ fn build_hdfs_scan_node(
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
         Some(scan_tuple_id),
         None::<BTreeMap<types::TTupleId, Vec<exprs::TExpr>>>,
-        None::<Vec<exprs::TExpr>>,
-        None::<types::TTupleId>,
+        min_max_conjuncts,
+        min_max_tuple_id,
         None::<BTreeMap<types::TSlotId, Vec<i32>>>,
         None::<Vec<exprs::TExpr>>,
         Some(
@@ -100,6 +121,24 @@ fn build_hdfs_scan_node(
     ));
 
     node
+}
+
+pub(crate) fn append_hdfs_scan_min_max_conjuncts(
+    node: &mut plan_nodes::TPlanNode,
+    conjuncts: &[exprs::TExpr],
+) {
+    if conjuncts.is_empty() {
+        return;
+    }
+    let Some(hdfs) = node.hdfs_scan_node.as_mut() else {
+        return;
+    };
+    hdfs.min_max_conjuncts
+        .get_or_insert_with(Vec::new)
+        .extend(conjuncts.iter().cloned());
+    if hdfs.min_max_tuple_id.is_none() {
+        hdfs.min_max_tuple_id = hdfs.tuple_id;
+    }
 }
 
 fn build_lake_scan_node(
@@ -435,12 +474,13 @@ pub(crate) fn build_sort_node_raw(
 
 /// Build exec params for multiple scan nodes (used in JOIN queries).
 pub(crate) fn build_exec_params_multi(
-    scan_tables: &[(i32, ResolvedTable)],
+    scan_tables: &[PlannedScanTable],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
     let mut per_node_scan_ranges = BTreeMap::new();
 
-    for (scan_node_id, resolved) in scan_tables {
-        let scan_node_id = *scan_node_id;
+    for planned in scan_tables {
+        let scan_node_id = planned.scan_node_id;
+        let resolved = &planned.resolved;
         let ranges = if let Some(layout) = resolved.physical_layout.as_ref() {
             if layout.tablets.is_empty() {
                 return Err(format!(
@@ -463,23 +503,24 @@ pub(crate) fn build_exec_params_multi(
                     vec![build_hdfs_scan_range_params(
                         &path.display().to_string(),
                         file_len,
+                        0,
+                        file_len,
                         None,
                         None,
                         &[],
                     )?]
                 }
-                TableStorage::S3ParquetFiles { files, .. } => files
-                    .iter()
-                    .map(|f| {
-                        build_hdfs_scan_range_params(
-                            &f.path,
-                            f.size,
-                            f.first_row_id,
-                            f.data_sequence_number,
-                            &f.delete_files,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+                TableStorage::S3ParquetFiles { files, .. } => {
+                    let file_predicates = scan_file_min_max_predicates(planned);
+                    let mut ranges = Vec::new();
+                    for file in files
+                        .iter()
+                        .filter(|f| file_may_satisfy_min_max(f, &file_predicates))
+                    {
+                        ranges.extend(build_hdfs_scan_range_params_for_file(file)?);
+                    }
+                    ranges
+                }
             }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);
@@ -504,6 +545,335 @@ pub(crate) fn build_exec_params_multi(
         None::<bool>,
         None::<Vec<internal_service::TExecDebugOption>>,
     ))
+}
+
+fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredicate> {
+    let mut predicates = Vec::new();
+    for conjunct in &planned.min_max_conjuncts {
+        let parsed = parse_min_max_conjunct_with_column_resolver(conjunct, |slot_ref| {
+            planned
+                .slot_to_column
+                .get(&slot_ref.slot_id)
+                .cloned()
+                .ok_or_else(|| format!("slot_id {} has no scan column", slot_ref.slot_id))
+        });
+        if let Ok(Some(predicate)) = parsed {
+            predicates.push(predicate);
+        }
+    }
+    predicates
+}
+
+fn file_may_satisfy_min_max(file: &S3FileInfo, predicates: &[MinMaxPredicate]) -> bool {
+    if predicates.is_empty() {
+        return true;
+    }
+    let column_stats = file.column_stats.as_ref();
+    predicates.iter().all(|predicate| {
+        if let Some(may_satisfy) = partition_may_satisfy_predicate(file, predicate) {
+            return may_satisfy;
+        }
+        let Some(column_stats) = column_stats else {
+            return true;
+        };
+        let Some(stats) = find_column_stats(column_stats, predicate.column()) else {
+            return true;
+        };
+        stats_may_satisfy_predicate(stats, predicate)
+    })
+}
+
+fn partition_may_satisfy_predicate(file: &S3FileInfo, predicate: &MinMaxPredicate) -> Option<bool> {
+    let partition = file.partition_values.iter().find(|value| {
+        value.transform.eq_ignore_ascii_case("identity")
+            && value.source_column.eq_ignore_ascii_case(predicate.column())
+    })?;
+    let Some(value) = partition.value.as_ref() else {
+        return Some(false);
+    };
+    partition_value_may_satisfy_predicate(value, predicate)
+}
+
+fn partition_value_may_satisfy_predicate(
+    partition_value: &IcebergPartitionValue,
+    predicate: &MinMaxPredicate,
+) -> Option<bool> {
+    let value = predicate.value();
+    match partition_value {
+        IcebergPartitionValue::Boolean(v) => {
+            let value = value.as_bool()?;
+            let left = i64::from(*v);
+            let right = i64::from(value);
+            Some(point_may_satisfy_i64(left, predicate, right))
+        }
+        IcebergPartitionValue::Int32(v) => {
+            let value = value.as_i64()?;
+            Some(point_may_satisfy_i64(i64::from(*v), predicate, value))
+        }
+        IcebergPartitionValue::Int64(v) => {
+            let value = value.as_i64()?;
+            Some(point_may_satisfy_i64(*v, predicate, value))
+        }
+        IcebergPartitionValue::Float(v) => {
+            let value = value.as_f64()?;
+            Some(point_may_satisfy_f64(f64::from(*v), predicate, value))
+        }
+        IcebergPartitionValue::Double(v) => {
+            let value = value.as_f64()?;
+            Some(point_may_satisfy_f64(*v, predicate, value))
+        }
+        IcebergPartitionValue::String(v) => {
+            let value = value.as_bytes()?;
+            Some(point_may_satisfy_bytes(v.as_bytes(), predicate, value))
+        }
+        IcebergPartitionValue::Binary(v) => {
+            let value = value.as_bytes()?;
+            Some(point_may_satisfy_bytes(v.as_slice(), predicate, value))
+        }
+    }
+}
+
+fn find_column_stats<'a>(
+    column_stats: &'a HashMap<String, IcebergColumnStats>,
+    column: &str,
+) -> Option<&'a IcebergColumnStats> {
+    column_stats.get(column).or_else(|| {
+        column_stats
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, stats)| stats)
+    })
+}
+
+fn stats_may_satisfy_predicate(stats: &IcebergColumnStats, predicate: &MinMaxPredicate) -> bool {
+    let value = predicate.value();
+    if let Some(value) = value.as_bool() {
+        return stats_may_satisfy_bool(stats, predicate, value);
+    }
+    if let Some(value) = value.as_i64() {
+        return stats_may_satisfy_i64(stats, predicate, value);
+    }
+    if let Some(value) = value.as_f64() {
+        return stats_may_satisfy_f64(stats, predicate, value);
+    }
+    if let Some(value) = value.as_bytes() {
+        return stats_may_satisfy_bytes(stats, predicate, value);
+    }
+    true
+}
+
+fn stats_may_satisfy_bool(
+    stats: &IcebergColumnStats,
+    predicate: &MinMaxPredicate,
+    value: bool,
+) -> bool {
+    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_bool_bound) else {
+        return true;
+    };
+    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_bool_bound) else {
+        return true;
+    };
+    let value = i64::from(value);
+    range_may_satisfy_i64(i64::from(lower), i64::from(upper), predicate, value)
+}
+
+fn stats_may_satisfy_i64(
+    stats: &IcebergColumnStats,
+    predicate: &MinMaxPredicate,
+    value: i64,
+) -> bool {
+    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_i64_bound) else {
+        return true;
+    };
+    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_i64_bound) else {
+        return true;
+    };
+    range_may_satisfy_i64(lower, upper, predicate, value)
+}
+
+fn stats_may_satisfy_f64(
+    stats: &IcebergColumnStats,
+    predicate: &MinMaxPredicate,
+    value: f64,
+) -> bool {
+    let Some(lower) = stats.lower_bound.as_deref().and_then(decode_f64_bound) else {
+        return true;
+    };
+    let Some(upper) = stats.upper_bound.as_deref().and_then(decode_f64_bound) else {
+        return true;
+    };
+    range_may_satisfy_f64(lower, upper, predicate, value)
+}
+
+fn stats_may_satisfy_bytes(
+    stats: &IcebergColumnStats,
+    predicate: &MinMaxPredicate,
+    value: &[u8],
+) -> bool {
+    let Some(lower) = stats.lower_bound.as_deref() else {
+        return true;
+    };
+    let Some(upper) = stats.upper_bound.as_deref() else {
+        return true;
+    };
+    range_may_satisfy_bytes(lower, upper, predicate, value)
+}
+
+fn point_may_satisfy_i64(point: i64, predicate: &MinMaxPredicate, value: i64) -> bool {
+    range_may_satisfy_i64(point, point, predicate, value)
+}
+
+fn point_may_satisfy_f64(point: f64, predicate: &MinMaxPredicate, value: f64) -> bool {
+    range_may_satisfy_f64(point, point, predicate, value)
+}
+
+fn point_may_satisfy_bytes(point: &[u8], predicate: &MinMaxPredicate, value: &[u8]) -> bool {
+    range_may_satisfy_bytes(point, point, predicate, value)
+}
+
+fn range_may_satisfy_i64(lower: i64, upper: i64, predicate: &MinMaxPredicate, value: i64) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => lower <= value,
+        MinMaxPredicate::Ge { .. } => upper >= value,
+        MinMaxPredicate::Lt { .. } => lower < value,
+        MinMaxPredicate::Gt { .. } => upper > value,
+        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
+    }
+}
+
+fn range_may_satisfy_f64(lower: f64, upper: f64, predicate: &MinMaxPredicate, value: f64) -> bool {
+    if lower.is_nan() || upper.is_nan() || value.is_nan() {
+        return true;
+    }
+    match predicate {
+        MinMaxPredicate::Le { .. } => lower <= value,
+        MinMaxPredicate::Ge { .. } => upper >= value,
+        MinMaxPredicate::Lt { .. } => lower < value,
+        MinMaxPredicate::Gt { .. } => upper > value,
+        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
+    }
+}
+
+fn range_may_satisfy_bytes(
+    lower: &[u8],
+    upper: &[u8],
+    predicate: &MinMaxPredicate,
+    value: &[u8],
+) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => lower <= value,
+        MinMaxPredicate::Ge { .. } => upper >= value,
+        MinMaxPredicate::Lt { .. } => lower < value,
+        MinMaxPredicate::Gt { .. } => upper > value,
+        MinMaxPredicate::Eq { .. } => lower <= value && value <= upper,
+    }
+}
+
+fn decode_bool_bound(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
+fn decode_i64_bound(bytes: &[u8]) -> Option<i64> {
+    match bytes.len() {
+        1 => bytes.first().copied().map(i64::from),
+        4 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(i64::from(i32::from_le_bytes(arr)))
+        }
+        8 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(i64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
+    match bytes.len() {
+        4 => {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(f64::from(f32::from_le_bytes(arr)))
+        }
+        8 => {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(f64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+fn build_hdfs_scan_range_params_for_file(
+    file: &S3FileInfo,
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
+    let splits = plan_hdfs_file_splits(file);
+    splits
+        .into_iter()
+        .map(|(offset, length)| {
+            build_hdfs_scan_range_params(
+                &file.path,
+                file.size,
+                offset,
+                length,
+                file.first_row_id,
+                file.data_sequence_number,
+                &file.delete_files,
+            )
+        })
+        .collect()
+}
+
+fn plan_hdfs_file_splits(file: &S3FileInfo) -> Vec<(i64, i64)> {
+    let file_len = file.size.max(0);
+    if file_len <= ICEBERG_SCAN_SPLIT_TARGET_BYTES
+        || file.first_row_id.is_some()
+        || !file.delete_files.is_empty()
+    {
+        return vec![(0, file_len)];
+    }
+
+    let mut out = Vec::new();
+    let mut offset = 0_i64;
+    while offset < file_len {
+        let remaining = file_len - offset;
+        let length = remaining.min(ICEBERG_SCAN_SPLIT_TARGET_BYTES);
+        out.push((offset, length));
+        offset += length;
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+fn validate_iceberg_delete_apply_cost(
+    data_path: &str,
+    delete_files: &[IcebergDeleteFileInfo],
+) -> Result<(), String> {
+    if delete_files.len() > ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE {
+        return Err(format!(
+            "too many Iceberg delete files attached to data file {data_path}: count={} max={}",
+            delete_files.len(),
+            ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE
+        ));
+    }
+    let total_bytes = delete_files.iter().try_fold(0_i64, |acc, delete_file| {
+        let Some(length) = delete_file.length else {
+            return Ok(acc);
+        };
+        acc.checked_add(length.max(0))
+            .ok_or_else(|| format!("Iceberg delete file length overflow for data file {data_path}"))
+    })?;
+    if total_bytes > ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE {
+        return Err(format!(
+            "Iceberg delete files attached to data file {data_path} are too large: bytes={total_bytes} max={ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE}"
+        ));
+    }
+    Ok(())
 }
 
 fn build_internal_scan_range_params(
@@ -553,6 +923,8 @@ fn build_internal_scan_range_params(
 fn build_hdfs_scan_range_params(
     full_path: &str,
     file_len: i64,
+    offset: i64,
+    length: i64,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
     delete_files: &[IcebergDeleteFileInfo],
@@ -613,10 +985,10 @@ fn build_hdfs_scan_range_params(
     };
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
-        Some(0_i64),
-        Some(file_len),
+        Some(offset),
+        Some(length),
         None::<i64>,
-        None::<i64>, // file_length: let scan connector determine actual size
+        Some(file_len),
         Some(descriptors::THdfsFileFormat::PARQUET),
         None::<descriptors::TTextFileDesc>,
         Some(full_path.to_string()),
