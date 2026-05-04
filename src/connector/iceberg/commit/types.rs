@@ -223,4 +223,27 @@ mod tests {
         let decoded: MutationSidecar = serde_json::from_str(&json).expect("deserialize sidecar");
         assert_eq!(decoded, sidecar);
     }
+
+    #[test]
+    fn mutation_sidecar_round_trips_json() {
+        let sidecar = MutationSidecar::update(
+            IcebergUpdateMode::CopyOnWrite,
+            101,
+            "table-uuid".to_string(),
+            vec![11, 12, 13],
+            vec![MutationSidecarFile {
+                old_file: "s3://bucket/table/data/old.parquet".to_string(),
+                new_files: vec![
+                    "s3://bucket/table/data/new-1.parquet".to_string(),
+                    "s3://bucket/table/data/new-2.parquet".to_string(),
+                ],
+                row_ids: vec![11, 12, 13],
+            }],
+        );
+
+        let json = serde_json::to_string(&sidecar).expect("serialize sidecar");
+        let decoded: MutationSidecar = serde_json::from_str(&json).expect("deserialize sidecar");
+
+        assert_eq!(decoded, sidecar);
+    }
 }
