@@ -124,6 +124,18 @@ pub fn ensure_single_partition_spec(table: &Table) -> Result<(), String> {
     Ok(())
 }
 
+pub fn ensure_overwrite_single_partition_spec(table: &Table) -> Result<(), String> {
+    ensure_single_partition_spec(table).map_err(|err| {
+        format!("INSERT OVERWRITE on an evolved Iceberg table is not supported yet: {err}")
+    })
+}
+
+pub fn ensure_equality_delete_single_partition_spec(table: &Table) -> Result<(), String> {
+    ensure_single_partition_spec(table).map_err(|err| {
+        format!("ADD EQUALITY DELETE on an evolved Iceberg table is not supported yet: {err}")
+    })
+}
+
 /// INSERT OVERWRITE rewrites data manifests without fully reconciling existing
 /// equality-delete manifests yet. Row-level DELETE has its own visibility
 /// planner; keep this guard scoped to overwrite-style write planning.

@@ -18,9 +18,11 @@
 pub mod catalog;
 pub mod changes;
 pub mod commit;
+pub(crate) mod data_writer;
 pub mod equality_delete;
 mod jvm;
 pub mod metadata;
+pub(crate) mod partition_spec;
 pub mod position_delete;
 pub mod scan_deletes;
 pub mod schema;

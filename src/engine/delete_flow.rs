@@ -45,11 +45,10 @@ use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
-    classify_sql_delete_strategy, ensure_single_partition_spec, run_iceberg_commit,
-    write_position_delete_files,
+    classify_sql_delete_strategy, run_iceberg_commit, write_position_delete_files,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::{StandaloneState, StatementResult};
@@ -90,8 +89,6 @@ pub(crate) fn execute_delete_statement(
 
     // 3. Validation.
     let delete_strategy = classify_sql_delete_strategy(&table)?;
-    ensure_single_partition_spec(&table)?;
-
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
     //    early. The bound `Predicate` is also used for manifest-level pruning
     //    inside [`scan_for_position_deletes`].
@@ -99,6 +96,7 @@ pub(crate) fn execute_delete_statement(
     let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
     let existing_deletes_by_file =
         load_existing_delete_visibility_by_data_file(&table, entry.object_store_config())?;
+    let referenced_data_file_partitions = load_referenced_data_file_partitions(&table)?;
 
     // 5. Scan data files and collect (file, pos) pairs. This path still reads
     //    every physical row and applies the original sqlparser WHERE AST per
@@ -110,6 +108,7 @@ pub(crate) fn execute_delete_statement(
             predicate,
             &stmt.where_clause,
             &existing_deletes_by_file,
+            &referenced_data_file_partitions,
         )
         .await
     })??;
@@ -131,13 +130,7 @@ pub(crate) fn execute_delete_statement(
         IcebergSqlDeleteStrategy::PositionDeleteFiles => {
             // 6. Write v2 Parquet position-delete files into staging.
             let written = block_on_iceberg(async {
-                write_position_delete_files(
-                    &file_io,
-                    &staging_dir,
-                    metadata.default_partition_spec_id(),
-                    groups,
-                )
-                .await
+                write_position_delete_files(&file_io, &staging_dir, groups).await
             })??;
 
             // 7. Build collector + inject written files + commit via RowDeltaCommit.
@@ -424,6 +417,7 @@ async fn scan_for_position_deletes(
     predicate: Predicate,
     where_expr: &sqlast::Expr,
     existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &ReferencedDataFilePartitions,
 ) -> Result<Vec<PositionDeleteGroup>, String> {
     let schema = table.metadata().current_schema();
 
@@ -483,11 +477,83 @@ async fn scan_for_position_deletes(
 
     Ok(by_file
         .into_iter()
-        .map(|(referenced_data_file, positions)| PositionDeleteGroup {
-            referenced_data_file,
-            positions,
+        .map(|(referenced_data_file, positions)| {
+            let partition = referenced_data_file_partitions
+                .get(&referenced_data_file)
+                .ok_or_else(|| {
+                    format!(
+                        "matched iceberg data file `{referenced_data_file}` is missing partition metadata"
+                    )
+                })?;
+            Ok(PositionDeleteGroup {
+                referenced_data_file,
+                partition_spec_id: partition.partition_spec_id,
+                partition_values: partition.partition_values.clone(),
+                positions,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?)
+}
+
+struct ReferencedDataFilePartition {
+    partition_spec_id: i32,
+    partition_values: iceberg::spec::Struct,
+}
+
+type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
+
+fn load_referenced_data_file_partitions(
+    table: &iceberg::table::Table,
+) -> Result<ReferencedDataFilePartitions, String> {
+    let data_files = registry::extract_data_files_with_stats(table)?;
+    let mut out = HashMap::with_capacity(data_files.len());
+    for data_file in data_files {
+        let partition_spec_id = data_file.partition_spec_id.ok_or_else(|| {
+            format!(
+                "iceberg data file `{}` missing partition spec id",
+                data_file.path
+            )
+        })?;
+        let partition_values = data_file.partition_values.ok_or_else(|| {
+            format!(
+                "iceberg data file `{}` missing partition values",
+                data_file.path
+            )
+        })?;
+        let partition = ReferencedDataFilePartition {
+            partition_spec_id,
+            partition_values,
+        };
+        insert_referenced_data_file_partition(&mut out, data_file.path, partition)?;
+    }
+    Ok(out)
+}
+
+fn insert_referenced_data_file_partition(
+    partitions: &mut ReferencedDataFilePartitions,
+    path: String,
+    partition: ReferencedDataFilePartition,
+) -> Result<(), String> {
+    match partitions.entry(path) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(partition);
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            let existing = entry.get();
+            if existing.partition_spec_id == partition.partition_spec_id
+                && existing.partition_values == partition.partition_values
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
+                entry.key(),
+                existing.partition_spec_id,
+                partition.partition_spec_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -863,7 +929,7 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Struct, Type};
     use parquet::arrow::ArrowWriter;
     use sqlparser::ast as sqlast;
 
@@ -936,6 +1002,72 @@ mod tests {
             ],
             negated: false,
         }
+    }
+
+    #[test]
+    fn referenced_data_file_partition_insert_rejects_conflicting_duplicate_metadata() {
+        let path = "/warehouse/db/t/data.parquet".to_string();
+        let mut partitions = HashMap::new();
+        super::insert_referenced_data_file_partition(
+            &mut partitions,
+            path.clone(),
+            super::ReferencedDataFilePartition {
+                partition_spec_id: 1,
+                partition_values: Struct::from_iter([Some(Literal::int(10))]),
+            },
+        )
+        .expect("insert first partition metadata");
+        super::insert_referenced_data_file_partition(
+            &mut partitions,
+            path.clone(),
+            super::ReferencedDataFilePartition {
+                partition_spec_id: 1,
+                partition_values: Struct::from_iter([Some(Literal::int(10))]),
+            },
+        )
+        .expect("identical duplicate partition metadata");
+
+        let err = super::insert_referenced_data_file_partition(
+            &mut partitions,
+            path.clone(),
+            super::ReferencedDataFilePartition {
+                partition_spec_id: 2,
+                partition_values: Struct::from_iter([Some(Literal::int(10))]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains(&path));
+        assert!(err.contains("conflicting partition metadata"));
+        assert!(err.contains("old partition spec id 1"));
+        assert!(err.contains("new partition spec id 2"));
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[&path].partition_spec_id, 1);
+
+        let mut partitions = HashMap::new();
+        super::insert_referenced_data_file_partition(
+            &mut partitions,
+            path.clone(),
+            super::ReferencedDataFilePartition {
+                partition_spec_id: 1,
+                partition_values: Struct::from_iter([Some(Literal::int(10))]),
+            },
+        )
+        .expect("insert first partition metadata");
+        let err = super::insert_referenced_data_file_partition(
+            &mut partitions,
+            path.clone(),
+            super::ReferencedDataFilePartition {
+                partition_spec_id: 1,
+                partition_values: Struct::from_iter([Some(Literal::int(20))]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains(&path));
+        assert!(err.contains("conflicting partition metadata"));
+        assert!(err.contains("old partition spec id 1"));
+        assert!(err.contains("new partition spec id 1"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::engine::{
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName, SqlType,
 };
+use crate::sql::parser::dialect::StarRocksDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -321,6 +322,7 @@ pub(crate) fn execute_create_table_statement(
             columns,
             key_desc,
             bucket_count,
+            partition_fields,
             properties,
         } => {
             if current_catalog.is_none()
@@ -351,6 +353,7 @@ pub(crate) fn execute_create_table_statement(
                 columns,
                 key_desc,
                 bucket_count,
+                partition_fields,
                 properties,
             })?;
             if target.backend_name == "iceberg" {
@@ -624,8 +627,7 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
     let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;
     };
-    let dialect = crate::sql::parser::dialect::StarRocksDialect;
-    let Ok(mut parser) = Parser::new(&dialect).try_with_sql(&normalized) else {
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
         return false;
     };
 
@@ -654,8 +656,7 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
 
 pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSchemaStmt, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let dialect = crate::sql::parser::dialect::StarRocksDialect;
-    let mut parser = Parser::new(&dialect)
+    let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(&normalized)
         .map_err(|e| format!("parse ALTER TABLE schema DDL: {e}"))?;
 
@@ -747,6 +748,112 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
         data_type,
         default_null,
     })
+}
+
+pub(crate) fn looks_like_alter_partition_column(sql: &str) -> bool {
+    let mut parser = match Parser::new(&StarRocksDialect).try_with_sql(sql) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+
+    let is_partition_action = (parser.parse_keyword(Keyword::ADD)
+        || parser.parse_keyword(Keyword::DROP))
+        && parser.parse_keyword(Keyword::PARTITION)
+        && peek_token_word_eq(&parser, "COLUMN");
+    is_partition_action
+}
+
+pub(crate) fn parse_alter_partition_column_sql(
+    sql: &str,
+) -> Result<crate::sql::parser::ast::AlterIcebergPartitionSpecStmt, String> {
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(sql)
+        .map_err(|e| format!("parse ALTER TABLE partition column: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| format!("expected ALTER: {e}"))?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| format!("expected TABLE after ALTER: {e}"))?;
+
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser
+            .parse_object_name(false)
+            .map_err(|e| format!("parse ALTER TABLE name: {e}"))?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let is_add = if parser.parse_keyword(Keyword::ADD) {
+        true
+    } else if parser.parse_keyword(Keyword::DROP) {
+        false
+    } else {
+        return Err("expected ADD or DROP before PARTITION COLUMN".to_string());
+    };
+    parser
+        .expect_keyword(Keyword::PARTITION)
+        .map_err(|e| format!("expected PARTITION after ADD/DROP: {e}"))?;
+    expect_word(&mut parser, "COLUMN")?;
+
+    let field = crate::sql::parser::dialect::create_table::parse_partition_field_expr(&mut parser)?;
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser)?;
+
+    if is_add {
+        Ok(
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table,
+                field,
+            },
+        )
+    } else {
+        Ok(
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                table,
+                field,
+            },
+        )
+    }
+}
+
+fn peek_token_word_eq(parser: &Parser<'_>, word: &str) -> bool {
+    matches!(
+        &parser.peek_token_ref().token,
+        Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word)
+    )
+}
+
+fn expect_word(parser: &mut Parser<'_>, word: &str) -> Result<(), String> {
+    let token = parser.next_token();
+    match token.token {
+        Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word) => Ok(()),
+        other => Err(format!("expected {word}, got {other}")),
+    }
+}
+
+fn consume_optional_final_semicolon(parser: &mut Parser<'_>) -> Result<(), String> {
+    if parser.consume_token(&Token::SemiColon) && parser.peek_token_ref().token == Token::SemiColon
+    {
+        return Err("only one final semicolon is allowed".to_string());
+    }
+    Ok(())
+}
+
+fn expect_parser_eof(parser: &Parser<'_>) -> Result<(), String> {
+    match parser.peek_token_ref().token {
+        Token::EOF => Ok(()),
+        ref other => Err(format!("unexpected token after statement: {other}")),
+    }
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...
@@ -941,6 +1048,7 @@ mod tests {
             "ALTER TABLE ice.db.orders SET COMMENT = 'ADD COLUMN c INT'",
             "ALTER TABLE ice.db.orders /* ADD COLUMN c INT */ ADD FILES FROM 's3://bucket/path'",
             "ALTER TABLE ice.db.orders ADD PARTITION p1 VALUES LESS THAN (10)",
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN city",
         ] {
             assert!(
                 !super::looks_like_alter_iceberg_schema(sql),
@@ -971,5 +1079,119 @@ mod tests {
         )
         .expect_err("duplicate default should fail");
         assert!(duplicate_default.contains("duplicate DEFAULT NULL"));
+    }
+
+    #[test]
+    fn parse_alter_partition_column_statement() {
+        use crate::sql::parser::ast::{
+            AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, ObjectName,
+        };
+
+        assert!(super::looks_like_alter_partition_column(
+            "alter table ice.db.orders add partition column city"
+        ));
+        assert_eq!(
+            super::parse_alter_partition_column_sql(
+                "ALTER TABLE ice.db.orders ADD PARTITION COLUMN city;"
+            )
+            .expect("parse add with final semicolon"),
+            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table: ObjectName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
+                },
+                field: IcebergPartitionFieldExpr::Identity {
+                    column: "city".to_string()
+                }
+            }
+        );
+
+        let add = super::parse_alter_partition_column_sql(
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32)",
+        )
+        .expect("parse add");
+        assert_eq!(
+            add,
+            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table: ObjectName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
+                },
+                field: IcebergPartitionFieldExpr::Bucket {
+                    column: "user_id".to_string(),
+                    num_buckets: 32
+                }
+            }
+        );
+
+        let drop = super::parse_alter_partition_column_sql(
+            "ALTER TABLE ice.db.orders DROP PARTITION COLUMN month(ts)",
+        )
+        .expect("parse drop");
+        assert_eq!(
+            drop,
+            AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                table: ObjectName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
+                },
+                field: IcebergPartitionFieldExpr::Month {
+                    column: "ts".to_string()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_alter_partition_column_accepts_flexible_whitespace() {
+        use crate::sql::parser::ast::{AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr};
+
+        assert!(super::looks_like_alter_partition_column(
+            "ALTER TABLE ice.db.orders\nADD   PARTITION\tCOLUMN bucket(user_id, 32)"
+        ));
+
+        let add = super::parse_alter_partition_column_sql(
+            "ALTER TABLE ice.db.orders\nADD   PARTITION\tCOLUMN bucket(user_id, 32)",
+        )
+        .expect("parse add");
+        assert_eq!(
+            add,
+            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                table: crate::sql::parser::ast::ObjectName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
+                },
+                field: IcebergPartitionFieldExpr::Bucket {
+                    column: "user_id".to_string(),
+                    num_buckets: 32
+                }
+            }
+        );
+
+        let drop = super::parse_alter_partition_column_sql(
+            "ALTER TABLE ice.db.orders\tDROP\nPARTITION   COLUMN month(ts)",
+        )
+        .expect("parse drop");
+        assert_eq!(
+            drop,
+            AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                table: crate::sql::parser::ast::ObjectName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
+                },
+                field: IcebergPartitionFieldExpr::Month {
+                    column: "ts".to_string()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_alter_partition_column_rejects_multi_statement_tails() {
+        for sql in [
+            "ALTER TABLE ice.db.orders; ADD PARTITION COLUMN bucket(user_id, 32)",
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32); SELECT 1",
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32);;",
+        ] {
+            assert!(
+                super::parse_alter_partition_column_sql(sql).is_err(),
+                "expected ALTER partition parse failure for {sql}"
+            );
+        }
     }
 }

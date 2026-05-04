@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
@@ -18,20 +17,11 @@ use iceberg::spec::{
     FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::{
-    Catalog, NamespaceIdent, TableCreation, TableIdent,
-    writer::{IcebergWriter, IcebergWriterBuilder},
-};
-use parquet::file::properties::WriterProperties;
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
+use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
@@ -327,12 +317,17 @@ pub(crate) fn create_table(
     table_name: &str,
     columns: &[TableColumnDef],
     key_desc: Option<&TableKeyDesc>,
+    partition_fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
     properties: &[(String, String)],
 ) -> Result<(), String> {
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
     entry.invalidate_table_cache(namespace_name, &table_name);
     let schema = build_iceberg_schema(columns)?;
+    let partition_spec = crate::connector::iceberg::partition_spec::build_initial_partition_spec(
+        &schema,
+        partition_fields,
+    )?;
     let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     all_properties.extend(build_logical_type_properties(columns)?);
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
@@ -340,14 +335,70 @@ pub(crate) fn create_table(
         .name(table_name)
         .schema(schema)
         .properties(all_properties)
-        .format_version(format_version)
-        .build();
+        .format_version(format_version);
+    let table_creation = if let Some(spec) = partition_spec {
+        table_creation.partition_spec(spec).build()
+    } else {
+        table_creation.build()
+    };
 
     let catalog = build_hadoop_catalog(entry)?;
     let _ = block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
     block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn alter_partition_spec(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+) -> Result<(), String> {
+    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+
+    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let table_name = normalize_identifier(table_name)?;
+    let catalog = build_hadoop_catalog(entry)?;
+    let ident = TableIdent::new(namespace, table_name.clone());
+    let table = block_on_iceberg(async { catalog.load_table(&ident).await })
+        .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
+        .map_err(|e| format!("load iceberg table {ident}: {e}"))?;
+    let metadata = table.metadata();
+    let base_default_spec_id = metadata.default_partition_spec_id();
+    let schema = metadata.current_schema();
+    let current = metadata.default_partition_spec();
+    let change = match &stmt {
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            field,
+            ..
+        } => crate::connector::iceberg::partition_spec::PartitionSpecChange::Add(field),
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            field,
+            ..
+        } => crate::connector::iceberg::partition_spec::PartitionSpecChange::Drop(field),
+    };
+    let evolved = crate::connector::iceberg::partition_spec::build_evolved_partition_spec(
+        schema.as_ref(),
+        current,
+        change,
+    )?;
+
+    let commit = TableCommit::builder()
+        .ident(ident.clone())
+        .requirements(vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: base_default_spec_id,
+        }])
+        .updates(vec![
+            TableUpdate::AddSpec { spec: evolved },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ])
+        .build();
+    block_on_iceberg(async { catalog.update_table(commit).await })
+        .map_err(|e| format!("alter iceberg partition spec runtime failed: {e}"))?
+        .map_err(|e| format!("alter iceberg partition spec failed: {e}"))?;
+    entry.invalidate_table_cache(namespace_name, &table_name);
     Ok(())
 }
 
@@ -573,32 +624,9 @@ pub(crate) fn insert_rows(
     });
 
     block_on_iceberg(async {
-        let location_generator = DefaultLocationGenerator::new(loaded.table.metadata().clone())
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string()))?;
-        let file_name_prefix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| format!("standalone-{}", duration.as_nanos()))
-            .unwrap_or_else(|_| "standalone".to_string());
-        let file_name_generator = DefaultFileNameGenerator::new(
-            file_name_prefix,
-            None,
-            iceberg::spec::DataFileFormat::Parquet,
-        );
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            loaded.table.metadata().current_schema().clone(),
-        );
-        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_writer_builder,
-            loaded.table.file_io().clone(),
-            location_generator,
-            file_name_generator,
-        );
-        let mut data_file_writer = DataFileWriterBuilder::new(rolling_writer_builder)
-            .build(None)
-            .await?;
-        data_file_writer.write(batch).await?;
-        let data_files = data_file_writer.close().await?;
+        let data_files = write_record_batches_as_data_files(&loaded.table, [batch])
+            .await
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
         let tx = Transaction::new(&loaded.table);
         let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
         tx.commit(&catalog).await
@@ -642,6 +670,8 @@ pub(crate) struct DataFileWithStats {
     pub size: i64,
     pub record_count: Option<i64>,
     pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_values: Option<iceberg::spec::Struct>,
     /// Iceberg v3 row-lineage: first row id assigned to this data file.
     pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
@@ -1051,6 +1081,8 @@ pub(crate) fn extract_data_files_with_stats(
                     size,
                     record_count,
                     column_stats,
+                    partition_spec_id: Some(manifest_file.partition_spec_id),
+                    partition_values: Some(df.partition().clone()),
                     first_row_id,
                     data_sequence_number,
                     delete_files,
@@ -2112,6 +2144,8 @@ mod data_file_with_stats_tests {
             size: 1024,
             record_count: Some(100),
             column_stats: None,
+            partition_spec_id: None,
+            partition_values: None,
             first_row_id: Some(7),
             data_sequence_number: Some(42),
             delete_files: vec![],
@@ -2130,6 +2164,8 @@ mod data_file_with_stats_tests {
             size: 512,
             record_count: None,
             column_stats: None,
+            partition_spec_id: None,
+            partition_values: None,
             first_row_id: None,
             data_sequence_number: None,
             delete_files: vec![],

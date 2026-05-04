@@ -34,7 +34,7 @@
 //!    requirements for OCC. iceberg-rust's `Transaction::do_commit` packages
 //!    this into a `TableCommit` and calls `Catalog::update_table`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -100,7 +100,6 @@ impl IcebergCommitAction for RowDeltaCommit {
             written,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
-            partition_spec: ctx.collector.partition_spec.clone(),
             schema_id: ctx.table.metadata().current_schema_id(),
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
@@ -134,7 +133,6 @@ struct RowDeltaTxnAction {
     written: Vec<WrittenFile>,
     commit_uuid: Uuid,
     file_io: FileIO,
-    partition_spec: PartitionSpecRef,
     schema_id: i32,
     abort_handle: Arc<AbortLog>,
     /// Mutex<Vec<String>> shared with the outer RowDeltaCommit so the wrapper
@@ -153,35 +151,47 @@ impl TransactionAction for RowDeltaTxnAction {
         let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
         let metadata_dir = metadata_dir(table);
 
-        // 1. Write the new delete manifest.
-        let delete_manifest_path = format!(
-            "{metadata_dir}/{}-row-delta-deletes-0.avro",
-            self.commit_uuid
-        );
-        self.abort_handle
-            .record_manifest(delete_manifest_path.clone());
-        self.manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .push(delete_manifest_path.clone());
-        let new_delete_manifest = write_delete_manifest(
-            &self.file_io,
-            &delete_manifest_path,
-            &self.written,
-            self.partition_spec.clone(),
-            m.current_schema().clone(),
-            new_seq,
-            new_snapshot_id,
-            format_version,
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
+        // 1. Write one new delete manifest per referenced partition spec.
+        let mut new_delete_manifests = Vec::new();
+        for (idx, (spec_id, files)) in group_written_by_spec(self.written.clone())
+            .into_iter()
+            .enumerate()
+        {
+            let spec = m.partition_spec_by_id(spec_id).cloned().ok_or_else(|| {
+                to_iceberg_unexpected(format!(
+                    "RowDelta delete file references unknown partition spec id {spec_id}"
+                ))
+            })?;
+            let delete_manifest_path = format!(
+                "{metadata_dir}/{}-row-delta-deletes-{idx}.avro",
+                self.commit_uuid
+            );
+            self.abort_handle
+                .record_manifest(delete_manifest_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(delete_manifest_path.clone());
+            let manifest = write_delete_manifest(
+                &self.file_io,
+                &delete_manifest_path,
+                &files,
+                spec,
+                m.current_schema().clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_delete_manifests.push(manifest);
+        }
 
         // 2. Inherit every entry from the base manifest list.
         let mut entries = read_base_manifest_list(table, &self.file_io)
             .await
             .map_err(to_iceberg_unexpected)?;
-        entries.push(new_delete_manifest);
+        entries.extend(new_delete_manifests);
 
         // 3. Write the new manifest list.
         let manifest_list_path = format!(
@@ -412,6 +422,17 @@ fn row_delta_summary(written: &[WrittenFile]) -> HashMap<String, String> {
     p
 }
 
+fn group_written_by_spec(written: Vec<WrittenFile>) -> BTreeMap<i32, Vec<WrittenFile>> {
+    let mut grouped = BTreeMap::new();
+    for file in written {
+        grouped
+            .entry(file.partition_spec_id)
+            .or_insert_with(Vec::new)
+            .push(file);
+    }
+    grouped
+}
+
 fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
 }
@@ -423,6 +444,25 @@ mod tests {
     use iceberg::spec::{DataContentType, DataFileFormat, Struct};
 
     use super::*;
+
+    fn test_written_position_delete(path: &str) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 1,
+            file_size_in_bytes: 256,
+            split_offsets: vec![],
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            key_metadata: None,
+            referenced_data_file: Some("s3://bucket/data.parquet".to_string()),
+            equality_ids: None,
+        }
+    }
 
     #[test]
     fn equality_delete_written_file_preserves_equality_ids() {
@@ -447,5 +487,19 @@ mod tests {
 
         assert_eq!(df.content_type(), DataContentType::EqualityDeletes);
         assert_eq!(df.equality_ids(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn row_delta_groups_written_delete_files_by_partition_spec() {
+        let mut a = test_written_position_delete("s3://bucket/delete-a.parquet");
+        a.partition_spec_id = 0;
+        let mut b = test_written_position_delete("s3://bucket/delete-b.parquet");
+        b.partition_spec_id = 7;
+
+        let grouped = group_written_by_spec(vec![b.clone(), a.clone()]);
+
+        assert_eq!(grouped.keys().copied().collect::<Vec<_>>(), vec![0, 7]);
+        assert_eq!(grouped.get(&0).unwrap()[0].path, a.path);
+        assert_eq!(grouped.get(&7).unwrap()[0].path, b.path);
     }
 }

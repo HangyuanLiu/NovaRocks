@@ -30,7 +30,7 @@ use iceberg::spec::{FormatVersion, PrimitiveType, Type};
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, EqualityDeleteColumn, IcebergCommitCollector, RunInput,
-    ensure_single_partition_spec, run_iceberg_commit, write_equality_delete_file,
+    ensure_equality_delete_single_partition_spec, run_iceberg_commit, write_equality_delete_file,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::parquet::{parse_date_string_to_days, parse_datetime_string_to_micros};
@@ -73,7 +73,7 @@ pub(crate) fn execute_add_equality_delete_statement(
     if metadata.format_version() == FormatVersion::V1 {
         return Err("ADD EQUALITY DELETE requires an Iceberg v2 or v3 table".to_string());
     }
-    ensure_single_partition_spec(&table)?;
+    ensure_equality_delete_single_partition_spec(&table)?;
     if !metadata.default_partition_spec().fields().is_empty() {
         return Err(
             "ADD EQUALITY DELETE currently supports only unpartitioned iceberg tables".to_string(),

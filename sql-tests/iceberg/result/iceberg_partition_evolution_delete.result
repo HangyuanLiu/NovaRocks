@@ -1,0 +1,10 @@
+-- query 2
+cnt
+4
+
+-- query 3
+id	user_id	score
+1	10	100
+3	30	300
+4	40	400
+6	60	600

@@ -36,7 +36,32 @@ pub(crate) enum CreateTableKind {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,
         bucket_count: Option<u32>,
+        partition_fields: Vec<IcebergPartitionFieldExpr>,
         properties: Vec<(String, String)>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergPartitionFieldExpr {
+    Identity { column: String },
+    Year { column: String },
+    Month { column: String },
+    Day { column: String },
+    Hour { column: String },
+    Bucket { column: String, num_buckets: u32 },
+    Truncate { column: String, width: u32 },
+    Void { column: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AlterIcebergPartitionSpecStmt {
+    AddPartitionColumn {
+        table: ObjectName,
+        field: IcebergPartitionFieldExpr,
+    },
+    DropPartitionColumn {
+        table: ObjectName,
+        field: IcebergPartitionFieldExpr,
     },
 }
 

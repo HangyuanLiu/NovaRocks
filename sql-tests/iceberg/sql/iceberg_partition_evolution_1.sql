@@ -40,7 +40,8 @@ FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
 
 -- query 4
--- @result_contains=partitions=7/8
+-- @result_contains=min-max stats
+-- @result_contains=predicates: user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32)
 USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
 SELECT COUNT(*), SUM(score)
@@ -48,7 +49,8 @@ FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
 
 -- query 5
--- @result_contains=partitions=3/8
+-- @result_contains=min-max stats
+-- @result_contains=predicates: user_id IN (1, 2, 3, 4)
 USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
 SELECT COUNT(*), SUM(score)

@@ -6,22 +6,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use iceberg::spec::{DataFile, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
-use parquet::file::properties::WriterProperties;
 
 use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::iceberg::commit::{
     CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
+use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::managed::mv_ddl::{
     alloc_id, analyze_mv_select, extract_base_table_refs, find_or_create_managed_database, now_ms,
     resolve_mv_name, validate_mv_partition_columns,
@@ -690,94 +683,7 @@ pub(crate) async fn write_chunks_as_iceberg_data_files(
     table: &iceberg::table::Table,
     chunks: &[crate::exec::chunk::Chunk],
 ) -> Result<Vec<iceberg::spec::DataFile>, String> {
-    // Build an Arrow schema annotated with Iceberg field ids. The ParquetWriterBuilder
-    // uses FieldMatchMode::Id and requires PARQUET_FIELD_ID_META_KEY on each field.
-    let iceberg_arrow_schema =
-        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?;
-    let iceberg_arrow_schema_ref = Arc::new(iceberg_arrow_schema);
-
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
-    // Use a UUID-derived random suffix so that files written in rapid successive
-    // REFRESH calls never collide on the same path — nanosecond timestamps are
-    // not a uniqueness guarantee when two REFRESH calls complete within the same
-    // nanosecond (e.g. in tests or under high load).  The AtomicU64 counter
-    // inside DefaultFileNameGenerator resets to 0 on every new instance, making
-    // a per-call unique seed necessary.
-    let unique_suffix = {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut bytes = [0_u8; 16];
-        rng.fill(&mut bytes);
-        // RFC 4122 version-4 variant bits.
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3],
-            bytes[4],
-            bytes[5],
-            bytes[6],
-            bytes[7],
-            bytes[8],
-            bytes[9],
-            bytes[10],
-            bytes[11],
-            bytes[12],
-            bytes[13],
-            bytes[14],
-            bytes[15],
-        )
-    };
-    let file_name_generator = DefaultFileNameGenerator::new(
-        "novarocks".to_string(),
-        Some(unique_suffix),
-        DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        table.metadata().current_schema().clone(),
-    );
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-    let data_file_builder = DataFileWriterBuilder::new(rolling_builder);
-    let mut writer: <DataFileWriterBuilder<
-        ParquetWriterBuilder,
-        DefaultLocationGenerator,
-        DefaultFileNameGenerator,
-    > as IcebergWriterBuilder>::R = data_file_builder
-        .build(None)
-        .await
-        .map_err(|e| format!("build iceberg data file writer failed: {e}"))?;
-
-    for chunk in chunks {
-        if chunk.batch.num_rows() == 0 {
-            continue;
-        }
-        // Re-cast to the iceberg-annotated schema so that field ids are present.
-        let annotated = arrow::record_batch::RecordBatch::try_new(
-            Arc::clone(&iceberg_arrow_schema_ref),
-            chunk.batch.columns().to_vec(),
-        )
-        .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))?;
-        writer
-            .write(annotated)
-            .await
-            .map_err(|e| format!("iceberg data file write failed: {e}"))?;
-    }
-
-    writer
-        .close()
-        .await
-        .map_err(|e| format!("iceberg data file writer close failed: {e}"))
+    write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
 
 /// Commit a fast-append transaction adding `data_files` to `table`.
@@ -1319,6 +1225,102 @@ mod tests {
                     .map(|s| s.snapshot_id()),
                 Some(snapshot_id),
             );
+        });
+    }
+
+    #[test]
+    fn write_chunks_populates_partition_data_for_partitioned_table() {
+        use crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog;
+        use iceberg::Catalog;
+        use iceberg::io::{FileIOBuilder, LocalFsStorageFactory};
+        use iceberg::spec::{Transform, UnboundPartitionSpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}/wh", dir.path().display());
+        let file_io = FileIOBuilder::new(
+            StdArc::new(LocalFsStorageFactory) as StdArc<dyn iceberg::io::StorageFactory>
+        )
+        .build();
+        let catalog: StdArc<dyn Catalog> = StdArc::new(HadoopFileSystemCatalog::new(
+            file_io.clone(),
+            warehouse.clone(),
+        ));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .unwrap();
+
+            let schema = iceberg::spec::Schema::builder()
+                .with_fields(vec![
+                    StdArc::new(iceberg::spec::NestedField::required(
+                        1,
+                        "k",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                    )),
+                    StdArc::new(iceberg::spec::NestedField::optional(
+                        2,
+                        "v",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                    )),
+                ])
+                .build()
+                .unwrap();
+            let partition_spec = UnboundPartitionSpec::builder()
+                .with_spec_id(0)
+                .add_partition_field(1, "k_identity", Transform::Identity)
+                .unwrap()
+                .build();
+
+            let creation = iceberg::TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .partition_spec(partition_spec)
+                .build();
+            let table = catalog.create_table(&ns, creation).await.unwrap();
+
+            let arrow_schema = StdArc::new(ArrowSchema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int64, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    StdArc::new(Int32Array::from(vec![1, 2, 3])),
+                    StdArc::new(Int64Array::from(vec![Some(10), Some(20), None])),
+                ],
+            )
+            .unwrap();
+
+            use crate::common::ids::SlotId;
+            use crate::exec::chunk::ChunkSchema;
+            let chunk_schema_ref = ChunkSchema::try_ref_from_schema_and_slot_ids(
+                &arrow_schema,
+                &[SlotId(0), SlotId(1)],
+            )
+            .expect("chunk schema");
+            let chunk = crate::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref);
+
+            let written = write_chunks_as_iceberg_data_files(&table, &[chunk])
+                .await
+                .unwrap();
+            assert_eq!(written.len(), 3);
+            assert!(
+                written
+                    .iter()
+                    .all(|data_file| data_file.partition().fields().len() == 1)
+            );
+            assert!(
+                written
+                    .iter()
+                    .all(|data_file| data_file.record_count() == 1)
+            );
+
+            let snapshot_id = commit_fast_append(&table, &catalog, written).await.unwrap();
+            assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
     }
 }
