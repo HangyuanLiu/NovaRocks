@@ -4553,9 +4553,9 @@ enable_path_style_access = true
         let result = session.query(sql).expect("query");
         let mut out = Vec::new();
         for chunk in &result.chunks {
-            let ids = chunk
-                .batch
-                .column(0)
+            let ids_col = arrow::compute::cast(chunk.batch.column(0), &DataType::Int64)
+                .expect("cast id column to Int64");
+            let ids = ids_col
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column must be Int64");
@@ -4577,6 +4577,65 @@ enable_path_style_access = true
         }
         out.sort_by_key(|row| row.0);
         out
+    }
+
+    #[test]
+    fn iceberg_v3_cow_update_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = 'bb' where t.id = 2",
+                "default",
+            )
+            .expect("update");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(before[0].1, after[0].1);
+        assert_eq!(before[1].1, after[1].1);
+        assert_ne!(
+            before[1].2, after[1].2,
+            "updated row sequence should advance"
+        );
+    }
+
+    #[test]
+    fn iceberg_v3_cow_update_multiple_files_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert first file");
+        session
+            .execute_in_database("insert into ice.db1.t values (2, 'b')", "default")
+            .expect("insert second file");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t set v = 'updated' where id in (1, 2)",
+                "default",
+            )
+            .expect("update two files");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(before[0].1, after[0].1);
+        assert_eq!(before[1].1, after[1].1);
+        assert_ne!(before[0].2, after[0].2);
+        assert_ne!(before[1].2, after[1].2);
     }
 
     // -------------------------------------------------------------------------

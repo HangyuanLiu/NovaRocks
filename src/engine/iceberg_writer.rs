@@ -166,6 +166,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_sidecar: None,
         })
         .await
     })??;

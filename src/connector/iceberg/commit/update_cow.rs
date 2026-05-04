@@ -42,8 +42,9 @@ use super::action::{CommitCtx, IcebergCommitAction};
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use super::types::{
-    CommitOutcome, MutationSidecar, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE,
-    NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_SIDECAR, WrittenFile,
+    CommitOutcome, MutationSidecar, MutationSidecarFile, NOVAROCKS_ROW_LEVEL_OP,
+    NOVAROCKS_ROW_LEVEL_OP_UPDATE, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
+    NOVAROCKS_UPDATE_SIDECAR, WrittenFile,
 };
 
 pub struct CowUpdateCommit {
@@ -214,30 +215,50 @@ impl TransactionAction for CowUpdateTxnAction {
             new_manifests.push(delete_manifest);
         }
 
-        let data_manifest_path =
-            format!("{metadata_dir}/{}-cow-update-data-0.avro", self.commit_uuid);
-        self.abort_handle
-            .record_manifest(data_manifest_path.clone());
-        self.manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .push(data_manifest_path.clone());
-        let data_manifest = write_added_data_manifest(
-            &self.file_io,
-            &data_manifest_path,
-            &self.written,
-            m.default_partition_spec().clone(),
-            m.current_schema().clone(),
-            new_seq,
-            new_snapshot_id,
-            format_version,
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
-        new_manifests.push(mark_replacement_manifest_row_id_assigned(
-            data_manifest,
-            row_lineage_first_row_id,
-        ));
+        let written_by_path = self
+            .written
+            .iter()
+            .map(|file| (file.path.clone(), file.clone()))
+            .collect::<HashMap<_, _>>();
+        for (idx, sidecar_file) in self.sidecar.touched_data_files.iter().enumerate() {
+            let data_manifest_path = format!(
+                "{metadata_dir}/{}-cow-update-data-{idx}.avro",
+                self.commit_uuid
+            );
+            self.abort_handle
+                .record_manifest(data_manifest_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(data_manifest_path.clone());
+            let replacement_files = sidecar_file
+                .new_files
+                .iter()
+                .map(|path| {
+                    written_by_path.get(path).cloned().ok_or_else(|| {
+                        to_iceberg_data_invalid(format!(
+                            "CowUpdateCommit sidecar replacement data file {path} was not written"
+                        ))
+                    })
+                })
+                .collect::<iceberg::Result<Vec<_>>>()?;
+            let data_manifest = write_added_data_manifest(
+                &self.file_io,
+                &data_manifest_path,
+                &replacement_files,
+                m.default_partition_spec().clone(),
+                m.current_schema().clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(mark_replacement_manifest_row_id_assigned(
+                data_manifest,
+                replacement_manifest_first_row_id(sidecar_file).map_err(to_iceberg_data_invalid)?,
+            ));
+        }
 
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
@@ -566,6 +587,12 @@ fn validate_cow_update_inputs(
                 file.old_file
             ));
         }
+        if file.new_files.is_empty() {
+            return Err(format!(
+                "CowUpdateCommit sidecar touched data file {} has no replacement data files",
+                file.old_file
+            ));
+        }
         for row_id in &file.row_ids {
             if !sidecar_row_ids.insert(*row_id) {
                 return Err(format!(
@@ -586,12 +613,6 @@ fn validate_cow_update_inputs(
             "CowUpdateCommit sidecar updated_row_ids contains row id {row_id}, but touched files are missing touched row id {row_id}"
         ));
     }
-    for row_id in sidecar_row_ids.difference(&updated_row_ids) {
-        return Err(format!(
-            "CowUpdateCommit sidecar touched files contain extra touched row id {row_id}"
-        ));
-    }
-
     let written_files: HashSet<String> = written.iter().map(|f| f.path.clone()).collect();
     if written_files.len() != written.len() {
         return Err("CowUpdateCommit received duplicate replacement data file paths".to_string());
@@ -612,6 +633,17 @@ fn validate_cow_update_inputs(
     }
 
     Ok(())
+}
+
+fn replacement_manifest_first_row_id(sidecar_file: &MutationSidecarFile) -> Result<u64, String> {
+    let first = sidecar_file
+        .row_ids
+        .iter()
+        .copied()
+        .min()
+        .ok_or_else(|| "CowUpdateCommit sidecar has no replacement row ids".to_string())?;
+    u64::try_from(first)
+        .map_err(|_| format!("CowUpdateCommit sidecar contains negative row id {first}"))
 }
 
 fn touched_old_file_paths(sidecar: &MutationSidecar) -> HashSet<String> {
@@ -747,16 +779,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_cow_update_inputs_rejects_extra_touched_file_row_id() {
+    fn validate_cow_update_inputs_allows_rewritten_row_ids_in_touched_files() {
         let mut sidecar = cow_sidecar();
         sidecar.updated_row_ids = vec![1];
         sidecar.touched_data_files[0].row_ids = vec![1, 2];
         let written = vec![written_file("new.parquet")];
 
-        let err = validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
-            .expect_err("extra touched row id must fail");
-
-        assert!(err.contains("extra touched row id 2"));
+        validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
+            .expect("rewritten row ids may include unchanged rows");
     }
 
     fn cow_sidecar() -> MutationSidecar {

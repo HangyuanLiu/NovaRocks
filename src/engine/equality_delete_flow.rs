@@ -137,6 +137,7 @@ pub(crate) fn execute_add_equality_delete_statement(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_sidecar: None,
         })
         .await
     })??;

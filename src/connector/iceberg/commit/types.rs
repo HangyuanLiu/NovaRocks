@@ -33,6 +33,9 @@ pub enum CommitOpKind {
     /// Iceberg OPTIMIZE whole-table rewrite: replaces all current live data
     /// files with compacted data files and drops all current delete files.
     RewriteDataFiles,
+    /// Iceberg v3 row-lineage UPDATE in copy-on-write mode: rewrites touched
+    /// data files while preserving `_row_id`.
+    CowUpdate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +196,10 @@ mod tests {
         assert_ne!(CommitOpKind::RowDelta, CommitOpKind::RowDeltaDv);
         assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDeltaDv);
         assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDeltaDv);
+        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::FastAppend);
+        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::Overwrite);
+        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::RowDelta);
+        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::RowDeltaDv);
     }
 
     #[test]
