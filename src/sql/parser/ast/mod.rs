@@ -235,6 +235,22 @@ pub(crate) enum ColumnAggregation {
     Replace,
 }
 
+/// Literal that may appear in `DEFAULT <literal>` clauses for Iceberg v3
+/// columns.  `Null` is the sentinel for `DEFAULT NULL` and is NOT persisted
+/// into the Iceberg metadata; it only suppresses duplicate-DEFAULT diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DefaultLiteral {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal { unscaled: i128, scale: i8 },
+    String(String),
+    Date(i32),     // days since 1970-01-01
+    DateTime(i64), // microseconds since 1970-01-01T00:00:00Z
+    Binary(Vec<u8>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SqlType {
     TinyInt,
