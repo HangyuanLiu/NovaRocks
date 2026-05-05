@@ -327,6 +327,50 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     )
 }
 
+fn write_mv_delete_temp_parquet(
+    namespace: &str,
+    table_name: &str,
+    deleted_rows: &[arrow::record_batch::RecordBatch],
+) -> Result<(String, i64, Option<i64>), String> {
+    let first_batch = deleted_rows
+        .first()
+        .ok_or_else(|| "delete-side mv refresh has no rows to write".to_string())?;
+    let dir = std::env::temp_dir().join(format!(
+        "novarocks_mv_deletes_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create temp dir for delete-side mv refresh: {e}"))?;
+    let path = dir.join(format!("{namespace}_{table_name}.parquet"));
+    let schema = first_batch.schema();
+    let file = std::fs::File::create(&path)
+        .map_err(|e| format!("create temp parquet for delete-side mv refresh: {e}"))?;
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
+        .map_err(|e| format!("create temp parquet writer for delete-side mv refresh: {e}"))?;
+    for batch in deleted_rows {
+        writer
+            .write(batch)
+            .map_err(|e| format!("write temp parquet batch for delete-side mv refresh: {e}"))?;
+    }
+    writer
+        .close()
+        .map_err(|e| format!("close temp parquet writer for delete-side mv refresh: {e}"))?;
+
+    let total_size: i64 = deleted_rows
+        .iter()
+        .flat_map(|batch| batch.columns())
+        .map(|column| column.get_array_memory_size() as i64)
+        .sum();
+    let total_rows = Some(
+        deleted_rows
+            .iter()
+            .map(|batch| batch.num_rows() as i64)
+            .sum(),
+    );
+
+    Ok((format!("file://{}", path.display()), total_size, total_rows))
+}
+
 /// Run the MV's SELECT statement against a one-shot in-memory catalog
 /// where the base table's storage is a single temp parquet file
 /// containing the supplied deleted rows. Mirrors the insert-side
@@ -353,48 +397,14 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
     };
     let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
 
-    // Write the deleted rows to a temp parquet file. The temp directory
-    // is OS-cleaned (or torn down by the next test run); we don't add
-    // explicit cleanup logic — matches register_empty_iceberg_table.
-    let dir = std::env::temp_dir().join(format!(
-        "novarocks_mv_deletes_{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create temp dir for delete-side mv refresh: {e}"))?;
-    let path = dir.join(format!("{namespace}_{table_name}.parquet"));
-    let schema = deleted_rows[0].schema();
-    let file = std::fs::File::create(&path)
-        .map_err(|e| format!("create temp parquet for delete-side mv refresh: {e}"))?;
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
-        .map_err(|e| format!("create temp parquet writer for delete-side mv refresh: {e}"))?;
-    for batch in &deleted_rows {
-        writer
-            .write(batch)
-            .map_err(|e| format!("write temp parquet batch for delete-side mv refresh: {e}"))?;
-    }
-    writer
-        .close()
-        .map_err(|e| format!("close temp parquet writer for delete-side mv refresh: {e}"))?;
+    let (path, total_size, total_rows) =
+        write_mv_delete_temp_parquet(&namespace, &table_name, &deleted_rows)?;
 
     // Build a TableDef whose storage is the temp parquet file. Reuse
     // build_iceberg_table_def_with_files's column-shape logic by giving
     // it a one-element file list.
-    let total_size: i64 = deleted_rows
-        .iter()
-        .map(|b| {
-            // Best-effort byte estimate — used only for cardinality hints.
-            // The query path doesn't depend on the exact value.
-            let mut bytes: i64 = 0;
-            for col in b.columns() {
-                bytes += col.get_array_memory_size() as i64;
-            }
-            bytes
-        })
-        .sum();
-    let total_rows: Option<i64> = Some(deleted_rows.iter().map(|b| b.num_rows() as i64).sum());
     let delete_files = vec![IcebergFileForQuery {
-        path: format!("file://{}", path.display()),
+        path,
         size: total_size,
         record_count: total_rows,
         partition_spec_id: None,
@@ -425,4 +435,52 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
         state.exchange_port,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    #[test]
+    fn mv_delete_temp_parquet_preserves_iceberg_field_ids() {
+        let metadata = HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())]);
+        let field = Field::new("renamed_id", DataType::Int32, false).with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("batch");
+        assert_eq!(
+            batch
+                .schema()
+                .field(0)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("7")
+        );
+
+        let (path, _, _) = super::write_mv_delete_temp_parquet("ns", "orders", &[batch])
+            .expect("write temp parquet");
+        let local_path = path.strip_prefix("file://").expect("file path");
+        let file = std::fs::File::open(local_path).expect("open temp parquet");
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder");
+        assert_eq!(
+            builder
+                .schema()
+                .field(0)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("7")
+        );
+    }
 }
