@@ -144,6 +144,70 @@ pub(crate) fn require_v3_for_default(
     Ok(())
 }
 
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
+use arrow::datatypes::DataType;
+
+/// Build an Arrow constant array of length `row_count` whose every element is
+/// the value encoded by `literal`. The literal's runtime type must agree with
+/// `target_type`; mismatches fail fast.
+pub(crate) fn literal_to_constant_array(
+    literal: &IcebergLiteral,
+    target_type: &DataType,
+    row_count: usize,
+) -> Result<ArrayRef, String> {
+    let IcebergLiteral::Primitive(prim) = literal else {
+        return Err(format!(
+            "unsupported initial-default literal kind: {literal:?}"
+        ));
+    };
+    Ok(match (prim, target_type) {
+        (PrimitiveLiteral::Boolean(v), DataType::Boolean) => {
+            Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Int(v), DataType::Int32) => {
+            Arc::new(Int32Array::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Long(v), DataType::Int64) => {
+            Arc::new(Int64Array::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Float(v), DataType::Float32) => {
+            Arc::new(Float32Array::from(vec![v.0; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Double(v), DataType::Float64) => {
+            Arc::new(Float64Array::from(vec![v.0; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Int128(v), DataType::Decimal128(precision, scale)) => Arc::new(
+            Decimal128Array::from(vec![*v; row_count])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| format!("decimal default cast: {e}"))?,
+        )
+            as ArrayRef,
+        (PrimitiveLiteral::String(s), DataType::Utf8) => {
+            Arc::new(StringArray::from(vec![s.as_str(); row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Int(v), DataType::Date32) => {
+            Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Long(v), DataType::Timestamp(_, _)) => {
+            Arc::new(TimestampMicrosecondArray::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Binary(b), DataType::Binary) => {
+            let slice = b.as_slice();
+            Arc::new(BinaryArray::from(vec![slice; row_count])) as ArrayRef
+        }
+        (prim, ty) => {
+            return Err(format!(
+                "unsupported initial-default literal {prim:?} for arrow type {ty:?}"
+            ));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +341,43 @@ mod tests {
     #[test]
     fn v2_accepts_null_default() {
         require_v3_for_default(iceberg::spec::FormatVersion::V2, &None).expect("v2 + null ok");
+    }
+
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn literal_to_constant_array_int32() {
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::Int(5));
+        let arr = literal_to_constant_array(&lit, &DataType::Int32, 3).expect("array");
+        let i32arr = arr.as_any().downcast_ref::<Int32Array>().expect("i32");
+        assert_eq!(i32arr.len(), 3);
+        assert_eq!(i32arr.value(0), 5);
+        assert_eq!(i32arr.value(2), 5);
+    }
+
+    #[test]
+    fn literal_to_constant_array_string() {
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::String("hi".into()));
+        let arr = literal_to_constant_array(&lit, &DataType::Utf8, 2).expect("array");
+        let strarr = arr.as_any().downcast_ref::<StringArray>().expect("str");
+        assert_eq!(strarr.value(0), "hi");
+        assert_eq!(strarr.value(1), "hi");
+    }
+
+    #[test]
+    fn literal_to_constant_array_zero_rows() {
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::Int(5));
+        let arr = literal_to_constant_array(&lit, &DataType::Int32, 0).expect("array");
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn literal_to_constant_array_unsupported_type_fails_fast() {
+        // Use a (Long, Float64) mismatch — Long should not produce a Float64 array.
+        let lit = IcebergLiteral::Primitive(PrimitiveLiteral::Long(5));
+        let err =
+            literal_to_constant_array(&lit, &DataType::Float64, 1).expect_err("type mismatch");
+        assert!(err.contains("unsupported"), "unexpected error: {err}");
     }
 }
