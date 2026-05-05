@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, MAIN_BRANCH, ManifestFile, Operation, PartitionSpecRef, SchemaRef, Snapshot,
+    DataContentType, ManifestFile, Operation, PartitionSpecRef, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
@@ -134,6 +134,7 @@ async fn commit_v3_row_lineage_append(
         manifest_paths_out: manifest_paths_out.clone(),
         row_lineage_first_row_id,
         row_lineage_added_rows,
+        target_ref: ctx.target_ref.to_string(),
     };
 
     let tx = Transaction::new(ctx.table);
@@ -170,6 +171,7 @@ struct FastAppendV3TxnAction {
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     row_lineage_first_row_id: u64,
     row_lineage_added_rows: u64,
+    target_ref: String,
 }
 
 #[async_trait]
@@ -178,7 +180,18 @@ impl TransactionAction for FastAppendV3TxnAction {
         let m = table.metadata();
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
-        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let target_ref = &self.target_ref;
+        let parent_snapshot_id = m
+            .refs()
+            .get(target_ref.as_str())
+            .map(|r| r.snapshot_id)
+            .or_else(|| {
+                if target_ref == "main" {
+                    m.current_snapshot().map(|s| s.snapshot_id())
+                } else {
+                    None
+                }
+            });
         let metadata_dir = metadata_dir(table);
 
         let mut manifests: Vec<ManifestFile> = read_base_manifest_list(table, &self.file_io)
@@ -266,7 +279,7 @@ impl TransactionAction for FastAppendV3TxnAction {
         let updates = vec![
             TableUpdate::AddSnapshot { snapshot },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
+                ref_name: target_ref.clone(),
                 reference: SnapshotReference {
                     snapshot_id: new_snapshot_id,
                     retention: SnapshotRetention::Branch {
@@ -285,7 +298,7 @@ impl TransactionAction for FastAppendV3TxnAction {
                 default_spec_id: m.default_partition_spec_id(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
+                r#ref: target_ref.clone(),
                 snapshot_id: parent_snapshot_id,
             },
         ];

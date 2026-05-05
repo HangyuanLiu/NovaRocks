@@ -40,9 +40,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
-    ManifestWriterBuilder, Operation, PartitionSpecRef, Snapshot, SnapshotReference,
-    SnapshotRetention, Summary,
+    DataContentType, FormatVersion, ManifestContentType, ManifestFile, ManifestWriterBuilder,
+    Operation, PartitionSpecRef, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
@@ -103,6 +102,7 @@ impl IcebergCommitAction for RowDeltaCommit {
             schema_id: ctx.table.metadata().current_schema_id(),
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
+            target_ref: ctx.target_ref.to_string(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -139,6 +139,7 @@ struct RowDeltaTxnAction {
     /// can return the written manifest paths in `CommitOutcome` after the
     /// transaction completes.
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    target_ref: String,
 }
 
 #[async_trait]
@@ -148,7 +149,18 @@ impl TransactionAction for RowDeltaTxnAction {
         let format_version = m.format_version();
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
-        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let target_ref = &self.target_ref;
+        let parent_snapshot_id = m
+            .refs()
+            .get(target_ref.as_str())
+            .map(|r| r.snapshot_id)
+            .or_else(|| {
+                if target_ref == "main" {
+                    m.current_snapshot().map(|s| s.snapshot_id())
+                } else {
+                    None
+                }
+            });
         let metadata_dir = metadata_dir(table);
 
         // 1. Write one new delete manifest per referenced partition spec.
@@ -237,7 +249,7 @@ impl TransactionAction for RowDeltaTxnAction {
         let updates = vec![
             TableUpdate::AddSnapshot { snapshot },
             TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
+                ref_name: target_ref.clone(),
                 reference: SnapshotReference {
                     snapshot_id: new_snapshot_id,
                     retention: SnapshotRetention::Branch {
@@ -256,7 +268,7 @@ impl TransactionAction for RowDeltaTxnAction {
                 default_spec_id: m.default_partition_spec_id(),
             },
             TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
+                r#ref: target_ref.clone(),
                 snapshot_id: parent_snapshot_id,
             },
         ];

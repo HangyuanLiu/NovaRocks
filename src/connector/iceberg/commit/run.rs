@@ -93,6 +93,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         file_io: &file_io,
         commit_uuid: Uuid::new_v4(),
         abort_handle: collector.abort_log.clone(),
+        target_ref: "main",
     };
 
     match action.commit(ctx).await {
