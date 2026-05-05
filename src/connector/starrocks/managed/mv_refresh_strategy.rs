@@ -262,4 +262,24 @@ mod tests {
             }
         );
     }
+
+    /// Marked NovaRocks UPDATE snapshots are classified incrementally by
+    /// `classify_snapshot` (returning `LineageAction::CollectCowUpdate` /
+    /// `CollectMorUpdate`) and never reach `policy_from_change_error`.
+    /// Ordinary OVERWRITE snapshots still produce
+    /// `ChangeError::UnsupportedOperation` and map to a full refresh —
+    /// which is what this test guards against drift.
+    #[test]
+    fn ordinary_overwrite_change_error_still_maps_to_full_refresh() {
+        assert_eq!(
+            policy_from_change_error(ChangeError::UnsupportedOperation {
+                snapshot_id: 22,
+                op: "overwrite".to_string(),
+            }),
+            MvRefreshPolicy::FullRefresh {
+                target_snapshot_id: Some(22),
+                reason: FullRefreshReason::InsertOverwrite { snapshot_id: 22 },
+            }
+        );
+    }
 }
