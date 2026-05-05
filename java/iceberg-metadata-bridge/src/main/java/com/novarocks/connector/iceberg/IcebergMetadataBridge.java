@@ -85,6 +85,8 @@ public final class IcebergMetadataBridge {
                         scanLogicalMetadata(table, fileIO, serializedSplit, serializedPredicate, loadColumnStats));
             case "MANIFESTS":
                 return OBJECT_MAPPER.writeValueAsBytes(scanManifests(table, fileIO));
+            case "SNAPSHOTS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanSnapshots(table));
             default:
                 throw new IllegalArgumentException("unsupported iceberg metadata table type: " + scannerType);
         }
@@ -204,6 +206,27 @@ public final class IcebergMetadataBridge {
             row.partitions = buildPartitionSummaries(
                     manifestFile.partitions(),
                     partitionSpecsById.get(manifestFile.partitionSpecId()));
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<SnapshotMetadataRow> scanSnapshots(Table table) {
+        List<SnapshotMetadataRow> rows = new ArrayList<>();
+        for (org.apache.iceberg.Snapshot snapshot : table.snapshots()) {
+            SnapshotMetadataRow row = new SnapshotMetadataRow();
+            // Iceberg snapshot timestamps are millis; convert to micros for Arrow timestamp(us).
+            row.committed_at_micros = snapshot.timestampMillis() * 1000L;
+            row.snapshot_id = snapshot.snapshotId();
+            row.parent_id = snapshot.parentId();
+            row.operation = snapshot.operation();
+            row.manifest_list = snapshot.manifestListLocation();
+            Map<String, String> summary = snapshot.summary();
+            if (summary != null && !summary.isEmpty()) {
+                row.summary = summary.entrySet().stream()
+                    .map(e -> new StringStringEntry(e.getKey(), e.getValue()))
+                    .collect(Collectors.toList());
+            }
             rows.add(row);
         }
         return rows;
@@ -420,6 +443,26 @@ public final class IcebergMetadataBridge {
         }
 
         public StringEntry(int key, String value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
+    public static final class SnapshotMetadataRow {
+        public long committed_at_micros;
+        public long snapshot_id;
+        public Long parent_id;
+        public String operation;
+        public String manifest_list;
+        public List<StringStringEntry> summary;
+    }
+
+    public static final class StringStringEntry {
+        public String key;
+        public String value;
+
+        public StringStringEntry() {}
+        public StringStringEntry(String key, String value) {
             this.key = key;
             this.value = value;
         }
