@@ -1,0 +1,14 @@
+-- query 3
+id	amount
+1	10
+2	20
+
+-- query 5
+id	amount
+1	10
+2	25
+
+-- query 7
+id	amount
+1	10
+2	25
