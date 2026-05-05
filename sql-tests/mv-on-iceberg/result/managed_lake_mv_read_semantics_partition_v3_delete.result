@@ -1,0 +1,14 @@
+-- query 6
+id	customer	amount
+1	A	10
+2	A	20
+3	B	30
+4	B	40
+-- query 8
+id	customer	amount
+2	A	20
+4	B	40
+-- query 10
+id	customer	amount
+2	A	20
+4	B	40

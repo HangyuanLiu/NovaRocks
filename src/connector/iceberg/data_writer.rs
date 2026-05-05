@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
-use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::spec::{DataFile, DataFileBuilder, DataFileFormat};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -37,10 +37,16 @@ pub(crate) async fn write_record_batches_as_data_files(
                 .await
                 .map_err(|e| format!("iceberg data file write failed: {e}"))?;
         }
-        return writer
+        let data_files = writer
             .close()
             .await
-            .map_err(|e| format!("iceberg data file writer close failed: {e}"));
+            .map_err(|e| format!("iceberg data file writer close failed: {e}"))?;
+        return data_files
+            .into_iter()
+            .map(|data_file| {
+                retag_data_file_partition_spec_id(data_file, metadata.default_partition_spec_id())
+            })
+            .collect();
     }
 
     let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
@@ -74,6 +80,61 @@ pub(crate) async fn write_record_batches_as_data_files(
         }
     }
     Ok(data_files)
+}
+
+fn retag_data_file_partition_spec_id(
+    data_file: DataFile,
+    partition_spec_id: i32,
+) -> Result<DataFile, String> {
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(data_file.content_type())
+        .file_path(data_file.file_path().to_string())
+        .file_format(data_file.file_format())
+        .partition(data_file.partition().clone())
+        .partition_spec_id(partition_spec_id)
+        .record_count(data_file.record_count())
+        .file_size_in_bytes(data_file.file_size_in_bytes());
+
+    if !data_file.column_sizes().is_empty() {
+        builder.column_sizes(data_file.column_sizes().clone());
+    }
+    if !data_file.value_counts().is_empty() {
+        builder.value_counts(data_file.value_counts().clone());
+    }
+    if !data_file.null_value_counts().is_empty() {
+        builder.null_value_counts(data_file.null_value_counts().clone());
+    }
+    if !data_file.nan_value_counts().is_empty() {
+        builder.nan_value_counts(data_file.nan_value_counts().clone());
+    }
+    if !data_file.lower_bounds().is_empty() {
+        builder.lower_bounds(data_file.lower_bounds().clone());
+    }
+    if !data_file.upper_bounds().is_empty() {
+        builder.upper_bounds(data_file.upper_bounds().clone());
+    }
+    if let Some(key_metadata) = data_file.key_metadata() {
+        builder.key_metadata(Some(key_metadata.to_vec()));
+    }
+    if let Some(split_offsets) = data_file.split_offsets() {
+        builder.split_offsets(Some(split_offsets.to_vec()));
+    }
+    if let Some(equality_ids) = data_file.equality_ids() {
+        builder.equality_ids(Some(equality_ids));
+    }
+    if let Some(sort_order_id) = data_file.sort_order_id() {
+        builder.sort_order_id(sort_order_id);
+    }
+    builder
+        .first_row_id(data_file.first_row_id())
+        .referenced_data_file(data_file.referenced_data_file())
+        .content_offset(data_file.content_offset())
+        .content_size_in_bytes(data_file.content_size_in_bytes());
+
+    builder.build().map_err(|e| {
+        format!("failed to retag iceberg data file with partition spec id {partition_spec_id}: {e}")
+    })
 }
 
 fn build_data_file_writer(
@@ -137,4 +198,32 @@ fn unique_file_suffix() -> String {
         bytes[14],
         bytes[15],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
+    use super::*;
+
+    #[test]
+    fn retag_unpartitioned_data_file_with_current_default_spec_id() {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path("file:///tmp/data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(128);
+        let data_file = builder.build().unwrap();
+
+        let data_file = retag_data_file_partition_spec_id(data_file, 7).unwrap();
+
+        assert!(
+            format!("{data_file:?}").contains("partition_spec_id: 7"),
+            "retagged data file should carry the evolved default partition spec id"
+        );
+    }
 }
