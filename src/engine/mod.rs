@@ -704,6 +704,15 @@ impl StandaloneSession {
                     current_database,
                 )
             }
+            ref merge_stmt @ sqlast::Statement::Merge(_) => {
+                let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(merge_stmt)?;
+                crate::engine::mutation_flow::execute_merge_statement(
+                    &self.inner,
+                    &stmt,
+                    current_catalog,
+                    current_database,
+                )
+            }
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
                     let table_name = crate::sql::parser::dialect::convert_object_name(
