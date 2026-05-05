@@ -183,80 +183,14 @@ fn check_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{
-        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
-        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
-    };
-    use std::collections::HashMap;
+    use crate::sql::analyzer::iceberg_ref::test_utils;
 
-    fn base_builder() -> TableMetadataBuilder {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
-            .build()
-            .unwrap();
-
-        TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "memory://test/table".to_string(),
-            FormatVersion::V2,
-            HashMap::new(),
-        )
-        .unwrap()
-    }
-
-    /// Build a minimal V2 TableMetadata with no snapshots.
     fn metadata_empty() -> iceberg::spec::TableMetadata {
-        base_builder().build().unwrap().metadata
+        test_utils::metadata_empty()
     }
 
-    /// Build a TableMetadata with one snapshot and a branch ref named `branch_name`.
     fn metadata_with_branch(branch_name: &str) -> iceberg::spec::TableMetadata {
-        let snapshot_id = 1_i64;
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(snapshot_id)
-            .with_timestamp_ms(1_700_000_000_000)
-            .with_sequence_number(1)
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_manifest_list("memory://test/table/metadata/snap-1.avro".to_string())
-            .with_schema_id(0)
-            .build();
-
-        let branch_ref = SnapshotReference::new(
-            snapshot_id,
-            SnapshotRetention::Branch {
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-                max_ref_age_ms: None,
-            },
-        );
-
-        base_builder()
-            .add_snapshot(snapshot)
-            .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                ),
-            )
-            .unwrap()
-            .set_ref(branch_name, branch_ref)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
+        test_utils::metadata_with_branch(branch_name)
     }
 
     fn make_stmt(action: AlterIcebergRefAction) -> AlterIcebergRefStmt {

@@ -8,6 +8,7 @@ use crate::engine::StatementResult;
 use crate::engine::backend_resolver::resolve_table_target;
 use crate::engine::build_string_query_result;
 use crate::engine::statement::parse_add_files_sql;
+use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
 use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::ObjectName;
 use crate::sql::parser::query_refs::{
@@ -73,6 +74,285 @@ pub(crate) fn add_files(
     )?;
     let msg = format!("Added {count} file(s)");
     build_string_query_result("status", vec![msg]).map(StatementResult::Query)
+}
+
+// ---------------------------------------------------------------------------
+// Time-travel (FOR VERSION/TIMESTAMP AS OF) AST rewrite
+// ---------------------------------------------------------------------------
+
+/// Returns true if the query contains any `TableFactor::Table` node with a
+/// `version: Some(...)` clause. Used as a cheap pre-check before cloning.
+pub(crate) fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            if has_time_travel_in_set_expr(cte.query.body.as_ref()) {
+                return true;
+            }
+        }
+    }
+    has_time_travel_in_set_expr(query.body.as_ref())
+}
+
+fn has_time_travel_in_set_expr(expr: &sqlparser::ast::SetExpr) -> bool {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for tw in &select.from {
+                if has_time_travel_in_factor(&tw.relation) {
+                    return true;
+                }
+                for join in &tw.joins {
+                    if has_time_travel_in_factor(&join.relation) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            has_time_travel_in_set_expr(left) || has_time_travel_in_set_expr(right)
+        }
+        sqlparser::ast::SetExpr::Query(q) => has_time_travel_in_set_expr(q.body.as_ref()),
+        _ => false,
+    }
+}
+
+fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
+    match factor {
+        sqlparser::ast::TableFactor::Table { version, .. } => version.is_some(),
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            has_time_travel_in_set_expr(subquery.body.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Walk the query AST in-place and rewrite each `TableFactor::Table` that has
+/// a `version: Some(...)` clause:
+///
+/// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
+/// 2. Build a synthetic `TableDef` for that snapshot and register it in the
+///    in-memory catalog under the name `<table>__at_<snapshot_id>`.
+/// 3. Rewrite the `TableFactor::Table`:
+///    - Replace `name` with the synthetic 1-part name.
+///    - Clear `version` (set to `None`).
+///    - Preserve any existing alias; if none, set `alias` = original table name
+///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
+///
+/// Tables without a version clause are left untouched.
+pub(crate) fn rewrite_time_travel_refs(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &mut sqlparser::ast::Query,
+) -> Result<(), String> {
+    let (catalog_backend, table_source) = {
+        let registry = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock");
+        (
+            registry.catalog_backend("iceberg")?,
+            registry.table_source("iceberg")?,
+        )
+    };
+
+    // Walk CTEs
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            rewrite_time_travel_in_set_expr(
+                state,
+                current_catalog,
+                current_database,
+                &catalog_backend,
+                &table_source,
+                cte.query.body.as_mut(),
+            )?;
+        }
+    }
+    rewrite_time_travel_in_set_expr(
+        state,
+        current_catalog,
+        current_database,
+        &catalog_backend,
+        &table_source,
+        query.body.as_mut(),
+    )
+}
+
+fn rewrite_time_travel_in_set_expr(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    catalog_backend: &Arc<dyn crate::connector::backend::CatalogBackend>,
+    table_source: &Arc<dyn crate::connector::backend::TableSource>,
+    expr: &mut sqlparser::ast::SetExpr,
+) -> Result<(), String> {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for tw in &mut select.from {
+                rewrite_time_travel_in_factor(
+                    state,
+                    current_catalog,
+                    current_database,
+                    catalog_backend,
+                    table_source,
+                    &mut tw.relation,
+                )?;
+                for join in &mut tw.joins {
+                    rewrite_time_travel_in_factor(
+                        state,
+                        current_catalog,
+                        current_database,
+                        catalog_backend,
+                        table_source,
+                        &mut join.relation,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            rewrite_time_travel_in_set_expr(
+                state,
+                current_catalog,
+                current_database,
+                catalog_backend,
+                table_source,
+                left.as_mut(),
+            )?;
+            rewrite_time_travel_in_set_expr(
+                state,
+                current_catalog,
+                current_database,
+                catalog_backend,
+                table_source,
+                right.as_mut(),
+            )
+        }
+        sqlparser::ast::SetExpr::Query(q) => rewrite_time_travel_in_set_expr(
+            state,
+            current_catalog,
+            current_database,
+            catalog_backend,
+            table_source,
+            q.body.as_mut(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_time_travel_in_factor(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    catalog_backend: &Arc<dyn crate::connector::backend::CatalogBackend>,
+    table_source: &Arc<dyn crate::connector::backend::TableSource>,
+    factor: &mut sqlparser::ast::TableFactor,
+) -> Result<(), String> {
+    match factor {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            version,
+            alias,
+            ..
+        } if version.is_some() => {
+            let version_clause = version.take().expect("checked is_some above");
+
+            // Extract name parts for our ObjectName lookup
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|p| match p {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if parts.is_empty() {
+                return Err("iceberg time travel: table name has no identifier parts".to_string());
+            }
+
+            let our_name = ObjectName { parts };
+            let target = resolve_table_target(state, &our_name, current_catalog, current_database)?;
+
+            if target.backend_name != "iceberg" {
+                return Err(format!(
+                    "iceberg time travel: table '{}' is not an Iceberg table; time travel is only supported for Iceberg",
+                    our_name.leaf()
+                ));
+            }
+
+            // Load metadata to resolve the version clause
+            let metadata = {
+                let registry = state
+                    .iceberg_catalogs
+                    .read()
+                    .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+                let entry = registry.get(&target.catalog)?;
+                let loaded = crate::connector::iceberg::catalog::load_table(
+                    &entry,
+                    &target.namespace,
+                    &target.table,
+                )?;
+                loaded.table.metadata().clone()
+            };
+
+            let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+            let binding = resolve_read_binding(&version_clause, &metadata, &fqn)?;
+            let snapshot_id = binding.snapshot_id;
+
+            // Build and register the synthetic table def
+            let synthetic_table_name = format!("{}__at_{}", target.table, snapshot_id);
+            {
+                let resolved = catalog_backend.load_table(
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                )?;
+                let table_def = table_source.build_table_def_at(&resolved, Some(snapshot_id))?;
+                // Build a new TableDef with the synthetic name
+                let synthetic_def = TableDef {
+                    name: synthetic_table_name.clone(),
+                    ..table_def
+                };
+                register_external_table(state, &target.namespace, synthetic_def)?;
+            }
+
+            // Rewrite the AST node in-place:
+            // - Set alias to original table name if user didn't specify one
+            // - Replace name with the synthetic 1-part name in the current namespace
+            // - version is already cleared (we took it above)
+            if alias.is_none() {
+                // Infer the original table alias from the last non-catalog part of the name
+                let original_leaf = our_name.leaf().to_string();
+                *alias = Some(sqlparser::ast::TableAlias {
+                    name: sqlparser::ast::Ident::new(original_leaf),
+                    columns: vec![],
+                    explicit: false,
+                });
+            }
+
+            // Replace with 1-part synthetic name (just the table name part — the namespace
+            // context comes from the current_database setting, same as the existing path)
+            *name = sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+                sqlparser::ast::Ident::new(synthetic_table_name),
+            )]);
+
+            Ok(())
+        }
+        sqlparser::ast::TableFactor::Table { .. } => Ok(()),
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => rewrite_time_travel_in_set_expr(
+            state,
+            current_catalog,
+            current_database,
+            catalog_backend,
+            table_source,
+            subquery.body.as_mut(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn register_external_tables_for_query(
