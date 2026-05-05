@@ -83,8 +83,7 @@ pub(crate) fn execute(
     crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
         crate::connector::iceberg::commit::execute_ref_action(&catalog, &connector_plan).await
     })
-    .map_err(|e| format!("iceberg ref: async runtime error: {e}"))?
-    .map_err(|e| e)?;
+    .map_err(|e| format!("iceberg ref: async runtime error: {e}"))??;
 
     Ok(StatementResult::Ok)
 }
