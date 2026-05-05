@@ -1563,11 +1563,16 @@ mod tests {
         .expect_err("not null should fail");
         assert!(not_null.contains("ADD COLUMN NOT NULL is not supported"));
 
-        let non_null_default = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 1",
+        // String literal as DEFAULT for an INT column must be rejected because
+        // string values are not valid for integer columns.
+        let type_mismatch = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 'abc'",
         )
-        .expect_err("non-null default should fail");
-        assert!(non_null_default.contains("non-NULL DEFAULT not yet implemented"));
+        .expect_err("string default for INT should fail");
+        assert!(
+            type_mismatch.contains("DEFAULT not supported"),
+            "expected 'DEFAULT not supported' but got: {type_mismatch}"
+        );
     }
 
     #[test]
@@ -1621,6 +1626,34 @@ mod tests {
         )
         .expect_err("duplicate default should fail");
         assert!(duplicate_default.contains("duplicate DEFAULT clause"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_date_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c DATE DEFAULT '1970-01-02'",
+        )
+        .expect("date default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Date(1)));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_datetime_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c DATETIME DEFAULT '1970-01-01 00:00:01'",
+        )
+        .expect("datetime default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::DateTime(1_000_000)),);
+            }
+            _ => panic!("expected AddColumn"),
+        }
     }
 
     #[test]
@@ -1734,6 +1767,71 @@ mod tests {
                 super::parse_alter_partition_column_sql(sql).is_err(),
                 "expected ALTER partition parse failure for {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_int_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT 5",
+        )
+        .expect("parsed");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Int(5)));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_string_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c STRING DEFAULT 'hi'",
+        )
+        .expect("parsed");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::String("hi".into())));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_default_overflow_rejected() {
+        let err = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c TINYINT DEFAULT 200",
+        )
+        .expect_err("overflow");
+        assert!(err.contains("TINYINT"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_null_then_default_null() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT NULL DEFAULT NULL",
+        )
+        .expect("null before default null");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Null));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_default_null_then_null() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT NULL NULL",
+        )
+        .expect("default null before null");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Null));
+            }
+            _ => panic!("expected AddColumn"),
         }
     }
 }
