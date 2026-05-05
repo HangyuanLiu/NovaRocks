@@ -32,6 +32,7 @@ mod helpers;
 mod overwrite;
 mod position_delete_writer;
 mod puffin_dv;
+mod ref_action;
 mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
@@ -51,6 +52,7 @@ pub use puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
+pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 pub(crate) use rewrite_data_files::count_current_live_files;
 pub use row_delta::RowDeltaCommit;
