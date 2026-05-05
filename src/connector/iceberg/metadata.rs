@@ -1391,9 +1391,10 @@ fn build_partition_struct_array(
             }
             Some(values) => {
                 return Err(format!(
-                    "iceberg partitions row has {} partition values but FE schema has {} fields",
+                    "iceberg partitions row has {} partition values but FE schema expects {} fields ({:?})",
                     values.len(),
-                    n_fields
+                    n_fields,
+                    fields.iter().map(|f| f.name().clone()).collect::<Vec<_>>()
                 ));
             }
             None => {
@@ -1441,8 +1442,11 @@ fn build_partition_array(
         "record_count" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.record_count).collect::<Vec<_>>(),
         ))),
-        "file_count" => Ok(Arc::new(Int32Array::from(
-            rows.iter().map(|r| r.file_count).collect::<Vec<_>>(),
+        // FE declares file_count, position_delete_file_count, equality_delete_file_count
+        // as BIGINT (Int64) even though Iceberg native stores them as int32. Widen here;
+        // RawPartitionMetadataRow keeps Option<i32> to match the JSON from the JVM side.
+        "file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.file_count.map(i64::from)).collect::<Vec<_>>(),
         ))),
         "total_data_file_size_in_bytes" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.total_data_file_size_in_bytes).collect::<Vec<_>>(),
@@ -1450,14 +1454,14 @@ fn build_partition_array(
         "position_delete_record_count" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.position_delete_record_count).collect::<Vec<_>>(),
         ))),
-        "position_delete_file_count" => Ok(Arc::new(Int32Array::from(
-            rows.iter().map(|r| r.position_delete_file_count).collect::<Vec<_>>(),
+        "position_delete_file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.position_delete_file_count.map(i64::from)).collect::<Vec<_>>(),
         ))),
         "equality_delete_record_count" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.equality_delete_record_count).collect::<Vec<_>>(),
         ))),
-        "equality_delete_file_count" => Ok(Arc::new(Int32Array::from(
-            rows.iter().map(|r| r.equality_delete_file_count).collect::<Vec<_>>(),
+        "equality_delete_file_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.equality_delete_file_count.map(i64::from)).collect::<Vec<_>>(),
         ))),
         "last_updated_at" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.last_updated_at_micros).collect::<Vec<_>>(),
@@ -1748,6 +1752,39 @@ mod tests {
             IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
             "PARTITIONS"
         );
+    }
+
+    #[test]
+    fn test_build_partition_file_count_widens_to_int64() {
+        use super::PartitionMetadataRow;
+        use arrow::array::Int64Array;
+        let rows = vec![PartitionMetadataRow {
+            partition_values: None,
+            spec_id: Some(0),
+            record_count: Some(10),
+            file_count: Some(2),
+            total_data_file_size_in_bytes: Some(123),
+            position_delete_record_count: None,
+            position_delete_file_count: Some(5),
+            equality_delete_record_count: None,
+            equality_delete_file_count: None,
+            last_updated_at_micros: None,
+            last_updated_snapshot_id: None,
+        }];
+        for name in ["file_count", "position_delete_file_count"] {
+            let col = super::IcebergMetadataOutputColumn {
+                name: name.into(),
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int64,
+                nullable: true,
+            };
+            let arr = super::build_partition_array(&col, &rows).unwrap();
+            let int64 = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap_or_else(|| panic!("{name} should be Int64Array"));
+            assert_eq!(int64.len(), 1);
+        }
     }
 
     #[test]

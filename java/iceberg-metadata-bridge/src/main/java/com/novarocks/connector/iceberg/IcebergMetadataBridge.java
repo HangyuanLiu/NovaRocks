@@ -301,50 +301,53 @@ public final class IcebergMetadataBridge {
         List<PartitionMetadataRow> rows = new ArrayList<>();
         try (org.apache.iceberg.io.CloseableIterator<org.apache.iceberg.FileScanTask> tasks =
                 scan.planFiles().iterator()) {
-            if (!tasks.hasNext()) {
-                return rows;
-            }
-            try (org.apache.iceberg.io.CloseableIterator<StructLike> reader =
-                    tasks.next().asDataTask().rows().iterator()) {
-                while (reader.hasNext()) {
-                    StructLike sl = reader.next();
-                    PartitionMetadataRow row = new PartitionMetadataRow();
-                    Integer partPos = col2pos.get("partition");
-                    if (partPos != null) {
-                        StructLike part = sl.get(partPos, StructLike.class);
-                        if (part != null) {
-                            List<String> values = new ArrayList<>();
-                            int spec = sl.get(col2pos.get("spec_id"), Integer.class);
-                            PartitionSpec partSpec = table.specs().get(spec);
-                            org.apache.iceberg.types.Types.StructType partType = partSpec.partitionType();
-                            for (int i = 0; i < part.size(); i++) {
-                                Class<?> javaType = partSpec.javaClasses()[i];
-                                Object v = part.get(i, javaType);
-                                values.add(v == null ? null
-                                        : org.apache.iceberg.transforms.Transforms.identity()
-                                              .toHumanString(partType.fields().get(i).type(), v));
+            while (tasks.hasNext()) {
+                org.apache.iceberg.FileScanTask task = tasks.next();
+                try (org.apache.iceberg.io.CloseableIterable<StructLike> rowIter =
+                        task.asDataTask().rows()) {
+                    for (StructLike sl : rowIter) {
+                        PartitionMetadataRow row = new PartitionMetadataRow();
+                        Integer partPos = col2pos.get("partition");
+                        Integer specPos = col2pos.get("spec_id");
+                        if (partPos != null && specPos != null) {
+                            StructLike part = sl.get(partPos, StructLike.class);
+                            Integer specBoxed = sl.get(specPos, Integer.class);
+                            if (part != null && specBoxed != null) {
+                                int spec = specBoxed;
+                                PartitionSpec partSpec = table.specs().get(spec);
+                                if (partSpec != null) {
+                                    List<String> values = new ArrayList<>();
+                                    org.apache.iceberg.types.Types.StructType partType = partSpec.partitionType();
+                                    for (int i = 0; i < part.size(); i++) {
+                                        Class<?> javaType = partSpec.javaClasses()[i];
+                                        Object v = part.get(i, javaType);
+                                        values.add(v == null ? null
+                                                : org.apache.iceberg.transforms.Transforms.identity()
+                                                      .toHumanString(partType.fields().get(i).type(), v));
+                                    }
+                                    row.partition_values = values;
+                                }
                             }
-                            row.partition_values = values;
                         }
+                        row.spec_id = nullableInt(sl, col2pos, "spec_id");
+                        row.record_count = nullableLong(sl, col2pos, "record_count");
+                        row.file_count = nullableInt(sl, col2pos, "file_count");
+                        row.total_data_file_size_in_bytes =
+                                nullableLong(sl, col2pos, "total_data_file_size_in_bytes");
+                        row.position_delete_record_count =
+                                nullableLong(sl, col2pos, "position_delete_record_count");
+                        row.position_delete_file_count =
+                                nullableInt(sl, col2pos, "position_delete_file_count");
+                        row.equality_delete_record_count =
+                                nullableLong(sl, col2pos, "equality_delete_record_count");
+                        row.equality_delete_file_count =
+                                nullableInt(sl, col2pos, "equality_delete_file_count");
+                        Long lastUpdatedMs = nullableLong(sl, col2pos, "last_updated_at");
+                        row.last_updated_at_micros = lastUpdatedMs == null ? null : lastUpdatedMs * 1000L;
+                        row.last_updated_snapshot_id =
+                                nullableLong(sl, col2pos, "last_updated_snapshot_id");
+                        rows.add(row);
                     }
-                    row.spec_id = (Integer) sl.get(col2pos.get("spec_id"), Integer.class);
-                    row.record_count = nullableLong(sl, col2pos, "record_count");
-                    row.file_count = nullableInt(sl, col2pos, "file_count");
-                    row.total_data_file_size_in_bytes =
-                            nullableLong(sl, col2pos, "total_data_file_size_in_bytes");
-                    row.position_delete_record_count =
-                            nullableLong(sl, col2pos, "position_delete_record_count");
-                    row.position_delete_file_count =
-                            nullableInt(sl, col2pos, "position_delete_file_count");
-                    row.equality_delete_record_count =
-                            nullableLong(sl, col2pos, "equality_delete_record_count");
-                    row.equality_delete_file_count =
-                            nullableInt(sl, col2pos, "equality_delete_file_count");
-                    Long lastUpdatedMs = nullableLong(sl, col2pos, "last_updated_at");
-                    row.last_updated_at_micros = lastUpdatedMs == null ? null : lastUpdatedMs * 1000L;
-                    row.last_updated_snapshot_id =
-                            nullableLong(sl, col2pos, "last_updated_snapshot_id");
-                    rows.add(row);
                 }
             }
         }
