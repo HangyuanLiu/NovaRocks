@@ -10,6 +10,8 @@ mod resolve_from;
 mod scope;
 mod subquery_rewrite;
 
+pub mod iceberg_ref;
+
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
