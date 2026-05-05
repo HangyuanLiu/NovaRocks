@@ -1,0 +1,8 @@
+-- query 2
+id	city	amount
+1	A	10
+-- query 4
+id	city	amount
+1	A	10
+2	B	25
+3	A	30
