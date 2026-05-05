@@ -203,6 +203,9 @@ impl ScanOp for IcebergMetadataScanOp {
         let ScanMorsel::IcebergMetadata { index } = morsel else {
             return Err("iceberg metadata scan received unexpected morsel".to_string());
         };
+        // Indices come from build_morsels (0..ranges.len()), so .get(index) is
+        // always Some. Table-level scans (snapshots/history/refs/partitions)
+        // borrow `range` only for the optional profile annotation below.
         let range = self
             .cfg
             .ranges
@@ -1103,7 +1106,7 @@ mod tests {
         build_i32_i64_map_array, build_i32_utf8_map_array, normalize_metadata_output_type,
     };
     use crate::common::ids::SlotId;
-    use arrow::array::MapArray;
+    use arrow::array::{Array, MapArray};
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -1224,6 +1227,46 @@ mod tests {
             let arr = super::build_snapshot_array(&col, &rows).unwrap();
             assert_eq!(arr.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_build_snapshot_summary_map_uses_iceberg_field_names() {
+        use super::SnapshotMetadataRow;
+        let rows = vec![SnapshotMetadataRow {
+            committed_at_micros: 0,
+            snapshot_id: 1,
+            parent_id: None,
+            operation: None,
+            manifest_list: "x".into(),
+            summary: Some(vec![("added-records".into(), "10".into())]),
+        }];
+        // The Map type passed in matches what FE will declare for the summary column.
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(Field::new("value", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let col = super::IcebergMetadataOutputColumn {
+            name: "summary".into(),
+            slot_id: SlotId::new(1),
+            data_type: map_type,
+            nullable: true,
+        };
+        let arr = super::build_snapshot_array(&col, &rows).unwrap();
+        let map = arr.as_any().downcast_ref::<MapArray>().expect("MapArray");
+        assert_eq!(map.len(), 1);
+        let (key_field, value_field) = map.entries_fields();
+        assert_eq!(key_field.name(), "key");
+        assert_eq!(value_field.name(), "value");
     }
 
     #[test]
