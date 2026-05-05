@@ -264,9 +264,13 @@ mod tests {
                     fields: vec![IcebergSchemaFieldDef {
                         field_id: 7,
                         name: "order_id".to_string(),
+                        initial_default: None,
+                        write_default: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 8,
                             name: "nested".to_string(),
+                            initial_default: None,
+                            write_default: None,
                             children: vec![],
                         }],
                     }],

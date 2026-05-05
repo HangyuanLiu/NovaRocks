@@ -3051,11 +3051,15 @@ mod tests {
                 IcebergSchemaFieldDef {
                     field_id: 1,
                     name: "id".to_string(),
+                    initial_default: None,
+                    write_default: None,
                     children: vec![],
                 },
                 IcebergSchemaFieldDef {
                     field_id: 3,
                     name: "category".to_string(),
+                    initial_default: None,
+                    write_default: None,
                     children: vec![],
                 },
             ],
@@ -3078,6 +3082,8 @@ mod tests {
             vec![IcebergSchemaFieldDef {
                 field_id: 1,
                 name: "id".to_string(),
+                initial_default: None,
+                write_default: None,
                 children: vec![],
             }],
         );
@@ -3096,6 +3102,8 @@ mod tests {
             vec![IcebergSchemaFieldDef {
                 field_id: 1,
                 name: "id".to_string(),
+                initial_default: None,
+                write_default: None,
                 children: vec![],
             }],
         );
@@ -3179,6 +3187,8 @@ mod tests {
                             fields: vec![IcebergSchemaFieldDef {
                                 field_id: 1,
                                 name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
                                 children: vec![],
                             }],
                         },
@@ -3217,6 +3227,8 @@ mod tests {
                             fields: vec![IcebergSchemaFieldDef {
                                 field_id: 1,
                                 name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
                                 children: vec![],
                             }],
                         },
@@ -3258,6 +3270,8 @@ mod tests {
                             fields: vec![IcebergSchemaFieldDef {
                                 field_id: 1,
                                 name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
                                 children: vec![],
                             }],
                         },
@@ -3301,6 +3315,8 @@ mod tests {
                             fields: vec![IcebergSchemaFieldDef {
                                 field_id: 1,
                                 name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
                                 children: vec![],
                             }],
                         },
@@ -3343,6 +3359,8 @@ mod tests {
                             fields: vec![IcebergSchemaFieldDef {
                                 field_id: 1,
                                 name: "id".to_string(),
+                                initial_default: None,
+                                write_default: None,
                                 children: vec![],
                             }],
                         },

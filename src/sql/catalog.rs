@@ -66,19 +66,21 @@ pub struct IcebergDeleteFileInfo {
     pub equality_field_ids: Vec<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
+    pub initial_default: Option<iceberg::spec::Literal>,
+    pub write_default: Option<iceberg::spec::Literal>,
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergSchemaDef {
     pub fields: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergTableInfo {
     pub location: String,
     pub schema: IcebergSchemaDef,
@@ -191,9 +193,13 @@ mod tests {
                     fields: vec![IcebergSchemaFieldDef {
                         field_id: 10,
                         name: "order_id".to_string(),
+                        initial_default: None,
+                        write_default: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 11,
                             name: "nested".to_string(),
+                            initial_default: None,
+                            write_default: None,
                             children: vec![],
                         }],
                     }],
