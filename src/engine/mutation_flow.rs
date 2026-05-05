@@ -16,7 +16,8 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteBatch};
 use crate::engine::{StandaloneState, StatementResult};
-use crate::sql::parser::ast::UpdateStmt;
+use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
+use crate::sql::parser::ast::{ObjectName, UpdateStmt};
 
 pub(crate) fn execute_update_statement(
     state: &Arc<StandaloneState>,
@@ -24,9 +25,31 @@ pub(crate) fn execute_update_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    // Detect branch/tag suffix in the target table name.
+    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
+    let effective_name;
+    let table_name: &ObjectName = match ref_suffix {
+        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
+            return Err(format!(
+                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
+            ));
+        }
+        Some(IcebergRefSuffix::Branch(_)) => {
+            effective_name = ObjectName {
+                parts: stripped_parts,
+            };
+            &effective_name
+        }
+        None => &stmt.table,
+    };
+    let target_ref = match &ref_suffix {
+        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
+        _ => "main".to_string(),
+    };
+
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
-        &stmt.table,
+        table_name,
         current_catalog,
         current_database,
     )?;
@@ -53,6 +76,17 @@ pub(crate) fn execute_update_statement(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
+    // Branch writes require Iceberg v3 (row-lineage semantics).
+    if target_ref != "main" {
+        let fmt = table.metadata().format_version();
+        if fmt != iceberg::spec::FormatVersion::V3 {
+            return Err(format!(
+                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
+                table_ident, fmt as u8,
+            ));
+        }
+    }
+
     let target_columns = iceberg_table_columns(&table)?;
     let partition_columns = iceberg_partition_source_columns(&table)?;
     validate_update_assignments(&stmt.assignments, &target_columns, &partition_columns)?;
@@ -65,12 +99,26 @@ pub(crate) fn execute_update_statement(
 
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
-        IcebergUpdateMode::CopyOnWrite => {
-            execute_cow_update(state, &target, catalog, table_ident, table, &matched, entry)
-        }
-        IcebergUpdateMode::MergeOnRead => {
-            execute_mor_update(state, &target, catalog, table_ident, table, &matched, entry)
-        }
+        IcebergUpdateMode::CopyOnWrite => execute_cow_update(
+            state,
+            &target,
+            catalog,
+            table_ident,
+            table,
+            &matched,
+            entry,
+            &target_ref,
+        ),
+        IcebergUpdateMode::MergeOnRead => execute_mor_update(
+            state,
+            &target,
+            catalog,
+            table_ident,
+            table,
+            &matched,
+            entry,
+            &target_ref,
+        ),
     }
 }
 
@@ -160,9 +208,19 @@ fn execute_mor_update(
     table: iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target_ref: &str,
 ) -> Result<StatementResult, String> {
+    // For branch DML, read partition metadata at the branch head snapshot.
+    let read_snapshot_id: Option<i64> = if target_ref != "main" {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+    } else {
+        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    };
     let referenced_partitions =
-        crate::engine::delete_flow::load_referenced_data_file_partitions(&table)?;
+        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+            &table,
+            read_snapshot_id,
+        )?;
     let delete_groups = build_position_delete_groups_from_matched(matched, &referenced_partitions)?;
 
     let metadata = table.metadata();
@@ -210,7 +268,7 @@ fn execute_mor_update(
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::RowDeltaDv,
         table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        read_snapshot_id,
         metadata.last_sequence_number(),
         metadata.current_schema().clone(),
         metadata.default_partition_spec().clone(),
@@ -235,6 +293,7 @@ fn execute_mor_update(
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_sidecar: None,
+            target_ref: target_ref.to_string(),
         })
         .await
     })??;
@@ -377,6 +436,7 @@ fn execute_cow_update(
     table: iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    target_ref: &str,
 ) -> Result<StatementResult, String> {
     let (data_files, sidecar) = block_on_iceberg(async {
         write_cow_update_files(&table, matched, entry.object_store_config()).await
@@ -387,6 +447,12 @@ fn execute_cow_update(
     }
 
     let metadata = table.metadata();
+    // For branch DML, commit against the branch head snapshot.
+    let base_snapshot_id: Option<i64> = if target_ref != "main" {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(metadata, target_ref)?
+    } else {
+        metadata.current_snapshot().map(|s| s.snapshot_id())
+    };
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
@@ -396,7 +462,7 @@ fn execute_cow_update(
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::CowUpdate,
         table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        base_snapshot_id,
         metadata.last_sequence_number(),
         metadata.current_schema().clone(),
         metadata.default_partition_spec().clone(),
@@ -421,6 +487,7 @@ fn execute_cow_update(
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_sidecar: Some(sidecar),
+            target_ref: target_ref.to_string(),
         })
         .await
     })??;

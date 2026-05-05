@@ -54,6 +54,9 @@ pub struct RunInput {
     pub file_io: FileIO,
     pub cleanup_path_mapper: Option<CleanupPathMapper>,
     pub cow_update_sidecar: Option<MutationSidecar>,
+    /// Iceberg ref to commit to. `"main"` is the default; branch-qualified
+    /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
+    pub target_ref: String,
 }
 
 /// Dispatch a commit-action and handle abort/cleanup.
@@ -72,6 +75,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         file_io,
         cleanup_path_mapper,
         cow_update_sidecar,
+        target_ref,
     } = input;
 
     let action: Box<dyn IcebergCommitAction> = match collector.op_kind {
@@ -93,7 +97,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         file_io: &file_io,
         commit_uuid: Uuid::new_v4(),
         abort_handle: collector.abort_log.clone(),
-        target_ref: "main",
+        target_ref: &target_ref,
     };
 
     match action.commit(ctx).await {

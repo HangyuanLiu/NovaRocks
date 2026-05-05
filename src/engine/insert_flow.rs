@@ -13,6 +13,7 @@ use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::insert::reorder_insert_rows;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::QueryResult;
+use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
 pub(crate) fn run_insert(
@@ -24,6 +25,28 @@ pub(crate) fn run_insert(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    // Detect branch/tag suffix in the table name (e.g. `t.branch_dev`).
+    let (stripped_parts, ref_suffix) = split_ref_suffix(&name.parts);
+    let effective_name;
+    let name = match ref_suffix {
+        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
+            return Err(format!(
+                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
+            ));
+        }
+        Some(IcebergRefSuffix::Branch(_)) => {
+            effective_name = ObjectName {
+                parts: stripped_parts,
+            };
+            &effective_name
+        }
+        None => name,
+    };
+    let target_ref = match &ref_suffix {
+        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
+        _ => "main".to_string(),
+    };
+
     let target = resolve_existing_table_target(state, name, current_catalog, current_database)?;
     let (catalog, sink) = {
         let reg = state.connectors.read().expect("connector registry read");
@@ -33,6 +56,25 @@ pub(crate) fn run_insert(
         )
     };
     let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+
+    // Branch-qualified INSERT requires an iceberg backend and v3 table format.
+    if ref_suffix.is_some() {
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "iceberg ref: branch-qualified INSERT is only supported for iceberg backends, \
+                 got `{}`",
+                target.backend_name
+            ));
+        }
+        // V2 format check happens after the table is loaded via iceberg-rust below.
+        // For the non-pipeline path (VALUES/literal rows) we reject branch writes
+        // since they would bypass the format-version check.
+        if !matches!(source, InsertSource::FromQuery(_)) {
+            return Err(
+                "iceberg ref: branch-qualified INSERT requires a SELECT source (VALUES is not supported on this path)".to_string()
+            );
+        }
+    }
 
     // INSERT OVERWRITE is only supported on iceberg backends in phase 1.
     // For non-iceberg targets, fail fast with a clear message instead of
@@ -53,7 +95,13 @@ pub(crate) fn run_insert(
         && (overwrite || matches!(source, InsertSource::FromQuery(_)));
     if needs_iceberg_pipeline {
         return crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
-            state, &target, &resolved, columns, source, overwrite,
+            state,
+            &target,
+            &resolved,
+            columns,
+            source,
+            overwrite,
+            &target_ref,
         );
     }
 

@@ -11,6 +11,49 @@ pub enum IcebergRefKind {
     Tag,
 }
 
+// ---------------------------------------------------------------------------
+// DML branch/tag suffix helpers
+// ---------------------------------------------------------------------------
+
+/// The trailing suffix of a qualified table name that identifies a branch or tag.
+///
+/// `INSERT INTO t.branch_dev` → `Branch("dev")`.
+/// `INSERT INTO t.tag_v1`     → `Tag("v1")`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IcebergRefSuffix {
+    Branch(String),
+    Tag(String),
+}
+
+/// Inspect the trailing segment of a qualified table name.
+///
+/// If the last part matches `^branch_(.+)$`, strip that part and return
+/// `(stripped_parts, Some(IcebergRefSuffix::Branch(name)))`.
+/// If the last part matches `^tag_(.+)$`, return
+/// `(stripped_parts, Some(IcebergRefSuffix::Tag(name)))`.
+/// Otherwise return `(original_parts, None)` unchanged.
+pub fn split_ref_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergRefSuffix>) {
+    if let Some(last) = parts.last() {
+        if let Some(name) = last.strip_prefix("branch_") {
+            if !name.is_empty() {
+                return (
+                    parts[..parts.len() - 1].to_vec(),
+                    Some(IcebergRefSuffix::Branch(name.to_string())),
+                );
+            }
+        }
+        if let Some(name) = last.strip_prefix("tag_") {
+            if !name.is_empty() {
+                return (
+                    parts[..parts.len() - 1].to_vec(),
+                    Some(IcebergRefSuffix::Tag(name.to_string())),
+                );
+            }
+        }
+    }
+    (parts.to_vec(), None)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergRefBinding {
     pub snapshot_id: i64,
@@ -211,6 +254,44 @@ fn find_snapshot_at_or_before(
         None => Err(format!(
             "iceberg time travel: no snapshot at or before timestamp {ts_ms} in {fully_qualified_name}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod split_ref_tests {
+    use super::*;
+
+    #[test]
+    fn branch_suffix_is_stripped() {
+        let parts = vec!["db".to_string(), "t".to_string(), "branch_dev".to_string()];
+        let (stripped, suffix) = split_ref_suffix(&parts);
+        assert_eq!(stripped, vec!["db".to_string(), "t".to_string()]);
+        assert_eq!(suffix, Some(IcebergRefSuffix::Branch("dev".to_string())));
+    }
+
+    #[test]
+    fn tag_suffix_is_stripped() {
+        let parts = vec!["db".to_string(), "t".to_string(), "tag_v1".to_string()];
+        let (stripped, suffix) = split_ref_suffix(&parts);
+        assert_eq!(stripped, vec!["db".to_string(), "t".to_string()]);
+        assert_eq!(suffix, Some(IcebergRefSuffix::Tag("v1".to_string())));
+    }
+
+    #[test]
+    fn no_suffix_returns_original() {
+        let parts = vec!["db".to_string(), "t".to_string()];
+        let (stripped, suffix) = split_ref_suffix(&parts);
+        assert_eq!(stripped, parts);
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn bare_branch_prefix_without_name_is_ignored() {
+        // "branch_" with no name after it should not be treated as a suffix
+        let parts = vec!["db".to_string(), "branch_".to_string()];
+        let (stripped, suffix) = split_ref_suffix(&parts);
+        assert_eq!(stripped, parts);
+        assert_eq!(suffix, None);
     }
 }
 

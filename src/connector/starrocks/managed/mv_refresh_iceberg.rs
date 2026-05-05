@@ -528,6 +528,7 @@ async fn commit_overwrite_iceberg_mv(
         file_io: table.file_io().clone(),
         cleanup_path_mapper: Some(path_mapper),
         cow_update_sidecar: None,
+        target_ref: "main".to_string(),
     })
     .await
     .map(|outcome| outcome.new_snapshot_id)

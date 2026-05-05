@@ -55,6 +55,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     _insert_columns: &[String],
     source: &InsertSource,
     overwrite: bool,
+    target_ref: &str,
 ) -> Result<StatementResult, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -113,6 +114,17 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         ensure_overwrite_single_partition_spec(&table)?;
         ensure_no_equality_deletes(&table)?;
     }
+    // Branch writes require Iceberg v3 (row-lineage semantics).
+    if target_ref != "main" {
+        let fmt = table.metadata().format_version();
+        if fmt != iceberg::spec::FormatVersion::V3 {
+            return Err(format!(
+                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
+                target_string(target),
+                fmt as u8,
+            ));
+        }
+    }
 
     // 3. Run the SELECT and convert to chunks.
     let chunks = run_select_to_chunks(state, target, query)?;
@@ -167,6 +179,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
             cow_update_sidecar: None,
+            target_ref: target_ref.to_string(),
         })
         .await
     })??;
