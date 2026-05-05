@@ -342,6 +342,59 @@ mod tests {
     }
 
     #[test]
+    fn add_column_with_int_default_v3_sets_initial_and_write_default() {
+        let updated = apply_change_to_schema_for_test(
+            &schema(),
+            2,
+            &IcebergSchemaChange::AddColumn {
+                name: "c".to_string(),
+                data_type: SqlType::Int,
+                default: Some(DefaultLiteral::Int(5)),
+            },
+        )
+        .expect("v3 add column");
+        let field = updated.field_by_name("c").expect("new field");
+        let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
+        assert_eq!(field.initial_default.as_ref(), Some(&expected));
+        assert_eq!(field.write_default.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn add_column_with_default_null_does_not_persist_metadata() {
+        let updated = apply_change_to_schema_for_test(
+            &schema(),
+            2,
+            &IcebergSchemaChange::AddColumn {
+                name: "c".to_string(),
+                data_type: SqlType::Int,
+                default: Some(DefaultLiteral::Null),
+            },
+        )
+        .expect("default null");
+        let field = updated.field_by_name("c").expect("new field");
+        assert!(field.initial_default.is_none());
+        assert!(field.write_default.is_none());
+    }
+
+    #[test]
+    fn add_column_default_metadata_construction_independent_of_v2_v3() {
+        // build_updated_schema does not see format-version; the gate lives in
+        // alter_table_schema. Document this by asserting build_updated_schema
+        // succeeds even without v3 — the gate must be applied at the
+        // alter_table_schema call site, not here.
+        let _ = apply_change_to_schema_for_test(
+            &schema(),
+            2,
+            &IcebergSchemaChange::AddColumn {
+                name: "c".to_string(),
+                data_type: SqlType::Int,
+                default: Some(DefaultLiteral::Int(5)),
+            },
+        )
+        .expect("schema build succeeds; gate enforced upstream");
+    }
+
+    #[test]
     fn modify_column_updates_or_removes_logical_type_property() {
         let bigint = build_property_updates_for_test(
             &props(&[("novarocks.logical_type.id", "tinyint")]),
@@ -419,7 +472,9 @@ fn build_updated_schema(
 
     match change {
         IcebergSchemaChange::AddColumn {
-            name, data_type, ..
+            name,
+            data_type,
+            default,
         } => {
             reject_name_conflict(&fields, name)?;
             let mut next_nested_id = last_column_id
@@ -432,7 +487,20 @@ fn build_updated_schema(
             let id = last_column_id
                 .checked_add(1)
                 .ok_or_else(|| "too many iceberg columns".to_string())?;
-            fields.push(NestedField::optional(id, name, ty));
+            let mut field = NestedField::optional(id, name, ty);
+            if let Some(default_literal) = default {
+                if let Some(iceberg_lit) =
+                    crate::connector::iceberg::default_value::default_literal_to_iceberg(
+                        default_literal,
+                        data_type,
+                    )?
+                {
+                    field = field
+                        .with_initial_default(iceberg_lit.clone())
+                        .with_write_default(iceberg_lit);
+                }
+            }
+            fields.push(field);
         }
         IcebergSchemaChange::DropColumn { name } => {
             let normalized = normalize_identifier(name)?;
@@ -1012,6 +1080,22 @@ pub(crate) fn alter_table_schema(
         &target.namespace,
         &target.table,
     )?;
+
+    let format_version = loaded.table.metadata().format_version();
+    if let IcebergSchemaChange::AddColumn {
+        default: Some(literal),
+        data_type,
+        ..
+    } = &stmt.change
+    {
+        let iceberg_lit = crate::connector::iceberg::default_value::default_literal_to_iceberg(
+            literal, data_type,
+        )?;
+        crate::connector::iceberg::default_value::require_v3_for_default(
+            format_version,
+            &iceberg_lit,
+        )?;
+    }
 
     let commit_result = (|| {
         let catalog = crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)?;
