@@ -39,6 +39,10 @@ pub enum IcebergMetadataTableType {
     Files,
     Manifests,
     LogicalIcebergMetadata,
+    Snapshots,
+    History,
+    Refs,
+    Partitions,
 }
 
 impl IcebergMetadataTableType {
@@ -47,6 +51,10 @@ impl IcebergMetadataTableType {
             "FILES" => Ok(Self::Files),
             "MANIFESTS" => Ok(Self::Manifests),
             "LOGICAL_ICEBERG_METADATA" => Ok(Self::LogicalIcebergMetadata),
+            "SNAPSHOTS" => Ok(Self::Snapshots),
+            "HISTORY" => Ok(Self::History),
+            "REFS" => Ok(Self::Refs),
+            "PARTITIONS" => Ok(Self::Partitions),
             other => Err(format!("unsupported iceberg metadata table type: {other}")),
         }
     }
@@ -56,6 +64,10 @@ impl IcebergMetadataTableType {
             Self::Files => "FILES",
             Self::Manifests => "MANIFESTS",
             Self::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
+            Self::Snapshots => "SNAPSHOTS",
+            Self::History => "HISTORY",
+            Self::Refs => "REFS",
+            Self::Partitions => "PARTITIONS",
         }
     }
 }
@@ -230,6 +242,15 @@ impl ScanOp for IcebergMetadataScanOp {
                     &self.output_chunk_schema,
                     self.cfg.batch_size,
                 )?
+            }
+            IcebergMetadataTableType::Snapshots
+            | IcebergMetadataTableType::History
+            | IcebergMetadataTableType::Refs
+            | IcebergMetadataTableType::Partitions => {
+                return Err(format!(
+                    "iceberg metadata table {:?} is not implemented yet",
+                    self.cfg.metadata_table_type
+                ));
             }
         };
 
@@ -1019,5 +1040,45 @@ mod tests {
         } else {
             assert!(err.contains("built without the `embedded-jvm` feature"));
         }
+    }
+
+    #[test]
+    fn test_parse_snapshots_history_refs_partitions() {
+        assert_eq!(
+            IcebergMetadataTableType::parse("SNAPSHOTS").unwrap(),
+            IcebergMetadataTableType::Snapshots
+        );
+        assert_eq!(
+            IcebergMetadataTableType::parse("history").unwrap(),
+            IcebergMetadataTableType::History
+        );
+        assert_eq!(
+            IcebergMetadataTableType::parse("Refs").unwrap(),
+            IcebergMetadataTableType::Refs
+        );
+        assert_eq!(
+            IcebergMetadataTableType::parse("partitions").unwrap(),
+            IcebergMetadataTableType::Partitions
+        );
+    }
+
+    #[test]
+    fn test_jvm_scanner_type_for_new_variants() {
+        assert_eq!(
+            IcebergMetadataTableType::Snapshots.as_jvm_scanner_type(),
+            "SNAPSHOTS"
+        );
+        assert_eq!(
+            IcebergMetadataTableType::History.as_jvm_scanner_type(),
+            "HISTORY"
+        );
+        assert_eq!(
+            IcebergMetadataTableType::Refs.as_jvm_scanner_type(),
+            "REFS"
+        );
+        assert_eq!(
+            IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
+            "PARTITIONS"
+        );
     }
 }
