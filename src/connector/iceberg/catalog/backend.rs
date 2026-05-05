@@ -179,17 +179,7 @@ fn build_iceberg_table_def_with_data_files(
         TableStorage::S3ParquetFiles {
             files: data_files
                 .into_iter()
-                .map(|file| S3FileInfo {
-                    path: file.path,
-                    size: file.size,
-                    row_count: file.record_count,
-                    column_stats: file.column_stats,
-                    first_row_id: file.first_row_id,
-                    data_sequence_number: file.data_sequence_number,
-                    delete_files: file.delete_files,
-                    manifest_path: file.manifest_path,
-                    partition_values: file.partition_field_values,
-                })
+                .map(data_file_with_stats_to_s3_file_info)
                 .collect(),
             cloud_properties,
         }
@@ -201,17 +191,7 @@ fn build_iceberg_table_def_with_data_files(
         TableStorage::S3ParquetFiles {
             files: data_files
                 .into_iter()
-                .map(|file| S3FileInfo {
-                    path: file.path,
-                    size: file.size,
-                    row_count: file.record_count,
-                    column_stats: file.column_stats,
-                    first_row_id: file.first_row_id,
-                    data_sequence_number: file.data_sequence_number,
-                    delete_files: file.delete_files,
-                    manifest_path: file.manifest_path,
-                    partition_values: file.partition_field_values,
-                })
+                .map(data_file_with_stats_to_s3_file_info)
                 .collect(),
             cloud_properties: Default::default(),
         }
@@ -243,6 +223,22 @@ fn build_iceberg_table_def_with_data_files(
         iceberg_table,
         storage,
     })
+}
+
+fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats) -> S3FileInfo {
+    S3FileInfo {
+        path: file.path,
+        size: file.size,
+        row_count: file.record_count,
+        column_stats: file.column_stats,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key,
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+        delete_files: file.delete_files,
+        manifest_path: file.manifest_path,
+        partition_values: file.partition_field_values,
+    }
 }
 
 fn build_iceberg_table_info(loaded: &IcebergLoadedTable) -> IcebergTableInfo {
@@ -376,6 +372,36 @@ mod tests {
     use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
+
+    #[test]
+    fn data_file_with_stats_to_s3_file_info_preserves_read_metadata() {
+        let file = crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            path: "s3://bucket/table/data.parquet".to_string(),
+            size: 12,
+            record_count: Some(3),
+            column_stats: None,
+            partition_spec_id: Some(7),
+            partition_key: Some("city=A".to_string()),
+            partition_values: None,
+            manifest_path: Some("s3://bucket/table/metadata/manifest.avro".to_string()),
+            partition_field_values: vec![],
+            first_row_id: Some(100),
+            data_sequence_number: Some(11),
+            delete_files: vec![],
+        };
+
+        let s3_file = data_file_with_stats_to_s3_file_info(file);
+
+        assert_eq!(s3_file.partition_spec_id, Some(7));
+        assert_eq!(s3_file.partition_key.as_deref(), Some("city=A"));
+        assert_eq!(s3_file.first_row_id, Some(100));
+        assert_eq!(s3_file.data_sequence_number, Some(11));
+        assert_eq!(
+            s3_file.manifest_path.as_deref(),
+            Some("s3://bucket/table/metadata/manifest.avro")
+        );
+        assert!(s3_file.delete_files.is_empty());
+    }
 
     #[test]
     fn iceberg_schema_def_includes_nested_list_map_field_ids() {

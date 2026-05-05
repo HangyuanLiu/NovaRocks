@@ -939,6 +939,9 @@ fn build_hdfs_scan_range_params(
                         types::TIcebergFileContent::POSITION_DELETES
                     }
                     IcebergDeleteFileContent::Equality => {
+                        // Equality field IDs are read from the equality-delete Parquet schema by
+                        // the Rust scan runner. The Thrift scan range only needs to identify the
+                        // delete file as an equality-delete file.
                         types::TIcebergFileContent::EQUALITY_DELETES
                     }
                 };

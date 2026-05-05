@@ -1,0 +1,9 @@
+-- query 3
+id	amount	customer
+1	10.5	A
+2	20.5	B
+3	30.5	C
+-- query 6
+id	amount	customer
+1	10.5	A
+3	30.5	C

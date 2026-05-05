@@ -2854,6 +2854,8 @@ enable_path_style_access = true
                 path: f.path.clone(),
                 size: f.size,
                 record_count: f.record_count,
+                partition_spec_id: f.partition_spec_id,
+                partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
             })
@@ -3067,6 +3069,8 @@ enable_path_style_access = true
                 path: f.path.clone(),
                 size: f.size,
                 record_count: f.record_count,
+                partition_spec_id: f.partition_spec_id,
+                partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
             })
