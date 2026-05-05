@@ -1,14 +1,16 @@
 //! Resolve Iceberg time-travel clauses + DML branch suffixes into a single
 //! `IcebergRefBinding` that the read and commit paths consume.
 
-#[allow(dead_code)]
+#![allow(dead_code)]
+
+use std::fmt;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergRefKind {
     Branch,
     Tag,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergRefBinding {
     pub snapshot_id: i64,
@@ -16,7 +18,6 @@ pub struct IcebergRefBinding {
     pub ref_kind: Option<IcebergRefKind>,
 }
 
-#[allow(dead_code)]
 impl IcebergRefBinding {
     pub fn ref_repr(&self) -> String {
         match (&self.ref_name, &self.ref_kind) {
@@ -28,7 +29,12 @@ impl IcebergRefBinding {
     }
 }
 
-#[allow(dead_code)]
+impl fmt::Display for IcebergRefBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.ref_repr())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergDmlTarget {
     pub read_binding: IcebergRefBinding,
@@ -67,5 +73,15 @@ mod tests {
             ref_kind: None,
         };
         assert_eq!(b.ref_repr(), "snapshot 42");
+    }
+
+    #[test]
+    fn display_matches_ref_repr() {
+        let b = IcebergRefBinding {
+            snapshot_id: 7,
+            ref_name: Some("dev".into()),
+            ref_kind: Some(IcebergRefKind::Branch),
+        };
+        assert_eq!(format!("{b}"), b.ref_repr());
     }
 }
