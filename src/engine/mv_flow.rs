@@ -397,6 +397,8 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
         path: format!("file://{}", path.display()),
         size: total_size,
         record_count: total_rows,
+        partition_spec_id: None,
+        partition_key: None,
         first_row_id: Some(0),
         data_sequence_number: Some(0),
     }];

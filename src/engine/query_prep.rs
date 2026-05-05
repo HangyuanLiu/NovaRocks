@@ -19,6 +19,8 @@ pub(crate) struct IcebergFileForQuery {
     pub(crate) path: String,
     pub(crate) size: i64,
     pub(crate) record_count: Option<i64>,
+    pub(crate) partition_spec_id: Option<i32>,
+    pub(crate) partition_key: Option<String>,
     pub(crate) first_row_id: Option<i64>,
     pub(crate) data_sequence_number: Option<i64>,
 }
@@ -219,7 +221,8 @@ pub(crate) fn build_iceberg_table_def_with_files(
                 size: file.size,
                 record_count: file.record_count,
                 column_stats: None,
-                partition_spec_id: None,
+                partition_spec_id: file.partition_spec_id,
+                partition_key: file.partition_key,
                 partition_values: None,
                 manifest_path: None,
                 partition_field_values: vec![],

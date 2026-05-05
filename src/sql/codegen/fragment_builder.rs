@@ -3005,6 +3005,8 @@ mod tests {
                     size: 1,
                     row_count: Some(1),
                     column_stats: None,
+                    partition_spec_id: Some(0),
+                    partition_key: None,
                     first_row_id: None,
                     data_sequence_number: Some(1),
                     delete_files,

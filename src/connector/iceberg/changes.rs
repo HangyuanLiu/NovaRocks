@@ -150,6 +150,8 @@ pub(crate) struct DataFileRef {
     pub path: String,
     pub size: i64,
     pub record_count: Option<i64>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
 }
@@ -603,6 +605,8 @@ pub(crate) fn materialize_changes(
                 path: f.path.clone(),
                 size: f.size,
                 record_count: f.record_count,
+                partition_spec_id: f.partition_spec_id,
+                partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
             })
@@ -972,6 +976,8 @@ async fn collect_files(
                             path: df.file_path().to_string(),
                             size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
                             record_count: Some(record_count),
+                            partition_spec_id: Some(manifest_file.partition_spec_id),
+                            partition_key: iceberg_partition_key(df.partition()),
                             first_row_id,
                             data_sequence_number: Some(
                                 entry
@@ -1217,6 +1223,24 @@ mod tests {
             Some(3),
             Some("Struct([A])")
         ));
+    }
+
+    #[test]
+    fn data_file_ref_preserves_partition_and_lineage_metadata() {
+        let file = super::DataFileRef {
+            path: "s3://bucket/t/data.parquet".to_string(),
+            size: 10,
+            record_count: Some(2),
+            partition_spec_id: Some(4),
+            partition_key: Some("city=A".to_string()),
+            first_row_id: Some(100),
+            data_sequence_number: Some(12),
+        };
+
+        assert_eq!(file.partition_spec_id, Some(4));
+        assert_eq!(file.partition_key.as_deref(), Some("city=A"));
+        assert_eq!(file.first_row_id, Some(100));
+        assert_eq!(file.data_sequence_number, Some(12));
     }
 
     fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {

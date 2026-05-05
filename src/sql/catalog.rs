@@ -91,6 +91,12 @@ pub struct S3FileInfo {
     /// Row count from Iceberg file metadata. None for non-Iceberg sources.
     pub row_count: Option<i64>,
     pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
+    /// Iceberg partition spec id for this data file. None for non-Iceberg
+    /// sources or synthetic scans where partition metadata is unavailable.
+    pub partition_spec_id: Option<i32>,
+    /// Stable string form of the Iceberg partition struct. Used only as
+    /// metadata for read-planning paths that need delete applicability.
+    pub partition_key: Option<String>,
     /// Iceberg v3 row-lineage: first row id assigned to this data file.
     /// Used as the fallback base for `_row_id` reads. None for non-Iceberg
     /// sources and tables without row-lineage metadata.

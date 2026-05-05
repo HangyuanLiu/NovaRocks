@@ -454,6 +454,8 @@ mod tests {
                         size: 1000,
                         row_count: Some(1000),
                         column_stats: None,
+                        partition_spec_id: None,
+                        partition_key: None,
                         first_row_id: None,
                         data_sequence_number: None,
                         delete_files: vec![],
