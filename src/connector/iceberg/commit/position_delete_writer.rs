@@ -97,6 +97,7 @@ pub async fn write_position_delete_files(
             key_metadata: None,
             referenced_data_file: Some(group.referenced_data_file),
             equality_ids: None,
+            first_row_id: None,
         });
     }
     Ok(out)

@@ -202,6 +202,7 @@ impl IcebergCommitCollector {
             key_metadata: None,
             referenced_data_file: df.referenced_data_file,
             equality_ids: None,
+            first_row_id: None,
         })
     }
 

@@ -1,0 +1,13 @@
+-- query 2
+id	v
+1	a
+2	b
+
+-- query 4
+id	v
+1	a
+2	bb
+
+-- query 5
+distinct_row_ids	total_rows
+2	2

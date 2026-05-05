@@ -29,6 +29,7 @@ pub(crate) mod generate_series;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
+pub(crate) mod mutation_flow;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -687,6 +688,16 @@ impl StandaloneSession {
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
                 crate::engine::delete_flow::execute_delete_statement(
+                    &self.inner,
+                    &stmt,
+                    current_catalog,
+                    current_database,
+                )
+            }
+            ref update_stmt @ sqlast::Statement::Update(_) => {
+                let stmt =
+                    crate::engine::statement::convert_sqlparser_update_to_custom(update_stmt)?;
+                crate::engine::mutation_flow::execute_update_statement(
                     &self.inner,
                     &stmt,
                     current_catalog,
@@ -3985,6 +3996,13 @@ enable_path_style_access = true
     fn open_row_lineage_iceberg_session_with_table(
         warehouse: &TempDir,
     ) -> (StandaloneNovaRocks, StandaloneSession) {
+        open_row_lineage_iceberg_session_with_table_extra_props(warehouse, &[])
+    }
+
+    fn open_row_lineage_iceberg_session_with_table_extra_props(
+        warehouse: &TempDir,
+        extra_props: &[(&str, &str)],
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
         use iceberg::Catalog;
 
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
@@ -4018,11 +4036,16 @@ enable_path_style_access = true
             ])
             .build()
             .expect("build schema");
+        let mut props: Vec<(String, String)> =
+            vec![("write.row-lineage".to_string(), "true".to_string())];
+        for (k, v) in extra_props {
+            props.push(((*k).to_string(), (*v).to_string()));
+        }
         let table_creation = iceberg::TableCreation::builder()
             .name("t".to_string())
             .schema(schema)
             .format_version(iceberg::spec::FormatVersion::V3)
-            .properties([("write.row-lineage".to_string(), "true".to_string())])
+            .properties(props)
             .build();
         crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
             catalog
@@ -4542,9 +4565,9 @@ enable_path_style_access = true
         let result = session.query(sql).expect("query");
         let mut out = Vec::new();
         for chunk in &result.chunks {
-            let ids = chunk
-                .batch
-                .column(0)
+            let ids_col = arrow::compute::cast(chunk.batch.column(0), &DataType::Int64)
+                .expect("cast id column to Int64");
+            let ids = ids_col
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column must be Int64");
@@ -4566,6 +4589,170 @@ enable_path_style_access = true
         }
         out.sort_by_key(|row| row.0);
         out
+    }
+
+    #[test]
+    fn iceberg_v3_cow_update_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = 'bb' where t.id = 2",
+                "default",
+            )
+            .expect("update");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(before[0].1, after[0].1);
+        assert_eq!(before[1].1, after[1].1);
+        assert_ne!(
+            before[1].2, after[1].2,
+            "updated row sequence should advance"
+        );
+    }
+
+    #[test]
+    fn iceberg_v3_mor_update_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table_extra_props(
+            &warehouse,
+            &[("novarocks.update.mode", "merge-on-read")],
+        );
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = 'aa' where t.id = 1",
+                "default",
+            )
+            .expect("mor update");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(after.len(), 2, "MOR UPDATE must not duplicate rows");
+        assert_eq!(before[0].1, after[0].1, "_row_id of updated row preserved");
+        assert_eq!(
+            before[1].1, after[1].1,
+            "_row_id of unchanged row preserved"
+        );
+        assert_ne!(
+            before[0].2, after[0].2,
+            "updated row sequence number should advance"
+        );
+        assert_eq!(
+            before[1].2, after[1].2,
+            "unchanged row sequence number should be stable"
+        );
+        let v_after = collect_id_v(&session, "select id, v from ice.db1.t order by id");
+        assert_eq!(
+            v_after,
+            vec![(1, "aa".to_string()), (2, "b".to_string())],
+            "MOR UPDATE applied new value exactly once"
+        );
+    }
+
+    #[test]
+    fn iceberg_v3_update_from_source_table() {
+        // Use a second iceberg table (in the same catalog/namespace) as the
+        // source so the test does not depend on managed-lake configuration.
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create source iceberg table");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert target");
+        session
+            .execute_in_database("insert into ice.db1.src values (2, 'bb')", "default")
+            .expect("insert source");
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
+                "default",
+            )
+            .expect("update from source");
+        let rows = collect_id_v(&session, "select id, v from ice.db1.t order by id");
+        assert_eq!(rows, vec![(1, "a".to_string()), (2, "bb".to_string())]);
+    }
+
+    #[test]
+    fn iceberg_v3_update_from_rejects_duplicate_source_match() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create source iceberg table");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert target");
+        session
+            .execute_in_database(
+                "insert into ice.db1.src values (1, 'x'), (1, 'y')",
+                "default",
+            )
+            .expect("insert source");
+        let err = session
+            .execute_in_database(
+                "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
+                "default",
+            )
+            .expect_err("duplicate source rows must fail");
+        assert!(
+            err.contains("more than once"),
+            "expected dedup error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn iceberg_v3_cow_update_multiple_files_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert first file");
+        session
+            .execute_in_database("insert into ice.db1.t values (2, 'b')", "default")
+            .expect("insert second file");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t set v = 'updated' where id in (1, 2)",
+                "default",
+            )
+            .expect("update two files");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(before[0].1, after[0].1);
+        assert_eq!(before[1].1, after[1].1);
+        assert_ne!(before[0].2, after[0].2);
+        assert_ne!(before[1].2, after[1].2);
     }
 
     // -------------------------------------------------------------------------

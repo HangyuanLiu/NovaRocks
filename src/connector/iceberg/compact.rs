@@ -296,6 +296,7 @@ pub(crate) fn execute_whole_table_rewrite(
         fs: abort_cleanup.fs,
         file_io,
         cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_sidecar: None,
     }))??;
 
     invalidate_iceberg_caches(state, &target)?;

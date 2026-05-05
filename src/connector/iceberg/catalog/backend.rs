@@ -202,6 +202,16 @@ fn build_iceberg_table_def_with_data_files(
     let iceberg_row_lineage_metadata_columns = if is_v3_row_lineage(loaded.table.metadata()) {
         vec![
             ColumnDef {
+                name: "_file".to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "_pos".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+            ColumnDef {
                 name: "_row_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,

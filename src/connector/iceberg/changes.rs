@@ -266,6 +266,28 @@ pub(crate) struct IcebergChangeBatch {
     pub inserts: Vec<DataFileRef>,
     pub deletes: Vec<PositionDeleteRef>,
     pub equality_deletes: Vec<EqualityDeleteRef>,
+    /// One entry per copy-on-write UPDATE snapshot in the lineage. The
+    /// MV materializer reads each sidecar to recover the (old_row,
+    /// new_row) pairs that drove the snapshot.
+    pub cow_updates: Vec<CowUpdateRef>,
+    /// One entry per merge-on-read UPDATE snapshot in the lineage. The
+    /// inserts and deletes vectors carry the snapshot's contributions —
+    /// this vector lets the materializer pair them as old/new rows
+    /// (rather than treating them as unrelated deletes + inserts).
+    pub mor_updates: Vec<MorUpdateRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct CowUpdateRef {
+    pub snapshot_id: i64,
+    pub sidecar_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MorUpdateRef {
+    pub snapshot_id: i64,
 }
 
 /// Per-row Change action: this row got inserted or deleted relative to
@@ -312,6 +334,17 @@ pub(crate) enum LineageAction {
     /// `DataFile.content_type()` is `PositionDeletes`. Reject equality
     /// deletes.
     CollectDeletes { snapshot_id: i64 },
+    /// Marked NovaRocks copy-on-write UPDATE (overwrite operation with
+    /// `novarocks.row-level-op=update` + `novarocks.update.mode=copy-on-write`
+    /// in the snapshot summary). The MV planner reads the recorded
+    /// sidecar to materialize old/new row pairs instead of treating it as
+    /// a full overwrite.
+    CollectCowUpdate { snapshot_id: i64 },
+    /// Marked NovaRocks merge-on-read UPDATE (delete operation with
+    /// `novarocks.row-level-op=update` + `novarocks.update.mode=merge-on-read`
+    /// in the snapshot summary). Both the added data files and the
+    /// added DV / position-delete files contribute to the change batch.
+    CollectMorUpdate { snapshot_id: i64 },
 }
 
 /// Output of `classify_lineage`: a chronologically-ordered list of
@@ -344,7 +377,12 @@ fn classify_snapshot(
     let snapshot_id = snapshot.snapshot_id();
     match &snapshot.summary().operation {
         Operation::Append => Ok(Some(LineageAction::CollectInserts { snapshot_id })),
-        Operation::Delete => Ok(Some(LineageAction::CollectDeletes { snapshot_id })),
+        Operation::Delete => match update_marker_mode(snapshot) {
+            Some(mode) if mode == crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE_MOR => {
+                Ok(Some(LineageAction::CollectMorUpdate { snapshot_id }))
+            }
+            _ => Ok(Some(LineageAction::CollectDeletes { snapshot_id })),
+        },
         Operation::Replace => {
             let parent = parent.ok_or_else(|| ChangeError::ReplaceValidationFailed {
                 snapshot_id,
@@ -354,11 +392,35 @@ fn classify_snapshot(
             validate_replace_snapshot(snapshot, parent)?;
             Ok(None)
         }
-        Operation::Overwrite => Err(ChangeError::UnsupportedOperation {
-            snapshot_id,
-            op: "overwrite".to_string(),
-        }),
+        Operation::Overwrite => match update_marker_mode(snapshot) {
+            Some(mode) if mode == crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE_COW => {
+                Ok(Some(LineageAction::CollectCowUpdate { snapshot_id }))
+            }
+            _ => Err(ChangeError::UnsupportedOperation {
+                snapshot_id,
+                op: "overwrite".to_string(),
+            }),
+        },
     }
+}
+
+/// Read the NovaRocks UPDATE marker pair out of a snapshot's summary,
+/// returning the recorded mode (`copy-on-write` / `merge-on-read`) when
+/// the snapshot was produced by a NovaRocks UPDATE. Returns `None` for
+/// any other snapshot (regular INSERT, DELETE, OVERWRITE, or third-party
+/// writers).
+fn update_marker_mode(snapshot: &iceberg::spec::Snapshot) -> Option<&str> {
+    let props = &snapshot.summary().additional_properties;
+    if props
+        .get(crate::connector::iceberg::commit::NOVAROCKS_ROW_LEVEL_OP)
+        .map(String::as_str)
+        != Some(crate::connector::iceberg::commit::NOVAROCKS_ROW_LEVEL_OP_UPDATE)
+    {
+        return None;
+    }
+    props
+        .get(crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE)
+        .map(String::as_str)
 }
 
 /// Validate that a `Replace` snapshot is a compaction (file rewrite that
@@ -535,12 +597,14 @@ pub(crate) fn plan_changes(
             inserts: Vec::new(),
             deletes: Vec::new(),
             equality_deletes: Vec::new(),
+            cow_updates: Vec::new(),
+            mor_updates: Vec::new(),
         });
     }
 
     let file_io = table.file_io();
     let collect = collect_files(metadata, file_io, &plan.actions);
-    let (inserts, deletes, equality_deletes) =
+    let (inserts, deletes, equality_deletes, cow_updates, mor_updates) =
         crate::connector::iceberg::catalog::registry::block_on_iceberg(collect).map_err(
             |e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")),
         )??;
@@ -551,6 +615,8 @@ pub(crate) fn plan_changes(
         inserts,
         deletes,
         equality_deletes,
+        cow_updates,
+        mor_updates,
     })
 }
 
@@ -596,7 +662,10 @@ pub(crate) fn materialize_changes(
         )?
     };
 
-    let deletes = if batch.deletes.is_empty() && batch.equality_deletes.is_empty() {
+    let needs_deletes_scan = !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.cow_updates.is_empty();
+    let deletes = if !needs_deletes_scan {
         crate::engine::QueryResult::empty()
     } else {
         let factory = build_factory_for_table(base_table, object_store_config)?;
@@ -624,6 +693,13 @@ pub(crate) fn materialize_changes(
                 base_table,
                 &batch.equality_deletes,
                 &factory,
+                object_store_config,
+            )?);
+        }
+        if !batch.cow_updates.is_empty() {
+            deleted_rows.extend(scan_cow_update_old_rows(
+                base_table,
+                &batch.cow_updates,
                 object_store_config,
             )?);
         }
@@ -723,6 +799,98 @@ fn equality_change_to_delete_spec(
     )
 }
 
+/// Read and parse a NovaRocks COW UPDATE sidecar JSON document. The
+/// sidecar is written by `CowUpdateCommit` next to the snapshot's
+/// metadata directory and lists the old/new data files plus the row
+/// IDs touched by the UPDATE.
+async fn read_mutation_sidecar(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Result<crate::connector::iceberg::commit::MutationSidecar, String> {
+    let bytes = file_io
+        .new_input(path)
+        .map_err(|e| format!("open mutation sidecar input failed: {e}"))?
+        .read()
+        .await
+        .map_err(|e| format!("read mutation sidecar failed: {e}"))?;
+    serde_json::from_slice::<crate::connector::iceberg::commit::MutationSidecar>(bytes.as_ref())
+        .map_err(|e| format!("parse mutation sidecar failed: {e}"))
+}
+
+/// Read every COW UPDATE old data file recorded in `cow_updates` and
+/// return their row content as `RecordBatch`es. The MV refresh path
+/// feeds these to `execute_query_for_mv_incremental_deletes` so the MV
+/// SELECT projects the pre-update rows; the corresponding new-row
+/// projection comes from the COW snapshot's added data files (already
+/// surfaced as `batch.inserts` by `collect_files`).
+fn scan_cow_update_old_rows(
+    base_table: &iceberg::table::Table,
+    cow_updates: &[CowUpdateRef],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use crate::connector::iceberg::catalog::registry::block_on_iceberg;
+
+    if cow_updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file_io = base_table.file_io();
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+
+    let mut old_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cow_update in cow_updates {
+        let sidecar = block_on_iceberg(read_mutation_sidecar(file_io, &cow_update.sidecar_path))
+            .map_err(|e| {
+            format!(
+                "scan_cow_update_old_rows: block_on_iceberg for sidecar at {}: {e}",
+                cow_update.sidecar_path
+            )
+        })??;
+        for file in sidecar.touched_data_files {
+            old_paths.insert(file.old_file);
+        }
+    }
+
+    let mut out = Vec::new();
+    for path in old_paths {
+        let normalized = normalize_delete_projection_path(&path, object_store_config)
+            .map_err(|e| format!("normalize COW UPDATE old file `{path}`: {e}"))?;
+        let batches = read_full_data_file(&normalized, &factory)
+            .map_err(|e| format!("read COW UPDATE old file `{path}`: {e}"))?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
+fn read_full_data_file(
+    path: &str,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let reader = factory
+        .open_with_len(path, None)
+        .map_err(|e| format!("open data file {path} for COW UPDATE old-row scan: {e}"))?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
+        .map_err(|e| format!("read parquet metadata for {path}: {e}"))?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("build parquet reader for {path}: {e}"))?;
+    let mut out = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| format!("read parquet batch for {path}: {e}"))?;
+        if batch.num_rows() > 0 {
+            out.push(batch);
+        }
+    }
+    Ok(out)
+}
+
 /// Build a filesystem factory that can read both data files and
 /// position-delete files for the given iceberg base table. We use the
 /// same `OpendalRangeReaderFactory` shape as the HDFS scan path
@@ -802,9 +970,11 @@ fn normalize_delete_projection_path(
 }
 
 /// Async file collection for one `LineagePlan`. Loads each snapshot's
-/// manifest list, walks data manifests for `CollectInserts` actions, and
-/// walks delete manifests for `CollectDeletes` actions. Order of the
-/// returned `(inserts, deletes)` matches the lineage order in `actions`.
+/// manifest list, walks data manifests for `CollectInserts` /
+/// `CollectMorUpdate` actions, walks delete manifests for `CollectDeletes`
+/// / `CollectMorUpdate` actions, and records `CollectCowUpdate` sidecar
+/// references. Order of the returned vectors matches the lineage order
+/// in `actions`.
 async fn collect_files(
     metadata: &iceberg::spec::TableMetadata,
     file_io: &iceberg::io::FileIO,
@@ -814,19 +984,23 @@ async fn collect_files(
         Vec<DataFileRef>,
         Vec<PositionDeleteRef>,
         Vec<EqualityDeleteRef>,
+        Vec<CowUpdateRef>,
+        Vec<MorUpdateRef>,
     ),
     ChangeError,
 > {
-    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
-
     let mut inserts: Vec<DataFileRef> = Vec::new();
     let mut deletes: Vec<PositionDeleteRef> = Vec::new();
     let mut equality_deletes: Vec<EqualityDeleteRef> = Vec::new();
+    let mut cow_updates: Vec<CowUpdateRef> = Vec::new();
+    let mut mor_updates: Vec<MorUpdateRef> = Vec::new();
 
     for action in actions {
         let snapshot_id = match action {
             LineageAction::CollectInserts { snapshot_id }
-            | LineageAction::CollectDeletes { snapshot_id } => *snapshot_id,
+            | LineageAction::CollectDeletes { snapshot_id }
+            | LineageAction::CollectCowUpdate { snapshot_id }
+            | LineageAction::CollectMorUpdate { snapshot_id } => *snapshot_id,
         };
         let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
             ChangeError::InternalInconsistency(format!(
@@ -844,208 +1018,283 @@ async fn collect_files(
 
         match action {
             LineageAction::CollectInserts { .. } => {
-                for manifest_file in manifest_list.entries() {
-                    if manifest_file.content != ManifestContentType::Data {
-                        continue;
-                    }
-                    if manifest_file.added_snapshot_id != snapshot_id {
-                        continue;
-                    }
-                    let mut next_manifest_first_row_id = manifest_file
-                        .first_row_id
-                        .map(|v| {
-                            i64::try_from(v).map_err(|_| {
-                                ChangeError::InternalInconsistency(format!(
-                                    "manifest first_row_id too large in snapshot {snapshot_id}: {v}"
-                                ))
-                            })
-                        })
-                        .transpose()?;
-                    let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
-                        ChangeError::InternalInconsistency(format!(
-                            "load data manifest {} for snapshot {snapshot_id}: {e}",
-                            manifest_file.manifest_path
-                        ))
-                    })?;
-                    for entry in manifest.entries() {
-                        if entry.status == ManifestStatus::Deleted {
-                            return Err(ChangeError::InternalInconsistency(format!(
-                                "data manifest entry has DELETED status in snapshot {snapshot_id}: {}",
-                                entry.data_file().file_path()
-                            )));
-                        }
-                        if entry.status != ManifestStatus::Added {
-                            continue;
-                        }
-                        if entry.snapshot_id() != Some(snapshot_id) {
-                            continue;
-                        }
-                        let df = entry.data_file();
-                        if df.content_type() != DataContentType::Data {
-                            continue;
-                        }
-                        let record_count = i64::try_from(df.record_count()).unwrap_or(i64::MAX);
-                        let first_row_id = df.first_row_id().or(next_manifest_first_row_id);
-                        if let Some(next) = next_manifest_first_row_id.as_mut() {
-                            *next = next.checked_add(record_count).ok_or_else(|| {
-                                ChangeError::InternalInconsistency(format!(
-                                    "first_row_id overflow in manifest {}",
-                                    manifest_file.manifest_path
-                                ))
-                            })?;
-                        }
-                        inserts.push(DataFileRef {
-                            path: df.file_path().to_string(),
-                            size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
-                            record_count: Some(record_count),
-                            partition_spec_id: Some(manifest_file.partition_spec_id),
-                            partition_key: iceberg_partition_key(df.partition()),
-                            first_row_id,
-                            data_sequence_number: Some(
-                                entry
-                                    .sequence_number()
-                                    .unwrap_or(manifest_file.sequence_number),
-                            ),
-                        });
-                    }
-                }
+                collect_added_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                )
+                .await?;
             }
             LineageAction::CollectDeletes { .. } => {
-                for manifest_file in manifest_list.entries() {
-                    if manifest_file.content != ManifestContentType::Deletes {
-                        continue;
-                    }
-                    if manifest_file.added_snapshot_id != snapshot_id {
-                        continue;
-                    }
-                    let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+                collect_added_delete_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut deletes,
+                    &mut equality_deletes,
+                )
+                .await?;
+            }
+            LineageAction::CollectCowUpdate { .. } => {
+                let props = &snapshot.summary().additional_properties;
+                let sidecar_path = props
+                    .get(crate::connector::iceberg::commit::NOVAROCKS_UPDATE_SIDECAR)
+                    .ok_or_else(|| {
                         ChangeError::InternalInconsistency(format!(
-                            "load delete manifest {} for snapshot {snapshot_id}: {e}",
-                            manifest_file.manifest_path
+                            "COW update snapshot {snapshot_id} missing novarocks.update.sidecar"
                         ))
-                    })?;
-                    for entry in manifest.entries() {
-                        if entry.status != ManifestStatus::Added {
-                            continue;
-                        }
-                        if entry.snapshot_id() != Some(snapshot_id) {
-                            continue;
-                        }
-                        let df = entry.data_file();
-                        match df.content_type() {
-                            DataContentType::PositionDeletes => {
-                                let r = match df.file_format() {
-                                    DataFileFormat::Parquet => PositionDeleteRef {
-                                        delete_file_path: df.file_path().to_string(),
-                                        delete_file_size: i64::try_from(df.file_size_in_bytes())
-                                            .unwrap_or(i64::MAX),
-                                        record_count: Some(
-                                            i64::try_from(df.record_count()).unwrap_or(i64::MAX),
-                                        ),
-                                        referenced_data_file: df.referenced_data_file(),
-                                        file_format: DataFileFormat::Parquet,
-                                        content_offset: None,
-                                        content_size_in_bytes: None,
-                                    },
-                                    DataFileFormat::Puffin => {
-                                        let referenced =
-                                            df.referenced_data_file().ok_or_else(|| {
-                                                ChangeError::InternalInconsistency(format!(
-                                                    "Puffin DV {} in snapshot {snapshot_id} missing referenced_data_file",
-                                                    df.file_path()
-                                                ))
-                                            })?;
-                                        let offset = df.content_offset().ok_or_else(|| {
-                                            ChangeError::InternalInconsistency(format!(
-                                                "Puffin DV {} in snapshot {snapshot_id} missing content_offset",
-                                                df.file_path()
-                                            ))
-                                        })?;
-                                        let length =
-                                            df.content_size_in_bytes().ok_or_else(|| {
-                                                ChangeError::InternalInconsistency(format!(
-                                                    "Puffin DV {} in snapshot {snapshot_id} missing content_size_in_bytes",
-                                                    df.file_path()
-                                                ))
-                                            })?;
-                                        PositionDeleteRef {
-                                            delete_file_path: df.file_path().to_string(),
-                                            delete_file_size: i64::try_from(
-                                                df.file_size_in_bytes(),
-                                            )
-                                            .unwrap_or(i64::MAX),
-                                            record_count: Some(
-                                                i64::try_from(df.record_count())
-                                                    .unwrap_or(i64::MAX),
-                                            ),
-                                            referenced_data_file: Some(referenced),
-                                            file_format: DataFileFormat::Puffin,
-                                            content_offset: Some(offset),
-                                            content_size_in_bytes: Some(length),
-                                        }
-                                    }
-                                    other => {
-                                        return Err(ChangeError::InternalInconsistency(format!(
-                                            "delete manifest in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
-                                            other,
-                                            df.file_path()
-                                        )));
-                                    }
-                                };
-                                r.validate_invariants()?;
-                                deletes.push(r);
-                            }
-                            DataContentType::EqualityDeletes => {
-                                if df.file_format() != DataFileFormat::Parquet {
-                                    return Err(ChangeError::InternalInconsistency(format!(
-                                        "equality-delete file in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
-                                        df.file_format(),
-                                        df.file_path()
-                                    )));
-                                }
-                                let equality_ids = df.equality_ids().ok_or_else(|| {
-                                    ChangeError::InternalInconsistency(format!(
-                                        "equality-delete file {} in snapshot {snapshot_id} missing equality_ids",
-                                        df.file_path()
-                                    ))
-                                })?;
-                                if equality_ids.is_empty() {
-                                    return Err(ChangeError::InternalInconsistency(format!(
-                                        "equality-delete file {} in snapshot {snapshot_id} has empty equality_ids",
-                                        df.file_path()
-                                    )));
-                                }
-                                equality_deletes.push(EqualityDeleteRef {
-                                    delete_file_path: df.file_path().to_string(),
-                                    delete_file_size: i64::try_from(df.file_size_in_bytes())
-                                        .unwrap_or(i64::MAX),
-                                    record_count: Some(
-                                        i64::try_from(df.record_count()).unwrap_or(i64::MAX),
-                                    ),
-                                    equality_ids,
-                                    sequence_number: Some(
-                                        entry
-                                            .sequence_number()
-                                            .unwrap_or(manifest_file.sequence_number),
-                                    ),
-                                    partition_spec_id: Some(manifest_file.partition_spec_id),
-                                    partition_key: iceberg_partition_key(df.partition()),
-                                });
-                            }
-                            DataContentType::Data => {
-                                return Err(ChangeError::InternalInconsistency(format!(
-                                    "delete manifest contains DATA file in snapshot {snapshot_id}: {}",
-                                    df.file_path()
-                                )));
-                            }
-                        }
-                    }
-                }
+                    })?
+                    .clone();
+                // The COW snapshot's data manifests contain the rewritten
+                // (replacement) data files added by the UPDATE. Treat them
+                // as fresh inserts for MV refresh — the materializer pairs
+                // them with the recorded old rows by reading the sidecar.
+                collect_added_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                )
+                .await?;
+                cow_updates.push(CowUpdateRef {
+                    snapshot_id,
+                    sidecar_path,
+                });
+            }
+            LineageAction::CollectMorUpdate { .. } => {
+                collect_added_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                )
+                .await?;
+                collect_added_delete_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut deletes,
+                    &mut equality_deletes,
+                )
+                .await?;
+                mor_updates.push(MorUpdateRef { snapshot_id });
             }
         }
     }
 
-    Ok((inserts, deletes, equality_deletes))
+    Ok((inserts, deletes, equality_deletes, cow_updates, mor_updates))
+}
+
+async fn collect_added_data_files_for_manifest_list(
+    snapshot_id: i64,
+    file_io: &iceberg::io::FileIO,
+    manifest_list: &iceberg::spec::ManifestList,
+    inserts: &mut Vec<DataFileRef>,
+) -> Result<(), ChangeError> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+        if manifest_file.added_snapshot_id != snapshot_id {
+            continue;
+        }
+        let mut next_manifest_first_row_id = manifest_file
+            .first_row_id
+            .map(|v| {
+                i64::try_from(v).map_err(|_| {
+                    ChangeError::InternalInconsistency(format!(
+                        "manifest first_row_id too large in snapshot {snapshot_id}: {v}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "load data manifest {} for snapshot {snapshot_id}: {e}",
+                manifest_file.manifest_path
+            ))
+        })?;
+        for entry in manifest.entries() {
+            if entry.status == ManifestStatus::Deleted {
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "data manifest entry has DELETED status in snapshot {snapshot_id}: {}",
+                    entry.data_file().file_path()
+                )));
+            }
+            if entry.status != ManifestStatus::Added {
+                continue;
+            }
+            if entry.snapshot_id() != Some(snapshot_id) {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != DataContentType::Data {
+                continue;
+            }
+            let record_count = i64::try_from(df.record_count()).unwrap_or(i64::MAX);
+            let first_row_id = df.first_row_id().or(next_manifest_first_row_id);
+            if let Some(next) = next_manifest_first_row_id.as_mut() {
+                *next = next.checked_add(record_count).ok_or_else(|| {
+                    ChangeError::InternalInconsistency(format!(
+                        "first_row_id overflow in manifest {}",
+                        manifest_file.manifest_path
+                    ))
+                })?;
+            }
+            inserts.push(DataFileRef {
+                path: df.file_path().to_string(),
+                size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
+                record_count: Some(record_count),
+                partition_spec_id: Some(manifest_file.partition_spec_id),
+                partition_key: iceberg_partition_key(df.partition()),
+                first_row_id,
+                data_sequence_number: Some(
+                    entry
+                        .sequence_number()
+                        .unwrap_or(manifest_file.sequence_number),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn collect_added_delete_files_for_manifest_list(
+    snapshot_id: i64,
+    file_io: &iceberg::io::FileIO,
+    manifest_list: &iceberg::spec::ManifestList,
+    deletes: &mut Vec<PositionDeleteRef>,
+    equality_deletes: &mut Vec<EqualityDeleteRef>,
+) -> Result<(), ChangeError> {
+    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
+
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Deletes {
+            continue;
+        }
+        if manifest_file.added_snapshot_id != snapshot_id {
+            continue;
+        }
+        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "load delete manifest {} for snapshot {snapshot_id}: {e}",
+                manifest_file.manifest_path
+            ))
+        })?;
+        for entry in manifest.entries() {
+            if entry.status != ManifestStatus::Added {
+                continue;
+            }
+            if entry.snapshot_id() != Some(snapshot_id) {
+                continue;
+            }
+            let df = entry.data_file();
+            match df.content_type() {
+                DataContentType::PositionDeletes => {
+                    let r = match df.file_format() {
+                        DataFileFormat::Parquet => PositionDeleteRef {
+                            delete_file_path: df.file_path().to_string(),
+                            delete_file_size: i64::try_from(df.file_size_in_bytes())
+                                .unwrap_or(i64::MAX),
+                            record_count: Some(
+                                i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                            ),
+                            referenced_data_file: df.referenced_data_file(),
+                            file_format: DataFileFormat::Parquet,
+                            content_offset: None,
+                            content_size_in_bytes: None,
+                        },
+                        DataFileFormat::Puffin => {
+                            let referenced = df.referenced_data_file().ok_or_else(|| {
+                                ChangeError::InternalInconsistency(format!(
+                                    "Puffin DV {} in snapshot {snapshot_id} missing referenced_data_file",
+                                    df.file_path()
+                                ))
+                            })?;
+                            let offset = df.content_offset().ok_or_else(|| {
+                                ChangeError::InternalInconsistency(format!(
+                                    "Puffin DV {} in snapshot {snapshot_id} missing content_offset",
+                                    df.file_path()
+                                ))
+                            })?;
+                            let length = df.content_size_in_bytes().ok_or_else(|| {
+                                ChangeError::InternalInconsistency(format!(
+                                    "Puffin DV {} in snapshot {snapshot_id} missing content_size_in_bytes",
+                                    df.file_path()
+                                ))
+                            })?;
+                            PositionDeleteRef {
+                                delete_file_path: df.file_path().to_string(),
+                                delete_file_size: i64::try_from(df.file_size_in_bytes())
+                                    .unwrap_or(i64::MAX),
+                                record_count: Some(
+                                    i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                                ),
+                                referenced_data_file: Some(referenced),
+                                file_format: DataFileFormat::Puffin,
+                                content_offset: Some(offset),
+                                content_size_in_bytes: Some(length),
+                            }
+                        }
+                        other => {
+                            return Err(ChangeError::InternalInconsistency(format!(
+                                "delete manifest in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
+                                other,
+                                df.file_path()
+                            )));
+                        }
+                    };
+                    r.validate_invariants()?;
+                    deletes.push(r);
+                }
+                DataContentType::EqualityDeletes => {
+                    if df.file_format() != DataFileFormat::Parquet {
+                        return Err(ChangeError::InternalInconsistency(format!(
+                            "equality-delete file in snapshot {snapshot_id} has unsupported file_format {:?}: {}",
+                            df.file_format(),
+                            df.file_path()
+                        )));
+                    }
+                    let equality_ids = df.equality_ids().ok_or_else(|| {
+                        ChangeError::InternalInconsistency(format!(
+                            "equality-delete file {} in snapshot {snapshot_id} missing equality_ids",
+                            df.file_path()
+                        ))
+                    })?;
+                    if equality_ids.is_empty() {
+                        return Err(ChangeError::InternalInconsistency(format!(
+                            "equality-delete file {} in snapshot {snapshot_id} has empty equality_ids",
+                            df.file_path()
+                        )));
+                    }
+                    equality_deletes.push(EqualityDeleteRef {
+                        delete_file_path: df.file_path().to_string(),
+                        delete_file_size: i64::try_from(df.file_size_in_bytes())
+                            .unwrap_or(i64::MAX),
+                        record_count: Some(i64::try_from(df.record_count()).unwrap_or(i64::MAX)),
+                        equality_ids,
+                        sequence_number: Some(
+                            entry
+                                .sequence_number()
+                                .unwrap_or(manifest_file.sequence_number),
+                        ),
+                        partition_spec_id: Some(manifest_file.partition_spec_id),
+                        partition_key: iceberg_partition_key(df.partition()),
+                    });
+                }
+                DataContentType::Data => {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "delete manifest contains DATA file in snapshot {snapshot_id}: {}",
+                        df.file_path()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1261,6 +1510,62 @@ mod tests {
             err,
             ChangeError::UnsupportedOperation { snapshot_id: 7, ref op } if op == "overwrite"
         ));
+    }
+
+    #[test]
+    fn classify_marked_cow_update_overwrite_as_update() {
+        let s = snap(
+            7,
+            Some(6),
+            Operation::Overwrite,
+            &[
+                ("novarocks.row-level-op", "update"),
+                ("novarocks.update.mode", "copy-on-write"),
+                ("novarocks.update.sidecar", "file:///tmp/sidecar.json"),
+            ],
+            0,
+        );
+        assert_eq!(
+            classify_snapshot(&s, None).expect("classify"),
+            Some(LineageAction::CollectCowUpdate { snapshot_id: 7 })
+        );
+    }
+
+    #[test]
+    fn classify_marked_mor_update_delete_as_update() {
+        let s = snap(
+            7,
+            Some(6),
+            Operation::Delete,
+            &[
+                ("novarocks.row-level-op", "update"),
+                ("novarocks.update.mode", "merge-on-read"),
+            ],
+            0,
+        );
+        assert_eq!(
+            classify_snapshot(&s, None).expect("classify"),
+            Some(LineageAction::CollectMorUpdate { snapshot_id: 7 })
+        );
+    }
+
+    #[test]
+    fn ordinary_overwrite_still_maps_to_full_refresh_signal() {
+        let s = snap(7, Some(6), Operation::Overwrite, &[], 0);
+        let err = classify_snapshot(&s, None).expect_err("ordinary overwrite");
+        assert!(matches!(
+            err,
+            ChangeError::UnsupportedOperation { ref op, .. } if op == "overwrite"
+        ));
+    }
+
+    #[test]
+    fn ordinary_delete_without_marker_still_maps_to_collect_deletes() {
+        let s = snap(7, Some(6), Operation::Delete, &[], 0);
+        assert_eq!(
+            classify_snapshot(&s, None).expect("classify"),
+            Some(LineageAction::CollectDeletes { snapshot_id: 7 })
+        );
     }
 
     #[test]

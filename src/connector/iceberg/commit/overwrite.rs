@@ -308,7 +308,7 @@ impl TransactionAction for OverwriteTxnAction {
 /// each live entry's `(DataFile, sequence_number, file_sequence_number)`. The
 /// sequence numbers are needed verbatim by `add_delete_file` to faithfully
 /// preserve the original commit identity.
-async fn enumerate_live_data_files(
+pub(super) async fn enumerate_live_data_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
@@ -350,7 +350,7 @@ async fn enumerate_live_data_files(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_overwrite_deletes_manifest(
+pub(super) async fn write_overwrite_deletes_manifest(
     file_io: &FileIO,
     out_path: &str,
     existing: &[(DataFile, i64, Option<i64>)],
@@ -457,6 +457,9 @@ pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, Strin
     }
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
+    }
+    if let Some(first_row_id) = f.first_row_id {
+        builder.first_row_id(Some(first_row_id));
     }
     builder
         .build()

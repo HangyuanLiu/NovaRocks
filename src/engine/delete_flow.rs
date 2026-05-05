@@ -158,6 +158,7 @@ pub(crate) fn execute_delete_statement(
                     fs: abort_cleanup.fs,
                     file_io,
                     cleanup_path_mapper: abort_cleanup.path_mapper,
+                    cow_update_sidecar: None,
                 })
                 .await
             })??;
@@ -189,6 +190,7 @@ pub(crate) fn execute_delete_statement(
                     fs: abort_cleanup.fs,
                     file_io,
                     cleanup_path_mapper: abort_cleanup.path_mapper,
+                    cow_update_sidecar: None,
                 })
                 .await
             })??;
@@ -495,14 +497,14 @@ async fn scan_for_position_deletes(
         .collect::<Result<Vec<_>, String>>()?)
 }
 
-struct ReferencedDataFilePartition {
-    partition_spec_id: i32,
-    partition_values: iceberg::spec::Struct,
+pub(crate) struct ReferencedDataFilePartition {
+    pub(crate) partition_spec_id: i32,
+    pub(crate) partition_values: iceberg::spec::Struct,
 }
 
-type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
+pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
 
-fn load_referenced_data_file_partitions(
+pub(crate) fn load_referenced_data_file_partitions(
     table: &iceberg::table::Table,
 ) -> Result<ReferencedDataFilePartitions, String> {
     let data_files = registry::extract_data_files_with_stats(table)?;
@@ -557,14 +559,14 @@ fn insert_referenced_data_file_partition(
 }
 
 #[derive(Clone, Debug, Default)]
-struct ExistingDeleteVisibility {
-    deleted_positions: roaring::RoaringTreemap,
-    equality_deletes: Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>,
+pub(crate) struct ExistingDeleteVisibility {
+    pub(crate) deleted_positions: roaring::RoaringTreemap,
+    pub(crate) equality_deletes: Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>,
 }
 
-type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
+pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
 
-fn load_existing_delete_visibility_by_data_file(
+pub(crate) fn load_existing_delete_visibility_by_data_file(
     table: &iceberg::table::Table,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
@@ -682,6 +684,33 @@ fn load_existing_delete_visibility_by_data_file(
     Ok(out)
 }
 
+pub(crate) fn data_file_row_is_visible(
+    batch: &RecordBatch,
+    row: usize,
+    file_path: &str,
+    row_position: i64,
+    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
+) -> Result<bool, String> {
+    let visibility = existing_deletes_by_file.get(file_path);
+    if visibility
+        .map(|state| state.deleted_positions.contains(row_position as u64))
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let equality_deletes = visibility
+        .map(|state| state.equality_deletes.as_slice())
+        .unwrap_or(&[]);
+    if crate::connector::iceberg::equality_delete::equality_delete_row_is_deleted(
+        batch,
+        row,
+        equality_deletes,
+    )? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn collect_position_deletes_from_batch(
     batch: &RecordBatch,
     where_expr: &sqlast::Expr,
@@ -715,21 +744,7 @@ fn collect_position_deletes_from_batch(
             continue;
         }
         let path = file_arr.value(i);
-        let visibility = existing_deletes_by_file.get(path);
-        if visibility
-            .map(|state| state.deleted_positions.contains(pos_arr.value(i) as u64))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let equality_deletes = visibility
-            .map(|state| state.equality_deletes.as_slice())
-            .unwrap_or(&[]);
-        if crate::connector::iceberg::equality_delete::equality_delete_row_is_deleted(
-            batch,
-            i,
-            equality_deletes,
-        )? {
+        if !data_file_row_is_visible(batch, i, path, pos_arr.value(i), existing_deletes_by_file)? {
             continue;
         }
         let matches = evaluate_where_at_row(where_expr, batch, i, schema)?;

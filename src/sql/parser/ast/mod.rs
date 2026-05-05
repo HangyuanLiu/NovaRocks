@@ -153,6 +153,33 @@ pub(crate) struct DeleteStmt {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UpdateStmt {
+    pub table: ObjectName,
+    pub alias: Option<String>,
+    pub assignments: Vec<UpdateAssignment>,
+    pub source: Option<MutationSource>,
+    pub where_clause: Option<sqlparser::ast::Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UpdateAssignment {
+    pub column: String,
+    pub value: sqlparser::ast::Expr,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MutationSource {
+    Table {
+        name: ObjectName,
+        alias: Option<String>,
+    },
+    Query {
+        query: Box<sqlparser::ast::Query>,
+        alias: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InsertSource {
     Values(Vec<Vec<Literal>>),
     SelectLiteralRow(Vec<Literal>),

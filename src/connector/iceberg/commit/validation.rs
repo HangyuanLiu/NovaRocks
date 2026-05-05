@@ -25,7 +25,10 @@ use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use iceberg::spec::FormatVersion;
 use iceberg::table::Table;
 
-use super::types::{IcebergSqlDeleteStrategy, IcebergWriteMode};
+use super::types::{
+    IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
+    NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR,
+};
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
     props
@@ -62,6 +65,51 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
 pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
     let write_mode = ensure_iceberg_write_supported(table)?;
     Ok(sql_delete_strategy_from_write_mode(write_mode))
+}
+
+// Consumed by later UPDATE lowering/execution tasks.
+#[allow(dead_code)]
+pub fn ensure_update_requires_v3_row_lineage(table: &Table) -> Result<(), String> {
+    ensure_no_variant_columns(table)?;
+    let metadata = table.metadata();
+    ensure_update_properties_require_v3_row_lineage(
+        metadata.format_version(),
+        metadata.properties(),
+    )
+}
+
+// Consumed by later UPDATE lowering/execution tasks.
+#[allow(dead_code)]
+pub fn select_iceberg_update_mode(table: &Table) -> Result<IcebergUpdateMode, String> {
+    ensure_update_requires_v3_row_lineage(table)?;
+    select_update_mode_from_properties(
+        table.metadata().format_version(),
+        table.metadata().properties(),
+    )
+}
+
+fn select_update_mode_from_properties(
+    format_version: FormatVersion,
+    props: &HashMap<String, String>,
+) -> Result<IcebergUpdateMode, String> {
+    ensure_update_properties_require_v3_row_lineage(format_version, props)?;
+    let value = props
+        .get(NOVAROCKS_UPDATE_MODE)
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| NOVAROCKS_UPDATE_MODE_COW.to_string());
+    IcebergUpdateMode::from_property_value(value.as_str()).ok_or_else(|| {
+        format!("unsupported write.update.mode `{value}`; expected copy-on-write or merge-on-read")
+    })
+}
+
+fn ensure_update_properties_require_v3_row_lineage(
+    format_version: FormatVersion,
+    props: &HashMap<String, String>,
+) -> Result<(), String> {
+    if format_version != FormatVersion::V3 || !row_lineage_property_enabled(props) {
+        return Err("UPDATE requires an Iceberg v3 table with write.row-lineage=true".to_string());
+    }
+    Ok(())
 }
 
 fn sql_delete_strategy_from_write_mode(write_mode: IcebergWriteMode) -> IcebergSqlDeleteStrategy {
@@ -289,6 +337,49 @@ mod tests {
             sql_delete_strategy_from_write_mode(IcebergWriteMode::RowLineageV3),
             IcebergSqlDeleteStrategy::DeletionVectors
         );
+    }
+
+    #[test]
+    fn update_mode_defaults_to_copy_on_write() {
+        let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
+        assert_eq!(
+            select_update_mode_from_properties(FormatVersion::V3, &props).expect("mode"),
+            IcebergUpdateMode::CopyOnWrite
+        );
+    }
+
+    #[test]
+    fn update_mode_accepts_merge_on_read() {
+        let props = HashMap::from([
+            ("write.row-lineage".to_string(), "true".to_string()),
+            (
+                NOVAROCKS_UPDATE_MODE.to_string(),
+                NOVAROCKS_UPDATE_MODE_MOR.to_string(),
+            ),
+        ]);
+        assert_eq!(
+            select_update_mode_from_properties(FormatVersion::V3, &props).expect("mode"),
+            IcebergUpdateMode::MergeOnRead
+        );
+    }
+
+    #[test]
+    fn update_mode_rejects_v3_without_row_lineage() {
+        let props = HashMap::new();
+        let err =
+            select_update_mode_from_properties(FormatVersion::V3, &props).expect_err("must fail");
+        assert!(err.contains("write.row-lineage=true"), "{err}");
+    }
+
+    #[test]
+    fn update_mode_rejects_invalid_property() {
+        let props = HashMap::from([
+            ("write.row-lineage".to_string(), "true".to_string()),
+            (NOVAROCKS_UPDATE_MODE.to_string(), "delta".to_string()),
+        ]);
+        let err =
+            select_update_mode_from_properties(FormatVersion::V3, &props).expect_err("must fail");
+        assert!(err.contains("unsupported write.update.mode"), "{err}");
     }
 
     #[test]

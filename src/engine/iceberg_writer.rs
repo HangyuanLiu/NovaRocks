@@ -166,6 +166,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_sidecar: None,
         })
         .await
     })??;
@@ -223,6 +224,7 @@ pub(crate) fn data_file_to_written_file(
         key_metadata: df.key_metadata().map(|s| s.to_vec()),
         referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
         equality_ids: df.equality_ids(),
+        first_row_id: df.first_row_id(),
     })
 }
 

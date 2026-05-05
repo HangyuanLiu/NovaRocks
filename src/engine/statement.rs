@@ -288,6 +288,239 @@ pub(crate) fn convert_sqlparser_delete_to_custom(
     })
 }
 
+pub(crate) fn convert_sqlparser_update_to_custom(
+    statement: &sqlparser::ast::Statement,
+) -> Result<crate::sql::parser::ast::UpdateStmt, String> {
+    use crate::sql::parser::ast::{UpdateAssignment, UpdateStmt};
+    use sqlparser::ast as sqlast;
+
+    let sqlast::Statement::Update(update) = statement else {
+        return Err("expected UPDATE statement".to_string());
+    };
+    let sqlast::Update {
+        update_token,
+        optimizer_hint,
+        table,
+        assignments,
+        from,
+        selection,
+        returning,
+        or,
+        limit,
+    } = update;
+    let _ = update_token;
+    if optimizer_hint.is_some() {
+        return Err("UPDATE optimizer hints are not supported".to_string());
+    }
+    if or.is_some() {
+        return Err("UPDATE conflict clauses are not supported".to_string());
+    }
+    if returning.is_some() {
+        return Err("UPDATE RETURNING is not supported".to_string());
+    }
+    if limit.is_some() {
+        return Err("UPDATE LIMIT is not supported".to_string());
+    }
+    if !table.joins.is_empty() {
+        return Err(
+            "UPDATE target joins are not supported; use UPDATE ... FROM with a single source relation"
+                .to_string(),
+        );
+    }
+
+    let (target_name, target_alias) = match &table.relation {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "UPDATE target",
+            )?;
+            (
+                crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                update_alias_name(alias, "UPDATE target")?,
+            )
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            return Err("UPDATE target pivot/unpivot are not supported".to_string());
+        }
+        other => return Err(format!("UPDATE target must be a table, got {other:?}")),
+    };
+
+    let mut out_assignments = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let sqlast::AssignmentTarget::ColumnName(column_name) = &assignment.target else {
+            return Err("only single-column UPDATE assignments are supported".to_string());
+        };
+        let column = crate::sql::parser::dialect::convert_object_name(column_name.clone())?;
+        if column.parts.len() != 1 {
+            return Err(format!(
+                "UPDATE assignment must reference an unqualified target column, got `{column_name}`"
+            ));
+        }
+        out_assignments.push(UpdateAssignment {
+            column: column.parts[0].clone(),
+            value: assignment.value.clone(),
+        });
+    }
+    if out_assignments.is_empty() {
+        return Err("UPDATE requires at least one assignment".to_string());
+    }
+
+    let source = convert_update_from_source(from)?;
+    Ok(UpdateStmt {
+        table: target_name,
+        alias: target_alias,
+        assignments: out_assignments,
+        source,
+        where_clause: selection.clone(),
+    })
+}
+
+fn convert_update_from_source(
+    from: &Option<sqlparser::ast::UpdateTableFromKind>,
+) -> Result<Option<crate::sql::parser::ast::MutationSource>, String> {
+    use crate::sql::parser::ast::MutationSource;
+    use sqlparser::ast as sqlast;
+
+    let Some(from) = from else {
+        return Ok(None);
+    };
+    let tables = match from {
+        sqlast::UpdateTableFromKind::BeforeSet(tables)
+        | sqlast::UpdateTableFromKind::AfterSet(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return Err(format!(
+            "UPDATE ... FROM supports exactly one source relation, got {}",
+            tables.len()
+        ));
+    }
+    if !tables[0].joins.is_empty() {
+        return Err("UPDATE ... FROM joins must be wrapped in a subquery".to_string());
+    }
+    match &tables[0].relation {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "UPDATE ... FROM source",
+            )?;
+            Ok(Some(MutationSource::Table {
+                name: crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                alias: update_alias_name(alias, "UPDATE ... FROM source")?,
+            }))
+        }
+        sqlast::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if *lateral {
+                return Err(
+                    "UPDATE ... FROM source lateral subqueries are not supported".to_string(),
+                );
+            }
+            if sample.is_some() {
+                return Err("UPDATE ... FROM source samples are not supported".to_string());
+            }
+            Ok(Some(MutationSource::Query {
+                query: subquery.clone(),
+                alias: update_alias_name(alias, "UPDATE ... FROM source")?,
+            }))
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            Err("UPDATE ... FROM source pivot/unpivot are not supported".to_string())
+        }
+        other => Err(format!("unsupported UPDATE ... FROM source: {other:?}")),
+    }
+}
+
+fn reject_update_table_modifiers(
+    args: &Option<sqlparser::ast::TableFunctionArgs>,
+    with_hints: &[sqlparser::ast::Expr],
+    version: &Option<sqlparser::ast::TableVersion>,
+    with_ordinality: bool,
+    partitions: &[sqlparser::ast::Ident],
+    json_path: &Option<sqlparser::ast::JsonPath>,
+    sample: &Option<sqlparser::ast::TableSampleKind>,
+    index_hints: &[sqlparser::ast::TableIndexHints],
+    context: &str,
+) -> Result<(), String> {
+    if args.is_some() {
+        return Err(format!("{context} table arguments are not supported"));
+    }
+    if !with_hints.is_empty() {
+        return Err(format!("{context} table hints are not supported"));
+    }
+    if version.is_some() {
+        return Err(format!("{context} time travel is not supported"));
+    }
+    if with_ordinality {
+        return Err(format!("{context} WITH ORDINALITY is not supported"));
+    }
+    if !partitions.is_empty() {
+        return Err(format!("{context} partitions are not supported"));
+    }
+    if json_path.is_some() {
+        return Err(format!("{context} JSON paths are not supported"));
+    }
+    if sample.is_some() {
+        return Err(format!("{context} samples are not supported"));
+    }
+    if !index_hints.is_empty() {
+        return Err(format!("{context} index hints are not supported"));
+    }
+    Ok(())
+}
+
+fn update_alias_name(
+    alias: &Option<sqlparser::ast::TableAlias>,
+    context: &str,
+) -> Result<Option<String>, String> {
+    let Some(alias) = alias else {
+        return Ok(None);
+    };
+    if !alias.columns.is_empty() {
+        return Err(format!("{context} alias column lists are not supported"));
+    }
+    Ok(Some(alias.name.value.clone()))
+}
+
 // ---------------------------------------------------------------------------
 // DDL handlers
 // ---------------------------------------------------------------------------
@@ -1129,6 +1362,87 @@ pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDele
 #[cfg(test)]
 mod tests {
     use crate::sql::parser::ast::Literal;
+
+    #[test]
+    fn convert_update_from_table_source() {
+        let stmt = crate::sql::parser::parse_sql_raw(
+            "update ice.db1.t as t set v = s.v from staging.src as s where t.id = s.id",
+        )
+        .expect("parse");
+        let sqlparser::ast::Statement::Update(_) = &stmt else {
+            panic!("expected update statement: {stmt:?}");
+        };
+        let update = super::convert_sqlparser_update_to_custom(&stmt).expect("convert");
+        assert_eq!(update.table.parts, vec!["ice", "db1", "t"]);
+        assert_eq!(update.alias.as_deref(), Some("t"));
+        assert_eq!(update.assignments.len(), 1);
+        assert_eq!(update.assignments[0].column, "v");
+        let Some(crate::sql::parser::ast::MutationSource::Table { name, alias }) = &update.source
+        else {
+            panic!("expected table source: {:?}", update.source);
+        };
+        assert_eq!(name.parts, vec!["staging", "src"]);
+        assert_eq!(alias.as_deref(), Some("s"));
+        assert!(update.where_clause.is_some());
+    }
+
+    #[test]
+    fn convert_update_rejects_multi_column_assignment() {
+        let stmt = crate::sql::parser::parse_sql_raw(
+            "update ice.db1.t set (v1, v2) = (1, 2) where id = 1",
+        )
+        .expect("parse");
+        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
+        assert!(err.contains("single-column UPDATE assignments"), "{err}");
+    }
+
+    #[test]
+    fn convert_update_rejects_target_join() {
+        let stmt = crate::sql::parser::parse_sql_raw(
+            "update ice.db1.t as t join staging.src as s on t.id = s.id set v = s.v",
+        )
+        .expect("parse");
+        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
+        assert!(
+            err.contains("UPDATE target joins are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn convert_update_rejects_conflict_clause() {
+        let stmt = crate::sql::parser::parse_sql_raw("update or ignore ice.db1.t set v = 1")
+            .expect("parse");
+        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
+        assert!(
+            err.contains("UPDATE conflict clauses are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn convert_update_rejects_target_alias_column_list() {
+        let stmt =
+            crate::sql::parser::parse_sql_raw("update ice.db1.t as t(c) set v = 1").expect("parse");
+        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
+        assert!(
+            err.contains("UPDATE target alias column lists are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn convert_update_rejects_source_alias_column_list() {
+        let stmt = crate::sql::parser::parse_sql_raw(
+            "update ice.db1.t set v = s.v from staging.src as s(id)",
+        )
+        .expect("parse");
+        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
+        assert!(
+            err.contains("UPDATE ... FROM source alias column lists are not supported"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn parse_add_equality_delete_values_statement() {
