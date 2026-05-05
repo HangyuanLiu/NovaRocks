@@ -118,6 +118,17 @@ pub(crate) fn attach_applicable_deletes(
     data_file.deletes.extend(applicable);
 }
 
+pub(crate) fn data_files_matching_delete<'a>(
+    snapshot: &'a IcebergReadSnapshot,
+    delete_file: &IcebergReadDeleteFile,
+) -> Vec<&'a IcebergReadFile> {
+    snapshot
+        .files
+        .iter()
+        .filter(|data_file| delete_applies_to_data_file(delete_file, data_file))
+        .collect()
+}
+
 #[derive(Default)]
 struct DeleteApplicabilityIndex {
     by_referenced_data_path: HashMap<String, Vec<IcebergReadDeleteFile>>,
@@ -532,5 +543,21 @@ mod tests {
         attach_applicable_deletes(&mut data, &[applicable.clone(), too_old, wrong_partition]);
 
         assert_eq!(data.deletes, vec![applicable]);
+    }
+
+    #[test]
+    fn data_files_matching_delete_returns_only_applicable_files() {
+        let a = data_file(Some(1), Some(1), Some("city=A"));
+        let b = data_file(Some(1), Some(1), Some("city=B"));
+        let snapshot = IcebergReadSnapshot {
+            snapshot_id: Some(10),
+            files: vec![a.clone(), b],
+        };
+        let delete = equality_delete(Some(2), Some(1), Some("city=A"));
+
+        let files = data_files_matching_delete(&snapshot, &delete);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, a.path);
     }
 }
