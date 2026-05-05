@@ -412,6 +412,12 @@ impl TableMetadata {
         }
     }
 
+    /// Return a reference to the snapshot refs map (branch and tag references).
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Iterate over all encryption keys
     #[inline]
     pub fn encryption_keys_iter(&self) -> impl ExactSizeIterator<Item = &EncryptedKey> {
