@@ -66,12 +66,13 @@ pub(crate) fn run_insert(
                 target.backend_name
             ));
         }
-        // V2 format check happens after the table is loaded via iceberg-rust below.
-        // For the non-pipeline path (VALUES/literal rows) we reject branch writes
-        // since they would bypass the format-version check.
-        if !matches!(source, InsertSource::FromQuery(_)) {
+        // UnionAll and GenerateSeriesSelect are not supported for branch writes.
+        if matches!(
+            source,
+            InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_)
+        ) {
             return Err(
-                "iceberg ref: branch-qualified INSERT requires a SELECT source (VALUES is not supported on this path)".to_string()
+                "iceberg ref: branch-qualified INSERT does not support UNION ALL or generate_series sources".to_string()
             );
         }
     }
@@ -87,12 +88,12 @@ pub(crate) fn run_insert(
         ));
     }
 
-    // Iceberg + (OVERWRITE or FromQuery) routes through the new commit-action
-    // pipeline (execute_iceberg_insert_or_overwrite). Iceberg + literal-row
-    // INSERT INTO continues to use the existing fast-append path via
-    // sink.append_rows for backwards compatibility.
+    // Iceberg + (OVERWRITE or FromQuery or branch-qualified) routes through the new
+    // commit-action pipeline (execute_iceberg_insert_or_overwrite). Iceberg + literal-row
+    // INSERT INTO without a branch target continues to use the existing fast-append path
+    // via sink.append_rows for backwards compatibility.
     let needs_iceberg_pipeline = target.backend_name == "iceberg"
-        && (overwrite || matches!(source, InsertSource::FromQuery(_)));
+        && (overwrite || matches!(source, InsertSource::FromQuery(_)) || target_ref != "main");
     if needs_iceberg_pipeline {
         return crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
             state,

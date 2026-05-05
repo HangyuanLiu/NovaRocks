@@ -59,32 +59,16 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
 ) -> Result<StatementResult, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    // Phase 1 scope: Only FromQuery is supported on this new path. Other
-    // sources fall back to the existing literal-INSERT iceberg path
-    // (fast-append only) when overwrite=false; OVERWRITE for them is
-    // rejected explicitly so the caller learns the limit early.
-    let query = match source {
-        InsertSource::FromQuery(q) => q.as_ref(),
-        InsertSource::Values(_) | InsertSource::SelectLiteralRow(_) => {
-            return Err(
-                "phase 1 INSERT OVERWRITE iceberg requires a SELECT source; \
-                        VALUES is not yet supported on the OVERWRITE path"
-                    .to_string(),
-            );
-        }
-        InsertSource::UnionAll(_) => {
-            return Err(
-                "phase 1 INSERT OVERWRITE iceberg does not support UNION ALL sources".to_string(),
-            );
-        }
-        InsertSource::GenerateSeriesSelect(_) => {
-            return Err(
-                "phase 1 INSERT OVERWRITE iceberg does not support generate_series sources"
-                    .to_string(),
-            );
-        }
-    };
-    debug_assert!(overwrite || matches!(source, InsertSource::FromQuery(_)));
+    // Reject UNION ALL and generate_series on this path; caller enforces this
+    // for branch writes, and OVERWRITE with these sources is never valid.
+    if matches!(
+        source,
+        InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_)
+    ) {
+        return Err(
+            "iceberg INSERT/OVERWRITE does not support UNION ALL or generate_series sources on this path".to_string()
+        );
+    }
 
     // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
     let entry = {
@@ -126,8 +110,31 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         }
     }
 
-    // 3. Run the SELECT and convert to chunks.
-    let chunks = run_select_to_chunks(state, target, query)?;
+    // 3. Produce chunks from the source.
+    //    - FromQuery: execute the SELECT and collect the result chunks.
+    //    - Values / SelectLiteralRow: build a RecordBatch from the literal rows
+    //      using the iceberg table schema, then wrap it as a single Chunk.
+    //      This supports branch-qualified INSERT INTO t.branch_dev VALUES (...).
+    let chunks: Vec<Chunk> = match source {
+        InsertSource::FromQuery(query) => run_select_to_chunks(state, target, query)?,
+        InsertSource::Values(rows) => {
+            let loaded = load_iceberg_table_for_literals(state, target)?;
+            let batch =
+                crate::connector::iceberg::catalog::registry::build_insert_batch(&loaded, rows)?;
+            vec![crate::engine::record_batch_to_chunk(batch)?]
+        }
+        InsertSource::SelectLiteralRow(row) => {
+            let loaded = load_iceberg_table_for_literals(state, target)?;
+            let batch = crate::connector::iceberg::catalog::registry::build_insert_batch(
+                &loaded,
+                std::slice::from_ref(row),
+            )?;
+            vec![crate::engine::record_batch_to_chunk(batch)?]
+        }
+        InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_) => {
+            unreachable!("rejected above")
+        }
+    };
 
     // 4. Write data files. Empty input → no-op for INSERT INTO; for OVERWRITE
     //    an empty SELECT means "clear the table" so we still go through
@@ -216,6 +223,25 @@ pub(crate) fn invalidate_iceberg_caches(
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
+}
+
+/// Load the iceberg table metadata as an `IcebergLoadedTable` for use by the
+/// literal-row (VALUES) branch of the insert path. This provides the schema
+/// information needed by `build_insert_batch`.
+fn load_iceberg_table_for_literals(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+) -> Result<crate::connector::iceberg::catalog::registry::IcebergLoadedTable, String> {
+    let registry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+    let entry = registry.get(&target.catalog)?;
+    crate::connector::iceberg::catalog::registry::load_table(
+        &entry,
+        &target.namespace,
+        &target.table,
+    )
 }
 
 pub(crate) fn data_file_to_written_file(

@@ -337,7 +337,7 @@ fn rewrite_time_travel_in_factor(
 
             // Rewrite the AST node in-place:
             // - Set alias to original table name if user didn't specify one
-            // - Replace name with the synthetic 1-part name in the current namespace
+            // - Replace name with the synthetic name resolved against the target namespace
             // - version is already cleared (we took it above)
             if alias.is_none() {
                 // Infer the original table alias from the last non-catalog part of the name
@@ -349,11 +349,19 @@ fn rewrite_time_travel_in_factor(
                 });
             }
 
-            // Replace with 1-part synthetic name (just the table name part — the namespace
-            // context comes from the current_database setting, same as the existing path)
-            *name = sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
-                sqlparser::ast::Ident::new(synthetic_table_name),
-            )]);
+            // Replace with a 2-part namespace-qualified synthetic name so the
+            // rewritten query resolves correctly even when `current_database` is
+            // empty or does not match the table's namespace.  The analyzer
+            // accepts `<namespace>.<table>` 2-part references in the same way it
+            // handles non-time-travel tables found via register_external_tables.
+            *name = sqlparser::ast::ObjectName(vec![
+                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
+                    target.namespace.clone(),
+                )),
+                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
+                    synthetic_table_name,
+                )),
+            ]);
 
             Ok(())
         }

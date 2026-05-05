@@ -439,7 +439,7 @@ fn execute_cow_update(
     target_ref: &str,
 ) -> Result<StatementResult, String> {
     let (data_files, sidecar) = block_on_iceberg(async {
-        write_cow_update_files(&table, matched, entry.object_store_config()).await
+        write_cow_update_files(&table, matched, entry.object_store_config(), target_ref).await
     })??;
 
     if data_files.is_empty() {
@@ -652,9 +652,10 @@ async fn write_cow_update_files(
     table: &iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    target_ref: &str,
 ) -> Result<(Vec<iceberg::spec::DataFile>, MutationSidecar), String> {
     if matched.row_ids.is_empty() {
-        return Ok((Vec::new(), empty_sidecar(table)?));
+        return Ok((Vec::new(), empty_sidecar(table, target_ref)?));
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
     let rewrite_files = build_cow_rewrite_batches(table, matched, object_store_config).await?;
@@ -676,7 +677,13 @@ async fn write_cow_update_files(
         data_files.extend(written.clone());
         data_files_by_old_file.push((rewrite.old_file.clone(), written));
     }
-    let sidecar = build_cow_sidecar(table, matched, &data_files_by_old_file, &rewrite_files)?;
+    let sidecar = build_cow_sidecar(
+        table,
+        matched,
+        &data_files_by_old_file,
+        &rewrite_files,
+        target_ref,
+    )?;
     Ok((data_files, sidecar))
 }
 
@@ -919,12 +926,21 @@ fn build_cow_sidecar(
     matched: &MatchedUpdateBatch,
     data_files_by_old_file: &[(String, Vec<iceberg::spec::DataFile>)],
     rewrite_files: &[CowRewriteFile],
+    target_ref: &str,
 ) -> Result<MutationSidecar, String> {
-    let base_snapshot_id = table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
+    let metadata = table.metadata();
+    // For branch DML, record the branch head snapshot as the sidecar base.
+    // The sidecar validation in CowUpdateCommit checks that the base matches
+    // the parent snapshot, so these must agree.
+    let base_snapshot_id = if target_ref == "main" {
+        metadata
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?
+    } else {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(metadata, target_ref)?
+            .ok_or_else(|| format!("COW UPDATE branch '{target_ref}' has no head snapshot"))?
+    };
     let replacement_row_ids_by_old_file = rewrite_files
         .iter()
         .map(|rewrite| {
@@ -982,15 +998,24 @@ fn build_cow_sidecar(
     ))
 }
 
-fn empty_sidecar(table: &iceberg::table::Table) -> Result<MutationSidecar, String> {
-    Ok(MutationSidecar::update(
-        IcebergUpdateMode::CopyOnWrite,
-        table
-            .metadata()
+fn empty_sidecar(
+    table: &iceberg::table::Table,
+    target_ref: &str,
+) -> Result<MutationSidecar, String> {
+    let metadata = table.metadata();
+    let base_snapshot_id = if target_ref == "main" {
+        metadata
             .current_snapshot()
             .map(|s| s.snapshot_id())
-            .unwrap_or(0),
-        table.metadata().uuid().to_string(),
+            .unwrap_or(0)
+    } else {
+        crate::engine::delete_flow::resolve_branch_head_snapshot_id(metadata, target_ref)?
+            .unwrap_or(0)
+    };
+    Ok(MutationSidecar::update(
+        IcebergUpdateMode::CopyOnWrite,
+        base_snapshot_id,
+        metadata.uuid().to_string(),
         Vec::new(),
         Vec::new(),
     ))

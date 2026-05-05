@@ -187,9 +187,15 @@ impl TransactionAction for RowDeltaDvTxnAction {
 
         let mut vectors = groups_to_vectors(&self.groups).map_err(to_iceberg_unexpected)?;
         let touched_files: HashSet<String> = vectors.keys().cloned().collect();
-        let index = build_snapshot_index(table, &self.file_io, &touched_files, &mut vectors)
-            .await
-            .map_err(to_iceberg_unexpected)?;
+        let index = build_snapshot_index(
+            table,
+            &self.file_io,
+            &touched_files,
+            &mut vectors,
+            target_ref,
+        )
+        .await
+        .map_err(to_iceberg_unexpected)?;
 
         for referenced in vectors.keys() {
             if !index.data_files.contains_key(referenced) {
@@ -443,16 +449,31 @@ async fn build_snapshot_index(
     file_io: &FileIO,
     touched_files: &HashSet<String>,
     vectors: &mut HashMap<String, DeletionVector>,
+    target_ref: &str,
 ) -> Result<SnapshotIndex, String> {
     let mut data_files = HashMap::new();
     let mut untouched_manifests = Vec::new();
     let mut touched_delete_existing = Vec::new();
     let mut replaced_delete_files = 0usize;
     let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .ok_or_else(|| "row-lineage DELETE requires a current snapshot".to_string())?;
+    let m = table.metadata();
+    // For branch-targeted deletes, read the manifest list from the branch head
+    // snapshot (not from main's current snapshot). This ensures that files added
+    // to the branch by prior branch DML are visible and carry forward correctly.
+    let snapshot = if target_ref == "main" {
+        m.current_snapshot()
+            .ok_or_else(|| "row-lineage DELETE requires a current snapshot".to_string())?
+    } else {
+        let branch_snapshot_id = m.refs().get(target_ref).map(|r| r.snapshot_id).ok_or_else(
+            || {
+                format!(
+                    "row-lineage DELETE target branch '{target_ref}' not found in table metadata"
+                )
+            },
+        )?;
+        m.snapshot_by_id(branch_snapshot_id)
+            .ok_or_else(|| format!("row-lineage DELETE branch '{target_ref}' snapshot {branch_snapshot_id} not found in metadata"))?
+    };
     let list = snapshot
         .load_manifest_list(file_io, table.metadata())
         .await

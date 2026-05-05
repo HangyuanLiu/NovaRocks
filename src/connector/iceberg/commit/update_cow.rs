@@ -161,14 +161,15 @@ impl TransactionAction for CowUpdateTxnAction {
         )
         .map_err(to_iceberg_data_invalid)?;
         let touched_paths = touched_old_file_paths(&self.sidecar);
-        let index = build_cow_snapshot_index(table, &self.file_io, &touched_paths)
+        let index = build_cow_snapshot_index(table, &self.file_io, &touched_paths, target_ref)
             .await
             .map_err(to_iceberg_unexpected)?;
         if index.touched_live.len() != touched_paths.len() {
             return Err(to_iceberg_unexpected(format!(
-                "COW UPDATE touched {} data file(s), but only {} are live in the current snapshot",
+                "COW UPDATE touched {} data file(s), but only {} are live in the {} snapshot",
                 touched_paths.len(),
-                index.touched_live.len()
+                index.touched_live.len(),
+                target_ref,
             )));
         }
         let touched_delete_groups = group_live_files_by_partition_spec(&index.touched_live);
@@ -391,11 +392,27 @@ async fn build_cow_snapshot_index(
     table: &Table,
     file_io: &FileIO,
     touched_paths: &HashSet<String>,
+    target_ref: &str,
 ) -> Result<CowSnapshotIndex, String> {
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
+    let m = table.metadata();
+    // For branch-targeted updates, read the manifest list from the branch head
+    // snapshot (not from main's current snapshot). This ensures that files added
+    // to the branch by prior branch DML (e.g. a branch INSERT) are carried
+    // forward correctly by the COW rewrite.
+    let snapshot = if target_ref == "main" {
+        m.current_snapshot()
+            .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?
+    } else {
+        let branch_snapshot_id =
+            m.refs()
+                .get(target_ref)
+                .map(|r| r.snapshot_id)
+                .ok_or_else(|| {
+                    format!("COW UPDATE target branch '{target_ref}' not found in table metadata")
+                })?;
+        m.snapshot_by_id(branch_snapshot_id)
+            .ok_or_else(|| format!("COW UPDATE branch '{target_ref}' snapshot {branch_snapshot_id} not found in metadata"))?
+    };
     let manifest_list = snapshot
         .load_manifest_list(file_io, table.metadata())
         .await

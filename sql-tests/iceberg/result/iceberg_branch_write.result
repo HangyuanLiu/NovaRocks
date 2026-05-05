@@ -1,0 +1,31 @@
+-- query 6
+id	v
+1	10
+2	20
+
+-- query 7
+id	v
+1	10
+2	20
+3	30
+
+-- query 9
+id	v
+1	10
+2	20
+
+-- query 10
+id	v
+1	99
+2	20
+3	30
+
+-- query 12
+id	v
+1	10
+2	20
+
+-- query 13
+id	v
+1	99
+3	30
