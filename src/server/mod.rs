@@ -24,6 +24,7 @@ use crate::version;
 
 use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use crate::engine::statement::looks_like_show_alter_table_optimize;
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -612,7 +613,10 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if is_session_noop(trimmed) && !is_materialized_view_management_statement(trimmed) {
+    if is_session_noop(trimmed)
+        && !is_materialized_view_management_statement(trimmed)
+        && !looks_like_show_alter_table_optimize(trimmed)
+    {
         return Ok(StatementResult::Ok);
     }
 
@@ -631,6 +635,7 @@ async fn execute_statement_text(
 
     if !is_supported_embedded_statement(trimmed)
         && !is_materialized_view_management_statement(trimmed)
+        && !looks_like_show_alter_table_optimize(trimmed)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
