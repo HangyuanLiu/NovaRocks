@@ -67,6 +67,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_sql_raw_parses_for_version_as_of_string() {
+        // `FOR VERSION AS OF '<string>'` is normalizer-rewritten to
+        // `FOR SYSTEM_TIME AS OF '__nr_ref:<string>'` before parsing so
+        // sqlparser (which only allows numerics for VERSION AS OF) can handle it.
+        let stmt = parse_sql_raw("SELECT id FROM t FOR VERSION AS OF 'main'")
+            .expect("FOR VERSION AS OF string must parse after normalizer rewrite");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let tw = &select.from[0];
+        let sqlparser::ast::TableFactor::Table { version, .. } = &tw.relation else {
+            panic!("expected table factor");
+        };
+        assert!(version.is_some(), "version clause must be present");
+        // Should have been normalized to ForSystemTimeAsOf('__nr_ref:main').
+        match version.as_ref().unwrap() {
+            sqlparser::ast::TableVersion::ForSystemTimeAsOf(sqlparser::ast::Expr::Value(v)) => {
+                match &v.value {
+                    sqlparser::ast::Value::SingleQuotedString(s) => {
+                        assert_eq!(
+                            s, "__nr_ref:main",
+                            "normalizer must produce __nr_ref: prefix"
+                        );
+                    }
+                    other => panic!("expected single-quoted string, got: {other:?}"),
+                }
+            }
+            other => panic!("expected ForSystemTimeAsOf after normalization, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_sql_raw_rewrites_typed_array_literals() {
         let stmt = parse_sql_raw("SELECT array<double>[0.25, 0.5]").expect("parse should succeed");
         let sqlparser::ast::Statement::Query(query) = stmt else {

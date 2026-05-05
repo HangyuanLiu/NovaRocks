@@ -39,6 +39,10 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     fn supports_limit_comma(&self) -> bool {
         true
     }
+
+    fn supports_table_versioning(&self) -> bool {
+        true
+    }
 }
 
 /// Peek at a token by offset and check if it matches a word (case-insensitive).
@@ -221,7 +225,152 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_set_user_variables(sql)?;
     let sql = rewrite_from_dual(&sql)?;
     let sql = normalize_function_syntax(&sql)?;
+    let sql = rewrite_version_as_of_string(&sql)?;
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Rewrite `FOR VERSION AS OF '<ref_name>'` → `FOR SYSTEM_TIME AS OF '__nr_ref:<ref_name>'`
+///
+/// sqlparser 0.61 parses `VERSION AS OF` via `parse_number_value()`, which rejects
+/// single-quoted strings.  By normalizing string-valued VERSION clauses to a special
+/// `__nr_ref:` prefix on the SYSTEM_TIME path (which uses `parse_expr()`) we round-trip
+/// the ref-name through the AST and let `resolve_read_binding` detect the magic prefix
+/// and dispatch to branch/tag resolution instead of timestamp resolution.
+///
+/// Numeric `VERSION AS OF <integer>` is left untouched (already handled by sqlparser).
+fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
+    // Fast path: no VERSION keyword at all.
+    let sql_lower = sql.to_ascii_lowercase();
+    if !sql_lower.contains("version") {
+        return Ok(sql.to_string());
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 32);
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        // Track quoted contexts so we don't rewrite inside string literals.
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                in_double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Check for `VERSION` keyword (case-insensitive, word boundary).
+        if starts_with_keyword(bytes, idx, "version")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+        {
+            let after_version = idx + "version".len();
+            if is_identifier_byte(bytes.get(after_version).copied()) {
+                // Not a standalone keyword — push and continue.
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+
+            // Skip whitespace after VERSION.
+            let as_start = skip_ascii_whitespace(bytes, after_version);
+
+            // Check for `AS` keyword.
+            if !starts_with_keyword(bytes, as_start, "as")
+                || is_identifier_byte(bytes.get(as_start + 2).copied())
+            {
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+            let after_as = skip_ascii_whitespace(bytes, as_start + 2);
+
+            // Check for `OF` keyword.
+            if !starts_with_keyword(bytes, after_as, "of")
+                || is_identifier_byte(bytes.get(after_as + 2).copied())
+            {
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+            let after_of = skip_ascii_whitespace(bytes, after_as + 2);
+
+            // Check for single-quoted string literal.
+            if bytes.get(after_of) != Some(&b'\'') {
+                // Numeric VERSION AS OF — leave untouched.
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+
+            // Find the end of the single-quoted string.
+            let quote_start = after_of + 1; // First char inside the quotes.
+            let mut qi = quote_start;
+            while qi < bytes.len() && bytes[qi] != b'\'' {
+                qi += 1;
+            }
+            if qi >= bytes.len() {
+                return Err("unterminated string literal in FOR VERSION AS OF".to_string());
+            }
+            // bytes[quote_start..qi] is the unquoted ref name.
+            let ref_name = &sql[quote_start..qi];
+
+            // Emit: `SYSTEM_TIME AS OF '__nr_ref:<ref_name>'`
+            output.push_str("SYSTEM_TIME AS OF '__nr_ref:");
+            output.push_str(ref_name);
+            output.push('\'');
+            idx = qi + 1; // Move past the closing quote.
+            continue;
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    Ok(output)
 }
 
 /// Strip a bare `FROM dual` so the managed-lake path doesn't need a real

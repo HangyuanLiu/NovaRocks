@@ -410,6 +410,13 @@ fn register_external_tables_for_query_impl(
             }
             continue;
         }
+        // Skip synthetic time-travel tables registered by `rewrite_time_travel_refs`
+        // (name pattern: `<table>__at_<snapshot_id>`).  These live only in the
+        // InMemory catalog and must not be dropped or re-looked-up from the iceberg
+        // catalog backend, which doesn't know about them.
+        if is_synthetic_time_travel_table(&target.table) {
+            continue;
+        }
         {
             let registry = state
                 .iceberg_catalogs
@@ -447,6 +454,18 @@ fn query_table_names(
                 parts: vec![catalog, namespace, table],
             })
             .collect()
+    }
+}
+
+/// Returns true if `table_name` was produced by the time-travel rewriter.
+/// Synthetic names follow the pattern `<original_table>__at_<snapshot_id>`
+/// where `snapshot_id` is a decimal integer (i64).
+fn is_synthetic_time_travel_table(table_name: &str) -> bool {
+    if let Some(at_pos) = table_name.rfind("__at_") {
+        let suffix = &table_name[at_pos + "__at_".len()..];
+        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-')
+    } else {
+        false
     }
 }
 

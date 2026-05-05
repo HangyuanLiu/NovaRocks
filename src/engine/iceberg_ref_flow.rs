@@ -72,8 +72,8 @@ pub(crate) fn execute(
     };
     let connector_plan = RefActionPlan {
         catalog: catalog_name,
-        namespace,
-        table: table_name,
+        namespace: namespace.clone(),
+        table: table_name.clone(),
         action: connector_action,
     };
 
@@ -84,6 +84,10 @@ pub(crate) fn execute(
         crate::connector::iceberg::commit::execute_ref_action(&catalog, &connector_plan).await
     })
     .map_err(|e| format!("iceberg ref: async runtime error: {e}"))??;
+
+    // Invalidate the cached table metadata so subsequent reads (e.g. time-travel
+    // ref resolution in `rewrite_time_travel_refs`) see the updated snapshot refs.
+    entry.invalidate_table_cache(&namespace, &table_name);
 
     Ok(StatementResult::Ok)
 }
