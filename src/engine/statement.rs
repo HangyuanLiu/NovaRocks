@@ -393,6 +393,298 @@ pub(crate) fn convert_sqlparser_update_to_custom(
     })
 }
 
+pub(crate) fn convert_sqlparser_merge_to_custom(
+    statement: &sqlparser::ast::Statement,
+) -> Result<crate::sql::parser::ast::MergeStmt, String> {
+    use crate::sql::parser::ast::{
+        MergeMatchedAction, MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource,
+        UpdateAssignment,
+    };
+    use sqlparser::ast as sqlast;
+
+    let sqlast::Statement::Merge(merge) = statement else {
+        return Err("expected MERGE statement".to_string());
+    };
+    let sqlast::Merge {
+        merge_token,
+        optimizer_hint,
+        into: _,
+        table,
+        source,
+        on,
+        clauses,
+        output,
+    } = merge;
+    let _ = merge_token;
+    if optimizer_hint.is_some() {
+        return Err("MERGE optimizer hints are not supported".to_string());
+    }
+    if output.is_some() {
+        return Err("MERGE OUTPUT is not supported".to_string());
+    }
+
+    let (target_name, target_alias) = match table {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "MERGE target",
+            )?;
+            (
+                crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                update_alias_name(alias, "MERGE target")?,
+            )
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            return Err("MERGE target pivot/unpivot are not supported".to_string());
+        }
+        other => return Err(format!("MERGE target must be a table, got {other:?}")),
+    };
+
+    let source = match source {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "MERGE source",
+            )?;
+            MutationSource::Table {
+                name: crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                alias: update_alias_name(alias, "MERGE source")?,
+            }
+        }
+        sqlast::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if *lateral {
+                return Err("MERGE source lateral subqueries are not supported".to_string());
+            }
+            if sample.is_some() {
+                return Err("MERGE source samples are not supported".to_string());
+            }
+            MutationSource::Query {
+                query: subquery.clone(),
+                alias: update_alias_name(alias, "MERGE source")?,
+            }
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            return Err("MERGE source pivot/unpivot are not supported".to_string());
+        }
+        other => return Err(format!("unsupported MERGE source: {other:?}")),
+    };
+
+    let mut matched: Option<MergeWhenClause<MergeMatchedAction>> = None;
+    let mut not_matched: Option<MergeWhenClause<MergeNotMatchedAction>> = None;
+    for clause in clauses {
+        let sqlast::MergeClause {
+            when_token,
+            clause_kind,
+            predicate,
+            action,
+        } = clause;
+        let _ = when_token;
+        match clause_kind {
+            sqlast::MergeClauseKind::Matched => {
+                if matched.is_some() {
+                    return Err(
+                        "MERGE supports at most one WHEN MATCHED clause in this implementation"
+                            .to_string(),
+                    );
+                }
+                let action = match action {
+                    sqlast::MergeAction::Update(update) => {
+                        let sqlast::MergeUpdateExpr {
+                            update_token,
+                            assignments,
+                            update_predicate,
+                            delete_predicate,
+                        } = update;
+                        let _ = update_token;
+                        if update_predicate.is_some() || delete_predicate.is_some() {
+                            return Err(
+                                "MERGE WHEN MATCHED UPDATE WHERE / DELETE WHERE clauses are not supported"
+                                    .to_string(),
+                            );
+                        }
+                        let mut out = Vec::with_capacity(assignments.len());
+                        for assignment in assignments {
+                            let sqlast::AssignmentTarget::ColumnName(column_name) =
+                                &assignment.target
+                            else {
+                                return Err(
+                                    "only single-column MERGE UPDATE assignments are supported"
+                                        .to_string(),
+                                );
+                            };
+                            let column = crate::sql::parser::dialect::convert_object_name(
+                                column_name.clone(),
+                            )?;
+                            if column.parts.len() != 1 {
+                                return Err(format!(
+                                    "MERGE UPDATE assignment must reference an unqualified target column, got `{column_name}`"
+                                ));
+                            }
+                            out.push(UpdateAssignment {
+                                column: column.parts[0].clone(),
+                                value: assignment.value.clone(),
+                            });
+                        }
+                        if out.is_empty() {
+                            return Err(
+                                "MERGE WHEN MATCHED UPDATE requires at least one assignment"
+                                    .to_string(),
+                            );
+                        }
+                        MergeMatchedAction::Update { assignments: out }
+                    }
+                    sqlast::MergeAction::Delete { .. } => MergeMatchedAction::Delete,
+                    sqlast::MergeAction::Insert(_) => {
+                        return Err(
+                            "MERGE WHEN MATCHED INSERT is not valid; use UPDATE or DELETE"
+                                .to_string(),
+                        );
+                    }
+                };
+                matched = Some(MergeWhenClause {
+                    predicate: predicate.clone(),
+                    action,
+                });
+            }
+            sqlast::MergeClauseKind::NotMatched | sqlast::MergeClauseKind::NotMatchedByTarget => {
+                if not_matched.is_some() {
+                    return Err(
+                        "MERGE supports at most one WHEN NOT MATCHED clause in this implementation"
+                            .to_string(),
+                    );
+                }
+                let action = match action {
+                    sqlast::MergeAction::Insert(insert) => {
+                        let sqlast::MergeInsertExpr {
+                            insert_token,
+                            columns,
+                            kind_token,
+                            kind,
+                            insert_predicate,
+                        } = insert;
+                        let _ = (insert_token, kind_token);
+                        if insert_predicate.is_some() {
+                            return Err(
+                                "MERGE WHEN NOT MATCHED INSERT WHERE clauses are not supported"
+                                    .to_string(),
+                            );
+                        }
+                        let columns_out: Vec<String> = columns
+                            .iter()
+                            .map(|name| {
+                                let parts =
+                                    crate::sql::parser::dialect::convert_object_name(name.clone())?;
+                                if parts.parts.len() != 1 {
+                                    return Err(format!(
+                                        "MERGE INSERT column must be unqualified, got `{name}`"
+                                    ));
+                                }
+                                Ok::<_, String>(parts.parts[0].clone())
+                            })
+                            .collect::<Result<_, _>>()?;
+                        let values = match kind {
+                            sqlast::MergeInsertKind::Values(values) => {
+                                if values.rows.len() != 1 {
+                                    return Err(format!(
+                                        "MERGE WHEN NOT MATCHED INSERT VALUES requires exactly one row tuple, got {}",
+                                        values.rows.len()
+                                    ));
+                                }
+                                values.rows[0].clone()
+                            }
+                            sqlast::MergeInsertKind::Row => {
+                                return Err(
+                                    "MERGE WHEN NOT MATCHED INSERT ROW shorthand is not supported; \
+                                     spell out VALUES (...) explicitly"
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        if !columns_out.is_empty() && columns_out.len() != values.len() {
+                            return Err(format!(
+                                "MERGE INSERT column count {} does not match VALUES count {}",
+                                columns_out.len(),
+                                values.len()
+                            ));
+                        }
+                        MergeNotMatchedAction {
+                            columns: columns_out,
+                            values,
+                        }
+                    }
+                    sqlast::MergeAction::Update(_) | sqlast::MergeAction::Delete { .. } => {
+                        return Err("MERGE WHEN NOT MATCHED action must be INSERT".to_string());
+                    }
+                };
+                not_matched = Some(MergeWhenClause {
+                    predicate: predicate.clone(),
+                    action,
+                });
+            }
+            sqlast::MergeClauseKind::NotMatchedBySource => {
+                return Err(
+                    "MERGE WHEN NOT MATCHED BY SOURCE is not supported in this implementation"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if matched.is_none() && not_matched.is_none() {
+        return Err("MERGE requires at least one WHEN clause".to_string());
+    }
+
+    Ok(MergeStmt {
+        table: target_name,
+        target_alias,
+        source,
+        on: (**on).clone(),
+        matched,
+        not_matched,
+    })
+}
+
 fn convert_update_from_source(
     from: &Option<sqlparser::ast::UpdateTableFromKind>,
 ) -> Result<Option<crate::sql::parser::ast::MutationSource>, String> {

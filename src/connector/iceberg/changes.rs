@@ -1118,12 +1118,14 @@ async fn collect_added_data_files_for_manifest_list(
             ))
         })?;
         for entry in manifest.entries() {
-            if entry.status == ManifestStatus::Deleted {
-                return Err(ChangeError::InternalInconsistency(format!(
-                    "data manifest entry has DELETED status in snapshot {snapshot_id}: {}",
-                    entry.data_file().file_path()
-                )));
-            }
+            // Skip non-Added rows. `Deleted` entries appear here as carry-over
+            // bookkeeping when iceberg-rust's writer compacts a prior
+            // snapshot's manifest into the new manifest (e.g. an Append
+            // immediately following an Overwrite/COW UPDATE). They are not
+            // newly-added rows, so this collector ignores them. `Existing`
+            // entries are also carry-over and are similarly skipped. Only
+            // `Added` entries owned by `snapshot_id` represent inserts
+            // produced by this snapshot.
             if entry.status != ManifestStatus::Added {
                 continue;
             }
