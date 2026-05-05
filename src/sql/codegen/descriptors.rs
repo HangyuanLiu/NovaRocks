@@ -256,6 +256,7 @@ mod tests {
                 name: "order_id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: Some(IcebergTableInfo {

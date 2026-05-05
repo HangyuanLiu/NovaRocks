@@ -205,21 +205,25 @@ fn build_iceberg_table_def_with_data_files(
                 name: "_file".to_string(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_pos".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_row_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_last_updated_sequence_number".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
         ]
     } else {

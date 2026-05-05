@@ -9,6 +9,7 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub write_default: Option<iceberg::spec::Literal>,
 }
 
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
@@ -185,6 +186,7 @@ mod tests {
                 name: "order_id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: Some(IcebergTableInfo {

@@ -583,7 +583,8 @@ pub(crate) fn load_table(
     let logical_types = parse_logical_type_properties(table.metadata().properties())?;
     let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
     let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
-    let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
+    let iceberg_schema = table.metadata().current_schema();
+    let arrow_schema = schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
     let columns = arrow_schema
         .fields()
@@ -595,6 +596,9 @@ pub(crate) fn load_table(
                     field.name()
                 )
             })?;
+            let nested = iceberg_schema
+                .field_by_name(field.name())
+                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
             Ok(ColumnDef {
                 name: field.name().clone(),
                 data_type: apply_logical_type_override(
@@ -602,6 +606,7 @@ pub(crate) fn load_table(
                     logical_types.get(&field_name),
                 ),
                 nullable: field.is_nullable(),
+                write_default: nested.write_default.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

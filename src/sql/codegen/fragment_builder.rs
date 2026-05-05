@@ -1962,6 +1962,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 name: col_name.clone(),
                 data_type: ArrowDataType::Int64,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
@@ -2990,11 +2991,13 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    write_default: None,
                 },
                 ColumnDef {
                     name: "category".to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
+                    write_default: None,
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
@@ -3124,6 +3127,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -3150,6 +3154,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -3179,6 +3184,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3219,6 +3225,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3262,6 +3269,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3307,6 +3315,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3351,6 +3360,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
+                        write_default: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {

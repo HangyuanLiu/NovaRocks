@@ -439,6 +439,7 @@ mod tests {
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                write_default: None,
             })
             .collect();
         LogicalPlan::Scan(ScanNode {

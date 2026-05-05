@@ -2754,11 +2754,13 @@ enable_path_style_access = true
                                 name: "k".to_string(),
                                 data_type: DataType::Int64,
                                 nullable: false,
+                                write_default: None,
                             },
                             ColumnDef {
                                 name: "v".to_string(),
                                 data_type: DataType::Int64,
                                 nullable: false,
+                                write_default: None,
                             },
                         ],
                         storage: TableStorage::LocalParquetFile {

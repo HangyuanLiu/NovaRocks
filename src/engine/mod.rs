@@ -2317,16 +2317,19 @@ enable_path_style_access = true
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "score_items".to_string(),
                 data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
                 nullable: true,
+                write_default: None,
             },
             ColumnDef {
                 name: "tags".to_string(),
                 data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 nullable: true,
+                write_default: None,
             },
         ];
         let rows = vec![
@@ -2382,6 +2385,7 @@ enable_path_style_access = true
             name: "v".to_string(),
             data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
             nullable: true,
+            write_default: None,
         }];
         let rows = vec![
             vec![Literal::String(
@@ -2422,6 +2426,7 @@ enable_path_style_access = true
             name: "nums".to_string(),
             data_type: DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
             nullable: true,
+            write_default: None,
         }];
         let rows = vec![vec![Literal::Array(vec![
             Literal::Float(1.0),
@@ -2467,6 +2472,7 @@ enable_path_style_access = true
             name: "m".to_string(),
             data_type: DataType::Map(entries_field, false),
             nullable: true,
+            write_default: None,
         }];
         let rows = vec![vec![Literal::Map(vec![
             (Literal::Null, Literal::String("dropped".to_string())),
@@ -2520,6 +2526,7 @@ enable_path_style_access = true
             name: "m".to_string(),
             data_type: DataType::Map(source_entries_field, false),
             nullable: true,
+            write_default: None,
         }];
         let rows = vec![vec![Literal::Map(vec![(
             Literal::Int(1),
@@ -2584,6 +2591,7 @@ enable_path_style_access = true
             name: "m".to_string(),
             data_type: DataType::Map(entries_field, false),
             nullable: true,
+            write_default: None,
         }];
         let rows = vec![vec![Literal::Map(vec![
             (Literal::Null, Literal::String("dropped".to_string())),
