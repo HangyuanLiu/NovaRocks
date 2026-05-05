@@ -139,6 +139,12 @@ pub struct WrittenFile {
     pub referenced_data_file: Option<String>,
     /// Set only for content == EqualityDeletes.
     pub equality_ids: Option<Vec<i32>>,
+    /// For Iceberg v3 row-lineage data files whose rows reuse pre-existing
+    /// `_row_id`s (e.g. MOR UPDATE replacement files): the lineage `first_row_id`
+    /// to record on the manifest entry. When set, readers prefer this over the
+    /// manifest-level first_row_id and `df.first_row_id()` propagates without
+    /// triggering fresh row-id allocation. `None` for normal INSERT writes.
+    pub first_row_id: Option<i64>,
 }
 
 /// Result returned by a successful commit action.
@@ -171,6 +177,7 @@ mod tests {
             key_metadata: None,
             referenced_data_file: None,
             equality_ids: None,
+            first_row_id: None,
         };
         assert_eq!(f.record_count, 100);
         assert_eq!(f.content, DataContentType::Data);

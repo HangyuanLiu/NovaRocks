@@ -819,6 +819,7 @@ mod tests {
             key_metadata: None,
             referenced_data_file: None,
             equality_ids: None,
+            first_row_id: None,
         }
     }
 }

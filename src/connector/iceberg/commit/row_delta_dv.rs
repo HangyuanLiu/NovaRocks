@@ -67,7 +67,10 @@ use super::puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-use super::types::CommitOutcome;
+use super::types::{
+    CommitOutcome, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE, NOVAROCKS_UPDATE_MODE,
+    NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
+};
 
 pub struct RowDeltaDvCommit;
 
@@ -75,7 +78,16 @@ pub struct RowDeltaDvCommit;
 impl IcebergCommitAction for RowDeltaDvCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let groups = ctx.collector.take_delete_groups();
-        if groups.iter().all(|g| g.positions.is_empty()) {
+        let written = ctx.collector.take_written_files()?;
+        for f in &written {
+            if f.content != DataContentType::Data {
+                return Err(format!(
+                    "RowDeltaDvCommit received {:?} content; expected Data only",
+                    f.content
+                ));
+            }
+        }
+        if groups.iter().all(|g| g.positions.is_empty()) && written.is_empty() {
             let id = ctx
                 .table
                 .metadata()
@@ -91,6 +103,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = RowDeltaDvTxnAction {
             groups,
+            written,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
@@ -126,12 +139,18 @@ impl IcebergCommitAction for RowDeltaDvCommit {
 
 struct RowDeltaDvTxnAction {
     groups: Vec<PositionDeleteGroup>,
+    /// Replacement data files produced by an MOR UPDATE. Empty for plain
+    /// DELETE. Each file already carries stored row-lineage columns so the
+    /// snapshot must NOT allocate fresh row IDs for them — the added-data
+    /// manifest is marked with `first_row_id` to suppress allocation.
+    written: Vec<WrittenFile>,
     commit_uuid: Uuid,
     file_io: FileIO,
     schema: SchemaRef,
     schema_id: i32,
-    /// `next_row_id` of the base table — DELETE does not advance this, so the
-    /// snapshot's `row_range = (first_row_id, 0)`.
+    /// `next_row_id` of the base table — neither DELETE nor MOR UPDATE
+    /// allocate fresh row IDs (UPDATE rows reuse the matched `_row_id`s),
+    /// so the snapshot's `row_range = (first_row_id, 0)`.
     row_lineage_first_row_id: u64,
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
@@ -240,6 +259,38 @@ impl TransactionAction for RowDeltaDvTxnAction {
             new_manifests.push(added);
         }
 
+        if !self.written.is_empty() {
+            let data_path = format!(
+                "{metadata_dir}/{}-row-delta-update-data-0.avro",
+                self.commit_uuid
+            );
+            self.abort_handle.record_manifest(data_path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(data_path.clone());
+            let data_manifest = super::overwrite::write_added_data_manifest(
+                &self.file_io,
+                &data_path,
+                &self.written,
+                m.default_partition_spec().clone(),
+                self.schema.clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            // The replacement data files reuse the matched rows' `_row_id`s
+            // (stored in the row-lineage columns). Mark the manifest as
+            // already-assigned so the v3 manifest-list writer does NOT
+            // allocate fresh row IDs for them.
+            new_manifests.push(mark_replacement_manifest_row_id_assigned(
+                data_manifest,
+                self.row_lineage_first_row_id,
+            ));
+        }
+
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
@@ -250,7 +301,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
-        let _ = write_manifest_list(
+        let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
             new_manifests,
@@ -262,6 +313,13 @@ impl TransactionAction for RowDeltaDvTxnAction {
         )
         .await
         .map_err(to_iceberg_unexpected)?;
+        if manifest_list_next_row_id != Some(self.row_lineage_first_row_id) {
+            return Err(to_iceberg_unexpected(format!(
+                "row-lineage DELETE/MOR-UPDATE must not allocate row IDs: \
+                 expected next-row-id {}, got {manifest_list_next_row_id:?}",
+                self.row_lineage_first_row_id
+            )));
+        }
 
         let added_position_deletes = written_dvs.iter().try_fold(0u64, |sum, dv| {
             sum.checked_add(dv.cardinality)
@@ -281,6 +339,23 @@ impl TransactionAction for RowDeltaDvTxnAction {
         )
         .map_err(to_iceberg_unexpected)?;
 
+        let mut summary_props = dv_summary(
+            &written_dvs,
+            total_records,
+            newly_deleted_records,
+            index.replaced_delete_files,
+            index.replaced_delete_records,
+        );
+        if !self.written.is_empty() {
+            summary_props.insert(
+                NOVAROCKS_ROW_LEVEL_OP.to_string(),
+                NOVAROCKS_ROW_LEVEL_OP_UPDATE.to_string(),
+            );
+            summary_props.insert(
+                NOVAROCKS_UPDATE_MODE.to_string(),
+                NOVAROCKS_UPDATE_MODE_MOR.to_string(),
+            );
+        }
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(parent_snapshot_id)
@@ -289,13 +364,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
             .with_manifest_list(manifest_list_path)
             .with_summary(Summary {
                 operation: Operation::Delete,
-                additional_properties: dv_summary(
-                    &written_dvs,
-                    total_records,
-                    newly_deleted_records,
-                    index.replaced_delete_files,
-                    index.replaced_delete_records,
-                ),
+                additional_properties: summary_props,
             })
             .with_schema_id(self.schema_id)
             .with_row_range(self.row_lineage_first_row_id, 0)
@@ -523,6 +592,17 @@ fn groups_to_vectors(
         }
     }
     Ok(out)
+}
+
+fn mark_replacement_manifest_row_id_assigned(
+    mut manifest: ManifestFile,
+    row_lineage_first_row_id: u64,
+) -> ManifestFile {
+    // MOR UPDATE replacement files carry stored row-lineage columns. The
+    // manifest first-row-id is assigned only to prevent the v3 manifest-list
+    // writer from allocating new row IDs for those replacement rows.
+    manifest.first_row_id = Some(row_lineage_first_row_id);
+    manifest
 }
 
 fn partition_spec_by_id(

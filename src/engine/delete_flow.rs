@@ -497,14 +497,14 @@ async fn scan_for_position_deletes(
         .collect::<Result<Vec<_>, String>>()?)
 }
 
-struct ReferencedDataFilePartition {
-    partition_spec_id: i32,
-    partition_values: iceberg::spec::Struct,
+pub(crate) struct ReferencedDataFilePartition {
+    pub(crate) partition_spec_id: i32,
+    pub(crate) partition_values: iceberg::spec::Struct,
 }
 
-type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
+pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
 
-fn load_referenced_data_file_partitions(
+pub(crate) fn load_referenced_data_file_partitions(
     table: &iceberg::table::Table,
 ) -> Result<ReferencedDataFilePartitions, String> {
     let data_files = registry::extract_data_files_with_stats(table)?;

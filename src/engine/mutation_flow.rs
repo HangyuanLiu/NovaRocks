@@ -66,19 +66,257 @@ pub(crate) fn execute_update_statement(
             execute_cow_update(state, &target, catalog, table_ident, table, stmt, entry)
         }
         IcebergUpdateMode::MergeOnRead => {
-            execute_mor_update(state, &target, &table, stmt, current_database)
+            execute_mor_update(state, &target, catalog, table_ident, table, stmt, entry)
         }
     }
 }
 
 fn execute_mor_update(
-    _state: &Arc<StandaloneState>,
-    _target: &crate::engine::backend_resolver::TargetBackend,
-    _table: &iceberg::table::Table,
-    _stmt: &UpdateStmt,
-    _current_database: &str,
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table_ident: iceberg::TableIdent,
+    table: iceberg::table::Table,
+    stmt: &UpdateStmt,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<StatementResult, String> {
-    Err("merge-on-read UPDATE is implemented in the next stage".to_string())
+    let target_alias = stmt.alias.as_deref();
+    let target_sql = if let Some(alias) = target_alias {
+        format!("{} AS {alias}", target.table)
+    } else {
+        target.table.clone()
+    };
+    let assignments_sql = stmt
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
+        .collect::<Vec<_>>();
+    let assignments_sql = assignments_sql
+        .iter()
+        .map(|(column, expr)| (*column, expr.as_str()))
+        .collect::<Vec<_>>();
+    let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
+    let match_sql = build_update_match_query_sql(
+        &target_sql,
+        target_alias.unwrap_or(""),
+        None,
+        &assignments_sql,
+        where_sql.as_deref(),
+    );
+    let matched =
+        execute_update_match_query(state, Some(&target.catalog), &match_sql, &target.namespace)?;
+    if matched.row_ids.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
+    validate_unique_target_row_ids(&matched.row_ids)?;
+
+    let referenced_partitions =
+        crate::engine::delete_flow::load_referenced_data_file_partitions(&table)?;
+    let delete_groups =
+        build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
+
+    let metadata = table.metadata();
+    let new_sequence_number = metadata.last_sequence_number() + 1;
+    let runs = build_mor_update_runs(&matched, new_sequence_number)?;
+
+    let mut written_files: Vec<crate::connector::iceberg::commit::WrittenFile> = Vec::new();
+    for run in &runs {
+        let data_files = block_on_iceberg(async {
+            crate::connector::iceberg::data_writer::write_row_lineage_batches_as_data_files(
+                &table,
+                std::slice::from_ref(&run.batch),
+            )
+            .await
+        })??;
+        if data_files.is_empty() {
+            return Err(
+                "MOR UPDATE produced no replacement data files for matched rows".to_string(),
+            );
+        }
+        // Within each contiguous-row-id run we wrote rows in ascending row_id
+        // order, so position 0 of the file maps to `run.first_row_id`. Stamp
+        // `first_row_id` on the resulting WrittenFile so the manifest entry
+        // records the correct lineage origin.
+        let mut cursor = run.first_row_id;
+        for df in data_files {
+            let mut wf = crate::engine::iceberg_writer::data_file_to_written_file(
+                &df,
+                metadata.default_partition_spec_id(),
+            )?;
+            wf.first_row_id = Some(cursor);
+            cursor = cursor.checked_add(wf.record_count as i64).ok_or_else(|| {
+                "MOR UPDATE first_row_id cursor overflow when chaining rolling files".to_string()
+            })?;
+            written_files.push(wf);
+        }
+    }
+
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let file_io = table.file_io().clone();
+    let collector = Arc::new(IcebergCommitCollector::new(
+        CommitOpKind::RowDeltaDv,
+        table_ident,
+        metadata.current_snapshot().map(|s| s.snapshot_id()),
+        metadata.last_sequence_number(),
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().clone(),
+        staging_dir,
+        crate::common::types::UniqueId { hi: 0, lo: 0 },
+    ));
+    for group in delete_groups {
+        collector.inject_delete_group(group);
+    }
+    for wf in written_files {
+        collector.inject_written_file(wf);
+    }
+
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let _outcome = block_on_iceberg(async {
+        run_iceberg_commit(RunInput {
+            collector: collector.clone(),
+            catalog: catalog.clone(),
+            table,
+            fs: abort_cleanup.fs,
+            file_io,
+            cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_sidecar: None,
+        })
+        .await
+    })??;
+
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    Ok(StatementResult::Ok)
+}
+
+struct MorUpdateRun {
+    /// `_row_id` of the first row in the run. The data file written for this
+    /// run has `first_row_id = Self::first_row_id`, and rows occupy positions
+    /// `0..N` so the reader's `first_row_id + position` formula reconstructs
+    /// each row's `_row_id`.
+    first_row_id: i64,
+    batch: RowLineageWriteBatch,
+}
+
+fn build_mor_update_runs(
+    matched: &MatchedUpdateBatch,
+    new_sequence_number: i64,
+) -> Result<Vec<MorUpdateRun>, String> {
+    if matched.row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Sort matched rows by row_id ascending so each contiguous run lays out
+    // the new data file in row_id order (required for the read-side fallback
+    // formula). Group rows whose row_ids form a contiguous integer sequence
+    // into a single data file; non-contiguous gaps start a new file so each
+    // file's stored `first_row_id` correctly identifies its starting row.
+    let mut order: Vec<usize> = (0..matched.row_ids.len()).collect();
+    order.sort_by_key(|&i| matched.row_ids[i]);
+
+    let mut runs = Vec::new();
+    let mut current_indices: Vec<usize> = Vec::new();
+    let mut prev_row_id: Option<i64> = None;
+    for &idx in &order {
+        let row_id = matched.row_ids[idx];
+        let starts_new_run = match prev_row_id {
+            None => true,
+            Some(prev)
+                if row_id
+                    == prev.checked_add(1).ok_or_else(|| {
+                        "MOR UPDATE matched _row_id overflow while grouping contiguous runs"
+                            .to_string()
+                    })? =>
+            {
+                false
+            }
+            Some(_) => true,
+        };
+        if starts_new_run && !current_indices.is_empty() {
+            runs.push(materialize_mor_update_run(
+                matched,
+                &current_indices,
+                new_sequence_number,
+            )?);
+            current_indices.clear();
+        }
+        current_indices.push(idx);
+        prev_row_id = Some(row_id);
+    }
+    if !current_indices.is_empty() {
+        runs.push(materialize_mor_update_run(
+            matched,
+            &current_indices,
+            new_sequence_number,
+        )?);
+    }
+    Ok(runs)
+}
+
+fn materialize_mor_update_run(
+    matched: &MatchedUpdateBatch,
+    indices: &[usize],
+    new_sequence_number: i64,
+) -> Result<MorUpdateRun, String> {
+    let user_batch = take_rows(&matched.new_rows, indices)?;
+    let row_ids: Vec<i64> = indices.iter().map(|&i| matched.row_ids[i]).collect();
+    let first_row_id = row_ids[0];
+    let last_updated: Vec<Option<i64>> = (0..indices.len())
+        .map(|_| Some(new_sequence_number))
+        .collect();
+    let lineage = RowLineageColumns {
+        row_ids: Int64Array::from(row_ids),
+        last_updated_sequence_numbers: Int64Array::from(last_updated),
+    };
+    Ok(MorUpdateRun {
+        first_row_id,
+        batch: RowLineageWriteBatch {
+            user_batch,
+            lineage,
+        },
+    })
+}
+
+fn take_rows(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch, String> {
+    if indices.is_empty() {
+        return Ok(RecordBatch::new_empty(batch.schema()));
+    }
+    let idx_array =
+        arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for col in batch.columns() {
+        let taken = arrow::compute::take(col.as_ref(), &idx_array, None)
+            .map_err(|e| format!("take MOR UPDATE rows failed: {e}"))?;
+        new_columns.push(taken);
+    }
+    RecordBatch::try_new(batch.schema(), new_columns)
+        .map_err(|e| format!("rebuild MOR UPDATE batch failed: {e}"))
+}
+
+fn build_position_delete_groups_from_matched(
+    matched: &MatchedUpdateBatch,
+    referenced_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    let mut by_file: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for (path, pos) in matched.file_paths.iter().zip(matched.row_positions.iter()) {
+        by_file.entry(path.clone()).or_default().push(*pos);
+    }
+    let mut out = Vec::with_capacity(by_file.len());
+    for (file, positions) in by_file {
+        let partition = referenced_partitions.get(&file).ok_or_else(|| {
+            format!("matched iceberg data file `{file}` is missing partition metadata")
+        })?;
+        out.push(crate::connector::iceberg::commit::PositionDeleteGroup {
+            referenced_data_file: file,
+            partition_spec_id: partition.partition_spec_id,
+            partition_values: partition.partition_values.clone(),
+            positions,
+        });
+    }
+    Ok(out)
 }
 
 fn execute_cow_update(

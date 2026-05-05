@@ -3996,6 +3996,13 @@ enable_path_style_access = true
     fn open_row_lineage_iceberg_session_with_table(
         warehouse: &TempDir,
     ) -> (StandaloneNovaRocks, StandaloneSession) {
+        open_row_lineage_iceberg_session_with_table_extra_props(warehouse, &[])
+    }
+
+    fn open_row_lineage_iceberg_session_with_table_extra_props(
+        warehouse: &TempDir,
+        extra_props: &[(&str, &str)],
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
         use iceberg::Catalog;
 
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
@@ -4029,11 +4036,16 @@ enable_path_style_access = true
             ])
             .build()
             .expect("build schema");
+        let mut props: Vec<(String, String)> =
+            vec![("write.row-lineage".to_string(), "true".to_string())];
+        for (k, v) in extra_props {
+            props.push(((*k).to_string(), (*v).to_string()));
+        }
         let table_creation = iceberg::TableCreation::builder()
             .name("t".to_string())
             .schema(schema)
             .format_version(iceberg::spec::FormatVersion::V3)
-            .properties([("write.row-lineage".to_string(), "true".to_string())])
+            .properties(props)
             .build();
         crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
             catalog
@@ -4605,6 +4617,52 @@ enable_path_style_access = true
         assert_ne!(
             before[1].2, after[1].2,
             "updated row sequence should advance"
+        );
+    }
+
+    #[test]
+    fn iceberg_v3_mor_update_preserves_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table_extra_props(
+            &warehouse,
+            &[("novarocks.update.mode", "merge-on-read")],
+        );
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert");
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = 'aa' where t.id = 1",
+                "default",
+            )
+            .expect("mor update");
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(after.len(), 2, "MOR UPDATE must not duplicate rows");
+        assert_eq!(before[0].1, after[0].1, "_row_id of updated row preserved");
+        assert_eq!(
+            before[1].1, after[1].1,
+            "_row_id of unchanged row preserved"
+        );
+        assert_ne!(
+            before[0].2, after[0].2,
+            "updated row sequence number should advance"
+        );
+        assert_eq!(
+            before[1].2, after[1].2,
+            "unchanged row sequence number should be stable"
+        );
+        let v_after = collect_id_v(&session, "select id, v from ice.db1.t order by id");
+        assert_eq!(
+            v_after,
+            vec![(1, "aa".to_string()), (2, "b".to_string())],
+            "MOR UPDATE applied new value exactly once"
         );
     }
 

@@ -461,6 +461,7 @@ mod tests {
             key_metadata: None,
             referenced_data_file: Some("s3://bucket/data.parquet".to_string()),
             equality_ids: None,
+            first_row_id: None,
         }
     }
 
@@ -481,6 +482,7 @@ mod tests {
             key_metadata: None,
             referenced_data_file: None,
             equality_ids: Some(vec![1, 2]),
+            first_row_id: None,
         };
 
         let df = written_file_to_iceberg_data_file_minimal(&file).expect("data file");

@@ -458,6 +458,9 @@ pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, Strin
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
     }
+    if let Some(first_row_id) = f.first_row_id {
+        builder.first_row_id(Some(first_row_id));
+    }
     builder
         .build()
         .map_err(|e| format!("DataFileBuilder::build failed: {e}"))
