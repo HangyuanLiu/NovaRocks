@@ -36,9 +36,6 @@ pub(crate) fn execute_update_statement(
             target.backend_name
         ));
     }
-    if stmt.source.is_some() {
-        return Err("UPDATE ... FROM is implemented in a later stage".to_string());
-    }
 
     let entry = {
         let registry = state
@@ -60,32 +57,36 @@ pub(crate) fn execute_update_statement(
     let partition_columns = iceberg_partition_source_columns(&table)?;
     validate_update_assignments(&stmt.assignments, &target_columns, &partition_columns)?;
 
+    let matched = materialize_update_matches(state, &target, stmt, current_catalog)?;
+    if matched.row_ids.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
+    validate_unique_target_row_ids(&matched.row_ids)?;
+
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
         IcebergUpdateMode::CopyOnWrite => {
-            execute_cow_update(state, &target, catalog, table_ident, table, stmt, entry)
+            execute_cow_update(state, &target, catalog, table_ident, table, &matched, entry)
         }
         IcebergUpdateMode::MergeOnRead => {
-            execute_mor_update(state, &target, catalog, table_ident, table, stmt, entry)
+            execute_mor_update(state, &target, catalog, table_ident, table, &matched, entry)
         }
     }
 }
 
-fn execute_mor_update(
+fn materialize_update_matches(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table_ident: iceberg::TableIdent,
-    table: iceberg::table::Table,
     stmt: &UpdateStmt,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-) -> Result<StatementResult, String> {
-    let target_alias = stmt.alias.as_deref();
-    let target_sql = if let Some(alias) = target_alias {
-        format!("{} AS {alias}", target.table)
-    } else {
-        target.table.clone()
-    };
+    current_catalog: Option<&str>,
+) -> Result<MatchedUpdateBatch, String> {
+    let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
+    // The match SELECT runs against the standalone analyzer with
+    // `current_database = target.namespace` (so 1-part target name resolves
+    // to the iceberg target). Source relations may live in a different
+    // namespace; `mutation_source_to_sql` qualifies them with their
+    // namespace so the analyzer can find them.
+    let target_sql = format!("{} AS {}", target.table, target_alias);
     let assignments_sql = stmt
         .assignments
         .iter()
@@ -96,28 +97,77 @@ fn execute_mor_update(
         .map(|(column, expr)| (*column, expr.as_str()))
         .collect::<Vec<_>>();
     let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
+    let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let match_sql = build_update_match_query_sql(
         &target_sql,
-        target_alias.unwrap_or(""),
-        None,
+        target_alias,
+        source_sql.as_deref(),
         &assignments_sql,
         where_sql.as_deref(),
     );
-    let matched =
-        execute_update_match_query(state, Some(&target.catalog), &match_sql, &target.namespace)?;
-    if matched.row_ids.is_empty() {
-        return Ok(StatementResult::Ok);
-    }
-    validate_unique_target_row_ids(&matched.row_ids)?;
+    execute_update_match_query(state, Some(&target.catalog), &match_sql, &target.namespace)
+}
 
+fn mutation_source_to_sql(
+    state: &Arc<StandaloneState>,
+    source: &Option<crate::sql::parser::ast::MutationSource>,
+    current_catalog: Option<&str>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+) -> Result<Option<String>, String> {
+    use crate::sql::parser::ast::MutationSource;
+    match source {
+        None => Ok(None),
+        Some(MutationSource::Table { name, alias }) => {
+            // The match SELECT runs with `current_database = target.namespace`
+            // and `current_catalog = Some(target.catalog)`. Resolve the source
+            // against the user's surface name to get its concrete (catalog,
+            // namespace, table). Emit a 1-part name when the source shares the
+            // target's namespace+catalog (lets refresh follow the
+            // current-catalog path), and a 2-part `<namespace>.<table>` name
+            // otherwise so the standalone analyzer can find it directly.
+            let resolved = crate::engine::backend_resolver::resolve_existing_table_target(
+                state,
+                name,
+                current_catalog,
+                &target.namespace,
+            )?;
+            let mut sql =
+                if resolved.catalog == target.catalog && resolved.namespace == target.namespace {
+                    resolved.table.clone()
+                } else {
+                    format!("{}.{}", resolved.namespace, resolved.table)
+                };
+            if let Some(alias) = alias {
+                sql.push_str(" AS ");
+                sql.push_str(alias);
+            }
+            Ok(Some(sql))
+        }
+        Some(MutationSource::Query { query, alias }) => {
+            let alias = alias
+                .as_deref()
+                .ok_or_else(|| "UPDATE subquery source requires an alias".to_string())?;
+            Ok(Some(format!("({query}) AS {alias}")))
+        }
+    }
+}
+
+fn execute_mor_update(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table_ident: iceberg::TableIdent,
+    table: iceberg::table::Table,
+    matched: &MatchedUpdateBatch,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+) -> Result<StatementResult, String> {
     let referenced_partitions =
         crate::engine::delete_flow::load_referenced_data_file_partitions(&table)?;
-    let delete_groups =
-        build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
+    let delete_groups = build_position_delete_groups_from_matched(matched, &referenced_partitions)?;
 
     let metadata = table.metadata();
     let new_sequence_number = metadata.last_sequence_number() + 1;
-    let runs = build_mor_update_runs(&matched, new_sequence_number)?;
+    let runs = build_mor_update_runs(matched, new_sequence_number)?;
 
     let mut written_files: Vec<crate::connector::iceberg::commit::WrittenFile> = Vec::new();
     for run in &runs {
@@ -325,36 +375,11 @@ fn execute_cow_update(
     catalog: Arc<dyn Catalog>,
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
-    stmt: &UpdateStmt,
+    matched: &MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<StatementResult, String> {
-    let target_alias = stmt.alias.as_deref();
-    let target_sql = if let Some(alias) = target_alias {
-        format!("{} AS {alias}", target.table)
-    } else {
-        target.table.clone()
-    };
-    let assignments_sql = stmt
-        .assignments
-        .iter()
-        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
-        .collect::<Vec<_>>();
-    let assignments_sql = assignments_sql
-        .iter()
-        .map(|(column, expr)| (*column, expr.as_str()))
-        .collect::<Vec<_>>();
-    let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
-    let match_sql = build_update_match_query_sql(
-        &target_sql,
-        target_alias.unwrap_or(""),
-        None,
-        &assignments_sql,
-        where_sql.as_deref(),
-    );
-    let matched =
-        execute_update_match_query(state, Some(&target.catalog), &match_sql, &target.namespace)?;
     let (data_files, sidecar) = block_on_iceberg(async {
-        write_cow_update_files(&table, &matched, entry.object_store_config()).await
+        write_cow_update_files(&table, matched, entry.object_store_config()).await
     })??;
 
     if data_files.is_empty() {

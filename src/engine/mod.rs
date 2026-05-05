@@ -4667,6 +4667,65 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn iceberg_v3_update_from_source_table() {
+        // Use a second iceberg table (in the same catalog/namespace) as the
+        // source so the test does not depend on managed-lake configuration.
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create source iceberg table");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("insert target");
+        session
+            .execute_in_database("insert into ice.db1.src values (2, 'bb')", "default")
+            .expect("insert source");
+        session
+            .execute_in_database(
+                "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
+                "default",
+            )
+            .expect("update from source");
+        let rows = collect_id_v(&session, "select id, v from ice.db1.t order by id");
+        assert_eq!(rows, vec![(1, "a".to_string()), (2, "bb".to_string())]);
+    }
+
+    #[test]
+    fn iceberg_v3_update_from_rejects_duplicate_source_match() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                r#"create table ice.db1.src (id int, new_v string) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create source iceberg table");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("insert target");
+        session
+            .execute_in_database(
+                "insert into ice.db1.src values (1, 'x'), (1, 'y')",
+                "default",
+            )
+            .expect("insert source");
+        let err = session
+            .execute_in_database(
+                "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
+                "default",
+            )
+            .expect_err("duplicate source rows must fail");
+        assert!(
+            err.contains("more than once"),
+            "expected dedup error, got: {err}"
+        );
+    }
+
+    #[test]
     fn iceberg_v3_cow_update_multiple_files_preserves_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
