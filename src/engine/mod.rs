@@ -26,6 +26,7 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod generate_series;
+pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
@@ -1120,8 +1121,8 @@ pub(crate) fn dispatch_statement(
             crate::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
         Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
-        Statement::AlterIcebergRef(_) => {
-            Err("ALTER TABLE … BRANCH/TAG: engine dispatch not yet implemented".to_string())
+        Statement::AlterIcebergRef(stmt) => {
+            crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
         }
     }
 }
