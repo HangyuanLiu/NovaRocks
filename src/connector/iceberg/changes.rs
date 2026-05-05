@@ -662,7 +662,10 @@ pub(crate) fn materialize_changes(
         )?
     };
 
-    let deletes = if batch.deletes.is_empty() && batch.equality_deletes.is_empty() {
+    let needs_deletes_scan = !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.cow_updates.is_empty();
+    let deletes = if !needs_deletes_scan {
         crate::engine::QueryResult::empty()
     } else {
         let factory = build_factory_for_table(base_table, object_store_config)?;
@@ -690,6 +693,13 @@ pub(crate) fn materialize_changes(
                 base_table,
                 &batch.equality_deletes,
                 &factory,
+                object_store_config,
+            )?);
+        }
+        if !batch.cow_updates.is_empty() {
+            deleted_rows.extend(scan_cow_update_old_rows(
+                base_table,
+                &batch.cow_updates,
                 object_store_config,
             )?);
         }
@@ -787,6 +797,98 @@ fn equality_change_to_delete_spec(
             content_size_in_bytes: None,
         },
     )
+}
+
+/// Read and parse a NovaRocks COW UPDATE sidecar JSON document. The
+/// sidecar is written by `CowUpdateCommit` next to the snapshot's
+/// metadata directory and lists the old/new data files plus the row
+/// IDs touched by the UPDATE.
+async fn read_mutation_sidecar(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+) -> Result<crate::connector::iceberg::commit::MutationSidecar, String> {
+    let bytes = file_io
+        .new_input(path)
+        .map_err(|e| format!("open mutation sidecar input failed: {e}"))?
+        .read()
+        .await
+        .map_err(|e| format!("read mutation sidecar failed: {e}"))?;
+    serde_json::from_slice::<crate::connector::iceberg::commit::MutationSidecar>(bytes.as_ref())
+        .map_err(|e| format!("parse mutation sidecar failed: {e}"))
+}
+
+/// Read every COW UPDATE old data file recorded in `cow_updates` and
+/// return their row content as `RecordBatch`es. The MV refresh path
+/// feeds these to `execute_query_for_mv_incremental_deletes` so the MV
+/// SELECT projects the pre-update rows; the corresponding new-row
+/// projection comes from the COW snapshot's added data files (already
+/// surfaced as `batch.inserts` by `collect_files`).
+fn scan_cow_update_old_rows(
+    base_table: &iceberg::table::Table,
+    cow_updates: &[CowUpdateRef],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use crate::connector::iceberg::catalog::registry::block_on_iceberg;
+
+    if cow_updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file_io = base_table.file_io();
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+
+    let mut old_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for cow_update in cow_updates {
+        let sidecar = block_on_iceberg(read_mutation_sidecar(file_io, &cow_update.sidecar_path))
+            .map_err(|e| {
+            format!(
+                "scan_cow_update_old_rows: block_on_iceberg for sidecar at {}: {e}",
+                cow_update.sidecar_path
+            )
+        })??;
+        for file in sidecar.touched_data_files {
+            old_paths.insert(file.old_file);
+        }
+    }
+
+    let mut out = Vec::new();
+    for path in old_paths {
+        let normalized = normalize_delete_projection_path(&path, object_store_config)
+            .map_err(|e| format!("normalize COW UPDATE old file `{path}`: {e}"))?;
+        let batches = read_full_data_file(&normalized, &factory)
+            .map_err(|e| format!("read COW UPDATE old file `{path}`: {e}"))?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
+fn read_full_data_file(
+    path: &str,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let reader = factory
+        .open_with_len(path, None)
+        .map_err(|e| format!("open data file {path} for COW UPDATE old-row scan: {e}"))?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
+        .map_err(|e| format!("read parquet metadata for {path}: {e}"))?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("build parquet reader for {path}: {e}"))?;
+    let mut out = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| format!("read parquet batch for {path}: {e}"))?;
+        if batch.num_rows() > 0 {
+            out.push(batch);
+        }
+    }
+    Ok(out)
 }
 
 /// Build a filesystem factory that can read both data files and
@@ -944,6 +1046,17 @@ async fn collect_files(
                         ))
                     })?
                     .clone();
+                // The COW snapshot's data manifests contain the rewritten
+                // (replacement) data files added by the UPDATE. Treat them
+                // as fresh inserts for MV refresh — the materializer pairs
+                // them with the recorded old rows by reading the sidecar.
+                collect_added_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                )
+                .await?;
                 cow_updates.push(CowUpdateRef {
                     snapshot_id,
                     sidecar_path,
