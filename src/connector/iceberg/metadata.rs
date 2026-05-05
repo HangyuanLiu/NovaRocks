@@ -256,9 +256,17 @@ impl ScanOp for IcebergMetadataScanOp {
                     self.cfg.batch_size,
                 )?
             }
-            IcebergMetadataTableType::History
-            | IcebergMetadataTableType::Refs
-            | IcebergMetadataTableType::Partitions => {
+            IcebergMetadataTableType::History => {
+                let rows = load_history_rows(&self.cfg)?;
+                build_history_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
+            }
+            IcebergMetadataTableType::Refs | IcebergMetadataTableType::Partitions => {
                 return Err(format!(
                     "iceberg metadata table {:?} is not implemented yet",
                     self.cfg.metadata_table_type
@@ -1099,6 +1107,87 @@ where
     Ok(Arc::new(builder.finish()))
 }
 
+#[derive(Clone, Debug)]
+struct HistoryMetadataRow {
+    made_current_at_micros: i64,
+    snapshot_id: i64,
+    parent_id: Option<i64>,
+    is_current_ancestor: bool,
+}
+
+#[derive(Deserialize)]
+struct RawHistoryMetadataRow {
+    made_current_at_micros: i64,
+    snapshot_id: i64,
+    parent_id: Option<i64>,
+    is_current_ancestor: bool,
+}
+
+impl From<RawHistoryMetadataRow> for HistoryMetadataRow {
+    fn from(raw: RawHistoryMetadataRow) -> Self {
+        Self {
+            made_current_at_micros: raw.made_current_at_micros,
+            snapshot_id: raw.snapshot_id,
+            parent_id: raw.parent_id,
+            is_current_ancestor: raw.is_current_ancestor,
+        }
+    }
+}
+
+fn load_history_rows(
+    cfg: &IcebergMetadataScanConfig,
+) -> Result<Vec<HistoryMetadataRow>, String> {
+    let payload = scan_metadata(
+        IcebergMetadataTableType::History.as_jvm_scanner_type(),
+        &cfg.serialized_table,
+        "",
+        "",
+        cfg.load_column_stats,
+    )?;
+    let rows: Vec<RawHistoryMetadataRow> = serde_json::from_slice(&payload)
+        .map_err(|e| format!("parse JVM iceberg history metadata rows failed: {e}"))?;
+    Ok(rows.into_iter().map(HistoryMetadataRow::from).collect())
+}
+
+fn build_history_chunks(
+    rows: &[HistoryMetadataRow],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_history_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+}
+
+fn build_history_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[HistoryMetadataRow],
+) -> Result<ArrayRef, String> {
+    use arrow::array::BooleanArray;
+    match column.name.as_str() {
+        "made_current_at" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.made_current_at_micros).collect::<Vec<_>>(),
+        ))),
+        "snapshot_id" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.snapshot_id).collect::<Vec<_>>(),
+        ))),
+        "parent_id" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.parent_id).collect::<Vec<_>>(),
+        ))),
+        "is_current_ancestor" => Ok(Arc::new(BooleanArray::from(
+            rows.iter().map(|r| r.is_current_ancestor).collect::<Vec<_>>(),
+        ))),
+        other => Err(format!("unsupported iceberg history metadata column: {}", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1267,6 +1356,48 @@ mod tests {
         let (key_field, value_field) = map.entries_fields();
         assert_eq!(key_field.name(), "key");
         assert_eq!(value_field.name(), "value");
+    }
+
+    #[test]
+    fn test_build_history_arrays_basic_shapes() {
+        use super::HistoryMetadataRow;
+        use arrow::array::BooleanArray;
+        let rows = vec![
+            HistoryMetadataRow {
+                made_current_at_micros: 1_700_000_000_000_000,
+                snapshot_id: 1,
+                parent_id: None,
+                is_current_ancestor: true,
+            },
+            HistoryMetadataRow {
+                made_current_at_micros: 1_700_000_000_000_001,
+                snapshot_id: 2,
+                parent_id: Some(1),
+                is_current_ancestor: false,
+            },
+        ];
+        let bool_col = super::IcebergMetadataOutputColumn {
+            name: "is_current_ancestor".into(),
+            slot_id: SlotId::new(1),
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let arr = super::build_history_array(&bool_col, &rows).unwrap();
+        let bools = arr.as_any().downcast_ref::<BooleanArray>().expect("BooleanArray");
+        assert_eq!(bools.len(), 2);
+        assert!(bools.value(0));
+        assert!(!bools.value(1));
+
+        let parent_col = super::IcebergMetadataOutputColumn {
+            name: "parent_id".into(),
+            slot_id: SlotId::new(2),
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let arr = super::build_history_array(&parent_col, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.is_null(0));
+        assert!(!arr.is_null(1));
     }
 
     #[test]

@@ -87,6 +87,8 @@ public final class IcebergMetadataBridge {
                 return OBJECT_MAPPER.writeValueAsBytes(scanManifests(table, fileIO));
             case "SNAPSHOTS":
                 return OBJECT_MAPPER.writeValueAsBytes(scanSnapshots(table));
+            case "HISTORY":
+                return OBJECT_MAPPER.writeValueAsBytes(scanHistory(table));
             default:
                 throw new IllegalArgumentException("unsupported iceberg metadata table type: " + scannerType);
         }
@@ -227,6 +229,33 @@ public final class IcebergMetadataBridge {
                     .map(e -> new StringStringEntry(e.getKey(), e.getValue()))
                     .collect(Collectors.toList());
             }
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<HistoryMetadataRow> scanHistory(Table table) {
+        List<HistoryMetadataRow> rows = new ArrayList<>();
+        if (table.history() == null) {
+            return rows;
+        }
+        // Build the set of ancestor snapshot ids of the current snapshot for is_current_ancestor.
+        java.util.Set<Long> ancestors = new java.util.HashSet<>();
+        if (table.currentSnapshot() != null) {
+            org.apache.iceberg.Snapshot s = table.currentSnapshot();
+            while (s != null) {
+                ancestors.add(s.snapshotId());
+                Long parent = s.parentId();
+                s = parent == null ? null : table.snapshot(parent);
+            }
+        }
+        for (org.apache.iceberg.HistoryEntry entry : table.history()) {
+            HistoryMetadataRow row = new HistoryMetadataRow();
+            row.made_current_at_micros = entry.timestampMillis() * 1000L;
+            row.snapshot_id = entry.snapshotId();
+            org.apache.iceberg.Snapshot snap = table.snapshot(entry.snapshotId());
+            row.parent_id = snap == null ? null : snap.parentId();
+            row.is_current_ancestor = ancestors.contains(entry.snapshotId());
             rows.add(row);
         }
         return rows;
@@ -466,5 +495,12 @@ public final class IcebergMetadataBridge {
             this.key = key;
             this.value = value;
         }
+    }
+
+    public static final class HistoryMetadataRow {
+        public long made_current_at_micros;
+        public long snapshot_id;
+        public Long parent_id;
+        public boolean is_current_ancestor;
     }
 }
