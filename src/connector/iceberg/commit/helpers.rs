@@ -43,6 +43,30 @@ pub fn metadata_dir(table: &iceberg::table::Table) -> String {
     format!("{}/metadata", table.metadata().location())
 }
 
+/// Read the current snapshot's `total-records` summary value.
+///
+/// `Ok(None)` means either the table has no current snapshot or the current
+/// snapshot predates summary totals. A malformed value is an error because
+/// write actions must not guess table-level metrics.
+pub fn current_snapshot_total_records(
+    metadata: &iceberg::spec::TableMetadata,
+) -> Result<Option<u64>, String> {
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(None);
+    };
+    let Some(value) = snapshot
+        .summary()
+        .additional_properties
+        .get("total-records")
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|e| format!("invalid current snapshot total-records `{value}`: {e}"))
+}
+
 /// Write a manifest list (avro) to `out_path` containing the supplied entries.
 /// Caller is responsible for `abort_handle.record_manifest(out_path)` before
 /// invoking this function so that a later failure can clean up.

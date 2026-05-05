@@ -1,0 +1,609 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! `RewriteDataFilesCommit` — the OPTIMIZE whole-table rewrite commit-action.
+//!
+//! The action replaces every current live data file with the compacted data
+//! files produced by the pipeline and deletes every current live delete file,
+//! so the resulting snapshot has `summary.operation = "replace"` and a new
+//! manifest list containing only the rewrite's deleted/added manifests.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use iceberg::io::FileIO;
+use iceberg::spec::{
+    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
+    ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
+    SnapshotRetention, Summary,
+};
+use iceberg::table::Table;
+use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
+use iceberg::{TableRequirement, TableUpdate};
+use uuid::Uuid;
+
+use super::abort::AbortLog;
+use super::action::{CommitCtx, IcebergCommitAction};
+use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::overwrite::write_added_data_manifest;
+use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+
+pub struct RewriteDataFilesCommit;
+
+#[async_trait]
+impl IcebergCommitAction for RewriteDataFilesCommit {
+    async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
+        let written = ctx.collector.take_written_files()?;
+        for f in &written {
+            if f.content != DataContentType::Data {
+                return Err(format!(
+                    "RewriteDataFilesCommit received {:?} content; expected Data only",
+                    f.content
+                ));
+            }
+        }
+
+        let row_lineage_first_row_id =
+            match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
+                IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
+                IcebergWriteMode::LegacyPositionDeletes => None,
+            };
+        let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
+            sum.checked_add(f.record_count)
+                .ok_or_else(|| "row-lineage rewrite added row count overflow".to_string())
+        })?;
+
+        let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let action = RewriteDataFilesTxnAction {
+            written,
+            commit_uuid: ctx.commit_uuid,
+            file_io: ctx.file_io.clone(),
+            partition_spec: ctx.collector.partition_spec.clone(),
+            schema_id: ctx.table.metadata().current_schema_id(),
+            abort_handle: ctx.abort_handle.clone(),
+            manifest_paths_out: manifest_paths_out.clone(),
+            row_lineage_first_row_id,
+            row_lineage_added_rows,
+        };
+
+        let tx = Transaction::new(ctx.table);
+        let tx = action
+            .apply(tx)
+            .map_err(|e| format!("RewriteDataFiles apply failed: {e}"))?;
+        let table_after = tx
+            .commit(ctx.catalog)
+            .await
+            .map_err(|e| format!("RewriteDataFiles commit failed: {e}"))?;
+        let new_snapshot_id = table_after
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(0);
+        let written_manifest_paths = manifest_paths_out
+            .lock()
+            .expect("manifest_paths_out poisoned")
+            .clone();
+        Ok(CommitOutcome {
+            new_snapshot_id,
+            written_manifest_paths,
+        })
+    }
+}
+
+struct RewriteDataFilesTxnAction {
+    written: Vec<WrittenFile>,
+    commit_uuid: Uuid,
+    file_io: FileIO,
+    partition_spec: PartitionSpecRef,
+    schema_id: i32,
+    abort_handle: Arc<AbortLog>,
+    manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    row_lineage_first_row_id: Option<u64>,
+    row_lineage_added_rows: u64,
+}
+
+#[async_trait]
+impl TransactionAction for RewriteDataFilesTxnAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let m = table.metadata();
+        let format_version = m.format_version();
+        if format_version == FormatVersion::V1 {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                "RewriteDataFilesCommit does not support V1 tables",
+            ));
+        }
+
+        let new_seq = m.last_sequence_number() + 1;
+        let new_snapshot_id = generate_snapshot_id();
+        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let metadata_dir = metadata_dir(table);
+        let live = enumerate_live_files(table, &self.file_io)
+            .await
+            .map_err(to_iceberg_unexpected)?;
+
+        if self.written.is_empty() && live.data_files.is_empty() && live.delete_files.is_empty() {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
+
+        let mut new_manifests = Vec::new();
+        for (idx, (spec_id, entries)) in group_by_partition_spec(&live.data_files)
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!(
+                "{metadata_dir}/{}-rewrite-deleted-data-{idx}.avro",
+                self.commit_uuid
+            );
+            self.record_manifest_path(path.clone());
+            let mf = write_deleted_manifest(
+                &self.file_io,
+                &path,
+                entries,
+                ManifestContentType::Data,
+                partition_spec_by_id(m, spec_id)?,
+                m.current_schema().clone(),
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(mf);
+        }
+
+        if !self.written.is_empty() {
+            let path = format!(
+                "{metadata_dir}/{}-rewrite-added-data-0.avro",
+                self.commit_uuid
+            );
+            self.record_manifest_path(path.clone());
+            let mf = write_added_data_manifest(
+                &self.file_io,
+                &path,
+                &self.written,
+                self.partition_spec.clone(),
+                m.current_schema().clone(),
+                new_seq,
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(mf);
+        }
+
+        for (idx, (spec_id, entries)) in group_by_partition_spec(&live.delete_files)
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!(
+                "{metadata_dir}/{}-rewrite-deleted-delete-{idx}.avro",
+                self.commit_uuid
+            );
+            self.record_manifest_path(path.clone());
+            let mf = write_deleted_manifest(
+                &self.file_io,
+                &path,
+                entries,
+                ManifestContentType::Deletes,
+                partition_spec_by_id(m, spec_id)?,
+                m.current_schema().clone(),
+                new_snapshot_id,
+                format_version,
+            )
+            .await
+            .map_err(to_iceberg_unexpected)?;
+            new_manifests.push(mf);
+        }
+
+        let manifest_list_path = format!(
+            "{metadata_dir}/snap-{}-{}.avro",
+            new_snapshot_id, self.commit_uuid
+        );
+        self.record_manifest_path(manifest_list_path.clone());
+        let manifest_list_next_row_id = write_manifest_list(
+            &self.file_io,
+            &manifest_list_path,
+            new_manifests,
+            new_snapshot_id,
+            parent_snapshot_id,
+            new_seq,
+            format_version,
+            self.row_lineage_first_row_id,
+        )
+        .await
+        .map_err(to_iceberg_unexpected)?;
+        if let Some(first_row_id) = self.row_lineage_first_row_id {
+            let expected_next_row_id = first_row_id
+                .checked_add(self.row_lineage_added_rows)
+                .ok_or_else(|| {
+                    to_iceberg_unexpected(format!(
+                        "Row ID overflow when computing rewrite row lineage range: first_row_id={first_row_id}, added_rows={}",
+                        self.row_lineage_added_rows
+                    ))
+                })?;
+            if manifest_list_next_row_id != Some(expected_next_row_id) {
+                return Err(to_iceberg_unexpected(format!(
+                    "Manifest list row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
+                )));
+            }
+        }
+
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: rewrite_summary(&self.written, &live),
+        };
+        let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(summary)
+                .with_schema_id(self.schema_id)
+                .with_row_range(first_row_id, self.row_lineage_added_rows)
+                .build()
+        } else {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(summary)
+                .with_schema_id(self.schema_id)
+                .build()
+        };
+
+        Ok(ActionCommit::new(
+            vec![
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference {
+                        snapshot_id: new_snapshot_id,
+                        retention: SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
+                    },
+                },
+            ],
+            vec![
+                TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: m.current_schema_id(),
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: m.default_partition_spec_id(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: parent_snapshot_id,
+                },
+            ],
+        ))
+    }
+}
+
+impl RewriteDataFilesTxnAction {
+    fn record_manifest_path(&self, path: String) {
+        self.abort_handle.record_manifest(path.clone());
+        self.manifest_paths_out
+            .lock()
+            .expect("manifest_paths_out poisoned")
+            .push(path);
+    }
+}
+
+struct LiveManifestEntry {
+    data_file: DataFile,
+    partition_spec_id: i32,
+    sequence_number: i64,
+    file_sequence_number: Option<i64>,
+}
+
+#[derive(Default)]
+struct LiveFiles {
+    data_files: Vec<LiveManifestEntry>,
+    delete_files: Vec<LiveManifestEntry>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn count_current_live_files(
+    table: &Table,
+    file_io: &FileIO,
+) -> Result<(i64, i64), String> {
+    let live = enumerate_live_files(table, file_io).await?;
+    Ok((
+        i64::try_from(live.data_files.len())
+            .map_err(|_| "live data file count overflow".to_string())?,
+        i64::try_from(live.delete_files.len())
+            .map_err(|_| "live delete file count overflow".to_string())?,
+    ))
+}
+
+async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFiles, String> {
+    let mut out = LiveFiles::default();
+    let m = table.metadata();
+    let snapshot = match m.current_snapshot() {
+        Some(s) => s,
+        None => return Ok(out),
+    };
+    let list = snapshot
+        .load_manifest_list(file_io, m)
+        .await
+        .map_err(|e| format!("load manifest list failed: {e}"))?;
+
+    for mf in list.entries() {
+        let manifest = mf
+            .load_manifest(file_io)
+            .await
+            .map_err(|e| format!("load manifest {} failed: {e}", mf.manifest_path))?;
+        for entry in manifest.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let live = LiveManifestEntry {
+                data_file: entry.data_file().clone(),
+                partition_spec_id: mf.partition_spec_id,
+                sequence_number: entry.sequence_number().unwrap_or(mf.sequence_number),
+                file_sequence_number: entry.file_sequence_number,
+            };
+            match mf.content {
+                ManifestContentType::Data => out.data_files.push(live),
+                ManifestContentType::Deletes => out.delete_files.push(live),
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_deleted_manifest(
+    file_io: &FileIO,
+    out_path: &str,
+    entries: Vec<&LiveManifestEntry>,
+    content: ManifestContentType,
+    partition_spec: PartitionSpecRef,
+    schema: SchemaRef,
+    new_snapshot_id: i64,
+    format_version: FormatVersion,
+) -> Result<ManifestFile, String> {
+    let output_file = file_io
+        .new_output(out_path)
+        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
+    let builder = ManifestWriterBuilder::new(
+        output_file,
+        Some(new_snapshot_id),
+        None,
+        schema,
+        (*partition_spec).clone(),
+    );
+    let mut writer = match (format_version, content) {
+        (FormatVersion::V2, ManifestContentType::Data) => builder.build_v2_data(),
+        (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
+        (FormatVersion::V2, ManifestContentType::Deletes) => builder.build_v2_deletes(),
+        (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
+        (FormatVersion::V1, _) => return Err("phase 1 does not support V1 tables".to_string()),
+    };
+    for entry in entries {
+        writer
+            .add_delete_file(
+                entry.data_file.clone(),
+                entry.sequence_number,
+                entry.file_sequence_number,
+            )
+            .map_err(|e| format!("ManifestWriter::add_delete_file failed: {e}"))?;
+    }
+    let manifest_file = writer
+        .write_manifest_file()
+        .await
+        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
+    debug_assert_eq!(manifest_file.content, content);
+    Ok(manifest_file)
+}
+
+fn group_by_partition_spec(
+    entries: &[LiveManifestEntry],
+) -> BTreeMap<i32, Vec<&LiveManifestEntry>> {
+    let mut grouped = BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(entry.partition_spec_id)
+            .or_insert_with(Vec::new)
+            .push(entry);
+    }
+    grouped
+}
+
+fn partition_spec_by_id(
+    metadata: &iceberg::spec::TableMetadata,
+    spec_id: i32,
+) -> iceberg::Result<PartitionSpecRef> {
+    metadata
+        .partition_spec_by_id(spec_id)
+        .cloned()
+        .ok_or_else(|| {
+            to_iceberg_unexpected(format!(
+                "RewriteDataFilesCommit references unknown partition spec id {spec_id}"
+            ))
+        })
+}
+
+fn rewrite_summary(added: &[WrittenFile], live: &LiveFiles) -> HashMap<String, String> {
+    let added_records = added.iter().map(|f| f.record_count).sum::<u64>();
+    let deleted_records = live
+        .data_files
+        .iter()
+        .map(|f| f.data_file.record_count())
+        .sum::<u64>();
+    let removed_position_delete_files = live
+        .delete_files
+        .iter()
+        .filter(|f| f.data_file.content_type() == DataContentType::PositionDeletes)
+        .count();
+    let removed_equality_delete_files = live
+        .delete_files
+        .iter()
+        .filter(|f| f.data_file.content_type() == DataContentType::EqualityDeletes)
+        .count();
+    let removed_position_deletes = live
+        .delete_files
+        .iter()
+        .filter(|f| f.data_file.content_type() == DataContentType::PositionDeletes)
+        .map(|f| f.data_file.record_count())
+        .sum::<u64>();
+    let removed_equality_deletes = live
+        .delete_files
+        .iter()
+        .filter(|f| f.data_file.content_type() == DataContentType::EqualityDeletes)
+        .map(|f| f.data_file.record_count())
+        .sum::<u64>();
+    let mut p = HashMap::new();
+    p.insert("added-data-files".to_string(), added.len().to_string());
+    p.insert(
+        "deleted-data-files".to_string(),
+        live.data_files.len().to_string(),
+    );
+    p.insert("added-records".to_string(), added_records.to_string());
+    p.insert("deleted-records".to_string(), deleted_records.to_string());
+    p.insert("total-records".to_string(), added_records.to_string());
+    p.insert(
+        "removed-delete-files".to_string(),
+        live.delete_files.len().to_string(),
+    );
+    p.insert(
+        "removed-position-delete-files".to_string(),
+        removed_position_delete_files.to_string(),
+    );
+    p.insert(
+        "removed-equality-delete-files".to_string(),
+        removed_equality_delete_files.to_string(),
+    );
+    p.insert(
+        "removed-position-deletes".to_string(),
+        removed_position_deletes.to_string(),
+    );
+    p.insert(
+        "removed-equality-deletes".to_string(),
+        removed_equality_deletes.to_string(),
+    );
+    p.insert("added-delete-files".to_string(), "0".to_string());
+    p
+}
+
+fn to_iceberg_unexpected(s: String) -> iceberg::Error {
+    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
+
+    use super::*;
+
+    #[test]
+    fn rewrite_summary_reports_replace_counts() {
+        let added = vec![
+            test_written_data_file("file:///x/new-1.parquet", 7),
+            test_written_data_file("file:///x/new-2.parquet", 11),
+        ];
+        let live = LiveFiles {
+            data_files: vec![test_live_entry(
+                DataContentType::Data,
+                "file:///x/old.parquet",
+                23,
+            )],
+            delete_files: vec![
+                test_live_entry(
+                    DataContentType::PositionDeletes,
+                    "file:///x/delete-1.parquet",
+                    3,
+                ),
+                test_live_entry(
+                    DataContentType::EqualityDeletes,
+                    "file:///x/delete-2.parquet",
+                    5,
+                ),
+            ],
+        };
+
+        let summary = rewrite_summary(&added, &live);
+
+        assert_eq!(summary["added-data-files"], "2");
+        assert_eq!(summary["deleted-data-files"], "1");
+        assert_eq!(summary["added-records"], "18");
+        assert_eq!(summary["deleted-records"], "23");
+        assert_eq!(summary["total-records"], "18");
+        assert_eq!(summary["removed-delete-files"], "2");
+        assert_eq!(summary["removed-position-delete-files"], "1");
+        assert_eq!(summary["removed-equality-delete-files"], "1");
+        assert_eq!(summary["removed-position-deletes"], "3");
+        assert_eq!(summary["removed-equality-deletes"], "5");
+        assert_eq!(summary["added-delete-files"], "0");
+    }
+
+    fn test_written_data_file(path: &str, record_count: u64) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 1024,
+            split_offsets: vec![4],
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+        }
+    }
+
+    fn test_live_entry(
+        content: DataContentType,
+        path: &str,
+        record_count: u64,
+    ) -> LiveManifestEntry {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(record_count)
+            .file_size_in_bytes(1024);
+        if content == DataContentType::EqualityDeletes {
+            builder.equality_ids(Some(vec![1]));
+        }
+        if content == DataContentType::PositionDeletes {
+            builder.referenced_data_file(Some("file:///x/old.parquet".to_string()));
+        }
+        LiveManifestEntry {
+            data_file: builder.build().unwrap(),
+            partition_spec_id: 0,
+            sequence_number: 1,
+            file_sequence_number: Some(1),
+        }
+    }
+}

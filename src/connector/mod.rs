@@ -32,6 +32,8 @@ pub(crate) use iceberg::catalog::{
 };
 #[cfg(test)]
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
+#[cfg(not(test))]
+pub(crate) use iceberg::compact::spawn_optimize_worker as spawn_iceberg_optimize_worker;
 pub(crate) use starrocks::managed::ddl::truncate_managed_table;
 pub(crate) use starrocks::managed::erase::spawn_erase_worker as spawn_managed_erase_worker;
 #[cfg(test)]

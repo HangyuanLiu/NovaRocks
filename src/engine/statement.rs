@@ -566,6 +566,20 @@ pub(crate) struct AlterIcebergSchemaStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AlterTableOptimizeStmt {
+    pub(crate) table: ObjectName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShowAlterTableOptimizeStmt {
+    pub(crate) catalog: Option<String>,
+    pub(crate) database: Option<String>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) order_by_create_time_desc: bool,
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergSchemaChange {
     AddColumn {
         name: String,
@@ -583,6 +597,182 @@ pub(crate) enum IcebergSchemaChange {
         name: String,
         new_type: SqlType,
     },
+}
+
+pub(crate) fn looks_like_alter_table_optimize(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "OPTIMIZE")
+}
+
+pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    parser.parse_keyword(Keyword::SHOW)
+        && parser.parse_keyword(Keyword::ALTER)
+        && parser.parse_keyword(Keyword::TABLE)
+        && peek_token_word_eq(&parser, "OPTIMIZE")
+}
+
+pub(crate) fn parse_alter_table_optimize_sql(sql: &str) -> Result<AlterTableOptimizeStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE OPTIMIZE: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+    expect_word(&mut parser, "OPTIMIZE")?;
+    if peek_token_word_eq(&parser, "PARTITION") {
+        return Err("OPTIMIZE only supports whole-table compaction".to_string());
+    }
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|err| {
+        if peek_token_word_eq(&parser, "PARTITION") {
+            "OPTIMIZE only supports whole-table compaction".to_string()
+        } else {
+            format!("unsupported trailing ALTER TABLE OPTIMIZE tokens: {err}")
+        }
+    })?;
+    Ok(AlterTableOptimizeStmt { table })
+}
+
+pub(crate) fn parse_show_alter_table_optimize_sql(
+    sql: &str,
+) -> Result<ShowAlterTableOptimizeStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE: {e}"))?;
+    parser
+        .expect_keyword(Keyword::SHOW)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    expect_word(&mut parser, "OPTIMIZE")?;
+
+    let (catalog, database) =
+        if parser.parse_keyword(Keyword::FROM) || parser.parse_keyword(Keyword::IN) {
+            let mut name = crate::sql::parser::dialect::convert_object_name(
+                parser
+                    .parse_object_name(false)
+                    .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE namespace: {e}"))?,
+            )?;
+            name.parts = name
+                .parts
+                .into_iter()
+                .map(|part| normalize_identifier(&part))
+                .collect::<Result<Vec<_>, _>>()?;
+            match name.parts.as_slice() {
+                [database] => (None, Some(database.clone())),
+                [catalog, database] => (Some(catalog.clone()), Some(database.clone())),
+                _ => {
+                    return Err(
+                        "SHOW ALTER TABLE OPTIMIZE FROM only supports db or catalog.db".to_string(),
+                    );
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+    let table_name = if parser.parse_keyword(Keyword::WHERE) {
+        let ident = parser
+            .parse_identifier()
+            .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE WHERE column: {e}"))?;
+        if !ident.value.eq_ignore_ascii_case("TableName") {
+            return Err(
+                "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
+            );
+        }
+        if !parser.consume_token(&Token::Eq) {
+            return Err(
+                "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
+            );
+        }
+        let value = parser
+            .parse_literal_string()
+            .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE TableName filter: {e}"))?;
+        Some(normalize_identifier(&value)?)
+    } else {
+        None
+    };
+
+    let mut order_by_create_time_desc = false;
+    if parser.parse_keyword(Keyword::ORDER) {
+        parser
+            .expect_keyword(Keyword::BY)
+            .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE ORDER BY: {e}"))?;
+        let ident = parser
+            .parse_identifier()
+            .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE ORDER BY column: {e}"))?;
+        if !ident.value.eq_ignore_ascii_case("CreateTime") {
+            return Err("SHOW ALTER TABLE OPTIMIZE only supports ORDER BY CreateTime".to_string());
+        }
+        if parser.parse_keyword(Keyword::DESC) {
+            order_by_create_time_desc = true;
+        } else {
+            let _ = parser.parse_keyword(Keyword::ASC);
+        }
+    }
+
+    let limit = if parser.parse_keyword(Keyword::LIMIT) {
+        let token = parser.next_token();
+        let value = match token.token {
+            Token::Number(value, false) => value,
+            other => {
+                return Err(format!(
+                    "SHOW ALTER TABLE OPTIMIZE LIMIT expects number, got {other}"
+                ));
+            }
+        };
+        Some(
+            value
+                .parse::<usize>()
+                .map_err(|e| format!("parse SHOW ALTER TABLE OPTIMIZE LIMIT: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser)?;
+    Ok(ShowAlterTableOptimizeStmt {
+        catalog,
+        database,
+        table_name,
+        order_by_create_time_desc,
+        limit,
+    })
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD FILES FROM ...
@@ -956,6 +1146,37 @@ mod tests {
                 vec![Literal::Int(4), Literal::String("A".to_string())],
             ]
         );
+    }
+
+    #[test]
+    fn parse_alter_table_optimize_accepts_three_part_table() {
+        let stmt = super::parse_alter_table_optimize_sql("ALTER TABLE ice.db.orders OPTIMIZE")
+            .expect("parse");
+
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+    }
+
+    #[test]
+    fn parse_alter_table_optimize_rejects_partition_clause() {
+        let err = super::parse_alter_table_optimize_sql(
+            "ALTER TABLE ice.db.orders OPTIMIZE PARTITION (p1)",
+        )
+        .expect_err("partition should fail");
+
+        assert!(err.contains("OPTIMIZE only supports whole-table compaction"));
+    }
+
+    #[test]
+    fn parse_show_alter_table_optimize_extracts_filter() {
+        let stmt = super::parse_show_alter_table_optimize_sql(
+            "SHOW ALTER TABLE OPTIMIZE FROM ns WHERE TableName = 'orders' ORDER BY CreateTime DESC LIMIT 1",
+        )
+        .expect("parse");
+
+        assert_eq!(stmt.database.as_deref(), Some("ns"));
+        assert_eq!(stmt.table_name.as_deref(), Some("orders"));
+        assert!(stmt.order_by_create_time_desc);
+        assert_eq!(stmt.limit, Some(1));
     }
 
     #[test]

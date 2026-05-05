@@ -226,7 +226,7 @@ pub(crate) fn data_file_to_written_file(
     })
 }
 
-fn run_select_to_chunks(
+pub(crate) fn run_select_to_chunks(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     query: &sqlparser::ast::Query,

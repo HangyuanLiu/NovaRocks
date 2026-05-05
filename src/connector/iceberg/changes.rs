@@ -404,7 +404,9 @@ fn validate_replace_snapshot(
         .get("deleted-data-files")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    if added <= 0 || removed <= 0 {
+    let zero_row_rewrite =
+        matches!((snap_records, parent_records), (Some(0), Some(0))) && added == 0 && removed > 0;
+    if !zero_row_rewrite && (added <= 0 || removed <= 0) {
         return Err(ChangeError::ReplaceValidationFailed {
             snapshot_id: snapshot.snapshot_id(),
             reason: format!(
@@ -1161,6 +1163,21 @@ mod tests {
         ]
     }
 
+    fn replace_props_with_delete_counts(
+        total_records: i64,
+        added_files: i64,
+        deleted_files: i64,
+        added_delete_files: i64,
+        deleted_delete_files: i64,
+    ) -> Vec<(&'static str, String)> {
+        let mut props = replace_props(total_records, added_files, deleted_files);
+        props.extend([
+            ("added-delete-files", added_delete_files.to_string()),
+            ("removed-delete-files", deleted_delete_files.to_string()),
+        ]);
+        props
+    }
+
     fn test_object_store_config() -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: "http://127.0.0.1:9000".to_string(),
@@ -1254,6 +1271,67 @@ mod tests {
         let s = snap(2, Some(1), Operation::Replace, &props, 0);
         let action = classify_snapshot(&s, Some(&parent)).expect("ok");
         assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_delete_eliminating_replace_compaction() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props_with_delete_counts(100, 3, 5, 0, 2);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_rewrite_after_delete_elimination() {
+        let parent = snap(1, None, Operation::Delete, &[("total-records", "18")], 0);
+        let mut owned = replace_props_with_delete_counts(18, 2, 1, 0, 2);
+        owned.extend([
+            ("added-records", "18".to_string()),
+            ("deleted-records", "23".to_string()),
+        ]);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_zero_row_rewrite_after_delete_elimination() {
+        let parent = snap(1, None, Operation::Delete, &[("total-records", "0")], 0);
+        let mut owned = replace_props_with_delete_counts(0, 0, 1, 0, 1);
+        owned.extend([
+            ("added-records", "0".to_string()),
+            ("deleted-records", "23".to_string()),
+        ]);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_rejects_replace_that_changes_total_records() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props_with_delete_counts(101, 3, 5, 0, 2);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let err = classify_snapshot(&s, Some(&parent)).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("total-records"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

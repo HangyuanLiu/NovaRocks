@@ -59,7 +59,9 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::position_delete_writer::PositionDeleteGroup;
 use super::puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
@@ -261,6 +263,24 @@ impl TransactionAction for RowDeltaDvTxnAction {
         .await
         .map_err(to_iceberg_unexpected)?;
 
+        let added_position_deletes = written_dvs.iter().try_fold(0u64, |sum, dv| {
+            sum.checked_add(dv.cardinality)
+                .ok_or_else(|| to_iceberg_unexpected("DV cardinality overflow".to_string()))
+        })?;
+        let newly_deleted_records = added_position_deletes
+            .checked_sub(index.replaced_delete_records)
+            .ok_or_else(|| {
+                to_iceberg_unexpected(format!(
+                    "DV delete summary underflow: added_position_deletes={added_position_deletes}, replaced_position_deletes={}",
+                    index.replaced_delete_records
+                ))
+            })?;
+        let total_records = dv_total_records(
+            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
+            newly_deleted_records,
+        )
+        .map_err(to_iceberg_unexpected)?;
+
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(parent_snapshot_id)
@@ -269,7 +289,13 @@ impl TransactionAction for RowDeltaDvTxnAction {
             .with_manifest_list(manifest_list_path)
             .with_summary(Summary {
                 operation: Operation::Delete,
-                additional_properties: dv_summary(&written_dvs),
+                additional_properties: dv_summary(
+                    &written_dvs,
+                    total_records,
+                    newly_deleted_records,
+                    index.replaced_delete_files,
+                    index.replaced_delete_records,
+                ),
             })
             .with_schema_id(self.schema_id)
             .with_row_range(self.row_lineage_first_row_id, 0)
@@ -324,6 +350,10 @@ struct SnapshotIndex {
     /// rewritten into a new `*-row-delta-dv-existing-*.avro` so the DV
     /// lineage is preserved for unrelated data files.
     touched_delete_existing: Vec<LiveFile>,
+    /// Live DV files removed because a replacement DV was written.
+    replaced_delete_files: usize,
+    /// Position deletes already represented by removed DV files.
+    replaced_delete_records: u64,
 }
 
 async fn build_snapshot_index(
@@ -335,6 +365,8 @@ async fn build_snapshot_index(
     let mut data_files = HashMap::new();
     let mut untouched_manifests = Vec::new();
     let mut touched_delete_existing = Vec::new();
+    let mut replaced_delete_files = 0usize;
+    let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
     let snapshot = table
         .metadata()
         .current_snapshot()
@@ -412,6 +444,11 @@ async fn build_snapshot_index(
                                         file.file_path()
                                     )
                                 })?;
+                        replaced_delete_files += 1;
+                        replaced_delete_vectors
+                            .entry(referenced.clone())
+                            .or_default()
+                            .merge(&old);
                         vectors.entry(referenced).or_default().merge(&old);
                         manifest_touched = true;
                     } else {
@@ -433,10 +470,20 @@ async fn build_snapshot_index(
         }
     }
 
+    let replaced_delete_records =
+        replaced_delete_vectors
+            .values()
+            .try_fold(0u64, |sum, vector| {
+                sum.checked_add(vector.cardinality())
+                    .ok_or_else(|| "replaced DV cardinality overflow".to_string())
+            })?;
+
     Ok(SnapshotIndex {
         data_files,
         untouched_manifests,
         touched_delete_existing,
+        replaced_delete_files,
+        replaced_delete_records,
     })
 }
 
@@ -618,15 +665,61 @@ fn dv_data_file(written: &WrittenPuffinDv, referenced: &LiveFile) -> Result<Data
         .map_err(|e| format!("build DV DataFile failed: {e}"))
 }
 
-fn dv_summary(dvs: &[WrittenPuffinDv]) -> HashMap<String, String> {
+fn dv_total_records(
+    parent_total_records: Option<u64>,
+    newly_deleted_records: u64,
+) -> Result<Option<u64>, String> {
+    parent_total_records
+        .map(|parent| {
+            parent.checked_sub(newly_deleted_records).ok_or_else(|| {
+                format!(
+                    "DV delete total-records underflow: parent={parent}, deleted={newly_deleted_records}"
+                )
+            })
+        })
+        .transpose()
+}
+
+fn dv_summary(
+    dvs: &[WrittenPuffinDv],
+    total_records: Option<u64>,
+    newly_deleted_records: u64,
+    removed_delete_files: usize,
+    removed_position_deletes: u64,
+) -> HashMap<String, String> {
     let mut p = HashMap::new();
-    let total_records: u64 = dvs.iter().map(|d| d.cardinality).sum();
+    let added_position_deletes: u64 = dvs.iter().map(|d| d.cardinality).sum();
     let total_size: u64 = dvs.iter().map(|d| d.file_size_in_bytes).sum();
     p.insert("added-delete-files".to_string(), dvs.len().to_string());
     p.insert(
         "added-position-deletes".to_string(),
-        total_records.to_string(),
+        added_position_deletes.to_string(),
     );
+    if newly_deleted_records > 0 {
+        p.insert(
+            "deleted-records".to_string(),
+            newly_deleted_records.to_string(),
+        );
+    }
+    if removed_delete_files > 0 {
+        p.insert(
+            "removed-delete-files".to_string(),
+            removed_delete_files.to_string(),
+        );
+        p.insert(
+            "removed-position-delete-files".to_string(),
+            removed_delete_files.to_string(),
+        );
+    }
+    if removed_position_deletes > 0 {
+        p.insert(
+            "removed-position-deletes".to_string(),
+            removed_position_deletes.to_string(),
+        );
+    }
+    if let Some(total_records) = total_records {
+        p.insert("total-records".to_string(), total_records.to_string());
+    }
     p.insert("added-files-size".to_string(), total_size.to_string());
     p
 }
@@ -735,6 +828,38 @@ mod tests {
         assert_eq!(grouped[&2][0].referenced_data_file, "file:///x/new.parquet");
     }
 
+    #[test]
+    fn dv_summary_updates_total_records_for_new_deletes() {
+        let dvs = vec![test_written_dv_with_cardinality(
+            "file:///x/dv-new.puffin",
+            "file:///x/data.parquet",
+            4,
+        )];
+        let total_records = dv_total_records(Some(10), 4).unwrap();
+        let summary = dv_summary(&dvs, total_records, 4, 0, 0);
+
+        assert_eq!(summary["added-position-deletes"], "4");
+        assert_eq!(summary["deleted-records"], "4");
+        assert_eq!(summary["total-records"], "6");
+    }
+
+    #[test]
+    fn dv_summary_counts_only_new_deletes_when_replacing_existing_dv() {
+        let dvs = vec![test_written_dv_with_cardinality(
+            "file:///x/dv-new.puffin",
+            "file:///x/data.parquet",
+            5,
+        )];
+        let total_records = dv_total_records(Some(10), 2).unwrap();
+        let summary = dv_summary(&dvs, total_records, 2, 1, 3);
+
+        assert_eq!(summary["added-position-deletes"], "5");
+        assert_eq!(summary["deleted-records"], "2");
+        assert_eq!(summary["removed-delete-files"], "1");
+        assert_eq!(summary["removed-position-deletes"], "3");
+        assert_eq!(summary["total-records"], "8");
+    }
+
     fn test_live_file(partition_spec_id: i32) -> LiveFile {
         let data_file = DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -756,10 +881,18 @@ mod tests {
     }
 
     fn test_written_dv(path: &str, referenced_data_file: &str) -> WrittenPuffinDv {
+        test_written_dv_with_cardinality(path, referenced_data_file, 1)
+    }
+
+    fn test_written_dv_with_cardinality(
+        path: &str,
+        referenced_data_file: &str,
+        cardinality: u64,
+    ) -> WrittenPuffinDv {
         WrittenPuffinDv {
             path: path.to_string(),
             referenced_data_file: referenced_data_file.to_string(),
-            cardinality: 1,
+            cardinality,
             content_offset: 4,
             content_size_in_bytes: 8,
             file_size_in_bytes: 12,

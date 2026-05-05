@@ -36,7 +36,8 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
-    generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list, write_manifest_list,
+    current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms,
+    read_base_manifest_list, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -242,9 +243,15 @@ impl TransactionAction for FastAppendV3TxnAction {
             )));
         }
 
+        let total_records = append_total_records(
+            &self.written,
+            current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
+            parent_snapshot_id.is_some(),
+        )
+        .map_err(to_iceberg_unexpected)?;
         let summary = Summary {
             operation: Operation::Append,
-            additional_properties: append_summary(&self.written),
+            additional_properties: append_summary(&self.written, total_records),
         };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
@@ -286,17 +293,36 @@ impl TransactionAction for FastAppendV3TxnAction {
     }
 }
 
-fn append_summary(written: &[WrittenFile]) -> std::collections::HashMap<String, String> {
+fn append_total_records(
+    written: &[WrittenFile],
+    parent_total_records: Option<u64>,
+    has_parent_snapshot: bool,
+) -> Result<Option<u64>, String> {
+    let added_records = written.iter().try_fold(0u64, |sum, f| {
+        sum.checked_add(f.record_count)
+            .ok_or_else(|| "append added row count overflow".to_string())
+    })?;
+    match (parent_total_records, has_parent_snapshot) {
+        (Some(parent), _) => parent
+            .checked_add(added_records)
+            .map(Some)
+            .ok_or_else(|| "append total-records overflow".to_string()),
+        (None, false) => Ok(Some(added_records)),
+        (None, true) => Ok(None),
+    }
+}
+
+fn append_summary(
+    written: &[WrittenFile],
+    total_records: Option<u64>,
+) -> std::collections::HashMap<String, String> {
     let mut p = std::collections::HashMap::new();
+    let added_records = written.iter().map(|f| f.record_count).sum::<u64>();
     p.insert("added-data-files".to_string(), written.len().to_string());
-    p.insert(
-        "added-records".to_string(),
-        written
-            .iter()
-            .map(|f| f.record_count)
-            .sum::<u64>()
-            .to_string(),
-    );
+    p.insert("added-records".to_string(), added_records.to_string());
+    if let Some(total_records) = total_records {
+        p.insert("total-records".to_string(), total_records.to_string());
+    }
     p.insert(
         "added-files-size".to_string(),
         written
@@ -314,10 +340,60 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 
 #[cfg(test)]
 mod tests {
+    use iceberg::spec::{DataContentType, DataFileFormat, Struct};
+
     use super::*;
 
     #[test]
     fn type_compiles() {
         let _ = FastAppendCommit;
+    }
+
+    #[test]
+    fn append_summary_sets_initial_total_records() {
+        let written = vec![test_written_data_file(7), test_written_data_file(11)];
+        let total_records = append_total_records(&written, None, false).unwrap();
+        let summary = append_summary(&written, total_records);
+
+        assert_eq!(summary["added-records"], "18");
+        assert_eq!(summary["total-records"], "18");
+    }
+
+    #[test]
+    fn append_summary_adds_to_parent_total_records() {
+        let written = vec![test_written_data_file(7), test_written_data_file(11)];
+        let total_records = append_total_records(&written, Some(5), true).unwrap();
+        let summary = append_summary(&written, total_records);
+
+        assert_eq!(summary["added-records"], "18");
+        assert_eq!(summary["total-records"], "23");
+    }
+
+    #[test]
+    fn append_summary_omits_total_records_when_parent_is_legacy() {
+        let written = vec![test_written_data_file(7)];
+        let total_records = append_total_records(&written, None, true).unwrap();
+        let summary = append_summary(&written, total_records);
+
+        assert!(!summary.contains_key("total-records"));
+    }
+
+    fn test_written_data_file(record_count: u64) -> WrittenFile {
+        WrittenFile {
+            path: format!("file:///x/data-{record_count}.parquet"),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 1024,
+            split_offsets: vec![4],
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+        }
     }
 }
