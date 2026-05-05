@@ -11,7 +11,7 @@ pub(crate) struct CreateDatabaseStmt {
     pub name: ObjectName,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
@@ -30,7 +30,7 @@ pub(crate) struct DropDatabaseStmt {
     pub force: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
@@ -205,12 +205,13 @@ pub(crate) struct GenerateSeriesSelect {
     pub projection: Vec<Expr>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TableColumnDef {
     pub name: String,
     pub data_type: SqlType,
     pub nullable: bool,
     pub aggregation: Option<ColumnAggregation>,
+    pub default: Option<DefaultLiteral>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

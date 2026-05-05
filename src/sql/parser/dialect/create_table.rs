@@ -5,8 +5,8 @@ use sqlparser::tokenizer::Token;
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::ast::{
-    ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
-    TableColumnDef, TableKeyDesc, TableKeyKind,
+    ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
+    SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 /// Parse StarRocks CREATE TABLE statement:
@@ -418,6 +418,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         let mut aggregation = None;
         let mut nullable = true;
         let mut _comment = None;
+        let mut default: Option<DefaultLiteral> = None;
 
         // Parse optional NOT NULL, NULL, DEFAULT, COMMENT, AUTO_INCREMENT, etc.
         loop {
@@ -430,8 +431,14 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             } else if parser.parse_keyword(Keyword::NULL) {
                 nullable = true;
             } else if parser.parse_keyword(Keyword::DEFAULT) {
-                // Skip the default value expression
-                skip_default_value(parser);
+                if default.is_some() {
+                    return Err(format!("duplicate DEFAULT clause for column `{col_name}`"));
+                }
+                if parser.parse_keyword(Keyword::NULL) {
+                    default = Some(DefaultLiteral::Null);
+                } else {
+                    default = Some(parse_default_literal(parser, &sql_type)?);
+                }
             } else if peek_word_eq(parser, 0, "COMMENT") {
                 parser.next_token();
                 let tok = parser.next_token();
@@ -454,6 +461,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             data_type: sql_type,
             nullable,
             aggregation,
+            default,
         });
     }
     Ok(columns)
@@ -1122,5 +1130,57 @@ mod tests {
             assert!(partition_fields.is_empty());
             assert!(!properties.is_empty());
         }
+    }
+
+    #[test]
+    fn parse_create_table_captures_int_default() {
+        let sql = r#"
+            CREATE TABLE ice.ns.t (a INT, b INT DEFAULT 5)
+            PROPERTIES ('format-version' = '3')
+        "#;
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("parsed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected iceberg create table");
+        };
+        assert_eq!(
+            columns[1].default,
+            Some(crate::sql::parser::ast::DefaultLiteral::Int(5))
+        );
+    }
+
+    #[test]
+    fn parse_create_table_captures_default_null() {
+        let sql = r#"
+            CREATE TABLE ice.ns.t (a INT, b INT DEFAULT NULL)
+        "#;
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("parsed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected iceberg create table");
+        };
+        assert_eq!(columns[0].default, None);
+        assert_eq!(
+            columns[1].default,
+            Some(crate::sql::parser::ast::DefaultLiteral::Null)
+        );
+    }
+
+    #[test]
+    fn parse_create_table_rejects_duplicate_default() {
+        let sql =
+            "CREATE TABLE ice.ns.t (b INT DEFAULT 5 DEFAULT 6) PROPERTIES ('format-version' = '3')";
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let err = parse_create_table_statement(&mut parser).expect_err("duplicate DEFAULT");
+        assert!(err.contains("duplicate DEFAULT"), "unexpected error: {err}");
     }
 }
