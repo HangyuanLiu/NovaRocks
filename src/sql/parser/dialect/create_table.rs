@@ -667,6 +667,13 @@ fn skip_default_value(parser: &mut Parser<'_>) {
     }
 }
 
+pub(crate) fn parse_default_literal(
+    _parser: &mut sqlparser::parser::Parser<'_>,
+    _data_type: &crate::sql::parser::ast::SqlType,
+) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
+    Err("non-NULL DEFAULT not yet implemented".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlparser::parser::Parser;

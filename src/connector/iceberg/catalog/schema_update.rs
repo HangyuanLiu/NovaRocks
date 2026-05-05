@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::parser::ast::SqlType;
+    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::collections::HashMap;
 
@@ -46,7 +46,7 @@ mod tests {
             &IcebergSchemaChange::AddColumn {
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
-                default_null: true,
+                default: Some(DefaultLiteral::Null),
             },
         )
         .expect("updated");
@@ -102,7 +102,7 @@ mod tests {
             &IcebergSchemaChange::AddColumn {
                 name: "later".to_string(),
                 data_type: SqlType::Int,
-                default_null: false,
+                default: None,
             },
         )
         .expect("added");
@@ -131,7 +131,7 @@ mod tests {
             &IcebergSchemaChange::AddColumn {
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
-                default_null: true,
+                default: Some(DefaultLiteral::Null),
             },
         )
         .expect("added");
@@ -247,7 +247,7 @@ mod tests {
             &IcebergSchemaChange::AddColumn {
                 name: "New_Col".to_string(),
                 data_type: SqlType::TinyInt,
-                default_null: true,
+                default: Some(DefaultLiteral::Null),
             },
         )
         .expect("updates");
@@ -262,7 +262,7 @@ mod tests {
             &IcebergSchemaChange::AddColumn {
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
-                default_null: true,
+                default: Some(DefaultLiteral::Null),
             },
         )
         .expect("updates");
