@@ -277,10 +277,14 @@ impl ScanOp for IcebergMetadataScanOp {
                 )?
             }
             IcebergMetadataTableType::Partitions => {
-                return Err(format!(
-                    "iceberg metadata table {:?} is not implemented yet",
-                    self.cfg.metadata_table_type
-                ));
+                let rows = load_partition_rows(&self.cfg)?;
+                build_partition_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
             }
         };
 
@@ -1289,6 +1293,182 @@ fn build_ref_array(
     }
 }
 
+#[derive(Clone, Debug)]
+struct PartitionMetadataRow {
+    partition_values: Option<Vec<Option<String>>>,
+    spec_id: Option<i32>,
+    record_count: Option<i64>,
+    file_count: Option<i32>,
+    total_data_file_size_in_bytes: Option<i64>,
+    position_delete_record_count: Option<i64>,
+    position_delete_file_count: Option<i32>,
+    equality_delete_record_count: Option<i64>,
+    equality_delete_file_count: Option<i32>,
+    last_updated_at_micros: Option<i64>,
+    last_updated_snapshot_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RawPartitionMetadataRow {
+    partition_values: Option<Vec<Option<String>>>,
+    spec_id: Option<i32>,
+    record_count: Option<i64>,
+    file_count: Option<i32>,
+    total_data_file_size_in_bytes: Option<i64>,
+    position_delete_record_count: Option<i64>,
+    position_delete_file_count: Option<i32>,
+    equality_delete_record_count: Option<i64>,
+    equality_delete_file_count: Option<i32>,
+    last_updated_at_micros: Option<i64>,
+    last_updated_snapshot_id: Option<i64>,
+}
+
+impl From<RawPartitionMetadataRow> for PartitionMetadataRow {
+    fn from(r: RawPartitionMetadataRow) -> Self {
+        Self {
+            partition_values: r.partition_values,
+            spec_id: r.spec_id,
+            record_count: r.record_count,
+            file_count: r.file_count,
+            total_data_file_size_in_bytes: r.total_data_file_size_in_bytes,
+            position_delete_record_count: r.position_delete_record_count,
+            position_delete_file_count: r.position_delete_file_count,
+            equality_delete_record_count: r.equality_delete_record_count,
+            equality_delete_file_count: r.equality_delete_file_count,
+            last_updated_at_micros: r.last_updated_at_micros,
+            last_updated_snapshot_id: r.last_updated_snapshot_id,
+        }
+    }
+}
+
+fn load_partition_rows(
+    cfg: &IcebergMetadataScanConfig,
+) -> Result<Vec<PartitionMetadataRow>, String> {
+    let payload = scan_metadata(
+        IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
+        &cfg.serialized_table,
+        "",
+        "",
+        cfg.load_column_stats,
+    )?;
+    let rows: Vec<RawPartitionMetadataRow> = serde_json::from_slice(&payload)
+        .map_err(|e| format!("parse JVM iceberg partitions metadata rows failed: {e}"))?;
+    Ok(rows.into_iter().map(PartitionMetadataRow::from).collect())
+}
+
+fn build_partition_struct_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[PartitionMetadataRow],
+) -> Result<ArrayRef, String> {
+    let DataType::Struct(fields) = &column.data_type else {
+        return Err(format!(
+            "iceberg partitions `{}` column expects Struct, got {:?}",
+            column.name, column.data_type
+        ));
+    };
+    for f in fields.iter() {
+        if !matches!(f.data_type(), DataType::Utf8) {
+            return Err(format!(
+                "iceberg partitions struct child `{}` must be Utf8 (got {:?}); richer types not yet supported",
+                f.name(), f.data_type()
+            ));
+        }
+    }
+    let n_fields = fields.len();
+    let mut child_builders: Vec<StringBuilder> =
+        (0..n_fields).map(|_| StringBuilder::new()).collect();
+    let mut struct_nulls = NullBufferBuilder::new(rows.len());
+    for row in rows {
+        match row.partition_values.as_ref() {
+            Some(values) if values.len() == n_fields => {
+                struct_nulls.append(true);
+                for (i, v) in values.iter().enumerate() {
+                    match v.as_deref() {
+                        Some(s) => child_builders[i].append_value(s),
+                        None => child_builders[i].append_null(),
+                    }
+                }
+            }
+            Some(values) => {
+                return Err(format!(
+                    "iceberg partitions row has {} partition values but FE schema has {} fields",
+                    values.len(),
+                    n_fields
+                ));
+            }
+            None => {
+                struct_nulls.append(false);
+                for b in &mut child_builders {
+                    b.append_null();
+                }
+            }
+        }
+    }
+    let children: Vec<ArrayRef> = child_builders
+        .into_iter()
+        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+        .collect();
+    let arr = StructArray::new(fields.clone(), children, struct_nulls.finish());
+    Ok(Arc::new(arr))
+}
+
+fn build_partition_chunks(
+    rows: &[PartitionMetadataRow],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_partition_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+}
+
+fn build_partition_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[PartitionMetadataRow],
+) -> Result<ArrayRef, String> {
+    match column.name.as_str() {
+        "partition" | "partition_value" => build_partition_struct_array(column, rows),
+        "spec_id" => Ok(Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.spec_id).collect::<Vec<_>>(),
+        ))),
+        "record_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.record_count).collect::<Vec<_>>(),
+        ))),
+        "file_count" => Ok(Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.file_count).collect::<Vec<_>>(),
+        ))),
+        "total_data_file_size_in_bytes" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.total_data_file_size_in_bytes).collect::<Vec<_>>(),
+        ))),
+        "position_delete_record_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.position_delete_record_count).collect::<Vec<_>>(),
+        ))),
+        "position_delete_file_count" => Ok(Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.position_delete_file_count).collect::<Vec<_>>(),
+        ))),
+        "equality_delete_record_count" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.equality_delete_record_count).collect::<Vec<_>>(),
+        ))),
+        "equality_delete_file_count" => Ok(Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.equality_delete_file_count).collect::<Vec<_>>(),
+        ))),
+        "last_updated_at" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.last_updated_at_micros).collect::<Vec<_>>(),
+        ))),
+        "last_updated_snapshot_id" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.last_updated_snapshot_id).collect::<Vec<_>>(),
+        ))),
+        other => Err(format!("unsupported iceberg partitions metadata column: {}", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1568,5 +1748,52 @@ mod tests {
             IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
             "PARTITIONS"
         );
+    }
+
+    #[test]
+    fn test_build_partition_struct_array_aligns_children() {
+        use super::PartitionMetadataRow;
+        let rows = vec![
+            PartitionMetadataRow {
+                partition_values: Some(vec![Some("2026-01-01".into()), Some("US".into())]),
+                spec_id: Some(0),
+                record_count: Some(10),
+                file_count: Some(1),
+                total_data_file_size_in_bytes: Some(123),
+                position_delete_record_count: None,
+                position_delete_file_count: None,
+                equality_delete_record_count: None,
+                equality_delete_file_count: None,
+                last_updated_at_micros: None,
+                last_updated_snapshot_id: None,
+            },
+            PartitionMetadataRow {
+                partition_values: None,
+                spec_id: Some(0),
+                record_count: Some(0),
+                file_count: Some(0),
+                total_data_file_size_in_bytes: Some(0),
+                position_delete_record_count: None,
+                position_delete_file_count: None,
+                equality_delete_record_count: None,
+                equality_delete_file_count: None,
+                last_updated_at_micros: None,
+                last_updated_snapshot_id: None,
+            },
+        ];
+        let column = super::IcebergMetadataOutputColumn {
+            name: "partition".into(),
+            slot_id: SlotId::new(1),
+            data_type: DataType::Struct(
+                vec![
+                    Arc::new(Field::new("dt", DataType::Utf8, true)),
+                    Arc::new(Field::new("country", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            nullable: true,
+        };
+        let arr = super::build_partition_array(&column, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
     }
 }

@@ -91,6 +91,8 @@ public final class IcebergMetadataBridge {
                 return OBJECT_MAPPER.writeValueAsBytes(scanHistory(table));
             case "REFS":
                 return OBJECT_MAPPER.writeValueAsBytes(scanRefs(table));
+            case "PARTITIONS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanPartitions(table));
             default:
                 throw new IllegalArgumentException("unsupported iceberg metadata table type: " + scannerType);
         }
@@ -281,6 +283,84 @@ public final class IcebergMetadataBridge {
             rows.add(row);
         }
         return rows;
+    }
+
+    private static List<PartitionMetadataRow> scanPartitions(Table table) throws Exception {
+        if (table.currentSnapshot() == null) {
+            return List.of();
+        }
+        org.apache.iceberg.Table partitionsTable =
+                org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(
+                        table, org.apache.iceberg.MetadataTableType.PARTITIONS);
+        org.apache.iceberg.TableScan scan = partitionsTable.newScan();
+        Map<String, Integer> col2pos = new HashMap<>();
+        int pos = 0;
+        for (org.apache.iceberg.types.Types.NestedField f : scan.schema().columns()) {
+            col2pos.put(f.name(), pos++);
+        }
+        List<PartitionMetadataRow> rows = new ArrayList<>();
+        try (org.apache.iceberg.io.CloseableIterator<org.apache.iceberg.FileScanTask> tasks =
+                scan.planFiles().iterator()) {
+            if (!tasks.hasNext()) {
+                return rows;
+            }
+            try (org.apache.iceberg.io.CloseableIterator<StructLike> reader =
+                    tasks.next().asDataTask().rows().iterator()) {
+                while (reader.hasNext()) {
+                    StructLike sl = reader.next();
+                    PartitionMetadataRow row = new PartitionMetadataRow();
+                    Integer partPos = col2pos.get("partition");
+                    if (partPos != null) {
+                        StructLike part = sl.get(partPos, StructLike.class);
+                        if (part != null) {
+                            List<String> values = new ArrayList<>();
+                            int spec = sl.get(col2pos.get("spec_id"), Integer.class);
+                            PartitionSpec partSpec = table.specs().get(spec);
+                            org.apache.iceberg.types.Types.StructType partType = partSpec.partitionType();
+                            for (int i = 0; i < part.size(); i++) {
+                                Class<?> javaType = partSpec.javaClasses()[i];
+                                Object v = part.get(i, javaType);
+                                values.add(v == null ? null
+                                        : org.apache.iceberg.transforms.Transforms.identity()
+                                              .toHumanString(partType.fields().get(i).type(), v));
+                            }
+                            row.partition_values = values;
+                        }
+                    }
+                    row.spec_id = (Integer) sl.get(col2pos.get("spec_id"), Integer.class);
+                    row.record_count = nullableLong(sl, col2pos, "record_count");
+                    row.file_count = nullableInt(sl, col2pos, "file_count");
+                    row.total_data_file_size_in_bytes =
+                            nullableLong(sl, col2pos, "total_data_file_size_in_bytes");
+                    row.position_delete_record_count =
+                            nullableLong(sl, col2pos, "position_delete_record_count");
+                    row.position_delete_file_count =
+                            nullableInt(sl, col2pos, "position_delete_file_count");
+                    row.equality_delete_record_count =
+                            nullableLong(sl, col2pos, "equality_delete_record_count");
+                    row.equality_delete_file_count =
+                            nullableInt(sl, col2pos, "equality_delete_file_count");
+                    Long lastUpdatedMs = nullableLong(sl, col2pos, "last_updated_at");
+                    row.last_updated_at_micros = lastUpdatedMs == null ? null : lastUpdatedMs * 1000L;
+                    row.last_updated_snapshot_id =
+                            nullableLong(sl, col2pos, "last_updated_snapshot_id");
+                    rows.add(row);
+                }
+            }
+        }
+        return rows;
+    }
+
+    private static Long nullableLong(StructLike sl, Map<String, Integer> col2pos, String name) {
+        Integer p = col2pos.get(name);
+        if (p == null) return null;
+        return sl.get(p, Long.class);
+    }
+
+    private static Integer nullableInt(StructLike sl, Map<String, Integer> col2pos, String name) {
+        Integer p = col2pos.get(name);
+        if (p == null) return null;
+        return sl.get(p, Integer.class);
     }
 
     private static ManifestFile deserializeManifest(String serializedSplit) {
@@ -534,5 +614,19 @@ public final class IcebergMetadataBridge {
         public Long max_reference_age_in_ms;
         public Integer min_snapshots_to_keep;
         public Long max_snapshot_age_in_ms;
+    }
+
+    public static final class PartitionMetadataRow {
+        public List<String> partition_values;
+        public Integer spec_id;
+        public Long record_count;
+        public Integer file_count;
+        public Long total_data_file_size_in_bytes;
+        public Long position_delete_record_count;
+        public Integer position_delete_file_count;
+        public Long equality_delete_record_count;
+        public Integer equality_delete_file_count;
+        public Long last_updated_at_micros;
+        public Long last_updated_snapshot_id;
     }
 }
