@@ -11,7 +11,7 @@
 //! Default value helpers shared by DDL, schema transport, parquet read path,
 //! and INSERT write path.
 
-use iceberg::spec::{Literal as IcebergLiteral, PrimitiveLiteral};
+use iceberg::spec::{FormatVersion, Literal as IcebergLiteral, PrimitiveLiteral};
 
 use crate::sql::parser::ast::{DefaultLiteral, Literal as AstLiteral, SqlType};
 
@@ -130,6 +130,20 @@ pub(crate) fn iceberg_literal_to_ast(
     }
 }
 
+/// Reject non-NULL defaults on tables whose format-version is not v3.
+/// `None` is the no-default case and is always accepted.
+pub(crate) fn require_v3_for_default(
+    format_version: FormatVersion,
+    default: &Option<IcebergLiteral>,
+) -> Result<(), String> {
+    if default.is_some() && !matches!(format_version, FormatVersion::V3) {
+        return Err("non-NULL DEFAULT requires Iceberg format-version 3; \
+             set TBLPROPERTIES('format-version'='3')"
+            .to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +253,29 @@ mod tests {
         )
         .expect_err("type mismatch");
         assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn v2_rejects_non_null_default() {
+        let err = require_v3_for_default(
+            iceberg::spec::FormatVersion::V2,
+            &Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(5))),
+        )
+        .expect_err("v2 reject");
+        assert!(err.contains("format-version 3"));
+    }
+
+    #[test]
+    fn v3_accepts_non_null_default() {
+        require_v3_for_default(
+            iceberg::spec::FormatVersion::V3,
+            &Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(5))),
+        )
+        .expect("v3 accept");
+    }
+
+    #[test]
+    fn v2_accepts_null_default() {
+        require_v3_for_default(iceberg::spec::FormatVersion::V2, &None).expect("v2 + null ok");
     }
 }
