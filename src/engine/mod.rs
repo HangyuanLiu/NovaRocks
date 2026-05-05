@@ -263,6 +263,10 @@ impl StandaloneNovaRocks {
         if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
             crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
         }
+        #[cfg(not(test))]
+        if inner.metadata_store.is_some() {
+            crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
+        }
         Ok(Self { inner })
     }
 
@@ -1004,9 +1008,26 @@ fn build_show_alter_table_optimize_result(
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
         );
-        columns[5].push(job.error_message.unwrap_or_default());
+        columns[5].push(job.error_message.unwrap_or_else(|| {
+            outcome
+                .map(|value| {
+                    format!(
+                        "rewrote {} data files and {} delete files into {} data files ({} rows)",
+                        value.rewritten_data_files,
+                        value.deleted_data_files,
+                        value.added_data_files,
+                        value.output_record_count
+                    )
+                })
+                .unwrap_or_default()
+        }));
         columns[6].push(job.base_snapshot_id.to_string());
-        columns[7].push(String::new());
+        columns[7].push(
+            outcome
+                .and_then(|value| value.target_snapshot_id)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
         columns[8].push(
             outcome
                 .map(|value| value.rewritten_data_files.to_string())
@@ -1017,8 +1038,12 @@ fn build_show_alter_table_optimize_result(
                 .map(|value| value.added_data_files.to_string())
                 .unwrap_or_default(),
         );
-        columns[10].push(String::new());
-        columns[11].push(String::new());
+        columns[10].push(
+            outcome
+                .map(|value| value.deleted_data_files.to_string())
+                .unwrap_or_default(),
+        );
+        columns[11].push(outcome.map(|_| "0".to_string()).unwrap_or_default());
     }
 
     let fields = column_names
@@ -1903,13 +1928,30 @@ mod tests {
             metadata_db_path: Some(temp.path().join("metadata.db")),
         })
         .expect("engine");
-        engine
+        let store = engine
             .inner
             .metadata_store
             .as_ref()
-            .expect("metadata store")
+            .expect("metadata store");
+        let outcome = crate::connector::starrocks::managed::store::IcebergOptimizeJobOutcome {
+            target_snapshot_id: Some(124),
+            rewritten_data_files: 3,
+            deleted_data_files: 2,
+            added_data_files: 1,
+            output_record_count: 7,
+        };
+        let job = store
             .create_iceberg_optimize_job("ice", "db1", "orders", 123, 1000)
             .expect("create synthetic optimize job");
+        store
+            .claim_iceberg_optimize_job(job.id, 1_100)
+            .expect("claim synthetic optimize job");
+        store
+            .record_iceberg_optimize_job_outcome(job.id, 1_200, outcome.clone())
+            .expect("record synthetic optimize outcome");
+        store
+            .finish_iceberg_optimize_job(job.id, 1_300, outcome)
+            .expect("finish synthetic optimize job");
 
         let result = engine
             .session()
@@ -1933,8 +1975,43 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("state column");
+        let target_snapshot_ids = chunk
+            .batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("target snapshot column");
+        let input_data_files = chunk
+            .batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input data files column");
+        let output_data_files = chunk
+            .batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("output data files column");
+        let input_delete_files = chunk
+            .batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input delete files column");
+        let output_delete_files = chunk
+            .batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("output delete files column");
         assert_eq!(table_names.value(0), "orders");
-        assert_eq!(states.value(0), "PENDING");
+        assert_eq!(states.value(0), "FINISHED");
+        assert_eq!(target_snapshot_ids.value(0), "124");
+        assert_eq!(input_data_files.value(0), "3");
+        assert_eq!(output_data_files.value(0), "1");
+        assert_eq!(input_delete_files.value(0), "2");
+        assert_eq!(output_delete_files.value(0), "0");
     }
 
     #[test]

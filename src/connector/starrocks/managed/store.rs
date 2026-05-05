@@ -561,6 +561,8 @@ impl IcebergOptimizeJobState {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IcebergOptimizeJobOutcome {
+    #[serde(default)]
+    pub target_snapshot_id: Option<i64>,
     pub rewritten_data_files: i64,
     pub deleted_data_files: i64,
     pub added_data_files: i64,
@@ -2203,6 +2205,31 @@ impl SqliteMetadataStore {
                 params![job_id, now_ms, outcome_json],
             )
             .map_err(|e| format!("finish iceberg optimize job failed: {e}"))?;
+        if changed != 1 {
+            return Err(format!("iceberg optimize job {job_id} is not running"));
+        }
+        load_iceberg_optimize_job_by_id(&conn, job_id)
+    }
+
+    pub(crate) fn record_iceberg_optimize_job_outcome(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        outcome: IcebergOptimizeJobOutcome,
+    ) -> Result<StoredIcebergOptimizeJob, String> {
+        let conn = self.connection()?;
+        let outcome_json = serde_json::to_string(&outcome)
+            .map_err(|e| format!("serialize iceberg optimize outcome failed: {e}"))?;
+        let changed = conn
+            .execute(
+                "UPDATE iceberg_optimize_jobs
+                 SET updated_at_ms = ?2,
+                     error_message = NULL,
+                     outcome_json = ?3
+                 WHERE id = ?1 AND state = 'RUNNING'",
+                params![job_id, now_ms, outcome_json],
+            )
+            .map_err(|e| format!("record iceberg optimize job outcome failed: {e}"))?;
         if changed != 1 {
             return Err(format!("iceberg optimize job {job_id} is not running"));
         }
@@ -5144,11 +5171,18 @@ mod tests {
         );
 
         let outcome = IcebergOptimizeJobOutcome {
+            target_snapshot_id: Some(102),
             rewritten_data_files: 3,
             deleted_data_files: 5,
             added_data_files: 2,
             output_record_count: 1_234,
         };
+        let recorded = store
+            .record_iceberg_optimize_job_outcome(created.id, 2_500, outcome.clone())
+            .expect("record optimize outcome");
+        assert_eq!(recorded.state, IcebergOptimizeJobState::Running);
+        assert_eq!(recorded.updated_at_ms, 2_500);
+        assert_eq!(recorded.outcome, Some(outcome.clone()));
         let finished = store
             .finish_iceberg_optimize_job(created.id, 3_000, outcome.clone())
             .expect("finish optimize job");
@@ -5214,6 +5248,7 @@ mod tests {
             .create_iceberg_optimize_job("ice", "ns", "orders", 101, 1_000)
             .expect("create pending job");
         let outcome = IcebergOptimizeJobOutcome {
+            target_snapshot_id: Some(102),
             rewritten_data_files: 1,
             deleted_data_files: 1,
             added_data_files: 1,

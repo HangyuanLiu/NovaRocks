@@ -325,12 +325,18 @@ struct LiveFiles {
     delete_files: Vec<LiveManifestEntry>,
 }
 
-pub async fn count_current_live_files(
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn count_current_live_files(
     table: &Table,
     file_io: &FileIO,
-) -> Result<(usize, usize), String> {
+) -> Result<(i64, i64), String> {
     let live = enumerate_live_files(table, file_io).await?;
-    Ok((live.data_files.len(), live.delete_files.len()))
+    Ok((
+        i64::try_from(live.data_files.len())
+            .map_err(|_| "live data file count overflow".to_string())?,
+        i64::try_from(live.delete_files.len())
+            .map_err(|_| "live delete file count overflow".to_string())?,
+    ))
 }
 
 async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFiles, String> {

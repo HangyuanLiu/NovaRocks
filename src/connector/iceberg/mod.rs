@@ -18,6 +18,8 @@
 pub mod catalog;
 pub mod changes;
 pub mod commit;
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod compact;
 pub(crate) mod data_writer;
 pub mod equality_delete;
 mod jvm;

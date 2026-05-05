@@ -428,7 +428,9 @@ fn validate_replace_snapshot(
         .get("deleted-data-files")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    if added <= 0 || removed <= 0 {
+    let zero_row_rewrite =
+        matches!((snap_records, parent_records), (Some(0), Some(0))) && added == 0 && removed > 0;
+    if !zero_row_rewrite && (added <= 0 || removed <= 0) {
         return Err(ChangeError::ReplaceValidationFailed {
             snapshot_id: snapshot.snapshot_id(),
             reason: format!(
@@ -1408,6 +1410,21 @@ mod tests {
         let mut owned = replace_props_with_delete_counts(18, 2, 1, 0, 2);
         owned.extend([
             ("added-records", "18".to_string()),
+            ("deleted-records", "23".to_string()),
+        ]);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_lineage_skips_zero_row_rewrite_after_delete_elimination() {
+        let parent = snap(1, None, Operation::Delete, &[("total-records", "0")], 0);
+        let mut owned = replace_props_with_delete_counts(0, 0, 1, 0, 1);
+        owned.extend([
+            ("added-records", "0".to_string()),
             ("deleted-records", "23".to_string()),
         ]);
         let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();

@@ -50,7 +50,8 @@ pub use puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-pub use rewrite_data_files::{RewriteDataFilesCommit, count_current_live_files};
+pub use rewrite_data_files::RewriteDataFilesCommit;
+pub(crate) use rewrite_data_files::count_current_live_files;
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
