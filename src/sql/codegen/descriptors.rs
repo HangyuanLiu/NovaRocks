@@ -232,6 +232,10 @@ fn to_thrift_iceberg_schema_field(
     descriptors::TIcebergSchemaField::new(
         Some(field.field_id),
         Some(field.name.clone()),
+        field
+            .initial_default
+            .as_ref()
+            .map(|lit| serialize_iceberg_literal_json(lit)),
         (!field.children.is_empty()).then(|| {
             field
                 .children
@@ -241,6 +245,28 @@ fn to_thrift_iceberg_schema_field(
                 .collect::<Vec<_>>()
         }),
     )
+}
+
+fn serialize_iceberg_literal_json(literal: &iceberg::spec::Literal) -> String {
+    match literal {
+        iceberg::spec::Literal::Primitive(prim) => match prim {
+            iceberg::spec::PrimitiveLiteral::Boolean(b) => b.to_string(),
+            iceberg::spec::PrimitiveLiteral::Int(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::Long(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::Float(v) => v.0.to_string(),
+            iceberg::spec::PrimitiveLiteral::Double(v) => v.0.to_string(),
+            iceberg::spec::PrimitiveLiteral::Int128(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::String(s) => {
+                format!("\"{}\"", s.replace('"', "\\\""))
+            }
+            iceberg::spec::PrimitiveLiteral::Binary(b) => {
+                let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+                format!("\"{hex}\"")
+            }
+            other => panic!("unsupported primitive literal for thrift emission: {other:?}"),
+        },
+        other => panic!("unsupported literal kind for thrift emission: {other:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -317,5 +343,21 @@ mod tests {
                 .children
                 .is_none()
         );
+    }
+
+    #[test]
+    fn descriptor_builder_emits_iceberg_initial_default_json() {
+        use crate::sql::catalog::IcebergSchemaFieldDef;
+        let field = IcebergSchemaFieldDef {
+            field_id: 1,
+            name: "c".to_string(),
+            initial_default: Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::Int(5),
+            )),
+            write_default: None,
+            children: vec![],
+        };
+        let thrift = to_thrift_iceberg_schema_field(&field);
+        assert_eq!(thrift.initial_default_json.as_deref(), Some("5"));
     }
 }
