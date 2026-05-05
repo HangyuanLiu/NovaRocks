@@ -2925,6 +2925,8 @@ mod tests {
                     upper_bound: Some(max.to_le_bytes().to_vec()),
                 },
             )])),
+            partition_spec_id: None,
+            partition_key: None,
             first_row_id: None,
             data_sequence_number: Some(1),
             delete_files: vec![],
@@ -2939,6 +2941,8 @@ mod tests {
             size: 128,
             row_count: Some(10),
             column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: Some(format!("Struct([{id}])")),
             first_row_id: None,
             data_sequence_number: Some(1),
             delete_files: vec![],
@@ -2964,6 +2968,7 @@ mod tests {
             partition_spec_id: Some(0),
             partition_key: None,
             equality_column_names: vec![],
+            equality_field_ids: vec![],
         }
     }
 
