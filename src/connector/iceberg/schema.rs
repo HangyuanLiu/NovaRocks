@@ -24,6 +24,7 @@ use crate::descriptors;
 use crate::lower::type_lowering::arrow_type_from_desc;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
+pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
 
 #[derive(Clone, Debug)]
 pub struct IcebergArrowColumn {
@@ -127,6 +128,9 @@ pub fn apply_field_id_recursive(
         .ok_or_else(|| format!("iceberg schema field {} missing field_id", field.name()))?;
     let mut meta = field.metadata().clone();
     meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    if let Some(json) = schema_field.initial_default_json.as_ref() {
+        meta.insert(ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(), json.clone());
+    }
     let data_type = match field.data_type() {
         DataType::Struct(children) => {
             let schema_children = schema_field
@@ -206,4 +210,39 @@ pub fn apply_field_id_recursive(
         other => other.clone(),
     };
     Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(meta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn apply_field_id_recursive_writes_initial_default_metadata() {
+        let mut schema_field = crate::descriptors::TIcebergSchemaField::default();
+        schema_field.field_id = Some(1);
+        schema_field.name = Some("c".into());
+        schema_field.initial_default_json = Some("5".to_string());
+
+        let field = Field::new("c", DataType::Int32, true);
+        let updated = apply_field_id_recursive(field, &schema_field).expect("apply");
+        assert_eq!(
+            updated.metadata().get(ICEBERG_INITIAL_DEFAULT_META_KEY),
+            Some(&"5".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_field_id_recursive_omits_initial_default_when_absent() {
+        let mut schema_field = crate::descriptors::TIcebergSchemaField::default();
+        schema_field.field_id = Some(1);
+        schema_field.name = Some("c".into());
+        // initial_default_json omitted
+        let field = Field::new("c", DataType::Int32, true);
+        let updated = apply_field_id_recursive(field, &schema_field).expect("apply");
+        assert_eq!(
+            updated.metadata().get(ICEBERG_INITIAL_DEFAULT_META_KEY),
+            None
+        );
+    }
 }
