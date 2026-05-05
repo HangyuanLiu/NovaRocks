@@ -266,7 +266,17 @@ impl ScanOp for IcebergMetadataScanOp {
                     self.cfg.batch_size,
                 )?
             }
-            IcebergMetadataTableType::Refs | IcebergMetadataTableType::Partitions => {
+            IcebergMetadataTableType::Refs => {
+                let rows = load_ref_rows(&self.cfg)?;
+                build_ref_chunks(
+                    &rows,
+                    &self.cfg.output_columns,
+                    &self.output_schema,
+                    &self.output_chunk_schema,
+                    self.cfg.batch_size,
+                )?
+            }
+            IcebergMetadataTableType::Partitions => {
                 return Err(format!(
                     "iceberg metadata table {:?} is not implemented yet",
                     self.cfg.metadata_table_type
@@ -1188,6 +1198,97 @@ fn build_history_array(
     }
 }
 
+#[derive(Clone, Debug)]
+struct RefMetadataRow {
+    name: String,
+    type_: String,
+    snapshot_id: i64,
+    max_reference_age_in_ms: Option<i64>,
+    min_snapshots_to_keep: Option<i32>,
+    max_snapshot_age_in_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RawRefMetadataRow {
+    name: String,
+    #[serde(rename = "type")]
+    type_: String,
+    snapshot_id: i64,
+    max_reference_age_in_ms: Option<i64>,
+    min_snapshots_to_keep: Option<i32>,
+    max_snapshot_age_in_ms: Option<i64>,
+}
+
+impl From<RawRefMetadataRow> for RefMetadataRow {
+    fn from(raw: RawRefMetadataRow) -> Self {
+        Self {
+            name: raw.name,
+            type_: raw.type_,
+            snapshot_id: raw.snapshot_id,
+            max_reference_age_in_ms: raw.max_reference_age_in_ms,
+            min_snapshots_to_keep: raw.min_snapshots_to_keep,
+            max_snapshot_age_in_ms: raw.max_snapshot_age_in_ms,
+        }
+    }
+}
+
+fn load_ref_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<RefMetadataRow>, String> {
+    let payload = scan_metadata(
+        IcebergMetadataTableType::Refs.as_jvm_scanner_type(),
+        &cfg.serialized_table,
+        "",
+        "",
+        cfg.load_column_stats,
+    )?;
+    let rows: Vec<RawRefMetadataRow> = serde_json::from_slice(&payload)
+        .map_err(|e| format!("parse JVM iceberg refs metadata rows failed: {e}"))?;
+    Ok(rows.into_iter().map(RefMetadataRow::from).collect())
+}
+
+fn build_ref_chunks(
+    rows: &[RefMetadataRow],
+    output_columns: &[IcebergMetadataOutputColumn],
+    output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
+    batch_size: usize,
+) -> Result<Vec<Chunk>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arrays = output_columns
+        .iter()
+        .map(|column| build_ref_array(column, rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+}
+
+fn build_ref_array(
+    column: &IcebergMetadataOutputColumn,
+    rows: &[RefMetadataRow],
+) -> Result<ArrayRef, String> {
+    match column.name.as_str() {
+        "name" => Ok(Arc::new(StringArray::from(
+            rows.iter().map(|r| Some(r.name.as_str())).collect::<Vec<_>>(),
+        ))),
+        "type" => Ok(Arc::new(StringArray::from(
+            rows.iter().map(|r| Some(r.type_.as_str())).collect::<Vec<_>>(),
+        ))),
+        "snapshot_id" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.snapshot_id).collect::<Vec<_>>(),
+        ))),
+        "max_reference_age_in_ms" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.max_reference_age_in_ms).collect::<Vec<_>>(),
+        ))),
+        "min_snapshots_to_keep" => Ok(Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.min_snapshots_to_keep).collect::<Vec<_>>(),
+        ))),
+        "max_snapshot_age_in_ms" => Ok(Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.max_snapshot_age_in_ms).collect::<Vec<_>>(),
+        ))),
+        other => Err(format!("unsupported iceberg refs metadata column: {}", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1395,6 +1496,55 @@ mod tests {
             nullable: true,
         };
         let arr = super::build_history_array(&parent_col, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.is_null(0));
+        assert!(!arr.is_null(1));
+    }
+
+    #[test]
+    fn test_build_ref_arrays_basic_shapes() {
+        use super::RefMetadataRow;
+        let rows = vec![
+            RefMetadataRow {
+                name: "main".into(),
+                type_: "BRANCH".into(),
+                snapshot_id: 1,
+                max_reference_age_in_ms: None,
+                min_snapshots_to_keep: None,
+                max_snapshot_age_in_ms: None,
+            },
+            RefMetadataRow {
+                name: "release-2026-q1".into(),
+                type_: "TAG".into(),
+                snapshot_id: 2,
+                max_reference_age_in_ms: Some(86_400_000),
+                min_snapshots_to_keep: Some(3),
+                max_snapshot_age_in_ms: Some(31_536_000_000),
+            },
+        ];
+
+        let type_col = super::IcebergMetadataOutputColumn {
+            name: "type".into(),
+            slot_id: SlotId::new(1),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let arr = super::build_ref_array(&type_col, &rows).unwrap();
+        assert_eq!(arr.len(), 2);
+        let strs = arr
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("StringArray");
+        assert_eq!(strs.value(0), "BRANCH");
+        assert_eq!(strs.value(1), "TAG");
+
+        let min_col = super::IcebergMetadataOutputColumn {
+            name: "min_snapshots_to_keep".into(),
+            slot_id: SlotId::new(2),
+            data_type: DataType::Int32,
+            nullable: true,
+        };
+        let arr = super::build_ref_array(&min_col, &rows).unwrap();
         assert_eq!(arr.len(), 2);
         assert!(arr.is_null(0));
         assert!(!arr.is_null(1));

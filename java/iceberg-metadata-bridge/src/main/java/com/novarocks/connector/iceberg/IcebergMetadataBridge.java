@@ -89,6 +89,8 @@ public final class IcebergMetadataBridge {
                 return OBJECT_MAPPER.writeValueAsBytes(scanSnapshots(table));
             case "HISTORY":
                 return OBJECT_MAPPER.writeValueAsBytes(scanHistory(table));
+            case "REFS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanRefs(table));
             default:
                 throw new IllegalArgumentException("unsupported iceberg metadata table type: " + scannerType);
         }
@@ -256,6 +258,26 @@ public final class IcebergMetadataBridge {
             org.apache.iceberg.Snapshot snap = table.snapshot(entry.snapshotId());
             row.parent_id = snap == null ? null : snap.parentId();
             row.is_current_ancestor = ancestors.contains(entry.snapshotId());
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<RefMetadataRow> scanRefs(Table table) {
+        List<RefMetadataRow> rows = new ArrayList<>();
+        Map<String, org.apache.iceberg.SnapshotRef> refs = table.refs();
+        if (refs == null) {
+            return rows;
+        }
+        for (Map.Entry<String, org.apache.iceberg.SnapshotRef> entry : refs.entrySet()) {
+            org.apache.iceberg.SnapshotRef ref = entry.getValue();
+            RefMetadataRow row = new RefMetadataRow();
+            row.name = entry.getKey();
+            row.type_ = ref.isBranch() ? "BRANCH" : "TAG";
+            row.snapshot_id = ref.snapshotId();
+            row.max_reference_age_in_ms = ref.maxRefAgeMs();
+            row.min_snapshots_to_keep = ref.minSnapshotsToKeep();
+            row.max_snapshot_age_in_ms = ref.maxSnapshotAgeMs();
             rows.add(row);
         }
         return rows;
@@ -502,5 +524,15 @@ public final class IcebergMetadataBridge {
         public long snapshot_id;
         public Long parent_id;
         public boolean is_current_ancestor;
+    }
+
+    public static final class RefMetadataRow {
+        public String name;
+        @com.fasterxml.jackson.annotation.JsonProperty("type")
+        public String type_;
+        public long snapshot_id;
+        public Long max_reference_age_in_ms;
+        public Integer min_snapshots_to_keep;
+        public Long max_snapshot_age_in_ms;
     }
 }
