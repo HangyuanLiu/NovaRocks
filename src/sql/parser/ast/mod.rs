@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod iceberg_ref;
+pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateCatalogStmt {
     pub name: String,
@@ -129,6 +132,7 @@ pub(crate) enum Statement {
     DropMaterializedView(DropMaterializedViewStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     ShowMaterializedViews(ShowMaterializedViewsStmt),
+    AlterIcebergRef(AlterIcebergRefStmt),
 }
 
 #[derive(Clone, Debug, PartialEq)]

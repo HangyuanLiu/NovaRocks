@@ -54,6 +54,11 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         return Ok(vec![stmt]);
     }
 
+    if dialect::alter_iceberg_ref::looks_like_alter_iceberg_ref(&parser) {
+        let stmt = dialect::alter_iceberg_ref::parse_alter_iceberg_ref(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+
     Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 

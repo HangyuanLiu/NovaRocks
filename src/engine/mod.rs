@@ -1120,6 +1120,9 @@ pub(crate) fn dispatch_statement(
             crate::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
         Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
+        Statement::AlterIcebergRef(_) => {
+            Err("ALTER TABLE … BRANCH/TAG: engine dispatch not yet implemented".to_string())
+        }
     }
 }
 
