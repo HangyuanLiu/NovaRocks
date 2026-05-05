@@ -51,8 +51,8 @@ use crate::sql::parser::ast::InsertSource;
 pub(crate) fn execute_iceberg_insert_or_overwrite(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
-    _resolved: &ResolvedTable,
-    _insert_columns: &[String],
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
     source: &InsertSource,
     overwrite: bool,
 ) -> Result<StatementResult, String> {
@@ -116,6 +116,14 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
 
     // 3. Run the SELECT and convert to chunks.
     let chunks = run_select_to_chunks(state, target, query)?;
+
+    // 3.5. If the user specified an explicit column list, reorder columns and
+    //      fill omitted columns with their write_default literal (or NULL).
+    let chunks = if insert_columns.is_empty() {
+        chunks
+    } else {
+        align_chunks_to_target_schema(chunks, insert_columns, &resolved.columns)?
+    };
 
     // 4. Write data files. Empty input → no-op for INSERT INTO; for OVERWRITE
     //    an empty SELECT means "clear the table" so we still go through
@@ -270,6 +278,73 @@ pub(crate) fn run_select_to_chunks(
 pub(crate) struct AbortCleanupOperator {
     pub(crate) fs: opendal::Operator,
     pub(crate) path_mapper: Option<CleanupPathMapper>,
+}
+
+fn align_chunks_to_target_schema(
+    chunks: Vec<Chunk>,
+    insert_columns: &[String],
+    target_columns: &[crate::sql::catalog::ColumnDef],
+) -> Result<Vec<Chunk>, String> {
+    use crate::connector::iceberg::default_value::literal_to_constant_array;
+    use crate::engine::catalog::normalize_identifier;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let normalized_insert: Vec<String> = insert_columns
+        .iter()
+        .map(|c| normalize_identifier(c))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut insert_idx_by_name: HashMap<String, usize> = HashMap::new();
+    for (i, name) in normalized_insert.iter().enumerate() {
+        if insert_idx_by_name.insert(name.clone(), i).is_some() {
+            return Err(format!("duplicate INSERT column `{name}`"));
+        }
+    }
+
+    let mut aligned = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let row_count = chunk.batch.num_rows();
+        let source_schema = chunk.batch.schema();
+        if source_schema.fields().len() != insert_columns.len() {
+            return Err(format!(
+                "INSERT column-list length {} does not match SELECT projection length {}",
+                insert_columns.len(),
+                source_schema.fields().len()
+            ));
+        }
+        let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(target_columns.len());
+        let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(target_columns.len());
+        for column in target_columns {
+            let normalized = normalize_identifier(&column.name)?;
+            if let Some(insert_idx) = insert_idx_by_name.get(&normalized) {
+                let field = source_schema.field(*insert_idx);
+                columns.push(chunk.batch.column(*insert_idx).clone());
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    column.name.clone(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )));
+            } else {
+                let array = match &column.write_default {
+                    Some(iceberg_lit) => {
+                        literal_to_constant_array(iceberg_lit, &column.data_type, row_count)?
+                    }
+                    None => arrow::array::new_null_array(&column.data_type, row_count),
+                };
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )));
+                columns.push(array);
+            }
+        }
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
+            .map_err(|e| format!("align INSERT batch: {e}"))?;
+        aligned.push(crate::engine::record_batch_to_chunk(batch)?);
+    }
+    Ok(aligned)
 }
 
 pub(crate) fn build_abort_cleanup_for_catalog_entry(
