@@ -176,6 +176,38 @@ Concretely:
 Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
 `_last_updated_sequence_number` = 2147483539 = `i32::MAX - 108`.
 
+## Patch 6 — `PrimitiveType::Variant` + Arrow Struct mapping
+
+Files: `src/spec/datatypes.rs`, `src/arrow/schema.rs`.
+
+iceberg-rust 0.9.0 has no `PrimitiveType::Variant` arm, so any
+`metadata.json` field with `"type": "variant"` fails to deserialize.
+NovaRocks needs to read AND write Iceberg v3 tables that carry variant
+columns. This patch adds:
+
+* `PrimitiveType::Variant` on the `PrimitiveType` enum, going through
+  the default lowercase rename so serde reads/writes `"variant"` as
+  expected. The compatibility table never matches a literal — variant
+  default values / partition / stats are all out-of-scope for now.
+* `ToArrowSchemaConverter::primitive` returns
+  `DataType::Struct{ metadata: Binary req, value: Binary req }` for
+  `Variant`. Subfields deliberately carry no `PARQUET:field_id` —
+  spec assigns one iceberg field id to the variant column itself.
+* `ToArrowSchemaConverter::field` attaches
+  `ARROW:extension:name = "arrow.parquet.variant"` (with empty
+  `ARROW:extension:metadata`) when the underlying iceberg type is
+  `Variant`. parquet-rs 58.2 reads these keys and emits
+  `LogicalType::Variant` automatically when the consumer enables the
+  `variant_experimental` feature.
+
+When upstream iceberg-rust 0.10/0.11 ships native variant support,
+this whole block becomes redundant; remove the enum arm, the primitive
+arm, and the metadata-key attachments together.
+
+Spec ref: <https://iceberg.apache.org/spec/#variant> and
+parquet's `LogicalType::Variant` (parquet-rs source
+`src/arrow/schema/extension.rs::logical_type_for_struct`).
+
 ## Patch 7 — bump arrow / parquet to 58.2
 
 Files: `Cargo.toml` (vendor copy only; root is bumped in lock-step).
