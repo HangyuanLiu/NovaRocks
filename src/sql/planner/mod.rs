@@ -1183,9 +1183,7 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         })),
-        Relation::IcebergMetadataScan(rel) => {
-            plan_iceberg_metadata_scan(rel)
-        }
+        Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel),
     }
 }
 
@@ -1194,9 +1192,7 @@ fn plan_relation_scoped(
 /// `TableStorage::IcebergMetadataTable` storage. The optimizer treats it
 /// like any other Scan; codegen branches on the storage variant to emit
 /// the JVM-bridged metadata scanner.
-fn plan_iceberg_metadata_scan(
-    rel: IcebergMetadataScanRelation,
-) -> Result<LogicalPlan, String> {
+fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
 

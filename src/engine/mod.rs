@@ -4506,11 +4506,8 @@ enable_path_style_access = true
             error_message: None,
             outcome: None,
         };
-        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(
-            &engine.inner,
-            &job,
-        )
-        .expect("run optimize job");
+        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
+            .expect("run optimize job");
         assert!(
             outcome.target_snapshot_id.is_some(),
             "OPTIMIZE on a non-empty row-lineage table must commit a Replace snapshot"

@@ -28,16 +28,15 @@ use sqlparser::ast::Statement;
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::catalog::IcebergCatalogEntry;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
     AbortLog, CommitOpKind, IcebergCommitCollector, RunInput, count_current_live_files,
     run_iceberg_commit,
 };
-use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
 };
 use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
-use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use crate::connector::starrocks::managed::store::{
     IcebergOptimizeJobOutcome, IcebergOptimizeJobState, SqliteMetadataStore,
     StoredIcebergOptimizeJob,
@@ -48,6 +47,7 @@ use crate::engine::iceberg_writer::{
     build_abort_cleanup_for_catalog_entry, data_file_to_written_file, invalidate_iceberg_caches,
     run_select_to_chunks,
 };
+use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 
 const OPTIMIZE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -439,9 +439,7 @@ fn chunks_to_row_lineage_batches(
             .column(row_id_idx)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                format!("iceberg optimize `{ICEBERG_ROW_ID_COL}` column must be Int64")
-            })?
+            .ok_or_else(|| format!("iceberg optimize `{ICEBERG_ROW_ID_COL}` column must be Int64"))?
             .clone();
         let last_updated = chunk
             .batch
@@ -449,9 +447,7 @@ fn chunks_to_row_lineage_batches(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                format!(
-                    "iceberg optimize `{ICEBERG_LAST_UPDATED_SEQ_COL}` column must be Int64"
-                )
+                format!("iceberg optimize `{ICEBERG_LAST_UPDATED_SEQ_COL}` column must be Int64")
             })?
             .clone();
 
@@ -464,7 +460,10 @@ fn chunks_to_row_lineage_batches(
             .collect();
         keep.sort();
         let user_fields: Vec<_> = keep.iter().map(|i| schema.fields()[*i].clone()).collect();
-        let user_columns: Vec<_> = keep.iter().map(|i| chunk.batch.column(*i).clone()).collect();
+        let user_columns: Vec<_> = keep
+            .iter()
+            .map(|i| chunk.batch.column(*i).clone())
+            .collect();
         let user_schema = Arc::new(Schema::new_with_metadata(
             user_fields,
             schema.metadata().clone(),
