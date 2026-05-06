@@ -1521,6 +1521,14 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
         let new_type = crate::sql::parser::dialect::convert_sql_type(
             parser.parse_data_type().map_err(|e| e.to_string())?,
         )?;
+        if parser.parse_keyword(Keyword::FIRST)
+            || parser.parse_keyword(Keyword::AFTER)
+            || crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE")
+        {
+            return Err(
+                "MODIFY COLUMN cannot combine type change with FIRST/AFTER/BEFORE; use a separate ALTER COLUMN statement".to_string(),
+            );
+        }
         IcebergSchemaChange::ModifyColumn { path, new_type }
     } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::COLUMN]) {
         let path = parse_column_path(&mut parser)?;
@@ -2501,6 +2509,22 @@ mod tests {
             panic!();
         };
         assert_eq!(path.dotted(), "address.street");
+    }
+
+    #[test]
+    fn parse_modify_column_with_position_rejected() {
+        assert!(super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t MODIFY COLUMN c BIGINT FIRST"
+        )
+        .is_err());
+        assert!(super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t MODIFY COLUMN c BIGINT AFTER d"
+        )
+        .is_err());
+        assert!(super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t MODIFY COLUMN c BIGINT BEFORE d"
+        )
+        .is_err());
     }
 }
 
