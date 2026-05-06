@@ -1446,6 +1446,9 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
         parser.next_token();
         return parser.parse_keyword(Keyword::COLUMN);
     }
+    if parser.parse_keyword(Keyword::ALTER) {
+        return parser.parse_keyword(Keyword::COLUMN);
+    }
     false
 }
 
