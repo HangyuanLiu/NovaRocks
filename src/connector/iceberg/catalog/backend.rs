@@ -335,6 +335,28 @@ fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
     v3 && lineage
 }
 
+/// True iff the table can carry row-lineage metadata under the Iceberg V3
+/// spec rules: format-version >= 3 AND `write.row-lineage` is not
+/// explicitly disabled. Per the Iceberg V3 spec, row-lineage is enabled
+/// by default on V3 tables; writers may opt out with
+/// `write.row-lineage=false`.
+///
+/// This is intentionally more permissive than `is_v3_row_lineage`, which
+/// is used to gate exposure of the `_row_id` /
+/// `_last_updated_sequence_number` pseudo-columns at SQL analysis time
+/// (where the explicit opt-in property is the safer signal). OPTIMIZE
+/// preserves row-lineage whenever the writer would emit it on a fresh
+/// INSERT, which follows the V3-default semantics modelled here.
+pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bool {
+    if !matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3) {
+        return false;
+    }
+    match metadata.properties().get("write.row-lineage") {
+        Some(v) => !v.eq_ignore_ascii_case("false"),
+        None => true,
+    }
+}
+
 fn register_empty_iceberg_table(
     namespace: &str,
     table_name: &str,
