@@ -43,13 +43,3 @@ pub(crate) fn execute_iceberg_truncate_table(
 ) -> Result<StatementResult, String> {
     Err("TODO: TruncateCommit not yet implemented".to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder_returns_error() {
-        // Dummy test; later tasks replace this with a meaningful assertion.
-        // Ensures the module is compiled into the test binary.
-        assert_eq!(2 + 2, 4);
-    }
-}
