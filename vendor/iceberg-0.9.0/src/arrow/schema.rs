@@ -530,14 +530,18 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             field.field_type.as_ref(),
             crate::spec::Type::Primitive(crate::spec::PrimitiveType::Variant)
         ) {
-            // NovaRocks PATCH 6: parquet-rs 58.x reads ARROW:extension:name to
-            // emit LogicalType::Variant on the parent group when feature
-            // `variant_experimental` is enabled.
+            // PATCH 6: parquet-rs 58.x emits LogicalType::Variant when it sees this
+            // extension type name on a Struct field (feature `variant_experimental`).
+            // The exact string is the canonical
+            // `parquet_variant_compute::VariantType::NAME = "arrow.parquet.variant"`.
             metadata.insert(
-                "ARROW:extension:name".to_string(),
-                "parquet.variant".to_string(),
+                arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.to_string(),
+                "arrow.parquet.variant".to_string(),
             );
-            metadata.insert("ARROW:extension:metadata".to_string(), String::new());
+            metadata.insert(
+                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.to_string(),
+                String::new(),
+            );
         }
         Ok(ArrowSchemaOrFieldOrType::Field(
             Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
@@ -2366,12 +2370,40 @@ mod tests {
         );
         assert_eq!(
             field.metadata().get("ARROW:extension:name").map(String::as_str),
-            Some("parquet.variant"),
+            Some("arrow.parquet.variant"),
         );
         assert_eq!(
             field.metadata().get("ARROW:extension:metadata").map(String::as_str),
             Some(""),
         );
         assert!(field.is_nullable(), "optional iceberg field becomes nullable arrow field");
+    }
+
+    #[test]
+    fn variant_required_field_with_doc_carries_full_metadata() {
+        let schema = crate::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                crate::spec::NestedField::required(11, "v", Type::Primitive(PrimitiveType::Variant))
+                    .with_doc("the variant column".to_string())
+                    .into(),
+            ])
+            .build()
+            .expect("schema");
+        let arrow_schema = schema_to_arrow_schema(&schema).expect("convert");
+        let field = arrow_schema.field(0);
+        assert!(!field.is_nullable(), "required iceberg field becomes non-nullable arrow field");
+        assert_eq!(
+            field.metadata().get(PARQUET_FIELD_ID_META_KEY).map(String::as_str),
+            Some("11"),
+        );
+        assert_eq!(
+            field.metadata().get("doc").map(String::as_str),
+            Some("the variant column"),
+        );
+        assert_eq!(
+            field.metadata().get("ARROW:extension:name").map(String::as_str),
+            Some("arrow.parquet.variant"),
+        );
     }
 }
