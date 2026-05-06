@@ -58,11 +58,22 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             }
         }
 
-        let row_lineage_first_row_id =
+        // When the upstream engine flow wrote data files that already carry
+        // `_row_id` at the reserved field IDs (e.g. OPTIMIZE row-lineage
+        // preserve), do NOT advance `next_row_id` and do NOT stamp a
+        // `row_range` on the snapshot. The reader resolves per-row identity
+        // from the stored field-id column, and any bump to `next_row_id`
+        // here would cause future INSERTs to skip past row ids the table
+        // already uses. For all other rewrite shapes (no preserve flag,
+        // V2/legacy tables) keep the historical behaviour.
+        let row_lineage_first_row_id = if ctx.collector.preserve_row_lineage() {
+            None
+        } else {
             match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
                 IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
                 IcebergWriteMode::LegacyPositionDeletes => None,
-            };
+            }
+        };
         let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
             sum.checked_add(f.record_count)
                 .ok_or_else(|| "row-lineage rewrite added row count overflow".to_string())

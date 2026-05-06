@@ -300,6 +300,9 @@ pub(crate) fn execute_whole_table_rewrite(
         staging_dir,
         UniqueId { hi: 0, lo: 0 },
     ));
+    if preserve_row_lineage {
+        collector.mark_preserve_row_lineage();
+    }
     let default_spec_id = metadata.default_partition_spec_id();
     for data_file in &data_files {
         collector.inject_written_file(data_file_to_written_file(data_file, default_spec_id)?);
