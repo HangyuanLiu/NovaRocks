@@ -424,6 +424,10 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                     ))
                 }
             }
+            PrimitiveType::Variant => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "variant primitive type cannot be used in this context yet",
+            )),
         }
     }
 }

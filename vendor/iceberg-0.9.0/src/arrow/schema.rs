@@ -687,6 +687,10 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             crate::spec::PrimitiveType::Binary => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
+            crate::spec::PrimitiveType::Variant => Err(Error::new(
+                crate::ErrorKind::FeatureUnsupported,
+                "variant primitive type cannot be used in this context yet",
+            )),
         }
     }
 }
@@ -1125,6 +1129,9 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
         PrimitiveType::Binary => make_ree(DataType::Binary),
         PrimitiveType::Decimal { precision, scale } => {
             make_ree(DataType::Decimal128(*precision as u8, *scale as i8))
+        }
+        PrimitiveType::Variant => {
+            unreachable!("variant cannot reach datum_to_arrow_type_with_ree (Datum cannot hold a variant value)")
         }
     }
 }
