@@ -554,6 +554,98 @@ mod tests {
         let (field_id, _ty) = find_field_by_path(&schema, &path).unwrap();
         assert_eq!(field_id, 12);
     }
+
+    #[test]
+    fn find_field_by_path_map_key() {
+        use iceberg::spec::MapType;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "m",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(
+                        11,
+                        "key",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        12,
+                        "value",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                )),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("m.key").unwrap();
+        let (field_id, ty) = find_field_by_path(&schema, &path).unwrap();
+        assert_eq!(field_id, 11);
+        assert_eq!(ty, Type::Primitive(PrimitiveType::String));
+    }
+
+    #[test]
+    fn find_field_by_path_list_invalid_descent() {
+        use iceberg::spec::ListType;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tags",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    11,
+                    Type::Primitive(PrimitiveType::Int),
+                    true,
+                )))),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("tags.foo").unwrap();
+        let res = find_field_by_path(&schema, &path);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("element"));
+    }
+
+    #[test]
+    fn find_field_by_path_map_invalid_descent() {
+        use iceberg::spec::MapType;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "m",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(
+                        11,
+                        "key",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        12,
+                        "value",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                )),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("m.invalid").unwrap();
+        let res = find_field_by_path(&schema, &path);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn find_field_by_path_descent_into_primitive() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("id.foo").unwrap();
+        let res = find_field_by_path(&schema, &path);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("non-composite"));
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -587,7 +679,10 @@ pub(crate) fn apply_change_to_schema_for_test(
 /// and MAP (via "key" / "value") types.  Returns the leaf field-id and its `Type`.
 // This function is called by the B2-B7 walker subagents in subsequent schema evolution tasks.
 #[allow(dead_code)]
-pub(crate) fn find_field_by_path(schema: &Schema, path: &ColumnPath) -> Result<(i32, Type), String> {
+pub(crate) fn find_field_by_path(
+    schema: &Schema,
+    path: &ColumnPath,
+) -> Result<(i32, Type), String> {
     if path.is_empty() {
         return Err("column path is empty".to_string());
     }

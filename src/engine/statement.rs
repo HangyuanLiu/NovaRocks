@@ -2227,19 +2227,13 @@ mod column_path_tests {
     #[test]
     fn column_path_parses_dotted() {
         let p = ColumnPath::parse("address.street").unwrap();
-        assert_eq!(
-            p.segments(),
-            &["address".to_string(), "street".to_string()]
-        );
+        assert_eq!(p.segments(), &["address".to_string(), "street".to_string()]);
     }
 
     #[test]
     fn column_path_normalizes_case() {
         let p = ColumnPath::parse("Address.Street").unwrap();
-        assert_eq!(
-            p.segments(),
-            &["address".to_string(), "street".to_string()]
-        );
+        assert_eq!(p.segments(), &["address".to_string(), "street".to_string()]);
     }
 
     #[test]
