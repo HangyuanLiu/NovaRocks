@@ -1,0 +1,11 @@
+-- query 9
+row_id_collisions
+0
+
+-- query 10
+t1_collisions	t2_collisions	t3_collisions	t4_collisions	t5_collisions	t6_collisions
+0	0	0	0	0	0
+
+-- query 11
+max_row_ids_per_id
+1

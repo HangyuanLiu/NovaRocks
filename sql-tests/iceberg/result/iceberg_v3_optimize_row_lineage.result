@@ -1,0 +1,15 @@
+-- query 3
+n_rows	n_unique_row_ids
+5	5
+
+-- query 5
+n_rows	n_unique_row_ids
+5	5
+
+-- query 6
+rows_changed_by_optimize
+0
+
+-- query 7
+operation
+replace
