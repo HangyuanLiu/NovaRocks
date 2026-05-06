@@ -113,7 +113,7 @@ PrimitiveType::Variant => DataType::Struct(Fields::from(vec![
 when the underlying iceberg type is `PrimitiveType::Variant`, also attach
 
 ```
-ARROW:extension:name      = "parquet.variant"
+ARROW:extension:name      = "arrow.parquet.variant"
 ARROW:extension:metadata  = ""
 ```
 

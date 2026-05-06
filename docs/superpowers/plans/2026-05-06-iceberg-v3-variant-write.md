@@ -4,7 +4,7 @@
 
 **Goal:** Enable `INSERT INTO ... SELECT/VALUES` to write Iceberg v3 tables that contain variant columns, producing parquet files with `LogicalType::Variant` plus two required binary leaves (`metadata`, `value`); keep all other write paths fail-fast with actionable errors.
 
-**Architecture:** Add two vendor patches to `iceberg-0.9.0` (PATCH 6 introduces `PrimitiveType::Variant` + Arrow Struct mapping + `parquet.variant` extension metadata; PATCH 7 bumps arrow/parquet to 58.2). Add a thin `variant_write` module that transforms NovaRocks' internal `LargeBinary` variant column into a `StructArray{metadata, value}` immediately before handing the batch to iceberg's `ParquetWriter`. Replace the blanket `ensure_no_variant_columns` guard with precise spec-driven checks (partition spec / sort order) and add a single helper `ensure_no_variant_columns_for_row_level_mutation` wired into the four non-INSERT entry points.
+**Architecture:** Add two vendor patches to `iceberg-0.9.0` (PATCH 6 introduces `PrimitiveType::Variant` + Arrow Struct mapping + `arrow.parquet.variant` extension metadata; PATCH 7 bumps arrow/parquet to 58.2). Add a thin `variant_write` module that transforms NovaRocks' internal `LargeBinary` variant column into a `StructArray{metadata, value}` immediately before handing the batch to iceberg's `ParquetWriter`. Replace the blanket `ensure_no_variant_columns` guard with precise spec-driven checks (partition spec / sort order) and add a single helper `ensure_no_variant_columns_for_row_level_mutation` wired into the four non-INSERT entry points.
 
 **Tech Stack:** Rust, Arrow 58.2, parquet-rs 58.2 (`variant_experimental` feature), iceberg-rust 0.9.0 (vendored), sql-test-runner (NovaRocks).
 
@@ -19,7 +19,7 @@
 | `vendor/iceberg-0.9.0/Cargo.toml` | modify | bump `arrow-* = "57.1"` → `"58.2"`, `parquet = "57.1"` → `"58.2"` |
 | `Cargo.toml` (root) | modify | bump arrow/parquet to 58.2.0; enable `variant_experimental` feature on parquet |
 | `vendor/iceberg-0.9.0/src/spec/datatypes.rs` | modify | add `PrimitiveType::Variant` arm + serde |
-| `vendor/iceberg-0.9.0/src/arrow/schema.rs` | modify | map `Variant` → `Struct{metadata, value}`; attach `parquet.variant` extension metadata on the parent field in `ToArrowSchemaConverter::field` |
+| `vendor/iceberg-0.9.0/src/arrow/schema.rs` | modify | map `Variant` → `Struct{metadata, value}`; attach `arrow.parquet.variant` extension metadata on the parent field in `ToArrowSchemaConverter::field` |
 | `vendor/iceberg-0.9.0/PATCH.md` | modify | document PATCH 6 + PATCH 7 |
 | `src/connector/iceberg/variant_write.rs` | create | `metadata_byte_len`, `variant_field_indices`, `transform_variant_columns_for_write` |
 | `src/connector/iceberg/mod.rs` | modify | declare new `variant_write` module |
@@ -280,7 +280,7 @@ fn variant_field_attaches_parquet_variant_extension_metadata() {
     );
     assert_eq!(
         field.metadata().get("ARROW:extension:name").map(String::as_str),
-        Some("parquet.variant"),
+        Some("arrow.parquet.variant"),
     );
     assert_eq!(
         field.metadata().get("ARROW:extension:metadata").map(String::as_str),
@@ -317,7 +317,7 @@ Replace the inner closing `}`s with the new arm preserved in place:
             crate::spec::PrimitiveType::Variant => {
                 // NovaRocks PATCH 6: Iceberg v3 variant becomes a Struct with
                 // two required binary leaves; the parent field carries the
-                // `parquet.variant` Arrow extension type so parquet writes
+                // `arrow.parquet.variant` Arrow extension type so parquet writes
                 // emit `LogicalType::Variant` (see ToArrowSchemaConverter::field).
                 let metadata_field = Field::new("metadata", DataType::Binary, false);
                 let value_field = Field::new("value", DataType::Binary, false);
@@ -332,7 +332,7 @@ Replace the inner closing `}`s with the new arm preserved in place:
 
 If `Fields` is not in scope at the top of the file, add `use arrow_schema::Fields;` to the imports near `use arrow_schema::{...}`. (Verify it's already imported — `Field` is, so `Fields` typically is too in 58.x.)
 
-- [ ] **Step 4: Attach the `parquet.variant` extension metadata in `ToArrowSchemaConverter::field`**
+- [ ] **Step 4: Attach the `arrow.parquet.variant` extension metadata in `ToArrowSchemaConverter::field`**
 
 The current `field` body (515-534) builds a `metadata: HashMap<String, String>` based on whether `field.doc` is set. Replace it with a version that ALSO appends the extension keys when `field.field_type` is `Type::Primitive(PrimitiveType::Variant)`:
 
@@ -358,7 +358,7 @@ fn field(
         // NovaRocks PATCH 6: parquet-rs 58.x reads ARROW:extension:name to
         // emit LogicalType::Variant on the parent group when feature
         // `variant_experimental` is enabled.
-        metadata.insert("ARROW:extension:name".to_string(), "parquet.variant".to_string());
+        metadata.insert("ARROW:extension:name".to_string(), "arrow.parquet.variant".to_string());
         metadata.insert("ARROW:extension:metadata".to_string(), String::new());
     }
     Ok(ArrowSchemaOrFieldOrType::Field(
@@ -381,7 +381,7 @@ Expected: all tests pass — sanity check that the rewritten `field` method did 
 
 ```bash
 git add vendor/iceberg-0.9.0/src/arrow/schema.rs
-git commit -m "vendor: map iceberg Variant to Arrow Struct + parquet.variant extension (PATCH 6 part 2)"
+git commit -m "vendor: map iceberg Variant to Arrow Struct + arrow.parquet.variant extension (PATCH 6 part 2)"
 ```
 
 ---
@@ -414,7 +414,7 @@ columns. This patch adds:
   `Variant`. Subfields deliberately carry no `PARQUET:field_id` —
   spec assigns one iceberg field id to the variant column itself.
 * `ToArrowSchemaConverter::field` attaches
-  `ARROW:extension:name = "parquet.variant"` (with empty
+  `ARROW:extension:name = "arrow.parquet.variant"` (with empty
   `ARROW:extension:metadata`) when the underlying iceberg type is
   `Variant`. parquet-rs 58.2 reads these keys and emits
   `LogicalType::Variant` automatically when the consumer enables the
@@ -942,7 +942,7 @@ pub(crate) fn transform_variant_columns_for_write(
         let null_buffer = NullBuffer::from(nulls);
 
         // Use the annotated schema's variant field as the StructArray
-        // type — this carries the `parquet.variant` extension metadata
+        // type — this carries the `arrow.parquet.variant` extension metadata
         // that PATCH 6 attaches.
         let struct_field = annotated_schema.field(idx);
         let arrow::datatypes::DataType::Struct(child_fields) = struct_field.data_type() else {
