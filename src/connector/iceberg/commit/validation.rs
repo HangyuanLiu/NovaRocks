@@ -58,7 +58,8 @@ fn classify_iceberg_write_mode_from_metadata(
 /// Returns the write mode selected from Iceberg table metadata after rejecting
 /// table schemas that the current writer cannot encode.
 pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
-    ensure_no_variant_columns(table)?;
+    ensure_no_variant_in_partition_spec(table)?;
+    ensure_no_variant_in_sort_order(table)?;
     Ok(classify_iceberg_write_mode(table))
 }
 
@@ -119,7 +120,6 @@ pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStr
 // Consumed by later UPDATE lowering/execution tasks.
 #[allow(dead_code)]
 pub fn ensure_update_requires_v3_row_lineage(table: &Table) -> Result<(), String> {
-    ensure_no_variant_columns(table)?;
     let metadata = table.metadata();
     ensure_update_properties_require_v3_row_lineage(
         metadata.format_version(),
@@ -165,39 +165,6 @@ fn sql_delete_strategy_from_write_mode(write_mode: IcebergWriteMode) -> IcebergS
     match write_mode {
         IcebergWriteMode::LegacyPositionDeletes => IcebergSqlDeleteStrategy::PositionDeleteFiles,
         IcebergWriteMode::RowLineageV3 => IcebergSqlDeleteStrategy::DeletionVectors,
-    }
-}
-
-fn ensure_no_variant_columns(table: &Table) -> Result<(), String> {
-    let schema = table.metadata().current_schema();
-    for f in schema.as_struct().fields() {
-        if type_contains_variant(&f.field_type) {
-            return Err(format!(
-                "iceberg table column `{}` contains variant type; the current writer \
-                 cannot encode variant values. Drop the column or cast it to a supported type before writing.",
-                f.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Returns `true` when `ty` or any type nested inside it has a Debug
-/// representation that contains "variant" (case-insensitive).  This is a
-/// name-based proxy because iceberg-rust 0.9 does not have a dedicated
-/// `PrimitiveType::Variant` arm yet.
-fn type_contains_variant(ty: &iceberg::spec::Type) -> bool {
-    match ty {
-        iceberg::spec::Type::Primitive(_) => format!("{ty:?}").to_lowercase().contains("variant"),
-        iceberg::spec::Type::Struct(s) => s
-            .fields()
-            .iter()
-            .any(|f| type_contains_variant(&f.field_type)),
-        iceberg::spec::Type::List(l) => type_contains_variant(&l.element_field.field_type),
-        iceberg::spec::Type::Map(m) => {
-            type_contains_variant(&m.key_field.field_type)
-                || type_contains_variant(&m.value_field.field_type)
-        }
     }
 }
 
