@@ -85,6 +85,14 @@ public final class IcebergMetadataBridge {
                         scanLogicalMetadata(table, fileIO, serializedSplit, serializedPredicate, loadColumnStats));
             case "MANIFESTS":
                 return OBJECT_MAPPER.writeValueAsBytes(scanManifests(table, fileIO));
+            case "SNAPSHOTS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanSnapshots(table));
+            case "HISTORY":
+                return OBJECT_MAPPER.writeValueAsBytes(scanHistory(table));
+            case "REFS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanRefs(table));
+            case "PARTITIONS":
+                return OBJECT_MAPPER.writeValueAsBytes(scanPartitions(table));
             default:
                 throw new IllegalArgumentException("unsupported iceberg metadata table type: " + scannerType);
         }
@@ -207,6 +215,155 @@ public final class IcebergMetadataBridge {
             rows.add(row);
         }
         return rows;
+    }
+
+    private static List<SnapshotMetadataRow> scanSnapshots(Table table) {
+        List<SnapshotMetadataRow> rows = new ArrayList<>();
+        for (org.apache.iceberg.Snapshot snapshot : table.snapshots()) {
+            SnapshotMetadataRow row = new SnapshotMetadataRow();
+            // Iceberg snapshot timestamps are millis; convert to micros for Arrow timestamp(us).
+            row.committed_at_micros = snapshot.timestampMillis() * 1000L;
+            row.snapshot_id = snapshot.snapshotId();
+            row.parent_id = snapshot.parentId();
+            row.operation = snapshot.operation();
+            row.manifest_list = snapshot.manifestListLocation();
+            Map<String, String> summary = snapshot.summary();
+            if (summary != null && !summary.isEmpty()) {
+                row.summary = summary.entrySet().stream()
+                    .map(e -> new StringStringEntry(e.getKey(), e.getValue()))
+                    .collect(Collectors.toList());
+            }
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<HistoryMetadataRow> scanHistory(Table table) {
+        List<HistoryMetadataRow> rows = new ArrayList<>();
+        if (table.history() == null) {
+            return rows;
+        }
+        // Build the set of ancestor snapshot ids of the current snapshot for is_current_ancestor.
+        java.util.Set<Long> ancestors = new java.util.HashSet<>();
+        if (table.currentSnapshot() != null) {
+            org.apache.iceberg.Snapshot s = table.currentSnapshot();
+            while (s != null) {
+                ancestors.add(s.snapshotId());
+                Long parent = s.parentId();
+                s = parent == null ? null : table.snapshot(parent);
+            }
+        }
+        for (org.apache.iceberg.HistoryEntry entry : table.history()) {
+            HistoryMetadataRow row = new HistoryMetadataRow();
+            row.made_current_at_micros = entry.timestampMillis() * 1000L;
+            row.snapshot_id = entry.snapshotId();
+            org.apache.iceberg.Snapshot snap = table.snapshot(entry.snapshotId());
+            row.parent_id = snap == null ? null : snap.parentId();
+            row.is_current_ancestor = ancestors.contains(entry.snapshotId());
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<RefMetadataRow> scanRefs(Table table) {
+        List<RefMetadataRow> rows = new ArrayList<>();
+        Map<String, org.apache.iceberg.SnapshotRef> refs = table.refs();
+        if (refs == null) {
+            return rows;
+        }
+        for (Map.Entry<String, org.apache.iceberg.SnapshotRef> entry : refs.entrySet()) {
+            org.apache.iceberg.SnapshotRef ref = entry.getValue();
+            RefMetadataRow row = new RefMetadataRow();
+            row.name = entry.getKey();
+            row.type_ = ref.isBranch() ? "BRANCH" : "TAG";
+            row.snapshot_id = ref.snapshotId();
+            row.max_reference_age_in_ms = ref.maxRefAgeMs();
+            row.min_snapshots_to_keep = ref.minSnapshotsToKeep();
+            row.max_snapshot_age_in_ms = ref.maxSnapshotAgeMs();
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private static List<PartitionMetadataRow> scanPartitions(Table table) throws Exception {
+        if (table.currentSnapshot() == null) {
+            return List.of();
+        }
+        org.apache.iceberg.Table partitionsTable =
+                org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(
+                        table, org.apache.iceberg.MetadataTableType.PARTITIONS);
+        org.apache.iceberg.TableScan scan = partitionsTable.newScan();
+        Map<String, Integer> col2pos = new HashMap<>();
+        int pos = 0;
+        for (org.apache.iceberg.types.Types.NestedField f : scan.schema().columns()) {
+            col2pos.put(f.name(), pos++);
+        }
+        List<PartitionMetadataRow> rows = new ArrayList<>();
+        try (org.apache.iceberg.io.CloseableIterator<org.apache.iceberg.FileScanTask> tasks =
+                scan.planFiles().iterator()) {
+            while (tasks.hasNext()) {
+                org.apache.iceberg.FileScanTask task = tasks.next();
+                try (org.apache.iceberg.io.CloseableIterable<StructLike> rowIter =
+                        task.asDataTask().rows()) {
+                    for (StructLike sl : rowIter) {
+                        PartitionMetadataRow row = new PartitionMetadataRow();
+                        Integer partPos = col2pos.get("partition");
+                        Integer specPos = col2pos.get("spec_id");
+                        if (partPos != null && specPos != null) {
+                            StructLike part = sl.get(partPos, StructLike.class);
+                            Integer specBoxed = sl.get(specPos, Integer.class);
+                            if (part != null && specBoxed != null) {
+                                int spec = specBoxed;
+                                PartitionSpec partSpec = table.specs().get(spec);
+                                if (partSpec != null) {
+                                    List<String> values = new ArrayList<>();
+                                    org.apache.iceberg.types.Types.StructType partType = partSpec.partitionType();
+                                    for (int i = 0; i < part.size(); i++) {
+                                        Class<?> javaType = partSpec.javaClasses()[i];
+                                        Object v = part.get(i, javaType);
+                                        values.add(v == null ? null
+                                                : org.apache.iceberg.transforms.Transforms.identity()
+                                                      .toHumanString(partType.fields().get(i).type(), v));
+                                    }
+                                    row.partition_values = values;
+                                }
+                            }
+                        }
+                        row.spec_id = nullableInt(sl, col2pos, "spec_id");
+                        row.record_count = nullableLong(sl, col2pos, "record_count");
+                        row.file_count = nullableInt(sl, col2pos, "file_count");
+                        row.total_data_file_size_in_bytes =
+                                nullableLong(sl, col2pos, "total_data_file_size_in_bytes");
+                        row.position_delete_record_count =
+                                nullableLong(sl, col2pos, "position_delete_record_count");
+                        row.position_delete_file_count =
+                                nullableInt(sl, col2pos, "position_delete_file_count");
+                        row.equality_delete_record_count =
+                                nullableLong(sl, col2pos, "equality_delete_record_count");
+                        row.equality_delete_file_count =
+                                nullableInt(sl, col2pos, "equality_delete_file_count");
+                        Long lastUpdatedMs = nullableLong(sl, col2pos, "last_updated_at");
+                        row.last_updated_at_micros = lastUpdatedMs == null ? null : lastUpdatedMs * 1000L;
+                        row.last_updated_snapshot_id =
+                                nullableLong(sl, col2pos, "last_updated_snapshot_id");
+                        rows.add(row);
+                    }
+                }
+            }
+        }
+        return rows;
+    }
+
+    private static Long nullableLong(StructLike sl, Map<String, Integer> col2pos, String name) {
+        Integer p = col2pos.get(name);
+        if (p == null) return null;
+        return sl.get(p, Long.class);
+    }
+
+    private static Integer nullableInt(StructLike sl, Map<String, Integer> col2pos, String name) {
+        Integer p = col2pos.get(name);
+        if (p == null) return null;
+        return sl.get(p, Integer.class);
     }
 
     private static ManifestFile deserializeManifest(String serializedSplit) {
@@ -423,5 +580,56 @@ public final class IcebergMetadataBridge {
             this.key = key;
             this.value = value;
         }
+    }
+
+    public static final class SnapshotMetadataRow {
+        public long committed_at_micros;
+        public long snapshot_id;
+        public Long parent_id;
+        public String operation;
+        public String manifest_list;
+        public List<StringStringEntry> summary;
+    }
+
+    public static final class StringStringEntry {
+        public String key;
+        public String value;
+
+        public StringStringEntry() {}
+        public StringStringEntry(String key, String value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
+    public static final class HistoryMetadataRow {
+        public long made_current_at_micros;
+        public long snapshot_id;
+        public Long parent_id;
+        public boolean is_current_ancestor;
+    }
+
+    public static final class RefMetadataRow {
+        public String name;
+        @com.fasterxml.jackson.annotation.JsonProperty("type")
+        public String type_;
+        public long snapshot_id;
+        public Long max_reference_age_in_ms;
+        public Integer min_snapshots_to_keep;
+        public Long max_snapshot_age_in_ms;
+    }
+
+    public static final class PartitionMetadataRow {
+        public List<String> partition_values;
+        public Integer spec_id;
+        public Long record_count;
+        public Integer file_count;
+        public Long total_data_file_size_in_bytes;
+        public Long position_delete_record_count;
+        public Integer position_delete_file_count;
+        public Long equality_delete_record_count;
+        public Integer equality_delete_file_count;
+        public Long last_updated_at_micros;
+        public Long last_updated_snapshot_id;
     }
 }
