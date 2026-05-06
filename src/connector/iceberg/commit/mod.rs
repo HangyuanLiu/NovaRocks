@@ -37,6 +37,7 @@ mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
+mod truncate;
 mod types;
 mod update_cow;
 mod validation;
@@ -58,6 +59,7 @@ pub(crate) use rewrite_data_files::count_current_live_files;
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub use truncate::TruncateCommit;
 pub use types::{
     CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,
     MutationSidecar, MutationSidecarFile, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE,
