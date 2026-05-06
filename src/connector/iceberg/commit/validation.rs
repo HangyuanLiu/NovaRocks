@@ -27,7 +27,7 @@ use iceberg::table::Table;
 
 use super::types::{
     IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
-    NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR,
+    NOVAROCKS_UPDATE_MODE_COW,
 };
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
@@ -70,7 +70,10 @@ pub fn ensure_no_variant_columns_for_row_level_mutation(table: &Table) -> Result
     use iceberg::spec::{PrimitiveType, Type};
     let schema = table.metadata().current_schema();
     for f in schema.as_struct().fields() {
-        if matches!(f.field_type.as_ref(), Type::Primitive(PrimitiveType::Variant)) {
+        if matches!(
+            f.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Variant)
+        ) {
             return Err(format!(
                 "iceberg table column '{name}' is variant; row-level mutation of variant tables is not supported in this release. \
                  INSERT (without OVERWRITE) is supported.",
@@ -95,7 +98,10 @@ pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> 
                 sid = f.source_id
             )
         })?;
-        if matches!(source.field_type.as_ref(), Type::Primitive(PrimitiveType::Variant)) {
+        if matches!(
+            source.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Variant)
+        ) {
             return Err(format!(
                 "iceberg table column '{name}' is variant; variant columns cannot appear in the partition spec. \
                  Drop the partition transform on '{name}' before writing.",
@@ -119,7 +125,10 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
                 f.source_id
             )
         })?;
-        if matches!(source.field_type.as_ref(), Type::Primitive(PrimitiveType::Variant)) {
+        if matches!(
+            source.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Variant)
+        ) {
             return Err(format!(
                 "iceberg table column '{name}' is variant; variant columns cannot appear in the sort order. \
                  Drop the sort key on '{name}' before writing.",
@@ -327,6 +336,7 @@ fn arrow_iceberg_types_compatible(
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
 
     #[test]
@@ -547,9 +557,18 @@ mod tests {
         use arrow::datatypes::DataType;
         use iceberg::spec::{PrimitiveType, Type};
         let iceberg_ty = Type::Primitive(PrimitiveType::Variant);
-        assert!(arrow_iceberg_types_compatible(&DataType::LargeBinary, &iceberg_ty));
-        assert!(!arrow_iceberg_types_compatible(&DataType::Binary, &iceberg_ty));
-        assert!(!arrow_iceberg_types_compatible(&DataType::Utf8, &iceberg_ty));
+        assert!(arrow_iceberg_types_compatible(
+            &DataType::LargeBinary,
+            &iceberg_ty
+        ));
+        assert!(!arrow_iceberg_types_compatible(
+            &DataType::Binary,
+            &iceberg_ty
+        ));
+        assert!(!arrow_iceberg_types_compatible(
+            &DataType::Utf8,
+            &iceberg_ty
+        ));
     }
 
     #[test]
@@ -572,9 +591,7 @@ mod tests {
     fn ensure_no_variant_columns_for_row_level_mutation_accepts_plain_table() {
         use iceberg::spec::{NestedField, PrimitiveType, Type};
         let table = make_table_with(
-            vec![
-                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-            ],
+            vec![NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into()],
             vec![],
             vec![],
         );

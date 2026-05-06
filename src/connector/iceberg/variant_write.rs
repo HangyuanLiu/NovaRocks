@@ -53,7 +53,9 @@ pub(crate) fn metadata_byte_len(payload: &[u8]) -> Result<usize, String> {
     }
     let offset_size = 1 + ((header & OFFSET_SIZE_MASK) >> OFFSET_SIZE_SHIFT);
     if !(1..=4).contains(&offset_size) {
-        return Err(format!("invalid variant metadata offset size: {offset_size}"));
+        return Err(format!(
+            "invalid variant metadata offset size: {offset_size}"
+        ));
     }
     if payload.len() < HEADER + offset_size as usize {
         return Err("variant metadata too short to contain dict_size".to_string());
@@ -114,10 +116,12 @@ pub(crate) fn transform_variant_columns_for_write(
     annotated_schema: &arrow::datatypes::SchemaRef,
     variant_indices: &[usize],
 ) -> Result<RecordBatch, String> {
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, StructArray,
+    };
+    use arrow::buffer::NullBuffer;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, StructArray};
-    use arrow::buffer::NullBuffer;
 
     if batch.num_columns() != annotated_schema.fields().len() {
         return Err(format!(
@@ -150,6 +154,7 @@ pub(crate) fn transform_variant_columns_for_write(
         let mut value_builder = BinaryBuilder::new();
         let mut nulls = vec![true; n];
 
+        #[allow(clippy::needless_range_loop)]
         for row in 0..n {
             if lb.is_null(row) {
                 nulls[row] = false;
@@ -192,7 +197,10 @@ pub(crate) fn transform_variant_columns_for_write(
         };
         let struct_arr = StructArray::new(
             child_fields.clone(),
-            vec![Arc::new(meta_arr) as ArrayRef, Arc::new(value_arr) as ArrayRef],
+            vec![
+                Arc::new(meta_arr) as ArrayRef,
+                Arc::new(value_arr) as ArrayRef,
+            ],
             Some(null_buffer),
         );
         out_columns.push(Arc::new(struct_arr));
@@ -214,7 +222,11 @@ mod tests {
     #[test]
     fn metadata_byte_len_empty_dict() {
         let m = build_metadata_empty();
-        let payload: Vec<u8> = m.iter().copied().chain([/* value */ 0x00].iter().copied()).collect();
+        let payload: Vec<u8> = m
+            .iter()
+            .copied()
+            .chain([/* value */ 0x00].iter().copied())
+            .collect();
         assert_eq!(metadata_byte_len(&payload).expect("ok"), m.len());
     }
 
@@ -293,11 +305,11 @@ mod tests {
         )
     }
 
-    fn make_annotated_arrow_schema(iceberg_schema: &iceberg::spec::SchemaRef) -> arrow::datatypes::SchemaRef {
+    fn make_annotated_arrow_schema(
+        iceberg_schema: &iceberg::spec::SchemaRef,
+    ) -> arrow::datatypes::SchemaRef {
         use std::sync::Arc;
-        Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(iceberg_schema).expect("convert"),
-        )
+        Arc::new(iceberg::arrow::schema_to_arrow_schema(iceberg_schema).expect("convert"))
     }
 
     #[test]
@@ -312,19 +324,34 @@ mod tests {
         ]);
         let annotated = make_annotated_arrow_schema(&iceberg_schema);
         let raw = build_variant_payload_with_string("hi");
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::LargeBinary, true)]));
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::LargeBinary,
+            true,
+        )]));
         let arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
         let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
 
         let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
         assert_eq!(out.num_columns(), 1);
         let col = out.column(0);
-        let s = col.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        let s = col
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct");
         assert_eq!(s.fields().len(), 2);
         assert_eq!(s.fields()[0].name(), "metadata");
         assert_eq!(s.fields()[1].name(), "value");
-        let meta_arr = s.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("binary");
-        let val_arr = s.column(1).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("binary");
+        let meta_arr = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("binary");
+        let val_arr = s
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("binary");
         // metadata = empty dict (3 bytes), value = short-string "hi" (1 + 2 bytes).
         assert_eq!(meta_arr.value(0), &[0x01, 0x00, 0x00]);
         assert_eq!(val_arr.value(0).len(), 3);
@@ -343,18 +370,34 @@ mod tests {
         ]);
         let annotated = make_annotated_arrow_schema(&iceberg_schema);
         let raw = build_variant_payload_with_string("a");
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::LargeBinary, true)]));
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::LargeBinary,
+            true,
+        )]));
         let arr = LargeBinaryArray::from(vec![Some(raw.as_slice()), None, Some(raw.as_slice())]);
         let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
 
         let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
-        let s = out.column(0).as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct");
         assert_eq!(s.len(), 3);
         assert!(s.is_valid(0));
         assert!(!s.is_valid(1)); // parent null
         assert!(s.is_valid(2));
-        let meta = s.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("b");
-        let val = s.column(1).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("b");
+        let meta = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("b");
+        let val = s
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("b");
         // Children must NOT be marked null at the leaf level (Required) —
         // null parent rows carry zero-length placeholders.
         assert!(meta.is_valid(1));
@@ -386,9 +429,17 @@ mod tests {
             .expect("batch");
         let out = transform_variant_columns_for_write(&batch, &annotated, &[1]).expect("ok");
         assert_eq!(out.num_columns(), 2);
-        let id = out.column(0).as_any().downcast_ref::<Int32Array>().expect("i32");
+        let id = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("i32");
         assert_eq!(id.value(0), 7);
-        let v = out.column(1).as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        let v = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct");
         assert_eq!(v.fields().len(), 2);
     }
 
@@ -412,10 +463,19 @@ mod tests {
         ]));
         let v1 = LargeBinaryArray::from_iter_values([raw1.as_slice()]);
         let v2 = LargeBinaryArray::from_iter_values([raw2.as_slice()]);
-        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(v1), Arc::new(v2)]).expect("batch");
+        let batch =
+            RecordBatch::try_new(input_schema, vec![Arc::new(v1), Arc::new(v2)]).expect("batch");
         let out = transform_variant_columns_for_write(&batch, &annotated, &[0, 1]).expect("ok");
-        let s1 = out.column(0).as_any().downcast_ref::<arrow::array::StructArray>().unwrap();
-        let s2 = out.column(1).as_any().downcast_ref::<arrow::array::StructArray>().unwrap();
+        let s1 = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let s2 = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
         assert_eq!(s1.len(), 1);
         assert_eq!(s2.len(), 1);
     }

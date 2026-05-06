@@ -662,11 +662,11 @@ mod tests {
             .find(|f| f.name() == "v")
             .expect("v");
         assert!(
-            format!("{:?}", v_field.get_basic_info().logical_type())
+            format!("{:?}", v_field.get_basic_info().logical_type_ref())
                 .to_lowercase()
                 .contains("variant"),
             "v parent group must carry LogicalType::Variant; got {:?}",
-            v_field.get_basic_info().logical_type()
+            v_field.get_basic_info().logical_type_ref()
         );
     }
 }

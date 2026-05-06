@@ -100,8 +100,7 @@ pub(crate) fn execute_update_statement(
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
 
-    ensure_no_variant_columns_for_row_level_mutation(&table)
-        .map_err(|e| format!("UPDATE: {e}"))?;
+    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("UPDATE: {e}"))?;
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
         IcebergUpdateMode::CopyOnWrite => execute_cow_update(
