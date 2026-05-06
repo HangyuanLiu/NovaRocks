@@ -1540,13 +1540,22 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
 }
 
 fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChange, String> {
-    let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+    let path = parse_column_path(parser)?;
+    if path.is_empty() {
+        return Err("ADD COLUMN requires a column path".to_string());
+    }
+    let last = path.segments().last().unwrap().clone();
+    let parent_segments = path.segments()[..path.segments().len() - 1].to_vec();
+    let parent = ColumnPath::from_segments(parent_segments);
+
     let data_type = crate::sql::parser::dialect::convert_sql_type(
         parser.parse_data_type().map_err(|e| e.to_string())?,
     )?;
     let mut default: Option<DefaultLiteral> = None;
     let mut seen_null = false;
     let mut seen_default = false;
+    let mut position = AddPosition::Default;
+    let mut seen_position = false;
     loop {
         if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
             return Err(
@@ -1577,14 +1586,41 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
             );
             continue;
         }
+        if parser.parse_keyword(Keyword::FIRST) {
+            if seen_position {
+                return Err("duplicate column position clause in ADD COLUMN".to_string());
+            }
+            seen_position = true;
+            position = AddPosition::First;
+            continue;
+        }
+        if parser.parse_keyword(Keyword::AFTER) {
+            if seen_position {
+                return Err("duplicate column position clause in ADD COLUMN".to_string());
+            }
+            seen_position = true;
+            let target = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+            position = AddPosition::After(target);
+            continue;
+        }
+        if crate::sql::parser::dialect::peek_word_eq(parser, 0, "BEFORE") {
+            if seen_position {
+                return Err("duplicate column position clause in ADD COLUMN".to_string());
+            }
+            seen_position = true;
+            parser.next_token();
+            let target = parser.parse_identifier().map_err(|e| e.to_string())?.value;
+            position = AddPosition::Before(target);
+            continue;
+        }
         break;
     }
     Ok(IcebergSchemaChange::AddColumn {
-        parent: ColumnPath::root(),
-        name,
+        parent,
+        name: last,
         data_type,
         default,
-        position: AddPosition::Default,
+        position,
     })
 }
 
@@ -2297,6 +2333,52 @@ mod tests {
             "ALTER TABLE t RENAME COLUMN address.zip TO foo.bar"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_add_column_first() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT FIRST").unwrap();
+        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
+            panic!();
+        };
+        assert!(matches!(position, super::AddPosition::First));
+    }
+
+    #[test]
+    fn parse_add_column_after_target() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN c INT AFTER existing",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
+            panic!();
+        };
+        assert!(matches!(position, super::AddPosition::After(ref s) if s == "existing"));
+    }
+
+    #[test]
+    fn parse_add_column_before_target() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN c INT BEFORE existing",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
+            panic!();
+        };
+        assert!(matches!(position, super::AddPosition::Before(ref s) if s == "existing"));
+    }
+
+    #[test]
+    fn parse_add_column_into_nested_struct() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN address.zip INT")
+                .unwrap();
+        let super::IcebergSchemaChange::AddColumn { parent, name, .. } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(parent.dotted(), "address");
+        assert_eq!(name, "zip");
     }
 }
 
