@@ -363,6 +363,10 @@ fn truncate_summary(
     p
 }
 
+// Local copy of the helper at `overwrite.rs::to_iceberg_unexpected` —
+// the original is `pub(super)`-scoped to `commit::overwrite` and is not
+// visible from sibling submodules. Keep in sync with that definition;
+// promote to `commit::helpers` if a third call site shows up.
 fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
 }
@@ -393,6 +397,7 @@ mod tests {
     use crate::connector::iceberg::commit::test_helpers::{
         empty_v3_iceberg_table, run_commit_with, v3_table_with_n_data_files,
     };
+    use crate::connector::iceberg::commit::types::CommitOpKind;
     use iceberg::spec::{DataFileBuilder, DataFileFormat, Operation, Struct};
 
     #[test]
@@ -475,7 +480,7 @@ mod tests {
         let fixture = empty_v3_iceberg_table().await;
         let outcome = run_commit_with(
             TruncateCommit,
-            CommitOpKind_for_truncate(),
+            CommitOpKind::Truncate,
             fixture.clone(),
             "main",
         )
@@ -497,14 +502,6 @@ mod tests {
         let p = &snap.summary().additional_properties;
         assert_eq!(p.get("deleted-data-files").map(String::as_str), Some("0"));
         assert_eq!(p.get("added-data-files").map(String::as_str), Some("0"));
-    }
-
-    /// Returns the `CommitOpKind` for TRUNCATE — exposed as a function rather
-    /// than a constant because `CommitOpKind` is `Copy` and not `const`-able
-    /// from foreign modules in some downstream crate configurations.
-    #[allow(non_snake_case)]
-    fn CommitOpKind_for_truncate() -> super::super::types::CommitOpKind {
-        super::super::types::CommitOpKind::Truncate
     }
 
     /// `write_truncate_deletes_manifest` should produce a `Deletes`-typed
@@ -566,9 +563,18 @@ mod tests {
             .expect("enumerate pre-truncate");
         assert_eq!(pre.len(), n, "fixture should expose {n} live files");
 
+        // Pin the row-lineage invariant: TRUNCATE must NOT advance
+        // `last-row-id`. iceberg-rust 0.9 V3 validation requires a non-null
+        // first-row-id even on zero-row snapshots, so the implementation
+        // records `(next_row_id, 0)`; `added_rows = 0` keeps `next_row_id`
+        // stable across the commit. Snapshot the pre-truncate value here so
+        // the post-truncate assertion below catches any future regression
+        // in the validator that would silently advance row lineage.
+        let pre_next_row_id = fixture.table.metadata().next_row_id();
+
         let outcome = run_commit_with(
             TruncateCommit,
-            CommitOpKind_for_truncate(),
+            CommitOpKind::Truncate,
             fixture.clone(),
             "main",
         )
@@ -616,6 +622,16 @@ mod tests {
             post.iter()
                 .map(|(df, _, _)| df.file_path())
                 .collect::<Vec<_>>(),
+        );
+
+        // Row-lineage invariance: TRUNCATE must NOT advance `last-row-id`.
+        // See the pre_next_row_id capture above for context.
+        assert_eq!(
+            reloaded.metadata().next_row_id(),
+            pre_next_row_id,
+            "TRUNCATE must NOT advance last-row-id (Iceberg v3 spec); \
+             a regression in iceberg-rust's V3 row-range validator could \
+             silently advance it via the (next_row_id, 0) workaround"
         );
     }
 }
