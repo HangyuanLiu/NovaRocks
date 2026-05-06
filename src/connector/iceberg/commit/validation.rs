@@ -62,6 +62,55 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
     Ok(classify_iceberg_write_mode(table))
 }
 
+// Wired in by later tasks (insert/overwrite/update/delete planning).
+#[allow(dead_code)]
+pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> {
+    use iceberg::spec::{PrimitiveType, Type};
+    let metadata = table.metadata();
+    let schema = metadata.current_schema();
+    for f in metadata.default_partition_spec().fields() {
+        let source = schema.field_by_id(f.source_id).ok_or_else(|| {
+            format!(
+                "iceberg table partition field '{name}' references missing source id {sid}",
+                name = f.name,
+                sid = f.source_id
+            )
+        })?;
+        if matches!(source.field_type.as_ref(), Type::Primitive(PrimitiveType::Variant)) {
+            return Err(format!(
+                "iceberg table column '{name}' is variant; variant columns cannot appear in the partition spec. \
+                 Drop the partition transform on '{name}' before writing.",
+                name = source.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Wired in by later tasks (insert/overwrite/update/delete planning).
+#[allow(dead_code)]
+pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
+    use iceberg::spec::{PrimitiveType, Type};
+    let metadata = table.metadata();
+    let schema = metadata.current_schema();
+    for f in metadata.default_sort_order().fields.iter() {
+        let source = schema.field_by_id(f.source_id).ok_or_else(|| {
+            format!(
+                "iceberg table sort field references missing source id {}",
+                f.source_id
+            )
+        })?;
+        if matches!(source.field_type.as_ref(), Type::Primitive(PrimitiveType::Variant)) {
+            return Err(format!(
+                "iceberg table column '{name}' is variant; variant columns cannot appear in the sort order. \
+                 Drop the sort key on '{name}' before writing.",
+                name = source.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn classify_sql_delete_strategy(table: &Table) -> Result<IcebergSqlDeleteStrategy, String> {
     let write_mode = ensure_iceberg_write_supported(table)?;
     Ok(sql_delete_strategy_from_write_mode(write_mode))
@@ -388,5 +437,116 @@ mod tests {
         // Real coverage comes from NEG-* integration tests in Task 17.
         let s = "row-lineage";
         assert!(s.contains("row-lineage"));
+    }
+
+    fn make_table_with(
+        fields: Vec<iceberg::spec::NestedFieldRef>,
+        partition_fields: Vec<iceberg::spec::PartitionField>,
+        sort_fields: Vec<iceberg::spec::SortField>,
+    ) -> iceberg::table::Table {
+        use std::sync::Arc;
+        let schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(fields)
+                .build()
+                .expect("schema"),
+        );
+        let mut spec_builder =
+            iceberg::spec::PartitionSpec::builder(schema.clone()).with_spec_id(0);
+        for f in partition_fields {
+            // Resolve source field name from source_id; the vendored
+            // `add_partition_field` API takes (source_name, target_name, transform).
+            let source_name = schema
+                .field_by_id(f.source_id)
+                .expect("partition source must exist in schema")
+                .name
+                .clone();
+            spec_builder = spec_builder
+                .add_partition_field(source_name, f.name, f.transform)
+                .expect("add");
+        }
+        let partition_spec = spec_builder.build().expect("spec");
+        let mut order_builder = iceberg::spec::SortOrder::builder();
+        for f in sort_fields {
+            order_builder = order_builder.with_sort_field(f).clone();
+        }
+        let sort_order = order_builder.build_unbound().expect("sort");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            partition_spec,
+            sort_order,
+            "file:///tmp/x".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["d", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table")
+    }
+
+    #[test]
+    fn ensure_no_variant_in_partition_spec_rejects_variant_partition_column() {
+        use iceberg::spec::{NestedField, PartitionField, PrimitiveType, Transform, Type};
+        let table = make_table_with(
+            vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ],
+            vec![PartitionField {
+                source_id: 2,
+                field_id: 1000,
+                name: "v_part".to_string(),
+                transform: Transform::Identity,
+            }],
+            vec![],
+        );
+        let err = ensure_no_variant_in_partition_spec(&table).expect_err("must reject");
+        assert!(err.contains("'v'"), "{err}");
+        assert!(err.contains("partition"), "{err}");
+    }
+
+    #[test]
+    fn ensure_no_variant_in_partition_spec_accepts_clean_table() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let table = make_table_with(
+            vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ],
+            vec![],
+            vec![],
+        );
+        ensure_no_variant_in_partition_spec(&table).expect("clean");
+    }
+
+    #[test]
+    fn ensure_no_variant_in_sort_order_rejects_variant_sort_column() {
+        use iceberg::spec::{
+            NestedField, NullOrder, PrimitiveType, SortDirection, SortField, Transform, Type,
+        };
+        let table = make_table_with(
+            vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+            ],
+            vec![],
+            vec![SortField {
+                source_id: 2,
+                transform: Transform::Identity,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::First,
+            }],
+        );
+        let err = ensure_no_variant_in_sort_order(&table).expect_err("must reject");
+        assert!(err.contains("'v'"), "{err}");
+        assert!(err.contains("sort"), "{err}");
     }
 }
