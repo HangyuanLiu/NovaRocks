@@ -1623,12 +1623,27 @@ mod tests {
     #[test]
     fn metadata_suffix_dollar_is_rewritten_for_known_types() {
         let cases = [
-            ("SELECT * FROM t$snapshots", "SELECT * FROM t.__nr_meta_snapshots__"),
-            ("SELECT * FROM db.t$history", "SELECT * FROM db.t.__nr_meta_history__"),
-            ("SELECT * FROM ice.db.t$refs", "SELECT * FROM ice.db.t.__nr_meta_refs__"),
-            ("select * from t$partitions", "select * from t.__nr_meta_partitions__"),
+            (
+                "SELECT * FROM t$snapshots",
+                "SELECT * FROM t.__nr_meta_snapshots__",
+            ),
+            (
+                "SELECT * FROM db.t$history",
+                "SELECT * FROM db.t.__nr_meta_history__",
+            ),
+            (
+                "SELECT * FROM ice.db.t$refs",
+                "SELECT * FROM ice.db.t.__nr_meta_refs__",
+            ),
+            (
+                "select * from t$partitions",
+                "select * from t.__nr_meta_partitions__",
+            ),
             // Mixed case input still routes — the rewritten metatype is lowercase.
-            ("SELECT * FROM t$Snapshots", "SELECT * FROM t.__nr_meta_snapshots__"),
+            (
+                "SELECT * FROM t$Snapshots",
+                "SELECT * FROM t.__nr_meta_snapshots__",
+            ),
         ];
         for (input, expected) in cases {
             let got = super::normalize_for_raw_parse(input).expect("normalize");

@@ -4,6 +4,7 @@ use sqlparser::ast as sqlast;
 use crate::sql::analysis::*;
 
 use super::helpers::eval_const_i64;
+use super::iceberg_metadata::{metadata_table_schema, split_metadata_suffix};
 use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
@@ -109,6 +110,58 @@ impl<'a> super::AnalyzerContext<'a> {
                         _ => None,
                     })
                     .collect();
+
+                // Iceberg metadata-table dispatch: parser pre-rewrites
+                // `<tbl>$<metatype>` into `<tbl>.__nr_meta_<metatype>__` so we
+                // detect the trailing `__nr_meta_*__` segment here, resolve
+                // the base table, and emit a typed `IcebergMetadataScan`.
+                let (base_parts, metadata_suffix) = split_metadata_suffix(&parts);
+                if let Some(metadata_ty) = metadata_suffix {
+                    // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
+                    if let Some(last) = base_parts.last() {
+                        if last.starts_with("branch_") || last.starts_with("tag_") {
+                            return Err(format!(
+                                "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
+                            ));
+                        }
+                    }
+
+                    let (db_lower, tbl_lower) = match base_parts.as_slice() {
+                        [tbl] => (self.current_database.to_lowercase(), tbl.to_lowercase()),
+                        [db, tbl] => (db.to_lowercase(), tbl.to_lowercase()),
+                        [_cat, db, tbl] => (db.to_lowercase(), tbl.to_lowercase()),
+                        _ => {
+                            return Err(format!(
+                                "iceberg metadata table requires <tbl> | <db>.<tbl> | <cat>.<db>.<tbl>, got: {parts:?}"
+                            ));
+                        }
+                    };
+
+                    let table_def = self.catalog.get_table(&db_lower, &tbl_lower)?;
+                    let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+
+                    // Build scope from the fixed metadata schema.
+                    let cols = metadata_table_schema(metadata_ty.clone());
+                    let mut scope = AnalyzerScope::new();
+                    let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
+                    for col in &cols {
+                        scope.add_column(
+                            Some(qualifier),
+                            &col.name,
+                            col.data_type.clone(),
+                            col.nullable,
+                        );
+                    }
+
+                    let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
+                        database: db_lower,
+                        table: table_def,
+                        metadata_table_type: metadata_ty,
+                        alias: alias_name,
+                    });
+                    return Ok((relation, scope));
+                }
+
                 let (db, tbl) = match parts.len() {
                     1 => (self.current_database.to_string(), parts[0].clone()),
                     2 => (parts[0].clone(), parts[1].clone()),
