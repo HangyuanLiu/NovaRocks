@@ -31,9 +31,37 @@ pub(crate) struct IcebergCatalogRegistry {
     catalogs: HashMap<String, IcebergCatalogEntry>,
 }
 
+/// Selects which Iceberg catalog implementation an [`IcebergCatalogEntry`]
+/// stands for. Determined at `CREATE EXTERNAL CATALOG` time from the
+/// `iceberg.catalog.type` property.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IcebergCatalogKind {
+    /// `iceberg.catalog.type = hadoop` (default when omitted) — NovaRocks
+    /// owns the warehouse directly via `HadoopFileSystemCatalog`. Metadata
+    /// lives at `<warehouse>/<ns>/<table>/metadata/v{N}.metadata.json`.
+    Hadoop,
+    /// `iceberg.catalog.type = memory` — testing-only, in-memory table
+    /// registry; not yet used by the catalog pipeline but accepted by
+    /// `build_catalog_entry` as a no-op kind.
+    Memory,
+    /// `iceberg.catalog.type = rest` — speak Iceberg REST Catalog
+    /// protocol against an external server (`uri`). Used by Lakekeeper /
+    /// Polaris / Tabular / Snowflake Open Catalog / etc.
+    Rest,
+}
+
 #[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
+    // Tracked but unused outside the REST catalog path / tests until the
+    // engine flows migrate from `build_hadoop_catalog` to the unified
+    // `build_iceberg_catalog` dispatcher.
+    #[allow(dead_code)]
+    pub(crate) kind: IcebergCatalogKind,
     pub(crate) warehouse_uri: String,
+    /// REST endpoint URL (`uri` property) — populated only when
+    /// `kind == IcebergCatalogKind::Rest`. None for Hadoop / Memory.
+    #[allow(dead_code)]
+    pub(crate) rest_uri: Option<String>,
     pub(crate) properties: Vec<(String, String)>,
     s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     pub(crate) warehouse_path: PathBuf,
@@ -986,14 +1014,20 @@ pub(crate) fn build_catalog_entry(
             "standalone iceberg catalog only supports type=iceberg, got {kind}"
         ));
     }
-    // Accept both "memory" and "hadoop" as valid catalog types (or ignore the field)
-    if let Some(catalog_type) = props.get("iceberg.catalog.type")
-        && !catalog_type.eq_ignore_ascii_case("memory")
-        && !catalog_type.eq_ignore_ascii_case("hadoop")
-    {
-        return Err(format!(
-            "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop, got {catalog_type}"
-        ));
+    let kind = match props.get("iceberg.catalog.type") {
+        None => IcebergCatalogKind::Hadoop,
+        Some(v) if v.eq_ignore_ascii_case("hadoop") => IcebergCatalogKind::Hadoop,
+        Some(v) if v.eq_ignore_ascii_case("memory") => IcebergCatalogKind::Memory,
+        Some(v) if v.eq_ignore_ascii_case("rest") => IcebergCatalogKind::Rest,
+        Some(v) => {
+            return Err(format!(
+                "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop|rest, got {v}"
+            ));
+        }
+    };
+
+    if matches!(kind, IcebergCatalogKind::Rest) {
+        return build_rest_catalog_entry(&mut props);
     }
 
     let raw_warehouse = props
@@ -1058,7 +1092,9 @@ pub(crate) fn build_catalog_entry(
     );
 
     let entry = IcebergCatalogEntry {
+        kind,
         warehouse_uri,
+        rest_uri: None,
         properties: sorted_properties(&props),
         s3_config,
         warehouse_path,
@@ -1069,23 +1105,102 @@ pub(crate) fn build_catalog_entry(
     Ok(entry)
 }
 
+/// Build an [`IcebergCatalogEntry`] for `iceberg.catalog.type = rest`. The
+/// REST flavor differs from Hadoop in two ways:
+///
+/// 1. **Warehouse is server-resolved.** A REST catalog returns its own
+///    `warehouse` via `GET /v1/config` (overrides + defaults). The user
+///    MAY pre-declare `iceberg.catalog.warehouse` (some servers forward
+///    this back to the storage backend), but it is not required.
+/// 2. **`uri` is required.** It points at the REST endpoint
+///    (`http(s)://host:port`), not at a filesystem warehouse.
+///
+/// The S3 / object-store properties (`aws.s3.endpoint` / `aws.s3.access_key`
+/// / `aws.s3.secret_key`) are still read here so that NovaRocks can hand the
+/// `RestCatalog` a `StorageFactory` capable of opening the data files the
+/// server points at. When those properties are absent, the catalog still
+/// builds — it just operates against local filesystem paths.
+fn build_rest_catalog_entry(
+    props: &mut HashMap<String, String>,
+) -> Result<IcebergCatalogEntry, String> {
+    let uri = props
+        .get("uri")
+        .or_else(|| props.get("iceberg.catalog.uri"))
+        .cloned()
+        .ok_or_else(|| {
+            "REST iceberg catalog requires `uri` property pointing at the REST endpoint".to_string()
+        })?;
+    let warehouse = props
+        .get("warehouse")
+        .or_else(|| props.get("iceberg.catalog.warehouse"))
+        .cloned()
+        .unwrap_or_default();
+
+    // Optional S3 storage props — populated only when the user provided them.
+    // The REST server may also vend storage credentials; that codepath is a
+    // follow-up (Issue: REST credential vending).
+    let raw_props: Vec<(String, String)> =
+        props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let s3_config = if let Some(s3_factory) =
+        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
+            &raw_props,
+        ) {
+        let bucket = warehouse
+            .strip_prefix("s3://")
+            .or_else(|| warehouse.strip_prefix("s3a://"))
+            .or_else(|| warehouse.strip_prefix("oss://"))
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default()
+            .to_string();
+        Some(crate::fs::object_store::ObjectStoreConfig {
+            endpoint: s3_factory.endpoint.clone(),
+            bucket,
+            root: String::new(),
+            access_key_id: s3_factory.access_key_id.clone(),
+            access_key_secret: s3_factory.access_key_secret.clone(),
+            session_token: None,
+            enable_path_style_access: Some(s3_factory.enable_path_style),
+            region: Some(s3_factory.region.clone()),
+            retry_max_times: Some(3),
+            retry_min_delay_ms: Some(100),
+            retry_max_delay_ms: Some(2000),
+            timeout_ms: Some(30000),
+            io_timeout_ms: Some(30000),
+        })
+    } else {
+        None
+    };
+
+    // No local warehouse_path for REST; allocate an empty placeholder so any
+    // legacy hadoop-only code path that touches `entry.warehouse_path` fails
+    // loudly rather than corrupting an unrelated directory.
+    let warehouse_path = PathBuf::from("/__novarocks_rest_catalog_no_local_warehouse__");
+
+    props.insert("type".to_string(), "iceberg".to_string());
+    props.insert("iceberg.catalog.type".to_string(), "rest".to_string());
+    props.insert("uri".to_string(), uri.clone());
+    if !warehouse.is_empty() {
+        props.insert("iceberg.catalog.warehouse".to_string(), warehouse.clone());
+    }
+
+    Ok(IcebergCatalogEntry {
+        kind: IcebergCatalogKind::Rest,
+        warehouse_uri: warehouse,
+        rest_uri: Some(uri),
+        properties: sorted_properties(props),
+        s3_config,
+        warehouse_path,
+        table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        data_files_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+    })
+}
+
 /// Build a `HadoopFileSystemCatalog` that writes metadata in the Hadoop naming
 /// convention (`v{N}.metadata.json` + `version-hint.text`).
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog, String> {
-    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
-            &entry.properties,
-        )
-        .ok_or_else(|| {
-            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
-                .to_string()
-        })?;
-        Arc::new(s3_factory)
-    } else {
-        Arc::new(iceberg::io::LocalFsStorageFactory)
-    };
+    let storage_factory = build_storage_factory_for_entry(entry)?;
     let file_io = iceberg::io::FileIOBuilder::new(storage_factory).build();
     Ok(
         crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
@@ -1093,6 +1208,99 @@ pub(crate) fn build_hadoop_catalog(
             entry.warehouse_uri.clone(),
         ),
     )
+}
+
+/// Build an Iceberg REST `RestCatalog` for an entry whose
+/// `kind == IcebergCatalogKind::Rest`. Performs the `GET /v1/config`
+/// handshake against the REST endpoint declared by `entry.rest_uri`.
+///
+/// Asynchronous because the spec requires a config call before any other
+/// REST operation. Synchronous callers should go through
+/// [`build_iceberg_catalog`], which wraps this with `block_on_iceberg`.
+#[allow(dead_code)] // Wired to engine flows in a follow-up; covered by mockito tests for now.
+pub(crate) async fn build_rest_catalog(
+    entry: &IcebergCatalogEntry,
+) -> Result<iceberg_catalog_rest::RestCatalog, String> {
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::{
+        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    };
+
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        return Err(format!(
+            "build_rest_catalog called on non-REST entry kind={:?}",
+            entry.kind
+        ));
+    }
+    let uri = entry.rest_uri.clone().ok_or_else(|| {
+        "REST iceberg catalog entry missing rest_uri (CREATE EXTERNAL CATALOG must set `uri`)"
+            .to_string()
+    })?;
+
+    // Carry through every user-supplied property except `type` (which is
+    // NovaRocks-internal) so OAuth credentials, prefix, signing-region and
+    // other RESTSessionCatalog options reach the iceberg-rust builder.
+    let mut props: HashMap<String, String> = HashMap::new();
+    for (k, v) in &entry.properties {
+        if k == "type" {
+            continue;
+        }
+        props.insert(k.clone(), v.clone());
+    }
+    props.insert(REST_CATALOG_PROP_URI.to_string(), uri);
+    if !entry.warehouse_uri.is_empty() {
+        props.insert(
+            REST_CATALOG_PROP_WAREHOUSE.to_string(),
+            entry.warehouse_uri.clone(),
+        );
+    }
+
+    let storage_factory = build_storage_factory_for_entry(entry)?;
+    let catalog_name = "rest".to_string();
+    RestCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
+        .load(catalog_name, props)
+        .await
+        .map_err(|e| format!("build REST iceberg catalog: {e}"))
+}
+
+fn build_storage_factory_for_entry(
+    entry: &IcebergCatalogEntry,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, String> {
+    if entry.is_s3() {
+        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
+            &entry.properties,
+        )
+        .ok_or_else(|| {
+            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                .to_string()
+        })?;
+        Ok(Arc::new(s3_factory))
+    } else {
+        Ok(Arc::new(iceberg::io::LocalFsStorageFactory))
+    }
+}
+
+/// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
+/// whether the entry is Hadoop or REST. REST catalog construction is
+/// asynchronous (one `/v1/config` handshake is required), so this helper
+/// blocks on it via `block_on_iceberg`. Callers in synchronous engine
+/// flows can swap `build_hadoop_catalog(...).map(Arc::new)` for
+/// `build_iceberg_catalog(...)` to gain REST support transparently.
+#[allow(dead_code)] // Will replace explicit build_hadoop_catalog calls in a follow-up.
+pub(crate) fn build_iceberg_catalog(
+    entry: &IcebergCatalogEntry,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    match entry.kind {
+        IcebergCatalogKind::Hadoop | IcebergCatalogKind::Memory => {
+            let hadoop = build_hadoop_catalog(entry)?;
+            Ok(Arc::new(hadoop) as Arc<dyn iceberg::Catalog>)
+        }
+        IcebergCatalogKind::Rest => {
+            let rest = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+            Ok(Arc::new(rest) as Arc<dyn iceberg::Catalog>)
+        }
+    }
 }
 
 pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
@@ -2105,7 +2313,7 @@ mod read_delete_conversion_tests {
 
 #[cfg(test)]
 mod data_file_with_stats_tests {
-    use super::{DataFileWithStats, IcebergCatalogEntry};
+    use super::{DataFileWithStats, IcebergCatalogEntry, IcebergCatalogKind};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
@@ -2161,7 +2369,9 @@ mod data_file_with_stats_tests {
     #[test]
     fn data_file_cache_is_snapshot_scoped_and_table_invalidation_clears_it() {
         let entry = IcebergCatalogEntry {
+            kind: IcebergCatalogKind::Hadoop,
             warehouse_uri: "file:///tmp/warehouse".to_string(),
+            rest_uri: None,
             properties: vec![],
             s3_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
@@ -2342,5 +2552,244 @@ mod nova_mv_reserved_name_tests {
             err.contains("reserved"),
             "error should mention that the name is reserved: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rest_catalog_tests {
+    //! Mocked unit tests for the REST catalog wiring. These tests use
+    //! `mockito` to stand up a fake REST endpoint locally so we can verify
+    //! the property-parsing → `IcebergCatalogEntry` → `build_iceberg_catalog`
+    //! → `Arc<dyn iceberg::Catalog>` chain without depending on a Docker
+    //! container or external service.
+    //!
+    //! The mock pattern mirrors `iceberg-catalog-rest`'s own internal tests
+    //! (see its `src/catalog.rs` `mod tests` block).
+    use std::sync::Arc;
+
+    use iceberg::{Catalog, NamespaceIdent};
+    use mockito::Server;
+
+    use super::{
+        IcebergCatalogEntry, IcebergCatalogKind, build_catalog_entry, build_iceberg_catalog,
+        build_rest_catalog,
+    };
+
+    fn rest_props(uri: &str) -> Vec<(String, String)> {
+        vec![
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ("uri".to_string(), uri.to_string()),
+        ]
+    }
+
+    /// Smallest config response a spec-compliant REST server returns to the
+    /// initial `GET /v1/config` call. Empty overrides + defaults are valid.
+    const EMPTY_CONFIG_BODY: &str = r#"{"overrides":{},"defaults":{}}"#;
+
+    #[test]
+    fn build_catalog_entry_accepts_rest_kind_with_uri() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+            ],
+        )
+        .expect("rest entry");
+        assert_eq!(entry.kind, IcebergCatalogKind::Rest);
+        assert_eq!(entry.rest_uri.as_deref(), Some("http://localhost:8181"));
+        assert!(
+            entry.warehouse_uri.is_empty(),
+            "warehouse is optional for REST and resolved from /v1/config"
+        );
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_rest_without_uri() {
+        let result = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ],
+        );
+        let err = result.map(|_| ()).expect_err("uri is required");
+        assert!(
+            err.contains("uri"),
+            "error should mention uri requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_catalog_entry_accepts_rest_with_warehouse() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+                ("warehouse".to_string(), "s3://demo/wh".to_string()),
+            ],
+        )
+        .expect("rest entry with warehouse");
+        assert_eq!(entry.kind, IcebergCatalogKind::Rest);
+        assert_eq!(entry.warehouse_uri, "s3://demo/wh");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_unknown_catalog_type() {
+        let err = build_catalog_entry(
+            "ice",
+            &[("iceberg.catalog.type".to_string(), "weird".to_string())],
+        )
+        .map(|_| ())
+        .expect_err("unknown type should be rejected");
+        assert!(err.contains("memory|hadoop|rest"), "{err}");
+    }
+
+    /// Confirms `build_rest_catalog` performs the spec-required
+    /// `GET /v1/config` handshake against the configured `uri` before
+    /// returning a usable `RestCatalog`.
+    #[tokio::test]
+    async fn build_rest_catalog_handshakes_v1_config() {
+        let mut server = Server::new_async().await;
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let catalog = build_rest_catalog(&entry)
+            .await
+            .expect("build rest catalog");
+
+        // Round-trip a list_namespaces call to force the catalog to issue its
+        // first authenticated request, which forces the config handshake.
+        let _ = mock_list_namespaces(&mut server, "[]").await;
+        let namespaces = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list namespaces over mock");
+        assert!(namespaces.is_empty(), "mock returns no namespaces");
+        config_mock.assert_async().await;
+    }
+
+    /// Confirms the full property-parsing → entry → dispatcher chain returns
+    /// an `Arc<dyn Catalog>` and that the dispatcher routes to the REST
+    /// implementation (not Hadoop) when the entry's kind is REST.
+    #[tokio::test]
+    async fn build_iceberg_catalog_dispatches_rest_kind() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let _list_mock = mock_list_namespaces(&mut server, "[]").await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let catalog: Arc<dyn Catalog> = tokio::task::spawn_blocking({
+            let entry = entry.clone();
+            move || build_iceberg_catalog(&entry)
+        })
+        .await
+        .expect("blocking task")
+        .expect("build_iceberg_catalog");
+
+        let namespaces = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list namespaces via dispatcher");
+        assert!(namespaces.is_empty());
+    }
+
+    /// Confirms a NovaRocks REST catalog can create a namespace by issuing
+    /// `POST /v1/namespaces` to the mock server with the right payload.
+    #[tokio::test]
+    async fn rest_catalog_creates_namespace() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let create_mock = server
+            .mock("POST", "/v1/namespaces")
+            .with_status(200)
+            .with_body(r#"{"namespace":["analytics"],"properties":{}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let catalog = build_rest_catalog(&entry)
+            .await
+            .expect("build rest catalog");
+        let ns = NamespaceIdent::from_strs(["analytics"]).expect("ns ident");
+        let created = catalog
+            .create_namespace(&ns, std::collections::HashMap::new())
+            .await
+            .expect("create namespace via mock");
+        assert_eq!(created.name(), &ns);
+        create_mock.assert_async().await;
+    }
+
+    /// Helper: register a `GET /v1/namespaces` mock that returns the given
+    /// JSON array body. Used by tests that need to walk past the initial
+    /// config handshake to a real catalog operation.
+    async fn mock_list_namespaces(server: &mut Server, namespaces_array: &str) -> mockito::Mock {
+        let body = format!(
+            r#"{{"namespaces":{namespaces_array}}}"#,
+            namespaces_array = namespaces_array
+        );
+        server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await
+    }
+
+    /// Sanity check: building a Hadoop entry (default kind) still works
+    /// after the REST extension. This guards against regressions in the
+    /// shared `build_catalog_entry` parsing path.
+    #[test]
+    fn build_catalog_entry_hadoop_default_still_works() {
+        let warehouse = tempfile::TempDir::new().expect("tempdir");
+        let entry = build_catalog_entry(
+            "ice_hadoop",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("hadoop entry");
+        assert_eq!(entry.kind, IcebergCatalogKind::Hadoop);
+        assert!(entry.rest_uri.is_none());
+    }
+
+    #[test]
+    fn entry_clone_preserves_rest_kind() {
+        let entry = build_catalog_entry(
+            "ice_rest",
+            &[
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://localhost:8181".to_string()),
+            ],
+        )
+        .expect("rest entry");
+        let _: IcebergCatalogEntry = entry.clone();
+        assert_eq!(entry.kind, IcebergCatalogKind::Rest);
     }
 }
