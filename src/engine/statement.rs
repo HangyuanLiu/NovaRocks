@@ -2466,6 +2466,42 @@ mod tests {
         };
         assert_eq!(s, "city");
     }
+
+    #[test]
+    fn parse_alter_column_set_not_null() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c SET NOT NULL")
+                .unwrap();
+        let super::IcebergSchemaChange::SetNullable { path, nullable } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "c");
+        assert!(!nullable);
+    }
+
+    #[test]
+    fn parse_alter_column_drop_not_null() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")
+                .unwrap();
+        let super::IcebergSchemaChange::SetNullable { path, nullable } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "c");
+        assert!(nullable);
+    }
+
+    #[test]
+    fn parse_alter_column_set_not_null_nested() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ALTER COLUMN address.street SET NOT NULL",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::SetNullable { path, .. } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "address.street");
+    }
 }
 
 #[cfg(test)]
