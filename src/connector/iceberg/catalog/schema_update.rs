@@ -1415,6 +1415,73 @@ mod tests {
         let new = build_updated_schema(&schema, 2, &change).unwrap();
         assert_eq!(new.as_struct().fields()[0].name, "b");
     }
+
+    #[test]
+    fn widen_decimal_precision_increase_same_scale() {
+        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
+        let new = SqlType::Decimal { precision: 20, scale: 2 };
+        let widened = widen_type(&curr, &new).unwrap();
+        let Type::Primitive(PrimitiveType::Decimal { precision, scale }) = widened else { panic!() };
+        assert_eq!(precision, 20);
+        assert_eq!(scale, 2);
+    }
+
+    #[test]
+    fn widen_decimal_scale_change_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
+        let new = SqlType::Decimal { precision: 10, scale: 3 };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_decimal_precision_decrease_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 20, scale: 2 });
+        let new = SqlType::Decimal { precision: 10, scale: 2 };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_decimal_same_precision_same_scale_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
+        let new = SqlType::Decimal { precision: 10, scale: 2 };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_date_to_timestamp() {
+        let curr = Type::Primitive(PrimitiveType::Date);
+        let new = SqlType::DateTime;
+        let widened = widen_type(&curr, &new).unwrap();
+        assert!(matches!(widened, Type::Primitive(PrimitiveType::Timestamp)));
+    }
+
+    #[test]
+    fn widen_string_to_binary_rejected() {
+        let curr = Type::Primitive(PrimitiveType::String);
+        let new = SqlType::Binary;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_long_to_int_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Long);
+        let new = SqlType::Int;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_double_to_float_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Double);
+        let new = SqlType::Float;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_timestamp_to_date_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Timestamp);
+        let new = SqlType::Date;
+        assert!(widen_type(&curr, &new).is_err());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -2491,6 +2558,29 @@ fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
         }
         (Type::Primitive(PrimitiveType::Float), SqlType::Double) => {
             Ok(Type::Primitive(PrimitiveType::Double))
+        }
+        (
+            Type::Primitive(PrimitiveType::Decimal { precision: cp, scale: cs }),
+            SqlType::Decimal { precision: np, scale: ns },
+        ) => {
+            // Iceberg spec: decimal precision can only increase, scale must remain unchanged.
+            if (*cs as i64) != (*ns as i64) {
+                return Err(format!(
+                    "decimal scale change is not allowed (current decimal({cp},{cs}), new decimal({np},{ns}))"
+                ));
+            }
+            if (*np as u32) <= *cp {
+                return Err(format!(
+                    "decimal precision must strictly increase (current decimal({cp},{cs}), new decimal({np},{ns}))"
+                ));
+            }
+            Ok(Type::Primitive(PrimitiveType::Decimal {
+                precision: *np as u32,
+                scale: *ns as u32,
+            }))
+        }
+        (Type::Primitive(PrimitiveType::Date), SqlType::DateTime) => {
+            Ok(Type::Primitive(PrimitiveType::Timestamp))
         }
         _ => Err(format!(
             "unsupported Iceberg type evolution: {current:?} -> {new_type:?}"
