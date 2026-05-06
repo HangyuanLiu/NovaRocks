@@ -321,10 +321,48 @@ impl TransactionAction for OverwriteTxnAction {
 /// each live entry's `(DataFile, sequence_number, file_sequence_number)`. The
 /// sequence numbers are needed verbatim by `add_delete_file` to faithfully
 /// preserve the original commit identity.
+///
+/// INSERT OVERWRITE intentionally preserves delete manifests (they keep
+/// applying against any rows preserved from the base table), so this walker
+/// skips manifests with content type `Deletes`.
 pub(super) async fn enumerate_live_data_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+    enumerate_live_files_filtered(table, file_io, |entry| {
+        entry.content == ManifestContentType::Data
+    })
+    .await
+}
+
+/// Walk every manifest in the base snapshot's manifest list (Data and
+/// Deletes alike) and collect every live entry's
+/// `(DataFile, sequence_number, file_sequence_number)`.
+///
+/// Distinct from `enumerate_live_data_files` which skips delete manifests:
+/// `TRUNCATE TABLE` must mark every live entry — data files,
+/// position-delete files, equality-delete files, and Iceberg v3 deletion
+/// vectors — as DELETED in the new snapshot, so this walker accepts both
+/// `ManifestContentType::Data` and `ManifestContentType::Deletes`.
+pub(super) async fn enumerate_live_all_files(
+    table: &Table,
+    file_io: &FileIO,
+) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+    enumerate_live_files_filtered(table, file_io, |_entry| true).await
+}
+
+/// Shared body for `enumerate_live_data_files` and `enumerate_live_all_files`.
+/// Walks the base snapshot's manifest list, applying `manifest_filter` to
+/// each manifest entry — only manifests for which the filter returns `true`
+/// are loaded and inspected.
+async fn enumerate_live_files_filtered<F>(
+    table: &Table,
+    file_io: &FileIO,
+    manifest_filter: F,
+) -> Result<Vec<(DataFile, i64, Option<i64>)>, String>
+where
+    F: Fn(&ManifestFile) -> bool,
+{
     let m = table.metadata();
     let snap = match m.current_snapshot() {
         Some(s) => s,
@@ -341,7 +379,7 @@ pub(super) async fn enumerate_live_data_files(
 
     let mut out = Vec::new();
     for entry in list.entries() {
-        if entry.content != ManifestContentType::Data {
+        if !manifest_filter(entry) {
             continue;
         }
         let manifest = entry
@@ -520,4 +558,74 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 #[allow(dead_code)]
 fn _check_status_variant_referenced() {
     let _ = ManifestStatus::Deleted;
+}
+
+#[cfg(test)]
+mod enumerate_tests {
+    //! Smoke tests for the manifest-list enumeration helpers. Only the
+    //! empty-snapshot path is exercised here; the mixed-content-type
+    //! assertion (Data + position-delete + equality-delete + DV) is
+    //! covered end-to-end by the SQL regression suite (Task 8 of the
+    //! TRUNCATE plan), where a real iceberg backend produces all four
+    //! content types.
+    use super::*;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+    use iceberg::table::Table;
+    use iceberg::{NamespaceIdent, TableIdent};
+    use std::collections::HashMap;
+
+    fn build_empty_table() -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let file_io = FileIO::new_with_memory();
+        let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
+        Table::builder()
+            .file_io(file_io)
+            .metadata(metadata)
+            .identifier(ident)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn enumerate_live_all_files_returns_empty_when_no_snapshot() {
+        let table = build_empty_table();
+        let file_io = table.file_io().clone();
+        let out = enumerate_live_all_files(&table, &file_io)
+            .await
+            .expect("enumerate_live_all_files succeeds on empty table");
+        assert!(out.is_empty(), "expected no entries, got {}", out.len());
+    }
+
+    #[tokio::test]
+    async fn enumerate_live_data_files_returns_empty_when_no_snapshot() {
+        let table = build_empty_table();
+        let file_io = table.file_io().clone();
+        let out = enumerate_live_data_files(&table, &file_io)
+            .await
+            .expect("enumerate_live_data_files succeeds on empty table");
+        assert!(out.is_empty(), "expected no entries, got {}", out.len());
+    }
 }
