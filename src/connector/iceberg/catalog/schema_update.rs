@@ -44,9 +44,11 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Null),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("updated");
@@ -60,7 +62,7 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::RenameColumn {
-                old_name: "id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("id").unwrap(),
                 new_name: "order_id".to_string(),
             },
         )
@@ -71,7 +73,7 @@ mod tests {
             &renamed,
             2,
             &IcebergSchemaChange::ModifyColumn {
-                name: "order_id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("order_id").unwrap(),
                 new_type: SqlType::BigInt,
             },
         )
@@ -90,7 +92,7 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::DropColumn {
-                name: "v".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("v").unwrap(),
             },
         )
         .expect("dropped");
@@ -100,9 +102,11 @@ mod tests {
             &dropped,
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "later".to_string(),
                 data_type: SqlType::Int,
                 default: None,
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("added");
@@ -115,7 +119,7 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::ModifyColumn {
-                name: "id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("id").unwrap(),
                 new_type: SqlType::Double,
             },
         )
@@ -129,9 +133,11 @@ mod tests {
             &schema_with_identifier(),
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Null),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("added");
@@ -141,7 +147,7 @@ mod tests {
             &added,
             3,
             &IcebergSchemaChange::RenameColumn {
-                old_name: "id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("id").unwrap(),
                 new_name: "order_id".to_string(),
             },
         )
@@ -153,7 +159,7 @@ mod tests {
             &renamed,
             3,
             &IcebergSchemaChange::ModifyColumn {
-                name: "order_id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("order_id").unwrap(),
                 new_type: SqlType::BigInt,
             },
         )
@@ -172,7 +178,7 @@ mod tests {
             &schema_with_identifier(),
             2,
             &IcebergSchemaChange::DropColumn {
-                name: "id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("id").unwrap(),
             },
         )
         .expect_err("identifier drop");
@@ -185,7 +191,7 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::DropColumn {
-                name: "_row_id".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("_row_id").unwrap(),
             },
         )
         .expect_err("reserved");
@@ -245,9 +251,11 @@ mod tests {
         let tinyint = build_property_updates_for_test(
             &HashMap::new(),
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "New_Col".to_string(),
                 data_type: SqlType::TinyInt,
                 default: Some(DefaultLiteral::Null),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("updates");
@@ -260,9 +268,11 @@ mod tests {
         let int = build_property_updates_for_test(
             &HashMap::new(),
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "new_col".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Null),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("updates");
@@ -278,7 +288,7 @@ mod tests {
                 ("novarocks.table.key_columns", "id"),
             ]),
             &IcebergSchemaChange::DropColumn {
-                name: "V".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("V").unwrap(),
             },
         )
         .expect("updates");
@@ -298,7 +308,7 @@ mod tests {
         let err = build_property_updates_for_test(
             &props(&[("novarocks.table.key_columns", "id,v")]),
             &IcebergSchemaChange::DropColumn {
-                name: "V".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("V").unwrap(),
             },
         )
         .expect_err("key column drop");
@@ -314,7 +324,7 @@ mod tests {
                 ("novarocks.table.key_columns", "id,old_col"),
             ]),
             &IcebergSchemaChange::RenameColumn {
-                old_name: "old_col".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("old_col").unwrap(),
                 new_name: "New_Col".to_string(),
             },
         )
@@ -347,9 +357,11 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "c".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Int(5)),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("v3 add column");
@@ -365,9 +377,11 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "c".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Null),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("default null");
@@ -386,9 +400,11 @@ mod tests {
             &schema(),
             2,
             &IcebergSchemaChange::AddColumn {
+                parent: crate::engine::statement::ColumnPath::root(),
                 name: "c".to_string(),
                 data_type: SqlType::Int,
                 default: Some(DefaultLiteral::Int(5)),
+                position: crate::engine::statement::AddPosition::Default,
             },
         )
         .expect("schema build succeeds; gate enforced upstream");
@@ -399,7 +415,7 @@ mod tests {
         let bigint = build_property_updates_for_test(
             &props(&[("novarocks.logical_type.id", "tinyint")]),
             &IcebergSchemaChange::ModifyColumn {
-                name: "ID".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("ID").unwrap(),
                 new_type: SqlType::BigInt,
             },
         )
@@ -413,7 +429,7 @@ mod tests {
         let decimal = build_property_updates_for_test(
             &HashMap::new(),
             &IcebergSchemaChange::ModifyColumn {
-                name: "amount".to_string(),
+                path: crate::engine::statement::ColumnPath::parse("amount").unwrap(),
                 new_type: SqlType::Decimal {
                     precision: 12,
                     scale: 2,
@@ -472,10 +488,17 @@ fn build_updated_schema(
 
     match change {
         IcebergSchemaChange::AddColumn {
+            parent,
             name,
             data_type,
             default,
+            position: _,
         } => {
+            if !parent.is_empty() {
+                return Err(
+                    "nested STRUCT ADD COLUMN not yet implemented in this step".to_string(),
+                );
+            }
             reject_name_conflict(&fields, name)?;
             let mut next_nested_id = last_column_id
                 .checked_add(2)
@@ -502,7 +525,13 @@ fn build_updated_schema(
             }
             fields.push(field);
         }
-        IcebergSchemaChange::DropColumn { name } => {
+        IcebergSchemaChange::DropColumn { path } => {
+            if path.segments().len() != 1 {
+                return Err(
+                    "nested DROP COLUMN not yet implemented in this step".to_string(),
+                );
+            }
+            let name = path.last().unwrap();
             let normalized = normalize_identifier(name)?;
             let field_id = fields
                 .iter()
@@ -520,7 +549,13 @@ fn build_updated_schema(
                 normalize_identifier(&f.name).ok().as_deref() != Some(normalized.as_str())
             });
         }
-        IcebergSchemaChange::RenameColumn { old_name, new_name } => {
+        IcebergSchemaChange::RenameColumn { path, new_name } => {
+            if path.segments().len() != 1 {
+                return Err(
+                    "nested RENAME COLUMN not yet implemented in this step".to_string(),
+                );
+            }
+            let old_name = path.last().unwrap();
             reject_name_conflict(&fields, new_name)?;
             let normalized = normalize_identifier(old_name)?;
             let field = fields
@@ -531,7 +566,13 @@ fn build_updated_schema(
                 .ok_or_else(|| format!("unknown Iceberg column `{old_name}`"))?;
             field.name = new_name.clone();
         }
-        IcebergSchemaChange::ModifyColumn { name, new_type } => {
+        IcebergSchemaChange::ModifyColumn { path, new_type } => {
+            if path.segments().len() != 1 {
+                return Err(
+                    "nested MODIFY COLUMN not yet implemented in this step".to_string(),
+                );
+            }
+            let name = path.last().unwrap();
             let normalized = normalize_identifier(name)?;
             let field = fields
                 .iter_mut()
@@ -540,6 +581,14 @@ fn build_updated_schema(
                 })
                 .ok_or_else(|| format!("unknown Iceberg column `{name}`"))?;
             field.field_type = Box::new(widen_type(field.field_type.as_ref(), new_type)?);
+        }
+        IcebergSchemaChange::SetNullable { .. } => {
+            return Err(
+                "ALTER COLUMN SET/DROP NOT NULL not yet implemented in this step".to_string(),
+            );
+        }
+        IcebergSchemaChange::Reorder { .. } => {
+            return Err("ALTER COLUMN reorder not yet implemented in this step".to_string());
         }
     }
 
@@ -564,11 +613,26 @@ fn reject_name_conflict(fields: &[NestedField], name: &str) -> Result<(), String
 fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
     let names: Vec<&str> = match change {
         IcebergSchemaChange::AddColumn { name, .. } => vec![name.as_str()],
-        IcebergSchemaChange::DropColumn { name } => vec![name.as_str()],
-        IcebergSchemaChange::RenameColumn { old_name, new_name } => {
-            vec![old_name.as_str(), new_name.as_str()]
+        IcebergSchemaChange::DropColumn { path } => {
+            path.last().map(|n| vec![n]).unwrap_or_default()
         }
-        IcebergSchemaChange::ModifyColumn { name, .. } => vec![name.as_str()],
+        IcebergSchemaChange::RenameColumn { path, new_name } => {
+            let mut names = Vec::new();
+            if let Some(old_name) = path.last() {
+                names.push(old_name);
+            }
+            names.push(new_name.as_str());
+            names
+        }
+        IcebergSchemaChange::ModifyColumn { path, .. } => {
+            path.last().map(|n| vec![n]).unwrap_or_default()
+        }
+        IcebergSchemaChange::SetNullable { path, .. } => {
+            path.last().map(|n| vec![n]).unwrap_or_default()
+        }
+        IcebergSchemaChange::Reorder { path, .. } => {
+            path.last().map(|n| vec![n]).unwrap_or_default()
+        }
     };
     for name in names {
         if crate::exec::row_position::is_iceberg_row_id(name)
@@ -919,7 +983,8 @@ fn build_property_updates(
                 updates.sets.insert(logical_type_property_key(name)?, value);
             }
         }
-        IcebergSchemaChange::DropColumn { name } => {
+        IcebergSchemaChange::DropColumn { path } => {
+            let name = path.last().unwrap_or_default();
             reject_key_column_drop(properties, name)?;
             let logical_key = logical_type_property_key(name)?;
             if properties.contains_key(&logical_key) {
@@ -930,7 +995,8 @@ fn build_property_updates(
                 updates.push_removal(aggregation_key);
             }
         }
-        IcebergSchemaChange::RenameColumn { old_name, new_name } => {
+        IcebergSchemaChange::RenameColumn { path, new_name } => {
+            let old_name = path.last().unwrap_or_default();
             let old_logical_key = logical_type_property_key(old_name)?;
             if let Some(value) = properties.get(&old_logical_key) {
                 updates
@@ -953,7 +1019,8 @@ fn build_property_updates(
                     .insert(TABLE_KEY_COLUMNS_PROPERTY.to_string(), key_columns);
             }
         }
-        IcebergSchemaChange::ModifyColumn { name, new_type } => {
+        IcebergSchemaChange::ModifyColumn { path, new_type } => {
+            let name = path.last().unwrap_or_default();
             let logical_key = logical_type_property_key(name)?;
             if let Some(value) = logical_type_property_value(new_type) {
                 updates.sets.insert(logical_key, value);
@@ -961,6 +1028,7 @@ fn build_property_updates(
                 updates.push_removal(logical_key);
             }
         }
+        IcebergSchemaChange::SetNullable { .. } | IcebergSchemaChange::Reorder { .. } => {}
     }
     Ok(updates)
 }
@@ -1125,7 +1193,7 @@ fn protect_schema_change(
     change: &IcebergSchemaChange,
 ) -> Result<(), String> {
     reject_reserved_change(change)?;
-    let IcebergSchemaChange::DropColumn { name } = change else {
+    let IcebergSchemaChange::DropColumn { path } = change else {
         return Ok(());
     };
 
@@ -1151,6 +1219,7 @@ fn protect_schema_change(
             &loaded.table,
         )?;
 
+    let name = path.last().unwrap_or_default();
     let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
     reject_drop_dependencies(name, &equality_delete_columns, &mv_dependencies)
 }

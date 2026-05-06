@@ -1174,23 +1174,33 @@ pub(crate) enum AddPosition {
     Before(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum IcebergSchemaChange {
     AddColumn {
+        parent: ColumnPath,
         name: String,
         data_type: SqlType,
         default: Option<DefaultLiteral>,
+        position: AddPosition,
     },
     DropColumn {
-        name: String,
+        path: ColumnPath,
     },
     RenameColumn {
-        old_name: String,
+        path: ColumnPath,
         new_name: String,
     },
     ModifyColumn {
-        name: String,
+        path: ColumnPath,
         new_type: SqlType,
+    },
+    SetNullable {
+        path: ColumnPath,
+        nullable: bool,
+    },
+    Reorder {
+        path: ColumnPath,
+        position: AddPosition,
     },
 }
 
@@ -1459,14 +1469,19 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
         parse_add_column_change(&mut parser)?
     } else if parser.parse_keywords(&[Keyword::DROP, Keyword::COLUMN]) {
         let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-        IcebergSchemaChange::DropColumn { name }
+        IcebergSchemaChange::DropColumn {
+            path: ColumnPath::parse(&name)?,
+        }
     } else if parser.parse_keywords(&[Keyword::RENAME, Keyword::COLUMN]) {
         let old_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
         parser
             .expect_keyword(Keyword::TO)
             .map_err(|e| e.to_string())?;
         let new_name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-        IcebergSchemaChange::RenameColumn { old_name, new_name }
+        IcebergSchemaChange::RenameColumn {
+            path: ColumnPath::parse(&old_name)?,
+            new_name,
+        }
     } else if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "MODIFY") {
         parser.next_token();
         parser
@@ -1476,7 +1491,10 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
         let new_type = crate::sql::parser::dialect::convert_sql_type(
             parser.parse_data_type().map_err(|e| e.to_string())?,
         )?;
-        IcebergSchemaChange::ModifyColumn { name, new_type }
+        IcebergSchemaChange::ModifyColumn {
+            path: ColumnPath::parse(&name)?,
+            new_type,
+        }
     } else {
         return Err("unsupported ALTER TABLE schema evolution clause".to_string());
     };
@@ -1535,9 +1553,11 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
         break;
     }
     Ok(IcebergSchemaChange::AddColumn {
+        parent: ColumnPath::root(),
         name,
         data_type,
         default,
+        position: AddPosition::Default,
     })
 }
 
@@ -1872,9 +1892,11 @@ mod tests {
         assert_eq!(
             stmt.change,
             super::IcebergSchemaChange::AddColumn {
+                parent: super::ColumnPath::root(),
                 name: "discount".to_string(),
                 data_type: crate::sql::parser::ast::SqlType::Int,
                 default: Some(super::DefaultLiteral::Null),
+                position: super::AddPosition::Default,
             }
         );
     }
@@ -1884,36 +1906,30 @@ mod tests {
         let drop_stmt =
             super::parse_alter_iceberg_schema_sql("ALTER TABLE ice.db.orders DROP COLUMN old_col")
                 .expect("drop");
-        assert_eq!(
-            drop_stmt.change,
-            super::IcebergSchemaChange::DropColumn {
-                name: "old_col".to_string(),
-            }
-        );
+        let super::IcebergSchemaChange::DropColumn { path } = drop_stmt.change else {
+            panic!("expected DropColumn");
+        };
+        assert_eq!(path.dotted(), "old_col");
 
         let rename_stmt = super::parse_alter_iceberg_schema_sql(
             "ALTER TABLE ice.db.orders RENAME COLUMN old_col TO new_col",
         )
         .expect("rename");
-        assert_eq!(
-            rename_stmt.change,
-            super::IcebergSchemaChange::RenameColumn {
-                old_name: "old_col".to_string(),
-                new_name: "new_col".to_string(),
-            }
-        );
+        let super::IcebergSchemaChange::RenameColumn { path, new_name } = rename_stmt.change else {
+            panic!("expected RenameColumn");
+        };
+        assert_eq!(path.dotted(), "old_col");
+        assert_eq!(new_name, "new_col");
 
         let modify_stmt = super::parse_alter_iceberg_schema_sql(
             "ALTER TABLE ice.db.orders MODIFY COLUMN id BIGINT",
         )
         .expect("modify");
-        assert_eq!(
-            modify_stmt.change,
-            super::IcebergSchemaChange::ModifyColumn {
-                name: "id".to_string(),
-                new_type: crate::sql::parser::ast::SqlType::BigInt,
-            }
-        );
+        let super::IcebergSchemaChange::ModifyColumn { path, new_type } = modify_stmt.change else {
+            panic!("expected ModifyColumn");
+        };
+        assert_eq!(path.dotted(), "id");
+        assert_eq!(new_type, crate::sql::parser::ast::SqlType::BigInt);
     }
 
     #[test]
