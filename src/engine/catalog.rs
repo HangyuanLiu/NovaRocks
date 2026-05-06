@@ -213,6 +213,7 @@ pub(crate) fn build_parquet_table(
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
+            write_default: None,
         });
     }
     Ok(TableDef {
@@ -237,6 +238,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,

@@ -277,6 +277,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    write_default: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
                 iceberg_table: None,

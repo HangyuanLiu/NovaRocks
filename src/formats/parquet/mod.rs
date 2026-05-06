@@ -1580,7 +1580,10 @@ fn align_iceberg_array_to_field(
                     )?;
                     columns.push(aligned);
                 } else {
-                    columns.push(new_null_array(target_child.data_type(), row_count));
+                    columns.push(build_iceberg_default_array(
+                        target_child.as_ref(),
+                        row_count,
+                    )?);
                 }
             }
             let array = StructArray::try_new(
@@ -1617,6 +1620,75 @@ fn align_iceberg_array_to_field(
     }
 }
 
+fn build_iceberg_default_array(target_field: &Field, row_count: usize) -> Result<ArrayRef, String> {
+    use crate::connector::iceberg::default_value::literal_to_constant_array;
+    use crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY;
+    use iceberg::spec::Literal;
+
+    let Some(json) = target_field
+        .metadata()
+        .get(ICEBERG_INITIAL_DEFAULT_META_KEY)
+    else {
+        return Ok(new_null_array(target_field.data_type(), row_count));
+    };
+    let json_value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        format!(
+            "corrupted initial-default JSON for column {}: {e}",
+            target_field.name()
+        )
+    })?;
+    let iceberg_type = arrow_type_to_iceberg_type(target_field.data_type()).map_err(|e| {
+        format!(
+            "unsupported initial-default for column {}: {e}",
+            target_field.name()
+        )
+    })?;
+    let literal = Literal::try_from_json(json_value, &iceberg_type)
+        .map_err(|e| {
+            format!(
+                "decode initial-default for column {}: {e}",
+                target_field.name()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "initial-default JSON for column {} produced no literal",
+                target_field.name()
+            )
+        })?;
+
+    literal_to_constant_array(&literal, target_field.data_type(), row_count)
+}
+
+fn arrow_type_to_iceberg_type(
+    dt: &arrow::datatypes::DataType,
+) -> Result<iceberg::spec::Type, String> {
+    use arrow::datatypes::TimeUnit;
+    use iceberg::spec::{PrimitiveType, Type};
+    Ok(match dt {
+        DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
+        DataType::Int32 => Type::Primitive(PrimitiveType::Int),
+        DataType::Int64 => Type::Primitive(PrimitiveType::Long),
+        DataType::Float32 => Type::Primitive(PrimitiveType::Float),
+        DataType::Float64 => Type::Primitive(PrimitiveType::Double),
+        DataType::Decimal128(precision, scale) => Type::Primitive(PrimitiveType::Decimal {
+            precision: *precision as u32,
+            scale: *scale as u32,
+        }),
+        DataType::Utf8 => Type::Primitive(PrimitiveType::String),
+        DataType::Date32 => Type::Primitive(PrimitiveType::Date),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Type::Primitive(PrimitiveType::Timestamp)
+        }
+        DataType::Binary => Type::Primitive(PrimitiveType::Binary),
+        other => {
+            return Err(format!(
+                "arrow type {other:?} cannot carry an iceberg default"
+            ));
+        }
+    })
+}
+
 fn align_batch_to_iceberg_schema(
     output_schema: &SchemaRef,
     batch: RecordBatch,
@@ -1651,7 +1723,7 @@ fn align_batch_to_iceberg_schema(
             )?;
             columns.push(array);
         } else {
-            columns.push(new_null_array(target.data_type(), row_count));
+            columns.push(build_iceberg_default_array(target.as_ref(), row_count)?);
         }
     }
     RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|e| e.to_string())
@@ -2598,5 +2670,61 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert!(matches!(sources[0], super::DelayedColumnSource::Active(0)));
         assert!(matches!(sources[1], super::DelayedColumnSource::Lazy(0)));
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_fills_missing_column_with_initial_default() {
+        // Build a parquet file with only column `a`, then read with an output
+        // schema that includes `b` carrying ICEBERG_INITIAL_DEFAULT_META_KEY=99.
+        // Expect b column to be filled with 99 instead of NULL.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("initial_default.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true).with_metadata(
+                std::iter::once((PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())).collect(),
+            ),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20])) as _],
+        )
+        .unwrap();
+        let file = File::create(&file_path).expect("create parquet");
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // Output schema includes `b` with initial-default JSON metadata.
+        let mut b_meta = HashMap::new();
+        b_meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string());
+        b_meta.insert(
+            crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+            "99".to_string(),
+        );
+        let out_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true).with_metadata(
+                std::iter::once((PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())).collect(),
+            ),
+            Field::new("b", DataType::Int32, true).with_metadata(b_meta),
+        ]);
+
+        let result = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["a".to_string(), "b".to_string()],
+                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                Some(out_schema),
+            ),
+            &file_path,
+        );
+
+        let b = result
+            .column_by_name("b")
+            .expect("b column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+        assert_eq!(b.value(0), 99);
+        assert_eq!(b.value(1), 99);
     }
 }

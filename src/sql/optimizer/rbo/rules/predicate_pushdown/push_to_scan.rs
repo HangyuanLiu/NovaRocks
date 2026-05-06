@@ -113,6 +113,7 @@ mod tests {
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: true,
+                        write_default: None,
                     })
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],

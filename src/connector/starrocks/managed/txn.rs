@@ -609,6 +609,7 @@ fn derive_column_defs_from_runtime(
                         schema_column,
                     )?,
                 nullable: column.nullable,
+                write_default: None,
             })
         })
         .collect()

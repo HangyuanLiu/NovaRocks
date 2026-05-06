@@ -530,6 +530,7 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
             name: column.column_name.clone(),
             data_type: arrow_type_from_tablet_column(schema_column)?,
             nullable: column.nullable,
+            write_default: None,
         });
     }
     Ok(TableDef {
@@ -851,11 +852,13 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    write_default: None,
                 },
                 ColumnDef {
                     name: "items".to_string(),
                     data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                     nullable: true,
+                    write_default: None,
                 },
             ]
         );

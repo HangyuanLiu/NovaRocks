@@ -199,6 +199,7 @@ mod tests {
             name: name.to_string(),
             data_type: ty,
             nullable,
+            write_default: None,
         }
     }
 

@@ -40,6 +40,7 @@ sqlparser = "0.61.0"
 hex = "0.4"
 libm = "0.2"
 num-traits = "0.2"
+ordered-float = "4"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 as-any = "0.3"

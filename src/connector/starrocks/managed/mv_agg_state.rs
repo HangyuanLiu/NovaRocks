@@ -24,7 +24,7 @@ use crate::sql::parser::ast::SqlType;
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateMvLayout {
     pub(crate) row_id_column: ManagedPhysicalColumn,
     pub(crate) visible_columns: Vec<AggregateVisibleColumn>,

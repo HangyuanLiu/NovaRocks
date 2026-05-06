@@ -229,9 +229,24 @@ fn to_thrift_iceberg_schema(schema: &IcebergSchemaDef) -> descriptors::TIcebergS
 fn to_thrift_iceberg_schema_field(
     field: &IcebergSchemaFieldDef,
 ) -> descriptors::TIcebergSchemaField {
+    let initial_default_json = field
+        .initial_default
+        .as_ref()
+        .map(serialize_iceberg_literal_json)
+        .transpose()
+        // Fallible serialization should never reach the codegen layer because
+        // the parser-side type validation rejects unsupported variants before
+        // they can be persisted. If it does, propagate as None so we don't
+        // crash the whole codegen — the read-side will simply see "no
+        // default" and fall through to NULL fill.
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "drop initial_default_json: {err}");
+            None
+        });
     descriptors::TIcebergSchemaField::new(
         Some(field.field_id),
         Some(field.name.clone()),
+        initial_default_json,
         (!field.children.is_empty()).then(|| {
             field
                 .children
@@ -241,6 +256,32 @@ fn to_thrift_iceberg_schema_field(
                 .collect::<Vec<_>>()
         }),
     )
+}
+
+fn serialize_iceberg_literal_json(literal: &iceberg::spec::Literal) -> Result<String, String> {
+    match literal {
+        iceberg::spec::Literal::Primitive(prim) => match prim {
+            iceberg::spec::PrimitiveLiteral::Boolean(b) => Ok(b.to_string()),
+            iceberg::spec::PrimitiveLiteral::Int(v) => Ok(v.to_string()),
+            iceberg::spec::PrimitiveLiteral::Long(v) => Ok(v.to_string()),
+            iceberg::spec::PrimitiveLiteral::Float(v) => Ok(v.0.to_string()),
+            iceberg::spec::PrimitiveLiteral::Double(v) => Ok(v.0.to_string()),
+            iceberg::spec::PrimitiveLiteral::Int128(v) => Ok(v.to_string()),
+            iceberg::spec::PrimitiveLiteral::String(s) => {
+                serde_json::to_string(s).map_err(|e| format!("serialize String default: {e}"))
+            }
+            iceberg::spec::PrimitiveLiteral::Binary(b) => {
+                let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+                serde_json::to_string(&hex).map_err(|e| format!("serialize Binary default: {e}"))
+            }
+            other => Err(format!(
+                "unsupported primitive literal for thrift emission: {other:?}"
+            )),
+        },
+        other => Err(format!(
+            "unsupported literal kind for thrift emission: {other:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +297,7 @@ mod tests {
                 name: "order_id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: Some(IcebergTableInfo {
@@ -264,9 +306,13 @@ mod tests {
                     fields: vec![IcebergSchemaFieldDef {
                         field_id: 7,
                         name: "order_id".to_string(),
+                        initial_default: None,
+                        write_default: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 8,
                             name: "nested".to_string(),
+                            initial_default: None,
+                            write_default: None,
                             children: vec![],
                         }],
                     }],
@@ -312,5 +358,40 @@ mod tests {
                 .children
                 .is_none()
         );
+    }
+
+    #[test]
+    fn descriptor_builder_emits_iceberg_initial_default_json() {
+        use crate::sql::catalog::IcebergSchemaFieldDef;
+        let field = IcebergSchemaFieldDef {
+            field_id: 1,
+            name: "c".to_string(),
+            initial_default: Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::Int(5),
+            )),
+            write_default: None,
+            children: vec![],
+        };
+        let thrift = to_thrift_iceberg_schema_field(&field);
+        assert_eq!(thrift.initial_default_json.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn descriptor_builder_escapes_control_chars_in_string_default() {
+        use crate::sql::catalog::IcebergSchemaFieldDef;
+        let field = IcebergSchemaFieldDef {
+            field_id: 1,
+            name: "c".to_string(),
+            initial_default: Some(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::String("a\nb\\c\"d".into()),
+            )),
+            write_default: None,
+            children: vec![],
+        };
+        let thrift = to_thrift_iceberg_schema_field(&field);
+        // serde_json escapes \n as \n, \\ as \\\\, " as \"
+        let json = thrift.initial_default_json.expect("present");
+        let decoded: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(decoded.as_str(), Some("a\nb\\c\"d"));
     }
 }

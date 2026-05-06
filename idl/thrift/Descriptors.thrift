@@ -561,8 +561,10 @@ struct TIcebergSchemaField {
     // Refer to field name
     2: optional string name
 
-    // You can fill other field properties here if you needed
-    // .......
+    // Iceberg v3 initial-default for this field, serialized to spec JSON.
+    // Used by readers to fill missing columns instead of NULL. Optional;
+    // absence indicates no default (preserves pre-v3 behavior).
+    3: optional string initial_default_json
 
     // Children fields for struct, map and list(array)
     100: optional list<TIcebergSchemaField> children

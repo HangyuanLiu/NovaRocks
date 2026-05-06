@@ -363,12 +363,12 @@ pub(crate) fn create_table(
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
     entry.invalidate_table_cache(namespace_name, &table_name);
-    let schema = build_iceberg_schema(columns)?;
+    let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
+    let schema = build_iceberg_schema(columns, format_version)?;
     let partition_spec = crate::connector::iceberg::partition_spec::build_initial_partition_spec(
         &schema,
         partition_fields,
     )?;
-    let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     all_properties.extend(build_logical_type_properties(columns)?);
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
     let table_creation = TableCreation::builder()
@@ -583,7 +583,8 @@ pub(crate) fn load_table(
     let logical_types = parse_logical_type_properties(table.metadata().properties())?;
     let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
     let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
-    let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
+    let iceberg_schema = table.metadata().current_schema();
+    let arrow_schema = schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
     let columns = arrow_schema
         .fields()
@@ -595,6 +596,9 @@ pub(crate) fn load_table(
                     field.name()
                 )
             })?;
+            let nested = iceberg_schema
+                .field_by_name(field.name())
+                .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
             Ok(ColumnDef {
                 name: field.name().clone(),
                 data_type: apply_logical_type_override(
@@ -602,6 +606,7 @@ pub(crate) fn load_table(
                     logical_types.get(&field_name),
                 ),
                 nullable: field.is_nullable(),
+                write_default: nested.write_default.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1214,7 +1219,10 @@ fn canonicalize_or_join(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
+fn build_iceberg_schema(
+    columns: &[TableColumnDef],
+    format_version: FormatVersion,
+) -> Result<Schema, String> {
     let mut next_nested_field_id =
         i32::try_from(columns.len() + 1).map_err(|_| "too many iceberg columns".to_string())?;
     let fields = columns
@@ -1226,18 +1234,43 @@ fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
             let iceberg_type =
                 iceberg_type_for_sql_type(&column.data_type, &mut next_nested_field_id)?;
             // Honor NOT NULL: required = non-nullable, optional = nullable.
-            let nested = if column.nullable {
+            let mut field = if column.nullable {
                 NestedField::optional(field_id, &column.name, iceberg_type)
             } else {
                 NestedField::required(field_id, &column.name, iceberg_type)
             };
-            Ok(nested.into())
+            // Persist DEFAULT literal for v3; reject non-NULL defaults on v1/v2.
+            if let Some(default_literal) = &column.default {
+                if let Some(iceberg_lit) =
+                    crate::connector::iceberg::default_value::default_literal_to_iceberg(
+                        default_literal,
+                        &column.data_type,
+                    )?
+                {
+                    crate::connector::iceberg::default_value::require_v3_for_default(
+                        format_version,
+                        &Some(iceberg_lit.clone()),
+                    )?;
+                    field = field
+                        .with_initial_default(iceberg_lit.clone())
+                        .with_write_default(iceberg_lit);
+                }
+            }
+            Ok(field.into())
         })
         .collect::<Result<Vec<_>, String>>()?;
     Schema::builder()
         .with_fields(fields)
         .build()
         .map_err(|e| format!("build iceberg schema failed: {e}"))
+}
+
+#[cfg(test)]
+pub(crate) fn build_iceberg_schema_for_test(
+    columns: &[TableColumnDef],
+    format_version: FormatVersion,
+) -> Result<Schema, String> {
+    build_iceberg_schema(columns, format_version)
 }
 
 pub(crate) fn iceberg_type_for_sql_type(
@@ -2233,6 +2266,37 @@ mod table_property_tests {
             err.contains("unsupported iceberg format-version"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn create_v2_table_with_non_null_default_rejected() {
+        let columns = vec![crate::sql::parser::ast::TableColumnDef {
+            name: "c".to_string(),
+            data_type: crate::sql::parser::ast::SqlType::Int,
+            nullable: true,
+            aggregation: None,
+            default: Some(crate::sql::parser::ast::DefaultLiteral::Int(5)),
+        }];
+        let err = build_iceberg_schema_for_test(&columns, FormatVersion::V2)
+            .expect_err("v2 + default rejected");
+        assert!(err.contains("format-version 3"));
+    }
+
+    #[test]
+    fn create_v3_table_with_int_default_persists_literal() {
+        let columns = vec![crate::sql::parser::ast::TableColumnDef {
+            name: "c".to_string(),
+            data_type: crate::sql::parser::ast::SqlType::Int,
+            nullable: true,
+            aggregation: None,
+            default: Some(crate::sql::parser::ast::DefaultLiteral::Int(5)),
+        }];
+        let schema =
+            build_iceberg_schema_for_test(&columns, FormatVersion::V3).expect("v3 + default ok");
+        let field = schema.field_by_name("c").expect("c");
+        let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
+        assert_eq!(field.initial_default.as_ref(), Some(&expected));
+        assert_eq!(field.write_default.as_ref(), Some(&expected));
     }
 }
 

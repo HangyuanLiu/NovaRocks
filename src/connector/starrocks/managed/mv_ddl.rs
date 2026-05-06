@@ -1081,6 +1081,7 @@ fn output_column_to_table_column(column: &OutputColumn) -> Result<TableColumnDef
         data_type: arrow_data_type_to_sql_type(&column.data_type)?,
         nullable: column.nullable,
         aggregation: None,
+        default: None,
     })
 }
 

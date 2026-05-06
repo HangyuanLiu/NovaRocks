@@ -960,6 +960,7 @@ fn iceberg_table_columns(
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
+            write_default: None,
         })
         .collect())
 }
@@ -1734,6 +1735,7 @@ mod tests {
             name: name.to_string(),
             data_type: DataType::Int64,
             nullable: true,
+            write_default: None,
         }
     }
 

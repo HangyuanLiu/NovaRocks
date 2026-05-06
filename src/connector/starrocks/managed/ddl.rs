@@ -29,7 +29,7 @@ const SHORT_KEY_MAX_COLUMN_COUNT: usize = 3;
 /// Mirrors StarRocks `SHORTKEY_MAXSIZE_BYTES`: at most 36 bytes in the short-key.
 const SHORT_KEY_MAX_SIZE_BYTES: usize = 36;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ManagedPhysicalColumn {
     pub(crate) column: TableColumnDef,
     pub(crate) visible: bool,
@@ -49,6 +49,7 @@ pub(crate) fn managed_physical_column(
             data_type,
             nullable,
             aggregation: None,
+            default: None,
         },
         visible,
         is_key,
@@ -823,6 +824,7 @@ pub(crate) fn request_schema_from_runtime(
                 data_type: parse_managed_logical_type(&column.logical_type)?,
                 nullable: column.nullable,
                 aggregation: None,
+                default: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1317,12 +1319,14 @@ mod tests {
                     data_type: SqlType::Int,
                     nullable: false,
                     aggregation: None,
+                    default: None,
                 },
                 TableColumnDef {
                     name: "k2".to_string(),
                     data_type: SqlType::Int,
                     nullable: true,
                     aggregation: Some(ColumnAggregation::Sum),
+                    default: None,
                 },
             ],
             &TableKeyDesc {
@@ -1349,12 +1353,14 @@ mod tests {
                     data_type: SqlType::Int,
                     nullable: false,
                     aggregation: None,
+                    default: None,
                 },
                 TableColumnDef {
                     name: "v1".to_string(),
                     data_type: SqlType::String,
                     nullable: true,
                     aggregation: None,
+                    default: None,
                 },
             ],
             &TableKeyDesc {
@@ -1726,12 +1732,14 @@ mod tests {
                     data_type: SqlType::BigInt,
                     nullable: false,
                     aggregation: None,
+                    default: None,
                 },
                 TableColumnDef {
                     name: "v".to_string(),
                     data_type: SqlType::String,
                     nullable: true,
                     aggregation: None,
+                    default: None,
                 },
             ],
             None,
@@ -1759,18 +1767,21 @@ mod tests {
                 data_type: SqlType::Float,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "k".to_string(),
                 data_type: SqlType::Int,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "v".to_string(),
                 data_type: SqlType::String,
                 nullable: true,
                 aggregation: None,
+                default: None,
             },
         ])
         .expect_err("float first column should fail");
@@ -1787,30 +1798,35 @@ mod tests {
                 data_type: SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "k2".to_string(),
                 data_type: SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "k3".to_string(),
                 data_type: SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "k4".to_string(),
                 data_type: SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "k5".to_string(),
                 data_type: SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
         ])
         .expect("choose keys");
@@ -1832,12 +1848,14 @@ mod tests {
                 data_type: SqlType::Double,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
             TableColumnDef {
                 name: "v".to_string(),
                 data_type: SqlType::Int,
                 nullable: false,
                 aggregation: None,
+                default: None,
             },
         ])
         .expect_err("double first column should fail");
