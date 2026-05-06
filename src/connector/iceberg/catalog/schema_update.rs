@@ -443,13 +443,124 @@ mod tests {
         );
         assert!(decimal.removals.is_empty());
     }
+
+    // ----- find_field_by_path tests -----
+
+    #[test]
+    fn find_field_by_path_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("a").unwrap();
+        let (field_id, _ty) = find_field_by_path(&schema, &path).unwrap();
+        assert_eq!(field_id, 1);
+    }
+
+    #[test]
+    fn find_field_by_path_nested_struct() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "street",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.street").unwrap();
+        let (field_id, ty) = find_field_by_path(&schema, &path).unwrap();
+        assert_eq!(field_id, 11);
+        assert_eq!(ty, Type::Primitive(PrimitiveType::String));
+    }
+
+    #[test]
+    fn find_field_by_path_unknown_returns_err() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(find_field_by_path(&schema, &path).is_err());
+    }
+
+    #[test]
+    fn find_field_by_path_array_element() {
+        use iceberg::spec::ListType;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tags",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    11,
+                    Type::Primitive(PrimitiveType::Int),
+                    false,
+                )))),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("tags.element").unwrap();
+        let (field_id, ty) = find_field_by_path(&schema, &path).unwrap();
+        assert_eq!(field_id, 11);
+        assert_eq!(ty, Type::Primitive(PrimitiveType::Int));
+    }
+
+    #[test]
+    fn find_field_by_path_map_value() {
+        use iceberg::spec::MapType;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "m",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(
+                        11,
+                        "key",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::optional(
+                        12,
+                        "value",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                )),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("m.value").unwrap();
+        let (field_id, _ty) = find_field_by_path(&schema, &path).unwrap();
+        assert_eq!(field_id, 12);
+    }
 }
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use iceberg::{TableRequirement, TableUpdate};
 
@@ -460,7 +571,7 @@ use crate::connector::iceberg::catalog::registry::{
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::statement::{AlterIcebergSchemaStmt, IcebergSchemaChange};
+use crate::engine::statement::{AlterIcebergSchemaStmt, ColumnPath, IcebergSchemaChange};
 use crate::sql::parser::ast::SqlType;
 
 #[cfg(test)]
@@ -470,6 +581,84 @@ pub(crate) fn apply_change_to_schema_for_test(
     change: &IcebergSchemaChange,
 ) -> Result<Schema, String> {
     build_updated_schema(current, last_column_id, change)
+}
+
+/// Walk `path` through `schema`, descending into nested STRUCT, LIST (via "element"),
+/// and MAP (via "key" / "value") types.  Returns the leaf field-id and its `Type`.
+// This function is called by the B2-B7 walker subagents in subsequent schema evolution tasks.
+#[allow(dead_code)]
+pub(crate) fn find_field_by_path(schema: &Schema, path: &ColumnPath) -> Result<(i32, Type), String> {
+    if path.is_empty() {
+        return Err("column path is empty".to_string());
+    }
+    let mut current_fields: Vec<NestedFieldRef> = schema.as_struct().fields().to_vec();
+    let mut field_id: Option<i32> = None;
+    let mut field_type: Option<Type> = None;
+    let segments = path.segments();
+    let mut idx = 0;
+    while idx < segments.len() {
+        let seg = &segments[idx];
+        let is_last = idx + 1 == segments.len();
+        let normalized = normalize_identifier(seg)?;
+        let found: Option<NestedFieldRef> = current_fields
+            .iter()
+            .find(|f| normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str()))
+            .cloned();
+        let Some(f) = found else {
+            return Err(format!("column path '{}' not found", path.dotted()));
+        };
+        field_id = Some(f.id);
+        field_type = Some((*f.field_type).clone());
+        if is_last {
+            break;
+        }
+        // Descend one level into the composite child; skip the synthetic segment name on
+        // the next iteration because the field itself already carries the right name.
+        match &*f.field_type {
+            Type::Struct(s) => {
+                current_fields = s.fields().to_vec();
+            }
+            Type::List(l) => {
+                let next = &segments[idx + 1];
+                let next_norm = normalize_identifier(next)?;
+                if next_norm != "element" {
+                    return Err(format!(
+                        "list field '{}' can only descend into 'element'",
+                        path.dotted()
+                    ));
+                }
+                // The element field's own name is "element", so the next loop
+                // iteration will match it by name.
+                current_fields = vec![l.element_field.clone()];
+            }
+            Type::Map(m) => {
+                let next = &segments[idx + 1];
+                let next_norm = normalize_identifier(next)?;
+                match next_norm.as_str() {
+                    "key" => {
+                        current_fields = vec![m.key_field.clone()];
+                    }
+                    "value" => {
+                        current_fields = vec![m.value_field.clone()];
+                    }
+                    _ => {
+                        return Err(format!(
+                            "map field '{}' can only descend into 'key' or 'value'",
+                            path.dotted()
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "column path '{}' descends into non-composite type",
+                    path.dotted()
+                ));
+            }
+        }
+        idx += 1;
+    }
+    Ok((field_id.unwrap(), field_type.unwrap()))
 }
 
 fn build_updated_schema(
@@ -495,9 +684,7 @@ fn build_updated_schema(
             position: _,
         } => {
             if !parent.is_empty() {
-                return Err(
-                    "nested STRUCT ADD COLUMN not yet implemented in this step".to_string(),
-                );
+                return Err("nested STRUCT ADD COLUMN not yet implemented in this step".to_string());
             }
             reject_name_conflict(&fields, name)?;
             let mut next_nested_id = last_column_id
@@ -527,9 +714,7 @@ fn build_updated_schema(
         }
         IcebergSchemaChange::DropColumn { path } => {
             if path.segments().len() != 1 {
-                return Err(
-                    "nested DROP COLUMN not yet implemented in this step".to_string(),
-                );
+                return Err("nested DROP COLUMN not yet implemented in this step".to_string());
             }
             let name = path.last().unwrap();
             let normalized = normalize_identifier(name)?;
@@ -551,9 +736,7 @@ fn build_updated_schema(
         }
         IcebergSchemaChange::RenameColumn { path, new_name } => {
             if path.segments().len() != 1 {
-                return Err(
-                    "nested RENAME COLUMN not yet implemented in this step".to_string(),
-                );
+                return Err("nested RENAME COLUMN not yet implemented in this step".to_string());
             }
             let old_name = path.last().unwrap();
             reject_name_conflict(&fields, new_name)?;
@@ -568,9 +751,7 @@ fn build_updated_schema(
         }
         IcebergSchemaChange::ModifyColumn { path, new_type } => {
             if path.segments().len() != 1 {
-                return Err(
-                    "nested MODIFY COLUMN not yet implemented in this step".to_string(),
-                );
+                return Err("nested MODIFY COLUMN not yet implemented in this step".to_string());
             }
             let name = path.last().unwrap();
             let normalized = normalize_identifier(name)?;
