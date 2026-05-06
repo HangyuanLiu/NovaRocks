@@ -4456,6 +4456,85 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn iceberg_row_lineage_optimize_does_not_advance_next_row_id() {
+        use crate::connector::starrocks::managed::store::{
+            IcebergOptimizeJobState, StoredIcebergOptimizeJob,
+        };
+
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+
+        // Seed 3 INSERTs so OPTIMIZE has multiple input data files to coalesce.
+        for i in 1..=3 {
+            session
+                .execute_in_database(
+                    &format!("insert into ice.db1.t values ({i}, '{i}')"),
+                    "default",
+                )
+                .expect("seed");
+        }
+        let (next_row_id_before, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+
+        // Locate the current snapshot id so the OPTIMIZE job's base_snapshot_id
+        // matches the table's live state — that's the precondition for
+        // `validate_base_snapshot` inside the rewrite executor.
+        let base_snapshot_id = {
+            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+            let entry = registry.get("ice").expect("entry");
+            entry.invalidate_table_cache("db1", "t");
+            let loaded = crate::connector::iceberg::catalog::load_table(&entry, "db1", "t")
+                .expect("load table");
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .expect("table must have a current snapshot after INSERTs")
+                .snapshot_id()
+        };
+
+        let job = StoredIcebergOptimizeJob {
+            id: 1,
+            catalog: "ice".to_string(),
+            namespace: "db1".to_string(),
+            table: "t".to_string(),
+            base_snapshot_id,
+            state: IcebergOptimizeJobState::Pending,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error_message: None,
+            outcome: None,
+        };
+        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(
+            &engine.inner,
+            &job,
+        )
+        .expect("run optimize job");
+        assert!(
+            outcome.target_snapshot_id.is_some(),
+            "OPTIMIZE on a non-empty row-lineage table must commit a Replace snapshot"
+        );
+
+        let (next_row_id_after, row_range_after) =
+            current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+        assert_eq!(
+            next_row_id_after, next_row_id_before,
+            "OPTIMIZE must not advance next_row_id on row-lineage tables (preserve mode)"
+        );
+        // V3 snapshots require first-row-id to be non-null per Iceberg spec
+        // (iceberg-rs vendor rejects null on add_snapshot). Preserve-mode
+        // expresses "no new rows allocated" by stamping `(next_row_id, 0)`
+        // — same first_row_id as before, zero added rows so next_row_id
+        // does not advance. Future INSERTs continue from the same id.
+        assert_eq!(
+            row_range_after,
+            Some((next_row_id_before, 0)),
+            "Preserve-mode OPTIMIZE must record (next_row_id, 0) row_range"
+        );
+    }
+
+    #[test]
     fn iceberg_row_lineage_overwrite_writes_row_range() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
