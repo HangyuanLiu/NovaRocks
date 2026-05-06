@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
     ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
     SnapshotRetention, Summary,
 };
@@ -87,6 +87,7 @@ impl IcebergCommitAction for CowUpdateCommit {
             file_io: ctx.file_io.clone(),
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
+            target_ref: ctx.target_ref.to_string(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -120,6 +121,7 @@ struct CowUpdateTxnAction {
     file_io: FileIO,
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    target_ref: String,
 }
 
 #[async_trait]
@@ -136,7 +138,18 @@ impl TransactionAction for CowUpdateTxnAction {
 
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
-        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let target_ref = &self.target_ref;
+        let parent_snapshot_id = m
+            .refs()
+            .get(target_ref.as_str())
+            .map(|r| r.snapshot_id)
+            .or_else(|| {
+                if target_ref == "main" {
+                    m.current_snapshot().map(|s| s.snapshot_id())
+                } else {
+                    None
+                }
+            });
         let metadata_dir = metadata_dir(table);
         let row_lineage_first_row_id = m.next_row_id();
 
@@ -148,14 +161,15 @@ impl TransactionAction for CowUpdateTxnAction {
         )
         .map_err(to_iceberg_data_invalid)?;
         let touched_paths = touched_old_file_paths(&self.sidecar);
-        let index = build_cow_snapshot_index(table, &self.file_io, &touched_paths)
+        let index = build_cow_snapshot_index(table, &self.file_io, &touched_paths, target_ref)
             .await
             .map_err(to_iceberg_unexpected)?;
         if index.touched_live.len() != touched_paths.len() {
             return Err(to_iceberg_unexpected(format!(
-                "COW UPDATE touched {} data file(s), but only {} are live in the current snapshot",
+                "COW UPDATE touched {} data file(s), but only {} are live in the {} snapshot",
                 touched_paths.len(),
-                index.touched_live.len()
+                index.touched_live.len(),
+                target_ref,
             )));
         }
         let touched_delete_groups = group_live_files_by_partition_spec(&index.touched_live);
@@ -307,7 +321,7 @@ impl TransactionAction for CowUpdateTxnAction {
             vec![
                 TableUpdate::AddSnapshot { snapshot },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
+                    ref_name: target_ref.clone(),
                     reference: SnapshotReference {
                         snapshot_id: new_snapshot_id,
                         retention: SnapshotRetention::Branch {
@@ -326,7 +340,7 @@ impl TransactionAction for CowUpdateTxnAction {
                     default_spec_id: m.default_partition_spec_id(),
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
+                    r#ref: target_ref.clone(),
                     snapshot_id: parent_snapshot_id,
                 },
             ],
@@ -378,11 +392,27 @@ async fn build_cow_snapshot_index(
     table: &Table,
     file_io: &FileIO,
     touched_paths: &HashSet<String>,
+    target_ref: &str,
 ) -> Result<CowSnapshotIndex, String> {
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?;
+    let m = table.metadata();
+    // For branch-targeted updates, read the manifest list from the branch head
+    // snapshot (not from main's current snapshot). This ensures that files added
+    // to the branch by prior branch DML (e.g. a branch INSERT) are carried
+    // forward correctly by the COW rewrite.
+    let snapshot = if target_ref == "main" {
+        m.current_snapshot()
+            .ok_or_else(|| "COW UPDATE requires a current snapshot".to_string())?
+    } else {
+        let branch_snapshot_id =
+            m.refs()
+                .get(target_ref)
+                .map(|r| r.snapshot_id)
+                .ok_or_else(|| {
+                    format!("COW UPDATE target branch '{target_ref}' not found in table metadata")
+                })?;
+        m.snapshot_by_id(branch_snapshot_id)
+            .ok_or_else(|| format!("COW UPDATE branch '{target_ref}' snapshot {branch_snapshot_id} not found in metadata"))?
+    };
     let manifest_list = snapshot
         .load_manifest_list(file_io, table.metadata())
         .await

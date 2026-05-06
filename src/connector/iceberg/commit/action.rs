@@ -42,6 +42,9 @@ pub struct CommitCtx<'a> {
     pub file_io: &'a FileIO,
     pub commit_uuid: Uuid,
     pub abort_handle: Arc<AbortLog>,
+    /// Target ref for this commit. `"main"` is the default; non-`main`
+    /// values are used for branch-qualified DML (`INSERT INTO t.branch_<x>`).
+    pub target_ref: &'a str,
 }
 
 #[async_trait]

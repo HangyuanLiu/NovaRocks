@@ -163,25 +163,23 @@ pub(crate) fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option
     }
 }
 
-pub(crate) fn build_read_snapshot(
+pub(crate) fn build_read_snapshot_at(
     table: &iceberg::table::Table,
+    snapshot_id: i64,
 ) -> Result<IcebergReadSnapshot, String> {
     use crate::connector::iceberg::catalog::registry::block_on_iceberg;
     use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
     let metadata = table.metadata();
-    let snapshot = match metadata.current_snapshot() {
-        Some(s) => s,
-        None => {
-            return Ok(IcebergReadSnapshot {
-                snapshot_id: None,
-                files: Vec::new(),
-            });
-        }
-    };
-    let snapshot_id = Some(snapshot.snapshot_id());
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
 
-    let schema = metadata.current_schema();
+    // Use the schema associated with this snapshot for correct schema-evolution semantics.
+    // Snapshot::schema() resolves the schema via schema_id if set, falling back to current.
+    let schema = snapshot
+        .schema(metadata)
+        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
     let field_id_to_name: HashMap<i32, String> = schema
         .as_struct()
         .fields()
@@ -418,9 +416,25 @@ pub(crate) fn build_read_snapshot(
             }
         }
 
-        Ok(IcebergReadSnapshot { snapshot_id, files })
+        Ok(IcebergReadSnapshot {
+            snapshot_id: Some(snapshot_id),
+            files,
+        })
     })
     .map_err(|e| format!("build iceberg read snapshot runtime: {e}"))?
+}
+
+pub(crate) fn build_read_snapshot(
+    table: &iceberg::table::Table,
+) -> Result<IcebergReadSnapshot, String> {
+    let metadata = table.metadata();
+    match metadata.current_snapshot() {
+        Some(s) => build_read_snapshot_at(table, s.snapshot_id()),
+        None => Ok(IcebergReadSnapshot {
+            snapshot_id: None,
+            files: Vec::new(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -559,5 +573,56 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, a.path);
+    }
+
+    #[test]
+    fn build_read_snapshot_at_returns_error_for_unknown_snapshot_id() {
+        use iceberg::io::FileIO;
+        use iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type,
+        };
+        use iceberg::table::Table;
+        use iceberg::{NamespaceIdent, TableIdent};
+        use std::collections::HashMap;
+
+        // Build a minimal TableMetadata with no snapshots.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let file_io = FileIO::new_with_memory();
+        let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
+
+        let table = Table::builder()
+            .file_io(file_io)
+            .metadata(metadata)
+            .identifier(ident)
+            .build()
+            .unwrap();
+
+        let result = build_read_snapshot_at(&table, 999_i64);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("snapshot 999 not found"),
+            "unexpected error: {msg}"
+        );
     }
 }

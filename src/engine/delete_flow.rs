@@ -52,7 +52,8 @@ use crate::connector::iceberg::commit::{
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::{StandaloneState, StatementResult};
-use crate::sql::parser::ast::DeleteStmt;
+use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
+use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 
 pub(crate) fn execute_delete_statement(
     state: &Arc<StandaloneState>,
@@ -60,9 +61,31 @@ pub(crate) fn execute_delete_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    // Detect branch/tag suffix in the target table name.
+    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
+    let effective_name;
+    let table_name: &ObjectName = match ref_suffix {
+        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
+            return Err(format!(
+                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
+            ));
+        }
+        Some(IcebergRefSuffix::Branch(_)) => {
+            effective_name = ObjectName {
+                parts: stripped_parts,
+            };
+            &effective_name
+        }
+        None => &stmt.table,
+    };
+    let target_ref = match &ref_suffix {
+        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
+        _ => "main".to_string(),
+    };
+
     // 1. Resolve target.
     let target =
-        resolve_existing_table_target(state, &stmt.table, current_catalog, current_database)?;
+        resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
     if target.backend_name != "iceberg" {
         return Err(format!(
             "phase 1 DELETE only supports iceberg backends, got `{}`",
@@ -87,6 +110,17 @@ pub(crate) fn execute_delete_statement(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
+    // Branch writes require Iceberg v3 (row-lineage semantics).
+    if target_ref != "main" {
+        let fmt = table.metadata().format_version();
+        if fmt != iceberg::spec::FormatVersion::V3 {
+            return Err(format!(
+                "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
+                table_ident, fmt as u8,
+            ));
+        }
+    }
+
     // 3. Validation.
     let delete_strategy = classify_sql_delete_strategy(&table)?;
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
@@ -94,17 +128,31 @@ pub(crate) fn execute_delete_statement(
     //    inside [`scan_for_position_deletes`].
     let schema = table.metadata().current_schema();
     let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
-    let existing_deletes_by_file =
-        load_existing_delete_visibility_by_data_file(&table, entry.object_store_config())?;
-    let referenced_data_file_partitions = load_referenced_data_file_partitions(&table)?;
+
+    // For branch DML, resolve the branch head snapshot to read the base state
+    // at that point rather than the table's current_snapshot.
+    let read_snapshot_id: Option<i64> = if target_ref != "main" {
+        resolve_branch_head_snapshot_id(table.metadata(), &target_ref)?
+    } else {
+        table.metadata().current_snapshot().map(|s| s.snapshot_id())
+    };
+
+    let existing_deletes_by_file = load_existing_delete_visibility_by_data_file_at(
+        &table,
+        read_snapshot_id,
+        entry.object_store_config(),
+    )?;
+    let referenced_data_file_partitions =
+        load_referenced_data_file_partitions_at(&table, read_snapshot_id)?;
 
     // 5. Scan data files and collect (file, pos) pairs. This path still reads
     //    every physical row and applies the original sqlparser WHERE AST per
     //    row so the currently supported DELETE semantics stay unchanged while
     //    existing row-level deletes remain visible to the write-side planner.
     let groups = block_on_iceberg(async {
-        scan_for_position_deletes(
+        scan_for_position_deletes_at(
             &table,
+            read_snapshot_id,
             predicate,
             &stmt.where_clause,
             &existing_deletes_by_file,
@@ -126,6 +174,14 @@ pub(crate) fn execute_delete_statement(
     );
     let file_io = table.file_io().clone();
 
+    // Determine the base snapshot for the commit. For branch DML, use the
+    // branch head; for main/default, use the current snapshot.
+    let base_snapshot_id = if target_ref != "main" {
+        resolve_branch_head_snapshot_id(metadata, &target_ref)?
+    } else {
+        metadata.current_snapshot().map(|s| s.snapshot_id())
+    };
+
     match delete_strategy {
         IcebergSqlDeleteStrategy::PositionDeleteFiles => {
             // 6. Write v2 Parquet position-delete files into staging.
@@ -137,7 +193,7 @@ pub(crate) fn execute_delete_statement(
             let collector = Arc::new(IcebergCommitCollector::new(
                 CommitOpKind::RowDelta,
                 table_ident,
-                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                base_snapshot_id,
                 metadata.last_sequence_number(),
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
@@ -159,6 +215,7 @@ pub(crate) fn execute_delete_statement(
                     file_io,
                     cleanup_path_mapper: abort_cleanup.path_mapper,
                     cow_update_sidecar: None,
+                    target_ref: target_ref.clone(),
                 })
                 .await
             })??;
@@ -169,7 +226,7 @@ pub(crate) fn execute_delete_statement(
             let collector = Arc::new(IcebergCommitCollector::new(
                 CommitOpKind::RowDeltaDv,
                 table_ident,
-                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                base_snapshot_id,
                 metadata.last_sequence_number(),
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
@@ -191,6 +248,7 @@ pub(crate) fn execute_delete_statement(
                     file_io,
                     cleanup_path_mapper: abort_cleanup.path_mapper,
                     cow_update_sidecar: None,
+                    target_ref: target_ref.clone(),
                 })
                 .await
             })??;
@@ -414,8 +472,9 @@ fn literal_to_datum(
     }
 }
 
-async fn scan_for_position_deletes(
+async fn scan_for_position_deletes_at(
     table: &iceberg::table::Table,
+    snapshot_id: Option<i64>,
     predicate: Predicate,
     where_expr: &sqlast::Expr,
     existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
@@ -423,23 +482,17 @@ async fn scan_for_position_deletes(
 ) -> Result<Vec<PositionDeleteGroup>, String> {
     let schema = table.metadata().current_schema();
 
-    // Project `_file`, `_pos`, and every primitive top-level column the WHERE
-    // clause may reference. Reading the whole row schema keeps the
-    // per-row evaluator simple and matches the supported predicate set
-    // (primitive comparisons + IN + IS NULL/IS NOT NULL + AND/OR).
     let mut select_cols: Vec<String> = vec!["_file".to_string(), "_pos".to_string()];
     for f in schema.as_struct().fields() {
         select_cols.push(f.name.clone());
     }
 
-    // Keep `predicate` for validation only. In this standalone path the
-    // sqlparser evaluator below owns row-level matching; pushing the Iceberg
-    // predicate into planning can prune too aggressively for locally-written
-    // overwrite snapshots whose column metrics are incomplete.
     let _ = predicate;
-    let scan = table
-        .scan()
-        .select(select_cols)
+    let mut scan_builder = table.scan().select(select_cols);
+    if let Some(snap_id) = snapshot_id {
+        scan_builder = scan_builder.snapshot_id(snap_id);
+    }
+    let scan = scan_builder
         .build()
         .map_err(|e| format!("build TableScan failed: {e}"))?;
     let task_stream = scan
@@ -453,10 +506,6 @@ async fn scan_for_position_deletes(
             task
         })
     });
-
-    // Build an ArrowReader with row_selection_enabled=false. Combined with
-    // cleared `task.deletes` and `task.predicate`, this keeps the manual
-    // sqlparser WHERE evaluator responsible for row-level DELETE matching.
     let arrow_reader = ArrowReaderBuilder::new(table.file_io().clone())
         .with_row_group_filtering_enabled(false)
         .with_row_selection_enabled(false)
@@ -497,6 +546,24 @@ async fn scan_for_position_deletes(
         .collect::<Result<Vec<_>, String>>()?)
 }
 
+async fn scan_for_position_deletes(
+    table: &iceberg::table::Table,
+    predicate: Predicate,
+    where_expr: &sqlast::Expr,
+    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &ReferencedDataFilePartitions,
+) -> Result<Vec<PositionDeleteGroup>, String> {
+    scan_for_position_deletes_at(
+        table,
+        None,
+        predicate,
+        where_expr,
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+    )
+    .await
+}
+
 pub(crate) struct ReferencedDataFilePartition {
     pub(crate) partition_spec_id: i32,
     pub(crate) partition_values: iceberg::spec::Struct,
@@ -504,10 +571,41 @@ pub(crate) struct ReferencedDataFilePartition {
 
 pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
 
-pub(crate) fn load_referenced_data_file_partitions(
+/// Resolve the snapshot id at the head of a named Iceberg branch.
+///
+/// Returns `None` when the branch exists but has never had a snapshot committed
+/// to it (unborn branch). Returns an error when the ref does not exist in the
+/// table metadata.
+pub(crate) fn resolve_branch_head_snapshot_id(
+    metadata: &iceberg::spec::TableMetadata,
+    branch_name: &str,
+) -> Result<Option<i64>, String> {
+    match metadata.refs().get(branch_name) {
+        Some(snap_ref) => Ok(Some(snap_ref.snapshot_id)),
+        None => {
+            if branch_name == "main" && metadata.current_snapshot().is_none() {
+                // Unborn main branch — no snapshot yet; caller should treat as empty.
+                Ok(None)
+            } else {
+                Err(format!(
+                    "iceberg ref: branch '{branch_name}' not found in table metadata"
+                ))
+            }
+        }
+    }
+}
+
+/// Snapshot-aware version of [`load_referenced_data_file_partitions`].
+///
+/// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
+pub(crate) fn load_referenced_data_file_partitions_at(
     table: &iceberg::table::Table,
+    snapshot_id: Option<i64>,
 ) -> Result<ReferencedDataFilePartitions, String> {
-    let data_files = registry::extract_data_files_with_stats(table)?;
+    let data_files = match snapshot_id {
+        Some(id) => registry::extract_data_files_with_stats_at(table, id)?,
+        None => registry::extract_data_files_with_stats(table)?,
+    };
     let mut out = HashMap::with_capacity(data_files.len());
     for data_file in data_files {
         let partition_spec_id = data_file.partition_spec_id.ok_or_else(|| {
@@ -529,6 +627,12 @@ pub(crate) fn load_referenced_data_file_partitions(
         insert_referenced_data_file_partition(&mut out, data_file.path, partition)?;
     }
     Ok(out)
+}
+
+pub(crate) fn load_referenced_data_file_partitions(
+    table: &iceberg::table::Table,
+) -> Result<ReferencedDataFilePartitions, String> {
+    load_referenced_data_file_partitions_at(table, None)
 }
 
 fn insert_referenced_data_file_partition(
@@ -566,12 +670,34 @@ pub(crate) struct ExistingDeleteVisibility {
 
 pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
 
+/// Snapshot-aware version of [`load_existing_delete_visibility_by_data_file`].
+///
+/// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
+pub(crate) fn load_existing_delete_visibility_by_data_file_at(
+    table: &iceberg::table::Table,
+    snapshot_id: Option<i64>,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<ExistingDeleteVisibilityByDataFile, String> {
+    let data_files = match snapshot_id {
+        Some(id) => crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+            table, id,
+        )?,
+        None => crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(table)?,
+    };
+    load_delete_visibility_from_data_files(data_files, object_store_config)
+}
+
 pub(crate) fn load_existing_delete_visibility_by_data_file(
     table: &iceberg::table::Table,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
-    let data_files =
-        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(table)?;
+    load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)
+}
+
+fn load_delete_visibility_from_data_files(
+    data_files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
 
     for data_file in data_files {

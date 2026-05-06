@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
     ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
     SnapshotRetention, Summary,
 };
@@ -79,6 +79,7 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             manifest_paths_out: manifest_paths_out.clone(),
             row_lineage_first_row_id,
             row_lineage_added_rows,
+            target_ref: ctx.target_ref.to_string(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -115,6 +116,7 @@ struct RewriteDataFilesTxnAction {
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     row_lineage_first_row_id: Option<u64>,
     row_lineage_added_rows: u64,
+    target_ref: String,
 }
 
 #[async_trait]
@@ -131,7 +133,18 @@ impl TransactionAction for RewriteDataFilesTxnAction {
 
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
-        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let target_ref = &self.target_ref;
+        let parent_snapshot_id = m
+            .refs()
+            .get(target_ref.as_str())
+            .map(|r| r.snapshot_id)
+            .or_else(|| {
+                if target_ref == "main" {
+                    m.current_snapshot().map(|s| s.snapshot_id())
+                } else {
+                    None
+                }
+            });
         let metadata_dir = metadata_dir(table);
         let live = enumerate_live_files(table, &self.file_io)
             .await
@@ -275,7 +288,7 @@ impl TransactionAction for RewriteDataFilesTxnAction {
             vec![
                 TableUpdate::AddSnapshot { snapshot },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
+                    ref_name: target_ref.clone(),
                     reference: SnapshotReference {
                         snapshot_id: new_snapshot_id,
                         retention: SnapshotRetention::Branch {
@@ -294,7 +307,7 @@ impl TransactionAction for RewriteDataFilesTxnAction {
                     default_spec_id: m.default_partition_spec_id(),
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
+                    r#ref: target_ref.clone(),
                     snapshot_id: parent_snapshot_id,
                 },
             ],

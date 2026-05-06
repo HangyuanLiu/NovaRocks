@@ -892,18 +892,18 @@ pub(crate) fn current_equality_delete_column_names(
 }
 
 /// Extract data file paths, sizes, row counts, and per-column statistics from
-/// Iceberg manifest entries.
+/// Iceberg manifest entries for a specific snapshot.
 ///
-/// This reads the manifest list from the current snapshot, loads each data
+/// This reads the manifest list from the given snapshot, loads each data
 /// manifest, and collects per-column stats (null counts, column sizes,
-/// lower/upper bounds) mapped to column names via the table schema.
-///
-/// If no snapshot exists the result is an empty vec.
-pub(crate) fn extract_data_files_with_stats(
+/// lower/upper bounds) mapped to column names via the snapshot's own schema.
+pub(crate) fn extract_data_files_with_stats_at(
     table: &iceberg::table::Table,
+    snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
     let metadata = table.metadata();
-    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
     read_snapshot
         .files
         .into_iter()
@@ -936,6 +936,23 @@ pub(crate) fn extract_data_files_with_stats(
             })
         })
         .collect()
+}
+
+/// Extract data file paths, sizes, row counts, and per-column statistics from
+/// Iceberg manifest entries for the current snapshot.
+///
+/// This reads the manifest list from the current snapshot, loads each data
+/// manifest, and collects per-column stats (null counts, column sizes,
+/// lower/upper bounds) mapped to column names via the table schema.
+///
+/// If no snapshot exists the result is an empty vec.
+pub(crate) fn extract_data_files_with_stats(
+    table: &iceberg::table::Table,
+) -> Result<Vec<DataFileWithStats>, String> {
+    match table.metadata().current_snapshot() {
+        Some(s) => extract_data_files_with_stats_at(table, s.snapshot_id()),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn read_delete_to_catalog_delete(

@@ -48,9 +48,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, MAIN_BRANCH,
-    ManifestContentType, ManifestFile, ManifestWriterBuilder, Operation, PartitionSpecRef,
-    SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType,
+    ManifestFile, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot,
+    SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
@@ -111,6 +111,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             row_lineage_first_row_id: ctx.table.metadata().next_row_id(),
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
+            target_ref: ctx.target_ref.to_string(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -154,6 +155,7 @@ struct RowDeltaDvTxnAction {
     row_lineage_first_row_id: u64,
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    target_ref: String,
 }
 
 #[async_trait]
@@ -169,14 +171,31 @@ impl TransactionAction for RowDeltaDvTxnAction {
         }
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
-        let parent_snapshot_id = m.current_snapshot().map(|s| s.snapshot_id());
+        let target_ref = &self.target_ref;
+        let parent_snapshot_id = m
+            .refs()
+            .get(target_ref.as_str())
+            .map(|r| r.snapshot_id)
+            .or_else(|| {
+                if target_ref == "main" {
+                    m.current_snapshot().map(|s| s.snapshot_id())
+                } else {
+                    None
+                }
+            });
         let metadata_dir = metadata_dir(table);
 
         let mut vectors = groups_to_vectors(&self.groups).map_err(to_iceberg_unexpected)?;
         let touched_files: HashSet<String> = vectors.keys().cloned().collect();
-        let index = build_snapshot_index(table, &self.file_io, &touched_files, &mut vectors)
-            .await
-            .map_err(to_iceberg_unexpected)?;
+        let index = build_snapshot_index(
+            table,
+            &self.file_io,
+            &touched_files,
+            &mut vectors,
+            target_ref,
+        )
+        .await
+        .map_err(to_iceberg_unexpected)?;
 
         for referenced in vectors.keys() {
             if !index.data_files.contains_key(referenced) {
@@ -374,7 +393,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
             vec![
                 TableUpdate::AddSnapshot { snapshot },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
+                    ref_name: target_ref.clone(),
                     reference: SnapshotReference {
                         snapshot_id: new_snapshot_id,
                         retention: SnapshotRetention::Branch {
@@ -393,7 +412,7 @@ impl TransactionAction for RowDeltaDvTxnAction {
                     default_spec_id: m.default_partition_spec_id(),
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
+                    r#ref: target_ref.clone(),
                     snapshot_id: parent_snapshot_id,
                 },
             ],
@@ -430,16 +449,31 @@ async fn build_snapshot_index(
     file_io: &FileIO,
     touched_files: &HashSet<String>,
     vectors: &mut HashMap<String, DeletionVector>,
+    target_ref: &str,
 ) -> Result<SnapshotIndex, String> {
     let mut data_files = HashMap::new();
     let mut untouched_manifests = Vec::new();
     let mut touched_delete_existing = Vec::new();
     let mut replaced_delete_files = 0usize;
     let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .ok_or_else(|| "row-lineage DELETE requires a current snapshot".to_string())?;
+    let m = table.metadata();
+    // For branch-targeted deletes, read the manifest list from the branch head
+    // snapshot (not from main's current snapshot). This ensures that files added
+    // to the branch by prior branch DML are visible and carry forward correctly.
+    let snapshot = if target_ref == "main" {
+        m.current_snapshot()
+            .ok_or_else(|| "row-lineage DELETE requires a current snapshot".to_string())?
+    } else {
+        let branch_snapshot_id = m.refs().get(target_ref).map(|r| r.snapshot_id).ok_or_else(
+            || {
+                format!(
+                    "row-lineage DELETE target branch '{target_ref}' not found in table metadata"
+                )
+            },
+        )?;
+        m.snapshot_by_id(branch_snapshot_id)
+            .ok_or_else(|| format!("row-lineage DELETE branch '{target_ref}' snapshot {branch_snapshot_id} not found in metadata"))?
+    };
     let list = snapshot
         .load_manifest_list(file_io, table.metadata())
         .await

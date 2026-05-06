@@ -127,24 +127,34 @@ impl TableSource for IcebergTableSource {
         "iceberg"
     }
 
-    fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
+    fn build_table_def_at(
+        &self,
+        table: &ResolvedTable,
+        snapshot_id: Option<i64>,
+    ) -> Result<TableDef, String> {
         let guard = self.registry.read().expect("iceberg catalog read lock");
         let entry = guard.get(&table.catalog)?;
         let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
-        let snapshot_id = loaded.table.metadata().current_snapshot_id();
-        let data_files = if let Some(cached) =
-            entry.cached_data_files(&table.namespace, &table.table, snapshot_id)?
-        {
-            cached
+        let effective_snapshot_id =
+            snapshot_id.or_else(|| loaded.table.metadata().current_snapshot_id());
+        let data_files = if let Some(id) = effective_snapshot_id {
+            if let Some(cached) =
+                entry.cached_data_files(&table.namespace, &table.table, Some(id))?
+            {
+                cached
+            } else {
+                let extracted =
+                    super::registry::extract_data_files_with_stats_at(&loaded.table, id)?;
+                entry.cache_data_files(
+                    &table.namespace,
+                    &table.table,
+                    Some(id),
+                    extracted.clone(),
+                )?;
+                extracted
+            }
         } else {
-            let data_files = super::registry::extract_data_files_with_stats(&loaded.table)?;
-            entry.cache_data_files(
-                &table.namespace,
-                &table.table,
-                snapshot_id,
-                data_files.clone(),
-            )?;
-            data_files
+            Vec::new()
         };
         build_iceberg_table_def_with_data_files(
             &entry,
@@ -153,6 +163,10 @@ impl TableSource for IcebergTableSource {
             loaded,
             data_files,
         )
+    }
+
+    fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
+        self.build_table_def_at(table, None)
     }
 }
 

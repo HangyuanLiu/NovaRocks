@@ -26,6 +26,7 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod generate_series;
+pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
@@ -59,6 +60,7 @@ use self::statement::{
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
+use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 use crate::sql::parser::query_refs::{
     extract_three_part_table_refs, strip_catalog_from_three_part_names,
 };
@@ -579,6 +581,20 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN only supports SELECT queries".to_string());
                 };
+                // Time-travel in EXPLAIN: rewrite version clauses before registration.
+                let mut time_travel_rewritten;
+                let query = if has_time_travel_refs(query) {
+                    time_travel_rewritten = query.as_ref().clone();
+                    rewrite_time_travel_refs(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        &mut time_travel_rewritten,
+                    )?;
+                    &time_travel_rewritten
+                } else {
+                    query.as_ref()
+                };
                 if current_catalog.is_some() {
                     register_iceberg_tables_for_query(
                         &self.inner,
@@ -597,7 +613,7 @@ impl StandaloneSession {
                             current_database,
                             query,
                         )?;
-                        rewritten_three_part_query = query.as_ref().clone();
+                        rewritten_three_part_query = query.clone();
                         strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
                         &rewritten_three_part_query
                     } else {
@@ -628,6 +644,55 @@ impl StandaloneSession {
                 {
                     return Ok(result);
                 }
+
+                // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.
+                // Clone the query, rewrite version-bearing table refs to synthetic
+                // per-snapshot names, register the synthetic TableDefs, then execute.
+                // Non-version table refs in the same query are handled by the
+                // regular registration path that follows in the rewritten query.
+                if has_time_travel_refs(query) {
+                    let mut rewritten = query.as_ref().clone();
+                    rewrite_time_travel_refs(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        &mut rewritten,
+                    )?;
+                    // Register any remaining (non-time-travel) iceberg tables in the rewritten query.
+                    if current_catalog.is_some() {
+                        register_iceberg_tables_for_query(
+                            &self.inner,
+                            current_catalog,
+                            current_database,
+                            &rewritten,
+                        )?;
+                    }
+                    let three_parts = extract_three_part_table_refs(&rewritten);
+                    if !three_parts.is_empty() && current_catalog.is_none() {
+                        register_iceberg_tables_for_query(
+                            &self.inner,
+                            None,
+                            current_database,
+                            &rewritten,
+                        )?;
+                        strip_catalog_from_three_part_names(&mut rewritten);
+                    }
+                    let catalog = self
+                        .inner
+                        .catalog
+                        .read()
+                        .expect("standalone catalog read lock");
+                    let result = execute_query(
+                        &rewritten,
+                        &catalog,
+                        current_database,
+                        self.inner.exchange_port,
+                        query_opts.clone(),
+                    )?;
+                    drop(catalog);
+                    return Ok(StatementResult::Query(result));
+                }
+
                 // When current_catalog is an Iceberg catalog, materialize
                 // referenced Iceberg tables into the local catalog first.
                 if current_catalog.is_some() {
@@ -1129,6 +1194,9 @@ pub(crate) fn dispatch_statement(
             crate::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
         Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
+        Statement::AlterIcebergRef(stmt) => {
+            crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
+        }
     }
 }
 

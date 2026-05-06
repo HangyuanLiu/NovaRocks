@@ -1027,16 +1027,14 @@ impl From<RawSnapshotMetadataRow> for SnapshotMetadataRow {
             parent_id: raw.parent_id,
             operation: raw.operation,
             manifest_list: raw.manifest_list,
-            summary: raw.summary.map(|entries| {
-                entries.into_iter().map(|e| (e.key, e.value)).collect()
-            }),
+            summary: raw
+                .summary
+                .map(|entries| entries.into_iter().map(|e| (e.key, e.value)).collect()),
         }
     }
 }
 
-fn load_snapshot_rows(
-    cfg: &IcebergMetadataScanConfig,
-) -> Result<Vec<SnapshotMetadataRow>, String> {
+fn load_snapshot_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<SnapshotMetadataRow>, String> {
     let payload = scan_metadata(
         IcebergMetadataTableType::Snapshots.as_jvm_scanner_type(),
         &cfg.serialized_table,
@@ -1063,7 +1061,13 @@ fn build_snapshot_chunks(
         .iter()
         .map(|column| build_snapshot_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
-    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_snapshot_array(
@@ -1072,7 +1076,9 @@ fn build_snapshot_array(
 ) -> Result<ArrayRef, String> {
     match column.name.as_str() {
         "committed_at" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.committed_at_micros).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.committed_at_micros)
+                .collect::<Vec<_>>(),
         ))),
         "snapshot_id" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.snapshot_id).collect::<Vec<_>>(),
@@ -1081,13 +1087,20 @@ fn build_snapshot_array(
             rows.iter().map(|r| r.parent_id).collect::<Vec<_>>(),
         ))),
         "operation" => Ok(Arc::new(StringArray::from(
-            rows.iter().map(|r| r.operation.as_deref()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.operation.as_deref())
+                .collect::<Vec<_>>(),
         ))),
         "manifest_list" => Ok(Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.manifest_list.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.manifest_list.as_str()))
+                .collect::<Vec<_>>(),
         ))),
         "summary" => build_string_string_map_array(rows.iter().map(|r| r.summary.as_ref())),
-        other => Err(format!("unsupported iceberg snapshots metadata column: {}", other)),
+        other => Err(format!(
+            "unsupported iceberg snapshots metadata column: {}",
+            other
+        )),
     }
 }
 
@@ -1148,9 +1161,7 @@ impl From<RawHistoryMetadataRow> for HistoryMetadataRow {
     }
 }
 
-fn load_history_rows(
-    cfg: &IcebergMetadataScanConfig,
-) -> Result<Vec<HistoryMetadataRow>, String> {
+fn load_history_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<HistoryMetadataRow>, String> {
     let payload = scan_metadata(
         IcebergMetadataTableType::History.as_jvm_scanner_type(),
         &cfg.serialized_table,
@@ -1177,7 +1188,13 @@ fn build_history_chunks(
         .iter()
         .map(|column| build_history_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
-    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_history_array(
@@ -1187,7 +1204,9 @@ fn build_history_array(
     use arrow::array::BooleanArray;
     match column.name.as_str() {
         "made_current_at" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.made_current_at_micros).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.made_current_at_micros)
+                .collect::<Vec<_>>(),
         ))),
         "snapshot_id" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.snapshot_id).collect::<Vec<_>>(),
@@ -1196,9 +1215,14 @@ fn build_history_array(
             rows.iter().map(|r| r.parent_id).collect::<Vec<_>>(),
         ))),
         "is_current_ancestor" => Ok(Arc::new(BooleanArray::from(
-            rows.iter().map(|r| r.is_current_ancestor).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.is_current_ancestor)
+                .collect::<Vec<_>>(),
         ))),
-        other => Err(format!("unsupported iceberg history metadata column: {}", other)),
+        other => Err(format!(
+            "unsupported iceberg history metadata column: {}",
+            other
+        )),
     }
 }
 
@@ -1263,7 +1287,13 @@ fn build_ref_chunks(
         .iter()
         .map(|column| build_ref_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
-    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_ref_array(
@@ -1272,24 +1302,37 @@ fn build_ref_array(
 ) -> Result<ArrayRef, String> {
     match column.name.as_str() {
         "name" => Ok(Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.name.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.name.as_str()))
+                .collect::<Vec<_>>(),
         ))),
         "type" => Ok(Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.type_.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.type_.as_str()))
+                .collect::<Vec<_>>(),
         ))),
         "snapshot_id" => Ok(Arc::new(Int64Array::from(
             rows.iter().map(|r| r.snapshot_id).collect::<Vec<_>>(),
         ))),
         "max_reference_age_in_ms" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.max_reference_age_in_ms).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.max_reference_age_in_ms)
+                .collect::<Vec<_>>(),
         ))),
         "min_snapshots_to_keep" => Ok(Arc::new(Int32Array::from(
-            rows.iter().map(|r| r.min_snapshots_to_keep).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.min_snapshots_to_keep)
+                .collect::<Vec<_>>(),
         ))),
         "max_snapshot_age_in_ms" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.max_snapshot_age_in_ms).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.max_snapshot_age_in_ms)
+                .collect::<Vec<_>>(),
         ))),
-        other => Err(format!("unsupported iceberg refs metadata column: {}", other)),
+        other => Err(format!(
+            "unsupported iceberg refs metadata column: {}",
+            other
+        )),
     }
 }
 
@@ -1370,7 +1413,8 @@ fn build_partition_struct_array(
         if !matches!(f.data_type(), DataType::Utf8) {
             return Err(format!(
                 "iceberg partitions struct child `{}` must be Utf8 (got {:?}); richer types not yet supported",
-                f.name(), f.data_type()
+                f.name(),
+                f.data_type()
             ));
         }
     }
@@ -1427,7 +1471,13 @@ fn build_partition_chunks(
         .iter()
         .map(|column| build_partition_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
-    build_chunks(output_schema, output_chunk_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_partition_array(
@@ -1446,30 +1496,49 @@ fn build_partition_array(
         // as BIGINT (Int64) even though Iceberg native stores them as int32. Widen here;
         // RawPartitionMetadataRow keeps Option<i32> to match the JSON from the JVM side.
         "file_count" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.file_count.map(i64::from)).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.file_count.map(i64::from))
+                .collect::<Vec<_>>(),
         ))),
         "total_data_file_size_in_bytes" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.total_data_file_size_in_bytes).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.total_data_file_size_in_bytes)
+                .collect::<Vec<_>>(),
         ))),
         "position_delete_record_count" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.position_delete_record_count).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.position_delete_record_count)
+                .collect::<Vec<_>>(),
         ))),
         "position_delete_file_count" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.position_delete_file_count.map(i64::from)).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.position_delete_file_count.map(i64::from))
+                .collect::<Vec<_>>(),
         ))),
         "equality_delete_record_count" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.equality_delete_record_count).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.equality_delete_record_count)
+                .collect::<Vec<_>>(),
         ))),
         "equality_delete_file_count" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.equality_delete_file_count.map(i64::from)).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.equality_delete_file_count.map(i64::from))
+                .collect::<Vec<_>>(),
         ))),
         "last_updated_at" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.last_updated_at_micros).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.last_updated_at_micros)
+                .collect::<Vec<_>>(),
         ))),
         "last_updated_snapshot_id" => Ok(Arc::new(Int64Array::from(
-            rows.iter().map(|r| r.last_updated_snapshot_id).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.last_updated_snapshot_id)
+                .collect::<Vec<_>>(),
         ))),
-        other => Err(format!("unsupported iceberg partitions metadata column: {}", other)),
+        other => Err(format!(
+            "unsupported iceberg partitions metadata column: {}",
+            other
+        )),
     }
 }
 
@@ -1668,7 +1737,10 @@ mod tests {
             nullable: false,
         };
         let arr = super::build_history_array(&bool_col, &rows).unwrap();
-        let bools = arr.as_any().downcast_ref::<BooleanArray>().expect("BooleanArray");
+        let bools = arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
         assert_eq!(bools.len(), 2);
         assert!(bools.value(0));
         assert!(!bools.value(1));
@@ -1744,10 +1816,7 @@ mod tests {
             IcebergMetadataTableType::History.as_jvm_scanner_type(),
             "HISTORY"
         );
-        assert_eq!(
-            IcebergMetadataTableType::Refs.as_jvm_scanner_type(),
-            "REFS"
-        );
+        assert_eq!(IcebergMetadataTableType::Refs.as_jvm_scanner_type(), "REFS");
         assert_eq!(
             IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
             "PARTITIONS"

@@ -89,6 +89,17 @@ pub(crate) trait TableSource: Send + Sync {
     /// catalog. Different backends pick different `TableStorage` variants
     /// (LocalParquetFile / S3ParquetFiles / ManagedLake).
     fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String>;
+
+    /// Phase-1 entry point for time-travel-aware table-def construction.
+    /// Default impl ignores the snapshot pin and delegates to `build_table_def`,
+    /// which is correct for connectors that do not have time-travel semantics.
+    fn build_table_def_at(
+        &self,
+        table: &ResolvedTable,
+        _snapshot_id: Option<i64>,
+    ) -> Result<TableDef, String> {
+        self.build_table_def(table)
+    }
 }
 
 /// Write-side: append rows or RecordBatches to a table. The INSERT
