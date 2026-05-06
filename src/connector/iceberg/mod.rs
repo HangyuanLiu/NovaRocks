@@ -21,6 +21,7 @@ pub mod commit;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod compact;
 pub(crate) mod data_writer;
+pub(crate) mod variant_write;
 pub(crate) mod default_value;
 pub mod equality_delete;
 mod jvm;
