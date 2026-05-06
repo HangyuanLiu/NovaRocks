@@ -2360,18 +2360,14 @@ mod tests {
 
     #[test]
     fn parse_modify_nested_column() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t MODIFY COLUMN address.zip BIGINT",
-        )
-        .unwrap();
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN address.zip BIGINT")
+                .unwrap();
         let super::IcebergSchemaChange::ModifyColumn { path, new_type } = stmt.change else {
             panic!();
         };
         assert_eq!(path.dotted(), "address.zip");
-        assert!(matches!(
-            new_type,
-            crate::sql::parser::ast::SqlType::BigInt
-        ));
+        assert!(matches!(new_type, crate::sql::parser::ast::SqlType::BigInt));
     }
 
     #[test]
@@ -2388,10 +2384,12 @@ mod tests {
 
     #[test]
     fn parse_rename_extracts_only_last_segment_in_new_name() {
-        assert!(super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t RENAME COLUMN address.zip TO foo.bar"
-        )
-        .is_err());
+        assert!(
+            super::parse_alter_iceberg_schema_sql(
+                "ALTER TABLE t RENAME COLUMN address.zip TO foo.bar"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2406,10 +2404,9 @@ mod tests {
 
     #[test]
     fn parse_add_column_after_target() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ADD COLUMN c INT AFTER existing",
-        )
-        .unwrap();
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT AFTER existing")
+                .unwrap();
         let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
             panic!();
         };
@@ -2418,10 +2415,9 @@ mod tests {
 
     #[test]
     fn parse_add_column_before_target() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ADD COLUMN c INT BEFORE existing",
-        )
-        .unwrap();
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT BEFORE existing")
+                .unwrap();
         let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
             panic!();
         };
@@ -2516,18 +2512,18 @@ mod tests {
 
     #[test]
     fn parse_modify_column_with_position_rejected() {
-        assert!(super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t MODIFY COLUMN c BIGINT FIRST"
-        )
-        .is_err());
-        assert!(super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t MODIFY COLUMN c BIGINT AFTER d"
-        )
-        .is_err());
-        assert!(super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t MODIFY COLUMN c BIGINT BEFORE d"
-        )
-        .is_err());
+        assert!(
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT FIRST")
+                .is_err()
+        );
+        assert!(
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT AFTER d")
+                .is_err()
+        );
+        assert!(
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT BEFORE d")
+                .is_err()
+        );
     }
 }
 

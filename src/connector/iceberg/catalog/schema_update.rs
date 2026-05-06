@@ -258,41 +258,28 @@ mod tests {
 
     #[test]
     fn drop_top_level_struct_blocked_when_equality_delete_targets_inner() {
-        let res = reject_drop_dependencies_for_test(
-            "address",
-            &["address.street".to_string()],
-            &[],
-        );
+        let res =
+            reject_drop_dependencies_for_test("address", &["address.street".to_string()], &[]);
         assert!(res.is_err());
     }
 
     #[test]
     fn drop_nested_blocked_when_equality_delete_targets_ancestor() {
-        let res = reject_drop_dependencies_for_test(
-            "address.street",
-            &["address".to_string()],
-            &[],
-        );
+        let res =
+            reject_drop_dependencies_for_test("address.street", &["address".to_string()], &[]);
         assert!(res.is_err());
     }
 
     #[test]
     fn drop_unrelated_top_level_not_blocked_when_equality_delete_targets_other() {
-        let res = reject_drop_dependencies_for_test(
-            "name",
-            &["address.street".to_string()],
-            &[],
-        );
+        let res = reject_drop_dependencies_for_test("name", &["address.street".to_string()], &[]);
         assert!(res.is_ok());
     }
 
     #[test]
     fn drop_unrelated_nested_not_blocked_when_equality_delete_targets_sibling() {
-        let res = reject_drop_dependencies_for_test(
-            "address.city",
-            &["address.street".to_string()],
-            &[],
-        );
+        let res =
+            reject_drop_dependencies_for_test("address.city", &["address.street".to_string()], &[]);
         assert!(res.is_ok());
     }
 
@@ -530,7 +517,11 @@ mod tests {
             nullable: false,
         };
         let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
-        assert!(updates.sets.contains_key("novarocks.nullability.attested.c"));
+        assert!(
+            updates
+                .sets
+                .contains_key("novarocks.nullability.attested.c")
+        );
     }
 
     #[test]
@@ -545,7 +536,11 @@ mod tests {
             nullable: true,
         };
         let updates = build_property_updates_for_test(&existing, &change).unwrap();
-        assert!(updates.removals.contains(&"novarocks.nullability.attested.c".to_string()));
+        assert!(
+            updates
+                .removals
+                .contains(&"novarocks.nullability.attested.c".to_string())
+        );
         assert!(updates.sets.is_empty());
     }
 
@@ -1433,8 +1428,7 @@ mod tests {
             .build()
             .unwrap();
         let path = ColumnPath::parse("a").unwrap();
-        let new =
-            apply_reorder_at(&schema, &path, &AddPosition::After("b".to_string())).unwrap();
+        let new = apply_reorder_at(&schema, &path, &AddPosition::After("b".to_string())).unwrap();
         let names: Vec<_> = new
             .as_struct()
             .fields()
@@ -1493,9 +1487,7 @@ mod tests {
             .build()
             .unwrap();
         let path = ColumnPath::parse("address.street").unwrap();
-        assert!(
-            apply_reorder_at(&schema, &path, &AddPosition::After("name".to_string())).is_err()
-        );
+        assert!(apply_reorder_at(&schema, &path, &AddPosition::After("name".to_string())).is_err());
     }
 
     #[test]
@@ -1543,32 +1535,58 @@ mod tests {
 
     #[test]
     fn widen_decimal_precision_increase_same_scale() {
-        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
-        let new = SqlType::Decimal { precision: 20, scale: 2 };
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 20,
+            scale: 2,
+        };
         let widened = widen_type(&curr, &new).unwrap();
-        let Type::Primitive(PrimitiveType::Decimal { precision, scale }) = widened else { panic!() };
+        let Type::Primitive(PrimitiveType::Decimal { precision, scale }) = widened else {
+            panic!()
+        };
         assert_eq!(precision, 20);
         assert_eq!(scale, 2);
     }
 
     #[test]
     fn widen_decimal_scale_change_rejected() {
-        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
-        let new = SqlType::Decimal { precision: 10, scale: 3 };
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 3,
+        };
         assert!(widen_type(&curr, &new).is_err());
     }
 
     #[test]
     fn widen_decimal_precision_decrease_rejected() {
-        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 20, scale: 2 });
-        let new = SqlType::Decimal { precision: 10, scale: 2 };
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 20,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
         assert!(widen_type(&curr, &new).is_err());
     }
 
     #[test]
     fn widen_decimal_same_precision_same_scale_rejected() {
-        let curr = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
-        let new = SqlType::Decimal { precision: 10, scale: 2 };
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
         assert!(widen_type(&curr, &new).is_err());
     }
 
@@ -2047,18 +2065,15 @@ fn set_nullable_in_fields(
 fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = set_nullable_in_fields(
-                s.fields().iter().cloned().collect(),
-                segments,
-                nullable,
-            )?;
+            let new =
+                set_nullable_in_fields(s.fields().iter().cloned().collect(), segments, nullable)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
         }
-        _ => Err(
-            "SET/DROP NOT NULL only supported on top-level or STRUCT-nested fields".to_string(),
-        ),
+        _ => {
+            Err("SET/DROP NOT NULL only supported on top-level or STRUCT-nested fields".to_string())
+        }
     }
 }
 
@@ -2190,7 +2205,10 @@ fn reject_drop_dependencies(
             ));
         }
     }
-    let leaf = target_segments.last().expect("checked non-empty above").as_str();
+    let leaf = target_segments
+        .last()
+        .expect("checked non-empty above")
+        .as_str();
     for dependency in mv_dependencies {
         if managed_mv_depends_on_column(dependency, leaf) {
             return Err(format!(
@@ -2686,11 +2704,7 @@ fn reorder_in_fields(
 fn reorder_in_type(ty: &Type, segments: &[String], position: &AddPosition) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
-            let new = reorder_in_fields(
-                s.fields().iter().cloned().collect(),
-                segments,
-                position,
-            )?;
+            let new = reorder_in_fields(s.fields().iter().cloned().collect(), segments, position)?;
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
@@ -2708,8 +2722,14 @@ fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
             Ok(Type::Primitive(PrimitiveType::Double))
         }
         (
-            Type::Primitive(PrimitiveType::Decimal { precision: cp, scale: cs }),
-            SqlType::Decimal { precision: np, scale: ns },
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: cp,
+                scale: cs,
+            }),
+            SqlType::Decimal {
+                precision: np,
+                scale: ns,
+            },
         ) => {
             // Iceberg spec: decimal precision can only increase, scale must remain unchanged.
             if (*cs as i64) != (*ns as i64) {
