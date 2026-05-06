@@ -1,0 +1,19 @@
+-- query 6
+n_snapshots
+3
+
+-- query 7
+operation	n
+append	3
+
+-- query 8
+n_root
+1
+
+-- query 9
+n_with_id
+3
+
+-- query 10
+n_root_aliased
+1
