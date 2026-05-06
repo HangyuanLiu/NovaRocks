@@ -504,6 +504,71 @@ mod tests {
         assert!(decimal.removals.is_empty());
     }
 
+    #[test]
+    fn build_property_updates_attests_set_not_null() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("address.street").unwrap(),
+            nullable: false,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        let key = "novarocks.nullability.attested.address.street";
+        assert!(
+            updates.sets.contains_key(key),
+            "expected attestation key, got sets={:?}",
+            updates.sets
+        );
+        assert!(
+            !updates.removals.contains(&key.to_string()),
+            "attestation key must not also be in removals"
+        );
+    }
+
+    #[test]
+    fn build_property_updates_attests_set_not_null_top_level() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: false,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(updates.sets.contains_key("novarocks.nullability.attested.c"));
+    }
+
+    #[test]
+    fn build_property_updates_removes_attestation_on_drop_not_null_when_present() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "novarocks.nullability.attested.c".to_string(),
+            "2026-05-06T00:00:00Z".to_string(),
+        );
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: true,
+        };
+        let updates = build_property_updates_for_test(&existing, &change).unwrap();
+        assert!(updates.removals.contains(&"novarocks.nullability.attested.c".to_string()));
+        assert!(updates.sets.is_empty());
+    }
+
+    #[test]
+    fn build_property_updates_drop_not_null_no_op_when_attestation_absent() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: true,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn build_property_updates_reorder_remains_no_op() {
+        let change = IcebergSchemaChange::Reorder {
+            path: ColumnPath::parse("c").unwrap(),
+            position: AddPosition::First,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
+    }
+
     // ----- find_field_by_path tests -----
 
     #[test]
@@ -2785,9 +2850,24 @@ fn build_property_updates(
                 updates.push_removal(logical_key);
             }
         }
-        IcebergSchemaChange::SetNullable { .. } | IcebergSchemaChange::Reorder { .. } => {}
+        IcebergSchemaChange::SetNullable { path, nullable } => {
+            let key = nullability_attestation_property_key(path);
+            if !*nullable {
+                // SET NOT NULL: leave a metadata trail (not an existence proof).
+                // The schema-id update and this property write commit together.
+                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                updates.sets.insert(key, now);
+            } else if properties.contains_key(&key) {
+                updates.push_removal(key);
+            }
+        }
+        IcebergSchemaChange::Reorder { .. } => {}
     }
     Ok(updates)
+}
+
+fn nullability_attestation_property_key(path: &ColumnPath) -> String {
+    format!("novarocks.nullability.attested.{}", path.dotted())
 }
 
 fn reject_key_column_drop(properties: &HashMap<String, String>, name: &str) -> Result<(), String> {
