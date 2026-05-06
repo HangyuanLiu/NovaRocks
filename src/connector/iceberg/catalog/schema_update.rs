@@ -1251,6 +1251,127 @@ mod tests {
         let path = ColumnPath::parse("id").unwrap();
         assert!(apply_set_nullable_at(&schema, &path, true).is_err());
     }
+
+    #[test]
+    fn apply_reorder_at_top_level_first() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("c").unwrap();
+        let new = apply_reorder_at(&schema, &path, &AddPosition::First).unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_after_target() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("a").unwrap();
+        let new =
+            apply_reorder_at(&schema, &path, &AddPosition::After("b".to_string())).unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_nested_struct() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "street",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.city").unwrap();
+        let new =
+            apply_reorder_at(&schema, &path, &AddPosition::Before("street".to_string())).unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        let names: Vec<_> = s.fields().iter().map(|f| f.name.clone()).collect();
+        assert_eq!(names, vec!["city", "street"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_after_target_in_different_parent_rejected() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "address", inner)),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.street").unwrap();
+        assert!(
+            apply_reorder_at(&schema, &path, &AddPosition::After("name".to_string())).is_err()
+        );
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -2315,6 +2436,87 @@ pub(crate) fn insert_at_position(
             fields.insert(idx, new_field);
             Ok(())
         }
+    }
+}
+
+/// Rebuild `schema` with the column at `path` moved to `position` within its parent.
+///
+/// Only fields within a STRUCT scope can be reordered.  `AddPosition::After`/`Before` look up
+/// the target name in the same parent's child list (with the moved field already removed),
+/// so attempting to reference a name in a different parent produces an error.
+#[allow(dead_code)]
+pub(crate) fn apply_reorder_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    position: &AddPosition,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = reorder_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        position,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after reorder: {e}"))
+}
+
+fn reorder_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    position: &AddPosition,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("reorder path is empty".to_string());
+    }
+    if segments.len() == 1 {
+        let head = normalize_identifier(&segments[0])?;
+        let mut existing: Vec<NestedField> = fields.iter().map(|f| (**f).clone()).collect();
+        let idx = existing
+            .iter()
+            .position(|f| normalize_identifier(&f.name).ok().as_deref() == Some(head.as_str()))
+            .ok_or_else(|| format!("column '{}' not found for reorder", head))?;
+        let target = existing.remove(idx);
+        insert_at_position(&mut existing, target, position)?;
+        return Ok(existing);
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let new_inner = reorder_in_type(&f.field_type, &segments[1..], position)?;
+            let mut updated = (*f).clone();
+            updated.field_type = Box::new(new_inner);
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for reorder", head));
+    }
+    Ok(out)
+}
+
+fn reorder_in_type(ty: &Type, segments: &[String], position: &AddPosition) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = reorder_in_fields(
+                s.fields().iter().cloned().collect(),
+                segments,
+                position,
+            )?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err("reorder path descends into non-struct type".to_string()),
     }
 }
 
