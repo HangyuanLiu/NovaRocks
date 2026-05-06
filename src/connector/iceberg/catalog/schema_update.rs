@@ -734,6 +734,103 @@ mod tests {
         assert!(res.is_err());
         // Drop on list element / map key/value is not allowed; only struct fields can be dropped.
     }
+
+    // ----- apply_rename_at tests -----
+
+    #[test]
+    fn apply_rename_at_nested() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.street").unwrap();
+        let new = apply_rename_at(&schema, &path, "road").unwrap();
+        let address = new.as_struct().fields()[0].clone();
+        let Type::Struct(s) = &*address.field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields()[0].name, "road");
+        assert_eq!(s.fields()[0].id, 11);
+    }
+
+    #[test]
+    fn apply_rename_at_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "old",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("old").unwrap();
+        let new = apply_rename_at(&schema, &path, "fresh").unwrap();
+        assert_eq!(new.as_struct().fields()[0].name, "fresh");
+        assert_eq!(new.as_struct().fields()[0].id, 1);
+    }
+
+    #[test]
+    fn apply_rename_at_conflict_with_sibling() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "street",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.street").unwrap();
+        assert!(apply_rename_at(&schema, &path, "city").is_err());
+    }
+
+    #[test]
+    fn apply_rename_at_into_list_or_map_rejected() {
+        use iceberg::spec::ListType;
+        let element = Arc::new(NestedField::list_element(
+            11,
+            Type::Primitive(PrimitiveType::Int),
+            true,
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tags",
+                Type::List(ListType::new(element)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("tags.element").unwrap();
+        assert!(apply_rename_at(&schema, &path, "item").is_err());
+    }
+
+    #[test]
+    fn apply_rename_at_unknown_path_errors() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(apply_rename_at(&schema, &path, "x").is_err());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -906,6 +1003,93 @@ fn drop_in_type(ty: &Type, segments: &[String]) -> Result<Type, String> {
             Err("drop path cannot descend into list element or map key/value".to_string())
         }
         _ => Err("drop path descends into non-composite type".to_string()),
+    }
+}
+
+/// Rebuild `schema` with the column at `path` renamed to `new_name`.
+///
+/// Only struct fields can be renamed.  Descending into a list element or map key/value
+/// is rejected.  Renaming to a name already used by a sibling field is rejected.
+#[allow(dead_code)]
+pub(crate) fn apply_rename_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    new_name: &str,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = rename_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        new_name,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after rename: {e}"))
+}
+
+fn rename_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    new_name: &str,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("rename path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let new_norm = normalize_identifier(new_name)?;
+    let is_leaf = segments.len() == 1;
+    // For leaf rename, validate no sibling already has the new name (case-insensitive).
+    if is_leaf {
+        for f in &fields {
+            let f_norm = normalize_identifier(&f.name).ok();
+            if f_norm.as_deref() != Some(head.as_str())
+                && f_norm.as_deref() == Some(new_norm.as_str())
+            {
+                return Err(format!(
+                    "rename target '{new_name}' conflicts with existing sibling"
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if is_leaf {
+                updated.name = new_name.to_string();
+            } else {
+                let new_inner = rename_in_type(&f.field_type, &segments[1..], new_name)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{head}' not found for rename"));
+    }
+    Ok(out)
+}
+
+fn rename_in_type(ty: &Type, segments: &[String], new_name: &str) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = rename_in_fields(s.fields().iter().cloned().collect(), segments, new_name)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        Type::List(_) | Type::Map(_) => {
+            Err("rename path cannot descend into list element or map key/value".to_string())
+        }
+        _ => Err("rename path descends into non-composite type".to_string()),
     }
 }
 
