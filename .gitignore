@@ -21,3 +21,4 @@ thirdparty/installed
 nosetests.xml
 /.claude/worktrees/
 /.codex/worktrees/
+/.codex/environments/runtime/
