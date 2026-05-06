@@ -107,6 +107,101 @@ pub(crate) fn variant_field_indices(iceberg_schema: &SchemaRef) -> Vec<usize> {
         .collect()
 }
 
+use arrow::record_batch::RecordBatch;
+
+pub(crate) fn transform_variant_columns_for_write(
+    batch: &RecordBatch,
+    annotated_schema: &arrow::datatypes::SchemaRef,
+    variant_indices: &[usize],
+) -> Result<RecordBatch, String> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, StructArray};
+    use arrow::buffer::NullBuffer;
+
+    if batch.num_columns() != annotated_schema.fields().len() {
+        return Err(format!(
+            "variant_write: column count mismatch: batch={} annotated={}",
+            batch.num_columns(),
+            annotated_schema.fields().len()
+        ));
+    }
+
+    let variant_set: HashSet<usize> = variant_indices.iter().copied().collect();
+    let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+    for (idx, col) in batch.columns().iter().enumerate() {
+        if !variant_set.contains(&idx) {
+            out_columns.push(col.clone());
+            continue;
+        }
+        let lb = col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| {
+                format!(
+                    "variant_write: column {idx} expected LargeBinary, got {:?}",
+                    col.data_type()
+                )
+            })?;
+
+        let n = lb.len();
+        let mut meta_builder = BinaryBuilder::new();
+        let mut value_builder = BinaryBuilder::new();
+        let mut nulls = vec![true; n];
+
+        for row in 0..n {
+            if lb.is_null(row) {
+                nulls[row] = false;
+                meta_builder.append_value(&[] as &[u8]);
+                value_builder.append_value(&[] as &[u8]);
+                continue;
+            }
+            let raw = lb.value(row);
+            if raw.len() < 4 {
+                return Err(format!(
+                    "variant_write: row {row} payload too short ({} bytes)",
+                    raw.len()
+                ));
+            }
+            let total = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+            if 4 + total > raw.len() {
+                return Err(format!(
+                    "variant_write: row {row} declared total {total} exceeds payload {}",
+                    raw.len() - 4
+                ));
+            }
+            let payload = &raw[4..4 + total];
+            let m_len = metadata_byte_len(payload)?;
+            meta_builder.append_value(&payload[..m_len]);
+            value_builder.append_value(&payload[m_len..]);
+        }
+
+        let meta_arr: BinaryArray = meta_builder.finish();
+        let value_arr: BinaryArray = value_builder.finish();
+        let null_buffer = NullBuffer::from(nulls);
+
+        // Use the annotated schema's variant field as the StructArray
+        // type — this carries the `arrow.parquet.variant` extension metadata
+        // that PATCH 6 attaches.
+        let struct_field = annotated_schema.field(idx);
+        let arrow::datatypes::DataType::Struct(child_fields) = struct_field.data_type() else {
+            return Err(format!(
+                "variant_write: annotated schema for variant index {idx} is not Struct"
+            ));
+        };
+        let struct_arr = StructArray::new(
+            child_fields.clone(),
+            vec![Arc::new(meta_arr) as ArrayRef, Arc::new(value_arr) as ArrayRef],
+            Some(null_buffer),
+        );
+        out_columns.push(Arc::new(struct_arr));
+    }
+
+    RecordBatch::try_new(annotated_schema.clone(), out_columns)
+        .map_err(|e| format!("variant_write: rebuild RecordBatch: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +260,163 @@ mod tests {
                 .expect("schema"),
         );
         assert!(variant_field_indices(&schema).is_empty());
+    }
+
+    fn build_variant_payload_with_string(s: &str) -> Vec<u8> {
+        // Replicates VariantValue with a short-string value but no metadata
+        // dict (dict_size = 0). Sufficient for round-trip tests.
+        let metadata = build_metadata_empty();
+        // Short-string value: basic_type = 1 (ShortString), header byte =
+        // (len << 2) | 0b01.
+        let mut value = Vec::with_capacity(1 + s.len());
+        let len = s.len();
+        assert!(len < 64, "test helper limit");
+        value.push(((len as u8) << 2) | 0b01);
+        value.extend_from_slice(s.as_bytes());
+
+        let total = (metadata.len() + value.len()) as u32;
+        let mut out = Vec::with_capacity(4 + metadata.len() + value.len());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(&metadata);
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn make_iceberg_schema(fields: Vec<iceberg::spec::NestedFieldRef>) -> iceberg::spec::SchemaRef {
+        use std::sync::Arc;
+        Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(fields)
+                .build()
+                .expect("schema"),
+        )
+    }
+
+    fn make_annotated_arrow_schema(iceberg_schema: &iceberg::spec::SchemaRef) -> arrow::datatypes::SchemaRef {
+        use std::sync::Arc;
+        Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(iceberg_schema).expect("convert"),
+        )
+    }
+
+    #[test]
+    fn transform_single_variant_column_one_row() {
+        use arrow::array::{LargeBinaryArray, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+        let raw = build_variant_payload_with_string("hi");
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::LargeBinary, true)]));
+        let arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
+
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
+        assert_eq!(out.num_columns(), 1);
+        let col = out.column(0);
+        let s = col.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        assert_eq!(s.fields().len(), 2);
+        assert_eq!(s.fields()[0].name(), "metadata");
+        assert_eq!(s.fields()[1].name(), "value");
+        let meta_arr = s.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("binary");
+        let val_arr = s.column(1).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("binary");
+        // metadata = empty dict (3 bytes), value = short-string "hi" (1 + 2 bytes).
+        assert_eq!(meta_arr.value(0), &[0x01, 0x00, 0x00]);
+        assert_eq!(val_arr.value(0).len(), 3);
+        assert_eq!(val_arr.value(0)[1..], *b"hi");
+    }
+
+    #[test]
+    fn transform_handles_null_row_with_zero_length_children() {
+        use arrow::array::{Array, LargeBinaryArray, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+        let raw = build_variant_payload_with_string("a");
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::LargeBinary, true)]));
+        let arr = LargeBinaryArray::from(vec![Some(raw.as_slice()), None, Some(raw.as_slice())]);
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(arr)]).expect("batch");
+
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[0]).expect("ok");
+        let s = out.column(0).as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        assert_eq!(s.len(), 3);
+        assert!(s.is_valid(0));
+        assert!(!s.is_valid(1)); // parent null
+        assert!(s.is_valid(2));
+        let meta = s.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("b");
+        let val = s.column(1).as_any().downcast_ref::<arrow::array::BinaryArray>().expect("b");
+        // Children must NOT be marked null at the leaf level (Required) —
+        // null parent rows carry zero-length placeholders.
+        assert!(meta.is_valid(1));
+        assert!(val.is_valid(1));
+        assert_eq!(meta.value(1), &[] as &[u8]);
+        assert_eq!(val.value(1), &[] as &[u8]);
+    }
+
+    #[test]
+    fn transform_passes_through_non_variant_columns_unchanged() {
+        use arrow::array::{Int32Array, LargeBinaryArray, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+        let raw = build_variant_payload_with_string("x");
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::LargeBinary, true),
+        ]));
+        let id_arr = Int32Array::from(vec![Some(7)]);
+        let v_arr = LargeBinaryArray::from_iter_values([raw.as_slice()]);
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(id_arr), Arc::new(v_arr)])
+            .expect("batch");
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[1]).expect("ok");
+        assert_eq!(out.num_columns(), 2);
+        let id = out.column(0).as_any().downcast_ref::<Int32Array>().expect("i32");
+        assert_eq!(id.value(0), 7);
+        let v = out.column(1).as_any().downcast_ref::<arrow::array::StructArray>().expect("struct");
+        assert_eq!(v.fields().len(), 2);
+    }
+
+    #[test]
+    fn transform_handles_two_adjacent_variant_columns() {
+        use arrow::array::{Array, LargeBinaryArray, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+
+        let iceberg_schema = make_iceberg_schema(vec![
+            NestedField::optional(1, "v1", Type::Primitive(PrimitiveType::Variant)).into(),
+            NestedField::optional(2, "v2", Type::Primitive(PrimitiveType::Variant)).into(),
+        ]);
+        let annotated = make_annotated_arrow_schema(&iceberg_schema);
+        let raw1 = build_variant_payload_with_string("a");
+        let raw2 = build_variant_payload_with_string("bcd");
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("v1", DataType::LargeBinary, true),
+            Field::new("v2", DataType::LargeBinary, true),
+        ]));
+        let v1 = LargeBinaryArray::from_iter_values([raw1.as_slice()]);
+        let v2 = LargeBinaryArray::from_iter_values([raw2.as_slice()]);
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(v1), Arc::new(v2)]).expect("batch");
+        let out = transform_variant_columns_for_write(&batch, &annotated, &[0, 1]).expect("ok");
+        let s1 = out.column(0).as_any().downcast_ref::<arrow::array::StructArray>().unwrap();
+        let s2 = out.column(1).as_any().downcast_ref::<arrow::array::StructArray>().unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s2.len(), 1);
     }
 }
