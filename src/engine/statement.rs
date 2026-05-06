@@ -1105,6 +1105,67 @@ pub(crate) struct ShowAlterTableOptimizeStmt {
     pub(crate) limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnPath {
+    segments: Vec<String>,
+}
+
+impl ColumnPath {
+    pub(crate) fn root() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
+    }
+
+    pub(crate) fn parse(input: &str) -> Result<Self, String> {
+        if input.is_empty() {
+            return Err("column path is empty".to_string());
+        }
+        let mut segments = Vec::new();
+        for raw in input.split('.') {
+            if raw.is_empty() {
+                return Err(format!("invalid column path '{input}': empty segment"));
+            }
+            segments.push(raw.to_ascii_lowercase());
+        }
+        Ok(Self { segments })
+    }
+
+    pub(crate) fn from_segments(segments: Vec<String>) -> Self {
+        Self {
+            segments: segments
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.segments
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    pub(crate) fn last(&self) -> Option<&str> {
+        self.segments.last().map(String::as_str)
+    }
+
+    pub(crate) fn parent(&self) -> ColumnPath {
+        if self.segments.is_empty() {
+            return ColumnPath::root();
+        }
+        Self {
+            segments: self.segments[..self.segments.len() - 1].to_vec(),
+        }
+    }
+
+    pub(crate) fn dotted(&self) -> String {
+        self.segments.join(".")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IcebergSchemaChange {
     AddColumn {
@@ -2125,5 +2186,49 @@ mod tests {
             }
             _ => panic!("expected AddColumn"),
         }
+    }
+}
+
+#[cfg(test)]
+mod column_path_tests {
+    use super::ColumnPath;
+
+    #[test]
+    fn column_path_parses_single_segment() {
+        let p = ColumnPath::parse("address").unwrap();
+        assert_eq!(p.segments(), &["address".to_string()]);
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn column_path_parses_dotted() {
+        let p = ColumnPath::parse("address.street").unwrap();
+        assert_eq!(
+            p.segments(),
+            &["address".to_string(), "street".to_string()]
+        );
+    }
+
+    #[test]
+    fn column_path_normalizes_case() {
+        let p = ColumnPath::parse("Address.Street").unwrap();
+        assert_eq!(
+            p.segments(),
+            &["address".to_string(), "street".to_string()]
+        );
+    }
+
+    #[test]
+    fn column_path_rejects_empty_segment() {
+        assert!(ColumnPath::parse("address.").is_err());
+        assert!(ColumnPath::parse(".street").is_err());
+        assert!(ColumnPath::parse("").is_err());
+        assert!(ColumnPath::parse("a..b").is_err());
+    }
+
+    #[test]
+    fn column_path_root_is_empty() {
+        assert!(ColumnPath::root().is_empty());
+        assert!(ColumnPath::root().segments().is_empty());
     }
 }
