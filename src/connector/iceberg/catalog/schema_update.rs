@@ -1372,6 +1372,49 @@ mod tests {
             apply_reorder_at(&schema, &path, &AddPosition::After("name".to_string())).is_err()
         );
     }
+
+    #[test]
+    fn build_updated_schema_dispatches_set_nullable() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("a").unwrap(),
+            nullable: false,
+        };
+        let new = build_updated_schema(&schema, 1, &change).unwrap();
+        assert!(new.as_struct().fields()[0].required);
+    }
+
+    #[test]
+    fn build_updated_schema_dispatches_reorder() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::Reorder {
+            path: ColumnPath::parse("b").unwrap(),
+            position: AddPosition::First,
+        };
+        let new = build_updated_schema(&schema, 2, &change).unwrap();
+        assert_eq!(new.as_struct().fields()[0].name, "b");
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1833,128 +1876,49 @@ fn build_updated_schema(
     change: &IcebergSchemaChange,
 ) -> Result<Schema, String> {
     reject_reserved_change(change)?;
-    let identifier_field_ids = current.identifier_field_ids().collect::<Vec<_>>();
-    let mut fields = current
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect::<Vec<_>>();
-
     match change {
         IcebergSchemaChange::AddColumn {
             parent,
             name,
             data_type,
             default,
-            position: _,
+            position,
         } => {
-            if !parent.is_empty() {
-                return Err("nested STRUCT ADD COLUMN not yet implemented in this step".to_string());
-            }
-            reject_name_conflict(&fields, name)?;
-            let mut next_nested_id = last_column_id
-                .checked_add(2)
-                .ok_or_else(|| "too many iceberg columns".to_string())?;
-            let ty = crate::connector::iceberg::catalog::registry::iceberg_type_for_sql_type(
+            let mut next_id = last_column_id;
+            apply_add_at(
+                current,
+                parent,
+                name,
                 data_type,
-                &mut next_nested_id,
-            )?;
-            let id = last_column_id
-                .checked_add(1)
-                .ok_or_else(|| "too many iceberg columns".to_string())?;
-            let mut field = NestedField::optional(id, name, ty);
-            if let Some(default_literal) = default {
-                if let Some(iceberg_lit) =
-                    crate::connector::iceberg::default_value::default_literal_to_iceberg(
-                        default_literal,
-                        data_type,
-                    )?
-                {
-                    field = field
-                        .with_initial_default(iceberg_lit.clone())
-                        .with_write_default(iceberg_lit);
-                }
-            }
-            fields.push(field);
+                default.as_ref(),
+                position.clone(),
+                &mut next_id,
+            )
         }
         IcebergSchemaChange::DropColumn { path } => {
-            if path.segments().len() != 1 {
-                return Err("nested DROP COLUMN not yet implemented in this step".to_string());
-            }
-            let name = path.last().unwrap();
-            let normalized = normalize_identifier(name)?;
-            let field_id = fields
-                .iter()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .map(|f| f.id)
-                .ok_or_else(|| format!("unknown Iceberg column `{name}`"))?;
-            if identifier_field_ids.contains(&field_id) {
+            let identifier_field_ids: Vec<i32> = current.identifier_field_ids().collect();
+            let (id, _) = find_field_by_path(current, path)?;
+            if identifier_field_ids.contains(&id) {
                 return Err(format!(
-                    "Iceberg schema evolution cannot drop identifier column `{name}`"
+                    "Iceberg schema evolution cannot drop identifier column `{}`",
+                    path.dotted()
                 ));
             }
-            fields.retain(|f| {
-                normalize_identifier(&f.name).ok().as_deref() != Some(normalized.as_str())
-            });
+            apply_drop_at(current, path)
         }
         IcebergSchemaChange::RenameColumn { path, new_name } => {
-            if path.segments().len() != 1 {
-                return Err("nested RENAME COLUMN not yet implemented in this step".to_string());
-            }
-            let old_name = path.last().unwrap();
-            reject_name_conflict(&fields, new_name)?;
-            let normalized = normalize_identifier(old_name)?;
-            let field = fields
-                .iter_mut()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .ok_or_else(|| format!("unknown Iceberg column `{old_name}`"))?;
-            field.name = new_name.clone();
+            apply_rename_at(current, path, new_name)
         }
         IcebergSchemaChange::ModifyColumn { path, new_type } => {
-            if path.segments().len() != 1 {
-                return Err("nested MODIFY COLUMN not yet implemented in this step".to_string());
-            }
-            let name = path.last().unwrap();
-            let normalized = normalize_identifier(name)?;
-            let field = fields
-                .iter_mut()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .ok_or_else(|| format!("unknown Iceberg column `{name}`"))?;
-            field.field_type = Box::new(widen_type(field.field_type.as_ref(), new_type)?);
+            apply_modify_at(current, path, new_type)
         }
-        IcebergSchemaChange::SetNullable { .. } => {
-            return Err(
-                "ALTER COLUMN SET/DROP NOT NULL not yet implemented in this step".to_string(),
-            );
+        IcebergSchemaChange::SetNullable { path, nullable } => {
+            apply_set_nullable_at(current, path, *nullable)
         }
-        IcebergSchemaChange::Reorder { .. } => {
-            return Err("ALTER COLUMN reorder not yet implemented in this step".to_string());
+        IcebergSchemaChange::Reorder { path, position } => {
+            apply_reorder_at(current, path, position)
         }
     }
-
-    Schema::builder()
-        .with_fields(fields.into_iter().map(Arc::new).collect::<Vec<_>>())
-        .with_identifier_field_ids(identifier_field_ids)
-        .build()
-        .map_err(|e| format!("build evolved iceberg schema failed: {e}"))
-}
-
-fn reject_name_conflict(fields: &[NestedField], name: &str) -> Result<(), String> {
-    let normalized = normalize_identifier(name)?;
-    if fields
-        .iter()
-        .any(|f| normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str()))
-    {
-        return Err(format!("Iceberg column `{name}` already exists"));
-    }
-    Ok(())
 }
 
 fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
