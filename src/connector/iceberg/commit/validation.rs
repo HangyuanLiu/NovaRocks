@@ -294,6 +294,13 @@ fn arrow_iceberg_types_compatible(
     arrow_ty: &arrow::datatypes::DataType,
     iceberg_ty: &iceberg::spec::Type,
 ) -> bool {
+    use iceberg::spec::{PrimitiveType, Type};
+    if matches!(iceberg_ty, Type::Primitive(PrimitiveType::Variant)) {
+        // NovaRocks execution layer carries variants as LargeBinary
+        // (see src/lower/type_lowering.rs:89,170). The full struct shape
+        // is materialized later by transform_variant_columns_for_write.
+        return matches!(arrow_ty, arrow::datatypes::DataType::LargeBinary);
+    }
     match iceberg::arrow::type_to_arrow_type(iceberg_ty) {
         Ok(expected) => &expected == arrow_ty,
         Err(_) => false,
@@ -515,5 +522,15 @@ mod tests {
         let err = ensure_no_variant_in_sort_order(&table).expect_err("must reject");
         assert!(err.contains("'v'"), "{err}");
         assert!(err.contains("sort"), "{err}");
+    }
+
+    #[test]
+    fn variant_iceberg_type_matches_largebinary_arrow_type() {
+        use arrow::datatypes::DataType;
+        use iceberg::spec::{PrimitiveType, Type};
+        let iceberg_ty = Type::Primitive(PrimitiveType::Variant);
+        assert!(arrow_iceberg_types_compatible(&DataType::LargeBinary, &iceberg_ty));
+        assert!(!arrow_iceberg_types_compatible(&DataType::Binary, &iceberg_ty));
+        assert!(!arrow_iceberg_types_compatible(&DataType::Utf8, &iceberg_ty));
     }
 }
