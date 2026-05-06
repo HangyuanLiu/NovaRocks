@@ -270,9 +270,16 @@ fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats
 }
 
 fn build_iceberg_table_info(loaded: &IcebergLoadedTable) -> IcebergTableInfo {
+    // Serialise the iceberg `TableMetadata` so a subsequent metadata-table
+    // reference (`t$snapshots` etc.) can hand the JSON to the JVM scanner
+    // bridge without having to re-resolve the table at codegen time. Loss
+    // of serialisation is non-fatal for normal data scans, so we fall back
+    // to None instead of failing here.
+    let serialized_metadata = serde_json::to_string(loaded.table.metadata()).ok();
     IcebergTableInfo {
         location: loaded.table.metadata().location().to_string(),
         schema: iceberg_schema_def(loaded.table.metadata().current_schema()),
+        serialized_metadata,
     }
 }
 

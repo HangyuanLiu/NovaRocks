@@ -317,6 +317,7 @@ mod tests {
                         }],
                     }],
                 },
+                serialized_metadata: None,
             }),
             storage: TableStorage::S3ParquetFiles {
                 files: vec![],

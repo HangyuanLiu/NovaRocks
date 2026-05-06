@@ -358,6 +358,12 @@ impl StandaloneNovaRocks {
             TableStorage::S3ParquetFiles { .. } => {
                 return Err("register_parquet_table_in_database does not support S3".to_string());
             }
+            TableStorage::IcebergMetadataTable { .. } => {
+                return Err(
+                    "register_parquet_table_in_database does not support iceberg metadata tables"
+                        .to_string(),
+                );
+            }
         }
         let mut guard = self
             .inner
