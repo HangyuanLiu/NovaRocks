@@ -831,6 +831,147 @@ mod tests {
         let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
         assert!(apply_rename_at(&schema, &path, "x").is_err());
     }
+
+    // ----- apply_modify_at tests -----
+
+    #[test]
+    fn apply_modify_at_top_level_int_to_long() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "n",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("n").unwrap();
+        let new =
+            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+        assert!(matches!(
+            *new.as_struct().fields()[0].field_type,
+            Type::Primitive(PrimitiveType::Long)
+        ));
+        assert_eq!(new.as_struct().fields()[0].id, 1);
+    }
+
+    #[test]
+    fn apply_modify_at_nested_struct_int_to_long() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "n",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "wrap", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("wrap.n").unwrap();
+        let new =
+            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert!(matches!(
+            *s.fields()[0].field_type,
+            Type::Primitive(PrimitiveType::Long)
+        ));
+        assert_eq!(s.fields()[0].id, 11);
+    }
+
+    #[test]
+    fn apply_modify_at_array_element() {
+        use iceberg::spec::ListType;
+        let element = Arc::new(NestedField::list_element(
+            11,
+            Type::Primitive(PrimitiveType::Int),
+            true,
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tags",
+                Type::List(ListType::new(element)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("tags.element").unwrap();
+        let new =
+            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+        let Type::List(l) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert!(matches!(
+            *l.element_field.field_type,
+            Type::Primitive(PrimitiveType::Long)
+        ));
+        assert_eq!(l.element_field.id, 11);
+    }
+
+    #[test]
+    fn apply_modify_at_map_value() {
+        use iceberg::spec::MapType;
+        let key = Arc::new(NestedField::map_key_element(
+            11,
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let value = Arc::new(NestedField::map_value_element(
+            12,
+            Type::Primitive(PrimitiveType::Int),
+            true,
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "m",
+                Type::Map(MapType::new(key, value)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("m.value").unwrap();
+        let new =
+            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+        let Type::Map(m) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert!(matches!(
+            *m.value_field.field_type,
+            Type::Primitive(PrimitiveType::Long)
+        ));
+        assert_eq!(m.value_field.id, 12);
+    }
+
+    #[test]
+    fn apply_modify_at_unsupported_widen_rejected() {
+        // String -> BigInt is not in the widen_type matrix, so this must fail.
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "s",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("s").unwrap();
+        let res = apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn apply_modify_at_unknown_path_errors() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(
+            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).is_err()
+        );
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1090,6 +1231,112 @@ fn rename_in_type(ty: &Type, segments: &[String], new_name: &str) -> Result<Type
             Err("rename path cannot descend into list element or map key/value".to_string())
         }
         _ => Err("rename path descends into non-composite type".to_string()),
+    }
+}
+
+/// Rebuild `schema` with the column at `path` widened to `new_type`.
+///
+/// Descends into STRUCT fields recursively.  Also handles LIST `element` and MAP `key`/`value`
+/// element widening at any depth.  The actual type-compatibility check is delegated to
+/// [`widen_type`], which enforces the narrow safe-widening matrix (Int → Long, Float → Double).
+#[allow(dead_code)]
+pub(crate) fn apply_modify_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    new_type: &SqlType,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = modify_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        new_type,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after modify: {e}"))
+}
+
+fn modify_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    new_type: &SqlType,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("modify path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if segments.len() == 1 {
+                // Leaf: apply the type widening directly.
+                let widened = widen_type(&f.field_type, new_type)?;
+                updated.field_type = Box::new(widened);
+            } else {
+                // Non-leaf: descend into the composite child type.
+                let new_inner = modify_in_type(&f.field_type, &segments[1..], new_type)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{head}' not found for modify"));
+    }
+    Ok(out)
+}
+
+fn modify_in_type(ty: &Type, segments: &[String], new_type: &SqlType) -> Result<Type, String> {
+    let head = normalize_identifier(&segments[0])?;
+    match ty {
+        Type::Struct(s) => {
+            // Re-enter modify_in_fields with the same segments: modify_in_fields will consume
+            // `head` by matching it against the struct's child fields.
+            let new = modify_in_fields(s.fields().iter().cloned().collect(), segments, new_type)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        Type::List(l) => {
+            if head != "element" || segments.len() != 1 {
+                return Err("list modify must target '<list>.element'".to_string());
+            }
+            let widened = widen_type(&l.element_field.field_type, new_type)?;
+            let mut new_elem = (*l.element_field).clone();
+            new_elem.field_type = Box::new(widened);
+            Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+        }
+        Type::Map(m) => match (head.as_str(), segments.len()) {
+            ("value", 1) => {
+                let widened = widen_type(&m.value_field.field_type, new_type)?;
+                let mut new_v = (*m.value_field).clone();
+                new_v.field_type = Box::new(widened);
+                Ok(Type::Map(iceberg::spec::MapType::new(
+                    m.key_field.clone(),
+                    Arc::new(new_v),
+                )))
+            }
+            ("key", 1) => {
+                let widened = widen_type(&m.key_field.field_type, new_type)?;
+                let mut new_k = (*m.key_field).clone();
+                new_k.field_type = Box::new(widened);
+                Ok(Type::Map(iceberg::spec::MapType::new(
+                    Arc::new(new_k),
+                    m.value_field.clone(),
+                )))
+            }
+            _ => Err("map modify must target '<map>.key' or '<map>.value'".to_string()),
+        },
+        _ => Err("modify path descends into non-composite type".to_string()),
     }
 }
 
