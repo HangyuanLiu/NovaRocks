@@ -1,51 +1,146 @@
 # NovaRocks
 
-NovaRocks is a Rust-based compute engine project under the StarRocks ecosystem.
+NovaRocks is a Rust-native analytical query engine that started as a
+StarRocks BE-compatible runtime and has evolved into a system that can also run
+independently without StarRocks FE.
 
-It is currently an independent project and keeps FE protocol compatibility through a C++ shim layer, with execution semantics implemented in Rust. At this stage, the repository is intended for learning and experimentation, not production use.
+The project currently has two first-class execution modes:
 
-## Project Goals
+1. **StarRocks-compatible backend mode**
+   - StarRocks FE keeps producing plans and talking through FE-compatible
+     heartbeat, backend thrift, and brpc/internal-service protocols.
+   - A C++ shim handles brpc compatibility; Rust owns plan lowering, execution,
+     exchange, connectors, and result handling.
 
-- This project is primarily created to study StarRocks architecture and code design.
-- Most of the code in this repository is AI-generated.
-- The project has not yet gone through detailed, production-grade testing.
-- Current practical uses:
-  - learning StarRocks BE design ideas
-  - acting as a StarRocks BE mock server for rapid vibe-coding development（Friendly for building on macOS）
+2. **Standalone SQL engine mode**
+   - NovaRocks can parse and execute SQL without StarRocks FE.
+   - `standalone-server` exposes a MySQL-compatible endpoint for SQL clients and
+     SQL regression tests.
+   - The standalone engine has its own in-process catalog, Iceberg catalog
+     registry, managed-lake metadata store, and connector-backed DDL/DML flows.
+
+NovaRocks is still experimental and is not production-ready. It is useful for
+learning StarRocks-style execution internals, iterating on connector and
+Iceberg semantics, testing managed-lake behavior, and running local SQL
+experiments on macOS/Linux without maintaining a full StarRocks FE/BE cluster.
+
+## Current Scope
+
+Implemented or actively exercised areas include:
+
+- FE-compatible BE runtime entrypoints:
+  - heartbeat thrift service
+  - backend thrift service
+  - brpc/internal-service gateway through the C++ shim
+  - gRPC exchange service
+- Rust execution stack:
+  - thrift-plan lowering
+  - Arrow `RecordBatch` / `Chunk` processing
+  - pipeline drivers, dependencies, and scheduling
+  - exchange, result buffering, runtime filters, spill, and cache plumbing
+- Standalone SQL stack:
+  - StarRocks-oriented SQL parsing and analysis
+  - SQL planner/codegen into NovaRocks execution plans
+  - one-shot local Parquet query CLI
+  - MySQL-compatible standalone server
+  - SQL test runner integration
+- Catalog and connector work:
+  - local Parquet table registration
+  - Iceberg catalogs: memory, Hadoop/filesystem, and REST
+  - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
+    changes, refs, and compaction experiments
+  - managed-lake DDL/DML, SQLite metadata, object-store-backed storage, and
+    materialized-view lifecycle work
+
+Known limits:
+
+- This repository is still research/experimental code.
+- Most code has been AI-assisted and has not gone through production-grade
+  validation.
+- Share-nothing mode is not supported; share-data style storage is the main
+  target.
+- Some Iceberg/managed-lake features are phase-based and may have narrow
+  contract support rather than full StarRocks parity.
+
+## Architecture
+
+### StarRocks-Compatible Mode
+
+```text
+StarRocks FE
+  |- HeartbeatService (Thrift) -------> Rust service/heartbeat_service
+  |- BackendService (Thrift) ---------> Rust service/backend_service
+  `- PInternalService (brpc) ---------> C++ shim
+                                          |
+                                          `- FFI
+                                               v
+                                      Rust internal_service
+                                               v
+                                          lower/**
+                                               v
+                                      exec/pipeline/**
+                                               v
+                         result_buffer / exchange / connectors
+```
+
+### Standalone Mode
+
+```text
+SQL client / mysql CLI / SQL test runner
+  `- MySQL-compatible protocol
+       v
+  src/server/mod.rs
+       v
+  src/engine/**
+       v
+  src/sql/parser + analyzer + optimizer + codegen
+       v
+  exec/pipeline + runtime
+       v
+  connector backends
+     |- local catalog / Parquet
+     |- Iceberg catalog registry
+     `- managed-lake metadata + object store
+```
 
 ## Design Principles
 
-- Arrow-first execution model: NovaRocks uses Arrow `RecordBatch` (wrapped as `Chunk`) as the in-memory data format. This is the base of vectorized processing and keeps execution batch-oriented instead of row-oriented.
-- Protocol and execution separation: the C++ shim is used as the FE protocol/brpc gateway, while plan lowering, operator semantics, and runtime behavior are implemented in Rust.
-- Strict semantics over implicit fallback: execution follows FE-provided plan/type metadata directly; unsupported or ambiguous semantics are expected to fail fast instead of silently degrading behavior.
-- Pipeline-native runtime: plans are lowered into a pipeline graph with drivers/operators/dependencies, then scheduled by dedicated runtime executors for parallel execution.
-- Exchange-aware distributed flow: inter-fragment data transfer is handled through gRPC-based exchange with chunk encode/decode, sender EOS tracking, and cancellation-aware cleanup.
-- Experimental support for using non-StarRocks native formats as StarRocks data files (for example, Parquet) is in progress and not production-ready.
-Share-nothing mode is not supported; only share-data mode is supported.
+- **Two mode boundaries are explicit.** FE-compatible mode follows
+  FE-provided thrift metadata and protocol contracts. Standalone mode owns SQL
+  parsing, catalog resolution, planning, and session context.
+- **Arrow-first execution.** NovaRocks uses Arrow `RecordBatch` wrapped as
+  `Chunk` as the in-memory batch format.
+- **Protocol and execution stay separated.** The C++ shim is only the brpc
+  compatibility gateway; execution semantics belong to Rust.
+- **Fail fast on unsupported semantics.** Ambiguous or unsupported plan/SQL
+  behavior should return explicit errors instead of silently falling back.
+- **Connector-backed storage semantics.** Standalone DDL/DML routes through
+  catalog/table-source/table-sink/MV backends instead of hard-coding storage
+  behavior into the SQL server.
 
 ## Prerequisites
 
-- Rust toolchain (edition 2024, `cargo`)
+- Rust toolchain from `rust-toolchain.toml`
 - C/C++ build toolchain
-- Minimum toolchain versions:
-  - `rustc`/`cargo`: **1.92.0** (from `rust-toolchain.toml`)
-  - `gcc`/`g++`: **12+** (Linux)
-  - `cmake`: **3.20+** (recommend 3.27+)
+- `cmake` 3.20+; 3.27+ recommended
+
+Minimum toolchain versions:
+
+- `rustc` / `cargo`: 1.92.0
+- Linux `gcc` / `g++`: 12+
 
 ### Linux
 
 Environment variables:
 
-- `STARROCKS_GCC_HOME`: GCC toolchain root (must contain `bin/gcc` and `bin/g++`)
+- `STARROCKS_GCC_HOME`: GCC toolchain root containing `bin/gcc` and `bin/g++`
 - `STARROCKS_THIRDPARTY`: thirdparty root
 
-Environment modes:
+Recommended environment:
 
-1. **StarRocks official Docker (recommended)**  
-   Both variables are preconfigured; use default values directly.  
-   Reference: [Build in Docker](https://docs.starrocks.io/docs/developers/build-starrocks/Build_in_docker/)
-2. **Non-official Docker / bare-metal Linux**  
-   Configure both variables manually, and build/use NovaRocks local thirdparty: `./thirdparty/build-thirdparty.sh`
+- StarRocks official Docker image, where both variables are preconfigured.
+- For non-official Docker or bare metal, configure both variables manually and
+  build NovaRocks thirdparty with `./thirdparty/build-thirdparty.sh`.
 
 ### macOS
 
@@ -53,14 +148,11 @@ Environment variables:
 
 - `STARROCKS_THIRDPARTY`: thirdparty root
 
-Prepare thirdparty:
+Prepare thirdparty by following the StarRocks macOS guide:
 
-- Follow StarRocks macOS guide to build thirdparty first:  
-  [Build, run, and test StarRocks on macOS](https://github.com/StarRocks/starrocks/blob/main/docs/en/developers/mac-compile-run-test.md)
+- <https://github.com/StarRocks/starrocks/blob/main/docs/en/developers/mac-compile-run-test.md>
 
 ## Build
-
-`build.sh` supports explicit compile modes on Linux and macOS:
 
 ```bash
 # debug mode (default)
@@ -71,36 +163,30 @@ Prepare thirdparty:
 ./build.sh --release
 ```
 
-Build mode only controls cargo profile:
+Build artifacts:
 
-- debug artifact: `./target/debug/novarocks`
-- release artifact: `./target/release/novarocks`
+- debug: `./target/debug/novarocks`
+- release: `./target/release/novarocks`
 
-Packaging is disabled by default.  
-Use `--package` explicitly when you need StarRocks-style runtime output:
+Packaging is disabled by default. Use `--package` when a StarRocks-style
+runtime output is needed:
 
 ```bash
 ./build.sh --release --package
 ```
 
-Default package output directory:
+Default package output:
 
-- `./output/novarocks`
+```text
+./output/novarocks
+```
 
-Release mode uses `RUSTFLAGS="-C target-cpu=native"` by default when `RUSTFLAGS` is not already set.  
-You can override it with:
+Release mode uses `RUSTFLAGS="-C target-cpu=native"` by default when
+`RUSTFLAGS` is not already set. Override it with:
 
 ```bash
 NOVAROCKS_RELEASE_RUSTFLAGS="-C target-cpu=native -C debuginfo=1" ./build.sh --release
 ```
-
-You can always override output path explicitly:
-
-```bash
-./build.sh --release --package --output ./output/novarocks-release
-```
-
-If you use custom thirdparty (for example, StarRocks thirdparty), complete the corresponding setup in `Prerequisites` first, then run one of the commands above.
 
 ## Configuration
 
@@ -110,12 +196,39 @@ NovaRocks loads config in this order:
 2. `NOVAROCKS_CONFIG=<path>`
 3. `./novarocks.toml`
 
-Useful files in this repo:
+Useful files:
 
-- `novarocks.toml` (local runtime config)
-- `novarocks.toml.example` (extended documented template)
+- `novarocks.toml`: local runtime config
+- `novarocks.toml.example`: extended documented template
+
+Standalone mode is configured through `[standalone_server]`:
+
+```toml
+[standalone_server]
+mysql_port = 9030
+user = "root"
+metadata_db_path = "meta/standalone.sqlite"
+warehouse_uri = "s3://novarocks/standalone"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+access_key_secret = "admin123"
+enable_path_style_access = true
+
+[[standalone_server.tables]]
+name = "tbl"
+path = "data/tbl.parquet"
+```
+
+`metadata_db_path` stores standalone catalog/managed-lake metadata in SQLite.
+`warehouse_uri` plus `[standalone_server.object_store]` enables managed-lake
+storage. `[[standalone_server.tables]]` can pre-register local Parquet tables;
+relative paths are resolved relative to the config file directory.
 
 ## Run
+
+### StarRocks-Compatible Backend Mode
 
 CLI usage:
 
@@ -123,10 +236,10 @@ CLI usage:
 novarocks [run|start|stop|restart] [--config <path>]
 ```
 
-Run through control script:
+Control script:
 
 ```bash
-# foreground (default)
+# foreground
 ./bin/novarocksctl start
 
 # daemon mode
@@ -139,15 +252,109 @@ Run through control script:
 ./bin/novarocksctl restart
 ```
 
-Run built binary directly:
+Built binary:
 
 ```bash
-# debug build
 ./target/debug/novarocks run --config ./novarocks.toml
-
-# release build
 ./target/release/novarocks run --config ./novarocks.toml
 ```
+
+### One-Shot Standalone Query
+
+Run a SQL query over one local Parquet file:
+
+```bash
+cargo run -- standalone \
+  --table tbl \
+  --path ./tbl.parquet \
+  --sql "select * from tbl"
+```
+
+### Standalone MySQL-Compatible Server
+
+Run a local standalone SQL server without StarRocks FE:
+
+```bash
+NO_PROXY=127.0.0.1,localhost \
+cargo run -- standalone-server --port 9030
+```
+
+Register local Parquet tables on the command line:
+
+```bash
+NO_PROXY=127.0.0.1,localhost \
+cargo run -- standalone-server \
+  --port 9030 \
+  --table tbl=/absolute/path/to/tbl.parquet
+```
+
+Or use a config file:
+
+```bash
+NO_PROXY=127.0.0.1,localhost \
+cargo run -- standalone-server --config ./novarocks.toml
+```
+
+Connect with a MySQL client:
+
+```bash
+mysql -h 127.0.0.1 -P 9030 -uroot
+```
+
+The standalone server supports session context such as `USE <db>`,
+`SET catalog = <catalog>`, `SET query_timeout = N`, and
+`SET group_concat_max_len = N`.
+
+## Local Iceberg REST + MinIO Environment
+
+Codex workspaces can use `.codex/environments` to start an isolated Iceberg
+REST + MinIO environment. After setup, discover the active ports and generated
+configs from the fixed entry:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+```
+
+Useful generated values:
+
+- `NOVAROCKS_ICEBERG_REST_URI`
+- `AWS_S3_ENDPOINT`
+- `NOVAROCKS_STANDALONE_CONFIG`
+- `NOVAROCKS_SQL_TEST_CONFIG`
+- `NOVAROCKS_ICE_REST_CATALOG_SQL`
+
+Start standalone-server with the generated object-store config:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+NO_PROXY=127.0.0.1,localhost \
+cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+```
+
+## SQL Regression Tests
+
+The SQL test runner expects a MySQL-compatible NovaRocks standalone server.
+
+```bash
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --suite <suite> \
+  --mode <verify|record|diff> \
+  --query-timeout 60 \
+  -j 4
+```
+
+When using the generated Codex environment:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg \
+  --mode verify
+```
+
+Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
+`sort`, and `iceberg`.
 
 ## Development Workflow
 
@@ -156,6 +363,13 @@ cargo fmt --all
 cargo clippy --all-targets --all-features
 ./build.sh
 cargo test
+```
+
+For focused standalone validation:
+
+```bash
+cargo test --test standalone_cli
+cargo test --test standalone_mysql_server
 ```
 
 ## License
