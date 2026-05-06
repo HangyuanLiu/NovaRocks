@@ -88,6 +88,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
             sidecar: cow_update_sidecar
                 .ok_or_else(|| "CowUpdate commit requires a mutation sidecar".to_string())?,
         }),
+        CommitOpKind::Truncate => unimplemented!("TruncateCommit lands in Task 5"),
     };
 
     let ctx = CommitCtx {

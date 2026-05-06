@@ -36,6 +36,11 @@ pub enum CommitOpKind {
     /// Iceberg v3 row-lineage UPDATE in copy-on-write mode: rewrites touched
     /// data files while preserving `_row_id`.
     CowUpdate,
+    /// Iceberg `TRUNCATE TABLE`: writes a single `operation=delete` snapshot
+    /// that marks every live data / DV / position-delete / equality-delete
+    /// file as DELETED while preserving schema, partition spec, properties,
+    /// and other refs.
+    Truncate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,22 +196,14 @@ mod tests {
             CommitOpKind::RowDelta,
             CommitOpKind::RowDeltaDv,
             CommitOpKind::RewriteDataFiles,
+            CommitOpKind::CowUpdate,
+            CommitOpKind::Truncate,
         ];
         for (idx, left) in variants.iter().enumerate() {
             for right in variants.iter().skip(idx + 1) {
                 assert_ne!(left, right);
             }
         }
-        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::Overwrite);
-        assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDelta);
-        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDelta);
-        assert_ne!(CommitOpKind::RowDelta, CommitOpKind::RowDeltaDv);
-        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDeltaDv);
-        assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDeltaDv);
-        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::FastAppend);
-        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::Overwrite);
-        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::RowDelta);
-        assert_ne!(CommitOpKind::CowUpdate, CommitOpKind::RowDeltaDv);
     }
 
     #[test]
