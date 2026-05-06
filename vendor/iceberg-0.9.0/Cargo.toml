@@ -50,28 +50,28 @@ features = ["zstandard"]
 version = "2"
 
 [dependencies.arrow-arith]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-array]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-buffer]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-cast]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-ord]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-schema]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-select]
-version = "57.1"
+version = "58.2"
 
 [dependencies.arrow-string]
-version = "57.1"
+version = "58.2"
 
 [dependencies.as-any]
 version = "0.3.2"
@@ -134,7 +134,7 @@ version = "1.20"
 version = "4"
 
 [dependencies.parquet]
-version = "57.1"
+version = "58.2"
 features = ["async"]
 
 [dependencies.rand]

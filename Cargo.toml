@@ -19,11 +19,11 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # engine/connectors
-arrow = { version = "57.1.0", features = ["prettyprint", "ipc", "ipc_compression"] }
-arrow-buffer = { version = "57.1.0" }
-arrow-data = { version = "57.1.0" }
-parquet = { version = "57.1.0", features = ["arrow"] }
-orc-rust = { version = "0.7.1", default-features = false }
+arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+arrow-buffer = { version = "58.2.0" }
+arrow-data = { version = "58.2.0" }
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+orc-rust = { version = "0.8.0", default-features = false }
 apache-avro = "0.21.0"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"

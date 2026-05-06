@@ -176,6 +176,19 @@ Concretely:
 Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
 `_last_updated_sequence_number` = 2147483539 = `i32::MAX - 108`.
 
+## Patch 7 — bump arrow / parquet to 58.2
+
+Files: `Cargo.toml` (vendor copy only; root is bumped in lock-step).
+
+iceberg-rust 0.9.0 originally pinned `arrow-* = "57.1"` and
+`parquet = "57.1"`. NovaRocks needs parquet 58.x to reach the
+`variant_experimental` feature (used by PATCH 6 to emit
+`LogicalType::Variant`). The diff is mechanical — every `"57.1"` literal
+in `[dependencies.arrow-*]` and `[dependencies.parquet]` becomes `"58.2"`.
+
+When upstream iceberg-rust 0.10 lands with its own arrow/parquet bump,
+this entry is removed by the same path that already retires PATCH 1–5.
+
 ## Verification after rebase
 
 When bumping the vendored copy to a newer iceberg-rust patch release:
