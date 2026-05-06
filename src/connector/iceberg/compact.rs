@@ -32,7 +32,12 @@ use crate::connector::iceberg::commit::{
     AbortLog, CommitOpKind, IcebergCommitCollector, RunInput, count_current_live_files,
     run_iceberg_commit,
 };
+use crate::connector::iceberg::catalog::row_lineage_enabled;
+use crate::connector::iceberg::data_writer::{
+    RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
+};
 use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
+use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use crate::connector::starrocks::managed::store::{
     IcebergOptimizeJobOutcome, IcebergOptimizeJobState, SqliteMetadataStore,
     StoredIcebergOptimizeJob,
@@ -221,12 +226,22 @@ pub(crate) fn execute_whole_table_rewrite(
         });
     }
 
-    let select_sql = format!(
-        "SELECT * FROM {}.{}.{}",
-        quote_ident(&job.catalog),
-        quote_ident(&job.namespace),
-        quote_ident(&job.table)
-    );
+    let preserve_row_lineage = row_lineage_enabled(table.metadata());
+    let select_sql = if preserve_row_lineage {
+        format!(
+            "SELECT *, {ICEBERG_ROW_ID_COL}, {ICEBERG_LAST_UPDATED_SEQ_COL} FROM {}.{}.{}",
+            quote_ident(&job.catalog),
+            quote_ident(&job.namespace),
+            quote_ident(&job.table)
+        )
+    } else {
+        format!(
+            "SELECT * FROM {}.{}.{}",
+            quote_ident(&job.catalog),
+            quote_ident(&job.namespace),
+            quote_ident(&job.table)
+        )
+    };
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(&select_sql)?;
     let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("parse optimize SELECT failed: {e}"))?;
@@ -238,6 +253,9 @@ pub(crate) fn execute_whole_table_rewrite(
 
     let data_files = if visible_rows == 0 {
         Vec::new()
+    } else if preserve_row_lineage {
+        let batches = chunks_to_row_lineage_batches(&chunks)?;
+        block_on_iceberg(write_row_lineage_batches_as_data_files(&table, &batches))??
     } else {
         block_on_iceberg(write_chunks_as_iceberg_data_files(&table, &chunks))??
     };
@@ -374,6 +392,92 @@ fn chunk_row_count(chunks: &[crate::exec::chunk::Chunk]) -> Result<i64, String> 
         sum.checked_add(rows)
             .ok_or_else(|| "iceberg optimize selected row count overflow".to_string())
     })
+}
+
+/// Split each chunk into (user-facing payload, row-lineage columns) so the
+/// downstream `write_row_lineage_batches_as_data_files` writer can stamp
+/// `_row_id` / `_last_updated_sequence_number` at their reserved field IDs
+/// instead of allocating fresh row ids. The chunks come from the OPTIMIZE
+/// `SELECT *, _row_id, _last_updated_sequence_number FROM …` and are
+/// expected to carry both columns at the end of the schema in that order.
+fn chunks_to_row_lineage_batches(
+    chunks: &[crate::exec::chunk::Chunk],
+) -> Result<Vec<RowLineageWriteBatch>, String> {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+
+    let mut batches = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.batch.num_rows() == 0 {
+            continue;
+        }
+        let schema = chunk.batch.schema();
+        let row_id_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == ICEBERG_ROW_ID_COL)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg optimize row-lineage SELECT did not return `{ICEBERG_ROW_ID_COL}` column"
+                )
+            })?;
+        let last_updated_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == ICEBERG_LAST_UPDATED_SEQ_COL)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg optimize row-lineage SELECT did not return `{ICEBERG_LAST_UPDATED_SEQ_COL}` column"
+                )
+            })?;
+
+        let row_ids = chunk
+            .batch
+            .column(row_id_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                format!("iceberg optimize `{ICEBERG_ROW_ID_COL}` column must be Int64")
+            })?
+            .clone();
+        let last_updated = chunk
+            .batch
+            .column(last_updated_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                format!(
+                    "iceberg optimize `{ICEBERG_LAST_UPDATED_SEQ_COL}` column must be Int64"
+                )
+            })?
+            .clone();
+
+        // Strip the two trailing lineage columns from the user-facing
+        // payload while keeping the rest of the schema (and field-id
+        // metadata) intact. The downstream writer re-attaches the lineage
+        // columns at their reserved field IDs.
+        let mut keep: Vec<usize> = (0..schema.fields().len())
+            .filter(|i| *i != row_id_idx && *i != last_updated_idx)
+            .collect();
+        keep.sort();
+        let user_fields: Vec<_> = keep.iter().map(|i| schema.fields()[*i].clone()).collect();
+        let user_columns: Vec<_> = keep.iter().map(|i| chunk.batch.column(*i).clone()).collect();
+        let user_schema = Arc::new(Schema::new_with_metadata(
+            user_fields,
+            schema.metadata().clone(),
+        ));
+        let user_batch = arrow::record_batch::RecordBatch::try_new(user_schema, user_columns)
+            .map_err(|e| format!("iceberg optimize rebuild user batch failed: {e}"))?;
+
+        batches.push(RowLineageWriteBatch {
+            user_batch,
+            lineage: RowLineageColumns {
+                row_ids,
+                last_updated_sequence_numbers: last_updated,
+            },
+        });
+    }
+    Ok(batches)
 }
 
 fn data_file_record_count(data_files: &[DataFile]) -> Result<i64, String> {
