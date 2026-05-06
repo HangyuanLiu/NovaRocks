@@ -11,6 +11,7 @@ mod scope;
 mod subquery_rewrite;
 
 pub mod alter_iceberg_ref;
+pub mod iceberg_metadata;
 pub mod iceberg_ref;
 
 use arrow::datatypes::DataType;
@@ -1265,6 +1266,11 @@ impl<'a> AnalyzerContext<'a> {
                     );
                 }
                 Ok(())
+            }
+            Relation::IcebergMetadataScan(_) => {
+                unreachable!(
+                    "IcebergMetadataScan handled in resolve_from + lowering (Task A3/A4)"
+                )
             }
         }
     }

@@ -96,6 +96,9 @@ pub(crate) struct ProjectItem {
 pub(crate) enum Relation {
     /// A base table scan.
     Scan(ScanRelation),
+    /// An Iceberg metadata table scan: `t$snapshots`, `t$history`, etc.
+    /// Produced by `resolve_from` after `__nr_meta_<type>__` suffix detection.
+    IcebergMetadataScan(IcebergMetadataScanRelation),
     /// A subquery in FROM: `(SELECT ...) AS alias`.
     Subquery {
         query: Box<ResolvedQuery>,
@@ -127,6 +130,16 @@ pub(crate) struct GenerateSeriesRelation {
 pub(crate) struct ScanRelation {
     pub database: String,
     pub table: TableDef,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergMetadataScanRelation {
+    /// The underlying iceberg table being inspected.
+    pub database: String,
+    pub table: TableDef,
+    pub metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    /// FROM-clause alias (e.g., `t$snapshots AS s` → `Some("s")`).
     pub alias: Option<String>,
 }
 

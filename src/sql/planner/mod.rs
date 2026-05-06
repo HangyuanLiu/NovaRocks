@@ -1183,6 +1183,9 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         })),
+        Relation::IcebergMetadataScan(_) => {
+            unreachable!("IcebergMetadataScan handled in resolve_from + lowering (Task A3/A4)")
+        }
     }
 }
 
