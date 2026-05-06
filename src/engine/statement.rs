@@ -1166,6 +1166,14 @@ impl ColumnPath {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AddPosition {
+    Default,
+    First,
+    After(String),
+    Before(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IcebergSchemaChange {
     AddColumn {
@@ -2230,5 +2238,20 @@ mod column_path_tests {
     fn column_path_root_is_empty() {
         assert!(ColumnPath::root().is_empty());
         assert!(ColumnPath::root().segments().is_empty());
+    }
+
+    #[test]
+    fn add_position_default_constructed() {
+        use super::AddPosition;
+        let pos = AddPosition::Default;
+        assert!(matches!(pos, AddPosition::Default));
+    }
+
+    #[test]
+    fn add_position_variants_construct() {
+        use super::AddPosition;
+        let _ = AddPosition::First;
+        let _ = AddPosition::After("col_a".to_string());
+        let _ = AddPosition::Before("col_b".to_string());
     }
 }
