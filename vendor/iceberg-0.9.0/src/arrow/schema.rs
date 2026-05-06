@@ -521,14 +521,24 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             ArrowSchemaOrFieldOrType::Type(ty) => ty,
             _ => unreachable!(),
         };
-        let metadata = if let Some(doc) = &field.doc {
-            HashMap::from([
-                (PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string()),
-                (ARROW_FIELD_DOC_KEY.to_string(), doc.clone()),
-            ])
-        } else {
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())])
-        };
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string());
+        if let Some(doc) = &field.doc {
+            metadata.insert(ARROW_FIELD_DOC_KEY.to_string(), doc.clone());
+        }
+        if matches!(
+            field.field_type.as_ref(),
+            crate::spec::Type::Primitive(crate::spec::PrimitiveType::Variant)
+        ) {
+            // NovaRocks PATCH 6: parquet-rs 58.x reads ARROW:extension:name to
+            // emit LogicalType::Variant on the parent group when feature
+            // `variant_experimental` is enabled.
+            metadata.insert(
+                "ARROW:extension:name".to_string(),
+                "parquet.variant".to_string(),
+            );
+            metadata.insert("ARROW:extension:metadata".to_string(), String::new());
+        }
         Ok(ArrowSchemaOrFieldOrType::Field(
             Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
         ))
@@ -687,10 +697,17 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             crate::spec::PrimitiveType::Binary => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
-            crate::spec::PrimitiveType::Variant => Err(Error::new(
-                crate::ErrorKind::FeatureUnsupported,
-                "variant primitive type cannot be used in this context yet",
-            )),
+            crate::spec::PrimitiveType::Variant => {
+                // NovaRocks PATCH 6: Iceberg v3 variant becomes a Struct with
+                // two required binary leaves; the parent field carries the
+                // `parquet.variant` Arrow extension type so parquet writes
+                // emit `LogicalType::Variant` (see ToArrowSchemaConverter::field).
+                let metadata_field = Field::new("metadata", DataType::Binary, false);
+                let value_field = Field::new("value", DataType::Binary, false);
+                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(
+                    Fields::from(vec![metadata_field, value_field]),
+                )))
+            }
         }
     }
 }
@@ -2313,5 +2330,48 @@ mod tests {
 
         pretty_assertions::assert_eq!(schema, expected);
         assert_eq!(schema.highest_field_id(), 17);
+    }
+
+    #[test]
+    fn variant_primitive_maps_to_struct() {
+        let arrow_ty = type_to_arrow_type(&Type::Primitive(PrimitiveType::Variant)).expect("ok");
+        let DataType::Struct(fields) = arrow_ty else {
+            panic!("expected Struct, got {arrow_ty:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "metadata");
+        assert_eq!(fields[0].data_type(), &DataType::Binary);
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), "value");
+        assert_eq!(fields[1].data_type(), &DataType::Binary);
+        assert!(!fields[1].is_nullable());
+    }
+
+    #[test]
+    fn variant_field_attaches_parquet_variant_extension_metadata() {
+        let schema = crate::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                crate::spec::NestedField::optional(7, "v", Type::Primitive(PrimitiveType::Variant))
+                    .into(),
+            ])
+            .build()
+            .expect("schema");
+        let arrow_schema = schema_to_arrow_schema(&schema).expect("convert");
+        let field = arrow_schema.field(0);
+        assert_eq!(field.name(), "v");
+        assert_eq!(
+            field.metadata().get(PARQUET_FIELD_ID_META_KEY).map(String::as_str),
+            Some("7"),
+        );
+        assert_eq!(
+            field.metadata().get("ARROW:extension:name").map(String::as_str),
+            Some("parquet.variant"),
+        );
+        assert_eq!(
+            field.metadata().get("ARROW:extension:metadata").map(String::as_str),
+            Some(""),
+        );
+        assert!(field.is_nullable(), "optional iceberg field becomes nullable arrow field");
     }
 }
