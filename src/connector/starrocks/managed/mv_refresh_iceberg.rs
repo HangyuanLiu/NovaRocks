@@ -153,6 +153,7 @@ pub(crate) fn create_iceberg_mv(
                     name: col.name.clone(),
                     data_type: col.data_type.clone(),
                     nullable: col.nullable,
+                    write_default: None,
                 })
                 .collect();
             TableDef {

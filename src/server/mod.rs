@@ -389,8 +389,10 @@ fn trim_query(query: &str) -> &str {
 fn is_session_noop(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
     // Note: "alter " is NOT a noop — it's handled by engine.rs (ADD FILES)
-    // Note: "update " is NOT a noop — it is a real DML statement dispatched
-    //       by the engine's update handler (mutation_flow.rs).
+    // Note: "update " was previously listed here as a stub when UPDATE was
+    // unimplemented. UPDATE is now a real DML statement routed through
+    // mutation_flow::execute_update_statement, so it must reach the engine
+    // instead of being silently swallowed.
     lower.starts_with("set ")
         || lower.starts_with("show ")
         || lower.starts_with("admin ")
@@ -544,6 +546,7 @@ fn is_supported_embedded_statement(query: &str) -> bool {
         || head.eq_ignore_ascii_case("insert")
         || head.eq_ignore_ascii_case("delete")
         || head.eq_ignore_ascii_case("update")
+        || head.eq_ignore_ascii_case("merge")
         || head.eq_ignore_ascii_case("explain")
         || head.eq_ignore_ascii_case("truncate")
         || head.eq_ignore_ascii_case("alter")

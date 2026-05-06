@@ -5,8 +5,8 @@ use sqlparser::tokenizer::Token;
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::ast::{
-    ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
-    TableColumnDef, TableKeyDesc, TableKeyKind,
+    ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
+    SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 /// Parse StarRocks CREATE TABLE statement:
@@ -418,6 +418,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         let mut aggregation = None;
         let mut nullable = true;
         let mut _comment = None;
+        let mut default: Option<DefaultLiteral> = None;
 
         // Parse optional NOT NULL, NULL, DEFAULT, COMMENT, AUTO_INCREMENT, etc.
         loop {
@@ -430,8 +431,14 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             } else if parser.parse_keyword(Keyword::NULL) {
                 nullable = true;
             } else if parser.parse_keyword(Keyword::DEFAULT) {
-                // Skip the default value expression
-                skip_default_value(parser);
+                if default.is_some() {
+                    return Err(format!("duplicate DEFAULT clause for column `{col_name}`"));
+                }
+                if parser.parse_keyword(Keyword::NULL) {
+                    default = Some(DefaultLiteral::Null);
+                } else {
+                    default = Some(parse_default_literal(parser, &sql_type)?);
+                }
             } else if peek_word_eq(parser, 0, "COMMENT") {
                 parser.next_token();
                 let tok = parser.next_token();
@@ -454,6 +461,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             data_type: sql_type,
             nullable,
             aggregation,
+            default,
         });
     }
     Ok(columns)
@@ -665,6 +673,139 @@ fn skip_default_value(parser: &mut Parser<'_>) {
             }
         }
     }
+}
+
+pub(crate) fn parse_default_literal(
+    parser: &mut sqlparser::parser::Parser<'_>,
+    data_type: &crate::sql::parser::ast::SqlType,
+) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
+    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+
+    // Consumes one token unconditionally. Callers must propagate Err
+    // immediately — parser state is not rewound on failure.
+    let token = parser.next_token();
+    let lit = match token.token {
+        sqlparser::tokenizer::Token::Word(w) if w.value.eq_ignore_ascii_case("TRUE") => {
+            DefaultLiteral::Bool(true)
+        }
+        sqlparser::tokenizer::Token::Word(w) if w.value.eq_ignore_ascii_case("FALSE") => {
+            DefaultLiteral::Bool(false)
+        }
+        sqlparser::tokenizer::Token::Number(n, _) => parse_numeric_default(&n, data_type)?,
+        sqlparser::tokenizer::Token::SingleQuotedString(s)
+        | sqlparser::tokenizer::Token::DoubleQuotedString(s) => {
+            parse_string_default(&s, data_type)?
+        }
+        sqlparser::tokenizer::Token::HexStringLiteral(s) => {
+            let bytes = hex::decode(&s)
+                .map_err(|e| format!("invalid hex DEFAULT literal `x'{s}'`: {e}"))?;
+            // Validate that the column accepts binary
+            if !matches!(data_type, SqlType::Binary) {
+                return Err(format!(
+                    "hex DEFAULT not supported for column type {data_type:?}"
+                ));
+            }
+            DefaultLiteral::Binary(bytes)
+        }
+        sqlparser::tokenizer::Token::Minus => {
+            // Negative numeric literal
+            let next = parser.next_token();
+            if let sqlparser::tokenizer::Token::Number(n, _) = next.token {
+                let mut signed = String::from('-');
+                signed.push_str(&n);
+                parse_numeric_default(&signed, data_type)?
+            } else {
+                return Err(format!(
+                    "expected number after `-` in DEFAULT, got {next:?}"
+                ));
+            }
+        }
+        other => {
+            return Err(format!("unsupported DEFAULT value token: {other:?}"));
+        }
+    };
+
+    // Type-check the literal against the column type up front so the parser
+    // fails fast (re-using the conversion helper from default_value.rs).
+    crate::connector::iceberg::default_value::default_literal_to_iceberg(&lit, data_type)?;
+
+    Ok(lit)
+}
+
+fn parse_numeric_default(
+    text: &str,
+    data_type: &crate::sql::parser::ast::SqlType,
+) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
+    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    match data_type {
+        SqlType::TinyInt | SqlType::SmallInt | SqlType::Int | SqlType::BigInt => {
+            let v: i64 = text
+                .parse()
+                .map_err(|e| format!("invalid integer DEFAULT `{text}`: {e}"))?;
+            Ok(DefaultLiteral::Int(v))
+        }
+        SqlType::Float | SqlType::Double => {
+            let v: f64 = text
+                .parse()
+                .map_err(|e| format!("invalid float DEFAULT `{text}`: {e}"))?;
+            Ok(DefaultLiteral::Float(v))
+        }
+        SqlType::Decimal { scale, .. } => {
+            let (unscaled, scanned_scale) = decimal_from_str(text)?;
+            if scanned_scale != *scale {
+                return Err(format!(
+                    "DEFAULT value scale {scanned_scale} does not match column scale {scale}"
+                ));
+            }
+            Ok(DefaultLiteral::Decimal {
+                unscaled,
+                scale: *scale,
+            })
+        }
+        other => Err(format!(
+            "numeric DEFAULT not supported for column type {other:?}"
+        )),
+    }
+}
+
+fn parse_string_default(
+    s: &str,
+    data_type: &crate::sql::parser::ast::SqlType,
+) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
+    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    match data_type {
+        SqlType::String => Ok(DefaultLiteral::String(s.to_string())),
+        SqlType::Date => {
+            let days = crate::engine::parquet::parse_date_string_to_days(s)?;
+            Ok(DefaultLiteral::Date(days))
+        }
+        SqlType::DateTime => {
+            let micros = crate::engine::parquet::parse_datetime_string_to_micros(s)?;
+            Ok(DefaultLiteral::DateTime(micros))
+        }
+        other => Err(format!(
+            "string DEFAULT not supported for column type {other:?}"
+        )),
+    }
+}
+
+fn decimal_from_str(text: &str) -> Result<(i128, i8), String> {
+    let trimmed = text.trim();
+    let (sign, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (-1i128, rest)
+    } else {
+        (1, trimmed)
+    };
+    let (whole, frac) = match body.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (body, ""),
+    };
+    let combined: String = whole.chars().chain(frac.chars()).collect();
+    let unscaled: i128 = combined
+        .parse()
+        .map_err(|e| format!("invalid decimal DEFAULT `{text}`: {e}"))?;
+    let scale = i8::try_from(frac.len()).map_err(|_| "decimal scale too large".to_string())?;
+    Ok((sign * unscaled, scale))
 }
 
 #[cfg(test)]
@@ -989,5 +1130,57 @@ mod tests {
             assert!(partition_fields.is_empty());
             assert!(!properties.is_empty());
         }
+    }
+
+    #[test]
+    fn parse_create_table_captures_int_default() {
+        let sql = r#"
+            CREATE TABLE ice.ns.t (a INT, b INT DEFAULT 5)
+            PROPERTIES ('format-version' = '3')
+        "#;
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("parsed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected iceberg create table");
+        };
+        assert_eq!(
+            columns[1].default,
+            Some(crate::sql::parser::ast::DefaultLiteral::Int(5))
+        );
+    }
+
+    #[test]
+    fn parse_create_table_captures_default_null() {
+        let sql = r#"
+            CREATE TABLE ice.ns.t (a INT, b INT DEFAULT NULL)
+        "#;
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("parsed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected iceberg create table");
+        };
+        assert_eq!(columns[0].default, None);
+        assert_eq!(
+            columns[1].default,
+            Some(crate::sql::parser::ast::DefaultLiteral::Null)
+        );
+    }
+
+    #[test]
+    fn parse_create_table_rejects_duplicate_default() {
+        let sql =
+            "CREATE TABLE ice.ns.t (b INT DEFAULT 5 DEFAULT 6) PROPERTIES ('format-version' = '3')";
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        let err = parse_create_table_statement(&mut parser).expect_err("duplicate DEFAULT");
+        assert!(err.contains("duplicate DEFAULT"), "unexpected error: {err}");
     }
 }

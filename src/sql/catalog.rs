@@ -9,6 +9,7 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub write_default: Option<iceberg::spec::Literal>,
 }
 
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
@@ -66,19 +67,21 @@ pub struct IcebergDeleteFileInfo {
     pub equality_field_ids: Vec<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
+    pub initial_default: Option<iceberg::spec::Literal>,
+    pub write_default: Option<iceberg::spec::Literal>,
     pub children: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergSchemaDef {
     pub fields: Vec<IcebergSchemaFieldDef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IcebergTableInfo {
     pub location: String,
     pub schema: IcebergSchemaDef,
@@ -183,6 +186,7 @@ mod tests {
                 name: "order_id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                write_default: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: Some(IcebergTableInfo {
@@ -191,9 +195,13 @@ mod tests {
                     fields: vec![IcebergSchemaFieldDef {
                         field_id: 10,
                         name: "order_id".to_string(),
+                        initial_default: None,
+                        write_default: None,
                         children: vec![IcebergSchemaFieldDef {
                             field_id: 11,
                             name: "nested".to_string(),
+                            initial_default: None,
+                            write_default: None,
                             children: vec![],
                         }],
                     }],

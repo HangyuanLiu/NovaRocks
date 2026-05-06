@@ -16,7 +16,8 @@ use crate::engine::{
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
 use crate::sql::parser::ast::{
-    CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName, SqlType,
+    CreateTableKind, DefaultLiteral, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
+    SqlType,
 };
 use crate::sql::parser::dialect::StarRocksDialect;
 use sqlparser::keywords::Keyword;
@@ -390,6 +391,298 @@ pub(crate) fn convert_sqlparser_update_to_custom(
         assignments: out_assignments,
         source,
         where_clause: selection.clone(),
+    })
+}
+
+pub(crate) fn convert_sqlparser_merge_to_custom(
+    statement: &sqlparser::ast::Statement,
+) -> Result<crate::sql::parser::ast::MergeStmt, String> {
+    use crate::sql::parser::ast::{
+        MergeMatchedAction, MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource,
+        UpdateAssignment,
+    };
+    use sqlparser::ast as sqlast;
+
+    let sqlast::Statement::Merge(merge) = statement else {
+        return Err("expected MERGE statement".to_string());
+    };
+    let sqlast::Merge {
+        merge_token,
+        optimizer_hint,
+        into: _,
+        table,
+        source,
+        on,
+        clauses,
+        output,
+    } = merge;
+    let _ = merge_token;
+    if optimizer_hint.is_some() {
+        return Err("MERGE optimizer hints are not supported".to_string());
+    }
+    if output.is_some() {
+        return Err("MERGE OUTPUT is not supported".to_string());
+    }
+
+    let (target_name, target_alias) = match table {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "MERGE target",
+            )?;
+            (
+                crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                update_alias_name(alias, "MERGE target")?,
+            )
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            return Err("MERGE target pivot/unpivot are not supported".to_string());
+        }
+        other => return Err(format!("MERGE target must be a table, got {other:?}")),
+    };
+
+    let source = match source {
+        sqlast::TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } => {
+            reject_update_table_modifiers(
+                args,
+                with_hints,
+                version,
+                *with_ordinality,
+                partitions,
+                json_path,
+                sample,
+                index_hints,
+                "MERGE source",
+            )?;
+            MutationSource::Table {
+                name: crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                alias: update_alias_name(alias, "MERGE source")?,
+            }
+        }
+        sqlast::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if *lateral {
+                return Err("MERGE source lateral subqueries are not supported".to_string());
+            }
+            if sample.is_some() {
+                return Err("MERGE source samples are not supported".to_string());
+            }
+            MutationSource::Query {
+                query: subquery.clone(),
+                alias: update_alias_name(alias, "MERGE source")?,
+            }
+        }
+        sqlast::TableFactor::Pivot { .. } | sqlast::TableFactor::Unpivot { .. } => {
+            return Err("MERGE source pivot/unpivot are not supported".to_string());
+        }
+        other => return Err(format!("unsupported MERGE source: {other:?}")),
+    };
+
+    let mut matched: Option<MergeWhenClause<MergeMatchedAction>> = None;
+    let mut not_matched: Option<MergeWhenClause<MergeNotMatchedAction>> = None;
+    for clause in clauses {
+        let sqlast::MergeClause {
+            when_token,
+            clause_kind,
+            predicate,
+            action,
+        } = clause;
+        let _ = when_token;
+        match clause_kind {
+            sqlast::MergeClauseKind::Matched => {
+                if matched.is_some() {
+                    return Err(
+                        "MERGE supports at most one WHEN MATCHED clause in this implementation"
+                            .to_string(),
+                    );
+                }
+                let action = match action {
+                    sqlast::MergeAction::Update(update) => {
+                        let sqlast::MergeUpdateExpr {
+                            update_token,
+                            assignments,
+                            update_predicate,
+                            delete_predicate,
+                        } = update;
+                        let _ = update_token;
+                        if update_predicate.is_some() || delete_predicate.is_some() {
+                            return Err(
+                                "MERGE WHEN MATCHED UPDATE WHERE / DELETE WHERE clauses are not supported"
+                                    .to_string(),
+                            );
+                        }
+                        let mut out = Vec::with_capacity(assignments.len());
+                        for assignment in assignments {
+                            let sqlast::AssignmentTarget::ColumnName(column_name) =
+                                &assignment.target
+                            else {
+                                return Err(
+                                    "only single-column MERGE UPDATE assignments are supported"
+                                        .to_string(),
+                                );
+                            };
+                            let column = crate::sql::parser::dialect::convert_object_name(
+                                column_name.clone(),
+                            )?;
+                            if column.parts.len() != 1 {
+                                return Err(format!(
+                                    "MERGE UPDATE assignment must reference an unqualified target column, got `{column_name}`"
+                                ));
+                            }
+                            out.push(UpdateAssignment {
+                                column: column.parts[0].clone(),
+                                value: assignment.value.clone(),
+                            });
+                        }
+                        if out.is_empty() {
+                            return Err(
+                                "MERGE WHEN MATCHED UPDATE requires at least one assignment"
+                                    .to_string(),
+                            );
+                        }
+                        MergeMatchedAction::Update { assignments: out }
+                    }
+                    sqlast::MergeAction::Delete { .. } => MergeMatchedAction::Delete,
+                    sqlast::MergeAction::Insert(_) => {
+                        return Err(
+                            "MERGE WHEN MATCHED INSERT is not valid; use UPDATE or DELETE"
+                                .to_string(),
+                        );
+                    }
+                };
+                matched = Some(MergeWhenClause {
+                    predicate: predicate.clone(),
+                    action,
+                });
+            }
+            sqlast::MergeClauseKind::NotMatched | sqlast::MergeClauseKind::NotMatchedByTarget => {
+                if not_matched.is_some() {
+                    return Err(
+                        "MERGE supports at most one WHEN NOT MATCHED clause in this implementation"
+                            .to_string(),
+                    );
+                }
+                let action = match action {
+                    sqlast::MergeAction::Insert(insert) => {
+                        let sqlast::MergeInsertExpr {
+                            insert_token,
+                            columns,
+                            kind_token,
+                            kind,
+                            insert_predicate,
+                        } = insert;
+                        let _ = (insert_token, kind_token);
+                        if insert_predicate.is_some() {
+                            return Err(
+                                "MERGE WHEN NOT MATCHED INSERT WHERE clauses are not supported"
+                                    .to_string(),
+                            );
+                        }
+                        let columns_out: Vec<String> = columns
+                            .iter()
+                            .map(|name| {
+                                let parts =
+                                    crate::sql::parser::dialect::convert_object_name(name.clone())?;
+                                if parts.parts.len() != 1 {
+                                    return Err(format!(
+                                        "MERGE INSERT column must be unqualified, got `{name}`"
+                                    ));
+                                }
+                                Ok::<_, String>(parts.parts[0].clone())
+                            })
+                            .collect::<Result<_, _>>()?;
+                        let values = match kind {
+                            sqlast::MergeInsertKind::Values(values) => {
+                                if values.rows.len() != 1 {
+                                    return Err(format!(
+                                        "MERGE WHEN NOT MATCHED INSERT VALUES requires exactly one row tuple, got {}",
+                                        values.rows.len()
+                                    ));
+                                }
+                                values.rows[0].clone()
+                            }
+                            sqlast::MergeInsertKind::Row => {
+                                return Err(
+                                    "MERGE WHEN NOT MATCHED INSERT ROW shorthand is not supported; \
+                                     spell out VALUES (...) explicitly"
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        if !columns_out.is_empty() && columns_out.len() != values.len() {
+                            return Err(format!(
+                                "MERGE INSERT column count {} does not match VALUES count {}",
+                                columns_out.len(),
+                                values.len()
+                            ));
+                        }
+                        MergeNotMatchedAction {
+                            columns: columns_out,
+                            values,
+                        }
+                    }
+                    sqlast::MergeAction::Update(_) | sqlast::MergeAction::Delete { .. } => {
+                        return Err("MERGE WHEN NOT MATCHED action must be INSERT".to_string());
+                    }
+                };
+                not_matched = Some(MergeWhenClause {
+                    predicate: predicate.clone(),
+                    action,
+                });
+            }
+            sqlast::MergeClauseKind::NotMatchedBySource => {
+                return Err(
+                    "MERGE WHEN NOT MATCHED BY SOURCE is not supported in this implementation"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if matched.is_none() && not_matched.is_none() {
+        return Err("MERGE requires at least one WHEN clause".to_string());
+    }
+
+    Ok(MergeStmt {
+        table: target_name,
+        target_alias,
+        source,
+        on: (**on).clone(),
+        matched,
+        not_matched,
     })
 }
 
@@ -792,7 +1085,7 @@ pub(crate) struct AddEqualityDeleteStmt {
     pub(crate) rows: Vec<Vec<Literal>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AlterIcebergSchemaStmt {
     pub(crate) table: ObjectName,
     pub(crate) change: IcebergSchemaChange,
@@ -812,12 +1105,12 @@ pub(crate) struct ShowAlterTableOptimizeStmt {
     pub(crate) limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IcebergSchemaChange {
     AddColumn {
         name: String,
         data_type: SqlType,
-        default_null: bool,
+        default: Option<DefaultLiteral>,
     },
     DropColumn {
         name: String,
@@ -1137,9 +1430,9 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
     let data_type = crate::sql::parser::dialect::convert_sql_type(
         parser.parse_data_type().map_err(|e| e.to_string())?,
     )?;
-    let mut default_null = false;
+    let mut default: Option<DefaultLiteral> = None;
     let mut seen_null = false;
-    let mut seen_default_null = false;
+    let mut seen_default = false;
     loop {
         if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
             return Err(
@@ -1154,22 +1447,28 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
             continue;
         }
         if parser.parse_keyword(Keyword::DEFAULT) {
+            if seen_default {
+                return Err("duplicate DEFAULT clause in ADD COLUMN".to_string());
+            }
+            seen_default = true;
+            // DEFAULT NULL keeps existing v2 behavior (does not persist).
             if parser.parse_keyword(Keyword::NULL) {
-                if seen_default_null {
-                    return Err("duplicate DEFAULT NULL clause in ADD COLUMN".to_string());
-                }
-                seen_default_null = true;
-                default_null = true;
+                default = Some(DefaultLiteral::Null);
                 continue;
             }
-            return Err("ADD COLUMN default values other than NULL are not supported".to_string());
+            default = Some(
+                crate::sql::parser::dialect::create_table::parse_default_literal(
+                    parser, &data_type,
+                )?,
+            );
+            continue;
         }
         break;
     }
     Ok(IcebergSchemaChange::AddColumn {
         name,
         data_type,
-        default_null,
+        default,
     })
 }
 
@@ -1506,7 +1805,7 @@ mod tests {
             super::IcebergSchemaChange::AddColumn {
                 name: "discount".to_string(),
                 data_type: crate::sql::parser::ast::SqlType::Int,
-                default_null: true,
+                default: Some(super::DefaultLiteral::Null),
             }
         );
     }
@@ -1556,11 +1855,16 @@ mod tests {
         .expect_err("not null should fail");
         assert!(not_null.contains("ADD COLUMN NOT NULL is not supported"));
 
-        let non_null_default = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 1",
+        // String literal as DEFAULT for an INT column must be rejected because
+        // string values are not valid for integer columns.
+        let type_mismatch = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 'abc'",
         )
-        .expect_err("non-null default should fail");
-        assert!(non_null_default.contains("default values other than NULL"));
+        .expect_err("string default for INT should fail");
+        assert!(
+            type_mismatch.contains("DEFAULT not supported"),
+            "expected 'DEFAULT not supported' but got: {type_mismatch}"
+        );
     }
 
     #[test]
@@ -1613,7 +1917,35 @@ mod tests {
             "ALTER TABLE ice.db.orders ADD COLUMN c INT DEFAULT NULL DEFAULT NULL",
         )
         .expect_err("duplicate default should fail");
-        assert!(duplicate_default.contains("duplicate DEFAULT NULL"));
+        assert!(duplicate_default.contains("duplicate DEFAULT clause"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_date_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c DATE DEFAULT '1970-01-02'",
+        )
+        .expect("date default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Date(1)));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_datetime_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c DATETIME DEFAULT '1970-01-01 00:00:01'",
+        )
+        .expect("datetime default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::DateTime(1_000_000)),);
+            }
+            _ => panic!("expected AddColumn"),
+        }
     }
 
     #[test]
@@ -1727,6 +2059,71 @@ mod tests {
                 super::parse_alter_partition_column_sql(sql).is_err(),
                 "expected ALTER partition parse failure for {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_int_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT 5",
+        )
+        .expect("parsed");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Int(5)));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_string_default() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c STRING DEFAULT 'hi'",
+        )
+        .expect("parsed");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::String("hi".into())));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_default_overflow_rejected() {
+        let err = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c TINYINT DEFAULT 200",
+        )
+        .expect_err("overflow");
+        assert!(err.contains("TINYINT"));
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_null_then_default_null() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT NULL DEFAULT NULL",
+        )
+        .expect("null before default null");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Null));
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_iceberg_schema_add_column_default_null_then_null() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT NULL NULL",
+        )
+        .expect("default null before null");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn { default, .. } => {
+                assert_eq!(default, Some(super::DefaultLiteral::Null));
+            }
+            _ => panic!("expected AddColumn"),
         }
     }
 }

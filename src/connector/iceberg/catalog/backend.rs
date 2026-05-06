@@ -219,21 +219,25 @@ fn build_iceberg_table_def_with_data_files(
                 name: "_file".to_string(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_pos".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_row_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
             ColumnDef {
                 name: "_last_updated_sequence_number".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
+                write_default: None,
             },
         ]
     } else {
@@ -287,6 +291,8 @@ fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDe
     IcebergSchemaFieldDef {
         field_id: field.id,
         name: field.name.clone(),
+        initial_default: field.initial_default.clone(),
+        write_default: field.write_default.clone(),
         children: iceberg_type_children(field.field_type.as_ref()),
     }
 }

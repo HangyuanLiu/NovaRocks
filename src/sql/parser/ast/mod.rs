@@ -14,7 +14,7 @@ pub(crate) struct CreateDatabaseStmt {
     pub name: ObjectName,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
@@ -33,7 +33,7 @@ pub(crate) struct DropDatabaseStmt {
     pub force: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
@@ -183,6 +183,45 @@ pub(crate) enum MutationSource {
     },
 }
 
+/// `MERGE INTO <target> USING <source> ON <pred> WHEN ...`. The first
+/// implementation supports at most one `WHEN MATCHED` clause and at most one
+/// `WHEN NOT MATCHED` clause; each clause may carry an optional `AND`
+/// predicate. `WHEN NOT MATCHED BY SOURCE` and lateral source subqueries are
+/// rejected at conversion time.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MergeStmt {
+    pub table: ObjectName,
+    pub target_alias: Option<String>,
+    pub source: MutationSource,
+    pub on: sqlparser::ast::Expr,
+    pub matched: Option<MergeWhenClause<MergeMatchedAction>>,
+    pub not_matched: Option<MergeWhenClause<MergeNotMatchedAction>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MergeWhenClause<A> {
+    /// Optional `AND <expr>` predicate refining the clause.
+    pub predicate: Option<sqlparser::ast::Expr>,
+    pub action: A,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MergeMatchedAction {
+    Update { assignments: Vec<UpdateAssignment> },
+    Delete,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MergeNotMatchedAction {
+    /// Target columns named in `INSERT (a, b, c)`. Empty when omitted (callers
+    /// must align the values with the target schema in column order).
+    pub columns: Vec<String>,
+    /// Per-column value expressions from the `VALUES (...)` clause. The
+    /// element count must match `columns` (or the target schema when
+    /// `columns` is empty).
+    pub values: Vec<sqlparser::ast::Expr>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InsertSource {
     Values(Vec<Vec<Literal>>),
@@ -209,12 +248,13 @@ pub(crate) struct GenerateSeriesSelect {
     pub projection: Vec<Expr>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TableColumnDef {
     pub name: String,
     pub data_type: SqlType,
     pub nullable: bool,
     pub aggregation: Option<ColumnAggregation>,
+    pub default: Option<DefaultLiteral>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +277,22 @@ pub(crate) enum ColumnAggregation {
     Min,
     Max,
     Replace,
+}
+
+/// Literal that may appear in `DEFAULT <literal>` clauses for Iceberg v3
+/// columns.  `Null` is the sentinel for `DEFAULT NULL` and is NOT persisted
+/// into the Iceberg metadata; it only suppresses duplicate-DEFAULT diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DefaultLiteral {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal { unscaled: i128, scale: i8 },
+    String(String),
+    Date(i32),     // days since 1970-01-01
+    DateTime(i64), // microseconds since 1970-01-01T00:00:00Z
+    Binary(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

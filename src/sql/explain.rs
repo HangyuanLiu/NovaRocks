@@ -948,6 +948,7 @@ mod tests {
             name: "c_2_0".to_string(),
             data_type: DataType::FixedSizeBinary(16),
             nullable: false,
+            write_default: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
@@ -993,6 +994,7 @@ mod tests {
             name: "c8".to_string(),
             data_type: DataType::Utf8,
             nullable: true,
+            write_default: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {

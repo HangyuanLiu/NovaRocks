@@ -29,14 +29,14 @@ pub(crate) fn reorder_insert_rows(
     }
     let mapping = build_insert_column_mapping(insert_columns, target_columns)?;
     rows.iter()
-        .map(|row| reorder_insert_row(row, &mapping, target_columns.len()))
+        .map(|row| reorder_insert_row(row, &mapping, target_columns))
         .collect()
 }
 
 fn build_insert_column_mapping(
     insert_columns: &[String],
     target_columns: &[ColumnDef],
-) -> Result<Vec<Option<usize>>, String> {
+) -> Result<Vec<(usize, Option<usize>)>, String> {
     let mut insert_index_by_name = HashMap::with_capacity(insert_columns.len());
     for (idx, column) in insert_columns.iter().enumerate() {
         let key = normalize_identifier(column)?;
@@ -46,9 +46,9 @@ fn build_insert_column_mapping(
     }
 
     let mut mapping = Vec::with_capacity(target_columns.len());
-    for column in target_columns {
+    for (target_idx, column) in target_columns.iter().enumerate() {
         let key = normalize_identifier(&column.name)?;
-        mapping.push(insert_index_by_name.remove(&key));
+        mapping.push((target_idx, insert_index_by_name.remove(&key)));
     }
     if let Some((name, _)) = insert_index_by_name.into_iter().next() {
         return Err(format!("unknown INSERT column `{name}`"));
@@ -58,17 +58,18 @@ fn build_insert_column_mapping(
 
 fn reorder_insert_row(
     row: &[Literal],
-    mapping: &[Option<usize>],
-    target_width: usize,
+    mapping: &[(usize, Option<usize>)],
+    target_columns: &[ColumnDef],
 ) -> Result<Vec<Literal>, String> {
-    if row.len() > target_width {
+    if row.len() > target_columns.len() {
         return Err(format!(
-            "insert column count mismatch: expected at most {target_width} values, got {}",
+            "insert column count mismatch: expected at most {} values, got {}",
+            target_columns.len(),
             row.len()
         ));
     }
-    let mut reordered = Vec::with_capacity(target_width);
-    for source_idx in mapping {
+    let mut reordered = Vec::with_capacity(target_columns.len());
+    for (target_idx, source_idx) in mapping {
         match source_idx {
             Some(idx) => {
                 let value = row.get(*idx).cloned().ok_or_else(|| {
@@ -76,10 +77,55 @@ fn reorder_insert_row(
                 })?;
                 reordered.push(value);
             }
-            None => reordered.push(Literal::Null),
+            None => {
+                let column = &target_columns[*target_idx];
+                let literal = match &column.write_default {
+                    Some(iceberg_lit) => {
+                        let sql_type =
+                            arrow_data_type_to_sql_type(&column.data_type).map_err(|e| {
+                                format!("INSERT write-default for `{}`: {e}", column.name)
+                            })?;
+                        crate::connector::iceberg::default_value::iceberg_literal_to_ast(
+                            iceberg_lit,
+                            &sql_type,
+                        )?
+                    }
+                    None => Literal::Null,
+                };
+                reordered.push(literal);
+            }
         }
     }
     Ok(reordered)
+}
+
+fn arrow_data_type_to_sql_type(
+    dt: &arrow::datatypes::DataType,
+) -> Result<crate::sql::parser::ast::SqlType, String> {
+    use crate::sql::parser::ast::SqlType;
+    use arrow::datatypes::{DataType, TimeUnit};
+    Ok(match dt {
+        DataType::Boolean => SqlType::Boolean,
+        DataType::Int8 => SqlType::TinyInt,
+        DataType::Int16 => SqlType::SmallInt,
+        DataType::Int32 => SqlType::Int,
+        DataType::Int64 => SqlType::BigInt,
+        DataType::Float32 => SqlType::Float,
+        DataType::Float64 => SqlType::Double,
+        DataType::Decimal128(precision, scale) => SqlType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        DataType::Utf8 => SqlType::String,
+        DataType::Date32 => SqlType::Date,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
+        DataType::Binary => SqlType::Binary,
+        other => {
+            return Err(format!(
+                "unsupported Arrow type for write-default conversion: {other:?}"
+            ));
+        }
+    })
 }
 
 /// Build a RecordBatch from literal value rows for a local table.
@@ -510,6 +556,60 @@ fn build_local_literal_array(
             "local table insert does not support column type {:?}",
             other
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::ColumnDef;
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn reorder_insert_row_uses_write_default_for_omitted_column() {
+        let target_columns = vec![
+            ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: Some(iceberg::spec::Literal::Primitive(
+                    iceberg::spec::PrimitiveLiteral::Int(5),
+                )),
+            },
+        ];
+        let rows = vec![vec![Literal::Int(1)]];
+        let insert_columns = vec!["a".to_string()];
+        let result = reorder_insert_rows(&rows, &insert_columns, &target_columns).expect("reorder");
+        assert_eq!(result[0][0], Literal::Int(1));
+        assert_eq!(result[0][1], Literal::Int(5));
+    }
+
+    #[test]
+    fn reorder_insert_row_uses_null_when_no_write_default() {
+        let target_columns = vec![
+            ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+            },
+        ];
+        let rows = vec![vec![Literal::Int(1)]];
+        let insert_columns = vec!["a".to_string()];
+        let result = reorder_insert_rows(&rows, &insert_columns, &target_columns).expect("reorder");
+        assert_eq!(result[0][1], Literal::Null);
     }
 }
 

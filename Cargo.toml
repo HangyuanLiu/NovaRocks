@@ -26,6 +26,7 @@ parquet = { version = "57.1.0", features = ["arrow"] }
 orc-rust = { version = "0.7.1", default-features = false }
 apache-avro = "0.21.0"
 iceberg = "0.9.0"
+iceberg-catalog-rest = "0.9.0"
 typetag = "0.2"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 futures = "0.3"
@@ -40,6 +41,7 @@ sqlparser = "0.61.0"
 hex = "0.4"
 libm = "0.2"
 num-traits = "0.2"
+ordered-float = "4"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 as-any = "0.3"
@@ -81,6 +83,7 @@ tdigest = { version = "0.2.3", features = ["use_serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+mockito = "1"
 
 [features]
 ssb = []
