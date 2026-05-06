@@ -1521,6 +1521,7 @@ pub(crate) fn iceberg_type_for_sql_type(
         SqlType::Date => Type::Primitive(PrimitiveType::Date),
         SqlType::DateTime => Type::Primitive(PrimitiveType::Timestamp),
         SqlType::Time => Type::Primitive(PrimitiveType::Time),
+        SqlType::Variant => Type::Primitive(PrimitiveType::Variant),
         SqlType::Array(inner) => {
             let element_field_id = *next_field_id;
             *next_field_id += 1;

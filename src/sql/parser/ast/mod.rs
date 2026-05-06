@@ -314,6 +314,9 @@ pub enum SqlType {
     Array(Box<SqlType>),
     Map(Box<SqlType>, Box<SqlType>),
     Struct(Vec<(String, SqlType)>),
+    /// Iceberg v3 unshredded variant. Carried as Arrow `LargeBinary`
+    /// in execution; persisted as a parquet group with `LogicalType::Variant`.
+    Variant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -731,6 +731,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
                 .collect::<Result<Vec<_>, String>>()?
                 .into(),
         )),
+        SqlType::Variant => Ok(DataType::LargeBinary),
     }
 }
 

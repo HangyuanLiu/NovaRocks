@@ -145,6 +145,7 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
                 "largeint" => Ok(SqlType::LargeInt),
                 "json" | "jsonb" => Ok(SqlType::String),
                 "varbinary" | "binary" => Ok(SqlType::Binary),
+                "variant" => Ok(SqlType::Variant),
                 "decimal32" | "decimal64" | "decimal128" => {
                     let (precision, scale) = parse_custom_decimal_modifiers(&modifiers);
                     Ok(SqlType::Decimal { precision, scale })
