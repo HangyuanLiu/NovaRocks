@@ -109,7 +109,7 @@ TRUNCATE TABLE <ident>[ . branch_<name>]
 
 **解析侧**：
 
-- 新增 `Statement::Truncate { name: ObjectName, target_ref: Option<IcebergRef> }`。
+- 新增 `Statement::Truncate { name: ObjectName, target_ref: String }`（与现有 `insert_flow.rs` 的 `target_ref` 对齐：默认 `"main"`，branch 时为 `<branch_name>`）。
 - `src/engine/statement.rs::execute_truncate_table_statement()` 既有入口直接复用，扩展其 Iceberg 分支（当前在 `:1051-1054` 直接报错）。
 - 不支持 `PARTITION (...)` / `WHERE` 子句；遇到直接 parser reject。
 
@@ -147,7 +147,8 @@ TRUNCATE TABLE <ident>[ . branch_<name>]
 
 ```rust
 pub struct TruncateCommit {
-    target_ref: Option<String>,  // None = main，Some(branch_name) = 指定 branch
+    // target_ref 跟随现有 `RunInput::target_ref: String` 的约定，
+    // 由 run_iceberg_commit 通过 CommitCtx 注入；TruncateCommit 内部不持有
 }
 
 impl IcebergCommitAction for TruncateCommit { /* commit() */ }
@@ -222,7 +223,7 @@ impl IcebergCommitAction for TruncateCommit { /* commit() */ }
 pub struct OverwritePartitionsCommit {
     new_files: Vec<DataFile>,
     deleted_files: Vec<DataFile>,
-    target_ref: Option<String>,
+    // target_ref 由 CommitCtx 注入（同 TruncateCommit）
 }
 
 impl IcebergCommitAction for OverwritePartitionsCommit { /* commit() */ }
@@ -295,7 +296,7 @@ Step C — 写数据（原子点 #2）
      → 失败：进入 Step E 回滚
 
 Step D — 提交首个 snapshot（原子点 #3）
-  7. run_iceberg_commit(FastAppendCommit, target_ref=None)
+  7. run_iceberg_commit(FastAppendCommit, target_ref="main")
      → 成功：CTAS 完成
      → 失败：进入 Step E 回滚
 
@@ -312,7 +313,7 @@ Step E — 失败回滚
 - **不支持的列类型**：variant、geometry、geography 写路径未通（清单 §4.3）。CTAS 中 SELECT 输出包含这些类型 → reject `"CTAS does not support variant/geometry/geography columns yet; use CREATE TABLE then INSERT"`。
 - **PARTITIONED BY 列名不在 SELECT 输出**：reject `"partition column <name> not found in SELECT output"`。
 - **`IF NOT EXISTS` 且表已存在**：跳过整个语句，**不执行 SELECT**（与 Spark / Trino 一致）。
-- **branch 写**：parser 已 reject `t.branch_<x>` 形式，engine 层无需处理；`target_ref` 始终为 `None`。
+- **branch 写**：parser 已 reject `t.branch_<x>` 形式，engine 层无需处理；`target_ref` 始终为 `"main"`。
 - **commit-unknown 处理**：Step D 的 FastAppend 走 `commit/run.rs` 现有 retry / abort log；retry 仍失败再走 Step E。
 
 ### 5.3 失败路径与文档化错误消息
@@ -395,9 +396,9 @@ drop_table **不重试**（避免在错误路径上嵌套重试），直接走 S
 
 ## 7. SQL 测试覆盖
 
-每个 PR 自带 SQL regression 套件，放在 `tests/sql/iceberg/` 下，命名风格对齐 #80 的 `iceberg_branch_write.sql` / `iceberg_time_travel_select.sql`。所有测试在 `standalone-server` + 本地 warehouse 跑。
+每个 PR 自带 SQL regression 套件，sql 文件放在 `sql-tests/iceberg/sql/`、对应 result fixture 在 `sql-tests/iceberg/result/`。命名风格对齐 #80 的 `iceberg_branch_write.sql` / `iceberg_time_travel_select.sql` 与 #79 的 `iceberg_v3_default_*.sql`。所有测试在 `standalone-server` + 本地 warehouse 跑（runner 命令：`cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite iceberg --mode verify`）。
 
-### 7.1 PR-1（TRUNCATE）：`tests/sql/iceberg/iceberg_truncate.sql`
+### 7.1 PR-1（TRUNCATE）：`sql-tests/iceberg/sql/iceberg_truncate.sql`
 
 | 用例 | 校验点 |
 |---|---|
@@ -412,7 +413,7 @@ drop_table **不重试**（避免在错误路径上嵌套重试），直接走 S
 | 错误：`TRUNCATE TABLE t PARTITION (...)` | parser reject |
 | 错误：`TRUNCATE TABLE t WHERE ...` | parser reject |
 
-### 7.2 PR-2（OVERWRITE PARTITIONS）：`tests/sql/iceberg/iceberg_overwrite_partitions.sql`
+### 7.2 PR-2（OVERWRITE PARTITIONS）：`sql-tests/iceberg/sql/iceberg_v3_overwrite_partitions.sql`
 
 | 用例 | 校验点 |
 |---|---|
@@ -428,7 +429,7 @@ drop_table **不重试**（避免在错误路径上嵌套重试），直接走 S
 | 错误：v2 表 | reject `"requires v3 row-lineage"` |
 | 错误：列数 / 类型不匹配 | analyzer reject |
 
-### 7.3 PR-3（CTAS）：`tests/sql/iceberg/iceberg_ctas.sql`
+### 7.3 PR-3（CTAS）：`sql-tests/iceberg/sql/iceberg_v3_ctas.sql`
 
 | 用例 | 校验点 |
 |---|---|
