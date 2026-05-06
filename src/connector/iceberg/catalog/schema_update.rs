@@ -646,13 +646,101 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("non-composite"));
     }
+
+    #[test]
+    fn apply_drop_at_nested_struct() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "street",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.city").unwrap();
+        let new = apply_drop_at(&schema, &path).unwrap();
+        let address = new.as_struct().fields()[0].clone();
+        let Type::Struct(s) = &*address.field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields().len(), 1);
+        assert_eq!(s.fields()[0].name, "street");
+    }
+
+    #[test]
+    fn apply_drop_at_top_level_works() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("a").unwrap();
+        let new = apply_drop_at(&schema, &path).unwrap();
+        assert_eq!(new.as_struct().fields().len(), 1);
+        assert_eq!(new.as_struct().fields()[0].name, "b");
+    }
+
+    #[test]
+    fn apply_drop_at_unknown_path_errors() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(apply_drop_at(&schema, &path).is_err());
+    }
+
+    #[test]
+    fn apply_drop_at_into_list_or_map_rejected() {
+        use iceberg::spec::ListType;
+        let element = Arc::new(NestedField::list_element(
+            11,
+            Type::Primitive(PrimitiveType::Int),
+            true,
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tags",
+                Type::List(ListType::new(element)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("tags.element").unwrap();
+        let res = apply_drop_at(&schema, &path);
+        assert!(res.is_err());
+        // Drop on list element / map key/value is not allowed; only struct fields can be dropped.
+    }
 }
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, Type};
+use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type};
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use iceberg::{TableRequirement, TableUpdate};
 
@@ -754,6 +842,71 @@ pub(crate) fn find_field_by_path(
         idx += 1;
     }
     Ok((field_id.unwrap(), field_type.unwrap()))
+}
+
+/// Rebuild `schema` with the column at `path` removed.
+///
+/// Only struct fields can be dropped.  Descending into a list element or map key/value
+/// is rejected, because those are not named columns and cannot be individually dropped.
+#[allow(dead_code)]
+pub(crate) fn apply_drop_at(schema: &Schema, path: &ColumnPath) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = drop_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after drop: {e}"))
+}
+
+fn drop_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("drop path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            if segments.len() == 1 {
+                // skip = drop this field at the top of the remaining path
+                continue;
+            }
+            let new_inner_type = drop_in_type(&f.field_type, &segments[1..])?;
+            let mut updated = (*f).clone();
+            updated.field_type = Box::new(new_inner_type);
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for drop", head));
+    }
+    Ok(out)
+}
+
+fn drop_in_type(ty: &Type, segments: &[String]) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = drop_in_fields(s.fields().iter().cloned().collect(), segments)?;
+            let arc_fields: Vec<NestedFieldRef> = new.into_iter().map(Arc::new).collect();
+            Ok(Type::Struct(StructType::new(arc_fields)))
+        }
+        Type::List(_) | Type::Map(_) => {
+            Err("drop path cannot descend into list element or map key/value".to_string())
+        }
+        _ => Err("drop path descends into non-composite type".to_string()),
+    }
 }
 
 fn build_updated_schema(
