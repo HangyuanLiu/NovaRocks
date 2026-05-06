@@ -1037,6 +1037,7 @@ fn drop_local_catalog_table(
 pub(crate) fn execute_truncate_table_statement(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
+    target_ref: &str,
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
@@ -1046,12 +1047,38 @@ pub(crate) fn execute_truncate_table_statement(
         .expect("standalone managed lake read lock")
         .contains_table(&resolved.database, &resolved.table)?
     {
+        if target_ref != "main" {
+            return Err(format!(
+                "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
+            ));
+        }
         return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
     }
-    Err(format!(
-        "TRUNCATE TABLE only supports managed-lake tables: {}.{}",
-        resolved.database, resolved.table
-    ))
+
+    // Fall through to iceberg backend resolution.
+    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        state,
+        name,
+        None,
+        current_database,
+    )?;
+    if target.backend_name != "iceberg" {
+        return Err(format!(
+            "TRUNCATE TABLE only supports managed-lake or iceberg tables: {}.{}",
+            resolved.database, resolved.table
+        ));
+    }
+    let catalog = {
+        let reg = state.connectors.read().expect("connector registry read");
+        reg.catalog_backend(target.backend_name)?
+    };
+    let resolved_table = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+    crate::engine::iceberg_truncate::execute_iceberg_truncate_table(
+        state,
+        &target,
+        &resolved_table,
+        target_ref,
+    )
 }
 
 pub(crate) fn execute_insert_statement(

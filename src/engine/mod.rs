@@ -783,7 +783,12 @@ impl StandaloneSession {
                     let table_name = crate::sql::parser::dialect::convert_object_name(
                         truncate_table.name.clone(),
                     )?;
-                    execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
+                    execute_truncate_table_statement(
+                        &self.inner,
+                        &table_name,
+                        "main",
+                        current_database,
+                    )?;
                 }
                 Ok(StatementResult::Ok)
             }
@@ -1174,6 +1179,7 @@ fn iceberg_optimize_state_name(
 
 pub(crate) mod delete_flow;
 pub(crate) mod equality_delete_flow;
+pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
@@ -1197,8 +1203,13 @@ pub(crate) fn dispatch_statement(
         Statement::AlterIcebergRef(stmt) => {
             crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
         }
-        Statement::Truncate { .. } => {
-            Err("TRUNCATE TABLE: engine dispatch not yet implemented".to_string())
+        Statement::Truncate { name, target_ref } => {
+            crate::engine::statement::execute_truncate_table_statement(
+                state,
+                &name,
+                &target_ref,
+                current_database,
+            )
         }
     }
 }
