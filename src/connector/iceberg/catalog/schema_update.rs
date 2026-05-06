@@ -247,6 +247,66 @@ mod tests {
     }
 
     #[test]
+    fn drop_nested_column_blocked_by_equality_delete() {
+        let res = reject_drop_dependencies_for_test(
+            "address.street",
+            &["address.street".to_string()],
+            &[],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_top_level_struct_blocked_when_equality_delete_targets_inner() {
+        let res = reject_drop_dependencies_for_test(
+            "address",
+            &["address.street".to_string()],
+            &[],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_nested_blocked_when_equality_delete_targets_ancestor() {
+        let res = reject_drop_dependencies_for_test(
+            "address.street",
+            &["address".to_string()],
+            &[],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_unrelated_top_level_not_blocked_when_equality_delete_targets_other() {
+        let res = reject_drop_dependencies_for_test(
+            "name",
+            &["address.street".to_string()],
+            &[],
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn drop_unrelated_nested_not_blocked_when_equality_delete_targets_sibling() {
+        let res = reject_drop_dependencies_for_test(
+            "address.city",
+            &["address.street".to_string()],
+            &[],
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn drop_nested_blocked_by_managed_mv_referencing_leaf() {
+        let res = reject_drop_dependencies_for_test(
+            "address.street",
+            &[],
+            &["SELECT street FROM ice.ns.orders".to_string()],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn add_column_sets_logical_type_property_only_when_needed() {
         let tinyint = build_property_updates_for_test(
             &HashMap::new(),
@@ -2051,23 +2111,46 @@ fn reject_drop_dependencies(
     equality_delete_columns: &[String],
     mv_dependencies: &[ManagedMvDependency],
 ) -> Result<(), String> {
-    let normalized = normalize_identifier(column)?;
-    if equality_delete_columns
-        .iter()
-        .any(|c| normalize_identifier(c).ok().as_deref() == Some(normalized.as_str()))
-    {
-        return Err(format!(
-            "DROP COLUMN `{column}` is blocked because an Iceberg equality-delete file references it"
-        ));
+    let target_segments = normalize_dotted_path(column)?;
+    if target_segments.is_empty() {
+        return Err(format!("DROP COLUMN `{column}` has empty column path"));
     }
+    for ed in equality_delete_columns {
+        let ed_segments = normalize_dotted_path(ed)?;
+        // Block when the dropped path is an ancestor, descendant, or equal
+        // to an equality-delete column reference.
+        if path_overlaps(&target_segments, &ed_segments) {
+            return Err(format!(
+                "DROP COLUMN `{column}` is blocked because an Iceberg equality-delete file references `{ed}`"
+            ));
+        }
+    }
+    let leaf = target_segments.last().expect("checked non-empty above").as_str();
     for dependency in mv_dependencies {
-        if managed_mv_depends_on_column(dependency, &normalized) {
+        if managed_mv_depends_on_column(dependency, leaf) {
             return Err(format!(
                 "DROP COLUMN `{column}` is blocked because a managed materialized view references it"
             ));
         }
     }
     Ok(())
+}
+
+fn normalize_dotted_path(input: &str) -> Result<Vec<String>, String> {
+    input
+        .split('.')
+        .map(|segment| {
+            if segment.is_empty() {
+                return Err(format!("invalid column path `{input}`: empty segment"));
+            }
+            normalize_identifier(segment)
+        })
+        .collect()
+}
+
+fn path_overlaps(a: &[String], b: &[String]) -> bool {
+    let common = a.len().min(b.len());
+    a[..common] == b[..common]
 }
 
 #[derive(Clone, Debug)]
@@ -2893,15 +2976,8 @@ fn protect_schema_change(
             &loaded.table,
         )?;
 
-    // Phase B note: when nested DROP COLUMN is supported, reject_drop_dependencies
-    // must receive the full qualified column name, not just the leaf segment.
-    // For now only top-level drops are permitted (build_updated_schema rejects others).
-    if path.segments().len() != 1 {
-        return Err("nested DROP COLUMN not yet supported in protect_schema_change".to_string());
-    }
-    let name = path.last().unwrap();
     let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
-    reject_drop_dependencies(name, &equality_delete_columns, &mv_dependencies)
+    reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &mv_dependencies)
 }
 
 fn managed_mv_dependencies_for_target(
