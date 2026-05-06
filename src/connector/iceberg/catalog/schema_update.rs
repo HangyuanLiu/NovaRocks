@@ -972,6 +972,235 @@ mod tests {
             apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).is_err()
         );
     }
+
+    // ----- apply_add_at tests -----
+
+    #[test]
+    fn apply_add_at_top_level_default_position() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let mut last_id = 1;
+        let new = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "b",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        )
+        .unwrap();
+        assert_eq!(new.as_struct().fields().len(), 2);
+        assert_eq!(new.as_struct().fields()[1].name, "b");
+        assert_eq!(new.as_struct().fields()[1].id, 2);
+    }
+
+    #[test]
+    fn apply_add_at_top_level_first_position() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let mut last_id = 1;
+        let new = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "b",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::First,
+            &mut last_id,
+        )
+        .unwrap();
+        assert_eq!(new.as_struct().fields()[0].name, "b");
+        assert_eq!(new.as_struct().fields()[1].name, "a");
+    }
+
+    #[test]
+    fn apply_add_at_top_level_after_position() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let mut last_id = 2;
+        let new = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "b",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::After("a".to_string()),
+            &mut last_id,
+        )
+        .unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn apply_add_at_top_level_before_position() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let mut last_id = 2;
+        let new = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "b",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Before("c".to_string()),
+            &mut last_id,
+        )
+        .unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn apply_add_at_nested_struct() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let parent = crate::engine::statement::ColumnPath::parse("address").unwrap();
+        let mut last_id = 11;
+        let new = apply_add_at(
+            &schema,
+            &parent,
+            "zip",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        )
+        .unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields().len(), 2);
+        assert_eq!(s.fields()[1].name, "zip");
+        assert_eq!(s.fields()[1].id, 12);
+    }
+
+    #[test]
+    fn apply_add_at_name_conflict_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let mut last_id = 1;
+        let res = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "a",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn apply_add_at_after_target_not_found() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let mut last_id = 1;
+        let res = apply_add_at(
+            &schema,
+            &crate::engine::statement::ColumnPath::root(),
+            "b",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::After("nonexistent".to_string()),
+            &mut last_id,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn apply_add_at_into_non_struct_parent_rejected() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "n",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let parent = crate::engine::statement::ColumnPath::parse("n").unwrap();
+        let mut last_id = 1;
+        let res = apply_add_at(
+            &schema,
+            &parent,
+            "x",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        );
+        assert!(res.is_err());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1779,6 +2008,177 @@ fn normalized_object_name_parts(name: &sqlparser::ast::ObjectName) -> Option<Vec
         })
         .collect::<Result<Vec<_>, _>>()
         .ok()
+}
+
+use crate::engine::statement::AddPosition;
+
+/// Rebuild `schema` with a new column added under `parent` (or at top-level if `parent` is root).
+///
+/// The new column is inserted at `position` (Default = append, First, After, Before).
+/// Only STRUCT parents are supported; adding into a LIST or MAP element is rejected.
+/// A name-conflict check (case-insensitive) is performed against the target sibling list.
+#[allow(dead_code)]
+pub(crate) fn apply_add_at(
+    schema: &Schema,
+    parent: &ColumnPath,
+    name: &str,
+    data_type: &SqlType,
+    default: Option<&crate::sql::parser::ast::DefaultLiteral>,
+    position: AddPosition,
+    last_column_id: &mut i32,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+
+    // Allocate new field id; reserve a window above for any nested complex type ids.
+    let new_id = last_column_id
+        .checked_add(1)
+        .ok_or_else(|| "too many iceberg columns".to_string())?;
+    let mut next_nested_id = new_id
+        .checked_add(1)
+        .ok_or_else(|| "too many iceberg columns".to_string())?;
+    let new_ty = crate::connector::iceberg::catalog::registry::iceberg_type_for_sql_type(
+        data_type,
+        &mut next_nested_id,
+    )?;
+    let mut new_field = NestedField::optional(new_id, name, new_ty);
+    if let Some(lit) = default {
+        if let Some(iceberg_lit) =
+            crate::connector::iceberg::default_value::default_literal_to_iceberg(lit, data_type)?
+        {
+            new_field = new_field
+                .with_initial_default(iceberg_lit.clone())
+                .with_write_default(iceberg_lit);
+        }
+    }
+    *last_column_id = next_nested_id - 1;
+
+    let new_fields = add_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        parent.segments(),
+        new_field,
+        &position,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after add: {e}"))
+}
+
+fn add_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    parent_segments: &[String],
+    new_field: NestedField,
+    position: &AddPosition,
+) -> Result<Vec<NestedField>, String> {
+    if parent_segments.is_empty() {
+        // Top-level add: name conflict check + position insertion.
+        let normalized = normalize_identifier(&new_field.name)?;
+        for f in &fields {
+            if normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str()) {
+                return Err(format!(
+                    "Iceberg column `{}` already exists",
+                    new_field.name
+                ));
+            }
+        }
+        let mut existing: Vec<NestedField> = fields.iter().map(|f| (**f).clone()).collect();
+        insert_at_position(&mut existing, new_field, position)?;
+        return Ok(existing);
+    }
+    let head = normalize_identifier(&parent_segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let new_inner = add_in_type(
+                &f.field_type,
+                &parent_segments[1..],
+                new_field.clone(),
+                position,
+            )?;
+            let mut updated = (*f).clone();
+            updated.field_type = Box::new(new_inner);
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!(
+            "parent column '{}' not found for add",
+            &parent_segments[0]
+        ));
+    }
+    Ok(out)
+}
+
+fn add_in_type(
+    ty: &Type,
+    parent_segments: &[String],
+    new_field: NestedField,
+    position: &AddPosition,
+) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = add_in_fields(
+                s.fields().iter().cloned().collect(),
+                parent_segments,
+                new_field,
+                position,
+            )?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err("ADD COLUMN parent path must point to a STRUCT".to_string()),
+    }
+}
+
+/// Insert `new_field` into `fields` at the requested `position`.
+///
+/// Reused by B7 reorder.
+#[allow(dead_code)]
+pub(crate) fn insert_at_position(
+    fields: &mut Vec<NestedField>,
+    new_field: NestedField,
+    position: &AddPosition,
+) -> Result<(), String> {
+    match position {
+        AddPosition::Default => {
+            fields.push(new_field);
+            Ok(())
+        }
+        AddPosition::First => {
+            fields.insert(0, new_field);
+            Ok(())
+        }
+        AddPosition::After(target) => {
+            let target_norm = normalize_identifier(target)?;
+            let idx = fields
+                .iter()
+                .position(|f| {
+                    normalize_identifier(&f.name).ok().as_deref() == Some(target_norm.as_str())
+                })
+                .ok_or_else(|| format!("AFTER target '{target}' not found in same parent"))?;
+            fields.insert(idx + 1, new_field);
+            Ok(())
+        }
+        AddPosition::Before(target) => {
+            let target_norm = normalize_identifier(target)?;
+            let idx = fields
+                .iter()
+                .position(|f| {
+                    normalize_identifier(&f.name).ok().as_deref() == Some(target_norm.as_str())
+                })
+                .ok_or_else(|| format!("BEFORE target '{target}' not found in same parent"))?;
+            fields.insert(idx, new_field);
+            Ok(())
+        }
+    }
 }
 
 fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
