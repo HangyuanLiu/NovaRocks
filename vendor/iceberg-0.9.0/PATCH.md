@@ -210,13 +210,22 @@ parquet's `LogicalType::Variant` (parquet-rs source
 
 ## Patch 7 — bump arrow / parquet to 58.2
 
-Files: `Cargo.toml` (vendor copy only; root is bumped in lock-step).
+Files: `Cargo.toml` (vendor copy only; root is bumped in lock-step),
+`src/transform/temporal.rs`.
 
 iceberg-rust 0.9.0 originally pinned `arrow-* = "57.1"` and
 `parquet = "57.1"`. NovaRocks needs parquet 58.x to reach the
 `variant_experimental` feature (used by PATCH 6 to emit
 `LogicalType::Variant`). The diff is mechanical — every `"57.1"` literal
 in `[dependencies.arrow-*]` and `[dependencies.parquet]` becomes `"58.2"`.
+
+arrow 58.0 deprecates `Date32Type::to_naive_date` in favour of
+`to_naive_date_opt`. `src/transform/temporal.rs` calls the deprecated
+form at three sites (the `Year` and `Month` transforms over `Date`
+literals); each is rewritten to
+`to_naive_date_opt(*v).expect("Date32Type::to_naive_date_opt overflow")`,
+preserving the previous panic-on-overflow semantics while clearing the
+`-D warnings` build.
 
 When upstream iceberg-rust 0.10 lands with its own arrow/parquet bump,
 this entry is removed by the same path that already retires PATCH 1–5.

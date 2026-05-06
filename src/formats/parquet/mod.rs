@@ -43,7 +43,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
 };
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -381,7 +381,7 @@ impl ParquetScanIter {
     ) -> Result<ParquetRecordBatchReaderBuilder<ParquetCachedReader>, String> {
         let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
         if self.cfg.enable_page_index {
-            opts = opts.with_page_index(true);
+            opts = opts.with_page_index_policy(PageIndexPolicy::Required);
         }
         let parquet_reader =
             ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
