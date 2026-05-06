@@ -264,6 +264,64 @@ StarRocks FE
 - `[spill]`  
   Spill enablement, directories, block size, and compression strategy
 
+### 7.3 Codex Local Test Environment
+
+Codex workspaces use `.codex/environments/environment.toml` to start a
+workspace-scoped Iceberg REST + MinIO test environment.
+
+Do not guess local ports such as `9000`, `8181`, or `9030`. Always discover the
+active workspace environment from the fixed generated entry:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+```
+
+Important generated locations:
+
+- `.codex/environments/runtime/current/env.sh`
+  Shell exports for the active workspace. Prefer this for commands.
+- `.codex/environments/runtime/current/manifest.json`
+  Machine-readable endpoints, ports, Docker Compose project, warehouses, and config paths.
+- `.codex/environments/runtime/current/README.md`
+  Human-readable summary of the active environment.
+
+Important environment variables after sourcing `env.sh`:
+
+- `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
+- `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
+- `NOVAROCKS_ICEBERG_REST_URI`
+- `NOVAROCKS_STANDALONE_CONFIG`
+- `NOVAROCKS_SQL_TEST_CONFIG`
+- `NOVAROCKS_ICE_REST_CATALOG_SQL`
+
+If the fixed entry is missing, initialize or inspect the environment with:
+
+```bash
+.codex/environments/iceberg-rest-up.sh
+.codex/environments/iceberg-rest-status.sh
+```
+
+Start standalone-server against the generated config:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+NO_PROXY=127.0.0.1,localhost \
+cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+```
+
+Run SQL tests with the generated runner config:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg --mode verify
+```
+
+Workspace cleanup uses `.codex/environments/iceberg-rest-down.sh --purge`,
+which removes the workspace-specific Docker Compose project, MinIO volume, and
+generated runtime entry.
+
 ---
 
 ## 8. Development and Testing Standards

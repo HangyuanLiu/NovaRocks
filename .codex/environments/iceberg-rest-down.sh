@@ -11,7 +11,9 @@ fi
 slug="$(printf '%s' "$slug" | cut -c1-24)"
 hash="$(printf '%s' "$WORKSPACE_ROOT" | shasum -a 1 | awk '{print substr($1, 1, 8)}')"
 env_id="${slug}-${hash}"
-runtime_dir="$SCRIPT_DIR/runtime/$env_id"
+runtime_base="$SCRIPT_DIR/runtime"
+runtime_dir="$runtime_base/$env_id"
+current_link="$runtime_base/current"
 compose_file="$SCRIPT_DIR/iceberg-rest-compose.yml"
 compose_env="$runtime_dir/compose.env"
 exports_file="$runtime_dir/env.sh"
@@ -54,5 +56,12 @@ docker compose \
   down "${down_args[@]}"
 
 if [[ "$remove_runtime" == true ]]; then
+  if [[ -L "$current_link" || -e "$current_link" ]]; then
+    current_target="$(cd "$current_link" 2>/dev/null && pwd || true)"
+    current_ref="$(readlink "$current_link" 2>/dev/null || true)"
+    if [[ "$current_target" == "$runtime_dir" || "$current_ref" == "$env_id" ]]; then
+      rm -rf "$current_link"
+    fi
+  fi
   rm -rf "$runtime_dir"
 fi

@@ -17,15 +17,19 @@ bootstrap and tear down its matching local services automatically.
 .codex/environments/iceberg-rest-up.sh
 ```
 
-The script writes generated files under:
+The script writes generated files under a workspace-specific directory and
+publishes a fixed discovery entry:
 
 ```text
 .codex/environments/runtime/<env-id>/
+.codex/environments/runtime/current/
 ```
 
 Important generated files:
 
 - `env.sh`: shell exports for this workspace.
+- `manifest.json`: machine-readable ports, endpoints, compose project, and config paths.
+- `README.md`: human-readable summary of the active environment.
 - `standalone-managed-lake.toml`: NovaRocks standalone-server config.
 - `sql-test.conf`: SQL test runner config.
 - `ice-rest-catalog.sql`: REST catalog DDL for this workspace.
@@ -33,7 +37,7 @@ Important generated files:
 Use the generated configs like this:
 
 ```bash
-source .codex/environments/runtime/<env-id>/env.sh
+source .codex/environments/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
@@ -69,3 +73,6 @@ Codex workspace cleanup uses the stronger purge mode:
 
 That stops the workspace-specific Docker Compose project, removes its Docker
 volume, and deletes `.codex/environments/runtime/<env-id>/`.
+
+It also removes `.codex/environments/runtime/current` when that entry points at
+the purged workspace environment.

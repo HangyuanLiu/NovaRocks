@@ -11,7 +11,9 @@ fi
 slug="$(printf '%s' "$slug" | cut -c1-24)"
 hash="$(printf '%s' "$WORKSPACE_ROOT" | shasum -a 1 | awk '{print substr($1, 1, 8)}')"
 env_id="${slug}-${hash}"
-runtime_dir="$SCRIPT_DIR/runtime/$env_id"
+runtime_base="$SCRIPT_DIR/runtime"
+runtime_dir="$runtime_base/$env_id"
+current_link="$runtime_base/current"
 compose_file="$SCRIPT_DIR/iceberg-rest-compose.yml"
 compose_env="$runtime_dir/compose.env"
 exports_file="$runtime_dir/env.sh"
@@ -34,6 +36,11 @@ docker compose \
   -f "$compose_file" \
   ps
 
+echo
+echo "Fixed discovery entry:"
+echo "  current: $current_link"
+echo "  manifest: ${NOVA_ENV_MANIFEST:-$runtime_dir/manifest.json}"
+echo "  readme: ${NOVA_ENV_README:-$runtime_dir/README.md}"
 echo
 echo "Generated environment:"
 echo "  env: $exports_file"
