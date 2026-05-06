@@ -614,9 +614,11 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
     let names: Vec<&str> = match change {
         IcebergSchemaChange::AddColumn { name, .. } => vec![name.as_str()],
         IcebergSchemaChange::DropColumn { path } => {
+            debug_assert!(!path.is_empty(), "DropColumn path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
         IcebergSchemaChange::RenameColumn { path, new_name } => {
+            debug_assert!(!path.is_empty(), "RenameColumn path must be non-empty");
             let mut names = Vec::new();
             if let Some(old_name) = path.last() {
                 names.push(old_name);
@@ -625,12 +627,15 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
             names
         }
         IcebergSchemaChange::ModifyColumn { path, .. } => {
+            debug_assert!(!path.is_empty(), "ModifyColumn path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
         IcebergSchemaChange::SetNullable { path, .. } => {
+            debug_assert!(!path.is_empty(), "SetNullable path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
         IcebergSchemaChange::Reorder { path, .. } => {
+            debug_assert!(!path.is_empty(), "Reorder path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
     };
@@ -984,7 +989,13 @@ fn build_property_updates(
             }
         }
         IcebergSchemaChange::DropColumn { path } => {
-            let name = path.last().unwrap_or_default();
+            // Phase B note: when nested DROP COLUMN is supported, this site must
+            // be extended to handle non-top-level property keys explicitly.
+            // For now, only top-level columns carry novarocks properties.
+            if path.segments().len() != 1 {
+                return Ok(Default::default());
+            }
+            let name = path.last().unwrap();
             reject_key_column_drop(properties, name)?;
             let logical_key = logical_type_property_key(name)?;
             if properties.contains_key(&logical_key) {
@@ -996,7 +1007,12 @@ fn build_property_updates(
             }
         }
         IcebergSchemaChange::RenameColumn { path, new_name } => {
-            let old_name = path.last().unwrap_or_default();
+            // Phase B note: when nested RENAME COLUMN is supported, this site must
+            // be extended to handle non-top-level property keys explicitly.
+            if path.segments().len() != 1 {
+                return Ok(Default::default());
+            }
+            let old_name = path.last().unwrap();
             let old_logical_key = logical_type_property_key(old_name)?;
             if let Some(value) = properties.get(&old_logical_key) {
                 updates
@@ -1020,7 +1036,12 @@ fn build_property_updates(
             }
         }
         IcebergSchemaChange::ModifyColumn { path, new_type } => {
-            let name = path.last().unwrap_or_default();
+            // Phase B note: when nested MODIFY COLUMN is supported, this site must
+            // be extended to handle non-top-level property keys explicitly.
+            if path.segments().len() != 1 {
+                return Ok(Default::default());
+            }
+            let name = path.last().unwrap();
             let logical_key = logical_type_property_key(name)?;
             if let Some(value) = logical_type_property_value(new_type) {
                 updates.sets.insert(logical_key, value);
@@ -1219,7 +1240,13 @@ fn protect_schema_change(
             &loaded.table,
         )?;
 
-    let name = path.last().unwrap_or_default();
+    // Phase B note: when nested DROP COLUMN is supported, reject_drop_dependencies
+    // must receive the full qualified column name, not just the leaf segment.
+    // For now only top-level drops are permitted (build_updated_schema rejects others).
+    if path.segments().len() != 1 {
+        return Err("nested DROP COLUMN not yet supported in protect_schema_change".to_string());
+    }
+    let name = path.last().unwrap();
     let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
     reject_drop_dependencies(name, &equality_delete_columns, &mv_dependencies)
 }
