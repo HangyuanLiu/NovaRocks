@@ -3,6 +3,7 @@ pub(crate) mod create_catalog;
 pub(crate) mod create_table;
 pub(crate) mod drop;
 pub(crate) mod materialized_view;
+pub(crate) mod truncate;
 
 use sqlparser::ast as sqlast;
 use sqlparser::keywords::Keyword;

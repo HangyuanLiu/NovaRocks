@@ -59,6 +59,11 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         return Ok(vec![stmt]);
     }
 
+    if dialect::truncate::looks_like_truncate_table(&parser) {
+        let stmt = dialect::truncate::parse_truncate_table(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+
     Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 

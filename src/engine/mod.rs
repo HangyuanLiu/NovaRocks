@@ -1197,6 +1197,9 @@ pub(crate) fn dispatch_statement(
         Statement::AlterIcebergRef(stmt) => {
             crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
         }
+        Statement::Truncate { .. } => {
+            Err("TRUNCATE TABLE: engine dispatch not yet implemented".to_string())
+        }
     }
 }
 

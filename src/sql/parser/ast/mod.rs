@@ -133,6 +133,11 @@ pub(crate) enum Statement {
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     ShowMaterializedViews(ShowMaterializedViewsStmt),
     AlterIcebergRef(AlterIcebergRefStmt),
+    Truncate {
+        name: ObjectName,
+        /// `"main"` by default; branch name when the SQL uses `t.branch_<name>`.
+        target_ref: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
