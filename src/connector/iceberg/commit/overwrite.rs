@@ -440,6 +440,55 @@ pub(super) async fn write_overwrite_deletes_manifest(
     Ok(manifest_file)
 }
 
+/// Sibling of `write_overwrite_deletes_manifest` used by `TruncateCommit` for
+/// the delete-content (position-delete / equality-delete / Iceberg v3 deletion
+/// vector) entries. The existing helper above is hard-wired to
+/// `build_v*_data()` so adding a `DataFile` whose `content_type()` is
+/// `PositionDeletes` or `EqualityDeletes` would be rejected by
+/// `ManifestWriter::check_data_file` (which insists every entry in a Data
+/// manifest has `DataContentType::Data`). A separate helper that picks
+/// `build_v*_deletes()` is the cleanest fix; mirroring the existing function
+/// otherwise keeps the diff minimal and the behaviour parallel.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_truncate_deletes_manifest(
+    file_io: &FileIO,
+    out_path: &str,
+    existing: &[(DataFile, i64, Option<i64>)],
+    partition_spec: PartitionSpecRef,
+    schema: SchemaRef,
+    new_snapshot_id: i64,
+    format_version: FormatVersion,
+) -> Result<ManifestFile, String> {
+    let output_file = file_io
+        .new_output(out_path)
+        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
+    let builder = ManifestWriterBuilder::new(
+        output_file,
+        Some(new_snapshot_id),
+        None,
+        schema,
+        (*partition_spec).clone(),
+    );
+    let mut writer = match format_version {
+        FormatVersion::V2 => builder.build_v2_deletes(),
+        FormatVersion::V3 => builder.build_v3_deletes(),
+        FormatVersion::V1 => {
+            return Err("phase 1 does not support V1 tables".to_string());
+        }
+    };
+    for (df, seq, file_seq) in existing {
+        writer
+            .add_delete_file(df.clone(), *seq, *file_seq)
+            .map_err(|e| format!("ManifestWriter::add_delete_file failed: {e}"))?;
+    }
+    let manifest_file = writer
+        .write_manifest_file()
+        .await
+        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
+    debug_assert_eq!(manifest_file.content, ManifestContentType::Deletes);
+    Ok(manifest_file)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_added_data_manifest(
     file_io: &FileIO,

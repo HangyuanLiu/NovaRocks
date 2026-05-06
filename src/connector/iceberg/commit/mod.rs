@@ -37,6 +37,8 @@ mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
+#[cfg(test)]
+mod test_helpers;
 mod truncate;
 mod types;
 mod update_cow;
