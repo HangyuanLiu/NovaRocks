@@ -11,6 +11,7 @@ mod scope;
 mod subquery_rewrite;
 
 pub mod alter_iceberg_ref;
+pub mod iceberg_metadata;
 pub mod iceberg_ref;
 
 use arrow::datatypes::DataType;
@@ -1259,6 +1260,21 @@ impl<'a> AnalyzerContext<'a> {
                 for col in output_columns {
                     scope.add_column(
                         Some(alias.as_str()),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
+            Relation::IcebergMetadataScan(rel) => {
+                let cols = crate::sql::analyzer::iceberg_metadata::metadata_table_schema(
+                    rel.metadata_table_type.clone(),
+                );
+                let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
+                for col in &cols {
+                    scope.add_column(
+                        Some(qualifier),
                         &col.name,
                         col.data_type.clone(),
                         col.nullable,
@@ -2947,5 +2963,49 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Boolean);
         assert_eq!(args[0].data_type, arrow::datatypes::DataType::Boolean);
+    }
+
+    #[test]
+    fn analyzer_resolves_t_dollar_snapshots_to_metadata_scan() {
+        use crate::connector::iceberg::IcebergMetadataTableType;
+
+        // The parser rewrites `orders$snapshots` -> `orders.__nr_meta_snapshots__`
+        // so we go through `parse_raw_and_analyze` to exercise the full pipeline.
+        let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM orders$snapshots")
+            .expect("analyze should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let from = sel.from.as_ref().expect("FROM clause should be present");
+        match from {
+            Relation::IcebergMetadataScan(rel) => {
+                assert_eq!(rel.metadata_table_type, IcebergMetadataTableType::Snapshots);
+                assert_eq!(rel.table.name, "orders");
+                assert_eq!(rel.database, "default");
+                assert!(rel.alias.is_none());
+            }
+            other => panic!("expected IcebergMetadataScan, got {other:?}"),
+        }
+
+        // The output column `snapshot_id` should resolve through the synthetic
+        // metadata schema (Int64, NOT NULL).
+        assert_eq!(resolved.output_columns.len(), 1);
+        let col = &resolved.output_columns[0];
+        assert_eq!(col.name, "snapshot_id");
+        assert_eq!(col.data_type, arrow::datatypes::DataType::Int64);
+        assert!(!col.nullable);
+    }
+
+    #[test]
+    fn analyzer_rejects_branch_combined_with_metadata_suffix() {
+        // `orders.branch_dev$snapshots` -> `orders.branch_dev.__nr_meta_snapshots__`
+        // after parser rewrite. The base_parts ends in `branch_dev`, which is
+        // illegal in combination with a metadata-table suffix.
+        let err = parse_raw_and_analyze("SELECT * FROM orders.branch_dev$snapshots")
+            .expect_err("must fail");
+        assert!(
+            err.contains("cannot be combined with branch/tag suffix"),
+            "unexpected error: {err}"
+        );
     }
 }

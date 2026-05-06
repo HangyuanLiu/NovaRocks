@@ -58,15 +58,38 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             }
         }
 
-        let row_lineage_first_row_id =
-            match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
-                IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
-                IcebergWriteMode::LegacyPositionDeletes => None,
-            };
-        let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
+        // Row-lineage `next_row_id` accounting splits three ways:
+        //
+        // 1. `preserve` — the upstream engine flow wrote data files whose
+        //    `_row_id` values are already stamped at the reserved field IDs
+        //    (e.g. OPTIMIZE row-lineage preserve). The Replace snapshot must
+        //    still set `row_range` because iceberg-rs vendor 0.9 enforces a
+        //    non-null `first-row-id` on V3 snapshots, but we set
+        //    `added_rows = 0` so `next_row_id` does not advance and no fresh
+        //    row identity range is reserved.
+        // 2. `RowLineageV3` non-preserve — historical behaviour: allocate a
+        //    contiguous range of size `record_count` starting at the
+        //    table's current `next_row_id`.
+        // 3. `LegacyPositionDeletes` (V2) — no row-lineage at all; omit
+        //    `row_range` entirely.
+        let preserve_row_lineage = ctx.collector.preserve_row_lineage();
+        let written_record_count = written.iter().try_fold(0u64, |sum, f| {
             sum.checked_add(f.record_count)
                 .ok_or_else(|| "row-lineage rewrite added row count overflow".to_string())
         })?;
+        let (row_lineage_first_row_id, row_lineage_added_rows) = if preserve_row_lineage {
+            // Stamp first-row-id at the current next_row_id with 0 added rows
+            // so the V3 snapshot is well-formed but next_row_id is unchanged.
+            (Some(ctx.table.metadata().next_row_id()), 0u64)
+        } else {
+            match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
+                IcebergWriteMode::RowLineageV3 => (
+                    Some(ctx.table.metadata().next_row_id()),
+                    written_record_count,
+                ),
+                IcebergWriteMode::LegacyPositionDeletes => (None, 0),
+            }
+        };
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = RewriteDataFilesTxnAction {
@@ -79,6 +102,7 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             manifest_paths_out: manifest_paths_out.clone(),
             row_lineage_first_row_id,
             row_lineage_added_rows,
+            preserve_row_lineage,
             target_ref: ctx.target_ref.to_string(),
         };
 
@@ -114,8 +138,20 @@ struct RewriteDataFilesTxnAction {
     schema_id: i32,
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    /// First row id to record on the V3 snapshot's `row_range` field. Set
+    /// when the table is V3 row-lineage and either (a) we are allocating a
+    /// fresh range (`row_lineage_added_rows > 0`) or (b) we are preserving
+    /// per-row identity from the data files (`row_lineage_added_rows = 0`,
+    /// `preserve_row_lineage = true`). `None` for legacy V2 tables.
     row_lineage_first_row_id: Option<u64>,
     row_lineage_added_rows: u64,
+    /// True when the data files supplied to this rewrite already carry
+    /// `_row_id` at the reserved field IDs. The manifest list writer must
+    /// then NOT assign new first-row-id ranges to manifest entries (would
+    /// over-advance `next_row_id`), and the validation check between the
+    /// expected next-row-id and the manifest writer's reported next-row-id
+    /// is skipped because the two no longer reflect the same accounting.
+    preserve_row_lineage: bool,
     target_ref: String,
 }
 
@@ -229,6 +265,18 @@ impl TransactionAction for RewriteDataFilesTxnAction {
             new_snapshot_id, self.commit_uuid
         );
         self.record_manifest_path(manifest_list_path.clone());
+        // In preserve mode the data files already carry `_row_id` at the
+        // reserved field IDs, so we must NOT let the manifest list writer
+        // mint fresh row-id ranges for manifest entries (would advance
+        // `next_row_id` past the allocated row identities). Pass `None` to
+        // suppress the writer's auto-assignment; the snapshot's row_range
+        // separately stamps `(current_next_row_id, 0)` to satisfy the V3
+        // spec without reserving new ids.
+        let manifest_list_first_row_id = if self.preserve_row_lineage {
+            None
+        } else {
+            self.row_lineage_first_row_id
+        };
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
@@ -237,11 +285,13 @@ impl TransactionAction for RewriteDataFilesTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
-            self.row_lineage_first_row_id,
+            manifest_list_first_row_id,
         )
         .await
         .map_err(to_iceberg_unexpected)?;
-        if let Some(first_row_id) = self.row_lineage_first_row_id {
+        if !self.preserve_row_lineage
+            && let Some(first_row_id) = self.row_lineage_first_row_id
+        {
             let expected_next_row_id = first_row_id
                 .checked_add(self.row_lineage_added_rows)
                 .ok_or_else(|| {

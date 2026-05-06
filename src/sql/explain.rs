@@ -607,6 +607,9 @@ fn scan_supports_decode_hint(
                 .map(|column| supports_scan_decode_hint(&column.data_type))
                 .unwrap_or(false)
         }),
+        // Iceberg metadata-table scans are JVM-bridged; the parquet decode
+        // hint path does not apply.
+        TableStorage::IcebergMetadataTable { .. } => false,
     }
 }
 
@@ -616,6 +619,8 @@ fn scan_supports_min_max_stats(
 ) -> bool {
     match &table.storage {
         TableStorage::LocalParquetFile { .. } | TableStorage::S3ParquetFiles { .. } => {}
+        // Iceberg metadata tables do not produce parquet column statistics.
+        TableStorage::IcebergMetadataTable { .. } => return false,
     }
     required_columns.iter().all(|required| {
         table

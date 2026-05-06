@@ -1183,7 +1183,81 @@ fn plan_relation_scoped(
             alias,
             output_columns,
         })),
+        Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel),
     }
+}
+
+/// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
+/// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
+/// `TableStorage::IcebergMetadataTable` storage. The optimizer treats it
+/// like any other Scan; codegen branches on the storage variant to emit
+/// the JVM-bridged metadata scanner.
+fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<LogicalPlan, String> {
+    use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+
+    let cols = metadata_table_schema(rel.metadata_table_type.clone());
+    if cols.is_empty() {
+        return Err(format!(
+            "iceberg metadata table type {:?} is not supported",
+            rel.metadata_table_type
+        ));
+    }
+    let column_defs: Vec<ColumnDef> = cols
+        .iter()
+        .map(|c| ColumnDef {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+            write_default: None,
+        })
+        .collect();
+    let output_columns: Vec<OutputColumn> = cols
+        .iter()
+        .map(|c| OutputColumn {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+        })
+        .collect();
+    let serialized_table = rel
+        .table
+        .iceberg_table
+        .as_ref()
+        .and_then(|i| i.serialized_metadata.clone())
+        .ok_or_else(|| {
+            format!(
+                "iceberg metadata table {} requires serialized metadata; \
+                 table was not loaded through an iceberg catalog",
+                rel.table.name
+            )
+        })?;
+    let cloud_properties = match &rel.table.storage {
+        TableStorage::S3ParquetFiles {
+            cloud_properties, ..
+        } => cloud_properties.clone(),
+        _ => Default::default(),
+    };
+    let synthetic_name = format!("{}__nr_meta__", rel.table.name);
+    let synthetic_table = TableDef {
+        name: synthetic_name,
+        columns: column_defs,
+        iceberg_row_lineage_metadata_columns: vec![],
+        iceberg_table: rel.table.iceberg_table.clone(),
+        storage: TableStorage::IcebergMetadataTable {
+            metadata_table_type: rel.metadata_table_type,
+            serialized_table,
+            cloud_properties,
+        },
+    };
+    Ok(LogicalPlan::Scan(ScanNode {
+        database: rel.database,
+        table: synthetic_table,
+        alias: rel.alias,
+        columns: output_columns,
+        predicates: vec![],
+        required_columns: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------

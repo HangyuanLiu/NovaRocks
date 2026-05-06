@@ -85,6 +85,13 @@ pub struct IcebergSchemaDef {
 pub struct IcebergTableInfo {
     pub location: String,
     pub schema: IcebergSchemaDef,
+    /// JSON-serialized iceberg `TableMetadata`. Required when the table
+    /// is referenced as an Iceberg metadata table (`t$snapshots`,
+    /// `t$history`, `t$refs`, `t$partitions`) — the JNI metadata-scan
+    /// bridge consumes this string to materialise the metadata rows.
+    /// `None` for tables resolved via paths that do not have access to
+    /// the iceberg `TableMetadata` (e.g. synthetic test fixtures).
+    pub serialized_metadata: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +148,22 @@ pub enum TableStorage {
     },
     S3ParquetFiles {
         files: Vec<S3FileInfo>,
+        cloud_properties: BTreeMap<String, String>,
+    },
+    /// Synthetic storage backing an Iceberg metadata-table reference
+    /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
+    /// analyzer rewrites such references into a regular `Scan` over a
+    /// synthetic `TableDef` whose storage is this variant; codegen then
+    /// emits an `HDFS_SCAN_NODE` driven by the JVM iceberg metadata
+    /// bridge instead of a real parquet scan.
+    IcebergMetadataTable {
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        /// JSON-serialized iceberg `TableMetadata`. Forwarded to the JVM
+        /// metadata bridge as the `serialized_table` argument.
+        serialized_table: String,
+        /// Cloud properties from the underlying iceberg table's storage,
+        /// used to construct the THdfsScanNode cloud_configuration so the
+        /// JVM bridge can read manifest files from object storage.
         cloud_properties: BTreeMap<String, String>,
     },
 }
@@ -206,6 +229,7 @@ mod tests {
                         }],
                     }],
                 },
+                serialized_metadata: None,
             }),
             storage: TableStorage::S3ParquetFiles {
                 files: vec![],

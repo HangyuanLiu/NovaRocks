@@ -270,9 +270,16 @@ fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats
 }
 
 fn build_iceberg_table_info(loaded: &IcebergLoadedTable) -> IcebergTableInfo {
+    // Serialise the iceberg `TableMetadata` so a subsequent metadata-table
+    // reference (`t$snapshots` etc.) can hand the JSON to the JVM scanner
+    // bridge without having to re-resolve the table at codegen time. Loss
+    // of serialisation is non-fatal for normal data scans, so we fall back
+    // to None instead of failing here.
+    let serialized_metadata = serde_json::to_string(loaded.table.metadata()).ok();
     IcebergTableInfo {
         location: loaded.table.metadata().location().to_string(),
         schema: iceberg_schema_def(loaded.table.metadata().current_schema()),
+        serialized_metadata,
     }
 }
 
@@ -326,6 +333,28 @@ fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     v3 && lineage
+}
+
+/// True iff the table can carry row-lineage metadata under the Iceberg V3
+/// spec rules: format-version >= 3 AND `write.row-lineage` is not
+/// explicitly disabled. Per the Iceberg V3 spec, row-lineage is enabled
+/// by default on V3 tables; writers may opt out with
+/// `write.row-lineage=false`.
+///
+/// This is intentionally more permissive than `is_v3_row_lineage`, which
+/// is used to gate exposure of the `_row_id` /
+/// `_last_updated_sequence_number` pseudo-columns at SQL analysis time
+/// (where the explicit opt-in property is the safer signal). OPTIMIZE
+/// preserves row-lineage whenever the writer would emit it on a fresh
+/// INSERT, which follows the V3-default semantics modelled here.
+pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bool {
+    if !matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3) {
+        return false;
+    }
+    match metadata.properties().get("write.row-lineage") {
+        Some(v) => !v.eq_ignore_ascii_case("false"),
+        None => true,
+    }
 }
 
 fn register_empty_iceberg_table(

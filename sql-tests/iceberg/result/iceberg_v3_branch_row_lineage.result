@@ -1,0 +1,15 @@
+-- query 4
+n_main_rows	n_main_unique
+3	3
+
+-- query 5
+n_main_diverged
+0
+
+-- query 6
+n_branch_rows	n_branch_unique
+3	3
+
+-- query 7
+row_id_preserved_under_branch_update
+1

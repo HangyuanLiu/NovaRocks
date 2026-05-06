@@ -3006,6 +3006,7 @@ mod tests {
                 schema: IcebergSchemaDef {
                     fields: iceberg_schema_fields,
                 },
+                serialized_metadata: None,
             }),
             storage: TableStorage::S3ParquetFiles {
                 files: vec![crate::sql::catalog::S3FileInfo {
@@ -3198,6 +3199,7 @@ mod tests {
                                 children: vec![],
                             }],
                         },
+                        serialized_metadata: None,
                     }),
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![],
@@ -3239,6 +3241,7 @@ mod tests {
                                 children: vec![],
                             }],
                         },
+                        serialized_metadata: None,
                     }),
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![
@@ -3283,6 +3286,7 @@ mod tests {
                                 children: vec![],
                             }],
                         },
+                        serialized_metadata: None,
                     }),
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![
@@ -3329,6 +3333,7 @@ mod tests {
                                 children: vec![],
                             }],
                         },
+                        serialized_metadata: None,
                     }),
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![file],
@@ -3374,6 +3379,7 @@ mod tests {
                                 children: vec![],
                             }],
                         },
+                        serialized_metadata: None,
                     }),
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![file],

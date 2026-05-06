@@ -63,6 +63,13 @@ pub struct IcebergCommitCollector {
     /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
     /// drains this channel via [`take_delete_groups`].
     delete_groups: Mutex<Vec<PositionDeleteGroup>>,
+    /// When set, signals that the engine wrote data files whose `_row_id`
+    /// values are already stamped at the reserved field IDs inside the
+    /// file (e.g. the OPTIMIZE row-lineage preserve path). The commit
+    /// action then skips fresh `next_row_id` allocation, omits the
+    /// snapshot's `row_range`, and propagates the per-file row identity
+    /// without rebasing it onto a contiguous range.
+    preserve_row_lineage: AtomicBool,
     committed: AtomicBool,
 }
 
@@ -90,8 +97,23 @@ impl IcebergCommitCollector {
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
             delete_groups: Mutex::new(Vec::new()),
+            preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
         }
+    }
+
+    /// Mark that the data files injected via [`inject_written_file`] carry
+    /// per-row `_row_id` values stamped at the reserved field IDs. The
+    /// rewrite commit-action consumes this signal to skip `next_row_id`
+    /// allocation and `row_range` emission. Idempotent.
+    pub fn mark_preserve_row_lineage(&self) {
+        self.preserve_row_lineage.store(true, Ordering::Release);
+    }
+
+    /// Returns true when [`mark_preserve_row_lineage`] was called for this
+    /// query.
+    pub fn preserve_row_lineage(&self) -> bool {
+        self.preserve_row_lineage.load(Ordering::Acquire)
     }
 
     /// Push a grouped DELETE position vector into the collector. Used by the

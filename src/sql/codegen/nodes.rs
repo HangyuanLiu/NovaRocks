@@ -73,6 +73,9 @@ fn build_hdfs_scan_node(
     let cloud_config = match &resolved.table.storage {
         TableStorage::S3ParquetFiles {
             cloud_properties, ..
+        }
+        | TableStorage::IcebergMetadataTable {
+            cloud_properties, ..
         } => Some(crate::cloud_configuration::TCloudConfiguration::new(
             None::<crate::cloud_configuration::TCloudType>,
             None::<Vec<crate::cloud_configuration::TCloudProperty>>,
@@ -80,6 +83,18 @@ fn build_hdfs_scan_node(
             None::<bool>,
         )),
         _ => None,
+    };
+
+    let (serialized_table, metadata_table_type) = match &resolved.table.storage {
+        TableStorage::IcebergMetadataTable {
+            metadata_table_type,
+            serialized_table,
+            ..
+        } => (
+            Some(serialized_table.clone()),
+            Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
+        ),
+        _ => (None, None),
     };
 
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
@@ -101,16 +116,16 @@ fn build_hdfs_scan_node(
         None::<String>,
         None::<String>,
         None::<String>,
-        Some(true), // can_use_any_column
+        Some(true), // case_sensitive
         cloud_config,
         None::<bool>,
         None::<bool>,
         None::<bool>,
         None::<types::TTupleId>,
-        None::<String>,
+        serialized_table,
         None::<String>,
         None::<bool>,
-        None::<String>,
+        metadata_table_type,
         None::<crate::data_cache::TDataCacheOptions>,
         None::<Vec<types::TSlotId>>,
         None::<bool>,
@@ -121,6 +136,23 @@ fn build_hdfs_scan_node(
     ));
 
     node
+}
+
+/// Map an `IcebergMetadataTableType` to the uppercase thrift string the
+/// downstream `IcebergMetadataTableType::parse` expects.
+fn iceberg_metadata_table_type_thrift_str(
+    ty: &crate::connector::iceberg::IcebergMetadataTableType,
+) -> &'static str {
+    use crate::connector::iceberg::IcebergMetadataTableType as T;
+    match ty {
+        T::Files => "FILES",
+        T::Manifests => "MANIFESTS",
+        T::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
+        T::Snapshots => "SNAPSHOTS",
+        T::History => "HISTORY",
+        T::Refs => "REFS",
+        T::Partitions => "PARTITIONS",
+    }
 }
 
 pub(crate) fn append_hdfs_scan_min_max_conjuncts(
@@ -520,6 +552,13 @@ pub(crate) fn build_exec_params_multi(
                         ranges.extend(build_hdfs_scan_range_params_for_file(file)?);
                     }
                     ranges
+                }
+                TableStorage::IcebergMetadataTable { .. } => {
+                    // The JVM metadata bridge produces all rows in a single
+                    // call keyed off `serialized_table`. We still need at
+                    // least one scan range so the runtime allocates a morsel
+                    // and dispatches to `IcebergMetadataScanOp`.
+                    vec![build_iceberg_metadata_scan_range_params()]
                 }
             }
         };
@@ -1041,6 +1080,68 @@ fn build_hdfs_scan_range_params(
         Some(false),
         Some(false),
     ))
+}
+
+/// Build a single placeholder scan range that drives the iceberg metadata
+/// JVM bridge. The bridge keys off `serialized_table` on the
+/// `THdfsScanNode`, so the per-range payload only needs to satisfy
+/// `lower::node::hdfs_scan` invariants: a non-empty path and the
+/// `use_iceberg_jni_metadata_reader` flag set.
+fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangeParams {
+    let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
+        None::<String>,
+        Some(0),
+        Some(0),
+        None::<i64>,
+        Some(0),
+        Some(descriptors::THdfsFileFormat::PARQUET),
+        None::<descriptors::TTextFileDesc>,
+        Some("iceberg-metadata".to_string()),
+        None::<Vec<String>>,
+        None::<bool>,
+        None::<Vec<plan_nodes::TIcebergDeleteFile>>,
+        None::<i64>,
+        None::<bool>,
+        None::<String>,
+        None::<String>,
+        None::<i64>,
+        None::<crate::data_cache::TDataCacheOptions>,
+        None::<Vec<types::TSlotId>>,
+        None::<bool>,
+        None::<BTreeMap<String, String>>,
+        None::<Vec<types::TSlotId>>,
+        Some(true),
+        Some(String::new()),
+        None::<bool>,
+        None::<String>,
+        None::<String>,
+        None::<plan_nodes::TPaimonDeletionFile>,
+        None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+        None::<descriptors::THdfsPartition>,
+        None::<types::TTableId>,
+        None::<plan_nodes::TDeletionVectorDescriptor>,
+        None::<String>,
+        None::<i64>,
+        None::<bool>,
+        None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+        None::<i32>,
+        None::<i64>,
+        None::<i64>,
+    );
+    internal_service::TScanRangeParams::new(
+        plan_nodes::TScanRange::new(
+            None::<plan_nodes::TInternalScanRange>,
+            None::<Vec<u8>>,
+            None::<plan_nodes::TBrokerScanRange>,
+            None::<plan_nodes::TEsScanRange>,
+            Some(hdfs_scan_range),
+            None::<plan_nodes::TBinlogScanRange>,
+            None::<plan_nodes::TBenchmarkScanRange>,
+        ),
+        None::<i32>,
+        Some(false),
+        Some(false),
+    )
 }
 
 // ---------------------------------------------------------------------------

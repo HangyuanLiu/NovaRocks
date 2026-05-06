@@ -1,0 +1,5 @@
+-- query 6
+name	type
+dev	BRANCH
+main	BRANCH
+v1	TAG

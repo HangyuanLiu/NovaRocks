@@ -226,7 +226,115 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_from_dual(&sql)?;
     let sql = normalize_function_syntax(&sql)?;
     let sql = rewrite_version_as_of_string(&sql)?;
+    let sql = rewrite_iceberg_metadata_suffix(&sql)?;
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Rewrite `<ident>$<metatype>` (in unquoted/non-string context) to
+/// `<ident>.__nr_meta_<metatype>__`, lowercasing `<metatype>`.
+///
+/// Iceberg's `t$snapshots` syntax cannot be lexed by sqlparser without dialect
+/// hacks. The analyzer detects the `__nr_meta_*__` last-part suffix and
+/// dispatches to `IcebergMetadataScanOp`.
+///
+/// Restricted to the four BE-supported types: snapshots, history, refs,
+/// partitions. An unrecognised type errors at normalize time.
+fn rewrite_iceberg_metadata_suffix(sql: &str) -> Result<String, String> {
+    if !sql.contains('$') {
+        return Ok(sql.to_string());
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 16);
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                in_double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if byte == b'$' && idx > 0 && is_identifier_byte(Some(bytes[idx - 1])) {
+            // Read the identifier word that follows `$`.
+            let mut end = idx + 1;
+            while end < bytes.len() && is_identifier_byte(Some(bytes[end])) {
+                end += 1;
+            }
+            if end == idx + 1 {
+                // Lone `$` not followed by an identifier — pass through.
+                output.push('$');
+                idx += 1;
+                continue;
+            }
+            let metatype_raw = &sql[idx + 1..end];
+            let metatype = metatype_raw.to_ascii_lowercase();
+            // Whitelist the four scope types.
+            match metatype.as_str() {
+                "snapshots" | "history" | "refs" | "partitions" => {}
+                other => {
+                    return Err(format!(
+                        "unsupported iceberg metadata table type: {other}; \
+                         expected one of snapshots/history/refs/partitions"
+                    ));
+                }
+            }
+            output.push('.');
+            output.push_str("__nr_meta_");
+            output.push_str(&metatype);
+            output.push_str("__");
+            idx = end;
+            continue;
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+    Ok(output)
 }
 
 /// Rewrite `FOR VERSION AS OF '<ref_name>'` → `FOR SYSTEM_TIME AS OF '__nr_ref:<ref_name>'`
@@ -1510,5 +1618,59 @@ mod tests {
         let normalized = super::normalize_for_raw_parse("SELECT 1 FROM dual WHERE 1 = 1")
             .expect("normalize should succeed");
         assert!(normalized.contains("FROM dual"));
+    }
+
+    #[test]
+    fn metadata_suffix_dollar_is_rewritten_for_known_types() {
+        let cases = [
+            (
+                "SELECT * FROM t$snapshots",
+                "SELECT * FROM t.__nr_meta_snapshots__",
+            ),
+            (
+                "SELECT * FROM db.t$history",
+                "SELECT * FROM db.t.__nr_meta_history__",
+            ),
+            (
+                "SELECT * FROM ice.db.t$refs",
+                "SELECT * FROM ice.db.t.__nr_meta_refs__",
+            ),
+            (
+                "select * from t$partitions",
+                "select * from t.__nr_meta_partitions__",
+            ),
+            // Mixed case input still routes — the rewritten metatype is lowercase.
+            (
+                "SELECT * FROM t$Snapshots",
+                "SELECT * FROM t.__nr_meta_snapshots__",
+            ),
+        ];
+        for (input, expected) in cases {
+            let got = super::normalize_for_raw_parse(input).expect("normalize");
+            assert_eq!(got, expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn metadata_suffix_unknown_type_errors() {
+        let err = super::normalize_for_raw_parse("SELECT * FROM t$foo").unwrap_err();
+        assert!(
+            err.contains("unsupported iceberg metadata table type") && err.contains("foo"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_suffix_inside_string_literal_is_left_alone() {
+        let input = "SELECT 'a$snapshots' FROM t";
+        let got = super::normalize_for_raw_parse(input).expect("normalize");
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn metadata_suffix_with_alias() {
+        let input = "SELECT * FROM t$snapshots AS s";
+        let got = super::normalize_for_raw_parse(input).expect("normalize");
+        assert_eq!(got, "SELECT * FROM t.__nr_meta_snapshots__ AS s");
     }
 }
