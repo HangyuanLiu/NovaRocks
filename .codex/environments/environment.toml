@@ -3,4 +3,7 @@ version = 1
 name = "NovaRocks"
 
 [setup]
-script = ""
+script = ".codex/environments/iceberg-rest-up.sh"
+
+[cleanup]
+script = ".codex/environments/iceberg-rest-down.sh --purge"
