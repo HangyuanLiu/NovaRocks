@@ -12,7 +12,8 @@ use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergUpdateMode, MutationSidecar, MutationSidecarFile,
-    RunInput, run_iceberg_commit, select_iceberg_update_mode,
+    RunInput, ensure_no_variant_columns_for_row_level_mutation, run_iceberg_commit,
+    select_iceberg_update_mode,
 };
 use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteBatch};
 use crate::engine::{StandaloneState, StatementResult};
@@ -99,6 +100,8 @@ pub(crate) fn execute_update_statement(
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
 
+    ensure_no_variant_columns_for_row_level_mutation(&table)
+        .map_err(|e| format!("UPDATE: {e}"))?;
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
         IcebergUpdateMode::CopyOnWrite => execute_cow_update(
@@ -1226,6 +1229,8 @@ pub(crate) fn execute_merge_statement(
     // The match SELECT is built against the v3 row-lineage target so the
     // matched-side path can reuse the UPDATE executor. Validate the v3
     // requirement up front instead of letting the executor surface it.
+    ensure_no_variant_columns_for_row_level_mutation(&table)
+        .map_err(|e| format!("MERGE INTO: {e}"))?;
     let _ = select_iceberg_update_mode(&table)?;
 
     if let Some(clause) = stmt.matched.as_ref() {
