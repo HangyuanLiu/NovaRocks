@@ -1201,6 +1201,56 @@ mod tests {
         );
         assert!(res.is_err());
     }
+
+    #[test]
+    fn apply_set_nullable_at_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("a").unwrap();
+        let new = apply_set_nullable_at(&schema, &path, false).unwrap();
+        assert!(new.as_struct().fields()[0].required);
+    }
+
+    #[test]
+    fn apply_set_nullable_at_nested() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.street").unwrap();
+        let new = apply_set_nullable_at(&schema, &path, false).unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert!(s.fields()[0].required);
+    }
+
+    #[test]
+    fn apply_set_nullable_at_identifier_field_rejects_drop_not_null() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .with_identifier_field_ids(vec![1])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("id").unwrap();
+        assert!(apply_set_nullable_at(&schema, &path, true).is_err());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1566,6 +1616,93 @@ fn modify_in_type(ty: &Type, segments: &[String], new_type: &SqlType) -> Result<
             _ => Err("map modify must target '<map>.key' or '<map>.value'".to_string()),
         },
         _ => Err("modify path descends into non-composite type".to_string()),
+    }
+}
+
+/// Rebuild `schema` with the column at `path` having its nullability flipped.
+///
+/// `nullable = false` => SET NOT NULL (`required = true`).
+/// `nullable = true` => DROP NOT NULL (`required = false`).
+/// DROP NOT NULL is rejected on identifier fields, since identifier columns must remain
+/// required by Iceberg spec.  Only top-level or STRUCT-nested fields are supported; LIST
+/// element / MAP key/value nullability cannot be toggled this way.
+#[allow(dead_code)]
+pub(crate) fn apply_set_nullable_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    nullable: bool,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    if nullable {
+        let (target_id, _) = find_field_by_path(schema, path)?;
+        if identifier_field_ids.contains(&target_id) {
+            return Err(format!(
+                "cannot DROP NOT NULL on identifier field '{}'",
+                path.dotted()
+            ));
+        }
+    }
+    let new_fields = set_nullable_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        nullable,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after set nullable: {e}"))
+}
+
+fn set_nullable_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    nullable: bool,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("set nullable path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if segments.len() == 1 {
+                updated.required = !nullable;
+            } else {
+                let new_inner = set_nullable_in_type(&f.field_type, &segments[1..], nullable)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for set nullable", head));
+    }
+    Ok(out)
+}
+
+fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = set_nullable_in_fields(
+                s.fields().iter().cloned().collect(),
+                segments,
+                nullable,
+            )?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err(
+            "SET/DROP NOT NULL only supported on top-level or STRUCT-nested fields".to_string(),
+        ),
     }
 }
 
