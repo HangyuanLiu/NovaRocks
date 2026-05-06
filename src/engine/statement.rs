@@ -1522,6 +1522,54 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
             parser.parse_data_type().map_err(|e| e.to_string())?,
         )?;
         IcebergSchemaChange::ModifyColumn { path, new_type }
+    } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::COLUMN]) {
+        let path = parse_column_path(&mut parser)?;
+        if path.is_empty() {
+            return Err("ALTER COLUMN requires a column path".to_string());
+        }
+        if parser.parse_keyword(Keyword::FIRST) {
+            IcebergSchemaChange::Reorder {
+                path,
+                position: AddPosition::First,
+            }
+        } else if parser.parse_keyword(Keyword::AFTER) {
+            let target_path = parse_column_path(&mut parser)?;
+            let last = target_path
+                .segments()
+                .last()
+                .ok_or_else(|| "AFTER target empty".to_string())?
+                .clone();
+            IcebergSchemaChange::Reorder {
+                path,
+                position: AddPosition::After(last),
+            }
+        } else if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE") {
+            parser.next_token();
+            let target_path = parse_column_path(&mut parser)?;
+            let last = target_path
+                .segments()
+                .last()
+                .ok_or_else(|| "BEFORE target empty".to_string())?
+                .clone();
+            IcebergSchemaChange::Reorder {
+                path,
+                position: AddPosition::Before(last),
+            }
+        } else if parser.parse_keywords(&[Keyword::SET, Keyword::NOT, Keyword::NULL]) {
+            IcebergSchemaChange::SetNullable {
+                path,
+                nullable: false,
+            }
+        } else if parser.parse_keywords(&[Keyword::DROP, Keyword::NOT, Keyword::NULL]) {
+            IcebergSchemaChange::SetNullable {
+                path,
+                nullable: true,
+            }
+        } else {
+            return Err(
+                "ALTER COLUMN must be followed by FIRST / AFTER / BEFORE / SET NOT NULL / DROP NOT NULL".to_string(),
+            );
+        }
     } else {
         return Err("unsupported ALTER TABLE schema evolution clause".to_string());
     };
@@ -2379,6 +2427,44 @@ mod tests {
         };
         assert_eq!(parent.dotted(), "address");
         assert_eq!(name, "zip");
+    }
+
+    #[test]
+    fn parse_alter_column_first() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c FIRST").unwrap();
+        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "c");
+        assert!(matches!(position, super::AddPosition::First));
+    }
+
+    #[test]
+    fn parse_alter_column_after_target() {
+        let stmt =
+            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c AFTER d").unwrap();
+        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "c");
+        assert!(matches!(position, super::AddPosition::After(ref s) if s == "d"));
+    }
+
+    #[test]
+    fn parse_alter_column_nested_before() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ALTER COLUMN address.street BEFORE address.city",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
+            panic!();
+        };
+        assert_eq!(path.dotted(), "address.street");
+        let super::AddPosition::Before(ref s) = position else {
+            panic!();
+        };
+        assert_eq!(s, "city");
     }
 }
 
