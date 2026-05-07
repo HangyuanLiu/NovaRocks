@@ -1091,6 +1091,18 @@ pub(crate) struct AlterIcebergSchemaStmt {
     pub(crate) change: IcebergSchemaChange,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlterIcebergPropertiesStmt {
+    pub(crate) table: ObjectName,
+    pub(crate) op: PropertiesOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PropertiesOp {
+    Set { entries: Vec<(String, String)> },
+    Unset { keys: Vec<String>, if_exists: bool },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AlterTableOptimizeStmt {
     pub(crate) table: ObjectName,
@@ -1450,6 +1462,149 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
         return parser.parse_keyword(Keyword::COLUMN);
     }
     false
+}
+
+pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    // Use peek_word_eq for both SET and UNSET so no tokens are consumed before the check.
+    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "SET")
+        && crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES")
+    {
+        return true;
+    }
+    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "UNSET")
+        && crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES")
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn parse_alter_iceberg_properties_sql(
+    sql: &str,
+) -> Result<AlterIcebergPropertiesStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE TBLPROPERTIES DDL: {e}"))?;
+
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+
+    let op = if parser.parse_keyword(Keyword::SET) {
+        if !crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
+            return Err("expected TBLPROPERTIES after SET".to_string());
+        }
+        parser.next_token(); // consume TBLPROPERTIES
+        let entries = parse_property_entries(&mut parser)?;
+        PropertiesOp::Set { entries }
+    } else if parser.parse_keyword(Keyword::UNSET) {
+        if !crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
+            return Err("expected TBLPROPERTIES after UNSET".to_string());
+        }
+        parser.next_token(); // consume TBLPROPERTIES
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let keys = parse_property_keys(&mut parser)?;
+        PropertiesOp::Unset { keys, if_exists }
+    } else {
+        return Err("expected SET or UNSET TBLPROPERTIES".to_string());
+    };
+
+    if parser.peek_token_ref().token == Token::SemiColon {
+        parser.next_token();
+    }
+    if parser.peek_token_ref().token != Token::EOF {
+        return Err(format!(
+            "unsupported trailing tokens at {}",
+            parser.peek_token_ref().token
+        ));
+    }
+    Ok(AlterIcebergPropertiesStmt { table, op })
+}
+
+fn parse_property_entries(parser: &mut Parser<'_>) -> Result<Vec<(String, String)>, String> {
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| e.to_string())?;
+    if parser.peek_token_ref().token == Token::RParen {
+        parser.next_token();
+        return Err("SET TBLPROPERTIES requires at least one key=value pair".to_string());
+    }
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    loop {
+        let key = parse_string_literal(parser)?;
+        parser.expect_token(&Token::Eq).map_err(|e| e.to_string())?;
+        let value = parse_string_literal(parser)?;
+        if !seen.insert(key.clone()) {
+            return Err(format!("duplicate key '{key}' in SET TBLPROPERTIES"));
+        }
+        entries.push((key, value));
+        if parser.consume_token(&Token::Comma) {
+            continue;
+        }
+        break;
+    }
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+fn parse_property_keys(parser: &mut Parser<'_>) -> Result<Vec<String>, String> {
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| e.to_string())?;
+    if parser.peek_token_ref().token == Token::RParen {
+        parser.next_token();
+        return Err("UNSET TBLPROPERTIES requires at least one key".to_string());
+    }
+    let mut keys = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    loop {
+        let key = parse_string_literal(parser)?;
+        if !seen.insert(key.clone()) {
+            return Err(format!("duplicate key '{key}' in UNSET TBLPROPERTIES"));
+        }
+        keys.push(key);
+        if parser.consume_token(&Token::Comma) {
+            continue;
+        }
+        break;
+    }
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| e.to_string())?;
+    Ok(keys)
+}
+
+fn parse_string_literal(parser: &mut Parser<'_>) -> Result<String, String> {
+    let tok = parser.next_token();
+    match tok.token {
+        Token::SingleQuotedString(s) => Ok(s),
+        Token::DoubleQuotedString(s) => Ok(s),
+        other => Err(format!(
+            "TBLPROPERTIES key/value must be a string literal, got `{other}`"
+        )),
+    }
 }
 
 fn parse_column_path(parser: &mut Parser<'_>) -> Result<ColumnPath, String> {
@@ -2522,6 +2677,140 @@ mod tests {
         );
         assert!(
             super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT BEFORE d")
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_alter_iceberg_properties_tests {
+    use super::{
+        AlterIcebergPropertiesStmt, PropertiesOp, looks_like_alter_iceberg_properties,
+        parse_alter_iceberg_properties_sql,
+    };
+
+    #[test]
+    fn looks_like_set_tblproperties() {
+        assert!(looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t SET TBLPROPERTIES ('k' = 'v')"
+        ));
+    }
+
+    #[test]
+    fn looks_like_unset_tblproperties() {
+        assert!(looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t UNSET TBLPROPERTIES ('k')"
+        ));
+    }
+
+    #[test]
+    fn looks_like_unset_tblproperties_if_exists() {
+        assert!(looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t UNSET TBLPROPERTIES IF EXISTS ('k')"
+        ));
+    }
+
+    #[test]
+    fn looks_like_does_not_match_alter_column() {
+        assert!(!looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t ADD COLUMN c INT"
+        ));
+        assert!(!looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t ALTER COLUMN c FIRST"
+        ));
+    }
+
+    #[test]
+    fn parse_set_one_pair() {
+        let stmt = parse_alter_iceberg_properties_sql(
+            "ALTER TABLE ice.db.t SET TBLPROPERTIES ('write.parquet.compression-codec' = 'zstd')",
+        )
+        .expect("parse");
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!()
+        };
+        assert_eq!(
+            entries,
+            vec![(
+                "write.parquet.compression-codec".to_string(),
+                "zstd".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_set_multiple_pairs() {
+        let stmt = parse_alter_iceberg_properties_sql(
+            "ALTER TABLE t SET TBLPROPERTIES ('a' = 'x', 'b' = 'y', 'c' = 'z')",
+        )
+        .expect("parse");
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!()
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], ("a".to_string(), "x".to_string()));
+        assert_eq!(entries[2], ("c".to_string(), "z".to_string()));
+    }
+
+    #[test]
+    fn parse_unset_strict() {
+        let stmt =
+            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ('a', 'b')")
+                .expect("parse");
+        let PropertiesOp::Unset { keys, if_exists } = stmt.op else {
+            panic!()
+        };
+        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+        assert!(!if_exists);
+    }
+
+    #[test]
+    fn parse_unset_if_exists() {
+        let stmt =
+            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES IF EXISTS ('a')")
+                .expect("parse");
+        let PropertiesOp::Unset { keys, if_exists } = stmt.op else {
+            panic!()
+        };
+        assert_eq!(keys, vec!["a".to_string()]);
+        assert!(if_exists);
+    }
+
+    #[test]
+    fn parse_set_empty_parens_rejected() {
+        assert!(parse_alter_iceberg_properties_sql("ALTER TABLE t SET TBLPROPERTIES ()").is_err());
+    }
+
+    #[test]
+    fn parse_unset_empty_parens_rejected() {
+        assert!(
+            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ()").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_set_duplicate_key_rejected() {
+        let res = parse_alter_iceberg_properties_sql(
+            "ALTER TABLE t SET TBLPROPERTIES ('a' = 'x', 'a' = 'y')",
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_lowercase().contains("duplicate"));
+    }
+
+    #[test]
+    fn parse_unset_duplicate_key_rejected() {
+        let res =
+            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ('a', 'a')");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_lowercase().contains("duplicate"));
+    }
+
+    #[test]
+    fn parse_unquoted_key_rejected() {
+        // Keys must be string literals, not identifiers.
+        assert!(
+            parse_alter_iceberg_properties_sql("ALTER TABLE t SET TBLPROPERTIES (foo = 'bar')")
                 .is_err()
         );
     }
