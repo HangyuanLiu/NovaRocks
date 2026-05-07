@@ -36,8 +36,9 @@ use std::sync::Arc;
 
 use iceberg::io::FileIO;
 use iceberg::spec::{
-    FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention, Summary,
+    DataFile, DataFileBuilder, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention,
+    Summary,
 };
 use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
@@ -287,6 +288,57 @@ pub(crate) fn group_manifests_by_spec_and_content(
     groups
 }
 
+/// Clone a `DataFile`, overriding `first_row_id` with the given value.
+///
+/// Copies every field from `src` via `DataFileBuilder` using only public
+/// accessor methods. `partition_spec_id` is accepted as a parameter because
+/// `DataFile::partition_spec_id` is `pub(crate)` in the vendored iceberg crate
+/// and not accessible from NovaRocks — callers must supply it (the group's
+/// `spec_id` is known at merge time).
+///
+/// Used during manifest merge to stamp an explicit per-file `first_row_id`
+/// so that the read-path invariant `df.first_row_id().or(manifest_fallback)`
+/// returns the correct original value after the merged manifest's manifest-
+/// level `first_row_id` is reassigned by the `ManifestListWriter`.
+fn clone_data_file_with_first_row_id(
+    src: &DataFile,
+    partition_spec_id: i32,
+    first_row_id: Option<i64>,
+) -> Result<DataFile, iceberg::Error> {
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(src.content_type())
+        .file_path(src.file_path().to_string())
+        .file_format(src.file_format())
+        .partition(src.partition().clone())
+        .partition_spec_id(partition_spec_id)
+        .record_count(src.record_count())
+        .file_size_in_bytes(src.file_size_in_bytes())
+        .column_sizes(src.column_sizes().clone())
+        .value_counts(src.value_counts().clone())
+        .null_value_counts(src.null_value_counts().clone())
+        .nan_value_counts(src.nan_value_counts().clone())
+        .lower_bounds(src.lower_bounds().clone())
+        .upper_bounds(src.upper_bounds().clone())
+        .key_metadata(src.key_metadata().map(|b| b.to_vec()))
+        .split_offsets(src.split_offsets().map(|s| s.to_vec()))
+        .equality_ids(src.equality_ids())
+        .first_row_id(first_row_id)
+        .referenced_data_file(src.referenced_data_file())
+        .content_offset(src.content_offset())
+        .content_size_in_bytes(src.content_size_in_bytes());
+    // sort_order_id uses setter(strip_option) — pass the bare i32 only if Some.
+    if let Some(id) = src.sort_order_id() {
+        builder.sort_order_id(id);
+    }
+    builder.build().map_err(|e| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            format!("clone_data_file_with_first_row_id: DataFileBuilder::build failed: {e}"),
+        )
+    })
+}
+
 /// Merge all entries from a group of manifest files into one new manifest.
 /// Drops DELETED entries (spec §5.2 Step 3). Sets remaining entries' status
 /// to EXISTING (round-tripping snapshot_id, sequence_number, file_sequence_number
@@ -339,6 +391,28 @@ async fn merge_manifest_group(
     // Collect all live entries from all manifests in the group.
     for manifest_file in group {
         let manifest = manifest_file.load_manifest(file_io).await?;
+
+        // For V3 row-lineage: stamp an explicit first_row_id on each data file
+        // so that the value is preserved after merge. When INSERT writes data
+        // files with first_row_id=None, the manifest-list writer assigns the
+        // manifest-level first_row_id. After merging, the new merged manifest
+        // would get a fresh manifest-level first_row_id from next_row_id(),
+        // causing _row_id values to shift. By stamping at the data-file level,
+        // the read path (read.rs:338: df.first_row_id().or(manifest fallback))
+        // uses the explicit per-file value, preserving the §5.4 invariant.
+        //
+        // manifest_file.first_row_id is a u64 (Option<u64>); convert to i64
+        // for computation. We use the source manifest's first_row_id as the
+        // base and add a cumulative offset for each entry within it.
+        //
+        // If the source manifest has first_row_id=None (V2 table, no row
+        // lineage), we leave the data_file.first_row_id unchanged (None),
+        // preserving the V2 no-op path.
+        let manifest_first_row_id: Option<i64> = manifest_file
+            .first_row_id
+            .map(|v| i64::try_from(v).expect("manifest first_row_id fits in i64"));
+        let mut cumulative_offset: i64 = 0;
+
         for entry_ref in manifest.entries() {
             let entry: &ManifestEntry = entry_ref.as_ref();
             if entry.status == ManifestStatus::Deleted {
@@ -365,7 +439,23 @@ async fn merge_manifest_group(
                 .unwrap_or(manifest_file.sequence_number);
             let file_seq = entry.file_sequence_number.or(Some(seq));
 
-            let data_file = entry.data_file.clone();
+            let orig_df = &entry.data_file;
+            let record_count = orig_df.record_count() as i64;
+
+            // Compute stamped first_row_id:
+            //  - If data_file already has an explicit first_row_id (Some), preserve it.
+            //  - If manifest has a first_row_id but data_file doesn't, stamp it:
+            //    first_row_id = manifest_first_row_id + cumulative_offset.
+            //  - If neither has a value (V2 no row-lineage), leave as None.
+            let stamped_first_row_id = match (manifest_first_row_id, orig_df.first_row_id()) {
+                (_, Some(existing)) => Some(existing), // already explicit, preserve
+                (Some(m_first), None) => Some(m_first + cumulative_offset),
+                (None, None) => None, // V2: no row lineage
+            };
+            cumulative_offset += record_count;
+
+            let data_file =
+                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id)?;
             writer
                 .add_existing_file(data_file, snap_id, seq, file_seq)
                 .map_err(|e| {
@@ -649,12 +739,14 @@ mod tests {
         // 3 manifests). Run REWRITE MANIFESTS, then verify that:
         // - The manifest entries in the new merged manifest have the same
         //   data_file.file_path() values as before.
-        // - If first_row_id was set on entries before, it is preserved after.
+        // - The effective _row_id for each file is the same before and after
+        //   REWRITE (using the read-path formula: data_file.first_row_id()
+        //   falling back to manifest-level first_row_id + cumulative offset).
         let fixture = v3_table_with_multi_batch_appends(&[1, 1, 1]).await;
         let metadata_before = fixture.table.metadata().clone();
         let file_io = fixture.table.file_io().clone();
 
-        // Collect (file_path, first_row_id) from all live manifest entries before REWRITE.
+        // Collect (file_path, effective_first_row_id) before REWRITE.
         let pre_entries = collect_live_entry_info(&metadata_before, &file_io).await;
 
         let result =
@@ -682,7 +774,7 @@ mod tests {
         let post_entries = collect_live_entry_info(metadata_after, file_io_after).await;
 
         // Every file_path that existed before must still exist after.
-        for (path, first_row_id_before) in &pre_entries {
+        for (path, effective_frid_before) in &pre_entries {
             let found = post_entries
                 .iter()
                 .find(|(p, _)| p == path)
@@ -691,11 +783,14 @@ mod tests {
                 found.is_some(),
                 "file {path} missing after REWRITE MANIFESTS"
             );
-            // first_row_id must match (None==None or Some(x)==Some(x)).
+            // The effective _row_id (data_file fallback manifest-level) must be
+            // identical before and after REWRITE. The fix stamps an explicit
+            // data_file.first_row_id, so the raw field may change (None → Some)
+            // but the read-path result must be unchanged.
             assert_eq!(
                 found.unwrap(),
-                *first_row_id_before,
-                "first_row_id mismatch for {path}: before={first_row_id_before:?}, after={found:?}"
+                *effective_frid_before,
+                "effective first_row_id mismatch for {path}: before={effective_frid_before:?}, after={found:?}"
             );
         }
         // No extra files should appear.
@@ -842,8 +937,159 @@ mod tests {
         );
     }
 
-    /// Collect (file_path, first_row_id_on_datafile) from all live manifest entries
+    // ---- M4: stamp first_row_id from manifest-level when data_file has None ----
+
+    /// Build a single-entry manifest with `data_file.first_row_id = None` but
+    /// with the manifest descriptor's `first_row_id` set to `manifest_first_row_id`.
+    ///
+    /// This replicates the INSERT path: NovaRocks writes data files with
+    /// `first_row_id = None` and relies on the `ManifestListWriter` to assign
+    /// `manifest.first_row_id` from the snapshot's `row_lineage_first_row_id`.
+    async fn write_test_manifest_none_first_row_id(
+        file_io: &FileIO,
+        metadata: &iceberg::spec::TableMetadata,
+        manifest_path: &str,
+        file_path: &str,
+        record_count: u64,
+        manifest_first_row_id: u64,
+    ) -> ManifestFile {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(file_path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(record_count)
+            .file_size_in_bytes(1024u64)
+            .first_row_id(None) // None — the common INSERT path
+            .build()
+            .expect("build data_file");
+
+        let mut mf =
+            write_test_manifest_with_data_file(file_io, metadata, manifest_path, data_file).await;
+        // Simulate what ManifestListWriter does: stamp manifest-level first_row_id.
+        mf.first_row_id = Some(manifest_first_row_id);
+        mf
+    }
+
+    /// Verifies the §5.4 invariant: after REWRITE MANIFESTS, each output
+    /// data_file carries an explicit `first_row_id` equal to the one originally
+    /// derived from the source manifest's manifest-level `first_row_id`.
+    ///
+    /// This is the real-world bug case: INSERT writes `data_file.first_row_id =
+    /// None`; the manifest list assigns manifest-level `first_row_id` = 0, 1, 2.
+    /// Before the fix, REWRITE cloned those None data files into a merged
+    /// manifest whose manifest-level `first_row_id` was reassigned to
+    /// `next_row_id()` (= 3), causing all rows to be read with _row_id ≥ 3.
+    #[tokio::test]
+    async fn merge_preserves_first_row_id_via_explicit_stamping() {
+        let fixture = empty_v3_iceberg_table().await;
+        let metadata = fixture.table.metadata().clone();
+        let file_io = fixture.table.file_io().clone();
+        let table_location = metadata.location().to_string();
+
+        // 3 manifests, each with 1 row and data_file.first_row_id = None.
+        // Manifest-level first_row_id = 0, 1, 2 (as assigned by ManifestListWriter
+        // after three successive single-row INSERTs).
+        let mf0 = write_test_manifest_none_first_row_id(
+            &file_io,
+            &metadata,
+            &format!("{table_location}/metadata/m0.avro"),
+            &format!("{table_location}/data/row0.parquet"),
+            1, // record_count
+            0, // manifest_first_row_id
+        )
+        .await;
+
+        let mf1 = write_test_manifest_none_first_row_id(
+            &file_io,
+            &metadata,
+            &format!("{table_location}/metadata/m1.avro"),
+            &format!("{table_location}/data/row1.parquet"),
+            1, // record_count
+            1, // manifest_first_row_id
+        )
+        .await;
+
+        let mf2 = write_test_manifest_none_first_row_id(
+            &file_io,
+            &metadata,
+            &format!("{table_location}/metadata/m2.avro"),
+            &format!("{table_location}/data/row2.parquet"),
+            1, // record_count
+            2, // manifest_first_row_id
+        )
+        .await;
+
+        let merged_path = format!("{table_location}/metadata/merged.avro");
+        let group = vec![mf0, mf1, mf2];
+        let merged_mf = merge_manifest_group(
+            &file_io,
+            &metadata,
+            &group,
+            &merged_path,
+            999i64,
+            iceberg::spec::FormatVersion::V3,
+        )
+        .await
+        .expect("merge_manifest_group");
+
+        let merged_manifest = merged_mf
+            .load_manifest(&file_io)
+            .await
+            .expect("load merged manifest");
+
+        let entries: Vec<_> = merged_manifest
+            .entries()
+            .iter()
+            .map(|e| {
+                let entry: &ManifestEntry = e.as_ref();
+                (
+                    entry.data_file.file_path().to_string(),
+                    entry.data_file.first_row_id(),
+                )
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 3, "merged manifest must contain all 3 entries");
+
+        // After the fix, each data_file must carry its explicit first_row_id
+        // stamped from the source manifest's first_row_id + cumulative offset.
+        // row0: manifest_first_row_id=0, cumulative_offset=0 → first_row_id=Some(0)
+        // row1: manifest_first_row_id=1, cumulative_offset=0 → first_row_id=Some(1)
+        // row2: manifest_first_row_id=2, cumulative_offset=0 → first_row_id=Some(2)
+        let first_row_ids: Vec<Option<i64>> = entries.iter().map(|(_, frid)| *frid).collect();
+        assert!(
+            first_row_ids.contains(&Some(0)),
+            "first_row_id=Some(0) (row0) must be stamped; got: {first_row_ids:?}"
+        );
+        assert!(
+            first_row_ids.contains(&Some(1)),
+            "first_row_id=Some(1) (row1) must be stamped; got: {first_row_ids:?}"
+        );
+        assert!(
+            first_row_ids.contains(&Some(2)),
+            "first_row_id=Some(2) (row2) must be stamped; got: {first_row_ids:?}"
+        );
+
+        // Verify no entry has first_row_id=None (which would expose the bug path).
+        for (path, frid) in &entries {
+            assert!(
+                frid.is_some(),
+                "data_file at {path} must have explicit first_row_id after merge (found None)"
+            );
+        }
+    }
+
+    /// Collect `(file_path, effective_first_row_id)` from all live manifest entries
     /// in the current snapshot's manifest list.
+    ///
+    /// The "effective" first_row_id mirrors what the read path (read.rs:338) computes:
+    /// `data_file.first_row_id().or(manifest_level_first_row_id)`. Before REWRITE MANIFESTS,
+    /// the data file has `first_row_id = None` and the manifest carries the assigned value.
+    /// After REWRITE MANIFESTS (with the fix), the data file has an explicit `first_row_id`.
+    /// In both cases the effective value must be the same.
     async fn collect_live_entry_info(
         metadata: &iceberg::spec::TableMetadata,
         file_io: &FileIO,
@@ -857,6 +1103,13 @@ mod tests {
             .expect("load_manifest_list");
         let mut results = Vec::new();
         for mf in manifest_list.entries() {
+            // Replicate the read-path's manifest-level first_row_id tracking.
+            // read.rs uses manifest_file.first_row_id (u64) as i64 fallback.
+            let manifest_level_frid: Option<i64> = mf
+                .first_row_id
+                .map(|v| i64::try_from(v).expect("manifest first_row_id fits i64"));
+            let mut cumulative: i64 = 0;
+
             let manifest = mf.load_manifest(file_io).await.expect("load_manifest");
             for entry_ref in manifest.entries() {
                 let entry: &ManifestEntry = entry_ref.as_ref();
@@ -864,8 +1117,13 @@ mod tests {
                     continue;
                 }
                 let path = entry.data_file.file_path().to_string();
-                let first_row_id = entry.data_file.first_row_id();
-                results.push((path, first_row_id));
+                // Effective first_row_id: data_file wins; manifest_level is fallback.
+                let effective = entry
+                    .data_file
+                    .first_row_id()
+                    .or_else(|| manifest_level_frid.map(|base| base + cumulative));
+                cumulative += entry.data_file.record_count() as i64;
+                results.push((path, effective));
             }
         }
         results

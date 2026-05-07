@@ -40,9 +40,9 @@ id	_row_id
 
 -- query 31
 id	_row_id
-10	3
-20	4
-30	5
+10	0
+20	1
+30	2
 
 -- query 40
 id	v
