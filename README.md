@@ -305,11 +305,11 @@ The standalone server supports session context such as `USE <db>`,
 `SET catalog = <catalog>`, `SET query_timeout = N`, and
 `SET group_concat_max_len = N`.
 
-## Local Iceberg REST + MinIO Environment
+## Local Iceberg REST + MinIO + Spark Environment
 
 Codex workspaces can use `.codex/environments` to start an isolated Iceberg
-REST + MinIO environment. After setup, discover the active ports and generated
-configs from the fixed entry:
+REST + MinIO + Spark environment. After setup, discover the active ports and
+generated configs from the fixed entry:
 
 ```bash
 source .codex/environments/runtime/current/env.sh
@@ -318,10 +318,14 @@ source .codex/environments/runtime/current/env.sh
 Useful generated values:
 
 - `NOVAROCKS_ICEBERG_REST_URI`
+- `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `AWS_S3_ENDPOINT`
 - `NOVAROCKS_STANDALONE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
+- `NOVAROCKS_SPARK_DEFAULTS`
+- `NOVAROCKS_SPARK_V3_SMOKE_SQL`
+- `NOVAROCKS_SPARK_SQL`
 
 Start standalone-server with the generated object-store config:
 
@@ -329,6 +333,26 @@ Start standalone-server with the generated object-store config:
 source .codex/environments/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+```
+
+Generate an Iceberg format-v3 table through Spark using the same REST Catalog
+and MinIO object store:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+.codex/environments/iceberg-rest-spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+```
+
+Spark uses the Docker-network endpoints `http://rest:8181` and
+`http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
+
+Run the cross-engine Iceberg compatibility SQL suite:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --mode verify
 ```
 
 ## SQL Regression Tests

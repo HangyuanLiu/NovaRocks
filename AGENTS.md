@@ -407,7 +407,7 @@ SQL client / SQL test runner / one-shot CLI
 ### 7.3 Codex Local Test Environment
 
 Codex workspaces use `.codex/environments/environment.toml` to start a
-workspace-scoped Iceberg REST + MinIO test environment.
+workspace-scoped Iceberg REST + MinIO + Spark test environment.
 
 Do not guess local ports such as `9000`, `8181`, or `9030`. Always discover the
 active workspace environment from the fixed generated entry:
@@ -428,11 +428,16 @@ Important generated locations:
 Important environment variables after sourcing `env.sh`:
 
 - `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
+- `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
 - `NOVAROCKS_ICEBERG_REST_URI`
+- `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `NOVAROCKS_STANDALONE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
+- `NOVAROCKS_SPARK_DEFAULTS`
+- `NOVAROCKS_SPARK_V3_SMOKE_SQL`
+- `NOVAROCKS_SPARK_SQL`
 
 If the fixed entry is missing, initialize or inspect the environment with:
 
@@ -457,6 +462,29 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
 ```
+
+Run cross-engine Iceberg compatibility tests where Spark writes through REST
+Catalog + MinIO and NovaRocks reads the table:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --mode verify
+```
+
+Generate an Iceberg format-v3 table through Spark against the same REST Catalog
+and MinIO services:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+.codex/environments/iceberg-rest-spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+```
+
+Inside the Docker network, Spark must use `http://rest:8181` for REST Catalog
+and `http://minio:9000` for object storage. NovaRocks should use the host
+endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
+SQL.
 
 Workspace cleanup uses `.codex/environments/iceberg-rest-down.sh --purge`,
 which removes the workspace-specific Docker Compose project, MinIO volume, and

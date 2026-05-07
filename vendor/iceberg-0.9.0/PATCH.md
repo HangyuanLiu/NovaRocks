@@ -178,6 +178,19 @@ Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
 
 ## Patch 6 — `PrimitiveType::Variant` + Arrow Struct mapping
 
+## Patch 7 — Lenient V3 metadata read for Spark REST tables without `next-row-id`
+
+Some Spark + Iceberg 1.8.1 REST Catalog tables can be written with
+`format-version=3` while omitting the top-level `next-row-id` field when
+row-lineage is not explicitly enabled. Upstream iceberg-rust 0.9.0 treats the
+field as required for all V3 metadata and fails deserialization before
+NovaRocks can read the table.
+
+This patch defaults a missing `next-row-id` to `INITIAL_ROW_ID` during V3
+metadata deserialization. Serialization of NovaRocks-written V3 metadata still
+emits the field, so writer behavior is unchanged. The compatibility path only
+widens read tolerance for external V3 metadata.
+
 Files: `src/spec/datatypes.rs`, `src/arrow/schema.rs`.
 
 iceberg-rust 0.9.0 has no `PrimitiveType::Variant` arm, so any
