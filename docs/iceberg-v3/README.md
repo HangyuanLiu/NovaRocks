@@ -41,7 +41,7 @@
 
 - [Row Lineage（行级身份 `_row_id` / `_last_updated_sequence_number`）](row-lineage.md)
 - [Default Value（`initial-default` / `write-default`）](default-values.md)
-- [Variant 类型](variant.md) —— 读 ✅；写 ❌
+- [Variant 类型](variant.md) —— 读 ✅；INSERT 写 ✅（PR #87）；OVERWRITE / DELETE / UPDATE / MERGE 写仍 ❌
 - [Deletion Vector（V3 DV + V2 position-delete + equality-delete）](deletion-vectors.md)
 
 ### 查询与时间旅行
@@ -72,7 +72,7 @@ NovaRocks 努力对齐 Iceberg v3 spec，但有几处**语法和 Spark 不一致
 | 主题 | NovaRocks | Spark | 说明 |
 | --- | --- | --- | --- |
 | 写指定 branch | `INSERT INTO t.branch_<x> ...` | `INSERT INTO t@<branch> ...` | NovaRocks 用 `<table>.branch_<name>` 后缀而非 `@` 限定符 |
-| Metadata table 路由 | 🚧 standalone parser 暂不支持 `t$snapshots` 形式 | `SELECT * FROM t.snapshots` 或 `t$snapshots` | BE 已实现，SQL 入口待补 |
+| Metadata table 路由 | ✅ `<tbl>$snapshots` / `$history` / `$refs` / `$partitions`（PR #85） | `SELECT * FROM t.snapshots` 或 `t$snapshots` | NovaRocks 只接受 `$` 形式（点号会与 schema/database 限定名歧义）；其余 metadata table 仍未实现 |
 | Hadoop catalog metadata 文件名 | `vN.metadata.json`（Hadoop 约定） | `vN.metadata.json` | 与 StarRocks FE 期望的 `{version}-{uuid}.metadata.json` 不一致，混用时需要转换 |
 
 ---
