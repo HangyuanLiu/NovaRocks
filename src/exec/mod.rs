@@ -24,3 +24,4 @@ pub mod row_position;
 pub mod runtime_filter;
 pub mod spill;
 pub mod variant;
+pub mod variant_encode;
