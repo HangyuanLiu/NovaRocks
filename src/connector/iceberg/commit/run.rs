@@ -93,6 +93,12 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::OverwritePartitions => {
             Box::new(super::overwrite_partitions::OverwritePartitionsCommit)
         }
+        CommitOpKind::RewriteManifests => {
+            return Err(
+                "CommitOpKind::RewriteManifests must be invoked via run_rewrite_manifests \
+                directly, not the collector dispatcher".to_string(),
+            );
+        }
     };
 
     let ctx = CommitCtx {
@@ -225,6 +231,7 @@ mod tests {
     #[test]
     fn run_dispatch_accepts_rewrite_data_files_variant() {
         let _ = CommitOpKind::RewriteDataFiles;
+        let _ = CommitOpKind::RewriteManifests;
         let _ = std::any::type_name::<crate::connector::iceberg::commit::RewriteDataFilesCommit>();
     }
 }
