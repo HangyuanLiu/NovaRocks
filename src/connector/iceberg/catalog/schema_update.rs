@@ -1778,6 +1778,133 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
     }
+
+    // ---------- Phase D: invariant tests for spec §5.5 ----------
+    //
+    // These tests assert behavior the spec §5.5 calls out as invariants of
+    // the schema-update retry path:
+    //   1. Persistent state unchanged on every failure path (by construction
+    //      with closure injection: if the closure never reaches commit, the
+    //      catalog never sees a write attempt).
+    //   2. Retry eventually succeeds after a transient concurrent commit.
+    //   3. Retry stops at MAX_ATTEMPTS with a clear "after N attempts" error.
+    //   4. Non-retryable errors short-circuit the loop.
+    //   5. Backoff durations sum to a known bound.
+
+    #[tokio::test]
+    async fn commit_failure_returns_after_three_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::PreconditionFailed,
+                    "Requirement failed: AssertCurrentSchemaIdMatch{...}",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let err = res.unwrap_err();
+        assert!(err.contains("after 3 attempts"), "actual: {err}");
+    }
+
+    #[tokio::test]
+    async fn commit_retry_eventually_succeeds_after_concurrent_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(iceberg::Error::new(
+                        iceberg::ErrorKind::PreconditionFailed,
+                        "Requirement failed: AssertCurrentSchemaIdMatch{current_schema_id=2}",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_retry_uses_correct_backoff_durations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        let attempts = AtomicUsize::new(0);
+        let start = Instant::now();
+        let _res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::PreconditionFailed,
+                    "Requirement failed: AssertCurrentSchemaIdMatch{...}",
+                ))
+            }
+        })
+        .await;
+        let elapsed = start.elapsed();
+        // Sum of the first two backoffs is 10ms + 100ms = 110ms (no sleep after
+        // the final attempt). Allow generous slop for CI scheduling.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(105),
+            "elapsed {elapsed:?} should be >= 105ms (sum of 10ms + 100ms backoffs)"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "elapsed {elapsed:?} should be < 2s (no extra trailing sleep)"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_short_circuits_the_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "connection refused",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let err = res.unwrap_err();
+        assert!(
+            !err.contains("after 3 attempts"),
+            "non-retryable error must not be reported as exhausted retries: {err}"
+        );
+        assert!(err.contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn commit_retry_attempt_index_starts_at_zero() {
+        use std::sync::Mutex;
+        let seen: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let _res: Result<(), String> = commit_with_retry(|attempt| {
+            seen.lock().unwrap().push(attempt);
+            async move {
+                if attempt < 1 {
+                    Err(iceberg::Error::new(
+                        iceberg::ErrorKind::PreconditionFailed,
+                        "Requirement failed: AssertCurrentSchemaIdMatch{...}",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+    }
 }
 
 use std::collections::{HashMap, HashSet};
