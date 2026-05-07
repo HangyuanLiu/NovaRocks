@@ -1552,6 +1552,17 @@ fn align_iceberg_array_to_field(
     row_count: usize,
     case_sensitive: bool,
 ) -> Result<ArrayRef, String> {
+    // Iceberg V3 variant: parquet stores variant as
+    // `Struct{ metadata: Binary, value: Binary }`, but NovaRocks carries
+    // variants internally as `LargeBinary` (`[size:u32 LE | metadata |
+    // value]`). When the iceberg-output schema requests `LargeBinary` for
+    // a column whose source is the variant struct, collapse it inline —
+    // arrow's generic `cast()` cannot do this conversion.
+    if matches!(target_field.data_type(), DataType::LargeBinary)
+        && is_variant_struct_data_type(source_field.data_type())
+    {
+        return collapse_variant_struct_to_largebinary(&source_array, target_field);
+    }
     match (source_field.data_type(), target_field.data_type()) {
         (DataType::Struct(source_children), DataType::Struct(target_children)) => {
             let struct_array = source_array
@@ -1828,6 +1839,62 @@ fn validate_batch_slot_count(
     }
 
     Ok(batch)
+}
+
+/// Returns `true` when `data_type` is the canonical Iceberg V3 variant
+/// physical layout: `Struct { metadata: Binary, value: Binary }`. This
+/// matches both required and nullable variants of either child Field.
+fn is_variant_struct_data_type(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    if fields.len() != 2 {
+        return false;
+    }
+    let m = &fields[0];
+    let v = &fields[1];
+    m.name() == "metadata"
+        && matches!(m.data_type(), DataType::Binary)
+        && v.name() == "value"
+        && matches!(v.data_type(), DataType::Binary)
+}
+
+/// Collapse a variant `Struct{metadata, value}` array into the NovaRocks
+/// internal `LargeBinary` form (`VariantValue::serialize`). Mirrors the
+/// per-row logic of `convert_variant_columns`, but works on a single
+/// pre-aligned column from `align_iceberg_array_to_field`.
+fn collapse_variant_struct_to_largebinary(
+    source_array: &ArrayRef,
+    target_field: &Field,
+) -> Result<ArrayRef, String> {
+    let struct_arr = source_array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            format!(
+                "expected StructArray for variant column `{}`",
+                target_field.name()
+            )
+        })?;
+    let metadata_col = struct_arr.column(0).clone();
+    let value_col = struct_arr.column(1).clone();
+    let mut builder = LargeBinaryBuilder::new();
+    for row in 0..struct_arr.len() {
+        if struct_arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let metadata = binary_value_at(&metadata_col, row);
+        let value = binary_value_at(&value_col, row);
+        let serialized = match (metadata, value) {
+            (Ok(Some(m)), Ok(Some(v))) => VariantValue::create(m, v)
+                .unwrap_or_else(|_| VariantValue::null_value())
+                .serialize(),
+            _ => VariantValue::null_value().serialize(),
+        };
+        builder.append_value(serialized.as_slice());
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 fn convert_variant_columns(

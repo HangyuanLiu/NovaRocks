@@ -79,6 +79,11 @@ pub(crate) fn execute_update_statement(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
+    // Reject variant tables before any planning. Without this guard the
+    // failure surfaces deep inside `materialize_update_matches` as a
+    // planner error about the row-lineage `__nr_t` column.
+    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("UPDATE: {e}"))?;
+
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
         let fmt = table.metadata().format_version();
@@ -100,7 +105,6 @@ pub(crate) fn execute_update_statement(
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
 
-    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("UPDATE: {e}"))?;
     let mode = select_iceberg_update_mode(&table)?;
     match mode {
         IcebergUpdateMode::CopyOnWrite => execute_cow_update(
@@ -1222,14 +1226,16 @@ pub(crate) fn execute_merge_statement(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
+    // Reject variant tables before any planning (mirrors UPDATE entry).
+    ensure_no_variant_columns_for_row_level_mutation(&table)
+        .map_err(|e| format!("MERGE INTO: {e}"))?;
+
     let target_columns = iceberg_table_columns(&table)?;
     let partition_columns = iceberg_partition_source_columns(&table)?;
 
     // The match SELECT is built against the v3 row-lineage target so the
     // matched-side path can reuse the UPDATE executor. Validate the v3
     // requirement up front instead of letting the executor surface it.
-    ensure_no_variant_columns_for_row_level_mutation(&table)
-        .map_err(|e| format!("MERGE INTO: {e}"))?;
     let _ = select_iceberg_update_mode(&table)?;
 
     if let Some(clause) = stmt.matched.as_ref() {

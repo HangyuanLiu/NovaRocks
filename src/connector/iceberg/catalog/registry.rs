@@ -627,12 +627,25 @@ pub(crate) fn load_table(
             let nested = iceberg_schema
                 .field_by_name(field.name())
                 .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
+            // Variant columns surface as Struct{metadata, value} in the
+            // iceberg arrow schema (PATCH 6), but NovaRocks carries variants
+            // internally as LargeBinary `[size:u32 LE | metadata | value]`.
+            // The data_writer's transform_variant_columns_for_write splits
+            // the LargeBinary into the Struct shape right before
+            // ParquetWriter::write, so we expose LargeBinary at the
+            // ColumnDef level for INSERT-side literal building.
+            let is_variant = matches!(
+                nested.field_type.as_ref(),
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant)
+            );
+            let data_type = if is_variant {
+                DataType::LargeBinary
+            } else {
+                apply_logical_type_override(field.data_type(), logical_types.get(&field_name))
+            };
             Ok(ColumnDef {
                 name: field.name().clone(),
-                data_type: apply_logical_type_override(
-                    field.data_type(),
-                    logical_types.get(&field_name),
-                ),
+                data_type,
                 nullable: field.is_nullable(),
                 write_default: nested.write_default.clone(),
             })
@@ -1876,6 +1889,29 @@ fn build_literal_array(
                 values,
                 nulls,
             )))
+        }
+        DataType::LargeBinary => {
+            // Variant columns: the literal extractor (`parse_json` arm in
+            // `engine/sql_expr.rs::sqlparser_function_to_literal`) packs the
+            // [size:u32 LE | metadata | value] payload as a Latin-1 String.
+            // We unpack via the same convention `to_binary` uses.
+            use arrow::array::LargeBinaryBuilder;
+            let mut builder = LargeBinaryBuilder::new();
+            for literal in values {
+                match literal {
+                    Literal::Null => builder.append_null(),
+                    Literal::String(value) => builder.append_value(
+                        crate::engine::sql_expr::latin1_string_to_bytes(value)?,
+                    ),
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for VARIANT column",
+                            other
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         other => Err(format!(
             "standalone iceberg insert does not support column type {:?}",
