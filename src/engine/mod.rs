@@ -26,6 +26,7 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod generate_series;
+pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
@@ -491,16 +492,27 @@ impl StandaloneSession {
                     looks_like_create_materialized_view, looks_like_drop_materialized_view,
                     looks_like_refresh_materialized_view, looks_like_show_materialized_views,
                 };
+                use crate::sql::parser::dialect::truncate::looks_like_truncate_table;
                 if looks_like_create_materialized_view(peek_parser)
                     || looks_like_drop_materialized_view(peek_parser)
                     || looks_like_refresh_materialized_view(peek_parser)
                     || looks_like_show_materialized_views(peek_parser)
+                    // TRUNCATE TABLE: propagate our parser's reject errors
+                    // (PARTITION/WHERE not supported, tag refs read-only)
+                    // instead of falling through to sqlparser-rs's permissive
+                    // builtin which would silently accept and bypass our checks.
+                    || looks_like_truncate_table(peek_parser)
                 {
                     let mut statements = crate::sql::parser::parse_sql(&normalized)?;
                     let statement = statements
                         .pop()
                         .ok_or_else(|| "custom parser returned no statements".to_string())?;
-                    return dispatch_statement(&self.inner, current_database, statement);
+                    return dispatch_statement(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        statement,
+                    );
                 }
             }
         }
@@ -508,7 +520,7 @@ impl StandaloneSession {
             let statement = statements
                 .pop()
                 .ok_or_else(|| "custom parser returned no statements".to_string())?;
-            return dispatch_statement(&self.inner, current_database, statement);
+            return dispatch_statement(&self.inner, current_catalog, current_database, statement);
         }
         let (parse_sql, forced_explain_level) =
             if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
@@ -799,7 +811,13 @@ impl StandaloneSession {
                     let table_name = crate::sql::parser::dialect::convert_object_name(
                         truncate_table.name.clone(),
                     )?;
-                    execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
+                    execute_truncate_table_statement(
+                        &self.inner,
+                        &table_name,
+                        "main",
+                        current_catalog,
+                        current_database,
+                    )?;
                 }
                 Ok(StatementResult::Ok)
             }
@@ -1078,7 +1096,7 @@ impl StandaloneSession {
             &insert_stmt.table,
             &insert_stmt.columns,
             &insert_stmt.source,
-            insert_stmt.overwrite,
+            insert_stmt.overwrite_mode,
             current_catalog,
             current_database,
         )
@@ -1206,10 +1224,12 @@ fn iceberg_optimize_state_name(
 
 pub(crate) mod delete_flow;
 pub(crate) mod equality_delete_flow;
+pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
 ) -> Result<StatementResult, String> {
@@ -1228,6 +1248,15 @@ pub(crate) fn dispatch_statement(
         Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
         Statement::AlterIcebergRef(stmt) => {
             crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
+        }
+        Statement::Truncate { name, target_ref } => {
+            crate::engine::statement::execute_truncate_table_statement(
+                state,
+                &name,
+                &target_ref,
+                current_catalog,
+                current_database,
+            )
         }
     }
 }
@@ -4062,6 +4091,7 @@ enable_path_style_access = true
         register_connector_backends(&state);
         let err = dispatch_statement(
             &state,
+            None,
             "analytics",
             crate::sql::parser::ast::Statement::RefreshMaterializedView(
                 crate::sql::parser::ast::RefreshMaterializedViewStmt {

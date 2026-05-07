@@ -4,6 +4,7 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::engine::catalog::normalize_identifier;
+use crate::sql::analyzer::iceberg_ref::split_ref_suffix;
 use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
     SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
@@ -35,15 +36,21 @@ pub(crate) fn parse_create_table_statement(
         .map_err(|e| e.to_string())?;
 
     // IF NOT EXISTS
-    let _if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
     let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
 
-    // Parse column definitions
-    parser
-        .expect_token(&Token::LParen)
-        .map_err(|e| e.to_string())?;
-    let columns = parse_column_definitions(parser)?;
+    // Parse optional column definitions.
+    // CTAS (`CREATE TABLE ... AS SELECT`) omits the column list entirely;
+    // schema is inferred from the SELECT output at engine time.
+    let columns = if parser.peek_token_ref().token == Token::LParen {
+        parser
+            .expect_token(&Token::LParen)
+            .map_err(|e| e.to_string())?;
+        parse_column_definitions(parser)?
+    } else {
+        Vec::new()
+    };
 
     // Parse trailing clauses: ENGINE, KEY type, COMMENT, PARTITION, DISTRIBUTED, ORDER BY, PROPERTIES
     let mut _engine = None;
@@ -52,6 +59,7 @@ pub(crate) fn parse_create_table_statement(
     let mut partition_fields = Vec::new();
     let mut parsed_iceberg_partition_clause = false;
     let mut properties = Vec::new();
+    let mut as_select: Option<Box<sqlparser::ast::Query>> = None;
 
     // Consume all remaining clauses until EOF or semicolon
     loop {
@@ -105,6 +113,11 @@ pub(crate) fn parse_create_table_statement(
         {
             parser.next_token(); // PROPERTIES / TBLPROPERTIES
             properties = parse_kv_properties_vec(parser)?;
+        } else if parser.parse_keyword(Keyword::AS) {
+            // CTAS: `AS <select>` must be the final clause; nothing follows.
+            let query = parser.parse_query().map_err(|e| format!("CTAS: {e}"))?;
+            as_select = Some(query);
+            break;
         } else {
             if parsed_iceberg_partition_clause {
                 return Err(format!(
@@ -121,6 +134,35 @@ pub(crate) fn parse_create_table_statement(
         ensure_partitioned_create_table_end(parser)?;
     }
 
+    // Parse-time CTAS rejections — checked after the clause loop so all
+    // properties and column lists are fully populated before validation.
+    if as_select.is_some() {
+        // Reject branch/tag suffix in the target table name.
+        if let (_, Some(_)) = split_ref_suffix(&name.parts) {
+            return Err("CTAS does not support branch target".to_string());
+        }
+
+        // Reject explicit column list — CTAS infers schema from SELECT output.
+        if !columns.is_empty() {
+            return Err("CTAS with explicit column definitions is not supported; \
+                 use CREATE TABLE then INSERT instead"
+                .to_string());
+        }
+
+        // Validate TBLPROPERTIES constraints.
+        for (k, v) in &properties {
+            if k.eq_ignore_ascii_case("format-version") && v != "3" {
+                return Err(format!("CTAS only supports format-version=3, got '{v}'"));
+            }
+            if (k.eq_ignore_ascii_case("row-lineage")
+                || k.eq_ignore_ascii_case("write.row-lineage"))
+                && !v.eq_ignore_ascii_case("true")
+            {
+                return Err(format!("CTAS requires row-lineage=true, got '{v}'"));
+            }
+        }
+    }
+
     let kind = CreateTableKind::Iceberg {
         columns,
         key_desc,
@@ -129,7 +171,12 @@ pub(crate) fn parse_create_table_statement(
         properties,
     };
 
-    Ok(CreateTableStmt { name, kind })
+    Ok(CreateTableStmt {
+        name,
+        kind,
+        as_select,
+        if_not_exists,
+    })
 }
 
 fn is_legacy_partition_clause(parser: &Parser<'_>) -> bool {
@@ -161,6 +208,7 @@ fn ensure_partition_clause_boundary(parser: &mut Parser<'_>) -> Result<(), Strin
         || peek_word_eq(parser, 0, "ORDER")
         || peek_word_eq(parser, 0, "PROPERTIES")
         || peek_word_eq(parser, 0, "TBLPROPERTIES")
+        || peek_word_eq(parser, 0, "AS")
     {
         return Ok(());
     }
@@ -813,8 +861,16 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use super::parse_create_table_statement;
-    use crate::sql::parser::ast::{CreateTableKind, IcebergPartitionFieldExpr};
+    use crate::sql::parser::ast::{CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr};
     use crate::sql::parser::dialect::StarRocksDialect;
+
+    /// Parse a single `CREATE TABLE` statement from `sql` and return the result.
+    fn parse_create_table_one(sql: &str) -> Result<CreateTableStmt, String> {
+        let mut parser = Parser::new(&StarRocksDialect)
+            .try_with_sql(sql)
+            .map_err(|e| e.to_string())?;
+        parse_create_table_statement(&mut parser)
+    }
 
     #[test]
     fn parse_create_table_accepts_map_and_struct_columns() {
@@ -1182,5 +1238,97 @@ mod tests {
             .expect("build parser");
         let err = parse_create_table_statement(&mut parser).expect_err("duplicate DEFAULT");
         assert!(err.contains("duplicate DEFAULT"), "unexpected error: {err}");
+    }
+
+    // ----- CTAS tests -----
+
+    #[test]
+    fn parse_create_table_as_select_basic() {
+        let stmt = parse_create_table_one("CREATE TABLE t AS SELECT 1 AS x, 'a' AS y").unwrap();
+        assert!(stmt.as_select.is_some());
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert!(
+            columns.is_empty(),
+            "CTAS infers schema from SELECT, no explicit columns"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_as_select_if_not_exists() {
+        let stmt = parse_create_table_one("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x").unwrap();
+        assert!(stmt.as_select.is_some());
+    }
+
+    #[test]
+    fn parse_create_table_as_select_with_partitioned_by_and_properties() {
+        let stmt = parse_create_table_one(
+            "CREATE TABLE t PARTITION BY (region) TBLPROPERTIES('format-version'='3') AS SELECT 1 AS region",
+        )
+        .unwrap();
+        assert!(stmt.as_select.is_some());
+        let CreateTableKind::Iceberg {
+            partition_fields,
+            properties,
+            ..
+        } = stmt.kind;
+        assert_eq!(partition_fields.len(), 1);
+        assert!(
+            properties
+                .iter()
+                .any(|(k, v)| k == "format-version" && v == "3"),
+            "expected format-version=3 in properties"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_as_select_branch_rejected() {
+        let err = parse_create_table_one("CREATE TABLE t.branch_dev AS SELECT 1 AS x").unwrap_err();
+        assert!(
+            err.to_lowercase().contains("branch"),
+            "expected branch rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_as_select_format_version_2_rejected() {
+        let err = parse_create_table_one(
+            "CREATE TABLE t TBLPROPERTIES('format-version'='2') AS SELECT 1 AS x",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("format-version"),
+            "expected format-version rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_as_select_row_lineage_false_rejected() {
+        let err = parse_create_table_one(
+            "CREATE TABLE t TBLPROPERTIES('write.row-lineage'='false') AS SELECT 1 AS x",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("row-lineage"),
+            "expected row-lineage rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_as_select_with_explicit_columns_rejected() {
+        let err =
+            parse_create_table_one("CREATE TABLE t (id INT, name VARCHAR(32)) AS SELECT 1, 'a'")
+                .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("column"),
+            "expected explicit-column rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_create_table_without_as_select_unchanged() {
+        let stmt = parse_create_table_one("CREATE TABLE t (id INT) ENGINE=ICEBERG").unwrap();
+        assert!(stmt.as_select.is_none());
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert_eq!(columns.len(), 1);
     }
 }

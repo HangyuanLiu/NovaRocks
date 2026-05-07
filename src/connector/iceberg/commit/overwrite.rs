@@ -321,10 +321,48 @@ impl TransactionAction for OverwriteTxnAction {
 /// each live entry's `(DataFile, sequence_number, file_sequence_number)`. The
 /// sequence numbers are needed verbatim by `add_delete_file` to faithfully
 /// preserve the original commit identity.
+///
+/// INSERT OVERWRITE intentionally preserves delete manifests (they keep
+/// applying against any rows preserved from the base table), so this walker
+/// skips manifests with content type `Deletes`.
 pub(super) async fn enumerate_live_data_files(
     table: &Table,
     file_io: &FileIO,
 ) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+    enumerate_live_files_filtered(table, file_io, |entry| {
+        entry.content == ManifestContentType::Data
+    })
+    .await
+}
+
+/// Walk every manifest in the base snapshot's manifest list (Data and
+/// Deletes alike) and collect every live entry's
+/// `(DataFile, sequence_number, file_sequence_number)`.
+///
+/// Distinct from `enumerate_live_data_files` which skips delete manifests:
+/// `TRUNCATE TABLE` must mark every live entry — data files,
+/// position-delete files, equality-delete files, and Iceberg v3 deletion
+/// vectors — as DELETED in the new snapshot, so this walker accepts both
+/// `ManifestContentType::Data` and `ManifestContentType::Deletes`.
+pub(super) async fn enumerate_live_all_files(
+    table: &Table,
+    file_io: &FileIO,
+) -> Result<Vec<(DataFile, i64, Option<i64>)>, String> {
+    enumerate_live_files_filtered(table, file_io, |_entry| true).await
+}
+
+/// Shared body for `enumerate_live_data_files` and `enumerate_live_all_files`.
+/// Walks the base snapshot's manifest list, applying `manifest_filter` to
+/// each manifest entry — only manifests for which the filter returns `true`
+/// are loaded and inspected.
+async fn enumerate_live_files_filtered<F>(
+    table: &Table,
+    file_io: &FileIO,
+    manifest_filter: F,
+) -> Result<Vec<(DataFile, i64, Option<i64>)>, String>
+where
+    F: Fn(&ManifestFile) -> bool,
+{
     let m = table.metadata();
     let snap = match m.current_snapshot() {
         Some(s) => s,
@@ -341,7 +379,7 @@ pub(super) async fn enumerate_live_data_files(
 
     let mut out = Vec::new();
     for entry in list.entries() {
-        if entry.content != ManifestContentType::Data {
+        if !manifest_filter(entry) {
             continue;
         }
         let manifest = entry
@@ -399,6 +437,55 @@ pub(super) async fn write_overwrite_deletes_manifest(
         .await
         .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
     debug_assert_eq!(manifest_file.content, ManifestContentType::Data);
+    Ok(manifest_file)
+}
+
+/// Sibling of `write_overwrite_deletes_manifest` used by `TruncateCommit` for
+/// the delete-content (position-delete / equality-delete / Iceberg v3 deletion
+/// vector) entries. The existing helper above is hard-wired to
+/// `build_v*_data()` so adding a `DataFile` whose `content_type()` is
+/// `PositionDeletes` or `EqualityDeletes` would be rejected by
+/// `ManifestWriter::check_data_file` (which insists every entry in a Data
+/// manifest has `DataContentType::Data`). A separate helper that picks
+/// `build_v*_deletes()` is the cleanest fix; mirroring the existing function
+/// otherwise keeps the diff minimal and the behaviour parallel.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_truncate_deletes_manifest(
+    file_io: &FileIO,
+    out_path: &str,
+    existing: &[(DataFile, i64, Option<i64>)],
+    partition_spec: PartitionSpecRef,
+    schema: SchemaRef,
+    new_snapshot_id: i64,
+    format_version: FormatVersion,
+) -> Result<ManifestFile, String> {
+    let output_file = file_io
+        .new_output(out_path)
+        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
+    let builder = ManifestWriterBuilder::new(
+        output_file,
+        Some(new_snapshot_id),
+        None,
+        schema,
+        (*partition_spec).clone(),
+    );
+    let mut writer = match format_version {
+        FormatVersion::V2 => builder.build_v2_deletes(),
+        FormatVersion::V3 => builder.build_v3_deletes(),
+        FormatVersion::V1 => {
+            return Err("phase 1 does not support V1 tables".to_string());
+        }
+    };
+    for (df, seq, file_seq) in existing {
+        writer
+            .add_delete_file(df.clone(), *seq, *file_seq)
+            .map_err(|e| format!("ManifestWriter::add_delete_file failed: {e}"))?;
+    }
+    let manifest_file = writer
+        .write_manifest_file()
+        .await
+        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
+    debug_assert_eq!(manifest_file.content, ManifestContentType::Deletes);
     Ok(manifest_file)
 }
 
@@ -520,4 +607,74 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
 #[allow(dead_code)]
 fn _check_status_variant_referenced() {
     let _ = ManifestStatus::Deleted;
+}
+
+#[cfg(test)]
+mod enumerate_tests {
+    //! Smoke tests for the manifest-list enumeration helpers. Only the
+    //! empty-snapshot path is exercised here; the mixed-content-type
+    //! assertion (Data + position-delete + equality-delete + DV) is
+    //! covered end-to-end by the SQL regression suite (Task 8 of the
+    //! TRUNCATE plan), where a real iceberg backend produces all four
+    //! content types.
+    use super::*;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+    use iceberg::table::Table;
+    use iceberg::{NamespaceIdent, TableIdent};
+    use std::collections::HashMap;
+
+    fn build_empty_table() -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let file_io = FileIO::new_with_memory();
+        let ident = TableIdent::new(NamespaceIdent::new("db".to_string()), "table".to_string());
+        Table::builder()
+            .file_io(file_io)
+            .metadata(metadata)
+            .identifier(ident)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn enumerate_live_all_files_returns_empty_when_no_snapshot() {
+        let table = build_empty_table();
+        let file_io = table.file_io().clone();
+        let out = enumerate_live_all_files(&table, &file_io)
+            .await
+            .expect("enumerate_live_all_files succeeds on empty table");
+        assert!(out.is_empty(), "expected no entries, got {}", out.len());
+    }
+
+    #[tokio::test]
+    async fn enumerate_live_data_files_returns_empty_when_no_snapshot() {
+        let table = build_empty_table();
+        let file_io = table.file_io().clone();
+        let out = enumerate_live_data_files(&table, &file_io)
+            .await
+            .expect("enumerate_live_data_files succeeds on empty table");
+        assert!(out.is_empty(), "expected no entries, got {}", out.len());
+    }
 }

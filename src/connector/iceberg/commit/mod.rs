@@ -30,6 +30,7 @@ mod equality_delete_writer;
 mod fast_append;
 mod helpers;
 mod overwrite;
+mod overwrite_partitions;
 mod position_delete_writer;
 mod puffin_dv;
 mod ref_action;
@@ -37,6 +38,9 @@ mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
+#[cfg(test)]
+mod test_helpers;
+mod truncate;
 mod types;
 mod update_cow;
 mod validation;
@@ -47,6 +51,7 @@ pub use collector::IcebergCommitCollector;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub use overwrite::OverwriteCommit;
+pub use overwrite_partitions::OverwritePartitionsCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
@@ -58,6 +63,7 @@ pub(crate) use rewrite_data_files::count_current_live_files;
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub use truncate::TruncateCommit;
 pub use types::{
     CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,
     MutationSidecar, MutationSidecarFile, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE,

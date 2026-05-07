@@ -226,11 +226,40 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
     } else {
         convert_set_expr_to_insert_source(source_query.body.as_ref())?
     };
+    use crate::sql::parser::ast::OverwriteMode;
+    // The normaliser may have prepended the magic marker `__nr_op_dyn` as the
+    // first name segment when it detected `INSERT OVERWRITE PARTITIONS`. Peel
+    // that marker here and record the corresponding overwrite mode.
+    //
+    // `__nr_op_dyn` is a NovaRocks reserved identifier; it should never appear
+    // as a real table-name segment in user SQL.
+    let (table, overwrite_mode) = if !table.parts.is_empty() && table.parts[0] == "__nr_op_dyn" {
+        if !insert.overwrite {
+            // Defensive: the marker must only appear when sqlparser parsed an
+            // OVERWRITE statement.  A mismatch indicates a normaliser bug.
+            return Err(
+                "internal: __nr_op_dyn marker present without INSERT OVERWRITE \
+                 (parser/normalizer mismatch)"
+                    .to_string(),
+            );
+        }
+        let stripped = crate::sql::parser::ast::ObjectName {
+            parts: table.parts.into_iter().skip(1).collect(),
+        };
+        (stripped, OverwriteMode::DynamicPartitions)
+    } else {
+        let mode = if insert.overwrite {
+            OverwriteMode::FullTable
+        } else {
+            OverwriteMode::None
+        };
+        (table, mode)
+    };
     Ok(crate::sql::parser::ast::InsertStmt {
         table,
         columns,
         source,
-        overwrite: insert.overwrite,
+        overwrite_mode,
     })
 }
 
@@ -843,6 +872,18 @@ pub(crate) fn execute_create_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    // CTAS dispatch: when the statement carries an AS SELECT clause, the
+    // schema/partition/properties/data flow is governed by iceberg_ctas. The
+    // parser already rejected non-iceberg-compatible CTAS forms (branch
+    // target / format-version=2 / explicit columns / etc.).
+    if stmt.as_select.is_some() {
+        return crate::engine::iceberg_ctas::execute_iceberg_ctas(
+            state,
+            stmt,
+            current_catalog,
+            current_database,
+        );
+    }
     match stmt.kind {
         CreateTableKind::Iceberg {
             columns,
@@ -1037,21 +1078,50 @@ fn drop_local_catalog_table(
 pub(crate) fn execute_truncate_table_statement(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
+    target_ref: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
-    if state
-        .managed_lake
-        .read()
-        .expect("standalone managed lake read lock")
-        .contains_table(&resolved.database, &resolved.table)?
+    if current_catalog.is_none()
+        && state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock")
+            .contains_table(&resolved.database, &resolved.table)?
     {
+        if target_ref != "main" {
+            return Err(format!(
+                "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
+            ));
+        }
         return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
     }
-    Err(format!(
-        "TRUNCATE TABLE only supports managed-lake tables: {}.{}",
-        resolved.database, resolved.table
-    ))
+
+    // Fall through to iceberg backend resolution.
+    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        state,
+        name,
+        current_catalog,
+        current_database,
+    )?;
+    if target.backend_name != "iceberg" {
+        return Err(format!(
+            "TRUNCATE TABLE only supports managed-lake or iceberg tables: {}.{}",
+            resolved.database, resolved.table
+        ));
+    }
+    let catalog = {
+        let reg = state.connectors.read().expect("connector registry read");
+        reg.catalog_backend(target.backend_name)?
+    };
+    let resolved_table = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+    crate::engine::iceberg_truncate::execute_iceberg_truncate_table(
+        state,
+        &target,
+        &resolved_table,
+        target_ref,
+    )
 }
 
 pub(crate) fn execute_insert_statement(
@@ -1059,7 +1129,7 @@ pub(crate) fn execute_insert_statement(
     name: &ObjectName,
     columns: &[String],
     source: &InsertSource,
-    overwrite: bool,
+    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
@@ -1068,7 +1138,7 @@ pub(crate) fn execute_insert_statement(
         name,
         columns,
         source,
-        overwrite,
+        overwrite_mode,
         current_catalog,
         current_database,
     )
@@ -2866,5 +2936,65 @@ mod column_path_tests {
         let _ = AddPosition::First;
         let _ = AddPosition::After("col_a".to_string());
         let _ = AddPosition::Before("col_b".to_string());
+    }
+}
+
+#[cfg(test)]
+mod insert_overwrite_partitions_parser_tests {
+    // ----- INSERT OVERWRITE PARTITIONS parser tests -----
+
+    /// Normalize + parse + convert an INSERT statement through the full pipeline.
+    fn parse_insert_overwrite(sql: &str) -> crate::sql::parser::ast::InsertStmt {
+        use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
+        let normalized = normalize_for_raw_parse(sql).expect("normalize");
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&StarRocksDialect, &normalized).expect("parse");
+        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
+            panic!("expected INSERT statement; got {:?}", statements[0]);
+        };
+        super::convert_sqlparser_insert_to_custom(insert).expect("convert")
+    }
+
+    #[test]
+    fn parse_insert_overwrite_partitions_table() {
+        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS TABLE t SELECT * FROM s");
+        assert_eq!(
+            stmt.overwrite_mode,
+            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
+        );
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_insert_overwrite_partitions_no_table_keyword() {
+        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS t VALUES (1)");
+        assert_eq!(
+            stmt.overwrite_mode,
+            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
+        );
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_insert_overwrite_table_remains_full_table() {
+        let stmt = parse_insert_overwrite("INSERT OVERWRITE TABLE t SELECT * FROM s");
+        assert_eq!(
+            stmt.overwrite_mode,
+            crate::sql::parser::ast::OverwriteMode::FullTable
+        );
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_insert_overwrite_partitions_with_branch() {
+        // Branch resolution happens later in run_insert via split_ref_suffix;
+        // here we just verify the overwrite mode and that the branch segment
+        // is preserved in the table name.
+        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)");
+        assert_eq!(
+            stmt.overwrite_mode,
+            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
+        );
+        assert_eq!(stmt.table.parts, vec!["t", "branch_dev"]);
     }
 }

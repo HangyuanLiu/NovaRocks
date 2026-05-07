@@ -41,6 +41,7 @@ use super::overwrite::OverwriteCommit;
 use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
+use super::truncate::TruncateCommit;
 use super::types::{CommitOpKind, CommitOutcome, MutationSidecar};
 use super::update_cow::CowUpdateCommit;
 
@@ -88,6 +89,10 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
             sidecar: cow_update_sidecar
                 .ok_or_else(|| "CowUpdate commit requires a mutation sidecar".to_string())?,
         }),
+        CommitOpKind::Truncate => Box::new(TruncateCommit),
+        CommitOpKind::OverwritePartitions => {
+            Box::new(super::overwrite_partitions::OverwritePartitionsCommit)
+        }
     };
 
     let ctx = CommitCtx {

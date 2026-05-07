@@ -1,0 +1,29 @@
+-- query 4
+id	uname
+1	ALICE
+2	BOB
+3	CHARLIE
+
+-- query 6
+region	n
+eu	1
+us	2
+
+-- query 8
+n
+3
+
+-- query 10
+n
+3
+
+-- query 12
+n
+3
+
+-- query 14
+id	uname
+1	ALICE
+2	BOB
+3	CHARLIE
+99	late

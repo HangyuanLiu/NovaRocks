@@ -55,10 +55,14 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &InsertSource,
-    overwrite: bool,
+    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
+    use crate::sql::parser::ast::OverwriteMode;
     debug_assert_eq!(target.backend_name, "iceberg");
+
+    let overwrite_full_table = matches!(overwrite_mode, OverwriteMode::FullTable);
+    let overwrite_partitions = matches!(overwrite_mode, OverwriteMode::DynamicPartitions);
 
     // Reject UNION ALL and generate_series on this path; caller enforces this
     // for branch writes, and OVERWRITE with these sources is never valid.
@@ -95,11 +99,26 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
 
     // 2. Pre-lowering validators.
     let _write_mode = ensure_iceberg_write_supported(&table)?;
-    if overwrite {
+    if overwrite_full_table {
         ensure_no_variant_columns_for_row_level_mutation(&table)
             .map_err(|e| format!("INSERT OVERWRITE: {e}"))?;
         ensure_overwrite_single_partition_spec(&table)?;
         ensure_no_equality_deletes(&table)?;
+    }
+    if overwrite_partitions {
+        // OVERWRITE PARTITIONS shares the variant-write restriction with
+        // full-table OVERWRITE (#87 spec). Then check the partition-table
+        // requirement; v3 row-lineage + cross-historical-spec checks happen
+        // in OverwritePartitionsCommit.
+        ensure_no_variant_columns_for_row_level_mutation(&table)
+            .map_err(|e| format!("INSERT OVERWRITE PARTITIONS: {e}"))?;
+        if table.metadata().default_partition_spec().is_unpartitioned() {
+            return Err(format!(
+                "INSERT OVERWRITE PARTITIONS requires a partitioned table; \
+                 table {} is unpartitioned (use OVERWRITE without PARTITIONS)",
+                target_string(target),
+            ));
+        }
     }
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
@@ -164,10 +183,10 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         uuid::Uuid::new_v4()
     );
     let collector = Arc::new(IcebergCommitCollector::new(
-        if overwrite {
-            CommitOpKind::Overwrite
-        } else {
-            CommitOpKind::FastAppend
+        match overwrite_mode {
+            OverwriteMode::DynamicPartitions => CommitOpKind::OverwritePartitions,
+            OverwriteMode::FullTable => CommitOpKind::Overwrite,
+            OverwriteMode::None => CommitOpKind::FastAppend,
         },
         table_ident,
         metadata.current_snapshot().map(|s| s.snapshot_id()),
@@ -315,6 +334,55 @@ pub(crate) fn run_select_to_chunks(
         )?
     };
     query_result_to_chunks(result)
+}
+
+/// Like [`run_select_to_chunks`], but also returns the output schema columns
+/// from the query plan. The schema is always populated even when the SELECT
+/// produces zero rows — callers that need the column types for schema inference
+/// (e.g. CTAS) should use this instead of `run_select_to_chunks`.
+pub(crate) fn run_select_to_chunks_and_schema(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    query: &sqlparser::ast::Query,
+) -> Result<
+    (
+        Vec<Chunk>,
+        Vec<crate::runtime::query_result::QueryResultColumn>,
+    ),
+    String,
+> {
+    // CTAS context: SELECT may reference iceberg tables (1-part or 2-part
+    // names) that need registration into the standalone in-memory catalog
+    // before planning. resolve_table_target dispatches between iceberg and
+    // managed-lake based on whether current_catalog is supplied: passing
+    // Some(target.catalog) routes the unqualified refs to iceberg, mirroring
+    // the standalone server's SELECT path (engine/mod.rs:611).
+    let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
+        Some(target.catalog.as_str())
+    } else {
+        None
+    };
+    crate::engine::query_prep::refresh_external_tables_for_query(
+        state,
+        current_catalog,
+        &target.namespace,
+        query,
+    )?;
+    let mut rewritten = query.clone();
+    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
+    let result = {
+        let in_mem = state.catalog.read().expect("standalone catalog read lock");
+        crate::engine::execute_query(
+            &rewritten,
+            &in_mem,
+            &target.namespace,
+            state.exchange_port,
+            None,
+        )?
+    };
+    let schema_cols = result.columns.clone();
+    let chunks = query_result_to_chunks(result)?;
+    Ok((chunks, schema_cols))
 }
 
 pub(crate) struct AbortCleanupOperator {

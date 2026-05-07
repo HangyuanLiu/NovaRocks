@@ -18,6 +18,14 @@ pub(crate) struct CreateDatabaseStmt {
 pub(crate) struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
+    /// Present when the SQL was `CREATE TABLE ... AS <select>`. Schema and
+    /// (optionally) partition spec are inferred from the query at engine
+    /// time. `None` for plain `CREATE TABLE` (the existing path).
+    pub as_select: Option<Box<sqlparser::ast::Query>>,
+    /// Set to `true` when the SQL was `CREATE TABLE IF NOT EXISTS ...`.
+    /// For CTAS, the engine skips table creation and data write when the
+    /// target table already exists.
+    pub if_not_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +141,23 @@ pub(crate) enum Statement {
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     ShowMaterializedViews(ShowMaterializedViewsStmt),
     AlterIcebergRef(AlterIcebergRefStmt),
+    Truncate {
+        name: ObjectName,
+        /// `"main"` by default; branch name when the SQL uses `t.branch_<name>`.
+        target_ref: String,
+    },
+}
+
+/// Describes the overwrite semantics of an INSERT statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverwriteMode {
+    /// `INSERT INTO ...` — append.
+    None,
+    /// `INSERT OVERWRITE [TABLE] ...` — replace all rows in the table.
+    FullTable,
+    /// `INSERT OVERWRITE PARTITIONS [TABLE] ...` — replace only the partitions
+    /// touched by the new data; other partitions preserved. v3 row-lineage only.
+    DynamicPartitions,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,10 +165,11 @@ pub(crate) struct InsertStmt {
     pub table: ObjectName,
     pub columns: Vec<String>,
     pub source: InsertSource,
-    /// `true` when the statement was `INSERT OVERWRITE`; `false` for
-    /// `INSERT INTO`. Phase 1 only honors this for iceberg backends — non-iceberg
-    /// backends reject `overwrite = true` at the engine layer.
-    pub overwrite: bool,
+    /// Overwrite semantics for this INSERT statement. `OverwriteMode::None` for
+    /// `INSERT INTO`; `OverwriteMode::FullTable` for `INSERT OVERWRITE [TABLE]`.
+    /// Phase 1 only honors non-None for iceberg backends — non-iceberg backends
+    /// reject overwrite at the engine layer.
+    pub overwrite_mode: OverwriteMode,
 }
 
 /// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg
