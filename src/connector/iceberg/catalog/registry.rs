@@ -224,6 +224,16 @@ pub(crate) fn create_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let namespace = NamespaceIdent::new(ns_name);
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        return block_on_iceberg(async {
+            catalog.create_namespace(&namespace, HashMap::new()).await
+        })
+        .map_err(|e| format!("create REST namespace runtime: {e}"))?
+        .map(|_| ())
+        .map_err(|e| format!("create REST namespace {namespace}: {e}"));
+    }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace create: {e}"))?;
@@ -250,6 +260,13 @@ pub(crate) fn namespace_exists(
     namespace_name: &str,
 ) -> Result<bool, String> {
     let ns_name = normalize_identifier(namespace_name)?;
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let namespace = NamespaceIdent::new(ns_name);
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        return block_on_iceberg(async { catalog.namespace_exists(&namespace).await })
+            .map_err(|e| format!("check REST namespace runtime: {e}"))?
+            .map_err(|e| format!("check REST namespace failed: {e}"));
+    }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
@@ -276,6 +293,13 @@ pub(crate) fn drop_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let namespace = NamespaceIdent::new(ns_name);
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        return block_on_iceberg(async { catalog.drop_namespace(&namespace).await })
+            .map_err(|e| format!("drop REST namespace runtime: {e}"))?
+            .map_err(|e| format!("drop REST namespace {namespace}: {e}"));
+    }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace drop: {e}"))?;
@@ -335,6 +359,18 @@ pub(crate) fn list_tables(
     namespace_name: &str,
 ) -> Result<Vec<String>, String> {
     let ns_name = normalize_identifier(namespace_name)?;
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let namespace = NamespaceIdent::new(ns_name);
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let mut tables = block_on_iceberg(async { catalog.list_tables(&namespace).await })
+            .map_err(|e| format!("list REST tables runtime failed: {e}"))?
+            .map_err(|e| format!("list REST tables for namespace {namespace}: {e}"))?
+            .into_iter()
+            .map(|ident| ident.name)
+            .collect::<Vec<_>>();
+        tables.sort();
+        return Ok(tables);
+    }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
@@ -480,6 +516,15 @@ pub(crate) fn drop_table(
 
     entry.invalidate_table_cache(&ns_name, &tbl_name);
 
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+            .map_err(|e| format!("build REST table ident: {e}"))?;
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        return block_on_iceberg(async { catalog.drop_table(&ident).await })
+            .map_err(|e| format!("drop REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("drop REST iceberg table {ident}: {e}"));
+    }
+
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for table drop: {e}"))?;
@@ -523,7 +568,14 @@ pub(crate) fn load_table(
         }
     }
 
-    let table = if let Some(s3_config) = &entry.s3_config {
+    let table = if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+            .map_err(|e| format!("build REST table ident: {e}"))?;
+        block_on_iceberg(async { catalog.load_table(&ident).await })
+            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?
+    } else if let Some(s3_config) = &entry.s3_config {
         // S3 path: discover metadata from S3 directly
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
@@ -1900,9 +1952,8 @@ fn build_literal_array(
             for literal in values {
                 match literal {
                     Literal::Null => builder.append_null(),
-                    Literal::String(value) => builder.append_value(
-                        crate::engine::sql_expr::latin1_string_to_bytes(value)?,
-                    ),
+                    Literal::String(value) => builder
+                        .append_value(crate::engine::sql_expr::latin1_string_to_bytes(value)?),
                     other => {
                         return Err(format!(
                             "literal {:?} is not valid for VARIANT column",

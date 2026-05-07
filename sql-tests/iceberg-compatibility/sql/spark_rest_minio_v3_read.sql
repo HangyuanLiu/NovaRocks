@@ -33,9 +33,9 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT id, data, metric
-FROM `iceberg_compat_${suite_uuid0}`.`nr_compat_${suite_uuid0}`.`spark_v3_read_${uuid0}`
+FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0}
 ORDER BY id;
 
 -- query 3
-DROP TABLE `iceberg_compat_${suite_uuid0}`.`nr_compat_${suite_uuid0}`.`spark_v3_read_${uuid0}` FORCE;
-DROP DATABASE `iceberg_compat_${suite_uuid0}`.`nr_compat_${suite_uuid0}`;
+DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0} FORCE;
+DROP DATABASE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0};

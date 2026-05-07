@@ -39,5 +39,16 @@ cd "$WORKSPACE_ROOT"
   set -euo pipefail
   trap 'rm -f $tmp_sql' EXIT
   cat > '$tmp_sql'
-  spark-sql --properties-file /opt/novarocks-env/spark-defaults.conf -f '$tmp_sql'
+  spark_sql_bin=\"\${SPARK_SQL_BIN:-}\"
+  if [[ -z \"\$spark_sql_bin\" ]]; then
+    spark_sql_bin=\"\$(command -v spark-sql || true)\"
+  fi
+  if [[ -z \"\$spark_sql_bin\" && -x /opt/spark/bin/spark-sql ]]; then
+    spark_sql_bin=/opt/spark/bin/spark-sql
+  fi
+  if [[ -z \"\$spark_sql_bin\" ]]; then
+    echo 'spark-sql binary not found' >&2
+    exit 127
+  fi
+  \"\$spark_sql_bin\" --properties-file /opt/novarocks-env/spark-defaults.conf -f '$tmp_sql'
 " < "$sql_file"

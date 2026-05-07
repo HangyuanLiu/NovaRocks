@@ -304,7 +304,10 @@ pub enum SqlType {
     LargeInt,
     Float,
     Double,
-    Decimal { precision: u8, scale: i8 },
+    Decimal {
+        precision: u8,
+        scale: i8,
+    },
     String,
     Binary,
     Boolean,

@@ -85,8 +85,8 @@ fi
 
 minio_user="${MINIO_ROOT_USER:-admin}"
 minio_password="${MINIO_ROOT_PASSWORD:-admin123}"
-rest_image="${ICEBERG_REST_IMAGE:-tabulario/iceberg-rest:1.6.0}"
-rest_mirror_image="docker.1panel.live/tabulario/iceberg-rest:1.6.0"
+rest_image="${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:1.8.1}"
+rest_mirror_image="dockerproxy.net/apache/iceberg-rest-fixture:1.8.1"
 spark_image="${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}"
 spark_mirror_image="docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1"
 
@@ -105,7 +105,7 @@ Docker Desktop may be unhealthy. Check it manually before running setup again:
 EOF
     exit 1
   fi
-  if [[ "$rest_image" == "tabulario/iceberg-rest:1.6.0" ]] \
+  if [[ "$rest_image" == "apache/iceberg-rest-fixture:1.8.1" ]] \
     && docker_image_exists "$rest_mirror_image"; then
     docker tag "$rest_mirror_image" "$rest_image"
   else
@@ -113,8 +113,8 @@ EOF
 Missing Iceberg REST image: $rest_image
 
 Pull it first, for example:
-  docker pull docker.1panel.live/tabulario/iceberg-rest:1.6.0
-  docker tag docker.1panel.live/tabulario/iceberg-rest:1.6.0 tabulario/iceberg-rest:1.6.0
+  docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.8.1
+  docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.8.1 apache/iceberg-rest-fixture:1.8.1
 
 Or set ICEBERG_REST_IMAGE to an already available image.
 EOF

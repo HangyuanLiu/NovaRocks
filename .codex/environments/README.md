@@ -63,6 +63,17 @@ The Spark service talks to REST Catalog at `http://rest:8181` and MinIO at
 `http://minio:9000` from inside the Docker network. NovaRocks talks to the same
 services through the host-mapped endpoints recorded in `env.sh`.
 
+The default REST Catalog image is `apache/iceberg-rest-fixture:1.8.1` because
+`tabulario/iceberg-rest:1.6.0` rejects Iceberg format-version 3 tables.
+
+If Docker Hub is unavailable, pull and tag the REST fixture image from a mirror
+first:
+
+```bash
+docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.8.1
+docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.8.1 apache/iceberg-rest-fixture:1.8.1
+```
+
 If Docker Hub is unavailable, pull and tag the Spark image from a mirror first:
 
 ```bash

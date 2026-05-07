@@ -450,10 +450,14 @@ fn register_external_tables_for_query_impl(
         }
         drop_registered_external_table(state, &target.namespace, &target.table)?;
 
-        let resolved = match catalog.load_table(&target.catalog, &target.namespace, &target.table) {
-            Ok(resolved) => resolved,
-            Err(_) => continue,
-        };
+        let resolved = catalog
+            .load_table(&target.catalog, &target.namespace, &target.table)
+            .map_err(|err| {
+                format!(
+                    "load iceberg table {}.{}.{} failed: {err}",
+                    target.catalog, target.namespace, target.table
+                )
+            })?;
         let table_def = source.build_table_def(&resolved)?;
         register_external_table(state, &target.namespace, table_def)?;
     }

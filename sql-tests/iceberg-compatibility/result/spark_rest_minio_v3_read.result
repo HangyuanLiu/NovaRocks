@@ -1,4 +1,3 @@
--- query 2
 id	data	metric
 1	spark-rest-minio-a	10
 2	spark-rest-minio-b	20
