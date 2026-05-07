@@ -26,7 +26,7 @@ ALTER TABLE orders OPTIMIZE;
 - 把当前 snapshot 的所有 data file 重写到一组新 file（按当前 partition spec）
 - 同时合并 V2 position-delete / V3 DV：被删行不出现在新 file 中，DV blob 在重写完成后失效
 - 跨历史 partition spec：所有老文件按其 spec 解释，重写到当前 spec
-- 写出新 manifest，老文件由 EXPIRE 路径回收（待 EXPIRE 实现）
+- 写出新 manifest，老文件由 EXPIRE SNAPSHOTS 路径回收
 
 > ⚠️ 当前 OPTIMIZE 重写后**会重新分配 `_row_id`**（详见 [row-lineage](row-lineage.md)）。spec 允许保留 / 重新分配，NovaRocks 还没决定最终策略。
 
