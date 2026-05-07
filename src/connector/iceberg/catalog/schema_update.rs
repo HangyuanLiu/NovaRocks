@@ -1905,6 +1905,178 @@ mod tests {
         .await;
         assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
     }
+
+    #[test]
+    fn reserved_key_format_version() {
+        let reason = is_reserved_property_key("format-version").expect("denied");
+        let lower = reason.to_lowercase();
+        assert!(lower.contains("upgrade table") || lower.contains("format-version"));
+    }
+
+    #[test]
+    fn reserved_key_identifier_field_ids() {
+        assert!(is_reserved_property_key("identifier-field-ids").is_some());
+    }
+
+    #[test]
+    fn reserved_key_internal_schema_id() {
+        assert!(is_reserved_property_key("current-schema-id").is_some());
+        assert!(is_reserved_property_key("default-spec-id").is_some());
+        assert!(is_reserved_property_key("default-sort-order-id").is_some());
+    }
+
+    #[test]
+    fn reserved_key_internal_counters() {
+        assert!(is_reserved_property_key("last-column-id").is_some());
+        assert!(is_reserved_property_key("last-partition-id").is_some());
+        assert!(is_reserved_property_key("last-sequence-number").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_logical_type_prefix() {
+        assert!(is_reserved_property_key("novarocks.logical_type.foo").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_column_agg_prefix() {
+        assert!(is_reserved_property_key("novarocks.column_agg.bar").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_table_key_columns() {
+        assert!(is_reserved_property_key("novarocks.table.key_columns").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_nullability_attested_prefix() {
+        assert!(
+            is_reserved_property_key("novarocks.nullability.attested.address.street").is_some()
+        );
+    }
+
+    #[test]
+    fn reserved_key_novarocks_unknown_prefix_blocked() {
+        // Forward-compat: any unknown novarocks.* key is reserved.
+        assert!(is_reserved_property_key("novarocks.future.feature").is_some());
+        assert!(is_reserved_property_key("novarocks.x").is_some());
+    }
+
+    #[test]
+    fn reserved_key_allows_iceberg_write_props() {
+        assert!(is_reserved_property_key("write.parquet.compression-codec").is_none());
+        assert!(is_reserved_property_key("write.format.default").is_none());
+        assert!(is_reserved_property_key("write.target-file-size-bytes").is_none());
+        assert!(is_reserved_property_key("history.expire.max-snapshot-age-ms").is_none());
+        assert!(is_reserved_property_key("commit.retry.num-retries").is_none());
+        assert!(is_reserved_property_key("gc.enabled").is_none());
+    }
+
+    #[test]
+    fn reserved_key_allows_user_custom_keys() {
+        assert!(is_reserved_property_key("my.custom.key").is_none());
+        assert!(is_reserved_property_key("foo").is_none());
+        assert!(is_reserved_property_key("comment").is_none());
+    }
+
+    #[test]
+    fn properties_op_collect_denylist_hits_on_set() {
+        use crate::engine::statement::PropertiesOp;
+        let op = PropertiesOp::Set {
+            entries: vec![
+                ("comment".to_string(), "ok".to_string()),
+                ("format-version".to_string(), "2".to_string()),
+                ("write.format.default".to_string(), "parquet".to_string()),
+                ("novarocks.internal".to_string(), "x".to_string()),
+            ],
+        };
+        let hits = collect_property_denylist_hits(&op);
+        assert_eq!(hits.len(), 2, "expected 2 denied keys, got: {hits:?}");
+        let denied_keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(denied_keys.contains(&"format-version"));
+        assert!(denied_keys.contains(&"novarocks.internal"));
+    }
+
+    #[test]
+    fn properties_op_collect_denylist_hits_on_unset() {
+        use crate::engine::statement::PropertiesOp;
+        let op = PropertiesOp::Unset {
+            keys: vec![
+                "comment".to_string(),
+                "last-column-id".to_string(),
+                "write.parquet.compression-codec".to_string(),
+                "novarocks.nullability.attested.id".to_string(),
+            ],
+            if_exists: false,
+        };
+        let hits = collect_property_denylist_hits(&op);
+        assert_eq!(hits.len(), 2, "expected 2 denied keys, got: {hits:?}");
+        let denied_keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(denied_keys.contains(&"last-column-id"));
+        assert!(denied_keys.contains(&"novarocks.nullability.attested.id"));
+    }
+
+    #[test]
+    fn properties_op_validate_unset_strict_missing_key() {
+        use crate::engine::statement::PropertiesOp;
+        let op = PropertiesOp::Unset {
+            keys: vec!["present".to_string(), "missing-key".to_string()],
+            if_exists: false,
+        };
+        let existing = props(&[("present", "v")]);
+        let result = validate_unset_keys_present(&op, &existing);
+        assert!(result.is_err(), "expected Err for missing key");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("'missing-key'"),
+            "error must quote the missing key; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn properties_op_validate_unset_if_exists_skips_missing() {
+        use crate::engine::statement::PropertiesOp;
+        let op = PropertiesOp::Unset {
+            keys: vec!["not-there".to_string(), "also-absent".to_string()],
+            if_exists: true,
+        };
+        let existing = props(&[]);
+        assert!(
+            validate_unset_keys_present(&op, &existing).is_ok(),
+            "IF EXISTS must not error on missing keys"
+        );
+    }
+
+    #[test]
+    fn properties_op_compute_remove_keys_filters_missing_when_if_exists() {
+        use crate::engine::statement::PropertiesOp;
+        let op = PropertiesOp::Unset {
+            keys: vec![
+                "present".to_string(),
+                "absent".to_string(),
+                "also-present".to_string(),
+            ],
+            if_exists: true,
+        };
+        let existing = props(&[("present", "v1"), ("also-present", "v2")]);
+        let mut result = compute_remove_keys(&op, &existing);
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["also-present".to_string(), "present".to_string()]
+        );
+    }
+
+    #[test]
+    fn properties_op_compute_remove_keys_all_missing_with_if_exists_returns_empty() {
+        use crate::engine::statement::PropertiesOp;
+        let existing = props(&[]);
+        let op = PropertiesOp::Unset {
+            keys: vec!["a".to_string(), "b".to_string()],
+            if_exists: true,
+        };
+        let computed = compute_remove_keys(&op, &existing);
+        assert!(computed.is_empty());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1922,7 +2094,10 @@ use crate::connector::iceberg::catalog::registry::{
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::statement::{AlterIcebergSchemaStmt, ColumnPath, IcebergSchemaChange};
+use crate::engine::statement::{
+    AlterIcebergPropertiesStmt, AlterIcebergSchemaStmt, ColumnPath, IcebergSchemaChange,
+    PropertiesOp,
+};
 use crate::sql::parser::ast::SqlType;
 
 #[cfg(test)]
@@ -3427,6 +3602,232 @@ fn managed_mv_dependencies_for_target(
             target: target.clone(),
         })
         .collect())
+}
+
+/// Whether a property key is reserved (cannot be set/unset by SET TBLPROPERTIES).
+/// Returns `None` if the key is user-modifiable, or `Some(reason)` containing a
+/// human-readable category to include in the error message.
+fn is_reserved_property_key(key: &str) -> Option<&'static str> {
+    if key == "format-version" {
+        return Some(
+            "format-version is reserved; use UPGRADE TABLE syntax (not yet implemented in NovaRocks)",
+        );
+    }
+    if matches!(
+        key,
+        "identifier-field-ids"
+            | "current-schema-id"
+            | "default-spec-id"
+            | "default-sort-order-id"
+            | "last-column-id"
+            | "last-partition-id"
+            | "last-sequence-number"
+    ) {
+        return Some("Iceberg internal metadata key, not user-settable");
+    }
+    if key.starts_with("novarocks.") {
+        return Some("novarocks.* namespace is reserved for engine-managed properties");
+    }
+    None
+}
+
+/// Collect any property keys in `op` that are blocked by the denylist.
+/// Returns a list of `(key, reason)` pairs for each denied key.
+fn collect_property_denylist_hits(op: &PropertiesOp) -> Vec<(String, &'static str)> {
+    let mut hits = Vec::new();
+    match op {
+        PropertiesOp::Set { entries } => {
+            for (k, _) in entries {
+                if let Some(reason) = is_reserved_property_key(k) {
+                    hits.push((k.clone(), reason));
+                }
+            }
+        }
+        PropertiesOp::Unset { keys, .. } => {
+            for k in keys {
+                if let Some(reason) = is_reserved_property_key(k) {
+                    hits.push((k.clone(), reason));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// For a strict (non-IF-EXISTS) UNSET, verify every requested key is present in
+/// the current table properties. Returns an error naming the first missing key.
+fn validate_unset_keys_present(
+    op: &PropertiesOp,
+    existing: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    if let PropertiesOp::Unset { keys, if_exists } = op {
+        if !*if_exists {
+            for k in keys {
+                if !existing.contains_key(k) {
+                    return Err(format!(
+                        "UNSET TBLPROPERTIES key '{k}' does not exist; use IF EXISTS to silently skip"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute the final list of keys to remove for an UNSET operation.
+/// For IF EXISTS, filters out keys that are not present in `existing`.
+/// For strict UNSET, returns all keys as-is (caller must have validated them).
+/// Returns an empty list for SET operations.
+fn compute_remove_keys(
+    op: &PropertiesOp,
+    existing: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    if let PropertiesOp::Unset { keys, if_exists } = op {
+        if *if_exists {
+            return keys
+                .iter()
+                .filter(|k| existing.contains_key(*k))
+                .cloned()
+                .collect();
+        }
+        return keys.clone();
+    }
+    Vec::new()
+}
+
+/// Execute SET TBLPROPERTIES or UNSET TBLPROPERTIES on an Iceberg table.
+///
+/// Mirrors `alter_table_schema`: resolves the catalog entry, invalidates the
+/// table cache, then calls `commit_with_retry` with a closure that re-invalidates,
+/// re-loads, and re-builds the action on each attempt to avoid stale-cache conflicts.
+pub(crate) fn alter_table_properties(
+    state: &Arc<StandaloneState>,
+    stmt: &AlterIcebergPropertiesStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<(), String> {
+    // 1. Resolve target — same helper as alter_table_schema.
+    let target =
+        resolve_existing_table_target(state, &stmt.table, current_catalog, current_database)?;
+    if target.backend_name != "iceberg" {
+        return Err(
+            "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
+        );
+    }
+
+    // 2. Denylist check — fail fast before any IO.
+    let denied = collect_property_denylist_hits(&stmt.op);
+    if !denied.is_empty() {
+        let mut msgs: Vec<String> = denied
+            .iter()
+            .map(|(k, reason)| format!("`{k}`: {reason}"))
+            .collect();
+        msgs.sort();
+        return Err(format!(
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): {}",
+            msgs.join("; ")
+        ));
+    }
+
+    // 3. Acquire catalog entry — same pattern as alter_table_schema.
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+
+    // 4. Pre-commit cache invalidate.
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = target.namespace.clone();
+    let table_for_retry = target.table.clone();
+    let op_for_retry = stmt.op.clone();
+
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry_inner = entry_for_retry.clone();
+                let namespace_inner = namespace_for_retry.clone();
+                let table_inner = table_for_retry.clone();
+                let op_inner = op_for_retry.clone();
+                async move {
+                    // Each retry must start with a fresh metadata read to avoid stale-cache
+                    // conflicts (mirrors the same pattern in alter_table_schema).
+                    entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
+                    // HadoopFileSystemCatalog is not Clone; rebuild per attempt.
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_hadoop_catalog(
+                            &entry_inner,
+                        )
+                        .map_err(|e| {
+                            iceberg::Error::new(
+                                iceberg::ErrorKind::Unexpected,
+                                format!("build catalog for retry: {e}"),
+                            )
+                        })?;
+                    let loaded_inner = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry_inner,
+                        &namespace_inner,
+                        &table_inner,
+                    )
+                    .map_err(|e| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::Unexpected,
+                            format!("reload table for retry: {e}"),
+                        )
+                    })?;
+
+                    // Strict UNSET: validate every requested key against the LATEST metadata.
+                    let existing = loaded_inner.table.metadata().properties().clone();
+                    validate_unset_keys_present(&op_inner, &existing)
+                        .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
+
+                    // Early return for the IF EXISTS no-op case: all requested keys are
+                    // already absent from the latest metadata. Avoids an empty metadata
+                    // rewrite that would otherwise bump the version hint.
+                    if let PropertiesOp::Unset {
+                        if_exists: true, ..
+                    } = &op_inner
+                    {
+                        let removes = compute_remove_keys(&op_inner, &existing);
+                        if removes.is_empty() {
+                            return Ok(());
+                        }
+                    }
+
+                    let tx = Transaction::new(&loaded_inner.table);
+                    let mut action = tx.update_table_properties();
+                    match &op_inner {
+                        PropertiesOp::Set { entries } => {
+                            for (k, v) in entries {
+                                action = action.set(k.clone(), v.clone());
+                            }
+                        }
+                        PropertiesOp::Unset { .. } => {
+                            for k in compute_remove_keys(&op_inner, &existing) {
+                                action = action.remove(k);
+                            }
+                        }
+                    }
+                    let tx = action.apply(tx).map_err(|e| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
+                    })?;
+                    tx.commit(&catalog).await.map(|_| ())
+                }
+            })
+            .await
+        })
+        .map_err(|e| format!("alter table properties runtime failed: {e}"))?;
+
+    // 5. Post-commit cache invalidate (mirror alter_table_schema).
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+    commit_result?;
+
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
+    Ok(())
 }
 
 /// Whether an iceberg-rust commit error represents a transient table-requirement

@@ -52,8 +52,9 @@ use self::statement::{
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_alter_table_optimize, looks_like_show_alter_table_optimize,
+    looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
+    looks_like_alter_partition_column, looks_like_alter_table_optimize,
+    looks_like_show_alter_table_optimize, parse_alter_iceberg_properties_sql,
     parse_alter_partition_column_sql, parse_alter_table_optimize_sql,
     parse_show_alter_table_optimize_sql,
 };
@@ -549,6 +550,15 @@ impl StandaloneSession {
             return self.handle_drop(drop, current_catalog, current_database);
         }
 
+        // ALTER TABLE ... SET / UNSET TBLPROPERTIES
+        if looks_like_alter_iceberg_properties(&normalized) {
+            return self.handle_alter_iceberg_properties(
+                &normalized,
+                current_catalog,
+                current_database,
+            );
+        }
+
         // ALTER TABLE ... ADD/DROP/RENAME/MODIFY COLUMN
         if looks_like_alter_iceberg_schema(&normalized) {
             return self.handle_alter_iceberg_schema(
@@ -894,6 +904,22 @@ impl StandaloneSession {
             jobs.truncate(limit);
         }
         build_show_alter_table_optimize_result(jobs).map(StatementResult::Query)
+    }
+
+    fn handle_alter_iceberg_properties(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let stmt = parse_alter_iceberg_properties_sql(sql)?;
+        crate::connector::iceberg::catalog::alter_table_properties(
+            &self.inner,
+            &stmt,
+            current_catalog,
+            current_database,
+        )?;
+        Ok(StatementResult::Ok)
     }
 
     fn handle_alter_iceberg_schema(
