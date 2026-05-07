@@ -3175,20 +3175,53 @@ pub(crate) fn alter_table_schema(
         )?;
     }
 
-    let commit_result = (|| {
-        let catalog = crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)?;
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            let tx = Transaction::new(&loaded.table);
-            let tx = SchemaUpdateTxnAction {
-                change: stmt.change.clone(),
-            }
-            .apply(tx)?;
-            tx.commit(&catalog).await
+    let change_for_retry = stmt.change.clone();
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = target.namespace.clone();
+    let table_for_retry = target.table.clone();
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry_inner = entry_for_retry.clone();
+                let namespace_inner = namespace_for_retry.clone();
+                let table_inner = table_for_retry.clone();
+                let change_inner = change_for_retry.clone();
+                async move {
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_hadoop_catalog(
+                            &entry_inner,
+                        )
+                        .map_err(|e| {
+                            iceberg::Error::new(
+                                iceberg::ErrorKind::Unexpected,
+                                format!("build catalog for retry: {e}"),
+                            )
+                        })?;
+                    let loaded_inner = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry_inner,
+                        &namespace_inner,
+                        &table_inner,
+                    )
+                    .map_err(|e| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::Unexpected,
+                            format!("reload table for retry: {e}"),
+                        )
+                    })?;
+                    let tx = Transaction::new(&loaded_inner.table);
+                    let tx = SchemaUpdateTxnAction {
+                        change: change_inner,
+                    }
+                    .apply(tx)
+                    .map_err(|e| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
+                    })?;
+                    tx.commit(&catalog).await.map(|_committed| ())
+                }
+            })
+            .await
         })
-        .map_err(|e| format!("alter iceberg schema runtime failed: {e}"))?
-        .map_err(|e| format!("alter iceberg schema failed: {e}"))?;
-        Ok::<(), String>(())
-    })();
+        .map_err(|e| format!("alter iceberg schema runtime failed: {e}"))?;
 
     entry.invalidate_table_cache(&target.namespace, &target.table);
     commit_result?;
@@ -3267,7 +3300,6 @@ fn managed_mv_dependencies_for_target(
 /// Whether an iceberg-rust commit error represents a transient table-requirement
 /// conflict that warrants a retry (after re-loading the table). Network / IO /
 /// data-invalid / programmer errors are non-retryable.
-#[allow(dead_code)]
 fn is_retryable_commit_conflict(err: &iceberg::Error) -> bool {
     use iceberg::ErrorKind;
     match err.kind() {
@@ -3296,7 +3328,6 @@ const COMMIT_RETRY_BACKOFF_MS: [u64; 3] = [10, 100, 500];
 /// TODO(cancellation): this helper has no cancellation hook today because the
 /// DDL path doesn't carry a QueryContext. Add a check before the sleep when
 /// cancellation is plumbed through `alter_table_schema`.
-#[allow(dead_code)]
 async fn commit_with_retry<F, Fut>(mut do_attempt: F) -> Result<(), String>
 where
     F: FnMut(usize) -> Fut,
