@@ -1734,9 +1734,8 @@ fn infer_scalar_function_return_type(
             _ => Ok(DataType::Null),
         },
         "json_query" | "json_extract" | "get_json_string" | "get_json_int" | "get_json_double"
-        | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json" => {
-            Ok(DataType::Utf8)
-        }
+        | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json"
+        | "variant_typeof" => Ok(DataType::Utf8),
         "__struct_subfield" | "__array_struct_subfield" => Ok(DataType::Null),
         "row" | "struct" => Ok(infer_struct_constructor_return_type(arg_types)),
         "named_struct" => Ok(infer_named_struct_return_type(arg_types)),

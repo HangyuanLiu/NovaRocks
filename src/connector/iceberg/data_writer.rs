@@ -19,6 +19,8 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
+use super::variant_write::{transform_variant_columns_for_write, variant_field_indices};
+
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
@@ -78,6 +80,7 @@ async fn write_record_batches_as_data_files_with_writer(
     annotated_schema: arrow::datatypes::SchemaRef,
 ) -> Result<Vec<DataFile>, String> {
     let metadata = table.metadata();
+    let variant_indices = variant_field_indices(metadata.current_schema());
 
     if metadata.default_partition_spec().fields().is_empty() {
         let mut writer = data_file_builder
@@ -88,8 +91,13 @@ async fn write_record_batches_as_data_files_with_writer(
             if batch.num_rows() == 0 {
                 continue;
             }
+            let staged = if variant_indices.is_empty() {
+                batch
+            } else {
+                transform_variant_columns_for_write(&batch, &annotated_schema, &variant_indices)?
+            };
             writer
-                .write(annotate_batch(&batch, &annotated_schema)?)
+                .write(annotate_batch(&staged, &annotated_schema)?)
                 .await
                 .map_err(|e| format!("iceberg data file write failed: {e}"))?;
         }
@@ -115,7 +123,12 @@ async fn write_record_batches_as_data_files_with_writer(
         if batch.num_rows() == 0 {
             continue;
         }
-        let annotated = annotate_batch(&batch, &annotated_schema)?;
+        let staged = if variant_indices.is_empty() {
+            batch
+        } else {
+            transform_variant_columns_for_write(&batch, &annotated_schema, &variant_indices)?
+        };
+        let annotated = annotate_batch(&staged, &annotated_schema)?;
         let partitioned = splitter
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
@@ -546,6 +559,114 @@ mod tests {
         assert_eq!(
             annotated.schema().field(2).name(),
             "_last_updated_sequence_number"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_variant_column_round_trips_through_local_parquet() {
+        use arrow::array::{Int32Array, LargeBinaryArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let location = format!("file://{}", dir.path().display());
+
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            location.clone(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+
+        // Build a 1-row record batch where `v` holds a serialized variant
+        // (short string "hello").
+        let payload = {
+            let metadata = vec![0x01u8, 0x00, 0x00];
+            let mut value = Vec::new();
+            let s = b"hello";
+            value.push(((s.len() as u8) << 2) | 0b01);
+            value.extend_from_slice(s);
+            let total = (metadata.len() + value.len()) as u32;
+            let mut out = Vec::new();
+            out.extend_from_slice(&total.to_le_bytes());
+            out.extend_from_slice(&metadata);
+            out.extend_from_slice(&value);
+            out
+        };
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::LargeBinary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(LargeBinaryArray::from_iter_values([payload.as_slice()])),
+            ],
+        )
+        .expect("batch");
+
+        let data_files = write_record_batches_as_data_files(&table, vec![batch])
+            .await
+            .expect("write");
+        assert_eq!(data_files.len(), 1);
+        let path = data_files[0].file_path().to_string();
+        let on_disk = path.strip_prefix("file://").unwrap_or(&path);
+
+        // Re-open the parquet file with the standard parquet-rs reader and
+        // assert the physical layout matches the spec.
+        let f = File::open(on_disk).expect("open parquet");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).expect("builder");
+        let parquet_schema = builder.parquet_schema();
+        let v_node = parquet_schema
+            .columns()
+            .iter()
+            .find(|c| c.path().string().starts_with("v"))
+            .expect("v column");
+        assert!(
+            v_node.path().string() == "v.metadata" || v_node.path().string() == "v.value",
+            "expected leaf path under v.*; got {}",
+            v_node.path().string()
+        );
+        // Look at the parent group's logical type via the parquet schema descr.
+        let root = builder.parquet_schema().root_schema();
+        let v_field = root
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == "v")
+            .expect("v");
+        assert!(
+            format!("{:?}", v_field.get_basic_info().logical_type_ref())
+                .to_lowercase()
+                .contains("variant"),
+            "v parent group must carry LogicalType::Variant; got {:?}",
+            v_field.get_basic_info().logical_type_ref()
         );
     }
 }

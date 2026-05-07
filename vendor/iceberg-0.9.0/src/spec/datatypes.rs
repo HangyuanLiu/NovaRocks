@@ -247,6 +247,10 @@ pub enum PrimitiveType {
     Fixed(u64),
     /// Arbitrary-length byte array.
     Binary,
+    /// Iceberg v3 unshredded variant. Physical layout in parquet is a
+    /// group of two binary leaves (`metadata`, `value`) annotated with
+    /// `LogicalType::Variant`. NovaRocks vendor PATCH 6.
+    Variant,
 }
 
 impl PrimitiveType {
@@ -382,6 +386,7 @@ impl fmt::Display for PrimitiveType {
             PrimitiveType::Uuid => write!(f, "uuid"),
             PrimitiveType::Fixed(size) => write!(f, "fixed({size})"),
             PrimitiveType::Binary => write!(f, "binary"),
+            PrimitiveType::Variant => write!(f, "variant"),
         }
     }
 }
@@ -1259,5 +1264,23 @@ mod tests {
                 .to_string()
                 .contains("expected type 'struct'")
         );
+    }
+
+    #[test]
+    fn primitive_variant_serde_roundtrip() {
+        use serde_json;
+        let json = r#""variant""#;
+        let parsed: PrimitiveType = serde_json::from_str(json).expect("parse variant");
+        assert_eq!(parsed, PrimitiveType::Variant);
+        let serialized = serde_json::to_string(&parsed).expect("serialize variant");
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn primitive_variant_compatible_rejects_all_literals() {
+        use crate::spec::PrimitiveLiteral;
+        assert!(!PrimitiveType::Variant.compatible(&PrimitiveLiteral::Boolean(true)));
+        assert!(!PrimitiveType::Variant.compatible(&PrimitiveLiteral::String("x".to_string())));
+        assert!(!PrimitiveType::Variant.compatible(&PrimitiveLiteral::Binary(b"x".to_vec())));
     }
 }

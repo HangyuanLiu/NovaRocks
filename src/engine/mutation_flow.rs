@@ -12,7 +12,8 @@ use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergUpdateMode, MutationSidecar, MutationSidecarFile,
-    RunInput, run_iceberg_commit, select_iceberg_update_mode,
+    RunInput, ensure_no_variant_columns_for_row_level_mutation, run_iceberg_commit,
+    select_iceberg_update_mode,
 };
 use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteBatch};
 use crate::engine::{StandaloneState, StatementResult};
@@ -77,6 +78,11 @@ pub(crate) fn execute_update_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+
+    // Reject variant tables before any planning. Without this guard the
+    // failure surfaces deep inside `materialize_update_matches` as a
+    // planner error about the row-lineage `__nr_t` column.
+    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("UPDATE: {e}"))?;
 
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
@@ -1219,6 +1225,10 @@ pub(crate) fn execute_merge_statement(
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+
+    // Reject variant tables before any planning (mirrors UPDATE entry).
+    ensure_no_variant_columns_for_row_level_mutation(&table)
+        .map_err(|e| format!("MERGE INTO: {e}"))?;
 
     let target_columns = iceberg_table_columns(&table)?;
     let partition_columns = iceberg_partition_source_columns(&table)?;

@@ -388,6 +388,7 @@ fn key_eligible_type(data_type: &SqlType) -> bool {
             | SqlType::Array(_)
             | SqlType::Map(_, _)
             | SqlType::Struct(_)
+            | SqlType::Variant
     )
 }
 
@@ -401,7 +402,9 @@ fn short_key_index_size(data_type: &SqlType) -> usize {
         SqlType::String | SqlType::Binary => 20,
         SqlType::Float => 4,
         SqlType::Double => 8,
-        SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) => SHORT_KEY_MAX_SIZE_BYTES + 1,
+        SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) | SqlType::Variant => {
+            SHORT_KEY_MAX_SIZE_BYTES + 1
+        }
     }
 }
 
@@ -1061,6 +1064,11 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
                 "sql_type_to_tcolumn_type called on complex type {data_type:?}; callers must use sql_type_to_ttype_desc instead"
             ));
         }
+        SqlType::Variant => {
+            return Err(
+                "VARIANT columns are only supported on iceberg tables; managed-lake CREATE TABLE rejects VARIANT".to_string(),
+            );
+        }
     };
     Ok(crate::types::TColumnType {
         type_: primitive,
@@ -1161,7 +1169,8 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
         | SqlType::Array(_)
         | SqlType::Binary
         | SqlType::Map(_, _)
-        | SqlType::Struct(_) => None,
+        | SqlType::Struct(_)
+        | SqlType::Variant => None,
     }
 }
 
@@ -1190,6 +1199,7 @@ pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
             }
             format!("STRUCT<{}>", parts.join(","))
         }
+        SqlType::Variant => "VARIANT".to_string(),
     }
 }
 

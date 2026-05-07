@@ -48,7 +48,8 @@ use sqlparser::ast as sqlast;
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
-    classify_sql_delete_strategy, run_iceberg_commit, write_position_delete_files,
+    classify_sql_delete_strategy, ensure_no_variant_columns_for_row_level_mutation,
+    run_iceberg_commit, write_position_delete_files,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::{StandaloneState, StatementResult};
@@ -122,6 +123,7 @@ pub(crate) fn execute_delete_statement(
     }
 
     // 3. Validation.
+    ensure_no_variant_columns_for_row_level_mutation(&table).map_err(|e| format!("DELETE: {e}"))?;
     let delete_strategy = classify_sql_delete_strategy(&table)?;
     // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
     //    early. The bound `Predicate` is also used for manifest-level pruning

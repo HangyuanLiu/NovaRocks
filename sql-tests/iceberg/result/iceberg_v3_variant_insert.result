@@ -1,0 +1,10 @@
+-- query 2
+id	variant_typeof(v)
+1	Object
+2	Array
+3	Null
+4	NULL
+
+-- query 3
+id	get_json_string(v, '$.b')
+1	x
