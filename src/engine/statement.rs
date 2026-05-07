@@ -1604,6 +1604,93 @@ fn parse_expire_uint(parser: &mut Parser<'_>) -> Result<u64, String> {
     }
 }
 
+/// Detector for `ALTER TABLE x REMOVE ORPHAN FILES [OLDER THAN ...]`.
+///
+/// Used by `mod.rs::execute_in_context` to route before generic sqlparser-rs.
+pub(crate) fn looks_like_alter_table_remove_orphan_files(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "REMOVE")
+        && peek_token_word_eq_at(&parser, 1, "ORPHAN")
+        && peek_token_word_eq_at(&parser, 2, "FILES")
+}
+
+/// Parse `ALTER TABLE <name> REMOVE ORPHAN FILES OLDER THAN '<ts>' [;]`.
+///
+/// `OLDER THAN` is mandatory (spec §1.1; unlike EXPIRE SNAPSHOTS which can
+/// use RETAIN LAST instead).
+///
+/// Rejects:
+/// * No `OLDER THAN` clause.
+/// * Branch/tag suffix (≥2 parts, last starts with `branch_` or `tag_`).
+/// * Trailing tokens after the clause.
+pub(crate) fn parse_alter_table_remove_orphan_files_sql(
+    sql: &str,
+) -> Result<AlterTableRemoveOrphanFilesStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE REMOVE ORPHAN FILES: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject branch / tag suffix per spec §1.1.
+    if table.parts.len() >= 2 {
+        if let Some(last) = table.parts.last() {
+            if last.starts_with("branch_") || last.starts_with("tag_") {
+                return Err(format!(
+                    "REMOVE ORPHAN FILES does not support branch/tag suffix on table name: {}",
+                    table.parts.join(".")
+                ));
+            }
+        }
+    }
+
+    expect_word(&mut parser, "REMOVE")?;
+    expect_word(&mut parser, "ORPHAN")?;
+    expect_word(&mut parser, "FILES")?;
+
+    // OLDER THAN is mandatory for REMOVE ORPHAN FILES (spec §1.1 / §4.1).
+    if !peek_token_word_eq(&parser, "OLDER") {
+        return Err(
+            "REMOVE ORPHAN FILES requires OLDER THAN clause (e.g. OLDER THAN '2026-01-01')"
+                .to_string(),
+        );
+    }
+    expect_word(&mut parser, "OLDER")?;
+    expect_word(&mut parser, "THAN")?;
+    let older_than_ms = parse_expire_timestamp_ms(&mut parser)?;
+
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|e| format!("unsupported trailing tokens: {e}"))?;
+    Ok(AlterTableRemoveOrphanFilesStmt {
+        table,
+        older_than_ms,
+    })
+}
+
 /// Peek at the token `offset` positions ahead of current position.
 ///
 /// offset=0 is the same as `peek_token_word_eq`, offset=1 is one token ahead.
@@ -3537,6 +3624,148 @@ mod insert_overwrite_partitions_parser_tests {
     fn parse_expire_rejects_trailing_tokens() {
         let err = super::parse_alter_table_expire_snapshots_sql(
             "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 5 SOMETHING EXTRA",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsupported trailing tokens"),
+            "expected trailing token rejection, got: {err}"
+        );
+    }
+
+    // ---- looks_like_alter_table_remove_orphan_files tests ----
+
+    #[test]
+    fn looks_like_alter_table_remove_orphan_files_positive() {
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN FILES OLDER THAN '2026-01-01'"
+        ));
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "alter table db.t remove orphan files older than '2026-01-01 00:00:00'"
+        ));
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1700000000000"
+        ));
+        // Detector only checks REMOVE ORPHAN FILES — OLDER THAN is not required by detector.
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN FILES"
+        ));
+    }
+
+    #[test]
+    fn looks_like_alter_table_remove_orphan_files_negative() {
+        // Different action keyword.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x EXPIRE SNAPSHOTS"
+        ));
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x OPTIMIZE"
+        ));
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REWRITE MANIFESTS"
+        ));
+        // Missing ORPHAN.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE FILES"
+        ));
+        // Missing FILES.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN"
+        ));
+        // Not an ALTER TABLE.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "SELECT * FROM t"
+        ));
+    }
+
+    // ---- parse_alter_table_remove_orphan_files_sql tests ----
+
+    #[test]
+    fn parse_remove_orphan_files_basic() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+        // 2026-01-01 00:00:00 UTC in epoch-ms.
+        assert_eq!(stmt.older_than_ms, 1_767_225_600_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_rfc3339_timestamp() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN '2026-01-01T00:00:00Z'",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, 1_767_225_600_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_epoch_ms_int() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN 1700000000000",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, 1_700_000_000_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_accepts_trailing_semicolon() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE t REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00';",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_no_older_than_rejects() {
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("OLDER THAN"),
+            "expected OLDER THAN rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_branch_suffix_rejects() {
+        // Two-part name ending in branch_ → rejected.
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t.branch_dev REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not support branch"),
+            "expected branch rejection, got: {err}"
+        );
+
+        // tag_ suffix also rejected.
+        let err2 = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t.tag_v1 REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap_err();
+        assert!(
+            err2.contains("does not support branch"),
+            "expected tag rejection, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_single_part_branch_name_accepted() {
+        // A single-part table literally named `branch_x` is a valid table name.
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE branch_x REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["branch_x"]);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_rejects_trailing_tokens() {
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00' EXTRA TOKEN",
         )
         .unwrap_err();
         assert!(

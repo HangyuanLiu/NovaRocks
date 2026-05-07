@@ -35,6 +35,7 @@ mod overwrite_partitions;
 mod position_delete_writer;
 mod puffin_dv;
 mod ref_action;
+pub mod remove_orphan_files;
 pub mod retry;
 mod rewrite_data_files;
 pub mod rewrite_manifests;
