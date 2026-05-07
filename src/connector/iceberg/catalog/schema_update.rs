@@ -3607,7 +3607,6 @@ fn managed_mv_dependencies_for_target(
 /// Whether a property key is reserved (cannot be set/unset by SET TBLPROPERTIES).
 /// Returns `None` if the key is user-modifiable, or `Some(reason)` containing a
 /// human-readable category to include in the error message.
-#[allow(dead_code)]
 fn is_reserved_property_key(key: &str) -> Option<&'static str> {
     if key == "format-version" {
         return Some(
@@ -3634,7 +3633,6 @@ fn is_reserved_property_key(key: &str) -> Option<&'static str> {
 
 /// Collect any property keys in `op` that are blocked by the denylist.
 /// Returns a list of `(key, reason)` pairs for each denied key.
-#[allow(dead_code)]
 fn collect_property_denylist_hits(op: &PropertiesOp) -> Vec<(String, &'static str)> {
     let mut hits = Vec::new();
     match op {
@@ -3658,7 +3656,6 @@ fn collect_property_denylist_hits(op: &PropertiesOp) -> Vec<(String, &'static st
 
 /// For a strict (non-IF-EXISTS) UNSET, verify every requested key is present in
 /// the current table properties. Returns an error naming the first missing key.
-#[allow(dead_code)]
 fn validate_unset_keys_present(
     op: &PropertiesOp,
     existing: &std::collections::HashMap<String, String>,
@@ -3681,7 +3678,6 @@ fn validate_unset_keys_present(
 /// For IF EXISTS, filters out keys that are not present in `existing`.
 /// For strict UNSET, returns all keys as-is (caller must have validated them).
 /// Returns an empty list for SET operations.
-#[allow(dead_code)]
 fn compute_remove_keys(
     op: &PropertiesOp,
     existing: &std::collections::HashMap<String, String>,
@@ -3704,7 +3700,6 @@ fn compute_remove_keys(
 /// Mirrors `alter_table_schema`: resolves the catalog entry, invalidates the
 /// table cache, then calls `commit_with_retry` with a closure that re-invalidates,
 /// re-loads, and re-builds the action on each attempt to avoid stale-cache conflicts.
-#[allow(dead_code)]
 pub(crate) fn alter_table_properties(
     state: &Arc<StandaloneState>,
     stmt: &AlterIcebergPropertiesStmt,
