@@ -1038,14 +1038,16 @@ pub(crate) fn execute_truncate_table_statement(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
     target_ref: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
-    if state
-        .managed_lake
-        .read()
-        .expect("standalone managed lake read lock")
-        .contains_table(&resolved.database, &resolved.table)?
+    if current_catalog.is_none()
+        && state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock")
+            .contains_table(&resolved.database, &resolved.table)?
     {
         if target_ref != "main" {
             return Err(format!(
@@ -1059,7 +1061,7 @@ pub(crate) fn execute_truncate_table_statement(
     let target = crate::engine::backend_resolver::resolve_existing_table_target(
         state,
         name,
-        None,
+        current_catalog,
         current_database,
     )?;
     if target.backend_name != "iceberg" {

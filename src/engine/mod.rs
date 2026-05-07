@@ -493,7 +493,12 @@ impl StandaloneSession {
                     let statement = statements
                         .pop()
                         .ok_or_else(|| "custom parser returned no statements".to_string())?;
-                    return dispatch_statement(&self.inner, current_database, statement);
+                    return dispatch_statement(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        statement,
+                    );
                 }
             }
         }
@@ -501,7 +506,7 @@ impl StandaloneSession {
             let statement = statements
                 .pop()
                 .ok_or_else(|| "custom parser returned no statements".to_string())?;
-            return dispatch_statement(&self.inner, current_database, statement);
+            return dispatch_statement(&self.inner, current_catalog, current_database, statement);
         }
         let (parse_sql, forced_explain_level) =
             if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
@@ -787,6 +792,7 @@ impl StandaloneSession {
                         &self.inner,
                         &table_name,
                         "main",
+                        current_catalog,
                         current_database,
                     )?;
                 }
@@ -1184,6 +1190,7 @@ pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
 ) -> Result<StatementResult, String> {
@@ -1208,6 +1215,7 @@ pub(crate) fn dispatch_statement(
                 state,
                 &name,
                 &target_ref,
+                current_catalog,
                 current_database,
             )
         }
@@ -4044,6 +4052,7 @@ enable_path_style_access = true
         register_connector_backends(&state);
         let err = dispatch_statement(
             &state,
+            None,
             "analytics",
             crate::sql::parser::ast::Statement::RefreshMaterializedView(
                 crate::sql::parser::ast::RefreshMaterializedViewStmt {
