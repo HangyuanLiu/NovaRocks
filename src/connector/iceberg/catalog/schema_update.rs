@@ -1905,6 +1905,78 @@ mod tests {
         .await;
         assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
     }
+
+    #[test]
+    fn reserved_key_format_version() {
+        let reason = is_reserved_property_key("format-version").expect("denied");
+        let lower = reason.to_lowercase();
+        assert!(lower.contains("upgrade table") || lower.contains("format-version"));
+    }
+
+    #[test]
+    fn reserved_key_identifier_field_ids() {
+        assert!(is_reserved_property_key("identifier-field-ids").is_some());
+    }
+
+    #[test]
+    fn reserved_key_internal_schema_id() {
+        assert!(is_reserved_property_key("current-schema-id").is_some());
+        assert!(is_reserved_property_key("default-spec-id").is_some());
+        assert!(is_reserved_property_key("default-sort-order-id").is_some());
+    }
+
+    #[test]
+    fn reserved_key_internal_counters() {
+        assert!(is_reserved_property_key("last-column-id").is_some());
+        assert!(is_reserved_property_key("last-partition-id").is_some());
+        assert!(is_reserved_property_key("last-sequence-number").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_logical_type_prefix() {
+        assert!(is_reserved_property_key("novarocks.logical_type.foo").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_column_agg_prefix() {
+        assert!(is_reserved_property_key("novarocks.column_agg.bar").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_table_key_columns() {
+        assert!(is_reserved_property_key("novarocks.table.key_columns").is_some());
+    }
+
+    #[test]
+    fn reserved_key_novarocks_nullability_attested_prefix() {
+        assert!(
+            is_reserved_property_key("novarocks.nullability.attested.address.street").is_some()
+        );
+    }
+
+    #[test]
+    fn reserved_key_novarocks_unknown_prefix_blocked() {
+        // Forward-compat: any unknown novarocks.* key is reserved.
+        assert!(is_reserved_property_key("novarocks.future.feature").is_some());
+        assert!(is_reserved_property_key("novarocks.x").is_some());
+    }
+
+    #[test]
+    fn reserved_key_allows_iceberg_write_props() {
+        assert!(is_reserved_property_key("write.parquet.compression-codec").is_none());
+        assert!(is_reserved_property_key("write.format.default").is_none());
+        assert!(is_reserved_property_key("write.target-file-size-bytes").is_none());
+        assert!(is_reserved_property_key("history.expire.max-snapshot-age-ms").is_none());
+        assert!(is_reserved_property_key("commit.retry.num-retries").is_none());
+        assert!(is_reserved_property_key("gc.enabled").is_none());
+    }
+
+    #[test]
+    fn reserved_key_allows_user_custom_keys() {
+        assert!(is_reserved_property_key("my.custom.key").is_none());
+        assert!(is_reserved_property_key("foo").is_none());
+        assert!(is_reserved_property_key("comment").is_none());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -3427,6 +3499,34 @@ fn managed_mv_dependencies_for_target(
             target: target.clone(),
         })
         .collect())
+}
+
+/// Whether a property key is reserved (cannot be set/unset by SET TBLPROPERTIES).
+/// Returns `None` if the key is user-modifiable, or `Some(reason)` containing a
+/// human-readable category to include in the error message.
+#[allow(dead_code)]
+fn is_reserved_property_key(key: &str) -> Option<&'static str> {
+    if key == "format-version" {
+        return Some(
+            "format-version is reserved; use UPGRADE TABLE syntax (not yet implemented in NovaRocks)",
+        );
+    }
+    if matches!(
+        key,
+        "identifier-field-ids"
+            | "current-schema-id"
+            | "default-spec-id"
+            | "default-sort-order-id"
+            | "last-column-id"
+            | "last-partition-id"
+            | "last-sequence-number"
+    ) {
+        return Some("Iceberg internal metadata key, not user-settable");
+    }
+    if key.starts_with("novarocks.") {
+        return Some("novarocks.* namespace is reserved for engine-managed properties");
+    }
+    None
 }
 
 /// Whether an iceberg-rust commit error represents a transient table-requirement
