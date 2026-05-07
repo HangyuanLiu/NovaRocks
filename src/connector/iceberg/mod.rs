@@ -32,6 +32,7 @@ pub mod scan_deletes;
 pub mod schema;
 pub mod sink;
 mod state;
+pub(crate) mod variant_write;
 
 use crate::novarocks_config::config as novarocks_app_config;
 

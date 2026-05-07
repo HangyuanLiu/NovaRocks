@@ -240,6 +240,12 @@ impl SchemaVisitor for SchemaToAvroSchema {
             PrimitiveType::Decimal { precision, scale } => {
                 avro_decimal_schema(*precision as usize, *scale as usize)?
             }
+            PrimitiveType::Variant => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "variant primitive type cannot be used in this context yet",
+                ));
+            }
         };
         Ok(Either::Left(avro_schema))
     }

@@ -176,6 +176,60 @@ Concretely:
 Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
 `_last_updated_sequence_number` = 2147483539 = `i32::MAX - 108`.
 
+## Patch 6 — `PrimitiveType::Variant` + Arrow Struct mapping
+
+Files: `src/spec/datatypes.rs`, `src/arrow/schema.rs`.
+
+iceberg-rust 0.9.0 has no `PrimitiveType::Variant` arm, so any
+`metadata.json` field with `"type": "variant"` fails to deserialize.
+NovaRocks needs to read AND write Iceberg v3 tables that carry variant
+columns. This patch adds:
+
+* `PrimitiveType::Variant` on the `PrimitiveType` enum, going through
+  the default lowercase rename so serde reads/writes `"variant"` as
+  expected. The compatibility table never matches a literal — variant
+  default values / partition / stats are all out-of-scope for now.
+* `ToArrowSchemaConverter::primitive` returns
+  `DataType::Struct{ metadata: Binary req, value: Binary req }` for
+  `Variant`. Subfields deliberately carry no `PARQUET:field_id` —
+  spec assigns one iceberg field id to the variant column itself.
+* `ToArrowSchemaConverter::field` attaches
+  `ARROW:extension:name = "arrow.parquet.variant"` (with empty
+  `ARROW:extension:metadata`) when the underlying iceberg type is
+  `Variant`. parquet-rs 58.2 reads these keys and emits
+  `LogicalType::Variant` automatically when the consumer enables the
+  `variant_experimental` feature.
+
+When upstream iceberg-rust 0.10/0.11 ships native variant support,
+this whole block becomes redundant; remove the enum arm, the primitive
+arm, and the metadata-key attachments together.
+
+Spec ref: <https://iceberg.apache.org/spec/#variant> and
+parquet's `LogicalType::Variant` (parquet-rs source
+`src/arrow/schema/extension.rs::logical_type_for_struct`).
+
+## Patch 7 — bump arrow / parquet to 58.2
+
+Files: `Cargo.toml` (vendor copy only; root is bumped in lock-step),
+`src/transform/temporal.rs`.
+
+iceberg-rust 0.9.0 originally pinned `arrow-* = "57.1"` and
+`parquet = "57.1"`. NovaRocks needs parquet 58.x to reach the
+`variant_experimental` feature (used by PATCH 6 to emit
+`LogicalType::Variant`). The diff is mechanical — every `"57.1"` literal
+in `[dependencies.arrow-*]` and `[dependencies.parquet]` becomes `"58.2"`.
+
+arrow 58.0 deprecates `Date32Type::to_naive_date` in favour of
+`to_naive_date_opt`. `src/transform/temporal.rs` calls the deprecated
+form at three sites (the `Year` and `Month` transforms over `Date`
+literals); each is rewritten to
+`to_naive_date_opt(*v).expect("Date32Type::to_naive_date_opt overflow")`,
+preserving the previous panic-on-overflow semantics while clearing the
+`-D warnings` build.
+
+When upstream iceberg-rust 0.10 lands with its own arrow/parquet bump,
+this entry is removed by the same path that already retires PATCH 1–5.
+
 ## Verification after rebase
 
 When bumping the vendored copy to a newer iceberg-rust patch release:

@@ -427,6 +427,12 @@ impl Datum {
                     )
                 })?)
             }
+            PrimitiveType::Variant => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "variant primitive type cannot be used in this context yet",
+                ));
+            }
         };
         Ok(Datum::new(data_type, literal))
     }

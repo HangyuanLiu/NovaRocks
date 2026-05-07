@@ -342,6 +342,20 @@ pub(crate) fn sqlparser_function_to_literal(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
         }
+        "parse_json" => {
+            if args.len() != 1 {
+                return Err("parse_json expects 1 argument".to_string());
+            }
+            let Literal::String(json_text) = sqlparser_expr_to_literal(args[0])? else {
+                return Err("parse_json expects VARCHAR argument".to_string());
+            };
+            let bytes = crate::exec::variant_encode::encode_json_text_to_variant_bytes(&json_text)
+                .map_err(|e| format!("parse_json failed: {e}"))?;
+            // Pack raw variant bytes into Literal::String via Latin-1 (matches
+            // `to_binary` convention; INSERT VALUES decodes via
+            // `latin1_string_to_bytes`).
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+        }
         "row" => Ok(Literal::Struct(
             args.into_iter()
                 .map(sqlparser_expr_to_literal)
@@ -731,6 +745,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
                 .collect::<Result<Vec<_>, String>>()?
                 .into(),
         )),
+        SqlType::Variant => Ok(DataType::LargeBinary),
     }
 }
 
@@ -1091,5 +1106,38 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert!(matches!(items[0], Literal::Int(1)));
         assert!(matches!(items[2], Literal::Int(3)));
+    }
+
+    #[test]
+    fn parse_json_folds_to_variant_bytes_via_latin1_string() {
+        // sqlparser builds a Function node for `parse_json('{"a":1}')`.
+        let raw = parse_expr(r#"parse_json('{"a":1}')"#);
+        let sqlparser::ast::Expr::Function(ref func) = raw else {
+            panic!("expected Function node, got {raw:?}");
+        };
+
+        let lit = sqlparser_function_to_literal(func).expect("parse_json fold");
+        let Literal::String(packed) = lit else {
+            panic!("expected Literal::String");
+        };
+        let unpacked = latin1_string_to_bytes(&packed).expect("latin1 decode");
+
+        // Must equal the encoder's output for the same JSON.
+        let expected = crate::exec::variant_encode::encode_json_text_to_variant_bytes(r#"{"a":1}"#)
+            .expect("encode");
+        assert_eq!(unpacked, expected);
+    }
+
+    #[test]
+    fn parse_json_rejects_invalid_argument_count() {
+        let raw = parse_expr(r#"parse_json('{"a":1}', 'extra')"#);
+        let sqlparser::ast::Expr::Function(ref func) = raw else {
+            panic!("expected Function node");
+        };
+        let err = sqlparser_function_to_literal(func).expect_err("must fail");
+        assert!(
+            err.contains("parse_json expects 1 argument"),
+            "unexpected error: {err}"
+        );
     }
 }

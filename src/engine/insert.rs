@@ -335,6 +335,27 @@ fn build_local_literal_array(
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::LargeBinary => {
+            // VARIANT lowers to LargeBinary; INSERT VALUES carries the encoded
+            // variant bytes packed into Literal::String via Latin-1 (see
+            // `parse_json` / `to_binary` in src/engine/sql_expr.rs).
+            let mut builder = LargeBinaryBuilder::new();
+            for literal in values {
+                match literal {
+                    Literal::Null => builder.append_null(),
+                    Literal::String(v) | Literal::Date(v) => {
+                        builder.append_value(latin1_string_to_bytes(v)?)
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for VARIANT/LARGEBINARY",
+                            other
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         DataType::Utf8 => Ok(Arc::new(StringArray::from(
             values
                 .iter()
@@ -588,6 +609,43 @@ mod tests {
         let result = reorder_insert_rows(&rows, &insert_columns, &target_columns).expect("reorder");
         assert_eq!(result[0][0], Literal::Int(1));
         assert_eq!(result[0][1], Literal::Int(5));
+    }
+
+    #[test]
+    fn build_local_literal_array_large_binary_accepts_latin1_packed_bytes() {
+        use crate::engine::sql_expr::bytes_to_latin1_string;
+        use arrow::array::{Array, LargeBinaryArray};
+
+        let raw: &[u8] = &[1u8, 2, 3];
+        let packed = bytes_to_latin1_string(raw);
+        let lit_owned = vec![Literal::String(packed)];
+        let lit_refs: Vec<&Literal> = lit_owned.iter().collect();
+
+        let array = build_local_literal_array(&DataType::LargeBinary, &lit_refs, true)
+            .expect("build LargeBinary array");
+        let arr = array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("LargeBinaryArray");
+        assert_eq!(arr.len(), 1);
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), raw);
+    }
+
+    #[test]
+    fn build_local_literal_array_large_binary_appends_null() {
+        use arrow::array::{Array, LargeBinaryArray};
+
+        let lit_owned = vec![Literal::Null];
+        let lit_refs: Vec<&Literal> = lit_owned.iter().collect();
+        let array = build_local_literal_array(&DataType::LargeBinary, &lit_refs, true)
+            .expect("build LargeBinary array");
+        let arr = array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("LargeBinaryArray");
+        assert_eq!(arr.len(), 1);
+        assert!(arr.is_null(0));
     }
 
     #[test]
