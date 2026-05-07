@@ -307,12 +307,14 @@ The standalone server supports session context such as `USE <db>`,
 
 ## Local Iceberg REST + MinIO + Spark Environment
 
-Codex workspaces can use `.codex/environments` to start an isolated Iceberg
-REST + MinIO + Spark environment. After setup, discover the active ports and
-generated configs from the fixed entry:
+The `docker/iceberg-rest/` directory contains a workspace-scoped Iceberg REST
++ MinIO + Spark environment used by both local development and CI. Bring it
+up, then discover the active ports and generated configs from the fixed
+entry:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
 ```
 
 Useful generated values:
@@ -330,7 +332,7 @@ Useful generated values:
 Start standalone-server with the generated object-store config:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
@@ -339,8 +341,8 @@ Generate an Iceberg format-v3 table through Spark using the same REST Catalog
 and MinIO object store:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
-.codex/environments/iceberg-rest-spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
 Spark uses the Docker-network endpoints `http://rest:8181` and
@@ -349,11 +351,14 @@ Spark uses the Docker-network endpoints `http://rest:8181` and
 Run the cross-engine Iceberg compatibility SQL suite:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 ```
+
+See [`docker/iceberg-rest/README.md`](docker/iceberg-rest/README.md) for the
+full guide, including required Docker images and a CI integration example.
 
 ## SQL Regression Tests
 
@@ -367,10 +372,10 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   -j 4
 ```
 
-When using the generated Codex environment:
+When using the generated local environment:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg \

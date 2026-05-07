@@ -22,4 +22,4 @@ nosetests.xml
 /.claude/worktrees/
 /.claude/scheduled_tasks.lock
 /.codex/worktrees/
-/.codex/environments/runtime/
+/docker/iceberg-rest/runtime/

@@ -28,7 +28,7 @@ INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0} VALUES
   (2, 'spark-rest-minio-b', 20),
   (3, 'spark-rest-minio-c', 30);
 SPARK_SQL
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/.codex/environments/iceberg-rest-spark-sql.sh" "$tmp_sql"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'
 
 -- query 2
