@@ -54,9 +54,10 @@ use self::statement::{
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
     looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
-    looks_like_alter_partition_column, looks_like_alter_table_optimize,
-    looks_like_alter_table_rewrite_manifests, looks_like_show_alter_table_optimize,
-    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
+    looks_like_alter_partition_column, looks_like_alter_table_expire_snapshots,
+    looks_like_alter_table_optimize, looks_like_alter_table_rewrite_manifests,
+    looks_like_show_alter_table_optimize, parse_alter_iceberg_properties_sql,
+    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
     parse_alter_table_optimize_sql, parse_alter_table_rewrite_manifests_sql,
     parse_show_alter_table_optimize_sql,
 };
@@ -483,6 +484,14 @@ impl StandaloneSession {
         if looks_like_alter_table_rewrite_manifests(&normalized) {
             let stmt = parse_alter_table_rewrite_manifests_sql(&normalized)?;
             return self.handle_alter_table_rewrite_manifests(
+                stmt,
+                current_catalog,
+                current_database,
+            );
+        }
+        if looks_like_alter_table_expire_snapshots(&normalized) {
+            let stmt = parse_alter_table_expire_snapshots_sql(&normalized)?;
+            return self.handle_alter_table_expire_snapshots(
                 stmt,
                 current_catalog,
                 current_database,
@@ -928,6 +937,31 @@ impl StandaloneSession {
         )
     }
 
+    fn handle_alter_table_expire_snapshots(
+        &self,
+        stmt: crate::engine::statement::AlterTableExpireSnapshotsStmt,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &stmt.table,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "EXPIRE SNAPSHOTS only supports iceberg backends, got `{}`",
+                target.backend_name
+            ));
+        }
+        crate::engine::iceberg_expire_snapshots::execute_iceberg_expire_snapshots(
+            &self.inner,
+            &target,
+            &stmt,
+        )
+    }
+
     fn handle_show_alter_table_optimize(
         &self,
         stmt: crate::engine::statement::ShowAlterTableOptimizeStmt,
@@ -1257,6 +1291,7 @@ fn iceberg_optimize_state_name(
 
 pub(crate) mod delete_flow;
 pub(crate) mod equality_delete_flow;
+pub(crate) mod iceberg_expire_snapshots;
 pub(crate) mod iceberg_rewrite_manifests;
 pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;

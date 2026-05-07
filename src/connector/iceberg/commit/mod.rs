@@ -27,6 +27,7 @@ mod action;
 mod collector;
 mod data_file;
 mod equality_delete_writer;
+pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
 mod overwrite;

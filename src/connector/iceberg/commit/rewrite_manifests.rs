@@ -1052,7 +1052,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(entries.len(), 3, "merged manifest must contain all 3 entries");
+        assert_eq!(
+            entries.len(),
+            3,
+            "merged manifest must contain all 3 entries"
+        );
 
         // After the fix, each data_file must carry its explicit first_row_id
         // stamped from the source manifest's first_row_id + cumulative offset.
