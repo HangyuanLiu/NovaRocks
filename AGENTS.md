@@ -404,25 +404,27 @@ SQL client / SQL test runner / one-shot CLI
 - `[spill]`
   Spill enablement, directories, block size, and compression strategy
 
-### 7.3 Codex Local Test Environment
+### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
 
-Codex workspaces use `.codex/environments/environment.toml` to start a
-workspace-scoped Iceberg REST + MinIO + Spark test environment.
+The canonical local test fixture lives at `docker/iceberg-rest/` and is also
+the CI fixture for the `iceberg` and `iceberg-compatibility` SQL suites. The
+Codex workspace manifest at `.codex/environments/environment.toml` points its
+setup/cleanup hooks at this directory.
 
 Do not guess local ports such as `9000`, `8181`, or `9030`. Always discover the
 active workspace environment from the fixed generated entry:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 ```
 
 Important generated locations:
 
-- `.codex/environments/runtime/current/env.sh`
+- `docker/iceberg-rest/runtime/current/env.sh`
   Shell exports for the active workspace. Prefer this for commands.
-- `.codex/environments/runtime/current/manifest.json`
+- `docker/iceberg-rest/runtime/current/manifest.json`
   Machine-readable endpoints, ports, Docker Compose project, warehouses, and config paths.
-- `.codex/environments/runtime/current/README.md`
+- `docker/iceberg-rest/runtime/current/README.md`
   Human-readable summary of the active environment.
 
 Important environment variables after sourcing `env.sh`:
@@ -442,14 +444,14 @@ Important environment variables after sourcing `env.sh`:
 If the fixed entry is missing, initialize or inspect the environment with:
 
 ```bash
-.codex/environments/iceberg-rest-up.sh
-.codex/environments/iceberg-rest-status.sh
+docker/iceberg-rest/up.sh
+docker/iceberg-rest/status.sh
 ```
 
 Start standalone-server against the generated config:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
@@ -457,7 +459,7 @@ cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 Run SQL tests with the generated runner config:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
@@ -467,7 +469,7 @@ Run cross-engine Iceberg compatibility tests where Spark writes through REST
 Catalog + MinIO and NovaRocks reads the table:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
@@ -477,8 +479,8 @@ Generate an Iceberg format-v3 table through Spark against the same REST Catalog
 and MinIO services:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
-.codex/environments/iceberg-rest-spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
 Inside the Docker network, Spark must use `http://rest:8181` for REST Catalog
@@ -486,9 +488,9 @@ and `http://minio:9000` for object storage. NovaRocks should use the host
 endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
-Workspace cleanup uses `.codex/environments/iceberg-rest-down.sh --purge`,
-which removes the workspace-specific Docker Compose project, MinIO volume, and
-generated runtime entry.
+Workspace cleanup uses `docker/iceberg-rest/down.sh --purge`, which removes
+the workspace-specific Docker Compose project, MinIO volume, and generated
+runtime entry.
 
 ---
 
@@ -521,8 +523,8 @@ generated runtime entry.
 
 Unified runner under `sql-tests`. It requires a running NovaRocks
 MySQL-compatible standalone server. Do not assume a fixed port in Codex
-workspaces; source `.codex/environments/runtime/current/env.sh` when that entry
-exists.
+workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
+entry exists.
 
 **Start standalone-server (no external FE needed):**
 
@@ -534,10 +536,10 @@ NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --port 9030
 NO_PROXY=127.0.0.1,localhost cargo run --release -- standalone-server --port 9030
 ```
 
-When the Codex local test environment is active:
+When the local test environment is active:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
@@ -552,7 +554,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 With a generated runner config:
 
 ```bash
-source .codex/environments/runtime/current/env.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify

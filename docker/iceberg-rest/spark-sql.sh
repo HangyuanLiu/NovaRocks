@@ -7,7 +7,7 @@ CURRENT_ENV="$SCRIPT_DIR/runtime/current/env.sh"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then
   echo "environment is not initialized: $CURRENT_ENV" >&2
-  echo "run .codex/environments/iceberg-rest-up.sh first" >&2
+  echo "run docker/iceberg-rest/up.sh first" >&2
   exit 1
 fi
 
