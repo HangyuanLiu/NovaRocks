@@ -14,17 +14,21 @@ use crate::engine::insert::reorder_insert_rows;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
-use crate::sql::parser::ast::{InsertSource, ObjectName};
+use crate::sql::parser::ast::{InsertSource, ObjectName, OverwriteMode};
 
 pub(crate) fn run_insert(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
     columns: &[String],
     source: &InsertSource,
-    overwrite: bool,
+    overwrite_mode: OverwriteMode,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    let is_overwrite = matches!(
+        overwrite_mode,
+        OverwriteMode::FullTable | OverwriteMode::DynamicPartitions,
+    );
     // Detect branch/tag suffix in the table name (e.g. `t.branch_dev`).
     let (stripped_parts, ref_suffix) = split_ref_suffix(&name.parts);
     let effective_name;
@@ -77,10 +81,25 @@ pub(crate) fn run_insert(
         }
     }
 
+    // INSERT OVERWRITE PARTITIONS is only meaningful on a partitioned iceberg
+    // table (the partition-table + v3-row-lineage requirements are checked
+    // engine-side once metadata is loaded; see OverwritePartitionsCommit). The
+    // backend gate is fail-fast here so non-iceberg backends get a precise
+    // error rather than the generic OVERWRITE one.
+    if matches!(overwrite_mode, OverwriteMode::DynamicPartitions)
+        && target.backend_name != "iceberg"
+    {
+        return Err(format!(
+            "INSERT OVERWRITE PARTITIONS is only supported for iceberg backends, \
+             target uses backend `{}`",
+            target.backend_name
+        ));
+    }
+
     // INSERT OVERWRITE is only supported on iceberg backends in phase 1.
     // For non-iceberg targets, fail fast with a clear message instead of
     // silently doing INSERT INTO.
-    if overwrite && target.backend_name != "iceberg" {
+    if is_overwrite && target.backend_name != "iceberg" {
         return Err(format!(
             "INSERT OVERWRITE is only supported for iceberg backends in phase 1, \
              target uses backend `{}`",
@@ -93,7 +112,7 @@ pub(crate) fn run_insert(
     // INSERT INTO without a branch target continues to use the existing fast-append path
     // via sink.append_rows for backwards compatibility.
     let needs_iceberg_pipeline = target.backend_name == "iceberg"
-        && (overwrite || matches!(source, InsertSource::FromQuery(_)) || target_ref != "main");
+        && (is_overwrite || matches!(source, InsertSource::FromQuery(_)) || target_ref != "main");
     if needs_iceberg_pipeline {
         return crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
             state,
@@ -101,7 +120,7 @@ pub(crate) fn run_insert(
             &resolved,
             columns,
             source,
-            overwrite,
+            overwrite_mode,
             &target_ref,
         );
     }
@@ -128,7 +147,7 @@ pub(crate) fn run_insert(
                     name,
                     columns,
                     part,
-                    overwrite,
+                    overwrite_mode,
                     current_catalog,
                     current_database,
                 )?;

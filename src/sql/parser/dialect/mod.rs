@@ -3,6 +3,7 @@ pub(crate) mod create_catalog;
 pub(crate) mod create_table;
 pub(crate) mod drop;
 pub(crate) mod materialized_view;
+pub(crate) mod truncate;
 
 use sqlparser::ast as sqlast;
 use sqlparser::keywords::Keyword;
@@ -228,6 +229,7 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = normalize_function_syntax(&sql)?;
     let sql = rewrite_version_as_of_string(&sql)?;
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
+    let sql = rewrite_overwrite_partitions(&sql)?;
     Ok(rewrite_create_table_nested_generic_closers(&sql))
 }
 
@@ -472,6 +474,170 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             output.push_str(ref_name);
             output.push('\'');
             idx = qi + 1; // Move past the closing quote.
+            continue;
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    Ok(output)
+}
+
+/// Rewrite `INSERT OVERWRITE PARTITIONS [TABLE] <name>` so that sqlparser-rs
+/// can accept it.
+///
+/// sqlparser-rs does not recognise the `PARTITIONS` keyword in this position.
+/// This rewriter drops the `PARTITIONS` token and prepends the reserved marker
+/// identifier `__nr_op_dyn` as a leading name segment on the table object.
+/// Downstream code (`convert_sqlparser_insert_to_custom`) detects the marker
+/// and sets `OverwriteMode::DynamicPartitions`.
+///
+/// # Marker convention
+///
+/// `__nr_op_dyn` (NovaRocks reserved identifier — never a real table name).
+/// It carries no meaning to sqlparser; it is purely an out-of-band signal from
+/// the normaliser to the AST converter.
+///
+/// # Examples
+///
+/// ```text
+/// INSERT OVERWRITE PARTITIONS t VALUES (1)
+///     → INSERT OVERWRITE __nr_op_dyn.t VALUES (1)
+///
+/// INSERT OVERWRITE PARTITIONS TABLE x.y.z SELECT ...
+///     → INSERT OVERWRITE TABLE __nr_op_dyn.x.y.z SELECT ...
+///
+/// INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)
+///     → INSERT OVERWRITE __nr_op_dyn.t.branch_dev VALUES (1)
+/// ```
+fn rewrite_overwrite_partitions(sql: &str) -> Result<String, String> {
+    // Fast path: no PARTITIONS keyword at all.
+    let sql_lower = sql.to_ascii_lowercase();
+    if !sql_lower.contains("partitions") {
+        return Ok(sql.to_string());
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 16);
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        // Track quoted contexts so we never rewrite inside string literals.
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                in_double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Look for `INSERT` keyword (word boundary on left).
+        if starts_with_keyword(bytes, idx, "insert")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+            && !is_identifier_byte(bytes.get(idx + "insert".len()).copied())
+        {
+            let after_insert = skip_ascii_whitespace(bytes, idx + "insert".len());
+
+            // Must be followed by `OVERWRITE`.
+            if !starts_with_keyword(bytes, after_insert, "overwrite")
+                || is_identifier_byte(bytes.get(after_insert + "overwrite".len()).copied())
+            {
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+            let after_overwrite = skip_ascii_whitespace(bytes, after_insert + "overwrite".len());
+
+            // Must be followed by `PARTITIONS`.
+            if !starts_with_keyword(bytes, after_overwrite, "partitions")
+                || is_identifier_byte(bytes.get(after_overwrite + "partitions".len()).copied())
+            {
+                // Not our pattern — emit unchanged.
+                output.push(byte as char);
+                idx += 1;
+                continue;
+            }
+            let after_partitions =
+                skip_ascii_whitespace(bytes, after_overwrite + "partitions".len());
+
+            // Optional `TABLE` keyword.
+            let (emit_table_kw, name_start) =
+                if starts_with_keyword(bytes, after_partitions, "table")
+                    && !is_identifier_byte(bytes.get(after_partitions + "table".len()).copied())
+                {
+                    (
+                        true,
+                        skip_ascii_whitespace(bytes, after_partitions + "table".len()),
+                    )
+                } else {
+                    (false, after_partitions)
+                };
+
+            // Emit: `INSERT OVERWRITE` (preserving original keyword casing),
+            // then optionally ` TABLE`, then ` __nr_op_dyn.<rest>`.
+            //
+            // `after_insert` points to the first byte of OVERWRITE; emit the
+            // original INSERT + whitespace segment, then OVERWRITE itself.
+            // Avoid including trailing whitespace in the slice so we can emit
+            // exactly one space separator regardless of the original spacing.
+            let overwrite_end = after_insert + "overwrite".len();
+            output.push_str(&sql[idx..overwrite_end]);
+
+            if emit_table_kw {
+                output.push_str(" TABLE ");
+            } else {
+                output.push(' ');
+            }
+
+            output.push_str("__nr_op_dyn.");
+            // name_start points at the first byte of the table name — emit the
+            // rest of the SQL from there.
+            idx = name_start;
             continue;
         }
 
@@ -1673,5 +1839,73 @@ mod tests {
         let input = "SELECT * FROM t$snapshots AS s";
         let got = super::normalize_for_raw_parse(input).expect("normalize");
         assert_eq!(got, "SELECT * FROM t.__nr_meta_snapshots__ AS s");
+    }
+
+    // ----- rewrite_overwrite_partitions tests -----
+
+    #[test]
+    fn rewrite_overwrite_partitions_injects_marker_no_table_keyword() {
+        let normalized =
+            super::rewrite_overwrite_partitions("INSERT OVERWRITE PARTITIONS t VALUES (1)")
+                .expect("rewrite should succeed");
+        assert_eq!(normalized, "INSERT OVERWRITE __nr_op_dyn.t VALUES (1)");
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_injects_marker_with_table_keyword() {
+        let normalized = super::rewrite_overwrite_partitions(
+            "INSERT OVERWRITE PARTITIONS TABLE t SELECT * FROM s",
+        )
+        .expect("rewrite should succeed");
+        assert_eq!(
+            normalized,
+            "INSERT OVERWRITE TABLE __nr_op_dyn.t SELECT * FROM s"
+        );
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_injects_marker_multi_part_name() {
+        let normalized =
+            super::rewrite_overwrite_partitions("INSERT OVERWRITE PARTITIONS x.y.z SELECT 1")
+                .expect("rewrite should succeed");
+        assert_eq!(normalized, "INSERT OVERWRITE __nr_op_dyn.x.y.z SELECT 1");
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_injects_marker_with_branch_suffix() {
+        let normalized = super::rewrite_overwrite_partitions(
+            "INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)",
+        )
+        .expect("rewrite should succeed");
+        assert_eq!(
+            normalized,
+            "INSERT OVERWRITE __nr_op_dyn.t.branch_dev VALUES (1)"
+        );
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_case_insensitive() {
+        let normalized =
+            super::rewrite_overwrite_partitions("insert overwrite partitions t values (1)")
+                .expect("rewrite should succeed");
+        assert_eq!(normalized, "insert overwrite __nr_op_dyn.t values (1)");
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_passes_through_plain_overwrite() {
+        let sql = "INSERT OVERWRITE TABLE t VALUES (1)";
+        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_passes_through_unrelated_sql() {
+        let sql = "SELECT 'INSERT OVERWRITE PARTITIONS' AS s";
+        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
+    }
+
+    #[test]
+    fn rewrite_overwrite_partitions_does_not_rewrite_in_double_quoted_literal() {
+        let sql = r#"SELECT "INSERT OVERWRITE PARTITIONS t" AS s"#;
+        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
     }
 }

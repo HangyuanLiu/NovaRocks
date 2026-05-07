@@ -1,0 +1,38 @@
+-- query 3
+region	n
+eu	2
+us	2
+
+-- query 5
+region	n
+eu	2
+us	1
+
+-- query 6
+id	region
+99	us
+
+-- query 10
+region	n
+eu	1
+us	1
+
+-- query 14
+region	n
+eu	1
+us	2
+
+-- query 16
+id	region
+4	eu
+99	us
+
+-- query 22
+id	region
+2	eu
+99	us
+
+-- query 23
+id	region
+1	us
+2	eu

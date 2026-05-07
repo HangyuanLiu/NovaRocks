@@ -1,5 +1,5 @@
 use iceberg::spec::{
-    PartitionSpecRef, PrimitiveType, Schema, Transform, Type, UnboundPartitionField,
+    PartitionSpecRef, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionField,
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
 
@@ -209,6 +209,47 @@ fn validate_transform(
     Ok(())
 }
 
+/// Result of testing whether a base file's partition falls into the set
+/// of partitions touched by a new write under `INSERT OVERWRITE PARTITIONS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionMatch {
+    /// The base file's partition is one of the touched partitions
+    /// (same partition spec, same partition values).
+    InSet,
+    /// The base file's partition is NOT in the touched set
+    /// (same partition spec, different partition values).
+    NotInSet,
+    /// The base file was written under a different partition spec than
+    /// the current write. Cross-spec OVERWRITE PARTITIONS is not yet
+    /// supported — the caller must turn this into a user-facing reject:
+    /// "OVERWRITE PARTITIONS: base file under historical partition spec X
+    /// cannot be matched against current spec Y; run OPTIMIZE TABLE to
+    /// consolidate first".
+    DifferentSpec,
+}
+
+/// Decide how a base file's `(partition_struct, spec_id)` relates to the
+/// set of partitions touched by the new files. `current_spec_id` is the
+/// partition spec id used by every entry in `touched`.
+///
+/// Returns `InSet` if any touched partition is exactly equal to `base`,
+/// `NotInSet` if none match, `DifferentSpec` if `base_spec_id !=
+/// current_spec_id`.
+pub(crate) fn partition_match_in_touched(
+    base: &Struct,
+    base_spec_id: i32,
+    current_spec_id: i32,
+    touched: &[Struct],
+) -> PartitionMatch {
+    if base_spec_id != current_spec_id {
+        return PartitionMatch::DifferentSpec;
+    }
+    if touched.iter().any(|t| t == base) {
+        return PartitionMatch::InSet;
+    }
+    PartitionMatch::NotInSet
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -282,5 +323,58 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("date/timestamp"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod overwrite_partitions_match_tests {
+    use iceberg::spec::{Literal, PrimitiveLiteral, Struct};
+
+    use super::*;
+
+    fn region(value: &str) -> Struct {
+        Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
+            value.to_string(),
+        )))])
+    }
+
+    #[test]
+    fn same_spec_equal_partition_returns_in_set() {
+        let base = region("us");
+        let touched = vec![region("us"), region("eu")];
+        assert_eq!(
+            partition_match_in_touched(&base, /*base_spec=*/ 0, /*current=*/ 0, &touched),
+            PartitionMatch::InSet,
+        );
+    }
+
+    #[test]
+    fn same_spec_unequal_partition_returns_not_in_set() {
+        let base = region("ap");
+        let touched = vec![region("us"), region("eu")];
+        assert_eq!(
+            partition_match_in_touched(&base, 0, 0, &touched),
+            PartitionMatch::NotInSet,
+        );
+    }
+
+    #[test]
+    fn different_spec_returns_different_spec() {
+        let base = region("us");
+        let touched = vec![region("us")];
+        assert_eq!(
+            partition_match_in_touched(&base, /*base=*/ 1, /*current=*/ 0, &touched),
+            PartitionMatch::DifferentSpec,
+        );
+    }
+
+    #[test]
+    fn empty_touched_returns_not_in_set() {
+        let base = region("us");
+        let touched: Vec<Struct> = vec![];
+        assert_eq!(
+            partition_match_in_touched(&base, 0, 0, &touched),
+            PartitionMatch::NotInSet,
+        );
     }
 }
