@@ -554,8 +554,14 @@ impl StandaloneSession {
             return self.handle_create_catalog(result);
         }
         if looks_like_create_database(&parser) {
-            let db_name = crate::sql::parser::dialect::parse_create_database_name(&mut parser)?;
-            return execute_create_database_statement(&self.inner, &db_name, current_catalog);
+            let (db_name, if_not_exists) =
+                crate::sql::parser::dialect::parse_create_database_name(&mut parser)?;
+            return execute_create_database_statement(
+                &self.inner,
+                &db_name,
+                if_not_exists,
+                current_catalog,
+            );
         }
         if looks_like_drop_statement(&parser) {
             let drop = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
