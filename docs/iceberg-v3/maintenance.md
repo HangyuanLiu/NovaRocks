@@ -1,14 +1,14 @@
 # 维护 / 治理
 
-> Iceberg 的运维操作：压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 等。NovaRocks 当前只有 OPTIMIZE TABLE 的 whole-table 路径，其他治理操作仍待补。
+> Iceberg 的运维操作：压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 等。NovaRocks 支持 OPTIMIZE TABLE（whole-table 压缩）、EXPIRE SNAPSHOTS、REMOVE ORPHAN FILES、REWRITE MANIFESTS；增量压缩、自动调度等高级治理能力仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `OPTIMIZE TABLE`（whole-table 文件压缩） | ✅ | `src/connector/iceberg/compact.rs` |
 | `OPTIMIZE TABLE` 增量（仅小文件 / 仅 partition） | ❌ | |
-| `EXPIRE SNAPSHOTS` | ❌ | |
-| `REMOVE ORPHAN FILES` | ❌ | |
-| `REWRITE MANIFESTS` | ❌ | |
+| `EXPIRE SNAPSHOTS` | ✅ | `src/connector/iceberg/commit/expire_snapshots.rs` |
+| `REMOVE ORPHAN FILES` | ✅ | `src/connector/iceberg/commit/remove_orphan_files.rs` |
+| `REWRITE MANIFESTS` | ✅ | `src/connector/iceberg/commit/rewrite_manifests.rs` |
 | `REWRITE POSITION DELETES`（v2→DV） | ❌ | |
 | `REWRITE DATA FILES BY SORT ORDER` | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
@@ -42,39 +42,79 @@ ALTER TABLE orders OPTIMIZE WHERE country = 'CN';               -- 仅压指定 
 
 **TODO**：未实现。当前只能 whole-table 压缩，对大表代价高。
 
-## ❌ EXPIRE SNAPSHOTS
+## ✅ EXPIRE SNAPSHOTS
 
-Spec：
+### 行为
+
+删除 `metadata.json` 中不被任何 ref 祖先链覆盖的快照，物理删除其 orphan 文件。OLDER THAN 和 RETAIN LAST 可单独或组合使用，两个条件取交集：只有同时满足"早于时间戳"且"不属于最近 N 个"的 snapshot 才会被删。
+
+### 示例
 
 ```sql
--- 暂未实现
 ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00';
-ALTER TABLE orders EXPIRE SNAPSHOTS RETAIN LAST 50;
+ALTER TABLE orders EXPIRE SNAPSHOTS RETAIN LAST 5;
+ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST 5;
 ```
 
-**TODO**：未实现。当前 snapshot 历史会无限增长，需要外部脚本（Spark / iceberg-cli）做清理。
+### 支持的子集
 
-## ❌ REMOVE ORPHAN FILES
+- Branch / Tag 当前指向的 snapshot 永不过期（所有 ref 头保护）
+- RETAIN LAST 仅对 main ancestor chain 生效
+- per-branch retention 属性（`branch.<n>.min-snapshots-to-keep` 等）**未读取**
+- 至少要给一个 OLDER THAN 或 RETAIN LAST，否则拒绝（防止误清全部历史）
+- 不支持 `t.branch_<x>` 后缀（parse-time reject）
 
-Spec：扫描 warehouse 路径，找到没有被任何 manifest 引用的孤儿 data / delete file，清理。
+### 入口
+
+`src/connector/iceberg/commit/expire_snapshots.rs`
+
+## ✅ REMOVE ORPHAN FILES
+
+### 行为
+
+扫描 warehouse 下 `data/` + `metadata/` 路径，找到不被 `metadata.json` 中任何 snapshot 引用的文件，按 OLDER THAN 阈值过滤后物理删除。不提交新 snapshot，不更新 metadata.json。
+
+### 示例
 
 ```sql
--- 暂未实现
-ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01';
+ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01 00:00:00';
 ```
 
-**TODO**：未实现。
+### 支持的子集
 
-## ❌ REWRITE MANIFESTS
+- OLDER THAN **强制**（建议 ≥ 3 天，防御 in-flight 写入误删）
+- 保护当前 `metadata.json` + metadata-log 中所有历史 `metadata.json`
+- DV puffin 半引用保护：任一 blob 关联 live data file → 整个 puffin 文件保留
+- 支持 `file://`、`s3://`、`oss://` scheme；`hdfs://` **暂未实现**
+- 不支持 `t.branch_<x>` 后缀（parse-time reject）
 
-Spec：把多个小 manifest 合并成大 manifest，加速 plan 阶段。
+### 入口
+
+`src/connector/iceberg/commit/remove_orphan_files.rs`
+
+## ✅ REWRITE MANIFESTS
+
+### 行为
+
+按 `(partition_spec_id, content_type)` 分组将多个 manifest 合并为单个 manifest，发出 `operation=replace` 快照。不移动或重写 data file，仅重建 manifest 层。
+
+### 示例
 
 ```sql
--- 暂未实现
 ALTER TABLE orders REWRITE MANIFESTS;
 ```
 
-**TODO**：未实现。
+### 支持的子集
+
+- 单 manifest / 空表 / 全 singleton 组 → noop（不写新快照）
+- V3 row-lineage 字段（`first_row_id`、`referenced_data_file` 等）保留 round-trip
+- DELETED entry 在合并时丢弃；ADDED + EXISTING 都改成 EXISTING
+- `snapshot.sequence_number` 严格 +1（catalog 不变量），但 entry-level `data_sequence_number` / `file_sequence_number` 保留原值
+- 不支持 `t.branch_<x>` 后缀（parse-time reject）
+
+### 入口
+
+`src/connector/iceberg/commit/rewrite_manifests.rs`
 
 ## ❌ REWRITE POSITION DELETES
 
