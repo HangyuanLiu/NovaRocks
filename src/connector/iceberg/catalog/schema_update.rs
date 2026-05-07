@@ -1625,6 +1625,66 @@ mod tests {
         let new = SqlType::Date;
         assert!(widen_type(&curr, &new).is_err());
     }
+
+    #[test]
+    fn retryable_classifies_current_schema_id_mismatch() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::PreconditionFailed,
+            "Requirement failed: AssertCurrentSchemaIdMatch{current_schema_id=2}",
+        );
+        assert!(is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_classifies_last_assigned_field_id_mismatch() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::PreconditionFailed,
+            "Requirement failed: AssertLastAssignedFieldIdMatch{last_assigned_field_id=12}",
+        );
+        assert!(is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_classifies_ref_snapshot_id_mismatch() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::PreconditionFailed,
+            "Requirement failed: AssertRefSnapshotIdMatch{ref=main, snapshot_id=null}",
+        );
+        assert!(is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_classifies_catalog_commit_conflicts_kind() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "concurrent commit",
+        );
+        assert!(is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_rejects_unrelated_io_error() {
+        let e = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection refused");
+        assert!(!is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_rejects_data_invalid_error() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            "schema rebuild failed: column already exists",
+        );
+        assert!(!is_retryable_commit_conflict(&e));
+    }
+
+    #[test]
+    fn retryable_rejects_precondition_with_unrelated_message() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::PreconditionFailed,
+            "table is read-only",
+        );
+        assert!(!is_retryable_commit_conflict(&e));
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -3109,4 +3169,22 @@ fn managed_mv_dependencies_for_target(
             target: target.clone(),
         })
         .collect())
+}
+
+/// Whether an iceberg-rust commit error represents a transient table-requirement
+/// conflict that warrants a retry (after re-loading the table). Network / IO /
+/// data-invalid / programmer errors are non-retryable.
+#[allow(dead_code)]
+fn is_retryable_commit_conflict(err: &iceberg::Error) -> bool {
+    use iceberg::ErrorKind;
+    match err.kind() {
+        ErrorKind::CatalogCommitConflicts => true,
+        ErrorKind::PreconditionFailed => {
+            let msg = format!("{err}").to_ascii_lowercase();
+            msg.contains("assertcurrentschemaidmatch")
+                || msg.contains("assertlastassignedfieldidmatch")
+                || msg.contains("assertrefsnapshotidmatch")
+        }
+        _ => false,
+    }
 }
