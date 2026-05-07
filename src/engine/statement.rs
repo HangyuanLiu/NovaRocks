@@ -1374,6 +1374,87 @@ pub(crate) fn parse_alter_table_optimize_sql(sql: &str) -> Result<AlterTableOpti
     Ok(AlterTableOptimizeStmt { table })
 }
 
+/// Detect `ALTER TABLE <name> REWRITE MANIFESTS` without full parsing.
+///
+/// Used for fast early-routing in `execute_in_context` before dispatching
+/// to `parse_alter_table_rewrite_manifests_sql`.
+pub(crate) fn looks_like_alter_table_rewrite_manifests(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "REWRITE") && peek_token_word_eq_at(&parser, 1, "MANIFESTS")
+}
+
+/// Parse `ALTER TABLE <name> REWRITE MANIFESTS [;]`.
+///
+/// Rejects:
+/// * Table names whose last part starts with `branch_` or `tag_` AND there are
+///   at least 2 parts (spec §1.1: REWRITE MANIFESTS is table-level only).
+/// * Trailing tokens after MANIFESTS (excluding an optional final semicolon).
+pub(crate) fn parse_alter_table_rewrite_manifests_sql(
+    sql: &str,
+) -> Result<AlterTableRewriteManifestsStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE REWRITE MANIFESTS: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject branch / tag suffix per spec §1.1.
+    // Rule: the LAST part starts with `branch_` or `tag_` AND there are ≥ 2 parts.
+    // (A single-part table named `branch_x` is a legitimate table name, not a suffix.)
+    if table.parts.len() >= 2 {
+        if let Some(last) = table.parts.last() {
+            if last.starts_with("branch_") || last.starts_with("tag_") {
+                return Err(format!(
+                    "REWRITE MANIFESTS does not support branch/tag suffix on table name: {}",
+                    table.parts.join(".")
+                ));
+            }
+        }
+    }
+
+    expect_word(&mut parser, "REWRITE")?;
+    expect_word(&mut parser, "MANIFESTS")?;
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|err| {
+        format!("unsupported trailing ALTER TABLE REWRITE MANIFESTS tokens: {err}")
+    })?;
+    Ok(AlterTableRewriteManifestsStmt { table })
+}
+
+/// Peek at the token `offset` positions ahead of current position.
+///
+/// offset=0 is the same as `peek_token_word_eq`, offset=1 is one token ahead.
+fn peek_token_word_eq_at(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
+    matches!(
+        &parser.peek_nth_token(offset).token,
+        Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word)
+    )
+}
+
 pub(crate) fn parse_show_alter_table_optimize_sql(
     sql: &str,
 ) -> Result<ShowAlterTableOptimizeStmt, String> {
@@ -3021,5 +3102,111 @@ mod insert_overwrite_partitions_parser_tests {
             crate::sql::parser::ast::OverwriteMode::DynamicPartitions
         );
         assert_eq!(stmt.table.parts, vec!["t", "branch_dev"]);
+    }
+
+    // ---- looks_like_alter_table_rewrite_manifests tests ----
+
+    #[test]
+    fn looks_like_alter_table_rewrite_manifests_positive() {
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE MANIFESTS"
+        ));
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "alter table x rewrite manifests;"
+        ));
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS"
+        ));
+    }
+
+    #[test]
+    fn looks_like_alter_table_rewrite_manifests_negative() {
+        // Different action keyword.
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x OPTIMIZE"
+        ));
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x EXPIRE SNAPSHOTS"
+        ));
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE DATA FILES"
+        ));
+        // Missing MANIFESTS.
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE"
+        ));
+    }
+
+    // ---- parse_alter_table_rewrite_manifests_sql tests ----
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_basic() {
+        let stmt = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_single_part_table() {
+        let stmt =
+            super::parse_alter_table_rewrite_manifests_sql("ALTER TABLE orders REWRITE MANIFESTS")
+                .unwrap();
+        assert_eq!(stmt.table.parts, vec!["orders"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_accepts_trailing_semicolon() {
+        let stmt =
+            super::parse_alter_table_rewrite_manifests_sql("ALTER TABLE t REWRITE MANIFESTS;")
+                .unwrap();
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_rejects_branch_suffix() {
+        // Two-part name ending in branch_ → rejected.
+        let err = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE db.orders.branch_dev REWRITE MANIFESTS",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not support branch"),
+            "expected branch rejection, got: {err}"
+        );
+
+        // tag_ suffix also rejected.
+        let err2 = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE db.orders.tag_v1 REWRITE MANIFESTS",
+        )
+        .unwrap_err();
+        assert!(
+            err2.contains("does not support branch"),
+            "expected tag rejection, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_single_part_branch_name_accepted() {
+        // A single-part table literally named `branch_x` is a legitimate table
+        // name (there's no preceding table part, so it can't be a suffix).
+        let stmt = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE branch_x REWRITE MANIFESTS",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["branch_x"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_rejects_trailing_tokens() {
+        let err = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE x REWRITE MANIFESTS WHERE size_in_bytes < 100",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsupported trailing"),
+            "expected trailing token rejection, got: {err}"
+        );
     }
 }

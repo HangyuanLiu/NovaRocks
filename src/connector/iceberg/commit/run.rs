@@ -96,7 +96,8 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::RewriteManifests => {
             return Err(
                 "CommitOpKind::RewriteManifests must be invoked via run_rewrite_manifests \
-                directly, not the collector dispatcher".to_string(),
+                directly, not the collector dispatcher"
+                    .to_string(),
             );
         }
     };

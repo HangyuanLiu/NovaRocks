@@ -36,6 +36,7 @@ mod puffin_dv;
 mod ref_action;
 pub mod retry;
 mod rewrite_data_files;
+pub mod rewrite_manifests;
 mod row_delta;
 mod row_delta_dv;
 mod run;

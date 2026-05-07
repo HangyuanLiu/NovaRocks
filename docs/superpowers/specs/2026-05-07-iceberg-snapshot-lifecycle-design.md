@@ -413,8 +413,10 @@ if 每组都只有 1 个 manifest（new_manifests 与原始完全一致）:
 ```text
 new_snapshot_id = generate_snapshot_id()
 manifest_list_path = "<location>/metadata/snap-<id>-1-<uuid>.avro"
-# replace 操作不引入新 data，sequence_number 沿用 parent 的（与 Spark 一致）
-new_seq = current.sequence_number
+# 关键：snapshot-level sequence_number 必须严格递增（iceberg-rs catalog 不变量
+# table_metadata_builder.rs:358：snapshot.sequence_number > last_sequence_number）。
+# 每个 manifest entry 的 data_sequence_number / file_sequence_number 保留不变（合并不动 data）。
+new_seq = metadata.last_sequence_number + 1
 write_manifest_list(manifest_list_path, new_manifests, sequence_number = new_seq)
 
 new_snapshot = Snapshot {
@@ -440,8 +442,10 @@ commit_with_retry([
 ```
 
 `operation=replace` 是 spec 允许的合法 op；下游读路径已支持（compact 也用过）。
-`sequence_number` 沿用 parent 是因为 replace 不引入新 data file（与 spec
-"new sequence numbers come from new data" 一致）。
+**注意 sequence_number 语义**：snapshot 自身的 `sequence_number` 必须 +1（catalog 不变量），
+但每个 manifest entry 的 `data_sequence_number` / `file_sequence_number` 保留入参原值（reflect
+the original commit that introduced each file）。"replace doesn't introduce new data" 指的是
+后者，不是前者。
 
 **Step 6：物理删除老 manifest（best-effort）**
 
@@ -464,7 +468,7 @@ commit_with_retry([
 
 1. 合并组内所有 entry 的 `data_file.first_row_id` round-trip 全等
 2. commit 后 manifest list 总 record_count 与 commit 前一致（DELETED 丢弃后，ADDED+EXISTING 总和守恒）
-3. commit 后 `last_sequence_number` 与 commit 前一致（replace 不增 sequence）
+3. commit 后 `last_sequence_number` 严格 +1（catalog 不变量）；但每个 manifest entry 的 `data_sequence_number` / `file_sequence_number` 保留 commit 前原值
 4. commit 后 main ref 指向 new_snapshot_id，parent 链可回溯到 commit 前 current
 
 ---
@@ -559,7 +563,7 @@ commit_with_retry([
 5. **REWRITE**：合并组内所有 entry 的 `data_file.first_row_id` round-trip 全等
 6. **ORPHAN**：当前 metadata.json 不能被删
 7. **ORPHAN**：metadata-log 引用的所有历史 metadata.json 不能被删
-8. **REWRITE**：commit 后 `last_sequence_number` 不变（replace 不引入新 sequence）
+8. **REWRITE**：commit 后 `last_sequence_number` 严格 +1（catalog 不变量），但每个 manifest entry 的 `data_sequence_number` / `file_sequence_number` 保留原值
 
 ---
 

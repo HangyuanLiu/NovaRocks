@@ -213,7 +213,8 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
     /// Iceberg `ALTER TABLE x REWRITE MANIFESTS`: groups manifests by
     /// (partition_spec_id, content_type) and merges each group into a
     /// single manifest, emitting an `operation=replace` snapshot. No data
-    /// files are rewritten; sequence_number is preserved.
+    /// files are rewritten; per-entry data_sequence_number is preserved
+    /// (snapshot.sequence_number itself increments per catalog invariant).
     RewriteManifests,
 ```
 
@@ -1278,19 +1279,21 @@ async fn run_rewrite_manifests_one_attempt(
         "{}/snap-{}-1-{}.avro",
         metadata_dir, new_snapshot_id, uuid::Uuid::new_v4()
     );
+    let new_seq = metadata.last_sequence_number() + 1; // catalog invariant: strictly increasing
     write_manifest_list(
         file_io,
         &manifest_list_path,
         &new_manifests,
-        current.sequence_number(), // replace: do NOT increment
+        new_seq,
     )
     .await?;
 
-    // Build replace snapshot. sequence_number stays.
+    // Build replace snapshot. snapshot.sequence_number = last + 1; per-entry
+    // data_sequence_number / file_sequence_number preserved unchanged.
     let new_snapshot = Snapshot::builder()
         .with_snapshot_id(new_snapshot_id)
         .with_parent_snapshot_id(Some(current.snapshot_id()))
-        .with_sequence_number(current.sequence_number())
+        .with_sequence_number(new_seq)
         .with_timestamp_ms(now_ms())
         .with_manifest_list(manifest_list_path)
         .with_summary(Summary {
@@ -1384,8 +1387,11 @@ async fn rewrite_manifests_multi_manifest_merges_and_commits() {
     );
     let new_current = metadata_after.current_snapshot().unwrap();
     assert_eq!(new_current.summary().operation, Operation::Replace);
-    // sequence_number preserved (replace doesn't bump).
-    assert_eq!(new_current.sequence_number(), metadata_before.current_snapshot().unwrap().sequence_number());
+    // snapshot.sequence_number bumps by 1 (catalog invariant).
+    assert_eq!(
+        new_current.sequence_number(),
+        metadata_before.last_sequence_number() + 1,
+    );
 
     // Merged manifest list has fewer manifests than before.
     let manifests_after: Vec<_> = new_current
