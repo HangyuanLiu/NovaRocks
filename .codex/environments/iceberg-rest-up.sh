@@ -45,6 +45,25 @@ choose_port() {
   printf '%s\n' "$port"
 }
 
+docker_image_exists() {
+  local image="$1"
+  local timeout_seconds="${NOVA_ENV_DOCKER_INSPECT_TIMEOUT_SECONDS:-15}"
+
+  docker image inspect "$image" >/dev/null 2>&1 &
+  local pid="$!"
+  local elapsed=0
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if (( elapsed >= timeout_seconds )); then
+      kill "$pid" >/dev/null 2>&1 || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid"
+}
+
 hash4="${hash:0:4}"
 offset=$((16#$hash4 % 1000))
 
@@ -71,9 +90,23 @@ rest_mirror_image="docker.1panel.live/tabulario/iceberg-rest:1.6.0"
 spark_image="${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}"
 spark_mirror_image="docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1"
 
-if ! docker image inspect "$rest_image" >/dev/null 2>&1; then
+if docker_image_exists "$rest_image"; then
+  rest_status=0
+else
+  rest_status="$?"
+fi
+if [[ "$rest_status" -ne 0 ]]; then
+  if [[ "$rest_status" -eq 124 ]]; then
+    cat >&2 <<EOF
+Docker image inspect timed out for: $rest_image
+
+Docker Desktop may be unhealthy. Check it manually before running setup again:
+  docker image inspect $rest_image
+EOF
+    exit 1
+  fi
   if [[ "$rest_image" == "tabulario/iceberg-rest:1.6.0" ]] \
-    && docker image inspect "$rest_mirror_image" >/dev/null 2>&1; then
+    && docker_image_exists "$rest_mirror_image"; then
     docker tag "$rest_mirror_image" "$rest_image"
   else
     cat >&2 <<EOF
@@ -89,9 +122,23 @@ EOF
   fi
 fi
 
-if ! docker image inspect "$spark_image" >/dev/null 2>&1; then
+if docker_image_exists "$spark_image"; then
+  spark_status=0
+else
+  spark_status="$?"
+fi
+if [[ "$spark_status" -ne 0 ]]; then
+  if [[ "$spark_status" -eq 124 ]]; then
+    cat >&2 <<EOF
+Docker image inspect timed out for: $spark_image
+
+Docker Desktop may be unhealthy. Check it manually before running setup again:
+  docker image inspect $spark_image
+EOF
+    exit 1
+  fi
   if [[ "$spark_image" == "tabulario/spark-iceberg:3.5.5_1.8.1" ]] \
-    && docker image inspect "$spark_mirror_image" >/dev/null 2>&1; then
+    && docker_image_exists "$spark_mirror_image"; then
     docker tag "$spark_mirror_image" "$spark_image"
   else
     cat >&2 <<EOF
@@ -161,6 +208,8 @@ oss_endpoint = $minio_endpoint
 managed_lake_warehouse = $managed_warehouse
 iceberg_catalog_type = hadoop
 iceberg_catalog_warehouse = $iceberg_warehouse
+iceberg_rest_uri = $rest_uri
+iceberg_rest_warehouse = $rest_warehouse
 EOF
 
 cat > "$runtime_dir/ice-rest-catalog.sql" <<EOF
@@ -250,6 +299,8 @@ export MINIO_ROOT_PASSWORD="$minio_password"
 export CATALOG_WAREHOUSE_URI="$iceberg_warehouse"
 export NOVAROCKS_MANAGED_LAKE_WAREHOUSE="$managed_warehouse"
 export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"
+export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
+export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
@@ -317,6 +368,7 @@ Do not guess ports.
 - MinIO endpoint: \`$minio_endpoint\`
 - MinIO console: \`http://127.0.0.1:$minio_console_port\`
 - Iceberg REST: \`$rest_uri\`
+- Iceberg REST warehouse: \`$rest_warehouse\`
 - Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
 - Manifest: \`$manifest_file\`
@@ -333,6 +385,7 @@ Use:
 source "$current_link/env.sh"
 cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
 .codex/environments/iceberg-rest-spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 \`\`\`
 EOF
@@ -375,11 +428,13 @@ Compose project: $compose_project
 MinIO endpoint: $minio_endpoint
 MinIO console: http://127.0.0.1:$minio_console_port
 Iceberg REST: $rest_uri
+Iceberg REST warehouse: $rest_warehouse
 Spark UI: http://127.0.0.1:$spark_ui_port
 
 Use:
   source "$current_link/env.sh"
   cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
   .codex/environments/iceberg-rest-spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 EOF

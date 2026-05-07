@@ -431,6 +431,7 @@ Important environment variables after sourcing `env.sh`:
 - `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
 - `NOVAROCKS_ICEBERG_REST_URI`
+- `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `NOVAROCKS_STANDALONE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
@@ -460,6 +461,16 @@ source .codex/environments/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
+```
+
+Run cross-engine Iceberg compatibility tests where Spark writes through REST
+Catalog + MinIO and NovaRocks reads the table:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --mode verify
 ```
 
 Generate an Iceberg format-v3 table through Spark against the same REST Catalog

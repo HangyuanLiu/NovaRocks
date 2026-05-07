@@ -1,5 +1,5 @@
 use crate::types::*;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -143,18 +143,36 @@ pub(crate) fn insert_placeholder_default(
 }
 
 pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
-    if suite_name != "iceberg" && suite_name != "mv-on-iceberg" {
-        return;
+    match suite_name {
+        "iceberg" | "mv-on-iceberg" => {
+            // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
+            // defaults so they run out of the box against the MinIO-backed dev setup.
+            insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
+            insert_placeholder_default(
+                variables,
+                "iceberg_catalog_warehouse",
+                env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
+            );
+        }
+        "iceberg-compatibility" => {
+            let rest_warehouse_default = env_or_default(
+                "NOVA_ENV_REST_WAREHOUSE_URI",
+                "s3://warehouse/sql-tests-rest",
+            );
+            insert_placeholder_default(
+                variables,
+                "iceberg_rest_uri",
+                env_or_default("NOVAROCKS_ICEBERG_REST_URI", "http://127.0.0.1:8181"),
+            );
+            insert_placeholder_default(
+                variables,
+                "iceberg_rest_warehouse",
+                env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
+            );
+        }
+        _ => return,
     }
 
-    // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
-    // defaults so they run out of the box against the MinIO-backed dev setup.
-    insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
-    insert_placeholder_default(
-        variables,
-        "iceberg_catalog_warehouse",
-        env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
-    );
     insert_placeholder_default(
         variables,
         "oss_ak",

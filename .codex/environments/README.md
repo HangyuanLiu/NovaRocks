@@ -47,6 +47,10 @@ cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
+
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --mode verify
 ```
 
 Run the Spark Iceberg v3 smoke SQL:

@@ -318,6 +318,7 @@ source .codex/environments/runtime/current/env.sh
 Useful generated values:
 
 - `NOVAROCKS_ICEBERG_REST_URI`
+- `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `AWS_S3_ENDPOINT`
 - `NOVAROCKS_STANDALONE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
@@ -344,6 +345,15 @@ source .codex/environments/runtime/current/env.sh
 
 Spark uses the Docker-network endpoints `http://rest:8181` and
 `http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
+
+Run the cross-engine Iceberg compatibility SQL suite:
+
+```bash
+source .codex/environments/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility --mode verify
+```
 
 ## SQL Regression Tests
 
