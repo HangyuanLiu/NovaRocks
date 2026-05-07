@@ -1,0 +1,19 @@
+-- query 2
+id	email
+1	a@x.com
+2	b@x.com
+
+-- query 4
+id	email
+1	a@x.com
+2	b@x.com
+
+-- query 6
+id	email
+1	a@x.com
+2	b@x.com
+
+-- query 8
+id	email
+1	a@x.com
+2	b@x.com

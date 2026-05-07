@@ -247,6 +247,53 @@ mod tests {
     }
 
     #[test]
+    fn drop_nested_column_blocked_by_equality_delete() {
+        let res = reject_drop_dependencies_for_test(
+            "address.street",
+            &["address.street".to_string()],
+            &[],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_top_level_struct_blocked_when_equality_delete_targets_inner() {
+        let res =
+            reject_drop_dependencies_for_test("address", &["address.street".to_string()], &[]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_nested_blocked_when_equality_delete_targets_ancestor() {
+        let res =
+            reject_drop_dependencies_for_test("address.street", &["address".to_string()], &[]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn drop_unrelated_top_level_not_blocked_when_equality_delete_targets_other() {
+        let res = reject_drop_dependencies_for_test("name", &["address.street".to_string()], &[]);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn drop_unrelated_nested_not_blocked_when_equality_delete_targets_sibling() {
+        let res =
+            reject_drop_dependencies_for_test("address.city", &["address.street".to_string()], &[]);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn drop_nested_blocked_by_managed_mv_referencing_leaf() {
+        let res = reject_drop_dependencies_for_test(
+            "address.street",
+            &[],
+            &["SELECT street FROM ice.ns.orders".to_string()],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn add_column_sets_logical_type_property_only_when_needed() {
         let tinyint = build_property_updates_for_test(
             &HashMap::new(),
@@ -442,6 +489,79 @@ mod tests {
             Some(&"decimal(12,2)".to_string())
         );
         assert!(decimal.removals.is_empty());
+    }
+
+    #[test]
+    fn build_property_updates_attests_set_not_null() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("address.street").unwrap(),
+            nullable: false,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        let key = "novarocks.nullability.attested.address.street";
+        assert!(
+            updates.sets.contains_key(key),
+            "expected attestation key, got sets={:?}",
+            updates.sets
+        );
+        assert!(
+            !updates.removals.contains(&key.to_string()),
+            "attestation key must not also be in removals"
+        );
+    }
+
+    #[test]
+    fn build_property_updates_attests_set_not_null_top_level() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: false,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(
+            updates
+                .sets
+                .contains_key("novarocks.nullability.attested.c")
+        );
+    }
+
+    #[test]
+    fn build_property_updates_removes_attestation_on_drop_not_null_when_present() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "novarocks.nullability.attested.c".to_string(),
+            "2026-05-06T00:00:00Z".to_string(),
+        );
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: true,
+        };
+        let updates = build_property_updates_for_test(&existing, &change).unwrap();
+        assert!(
+            updates
+                .removals
+                .contains(&"novarocks.nullability.attested.c".to_string())
+        );
+        assert!(updates.sets.is_empty());
+    }
+
+    #[test]
+    fn build_property_updates_drop_not_null_no_op_when_attestation_absent() {
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("c").unwrap(),
+            nullable: true,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn build_property_updates_reorder_remains_no_op() {
+        let change = IcebergSchemaChange::Reorder {
+            path: ColumnPath::parse("c").unwrap(),
+            position: AddPosition::First,
+        };
+        let updates = build_property_updates_for_test(&HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
     }
 
     // ----- find_field_by_path tests -----
@@ -1201,6 +1321,310 @@ mod tests {
         );
         assert!(res.is_err());
     }
+
+    #[test]
+    fn apply_set_nullable_at_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("a").unwrap();
+        let new = apply_set_nullable_at(&schema, &path, false).unwrap();
+        assert!(new.as_struct().fields()[0].required);
+    }
+
+    #[test]
+    fn apply_set_nullable_at_nested() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.street").unwrap();
+        let new = apply_set_nullable_at(&schema, &path, false).unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert!(s.fields()[0].required);
+    }
+
+    #[test]
+    fn apply_set_nullable_at_identifier_field_rejects_drop_not_null() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .with_identifier_field_ids(vec![1])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("id").unwrap();
+        assert!(apply_set_nullable_at(&schema, &path, true).is_err());
+    }
+
+    #[test]
+    fn apply_reorder_at_top_level_first() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("c").unwrap();
+        let new = apply_reorder_at(&schema, &path, &AddPosition::First).unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_after_target() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("a").unwrap();
+        let new = apply_reorder_at(&schema, &path, &AddPosition::After("b".to_string())).unwrap();
+        let names: Vec<_> = new
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(names, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_nested_struct() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "street",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.city").unwrap();
+        let new =
+            apply_reorder_at(&schema, &path, &AddPosition::Before("street".to_string())).unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        let names: Vec<_> = s.fields().iter().map(|f| f.name.clone()).collect();
+        assert_eq!(names, vec!["city", "street"]);
+    }
+
+    #[test]
+    fn apply_reorder_at_after_target_in_different_parent_rejected() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "address", inner)),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = ColumnPath::parse("address.street").unwrap();
+        assert!(apply_reorder_at(&schema, &path, &AddPosition::After("name".to_string())).is_err());
+    }
+
+    #[test]
+    fn build_updated_schema_dispatches_set_nullable() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::SetNullable {
+            path: ColumnPath::parse("a").unwrap(),
+            nullable: false,
+        };
+        let new = build_updated_schema(&schema, 1, &change).unwrap();
+        assert!(new.as_struct().fields()[0].required);
+    }
+
+    #[test]
+    fn build_updated_schema_dispatches_reorder() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::Reorder {
+            path: ColumnPath::parse("b").unwrap(),
+            position: AddPosition::First,
+        };
+        let new = build_updated_schema(&schema, 2, &change).unwrap();
+        assert_eq!(new.as_struct().fields()[0].name, "b");
+    }
+
+    #[test]
+    fn widen_decimal_precision_increase_same_scale() {
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 20,
+            scale: 2,
+        };
+        let widened = widen_type(&curr, &new).unwrap();
+        let Type::Primitive(PrimitiveType::Decimal { precision, scale }) = widened else {
+            panic!()
+        };
+        assert_eq!(precision, 20);
+        assert_eq!(scale, 2);
+    }
+
+    #[test]
+    fn widen_decimal_scale_change_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 3,
+        };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_decimal_precision_decrease_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 20,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_decimal_same_precision_same_scale_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let new = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_date_to_timestamp() {
+        let curr = Type::Primitive(PrimitiveType::Date);
+        let new = SqlType::DateTime;
+        let widened = widen_type(&curr, &new).unwrap();
+        assert!(matches!(widened, Type::Primitive(PrimitiveType::Timestamp)));
+    }
+
+    #[test]
+    fn widen_string_to_binary_rejected() {
+        let curr = Type::Primitive(PrimitiveType::String);
+        let new = SqlType::Binary;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_long_to_int_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Long);
+        let new = SqlType::Int;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_double_to_float_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Double);
+        let new = SqlType::Float;
+        assert!(widen_type(&curr, &new).is_err());
+    }
+
+    #[test]
+    fn widen_timestamp_to_date_rejected() {
+        let curr = Type::Primitive(PrimitiveType::Timestamp);
+        let new = SqlType::Date;
+        assert!(widen_type(&curr, &new).is_err());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -1569,134 +1993,139 @@ fn modify_in_type(ty: &Type, segments: &[String], new_type: &SqlType) -> Result<
     }
 }
 
+/// Rebuild `schema` with the column at `path` having its nullability flipped.
+///
+/// `nullable = false` => SET NOT NULL (`required = true`).
+/// `nullable = true` => DROP NOT NULL (`required = false`).
+/// DROP NOT NULL is rejected on identifier fields, since identifier columns must remain
+/// required by Iceberg spec.  Only top-level or STRUCT-nested fields are supported; LIST
+/// element / MAP key/value nullability cannot be toggled this way.
+#[allow(dead_code)]
+pub(crate) fn apply_set_nullable_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    nullable: bool,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    if nullable {
+        let (target_id, _) = find_field_by_path(schema, path)?;
+        if identifier_field_ids.contains(&target_id) {
+            return Err(format!(
+                "cannot DROP NOT NULL on identifier field '{}'",
+                path.dotted()
+            ));
+        }
+    }
+    let new_fields = set_nullable_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        nullable,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after set nullable: {e}"))
+}
+
+fn set_nullable_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    nullable: bool,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("set nullable path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if segments.len() == 1 {
+                updated.required = !nullable;
+            } else {
+                let new_inner = set_nullable_in_type(&f.field_type, &segments[1..], nullable)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for set nullable", head));
+    }
+    Ok(out)
+}
+
+fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new =
+                set_nullable_in_fields(s.fields().iter().cloned().collect(), segments, nullable)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => {
+            Err("SET/DROP NOT NULL only supported on top-level or STRUCT-nested fields".to_string())
+        }
+    }
+}
+
 fn build_updated_schema(
     current: &Schema,
     last_column_id: i32,
     change: &IcebergSchemaChange,
 ) -> Result<Schema, String> {
     reject_reserved_change(change)?;
-    let identifier_field_ids = current.identifier_field_ids().collect::<Vec<_>>();
-    let mut fields = current
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect::<Vec<_>>();
-
     match change {
         IcebergSchemaChange::AddColumn {
             parent,
             name,
             data_type,
             default,
-            position: _,
+            position,
         } => {
-            if !parent.is_empty() {
-                return Err("nested STRUCT ADD COLUMN not yet implemented in this step".to_string());
-            }
-            reject_name_conflict(&fields, name)?;
-            let mut next_nested_id = last_column_id
-                .checked_add(2)
-                .ok_or_else(|| "too many iceberg columns".to_string())?;
-            let ty = crate::connector::iceberg::catalog::registry::iceberg_type_for_sql_type(
+            let mut next_id = last_column_id;
+            apply_add_at(
+                current,
+                parent,
+                name,
                 data_type,
-                &mut next_nested_id,
-            )?;
-            let id = last_column_id
-                .checked_add(1)
-                .ok_or_else(|| "too many iceberg columns".to_string())?;
-            let mut field = NestedField::optional(id, name, ty);
-            if let Some(default_literal) = default {
-                if let Some(iceberg_lit) =
-                    crate::connector::iceberg::default_value::default_literal_to_iceberg(
-                        default_literal,
-                        data_type,
-                    )?
-                {
-                    field = field
-                        .with_initial_default(iceberg_lit.clone())
-                        .with_write_default(iceberg_lit);
-                }
-            }
-            fields.push(field);
+                default.as_ref(),
+                position.clone(),
+                &mut next_id,
+            )
         }
         IcebergSchemaChange::DropColumn { path } => {
-            if path.segments().len() != 1 {
-                return Err("nested DROP COLUMN not yet implemented in this step".to_string());
-            }
-            let name = path.last().unwrap();
-            let normalized = normalize_identifier(name)?;
-            let field_id = fields
-                .iter()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .map(|f| f.id)
-                .ok_or_else(|| format!("unknown Iceberg column `{name}`"))?;
-            if identifier_field_ids.contains(&field_id) {
+            let identifier_field_ids: Vec<i32> = current.identifier_field_ids().collect();
+            let (id, _) = find_field_by_path(current, path)?;
+            if identifier_field_ids.contains(&id) {
                 return Err(format!(
-                    "Iceberg schema evolution cannot drop identifier column `{name}`"
+                    "Iceberg schema evolution cannot drop identifier column `{}`",
+                    path.dotted()
                 ));
             }
-            fields.retain(|f| {
-                normalize_identifier(&f.name).ok().as_deref() != Some(normalized.as_str())
-            });
+            apply_drop_at(current, path)
         }
         IcebergSchemaChange::RenameColumn { path, new_name } => {
-            if path.segments().len() != 1 {
-                return Err("nested RENAME COLUMN not yet implemented in this step".to_string());
-            }
-            let old_name = path.last().unwrap();
-            reject_name_conflict(&fields, new_name)?;
-            let normalized = normalize_identifier(old_name)?;
-            let field = fields
-                .iter_mut()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .ok_or_else(|| format!("unknown Iceberg column `{old_name}`"))?;
-            field.name = new_name.clone();
+            apply_rename_at(current, path, new_name)
         }
         IcebergSchemaChange::ModifyColumn { path, new_type } => {
-            if path.segments().len() != 1 {
-                return Err("nested MODIFY COLUMN not yet implemented in this step".to_string());
-            }
-            let name = path.last().unwrap();
-            let normalized = normalize_identifier(name)?;
-            let field = fields
-                .iter_mut()
-                .find(|f| {
-                    normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str())
-                })
-                .ok_or_else(|| format!("unknown Iceberg column `{name}`"))?;
-            field.field_type = Box::new(widen_type(field.field_type.as_ref(), new_type)?);
+            apply_modify_at(current, path, new_type)
         }
-        IcebergSchemaChange::SetNullable { .. } => {
-            return Err(
-                "ALTER COLUMN SET/DROP NOT NULL not yet implemented in this step".to_string(),
-            );
+        IcebergSchemaChange::SetNullable { path, nullable } => {
+            apply_set_nullable_at(current, path, *nullable)
         }
-        IcebergSchemaChange::Reorder { .. } => {
-            return Err("ALTER COLUMN reorder not yet implemented in this step".to_string());
+        IcebergSchemaChange::Reorder { path, position } => {
+            apply_reorder_at(current, path, position)
         }
     }
-
-    Schema::builder()
-        .with_fields(fields.into_iter().map(Arc::new).collect::<Vec<_>>())
-        .with_identifier_field_ids(identifier_field_ids)
-        .build()
-        .map_err(|e| format!("build evolved iceberg schema failed: {e}"))
-}
-
-fn reject_name_conflict(fields: &[NestedField], name: &str) -> Result<(), String> {
-    let normalized = normalize_identifier(name)?;
-    if fields
-        .iter()
-        .any(|f| normalize_identifier(&f.name).ok().as_deref() == Some(normalized.as_str()))
-    {
-        return Err(format!("Iceberg column `{name}` already exists"));
-    }
-    Ok(())
 }
 
 fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
@@ -1762,23 +2191,49 @@ fn reject_drop_dependencies(
     equality_delete_columns: &[String],
     mv_dependencies: &[ManagedMvDependency],
 ) -> Result<(), String> {
-    let normalized = normalize_identifier(column)?;
-    if equality_delete_columns
-        .iter()
-        .any(|c| normalize_identifier(c).ok().as_deref() == Some(normalized.as_str()))
-    {
-        return Err(format!(
-            "DROP COLUMN `{column}` is blocked because an Iceberg equality-delete file references it"
-        ));
+    let target_segments = normalize_dotted_path(column)?;
+    if target_segments.is_empty() {
+        return Err(format!("DROP COLUMN `{column}` has empty column path"));
     }
+    for ed in equality_delete_columns {
+        let ed_segments = normalize_dotted_path(ed)?;
+        // Block when the dropped path is an ancestor, descendant, or equal
+        // to an equality-delete column reference.
+        if path_overlaps(&target_segments, &ed_segments) {
+            return Err(format!(
+                "DROP COLUMN `{column}` is blocked because an Iceberg equality-delete file references `{ed}`"
+            ));
+        }
+    }
+    let leaf = target_segments
+        .last()
+        .expect("checked non-empty above")
+        .as_str();
     for dependency in mv_dependencies {
-        if managed_mv_depends_on_column(dependency, &normalized) {
+        if managed_mv_depends_on_column(dependency, leaf) {
             return Err(format!(
                 "DROP COLUMN `{column}` is blocked because a managed materialized view references it"
             ));
         }
     }
     Ok(())
+}
+
+fn normalize_dotted_path(input: &str) -> Result<Vec<String>, String> {
+    input
+        .split('.')
+        .map(|segment| {
+            if segment.is_empty() {
+                return Err(format!("invalid column path `{input}`: empty segment"));
+            }
+            normalize_identifier(segment)
+        })
+        .collect()
+}
+
+fn path_overlaps(a: &[String], b: &[String]) -> bool {
+    let common = a.len().min(b.len());
+    a[..common] == b[..common]
 }
 
 #[derive(Clone, Debug)]
@@ -2181,6 +2636,83 @@ pub(crate) fn insert_at_position(
     }
 }
 
+/// Rebuild `schema` with the column at `path` moved to `position` within its parent.
+///
+/// Only fields within a STRUCT scope can be reordered.  `AddPosition::After`/`Before` look up
+/// the target name in the same parent's child list (with the moved field already removed),
+/// so attempting to reference a name in a different parent produces an error.
+#[allow(dead_code)]
+pub(crate) fn apply_reorder_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    position: &AddPosition,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = reorder_in_fields(
+        schema.as_struct().fields().iter().cloned().collect(),
+        path.segments(),
+        position,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after reorder: {e}"))
+}
+
+fn reorder_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    position: &AddPosition,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("reorder path is empty".to_string());
+    }
+    if segments.len() == 1 {
+        let head = normalize_identifier(&segments[0])?;
+        let mut existing: Vec<NestedField> = fields.iter().map(|f| (**f).clone()).collect();
+        let idx = existing
+            .iter()
+            .position(|f| normalize_identifier(&f.name).ok().as_deref() == Some(head.as_str()))
+            .ok_or_else(|| format!("column '{}' not found for reorder", head))?;
+        let target = existing.remove(idx);
+        insert_at_position(&mut existing, target, position)?;
+        return Ok(existing);
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let new_inner = reorder_in_type(&f.field_type, &segments[1..], position)?;
+            let mut updated = (*f).clone();
+            updated.field_type = Box::new(new_inner);
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for reorder", head));
+    }
+    Ok(out)
+}
+
+fn reorder_in_type(ty: &Type, segments: &[String], position: &AddPosition) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = reorder_in_fields(s.fields().iter().cloned().collect(), segments, position)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err("reorder path descends into non-struct type".to_string()),
+    }
+}
+
 fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
     match (current, new_type) {
         (Type::Primitive(PrimitiveType::Int), SqlType::BigInt) => {
@@ -2188,6 +2720,35 @@ fn widen_type(current: &Type, new_type: &SqlType) -> Result<Type, String> {
         }
         (Type::Primitive(PrimitiveType::Float), SqlType::Double) => {
             Ok(Type::Primitive(PrimitiveType::Double))
+        }
+        (
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: cp,
+                scale: cs,
+            }),
+            SqlType::Decimal {
+                precision: np,
+                scale: ns,
+            },
+        ) => {
+            // Iceberg spec: decimal precision can only increase, scale must remain unchanged.
+            if (*cs as i64) != (*ns as i64) {
+                return Err(format!(
+                    "decimal scale change is not allowed (current decimal({cp},{cs}), new decimal({np},{ns}))"
+                ));
+            }
+            if (*np as u32) <= *cp {
+                return Err(format!(
+                    "decimal precision must strictly increase (current decimal({cp},{cs}), new decimal({np},{ns}))"
+                ));
+            }
+            Ok(Type::Primitive(PrimitiveType::Decimal {
+                precision: *np as u32,
+                scale: *ns as u32,
+            }))
+        }
+        (Type::Primitive(PrimitiveType::Date), SqlType::DateTime) => {
+            Ok(Type::Primitive(PrimitiveType::Timestamp))
         }
         _ => Err(format!(
             "unsupported Iceberg type evolution: {current:?} -> {new_type:?}"
@@ -2309,9 +2870,24 @@ fn build_property_updates(
                 updates.push_removal(logical_key);
             }
         }
-        IcebergSchemaChange::SetNullable { .. } | IcebergSchemaChange::Reorder { .. } => {}
+        IcebergSchemaChange::SetNullable { path, nullable } => {
+            let key = nullability_attestation_property_key(path);
+            if !*nullable {
+                // SET NOT NULL: leave a metadata trail (not an existence proof).
+                // The schema-id update and this property write commit together.
+                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                updates.sets.insert(key, now);
+            } else if properties.contains_key(&key) {
+                updates.push_removal(key);
+            }
+        }
+        IcebergSchemaChange::Reorder { .. } => {}
     }
     Ok(updates)
+}
+
+fn nullability_attestation_property_key(path: &ColumnPath) -> String {
+    format!("novarocks.nullability.attested.{}", path.dotted())
 }
 
 fn reject_key_column_drop(properties: &HashMap<String, String>, name: &str) -> Result<(), String> {
@@ -2500,15 +3076,8 @@ fn protect_schema_change(
             &loaded.table,
         )?;
 
-    // Phase B note: when nested DROP COLUMN is supported, reject_drop_dependencies
-    // must receive the full qualified column name, not just the leaf segment.
-    // For now only top-level drops are permitted (build_updated_schema rejects others).
-    if path.segments().len() != 1 {
-        return Err("nested DROP COLUMN not yet supported in protect_schema_change".to_string());
-    }
-    let name = path.last().unwrap();
     let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
-    reject_drop_dependencies(name, &equality_delete_columns, &mv_dependencies)
+    reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &mv_dependencies)
 }
 
 fn managed_mv_dependencies_for_target(

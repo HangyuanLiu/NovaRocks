@@ -66,7 +66,7 @@ ALTER TABLE orders_local DROP COLUMN _row_id;
 ALTER TABLE orders_local ADD EQUALITY DELETE (id) VALUES (1);
 
 -- query 18
--- @expect_error=DROP COLUMN `id` is blocked because an Iceberg equality-delete file references it
+-- @expect_error=DROP COLUMN `id` is blocked because an Iceberg equality-delete file references `id`
 ALTER TABLE orders_local DROP COLUMN id;
 
 -- query 19
