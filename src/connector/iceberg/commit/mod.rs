@@ -34,6 +34,7 @@ mod overwrite_partitions;
 mod position_delete_writer;
 mod puffin_dv;
 mod ref_action;
+pub mod retry;
 mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv;
@@ -46,6 +47,7 @@ mod update_cow;
 mod validation;
 
 pub use abort::{AbortLog, CleanupError};
+pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
