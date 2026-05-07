@@ -216,6 +216,75 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
     fixture
 }
 
+/// Build a `MemoryCatalog`-backed v3 iceberg table seeded with multiple
+/// sequential `FastAppendCommit` batches. Each element of `batches` gives the
+/// number of synthetic data files for that commit. File paths are assigned a
+/// globally unique index across all batches to avoid path collisions.
+///
+/// Returns the fixture after all commits; the table has `batches.len()`
+/// snapshots in its history. Useful for testing snapshot-lifecycle helpers that
+/// need a multi-snapshot history.
+pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> IcebergTestFixture {
+    let mut fixture = empty_v3_iceberg_table().await;
+    let mut global_idx: usize = 0;
+
+    for &n in batches {
+        let table_location = fixture.table.metadata().location().to_string();
+        let metadata = fixture.table.metadata();
+        let collector = Arc::new(IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{table_location}/staging"),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        ));
+        for _ in 0..n {
+            collector.inject_written_file(WrittenFile {
+                path: format!("{table_location}/data/file-{global_idx}.parquet"),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: 0,
+                record_count: 10,
+                file_size_in_bytes: 1024,
+                split_offsets: vec![],
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+            });
+            global_idx += 1;
+        }
+        let file_io = fixture.table.file_io().clone();
+        let abort_handle = collector.abort_log.clone();
+        let ctx = CommitCtx {
+            collector: &collector,
+            table: &fixture.table,
+            catalog: fixture.catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: Uuid::new_v4(),
+            abort_handle,
+            target_ref: "main",
+        };
+        FastAppendCommit
+            .commit(ctx)
+            .await
+            .expect("FastAppendCommit succeeds in v3_table_with_multi_batch_appends");
+        fixture.table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table after batch append");
+    }
+    fixture
+}
+
 /// Build a `MemoryCatalog`-backed v3 iceberg table with an identity partition
 /// on the `region` column, pre-seeded with:
 /// - 2 data files in partition `region=us`

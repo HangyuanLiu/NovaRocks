@@ -3550,4 +3550,3 @@ pub(crate) fn alter_table_properties(
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
     Ok(())
 }
-
