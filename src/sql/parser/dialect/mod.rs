@@ -204,17 +204,18 @@ pub(crate) fn looks_like_drop_statement(parser: &Parser<'_>) -> bool {
 }
 
 /// Parse a CREATE DATABASE statement and return just the database name.
-pub(crate) fn parse_create_database_name(parser: &mut Parser<'_>) -> Result<ObjectName, String> {
+pub(crate) fn parse_create_database_name(
+    parser: &mut Parser<'_>,
+) -> Result<(ObjectName, bool), String> {
     parser
         .expect_keyword(Keyword::CREATE)
         .map_err(|e| e.to_string())?;
     parser
         .expect_keyword(Keyword::DATABASE)
         .map_err(|e| e.to_string())?;
-    // Allow IF NOT EXISTS — just skip the keywords (create_database is idempotent).
-    let _if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
     let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
-    Ok(name)
+    Ok((name, if_not_exists))
 }
 
 // ---------------------------------------------------------------------------

@@ -850,6 +850,7 @@ fn update_alias_name(
 pub(crate) fn execute_create_database_statement(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
+    if_not_exists: bool,
     current_catalog: Option<&str>,
 ) -> Result<StatementResult, String> {
     let target =
@@ -859,6 +860,10 @@ pub(crate) fn execute_create_database_statement(
         .read()
         .expect("connector registry read")
         .catalog_backend(target.backend_name)?;
+    // When IF NOT EXISTS is specified, skip creation if the namespace already exists.
+    if if_not_exists && backend.namespace_exists(&target.catalog, &target.namespace)? {
+        return Ok(StatementResult::Ok);
+    }
     backend.create_namespace(&target.catalog, &target.namespace)?;
     if target.backend_name == "iceberg" {
         persist_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
