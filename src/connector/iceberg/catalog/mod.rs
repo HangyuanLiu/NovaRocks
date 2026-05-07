@@ -19,4 +19,4 @@ pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, insert_rows,
     load_table, namespace_exists, register_existing_table,
 };
-pub(crate) use schema_update::alter_table_schema;
+pub(crate) use schema_update::{alter_table_properties, alter_table_schema};
