@@ -20,10 +20,13 @@ INSERT INTO ${case_db}.t_v3_variant VALUES
   (3, parse_json('null')),
   (4, NULL);
 
--- query 2
-SELECT id, v FROM ${case_db}.t_v3_variant ORDER BY id;
+-- query 2 — round-trip through parquet: assert each row's variant
+-- payload decodes to the expected logical type. Selecting `v` directly
+-- would emit raw [size|metadata|value] bytes whose embedded \n breaks
+-- the MySQL row delimiter, so we use variant_typeof for a stable display.
+SELECT id, variant_typeof(v) FROM ${case_db}.t_v3_variant ORDER BY id;
 
--- query 3
+-- query 3 — concrete payload probe via the JSON-path accessor.
 SELECT id, get_json_string(v, '$.b') FROM ${case_db}.t_v3_variant WHERE id = 1;
 
 -- query 4
