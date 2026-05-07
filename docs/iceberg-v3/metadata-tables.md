@@ -1,47 +1,113 @@
 # Metadata Tables
 
-> Spec 定义的虚拟表，用来查表内部状态（snapshot 历史、refs、文件统计、partition 统计 ...）。NovaRocks 已经实现 BE 侧的首批四张（snapshots / history / refs / partitions），但 standalone-server 的 SQL parser 还没有接受 `t$tabletype` 路由语法，**端到端 SQL 入口暂未开放**。
+> Spec 定义的虚拟表，用来查表内部状态（snapshot 历史、refs、文件统计、partition 统计 ...）。PR #81 落地了 BE 端的 `snapshots / history / refs / partitions` 四张，PR #85 接通了 standalone parser 的 `<tbl>$<metatype>` 路由 —— **首批四张端到端 SQL 现在可用**。其余 metadata table（`$manifests` / `$files` / `$delete_files` / `$entries` / `$metadata_log_entries` / `$position_deletes` / `$all_files` 等）仍在路线图上。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `$snapshots` | 🚧 | BE 已落 PR #81，缺 SQL 入口 |
-| `$history` | 🚧 | 同上 |
-| `$refs`（branches + tags） | 🚧 | 同上 |
-| `$partitions` | 🚧 | 同上 |
-| `$manifests` | ❌ | |
-| `$files` / `$all_data_files` | ❌ | |
-| `$delete_files` / `$all_delete_files` | ❌ | |
-| `$entries`（manifest entries） | ❌ | |
-| `$metadata_log_entries` | ❌ | |
-| `$position_deletes` | ❌ | |
-| `$all_files`（V3 统一视图） | ❌ | |
+| `<tbl>$snapshots` | ✅ | BE PR #81 + SQL 路由 PR #85 |
+| `<tbl>$history` | ✅ | 同上 |
+| `<tbl>$refs`（branches + tags） | ✅ | 同上 |
+| `<tbl>$partitions` | ✅ | 同上 |
+| `<tbl>$manifests` | ❌ | |
+| `<tbl>$files` / `<tbl>$all_data_files` | ❌ | |
+| `<tbl>$delete_files` / `<tbl>$all_delete_files` | ❌ | |
+| `<tbl>$entries`（manifest entries） | ❌ | |
+| `<tbl>$metadata_log_entries` | ❌ | |
+| `<tbl>$position_deletes` | ❌ | |
+| `<tbl>$all_files`（V3 统一视图） | ❌ | |
 
-实现入口：`src/connector/iceberg/metadata.rs`、`src/connector/iceberg/IcebergMetadataBridge.java`
+实现入口：
+
+- BE bridge：`src/connector/iceberg/metadata.rs`、`src/connector/iceberg/IcebergMetadataBridge.java`
+- Parser 路由：`src/sql/parser/dialect/mod.rs`（`<tbl>$<metatype>` 重写为 `<tbl>.__nr_meta_<metatype>__`）
+- Analyzer：`src/sql/analyzer/iceberg_metadata.rs`（`split_metadata_suffix`）+ `Relation::IcebergMetadataScan` variant
+- 读路径：复用 `IcebergMetadataScanOp`（PR #81 已搭好的 JNI scanner）
+
+参考 plan：[2026-05-06-iceberg-v3-row-lineage-completion.md](../superpowers/plans/2026-05-06-iceberg-v3-row-lineage-completion.md)（Phase A）
 
 ---
 
-## 🚧 当前限制：SQL 入口缺失
+## ✅ `<tbl>$snapshots`
 
-下列 BE 已经能返回正确数据：
-
-| 元数据表 | 列 |
-| --- | --- |
-| `$snapshots` | `committed_at` (TIMESTAMP)、`snapshot_id` (BIGINT)、`parent_id` (BIGINT)、`operation` (STRING)、`manifest_list` (STRING)、`summary` (MAP<STRING, STRING>) |
-| `$history` | `made_current_at` (TIMESTAMP)、`snapshot_id` (BIGINT)、`parent_id` (BIGINT)、`is_current_ancestor` (BOOLEAN) |
-| `$refs` | `name` (STRING)、`type` (STRING `BRANCH` / `TAG`)、`snapshot_id` (BIGINT)、三个 retention 字段（min-snapshots-to-keep / max-snapshot-age-ms / max-ref-age-ms） |
-| `$partitions` | partition struct（按表当前 spec）+ `record_count` / `file_count` / `position_delete_file_count` / `equality_delete_file_count`（均 BIGINT） |
-
-但 standalone-server 的 SQL parser 不识别 `t$snapshots` 形式（参见 `src/engine/mod.rs:4538` 的 TODO），所以下列 SQL 暂时跑不通：
+列出表的所有 snapshot 与基本元信息。
 
 ```sql
--- 暂未实现：parser 不接受 $tabletype
 SELECT * FROM orders$snapshots;
+```
+
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| `committed_at` | TIMESTAMP | snapshot 提交时刻 |
+| `snapshot_id` | BIGINT | snapshot ID |
+| `parent_id` | BIGINT | 父 snapshot ID（root 为 NULL） |
+| `operation` | STRING | `append` / `overwrite` / `delete` / `replace` 等 |
+| `manifest_list` | STRING | manifest list 文件路径 |
+| `summary` | MAP&lt;STRING, STRING&gt; | snapshot summary（写入行数 / 字节数 / 删除行数等） |
+
+## ✅ `<tbl>$history`
+
+列出"什么时候哪个 snapshot 变成 current"的时间线。
+
+```sql
 SELECT * FROM orders$history;
+```
+
+| 列 | 类型 |
+| --- | --- |
+| `made_current_at` | TIMESTAMP |
+| `snapshot_id` | BIGINT |
+| `parent_id` | BIGINT |
+| `is_current_ancestor` | BOOLEAN |
+
+`is_current_ancestor=true` 表示该 snapshot 是当前 current snapshot 的祖先（直接 / 间接），方便区分主线和已经被覆盖 / rollback 掉的旁支。
+
+## ✅ `<tbl>$refs`
+
+列出表的所有 branch / tag。
+
+```sql
 SELECT * FROM orders$refs;
+```
+
+| 列 | 类型 |
+| --- | --- |
+| `name` | STRING |
+| `type` | STRING（`BRANCH` / `TAG`） |
+| `snapshot_id` | BIGINT |
+| `min_snapshots_to_keep` | INT |
+| `max_snapshot_age_ms` | BIGINT |
+| `max_ref_age_ms` | BIGINT |
+
+## ✅ `<tbl>$partitions`
+
+列出表当前的 partition 一览，含每个分区的文件 / 行数。
+
+```sql
 SELECT * FROM orders$partitions;
 ```
 
-**TODO**：补 parser 端的 `<table>$<metadata_table>` 路由，把它解析成对应的 metadata table scan plan，再下推到已实现的 BE 路径。
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| 分区列（按表当前 partition spec） | varies | `country='CN'` / `bucket(8, id)` 等都按 transform 后的值出现 |
+| `record_count` | BIGINT | live data record 数 |
+| `file_count` | BIGINT | live data file 数 |
+| `position_delete_file_count` | BIGINT | V2 position-delete 文件数 |
+| `equality_delete_file_count` | BIGINT | equality-delete 文件数 |
+
+> **注意**：当前不暴露 `dv_count`（V3 deletion vector），未来扩展。`$partitions` 只反映 current snapshot 的 partition 一览；要查历史 partition spec 的文件用 time travel + `$partitions`。
+
+---
+
+## 与 Spark / Trino 兼容性
+
+NovaRocks 的语法用 `<tbl>$<metatype>`（`$` 分隔），与 Spark 一致：
+
+- ✅ NovaRocks: `SELECT * FROM orders$snapshots`
+- ✅ Spark: `SELECT * FROM orders$snapshots` 或 `SELECT * FROM orders.snapshots`
+
+> Spark 也支持 `<tbl>.<metatype>` 形式（点号），NovaRocks 当前**只接受 `$` 形式**，因为点号会与 schema/database 限定名歧义。如果你从 Spark 搬 SQL，把 `.snapshots` 换成 `$snapshots` 即可。
+
+---
 
 ## ❌ 其他 metadata table
 
@@ -57,14 +123,18 @@ SELECT * FROM orders$partitions;
 - `$position_deletes`：所有 V2 position-delete 行展开
 - `$all_files`（V3）：data file + delete file 的统一视图
 
-**TODO**：路线图上集中在解锁 SQL 入口之后再补 BE bridge。
+**TODO**：路线图按需推进，BE bridge 可以参考 PR #81 的 4 张实现。
 
 ---
 
-## 临时绕过方案
+## 时间旅行 + metadata table
 
-在 SQL 入口落地前，如果你要查 metadata：
+可以组合 time travel 与 metadata table 查"某个历史 snapshot 当时的状态"：
 
-- 通过 Iceberg CLI / iceberg-rust：直接读 `metadata.json`
-- 通过 `tbl.<branch_or_tag>` SELECT：`SELECT * FROM t FOR VERSION AS OF <id>` 可以验证某个 snapshot 是否还能读
-- 通过外部 Spark / Trino：在共享 warehouse 上跑 `SELECT * FROM t.snapshots`
+```sql
+-- 历史 partition 一览
+SELECT * FROM orders$partitions FOR VERSION AS OF 1234567890;
+
+-- 历史 ref 列表
+SELECT * FROM orders$refs FOR TIMESTAMP AS OF '2026-05-01 00:00:00';
+```

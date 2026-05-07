@@ -1,6 +1,6 @@
 # Row Lineage（V3 行级身份）
 
-> Iceberg v3 引入 `_row_id` / `_last_updated_sequence_number` 两个元数据列，给每一行一个跨 snapshot 稳定的身份。NovaRocks 全链路实现了读 / INSERT / DELETE / UPDATE / MERGE 的 row-lineage 维持，仍欠 OPTIMIZE 重写后的策略选型与跨引擎一致性测试。
+> Iceberg v3 引入 `_row_id` / `_last_updated_sequence_number` 两个元数据列，给每一行一个跨 snapshot 稳定的身份。NovaRocks 全链路实现了读 / INSERT / DELETE / UPDATE / MERGE 的 row-lineage 维持。PR #85 进一步把 `OPTIMIZE TABLE` 路由到 row-lineage writer，**重写后逐行保留 `_row_id`**（物理写入到 reserved field id 上），并叠加了一组 cross-snapshot 唯一性回归测试。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
@@ -10,9 +10,10 @@
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
 | COW UPDATE 保留 `_row_id` + 写 `novarocks.update.sidecar` JSON | ✅ | |
 | MOR UPDATE 复用 `_row_id` + 显式赋 `DataFile.first_row_id` | ✅ | |
-| OPTIMIZE 重写后保留每行 `_row_id` | ❌ | 策略待选 |
-| Branch / tag 切换 `_row_id` 一致性测试 | ❌ | |
-| `_row_id` 跨 snapshot 唯一性 invariant 测试 | ❌ | cross-engine 写入混合后 |
+| OPTIMIZE 重写后保留每行 `_row_id`（物理写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
+| `_row_id` 跨 snapshot 唯一性 invariant 测试（含 OPTIMIZE 后） | ✅ | PR #85（`iceberg_v3_row_lineage_uniqueness.sql`） |
+| Branch / tag 切换 `_row_id` 一致性回归 | ❌ | |
+| Cross-engine `_row_id` 一致性测试（Spark / Trino 混写） | ❌ | 待 §17 cross-engine fixture |
 
 ---
 
@@ -70,24 +71,31 @@ MOR UPDATE（`write.update.mode='merge-on-read'`）：
 - 旧 data file 写 DV 标删被改的行
 - 新 data file 包含改后的行，**显式赋 `DataFile.first_row_id` = 旧行的 `_row_id`**
 
-## ❌ OPTIMIZE 重写后的 row-id 策略
+## ✅ OPTIMIZE 保留 `_row_id`（PR #85）
 
-Spec：v3 允许 OPTIMIZE / compact 时保留原 `_row_id`，也允许重新分配。NovaRocks 当前的 `OPTIMIZE TABLE` 走 whole-table 重写路径，**会重新分配 `_row_id`**。
+V3 spec 允许 OPTIMIZE / compact 时**保留**原 `_row_id`（也允许重新分配；NovaRocks 选保留以让 IVM 在 OPTIMIZE 触发后仍能按 row identity 配对）。
 
-**TODO**：
+实现细节：
 
-- 选定策略（保留 vs 重新分配）并明确对外行为
-- 跑端到端测试覆盖 OPTIMIZE 后的 lineage 查询
-- 让 IVM 在 OPTIMIZE 触发时不会因为 row-id 漂移误算 delta
+- OPTIMIZE 在 V3 row-lineage 表上自动路由到 `write_row_lineage_batches_as_data_files`（同 COW / MOR UPDATE 用的 writer），把 `_row_id` 与 `_last_updated_sequence_number` 物理写入 parquet 文件，使用 reserved field id `i32::MAX-107` / `i32::MAX-108`
+- `RewriteDataFiles` commit 检测到所有写出的 file 都带 `first_row_id=None`（因为行级 row-id 已经在文件内），跳过 `next_row_id` 全表水位线分配，并在 snapshot 元数据中省略 `row_range`
+- 读端 `synthesize_row_lineage_columns`（`src/exec/operators/scan/runner.rs`）优先从物理列读 row-id，回退到 `first_row_id + offset`
 
-## ❌ Branch / tag 切换 `_row_id` 一致性测试
+回归覆盖：
+
+- `iceberg_v3_optimize_compact_data_files.sql`：OPTIMIZE 前后 `_row_id` 不变（按行配对断言）
+- `iceberg_v3_row_lineage_uniqueness.sql`：OPTIMIZE / DELETE / UPDATE / MERGE 任意组合后，`_row_id` 在表内 + 历史 snapshot 中保持唯一
+
+参考 plan：[2026-05-06-iceberg-v3-row-lineage-completion.md](../superpowers/plans/2026-05-06-iceberg-v3-row-lineage-completion.md)（Phase B）
+
+## ❌ Branch / tag 切换 `_row_id` 一致性回归
 
 main 与 dev branch 上同一行的 `_row_id` 应该在分叉前一致；分叉后各自演进。NovaRocks 的实现按这个不变量写，但**没有专门的回归测试覆盖**。
 
-**TODO**：补 SQL 测试。
+**TODO**：补 branch / tag 切换场景下的 SQL 测试。
 
 ## ❌ Cross-engine `_row_id` invariant 测试
 
 如果让 Spark / Trino 也往同一张表写，多引擎对 `first_row_id` 全局水位线的认知一致性需要验证。
 
-**TODO**：等 cross-engine fixture 上线后补。
+**TODO**：等 cross-engine fixture（§17）上线后补。

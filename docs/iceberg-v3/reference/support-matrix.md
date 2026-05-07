@@ -75,25 +75,30 @@
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | variant（读） | ✅ | `src/exec/variant.rs` |
-| variant（写） | ❌ | IcebergSink 拒绝 variant 列；TODO INSERT / CTAS |
-| variant predicate pushdown 到 parquet | ❌ | |
+| variant（INSERT 写） | ✅ | PR #87；`INSERT INTO ... VALUES (parse_json(...))` / `INSERT INTO ... SELECT` 均 OK，单 partition spec、无 shredding |
+| variant（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete 写） | ❌ | PR #87 fail-fast，错误信息明确指向非目标边界 |
+| variant shredding（`typed_value` 子树） | ❌ | spec optional，未做 |
+| variant default value（`initial-default` / `write-default`） | ❌ | |
+| variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
+| variant predicate pushdown 到 parquet | ❌ | 当前在 BE 层 evaluate |
 | geometry / geography（V3 空间类型） | ❌ | 读端 parquet `geometry` 物理类型解码 / 写端 WKB-EWKB 序列化 / `ST_*` 函数族都未做 |
 | default value（`initial-default` / `write-default`） | ✅ | PR #79；DDL `DEFAULT <literal>` + 读端 backfill + INSERT 写端 fill |
 
 ## 5. Schema Evolution（DDL）
 
+> Phase 2 收官（PR #86 / #88 / #89）：10 项全部 ✅。详见 [schema-evolution](../schema-evolution.md)。
+
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| ADD COLUMN（含嵌套） | ✅ | `src/connector/iceberg/catalog/schema_update.rs` |
-| DROP COLUMN | ✅ | |
-| RENAME COLUMN | ✅ | |
-| 类型 widening（int→long / float→double / decimal precision↑） | ✅ | |
-| reorder | ✅ | |
-| required ↔ optional（按 spec 安全方向） | ✅ | |
-| STRUCT 内嵌 add / drop / rename / widen | ❌ | |
-| ARRAY / MAP 元素类型 widening | ❌ | |
-| DDL 失败原子回滚（schema commit conflict） | ❌ | |
-| `ALTER TABLE … SET TBLPROPERTIES` 全量 | 🚧 | 部分 props 已支持，需要全量审计 |
+| ADD COLUMN（含嵌套 STRUCT 路径） | ✅ | PR #86；`src/connector/iceberg/catalog/schema_update.rs` |
+| DROP COLUMN（含嵌套） | ✅ | PR #86 |
+| RENAME COLUMN（含嵌套） | ✅ | PR #86 |
+| 类型 widening（int→long / float→double / decimal precision↑ / date→timestamp） | ✅ | PR #86 |
+| ARRAY / MAP 元素类型 widening | ✅ | PR #86；`<list>.element` / `<map>.key` / `<map>.value` |
+| Column reorder（`ALTER COLUMN ... FIRST / AFTER / BEFORE`，含嵌套） | ✅ | PR #86 |
+| `SET / DROP NOT NULL`（含 identifier-field 保护 + `novarocks.nullability.attested.*` 留痕） | ✅ | PR #86 |
+| DDL 失败原子回滚（commit 冲突 3 次指数退避 10/100/500ms 重试） | ✅ | PR #88；retry 间隙 invalidate cache 强制重读 metadata |
+| `ALTER TABLE … SET / UNSET TBLPROPERTIES`（含 denylist + IF EXISTS） | ✅ | PR #89；`novarocks.*` / `format-version` / Iceberg 内部键全部 reject |
 
 ## 6. 分区与分区演进
 
@@ -180,10 +185,10 @@
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `$snapshots` | 🚧 | BE 已落 PR #81，缺 standalone parser `t$tabletype` 路由 |
-| `$history` | 🚧 | 同上 |
-| `$refs`（branches + tags） | 🚧 | 同上 |
-| `$partitions` | 🚧 | 同上 |
+| `$snapshots` | ✅ | BE PR #81 + SQL 路由 PR #85 |
+| `$history` | ✅ | BE PR #81 + SQL 路由 PR #85 |
+| `$refs`（branches + tags） | ✅ | BE PR #81 + SQL 路由 PR #85 |
+| `$partitions` | ✅ | BE PR #81 + SQL 路由 PR #85 |
 | `$manifests` | ❌ | |
 | `$files` / `$all_data_files` | ❌ | |
 | `$delete_files` / `$all_delete_files` | ❌ | |
@@ -230,9 +235,10 @@
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
 | COW UPDATE 保留 `_row_id` + 写 `novarocks.update.sidecar` JSON | ✅ | |
 | MOR UPDATE 复用 `_row_id` + 显式赋 `DataFile.first_row_id` | ✅ | |
-| OPTIMIZE 重写后保留每行 `_row_id` | ❌ | spec 允许保留 / 新分配；策略待选 |
-| Branch / tag 切换 `_row_id` 一致性测试 | ❌ | |
-| `_row_id` 跨 snapshot 唯一性 invariant 测试 | ❌ | cross-engine 写入混合后 |
+| OPTIMIZE 重写后保留每行 `_row_id`（写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
+| `_row_id` 跨 snapshot 唯一性 invariant 测试（含 OPTIMIZE 后） | ✅ | PR #85（`iceberg_v3_row_lineage_uniqueness.sql`） |
+| Branch / tag 切换 `_row_id` 一致性回归 | ❌ | |
+| Cross-engine `_row_id` 一致性测试 | ❌ | 待 §17 cross-engine fixture |
 
 ## 13. Deletion Vector / Puffin
 

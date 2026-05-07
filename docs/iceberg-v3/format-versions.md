@@ -36,7 +36,7 @@ Spec 新增能力：
 | Equality-delete 在 V3 下的语义保留 | ✅ | [deletion-vectors](deletion-vectors.md) |
 | Default Value（`initial-default` / `write-default`） | ✅ | [default-values](default-values.md) |
 | Variant 类型（读） | ✅ | [variant](variant.md) |
-| Variant 类型（写） | ❌ | [variant](variant.md) |
+| Variant 类型（写） | 🚧 | INSERT happy path ✅（PR #87）；OVERWRITE / DELETE / UPDATE / MERGE 仍 reject。详见 [variant](variant.md) |
 | Geometry / Geography 类型 | ❌ | [data-types](data-types.md) |
 | Timestamp_ns / Timestamptz_ns | ❌ | [data-types](data-types.md) |
 | Unknown 类型 | ❌ | [data-types](data-types.md) |
@@ -64,17 +64,16 @@ Spec：V1 不支持 row-level delete，仅 append + overwrite。
 
 ## ❌ 表升级 V1 → V2 / V2 → V3
 
-Spec 语法：
+PR #89 落地的 [SET / UNSET TBLPROPERTIES](schema-evolution.md#-set--unset-tblproperties) 显式把 `format-version` 列入 denylist：
 
 ```sql
--- TODO: 暂未实现
-ALTER TABLE t SET TBLPROPERTIES ('format-version' = '2');
 ALTER TABLE t SET TBLPROPERTIES ('format-version' = '3');
+-- ERROR: format-version is reserved; use UPGRADE TABLE syntax (not yet implemented in NovaRocks)
 ```
 
-**TODO**：未实现。原因是升级不仅是改 metadata.json 字段，还需要：
+未来会引入专门的 `UPGRADE TABLE ... TO V3` / `... TO V2` 语法。原因是升级不仅是改 metadata.json 的 `format-version` 字段，还要：
 
 - V1 → V2：补 sequence number
-- V2 → V3：可能需要把 position-delete 重写成 deletion vector、补 row-lineage 元数据列、改 manifest 版本
+- V2 → V3：可能要把 position-delete 重写成 deletion vector、补 row-lineage 元数据列、改 manifest 版本
 
-替代方案：用 Spark / Trino / iceberg-cli 完成升级后再让 NovaRocks 接入。
+替代方案（在 NovaRocks 实现升级前）：用 Spark / Trino / iceberg-cli 完成升级后再让 NovaRocks 接入。
