@@ -1178,6 +1178,31 @@ pub(crate) struct AlterTableOptimizeStmt {
     pub(crate) table: ObjectName,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableExpireSnapshotsStmt {
+    pub(crate) table: ObjectName,
+    /// epoch-ms threshold; expire only snapshots with timestamp_ms < this.
+    /// Mutually optional with retain_last but at least one must be Some
+    /// (parser enforces).
+    pub(crate) older_than_ms: Option<i64>,
+    /// Retain at least N most-recent snapshots in the main ancestor chain.
+    /// Must be >= 1 if Some (parser enforces).
+    pub(crate) retain_last: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableRemoveOrphanFilesStmt {
+    pub(crate) table: ObjectName,
+    /// Mandatory (parser enforces). epoch-ms threshold; only files with
+    /// last_modified_ms < this are eligible for removal.
+    pub(crate) older_than_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableRewriteManifestsStmt {
+    pub(crate) table: ObjectName,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShowAlterTableOptimizeStmt {
     pub(crate) catalog: Option<String>,
