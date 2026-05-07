@@ -20,6 +20,9 @@ compose_env="$runtime_dir/compose.env"
 exports_file="$runtime_dir/env.sh"
 manifest_file="$runtime_dir/manifest.json"
 readme_file="$runtime_dir/README.md"
+spark_defaults_file="$runtime_dir/spark-defaults.conf"
+spark_v3_smoke_sql="$runtime_dir/spark-iceberg-v3-smoke.sql"
+spark_sql_script="$SCRIPT_DIR/iceberg-rest-spark-sql.sh"
 
 mkdir -p "$runtime_dir"
 
@@ -52,10 +55,12 @@ if [[ -f "$exports_file" ]]; then
   minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT}"
   rest_port="${NOVA_ENV_REST_PORT}"
   mysql_port="${NOVA_ENV_MYSQL_PORT}"
+  spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-$(choose_port $((22000 + offset)))}"
 else
   minio_port="$(choose_port $((19000 + offset)))"
   minio_console_port="$(choose_port $((20000 + offset)))"
   rest_port="$(choose_port $((21000 + offset)))"
+  spark_ui_port="$(choose_port $((22000 + offset)))"
   mysql_port="$(choose_port $((23000 + offset)))"
 fi
 
@@ -63,6 +68,8 @@ minio_user="${MINIO_ROOT_USER:-admin}"
 minio_password="${MINIO_ROOT_PASSWORD:-admin123}"
 rest_image="${ICEBERG_REST_IMAGE:-tabulario/iceberg-rest:1.6.0}"
 rest_mirror_image="docker.1panel.live/tabulario/iceberg-rest:1.6.0"
+spark_image="${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}"
+spark_mirror_image="docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1"
 
 if ! docker image inspect "$rest_image" >/dev/null 2>&1; then
   if [[ "$rest_image" == "tabulario/iceberg-rest:1.6.0" ]] \
@@ -82,20 +89,44 @@ EOF
   fi
 fi
 
+if ! docker image inspect "$spark_image" >/dev/null 2>&1; then
+  if [[ "$spark_image" == "tabulario/spark-iceberg:3.5.5_1.8.1" ]] \
+    && docker image inspect "$spark_mirror_image" >/dev/null 2>&1; then
+    docker tag "$spark_mirror_image" "$spark_image"
+  else
+    cat >&2 <<EOF
+Missing Spark Iceberg image: $spark_image
+
+Pull it first, for example:
+  docker pull docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1
+  docker tag docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1 tabulario/spark-iceberg:3.5.5_1.8.1
+
+Or set SPARK_ICEBERG_IMAGE to an already available image that contains spark-sql
+and the Iceberg Spark runtime.
+EOF
+    exit 1
+  fi
+fi
+
 managed_warehouse="s3://novarocks/$env_id/sql-tests-managed-lake"
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
 rest_warehouse="s3://warehouse/$env_id/rest"
 minio_endpoint="http://127.0.0.1:$minio_port"
 rest_uri="http://127.0.0.1:$rest_port"
+spark_minio_endpoint="http://minio:9000"
+spark_rest_uri="http://rest:8181"
 
 cat > "$compose_env" <<EOF
+NOVA_ENV_RUNTIME_DIR=$runtime_dir
 NOVA_ENV_MINIO_PORT=$minio_port
 NOVA_ENV_MINIO_CONSOLE_PORT=$minio_console_port
 NOVA_ENV_REST_PORT=$rest_port
+NOVA_ENV_SPARK_UI_PORT=$spark_ui_port
 NOVA_ENV_REST_WAREHOUSE_URI=$rest_warehouse
 MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
 ICEBERG_REST_IMAGE=$rest_image
+SPARK_ICEBERG_IMAGE=$spark_image
 EOF
 
 cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
@@ -147,6 +178,55 @@ PROPERTIES (
 );
 EOF
 
+cat > "$spark_defaults_file" <<EOF
+spark.master local[*]
+spark.app.name NovaRocksIcebergSpark
+spark.ui.bindAddress 0.0.0.0
+spark.driver.bindAddress 0.0.0.0
+spark.sql.extensions org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.ice_rest org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.ice_rest.type rest
+spark.sql.catalog.ice_rest.uri $spark_rest_uri
+spark.sql.catalog.ice_rest.warehouse $rest_warehouse
+spark.sql.catalog.ice_rest.io-impl org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.ice_rest.s3.endpoint $spark_minio_endpoint
+spark.sql.catalog.ice_rest.s3.path-style-access true
+spark.sql.catalog.ice_rest.s3.access-key-id $minio_user
+spark.sql.catalog.ice_rest.s3.secret-access-key $minio_password
+spark.sql.catalog.ice_rest.s3.region us-east-1
+spark.sql.defaultCatalog ice_rest
+spark.hadoop.fs.s3a.endpoint $spark_minio_endpoint
+spark.hadoop.fs.s3a.access.key $minio_user
+spark.hadoop.fs.s3a.secret.key $minio_password
+spark.hadoop.fs.s3a.path.style.access true
+spark.hadoop.fs.s3a.connection.ssl.enabled false
+spark.hadoop.fs.s3a.aws.credentials.provider org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+EOF
+
+cat > "$spark_v3_smoke_sql" <<EOF
+CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;
+
+DROP TABLE IF EXISTS ice_rest.nr_v3.spark_v3_smoke;
+
+CREATE TABLE ice_rest.nr_v3.spark_v3_smoke (
+  id BIGINT,
+  data STRING,
+  category STRING,
+  ts TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+  'format-version' = '3',
+  'write.format.default' = 'parquet'
+);
+
+INSERT INTO ice_rest.nr_v3.spark_v3_smoke VALUES
+  (1, 'spark-v3-a', 'alpha', TIMESTAMP '2026-05-07 00:00:00'),
+  (2, 'spark-v3-b', 'beta', TIMESTAMP '2026-05-07 00:01:00'),
+  (3, 'spark-v3-c', 'alpha', TIMESTAMP '2026-05-07 00:02:00');
+
+SELECT * FROM ice_rest.nr_v3.spark_v3_smoke ORDER BY id;
+EOF
+
 cat > "$exports_file" <<EOF
 export NOVAROCKS_WORKSPACE_ROOT="$WORKSPACE_ROOT"
 export NOVA_ENV_ID="$env_id"
@@ -160,6 +240,7 @@ export NOVA_ENV_COMPOSE_ENV="$compose_env"
 export NOVA_ENV_MINIO_PORT="$minio_port"
 export NOVA_ENV_MINIO_CONSOLE_PORT="$minio_console_port"
 export NOVA_ENV_REST_PORT="$rest_port"
+export NOVA_ENV_SPARK_UI_PORT="$spark_ui_port"
 export NOVA_ENV_MYSQL_PORT="$mysql_port"
 export AWS_S3_ENDPOINT="$minio_endpoint"
 export AWS_S3_ACCESS_KEY_ID="$minio_user"
@@ -172,6 +253,13 @@ export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
+export NOVAROCKS_SPARK_IMAGE="$spark_image"
+export NOVAROCKS_SPARK_UI="http://127.0.0.1:$spark_ui_port"
+export NOVAROCKS_SPARK_REST_URI="$spark_rest_uri"
+export NOVAROCKS_SPARK_S3_ENDPOINT="$spark_minio_endpoint"
+export NOVAROCKS_SPARK_DEFAULTS="$spark_defaults_file"
+export NOVAROCKS_SPARK_V3_SMOKE_SQL="$spark_v3_smoke_sql"
+export NOVAROCKS_SPARK_SQL="$spark_sql_script"
 EOF
 
 cat > "$manifest_file" <<EOF
@@ -193,6 +281,15 @@ cat > "$manifest_file" <<EOF
   "iceberg_rest": {
     "uri": "$rest_uri",
     "warehouse": "$rest_warehouse"
+  },
+  "spark": {
+    "image": "$spark_image",
+    "ui": "http://127.0.0.1:$spark_ui_port",
+    "container_rest_uri": "$spark_rest_uri",
+    "container_minio_endpoint": "$spark_minio_endpoint",
+    "defaults_file": "$spark_defaults_file",
+    "v3_smoke_sql": "$spark_v3_smoke_sql",
+    "helper": "$spark_sql_script"
   },
   "novarocks": {
     "mysql_port": $mysql_port,
@@ -220,12 +317,15 @@ Do not guess ports.
 - MinIO endpoint: \`$minio_endpoint\`
 - MinIO console: \`http://127.0.0.1:$minio_console_port\`
 - Iceberg REST: \`$rest_uri\`
+- Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
 - Manifest: \`$manifest_file\`
 - Env exports: \`$exports_file\`
 - Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`
 - SQL test config: \`$runtime_dir/sql-test.conf\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
+- Spark defaults: \`$spark_defaults_file\`
+- Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`
 
 Use:
 
@@ -233,6 +333,7 @@ Use:
 source "$current_link/env.sh"
 cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+.codex/environments/iceberg-rest-spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 \`\`\`
 EOF
 
@@ -274,9 +375,11 @@ Compose project: $compose_project
 MinIO endpoint: $minio_endpoint
 MinIO console: http://127.0.0.1:$minio_console_port
 Iceberg REST: $rest_uri
+Spark UI: http://127.0.0.1:$spark_ui_port
 
 Use:
   source "$current_link/env.sh"
   cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+  .codex/environments/iceberg-rest-spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 EOF
