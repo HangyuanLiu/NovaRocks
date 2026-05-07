@@ -1679,11 +1679,104 @@ mod tests {
 
     #[test]
     fn retryable_rejects_precondition_with_unrelated_message() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::PreconditionFailed,
-            "table is read-only",
-        );
+        let e = iceberg::Error::new(iceberg::ErrorKind::PreconditionFailed, "table is read-only");
         assert!(!is_retryable_commit_conflict(&e));
+    }
+
+    #[tokio::test]
+    async fn commit_with_retry_succeeds_on_first_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<(), iceberg::Error>(()) }
+        })
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_with_retry_succeeds_after_one_conflict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(iceberg::Error::new(
+                        iceberg::ErrorKind::PreconditionFailed,
+                        "Requirement failed: AssertCurrentSchemaIdMatch{...}",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_with_retry_stops_at_max_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::CatalogCommitConflicts,
+                    "concurrent commit detected",
+                ))
+            }
+        })
+        .await;
+        let err = res.unwrap_err();
+        assert!(err.contains("after 3 attempts"));
+        assert!(err.to_lowercase().contains("concurrent"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn commit_with_retry_does_not_retry_non_conflict_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let res = commit_with_retry(|_attempt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "connection refused",
+                ))
+            }
+        })
+        .await;
+        assert!(res.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_with_retry_passes_attempt_index_to_closure() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_inner = seen.clone();
+        let res = commit_with_retry(move |attempt| {
+            seen_inner.lock().unwrap().push(attempt);
+            async move {
+                if attempt < 2 {
+                    Err(iceberg::Error::new(
+                        iceberg::ErrorKind::PreconditionFailed,
+                        "Requirement failed: AssertCurrentSchemaIdMatch{...}",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
     }
 }
 
@@ -3187,4 +3280,51 @@ fn is_retryable_commit_conflict(err: &iceberg::Error) -> bool {
         }
         _ => false,
     }
+}
+
+const COMMIT_RETRY_MAX_ATTEMPTS: usize = 3;
+const COMMIT_RETRY_BACKOFF_MS: [u64; 3] = [10, 100, 500];
+
+/// Run an iceberg commit closure with up to `COMMIT_RETRY_MAX_ATTEMPTS` attempts,
+/// retrying only on `is_retryable_commit_conflict` errors with a fixed exponential
+/// backoff. Each attempt receives its zero-based index so the caller can re-load
+/// the table and rebuild the action against the latest metadata.
+///
+/// On non-retryable error: returns immediately on the first attempt.
+/// On exhausted retries: returns an error including "after N attempts".
+///
+/// TODO(cancellation): this helper has no cancellation hook today because the
+/// DDL path doesn't carry a QueryContext. Add a check before the sleep when
+/// cancellation is plumbed through `alter_table_schema`.
+#[allow(dead_code)]
+async fn commit_with_retry<F, Fut>(mut do_attempt: F) -> Result<(), String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(), iceberg::Error>>,
+{
+    let mut last_err: Option<iceberg::Error> = None;
+    for attempt in 0..COMMIT_RETRY_MAX_ATTEMPTS {
+        match do_attempt(attempt).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retryable_commit_conflict(&e) => {
+                last_err = Some(e);
+                if attempt + 1 < COMMIT_RETRY_MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        COMMIT_RETRY_BACKOFF_MS[attempt],
+                    ))
+                    .await;
+                }
+            }
+            Err(e) => {
+                return Err(format!("schema commit error: {e}"));
+            }
+        }
+    }
+    let detail = last_err
+        .map(|e| format!("{e}"))
+        .unwrap_or_else(|| "no error captured".to_string());
+    Err(format!(
+        "schema commit conflict after {} attempts due to concurrent table commits: {detail}",
+        COMMIT_RETRY_MAX_ATTEMPTS
+    ))
 }
