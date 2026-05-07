@@ -2065,6 +2065,18 @@ mod tests {
             vec!["also-present".to_string(), "present".to_string()]
         );
     }
+
+    #[test]
+    fn properties_op_compute_remove_keys_all_missing_with_if_exists_returns_empty() {
+        use crate::engine::statement::PropertiesOp;
+        let existing = props(&[]);
+        let op = PropertiesOp::Unset {
+            keys: vec!["a".to_string(), "b".to_string()],
+            if_exists: true,
+        };
+        let computed = compute_remove_keys(&op, &existing);
+        assert!(computed.is_empty());
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -3777,6 +3789,19 @@ pub(crate) fn alter_table_properties(
                     let existing = loaded_inner.table.metadata().properties().clone();
                     validate_unset_keys_present(&op_inner, &existing)
                         .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
+
+                    // Early return for the IF EXISTS no-op case: all requested keys are
+                    // already absent from the latest metadata. Avoids an empty metadata
+                    // rewrite that would otherwise bump the version hint.
+                    if let PropertiesOp::Unset {
+                        if_exists: true, ..
+                    } = &op_inner
+                    {
+                        let removes = compute_remove_keys(&op_inner, &existing);
+                        if removes.is_empty() {
+                            return Ok(());
+                        }
+                    }
 
                     let tx = Transaction::new(&loaded_inner.table);
                     let mut action = tx.update_table_properties();
