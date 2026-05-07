@@ -3187,6 +3187,11 @@ pub(crate) fn alter_table_schema(
                 let table_inner = table_for_retry.clone();
                 let change_inner = change_for_retry.clone();
                 async move {
+                    // Each retry must start with a fresh metadata read; otherwise load_table()
+                    // would serve the stale cached state that just produced the conflict.
+                    entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
+                    // HadoopFileSystemCatalog is not Clone (holds a tokio::sync::Mutex);
+                    // rebuild per attempt rather than share a stale instance.
                     let catalog =
                         crate::connector::iceberg::catalog::registry::build_hadoop_catalog(
                             &entry_inner,
