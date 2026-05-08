@@ -1191,7 +1191,8 @@ fn plan_relation_scoped(
 /// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
 /// `TableStorage::IcebergMetadataTable` storage. The optimizer treats it
 /// like any other Scan; codegen branches on the storage variant to emit
-/// the JVM-bridged metadata scanner.
+/// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
+/// `IcebergMetadataScanOp` (no JNI bridge).
 fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<LogicalPlan, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};

@@ -18,10 +18,10 @@
 
 实现入口：
 
-- BE bridge：`src/connector/iceberg/metadata.rs`、`src/connector/iceberg/IcebergMetadataBridge.java`
+- 读路径 op：`src/connector/iceberg/metadata.rs::IcebergMetadataScanOp`（native Rust，基于 vendored iceberg-rust 0.9 的 `iceberg::spec::TableMetadata`，不再走 JNI/Java SDK）
 - Parser 路由：`src/sql/parser/dialect/mod.rs`（`<tbl>$<metatype>` 重写为 `<tbl>.__nr_meta_<metatype>__`）
 - Analyzer：`src/sql/analyzer/iceberg_metadata.rs`（`split_metadata_suffix`）+ `Relation::IcebergMetadataScan` variant
-- 读路径：复用 `IcebergMetadataScanOp`（PR #81 已搭好的 JNI scanner）
+- 当前覆盖：snapshots / history / refs。Files / Manifests / Partitions / LogicalIcebergMetadata 在 op 构造时 fail-fast 报 `not yet implemented in the native-Rust scan path`，留给后续 PR 用 iceberg-rust 的 manifest/scan API 补
 
 参考 plan：[2026-05-06-iceberg-v3-row-lineage-completion.md](../superpowers/plans/2026-05-06-iceberg-v3-row-lineage-completion.md)（Phase A）
 

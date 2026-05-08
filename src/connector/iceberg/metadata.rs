@@ -949,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jvm_scanner_type_for_new_variants() {
+    fn test_metadata_table_type_uppercase_strings() {
         assert_eq!(
             IcebergMetadataTableType::Snapshots.as_uppercase_str(),
             "SNAPSHOTS"

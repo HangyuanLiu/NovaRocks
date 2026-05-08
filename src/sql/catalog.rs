@@ -154,16 +154,22 @@ pub enum TableStorage {
     /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
     /// analyzer rewrites such references into a regular `Scan` over a
     /// synthetic `TableDef` whose storage is this variant; codegen then
-    /// emits an `HDFS_SCAN_NODE` driven by the JVM iceberg metadata
-    /// bridge instead of a real parquet scan.
+    /// emits an `HDFS_SCAN_NODE` whose lowering builds an
+    /// `IcebergMetadataScanOp` that reads `iceberg::spec::TableMetadata`
+    /// natively (no JNI bridge) — see
+    /// `src/connector/iceberg/metadata.rs`.
     IcebergMetadataTable {
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-        /// JSON-serialized iceberg `TableMetadata`. Forwarded to the JVM
-        /// metadata bridge as the `serialized_table` argument.
+        /// JSON-serialized iceberg-rust `TableMetadata` (produced by
+        /// `serde_json::to_string` in
+        /// `connector/iceberg/catalog/backend.rs`). The metadata-scan
+        /// operator parses it back into a `TableMetadata` and reads
+        /// snapshots / history / refs directly off it.
         serialized_table: String,
-        /// Cloud properties from the underlying iceberg table's storage,
-        /// used to construct the THdfsScanNode cloud_configuration so the
-        /// JVM bridge can read manifest files from object storage.
+        /// Cloud properties from the underlying iceberg table's storage.
+        /// Forwarded onto `THdfsScanNode.cloud_configuration` for parity
+        /// with regular HDFS scans; the native metadata-scan path itself
+        /// does not need them today.
         cloud_properties: BTreeMap<String, String>,
     },
 }
