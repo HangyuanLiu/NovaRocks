@@ -117,6 +117,11 @@ pub(crate) fn extract_three_part_table_refs(
     query: &sqlparser::ast::Query,
 ) -> Vec<(String, String, String)> {
     let mut refs = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_three_part_refs_from_set_expr(cte.query.body.as_ref(), &mut refs);
+        }
+    }
     extract_three_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
     refs.sort();
     refs.dedup();
@@ -135,6 +140,21 @@ fn extract_three_part_refs_from_set_expr(
                     extract_three_part_refs_from_factor(&join.relation, refs);
                 }
             }
+            if let Some(selection) = &select.selection {
+                extract_three_part_refs_from_expr(selection, refs);
+            }
+            if let Some(having) = &select.having {
+                extract_three_part_refs_from_expr(having, refs);
+            }
+            for projection in &select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        extract_three_part_refs_from_expr(expr, refs);
+                    }
+                    _ => {}
+                }
+            }
         }
         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
             extract_three_part_refs_from_set_expr(left, refs);
@@ -142,6 +162,78 @@ fn extract_three_part_refs_from_set_expr(
         }
         sqlparser::ast::SetExpr::Query(query) => {
             extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_three_part_refs_from_expr(
+    expr: &sqlparser::ast::Expr,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
+            extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            extract_three_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+            extract_three_part_refs_from_expr(expr, refs);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_three_part_refs_from_expr(left, refs);
+            extract_three_part_refs_from_expr(right, refs);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            extract_three_part_refs_from_expr(expr, refs);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            extract_three_part_refs_from_expr(expr, refs);
+            extract_three_part_refs_from_expr(low, refs);
+            extract_three_part_refs_from_expr(high, refs);
+        }
+        Expr::Function(function) => {
+            if let sqlparser::ast::FunctionArguments::List(arg_list) = &function.args {
+                for arg in &arg_list.args {
+                    let inner = match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => Some(e),
+                        sqlparser::ast::FunctionArg::Named {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => Some(e),
+                        sqlparser::ast::FunctionArg::ExprNamed {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => Some(e),
+                        _ => None,
+                    };
+                    if let Some(e) = inner {
+                        extract_three_part_refs_from_expr(e, refs);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                extract_three_part_refs_from_expr(op, refs);
+            }
+            for case_when in conditions {
+                extract_three_part_refs_from_expr(&case_when.condition, refs);
+                extract_three_part_refs_from_expr(&case_when.result, refs);
+            }
+            if let Some(else_expr) = else_result {
+                extract_three_part_refs_from_expr(else_expr, refs);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            extract_three_part_refs_from_expr(expr, refs);
         }
         _ => {}
     }
@@ -296,6 +388,69 @@ mod tests {
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
             Vec::<(String, String, String)>::new(),
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_from_projection_subquery() {
+        // Mirrors the iceberg_in_list_predicate failure pattern: outer SELECT has
+        // no FROM; the 3-part reference lives inside a COALESCE(SELECT ...) item.
+        let query = parse_query(
+            "SELECT COALESCE((SELECT count(*) FROM c1.db1.t1), 0) AS a"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("c1".to_string(), "db1".to_string(), "t1".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_from_where_in_subquery() {
+        let query = parse_query(
+            "SELECT 1 FROM dual WHERE x IN (SELECT y FROM c2.db2.t2)"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("c2".to_string(), "db2".to_string(), "t2".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_from_exists_subquery() {
+        let query = parse_query(
+            "SELECT 1 FROM dual WHERE EXISTS (SELECT * FROM c3.db3.t3)"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("c3".to_string(), "db3".to_string(), "t3".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_from_having_subquery() {
+        let query = parse_query(
+            "SELECT k, count(*) FROM dual GROUP BY k \
+             HAVING count(*) > (SELECT avg(v) FROM c4.db4.t4)"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("c4".to_string(), "db4".to_string(), "t4".to_string())],
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_from_cte_body() {
+        let query = parse_query(
+            "WITH x AS (SELECT * FROM c5.db5.t5) SELECT * FROM x"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("c5".to_string(), "db5".to_string(), "t5".to_string())],
         );
     }
 }
