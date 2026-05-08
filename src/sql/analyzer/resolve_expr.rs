@@ -224,6 +224,12 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Function call
             sqlast::Expr::Function(func) => self.analyze_function(func, scope),
+            sqlast::Expr::Ceil { expr, field } => {
+                self.analyze_ceil_floor_expr("ceil", expr, field, scope)
+            }
+            sqlast::Expr::Floor { expr, field } => {
+                self.analyze_ceil_floor_expr("floor", expr, field, scope)
+            }
 
             sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
                 let mut current = self.analyze_expr(root, scope)?;
@@ -645,6 +651,42 @@ impl<'a> super::AnalyzerContext<'a> {
                 distinct: false,
             },
             data_type: field_type,
+            nullable: true,
+        })
+    }
+
+    fn analyze_ceil_floor_expr(
+        &self,
+        name: &str,
+        expr: &sqlast::Expr,
+        field: &sqlast::CeilFloorKind,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, String> {
+        match field {
+            sqlast::CeilFloorKind::DateTimeField(sqlast::DateTimeField::NoDateTime) => {}
+            sqlast::CeilFloorKind::DateTimeField(other) => {
+                return Err(format!(
+                    "unsupported {} datetime field: {}",
+                    name.to_uppercase(),
+                    other
+                ));
+            }
+            sqlast::CeilFloorKind::Scale(_) => {
+                return Err(format!(
+                    "{} with scale is not supported",
+                    name.to_uppercase()
+                ));
+            }
+        }
+        let arg = self.analyze_expr(expr, scope)?;
+        let arg_types = vec![arg.data_type.clone()];
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: name.to_string(),
+                args: vec![arg],
+                distinct: false,
+            },
+            data_type: infer_scalar_return_type(name, &arg_types),
             nullable: true,
         })
     }
@@ -1135,37 +1177,7 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
 
-        // Implicit cast: for string functions like concat/concat_ws, auto-cast
-        // non-string arguments to Utf8.
-        let needs_string_args = matches!(
-            name.as_str(),
-            "concat" | "concat_ws" | "group_concat" | "string_agg"
-        );
-        if needs_string_args {
-            for arg in &mut args_typed {
-                if arg.data_type != DataType::Utf8
-                    && arg.data_type != DataType::LargeUtf8
-                    && arg.data_type != DataType::Null
-                {
-                    let inner = std::mem::replace(
-                        arg,
-                        TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Null),
-                            data_type: DataType::Null,
-                            nullable: true,
-                        },
-                    );
-                    *arg = TypedExpr {
-                        kind: ExprKind::Cast {
-                            expr: Box::new(inner),
-                            target: DataType::Utf8,
-                        },
-                        data_type: DataType::Utf8,
-                        nullable: true,
-                    };
-                }
-            }
-            // Update arg_types after cast
+        if apply_implicit_string_function_casts(&name, &mut args_typed) {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
@@ -1194,6 +1206,37 @@ impl<'a> super::AnalyzerContext<'a> {
                     };
                 }
             }
+            arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
+        if name == "date_trunc"
+            && let Some(value_arg) = args_typed.get_mut(1)
+            && !matches!(
+                value_arg.data_type,
+                DataType::Date32
+                    | DataType::Timestamp(_, _)
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Null
+            )
+        {
+            let target = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+            let inner = std::mem::replace(
+                value_arg,
+                TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Null),
+                    data_type: DataType::Null,
+                    nullable: true,
+                },
+            );
+            *value_arg = TypedExpr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(inner),
+                    target: target.clone(),
+                },
+                data_type: target,
+                nullable: true,
+            };
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
@@ -1936,6 +1979,64 @@ fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> Typed
         },
         data_type: target.clone(),
         nullable,
+    }
+}
+
+fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
+    if matches!(
+        expr.data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+    ) {
+        return false;
+    }
+    let nullable = expr.nullable;
+    let inner = std::mem::replace(
+        expr,
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            data_type: DataType::Null,
+            nullable: true,
+        },
+    );
+    *expr = TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(inner),
+            target: DataType::Utf8,
+        },
+        data_type: DataType::Utf8,
+        nullable,
+    };
+    true
+}
+
+fn cast_utf8_args(args: &mut [TypedExpr], indexes: &[usize]) -> bool {
+    let mut changed = false;
+    for index in indexes {
+        if let Some(arg) = args.get_mut(*index) {
+            changed |= cast_to_utf8_if_needed(arg);
+        }
+    }
+    changed
+}
+
+fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> bool {
+    match name {
+        "concat" | "concat_ws" | "group_concat" | "string_agg" => args
+            .iter_mut()
+            .fold(false, |changed, arg| cast_to_utf8_if_needed(arg) || changed),
+        "append_trailing_char_if_absent"
+        | "find_in_set"
+        | "instr"
+        | "locate"
+        | "split"
+        | "starts_with"
+        | "ends_with" => cast_utf8_args(args, &[0, 1]),
+        "lpad" | "rpad" => cast_utf8_args(args, &[0, 2]),
+        "replace" => cast_utf8_args(args, &[0, 1, 2]),
+        "ascii" | "char_length" | "character_length" | "initcap" | "left" | "length" | "lower"
+        | "ltrim" | "repeat" | "reverse" | "right" | "rtrim" | "strleft" | "strright"
+        | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
+        _ => false,
     }
 }
 

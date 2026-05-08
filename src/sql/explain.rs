@@ -332,7 +332,14 @@ fn format_physical_node(
             let eq: Vec<String> = op
                 .eq_conditions
                 .iter()
-                .map(|(l, r)| format!("{} = {}", format_expr(l), format_expr(r)))
+                .map(|eq| {
+                    format!(
+                        "{} {} {}",
+                        format_expr(&eq.left),
+                        if eq.null_safe { "<=>" } else { "=" },
+                        format_expr(&eq.right)
+                    )
+                })
                 .collect();
             out.push(format!(
                 "{pad}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}",

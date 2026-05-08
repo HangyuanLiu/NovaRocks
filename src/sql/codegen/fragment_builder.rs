@@ -696,7 +696,9 @@ impl<'a> PlanFragmentBuilder<'a> {
         // demote only when neither compiles successfully.
         let mut eq_join_conjuncts = Vec::new();
         let mut demoted_eq_exprs: Vec<crate::sql::analysis::TypedExpr> = Vec::new();
-        for (expr_a, expr_b) in &op.eq_conditions {
+        for eq in &op.eq_conditions {
+            let expr_a = &eq.left;
+            let expr_b = &eq.right;
             // Try natural order: expr_a on left, expr_b on right.
             let natural = ExprCompiler::new(&left.scope)
                 .compile_typed(expr_a)
@@ -725,7 +727,11 @@ impl<'a> PlanFragmentBuilder<'a> {
                 eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
                     left: lt,
                     right: rt,
-                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    opcode: Some(if eq.null_safe {
+                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
+                    } else {
+                        crate::opcodes::TExprOpcode::EQ
+                    }),
                 });
             } else {
                 // Both sides belong to the same child — demote to other_condition
@@ -733,7 +739,11 @@ impl<'a> PlanFragmentBuilder<'a> {
                 demoted_eq_exprs.push(crate::sql::analysis::TypedExpr {
                     kind: crate::sql::analysis::ExprKind::BinaryOp {
                         left: Box::new(expr_a.clone()),
-                        op: crate::sql::analysis::BinOp::Eq,
+                        op: if eq.null_safe {
+                            crate::sql::analysis::BinOp::EqForNull
+                        } else {
+                            crate::sql::analysis::BinOp::Eq
+                        },
                         right: Box::new(expr_b.clone()),
                     },
                     data_type: arrow::datatypes::DataType::Boolean,
@@ -1997,16 +2007,33 @@ impl<'a> PlanFragmentBuilder<'a> {
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         let mut child = self.visit(&node.children[0])?;
+        let child_output_bindings: Vec<_> = child
+            .scope
+            .iter_columns()
+            .map(|(_, binding)| binding.clone())
+            .collect();
 
         // Register all output columns with the alias as qualifier
-        for col in &op.output_columns {
+        for (idx, col) in op.output_columns.iter().enumerate() {
             let col_name_lower = col.name.to_lowercase();
-            if let Ok(binding) = child.scope.resolve_column(None, &col_name_lower) {
-                let binding = binding.clone();
-                child
-                    .scope
-                    .add_column(Some(op.alias.clone()), col.name.clone(), binding);
-            }
+            let binding = child
+                .scope
+                .resolve_column(None, &col_name_lower)
+                .cloned()
+                .or_else(|_| {
+                    child_output_bindings.get(idx).cloned().ok_or_else(|| {
+                        format!(
+                            "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
+                            op.alias,
+                            col.name,
+                            idx,
+                            child_output_bindings.len()
+                        )
+                    })
+                })?;
+            child
+                .scope
+                .add_column(Some(op.alias.clone()), col.name.clone(), binding);
         }
 
         Ok(child)
@@ -2814,8 +2841,8 @@ mod tests {
         ManagedTabletRef, PhysicalTableLayout, S3FileInfo, TableDef, TableStorage,
     };
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
-        PhysicalSortOp,
+        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
@@ -3529,8 +3556,8 @@ mod tests {
         PhysicalPlanNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![(
-                    TypedExpr {
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: TypedExpr {
                         kind: ExprKind::ColumnRef {
                             qualifier: Some("ice_t".to_string()),
                             column: "id".to_string(),
@@ -3538,7 +3565,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                     },
-                    TypedExpr {
+                    right: TypedExpr {
                         kind: ExprKind::ColumnRef {
                             qualifier: Some("managed_t".to_string()),
                             column: "id".to_string(),
@@ -3546,7 +3573,8 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                     },
-                )],
+                    null_safe: false,
+                }],
                 other_condition: None,
                 distribution: JoinDistribution::Colocate,
             }),

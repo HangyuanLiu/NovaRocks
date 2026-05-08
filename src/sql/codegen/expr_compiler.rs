@@ -66,8 +66,8 @@ impl<'a> ExprCompiler<'a> {
 
         let mut arg_types = Vec::new();
         for arg in &agg_call.args {
-            self.compile_typed_inner(arg)?;
-            arg_types.push(arg.data_type.clone());
+            let compiled_type = self.compile_aggregate_arg_typed(&agg_call.name, arg)?;
+            arg_types.push(compiled_type);
         }
         let mut agg_input_types = arg_types.clone();
 
@@ -197,7 +197,7 @@ impl<'a> ExprCompiler<'a> {
             // count(*): no original args, but merge needs the intermediate type
             vec![input_type.clone()]
         } else {
-            agg_call.args.iter().map(|a| a.data_type.clone()).collect()
+            aggregate_arg_types_for_signature(&agg_call.name, &agg_call.args)
         };
         let mut agg_input_types = arg_types.clone();
         agg_input_types.extend(agg_call.order_by.iter().map(|ob| ob.expr.data_type.clone()));
@@ -296,6 +296,28 @@ impl<'a> ExprCompiler<'a> {
         } else {
             self.compile_typed_inner(expr)
         }
+    }
+
+    fn compile_aggregate_arg_typed(
+        &mut self,
+        agg_name: &str,
+        arg: &TypedExpr,
+    ) -> Result<DataType, String> {
+        let Some(target_type) = aggregate_arg_cast_type(agg_name, &arg.data_type) else {
+            return self.compile_typed_inner(arg);
+        };
+        let type_desc = arrow_type_to_type_desc(&target_type)?;
+        self.nodes.push(exprs::TExprNode {
+            node_type: exprs::TExprNodeType::CAST_EXPR,
+            type_: type_desc,
+            num_children: 1,
+            opcode: None,
+            ..default_expr_node()
+        });
+        self.compile_typed_inner(arg)?;
+        self.last_type = target_type.clone();
+        self.last_nullable = true;
+        Ok(target_type)
     }
 
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
@@ -1574,7 +1596,7 @@ fn infer_scalar_function_return_type(
         ),
         "date_format" | "from_unixtime" | "time_format" => Ok(DataType::Utf8),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
-        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" | "date_trunc"
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
         | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
         | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
         | "microseconds_sub" => {
@@ -1588,6 +1610,7 @@ fn infer_scalar_function_return_type(
                 _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             })
         }
+        "date_trunc" => Ok(infer_date_trunc_return_type(arg_types)),
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
         | "yearweek" | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => {
             Ok(DataType::Int32)
@@ -1664,6 +1687,11 @@ fn infer_scalar_function_return_type(
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" | "map_size" => Ok(DataType::Int32),
         "grouping" | "grouping_id" => Ok(DataType::Int64),
+        "split" => Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),
             _ => Ok(DataType::Null),
@@ -2012,6 +2040,31 @@ fn infer_agg_function_types(
     }
 }
 
+fn aggregate_arg_types_for_signature(agg_name: &str, args: &[TypedExpr]) -> Vec<DataType> {
+    args.iter()
+        .map(|arg| {
+            aggregate_arg_cast_type(agg_name, &arg.data_type)
+                .unwrap_or_else(|| arg.data_type.clone())
+        })
+        .collect()
+}
+
+fn aggregate_arg_cast_type(agg_name: &str, input_type: &DataType) -> Option<DataType> {
+    if matches!(agg_name, "sum" | "avg") && matches!(input_type, DataType::Utf8) {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+fn infer_date_trunc_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.get(1) {
+        Some(DataType::Date32) => DataType::Date32,
+        Some(DataType::Timestamp(unit, tz)) => DataType::Timestamp(*unit, tz.clone()),
+        _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+    }
+}
+
 fn approx_top_k_output_type(item_type: DataType) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item",
@@ -2051,8 +2104,8 @@ fn list_output_type(item_type: DataType) -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_agg_function_types;
-    use arrow::datatypes::DataType;
+    use super::{aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type};
+    use arrow::datatypes::{DataType, TimeUnit};
 
     #[test]
     fn percentile_family_uses_binary_intermediate_state() {
@@ -2076,5 +2129,31 @@ mod tests {
             infer_agg_function_types("percentile_union", &[DataType::Binary], false)
                 .expect("percentile_union type inference");
         assert_eq!(union_intermediate, Some(DataType::Binary));
+    }
+
+    #[test]
+    fn sum_avg_cast_varchar_inputs_to_float64() {
+        assert_eq!(
+            aggregate_arg_cast_type("sum", &DataType::Utf8),
+            Some(DataType::Float64)
+        );
+        assert_eq!(
+            aggregate_arg_cast_type("avg", &DataType::Utf8),
+            Some(DataType::Float64)
+        );
+        assert_eq!(aggregate_arg_cast_type("count", &DataType::Utf8), None);
+        assert_eq!(aggregate_arg_cast_type("sum", &DataType::Int64), None);
+    }
+
+    #[test]
+    fn date_trunc_type_inference_uses_value_arg() {
+        assert_eq!(
+            infer_date_trunc_return_type(&[DataType::Utf8, DataType::Utf8]),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            infer_date_trunc_return_type(&[DataType::Utf8, DataType::Date32]),
+            DataType::Date32
+        );
     }
 }

@@ -125,6 +125,14 @@ pub(super) fn validate_aggregate_function_call(
     }
 }
 
+fn infer_date_trunc_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.get(1) {
+        Some(DataType::Date32) => DataType::Date32,
+        Some(DataType::Timestamp(unit, tz)) => DataType::Timestamp(*unit, tz.clone()),
+        _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+    }
+}
+
 fn validate_sum_map_arguments(arg_types: &[DataType]) -> Result<(), String> {
     let Some(arg_type) = arg_types.first() else {
         return Ok(());
@@ -353,6 +361,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
             }
         }
+        "date_trunc" => infer_date_trunc_return_type(arg_types),
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
         | "dayofyear" | "weekofyear" | "quarter" => DataType::Int32,
         "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" => DataType::Int64,
@@ -371,6 +380,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "encode_row_id" => DataType::Binary,
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "grouping" | "grouping_id" => DataType::Int64,
+        "split" => DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))),
         "array_min" | "array_max" => match arg_types.first() {
             Some(DataType::List(item)) => item.data_type().clone(),
             _ => DataType::Null,

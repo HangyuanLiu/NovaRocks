@@ -138,11 +138,15 @@ fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
 /// (e.g. self-joins where the same column name appears in both children, or
 /// when logical_props is missing for a child group).
 fn orient_eq_pair(
-    pair: (TypedExpr, TypedExpr),
+    pair: PhysicalHashJoinEqCondition,
     left_cols: &HashSet<String>,
     right_cols: &HashSet<String>,
-) -> Option<(TypedExpr, TypedExpr)> {
-    let (a, b) = pair;
+) -> Option<PhysicalHashJoinEqCondition> {
+    let PhysicalHashJoinEqCondition {
+        left: a,
+        right: b,
+        null_safe,
+    } = pair;
     let a_cols = collect_column_refs_lowercase(&a);
     let b_cols = collect_column_refs_lowercase(&b);
 
@@ -153,11 +157,19 @@ fn orient_eq_pair(
 
     // Unambiguous exclusive assignment: a from left only, b from right only.
     if a_in_left && !a_in_right && b_in_right && !b_in_left {
-        return Some((a, b));
+        return Some(PhysicalHashJoinEqCondition {
+            left: a,
+            right: b,
+            null_safe,
+        });
     }
     // Unambiguous exclusive swap: a from right only, b from left only.
     if a_in_right && !a_in_left && b_in_left && !b_in_right {
-        return Some((b, a));
+        return Some(PhysicalHashJoinEqCondition {
+            left: b,
+            right: a,
+            null_safe,
+        });
     }
     // Ambiguous or unknown: preserve natural order.  The fragment builder's
     // try-swap fallback will handle any incorrect orientation at compile time.
@@ -168,7 +180,11 @@ fn orient_eq_pair(
     if both_exclusively_left || both_exclusively_right {
         return None;
     }
-    Some((a, b))
+    Some(PhysicalHashJoinEqCondition {
+        left: a,
+        right: b,
+        null_safe,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +203,7 @@ fn orient_eq_pair(
 fn extract_eq_conditions(
     condition: &Option<TypedExpr>,
     _join_type: &JoinKind,
-) -> (Vec<(TypedExpr, TypedExpr)>, Option<TypedExpr>) {
+) -> (Vec<PhysicalHashJoinEqCondition>, Option<TypedExpr>) {
     let Some(cond) = condition else {
         return (vec![], None);
     };
@@ -217,7 +233,7 @@ fn extract_eq_conditions(
 /// either an equality pair or a residual predicate.
 fn collect_conjuncts(
     expr: &TypedExpr,
-    eq_pairs: &mut Vec<(TypedExpr, TypedExpr)>,
+    eq_pairs: &mut Vec<PhysicalHashJoinEqCondition>,
     others: &mut Vec<TypedExpr>,
 ) {
     match &expr.kind {
@@ -233,18 +249,18 @@ fn collect_conjuncts(
             collect_conjuncts(left, eq_pairs, others);
             collect_conjuncts(right, eq_pairs, others);
         }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => {
+        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
             // Only treat as equi-join key if BOTH sides are column refs.
             // Expressions like `d_year = 2002` (column = constant) are filters,
             // not equi-join keys.
             let left_is_col = matches!(left.kind, ExprKind::ColumnRef { .. });
             let right_is_col = matches!(right.kind, ExprKind::ColumnRef { .. });
             if left_is_col && right_is_col {
-                eq_pairs.push((*left.clone(), *right.clone()));
+                eq_pairs.push(PhysicalHashJoinEqCondition {
+                    left: *left.clone(),
+                    right: *right.clone(),
+                    null_safe: matches!(op, BinOp::EqForNull),
+                });
             } else {
                 others.push(expr.clone());
             }
@@ -298,9 +314,10 @@ fn typed_expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 }
 
 /// Check if two eq pairs are structurally equal (possibly with swapped sides).
-fn eq_pair_matches(a: &(TypedExpr, TypedExpr), b: &(TypedExpr, TypedExpr)) -> bool {
-    (typed_expr_eq(&a.0, &b.0) && typed_expr_eq(&a.1, &b.1))
-        || (typed_expr_eq(&a.0, &b.1) && typed_expr_eq(&a.1, &b.0))
+fn eq_pair_matches(a: &PhysicalHashJoinEqCondition, b: &PhysicalHashJoinEqCondition) -> bool {
+    a.null_safe == b.null_safe
+        && ((typed_expr_eq(&a.left, &b.left) && typed_expr_eq(&a.right, &b.right))
+            || (typed_expr_eq(&a.left, &b.right) && typed_expr_eq(&a.right, &b.left)))
 }
 
 /// Try to extract common equality conditions from an OR expression.
@@ -311,14 +328,14 @@ fn eq_pair_matches(a: &(TypedExpr, TypedExpr), b: &(TypedExpr, TypedExpr)) -> bo
 /// Returns `(common_eq_pairs, rewritten_or_condition)`.
 fn try_extract_common_eq_from_or(
     expr: &TypedExpr,
-) -> (Vec<(TypedExpr, TypedExpr)>, Option<TypedExpr>) {
+) -> (Vec<PhysicalHashJoinEqCondition>, Option<TypedExpr>) {
     let branches = split_or(expr);
     if branches.len() < 2 {
         return (vec![], Some(expr.clone()));
     }
 
     // For each branch, extract eq pairs and residual.
-    let mut branch_eqs: Vec<Vec<(TypedExpr, TypedExpr)>> = Vec::new();
+    let mut branch_eqs: Vec<Vec<PhysicalHashJoinEqCondition>> = Vec::new();
     let mut branch_others: Vec<Vec<TypedExpr>> = Vec::new();
     for branch in &branches {
         let mut eqs = Vec::new();
@@ -330,7 +347,7 @@ fn try_extract_common_eq_from_or(
 
     // Find eq pairs that appear in ALL branches.
     let first_eqs = &branch_eqs[0];
-    let mut common: Vec<(TypedExpr, TypedExpr)> = Vec::new();
+    let mut common: Vec<PhysicalHashJoinEqCondition> = Vec::new();
     for eq in first_eqs {
         if branch_eqs[1..]
             .iter()
@@ -352,12 +369,16 @@ fn try_extract_common_eq_from_or(
             if !common.iter().any(|c| eq_pair_matches(c, eq)) {
                 // Keep non-common eq pairs as regular conjuncts.
                 remaining_parts.push(TypedExpr {
-                    data_type: arrow::datatypes::DataType::Boolean,
-                    nullable: eq.0.nullable || eq.1.nullable,
+                    data_type: DataType::Boolean,
+                    nullable: eq.left.nullable || eq.right.nullable,
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(eq.0.clone()),
-                        op: BinOp::Eq,
-                        right: Box::new(eq.1.clone()),
+                        left: Box::new(eq.left.clone()),
+                        op: if eq.null_safe {
+                            BinOp::EqForNull
+                        } else {
+                            BinOp::Eq
+                        },
+                        right: Box::new(eq.right.clone()),
                     },
                 });
             }
@@ -529,7 +550,9 @@ impl Rule for JoinToHashJoin {
             let left_cols = get_group_column_names(memo, expr.children[0]);
             let right_cols = get_group_column_names(memo, expr.children[1]);
             for pair in raw_eq_conds {
-                let (a, b) = pair.clone();
+                let a = pair.left.clone();
+                let b = pair.right.clone();
+                let null_safe = pair.null_safe;
                 match orient_eq_pair(pair, &left_cols, &right_cols) {
                     Some(oriented) => eq_conds.push(oriented),
                     None => {
@@ -538,7 +561,11 @@ impl Rule for JoinToHashJoin {
                             nullable: false,
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(a),
-                                op: BinOp::Eq,
+                                op: if null_safe {
+                                    BinOp::EqForNull
+                                } else {
+                                    BinOp::Eq
+                                },
                                 right: Box::new(b),
                             },
                         };
@@ -1236,17 +1263,25 @@ mod eq_pair_tests {
         names.iter().map(|s| s.to_lowercase()).collect()
     }
 
+    fn eq_pair(left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left,
+            right,
+            null_safe: false,
+        }
+    }
+
     #[test]
     fn orient_natural_order_keeps_order() {
         let left = cols(&["a_id"]);
         let right = cols(&["b_id"]);
-        let pair = (col("a_id"), col("b_id"));
+        let pair = eq_pair(col("a_id"), col("b_id"));
         let out = orient_eq_pair(pair, &left, &right).expect("should orient");
-        match &out.0.kind {
+        match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
         }
-        match &out.1.kind {
+        match &out.right.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
             _ => panic!("expected ColumnRef"),
         }
@@ -1256,13 +1291,13 @@ mod eq_pair_tests {
     fn orient_swapped_pair_returns_swapped() {
         let left = cols(&["a_id"]);
         let right = cols(&["b_id"]);
-        let pair = (col("b_id"), col("a_id"));
+        let pair = eq_pair(col("b_id"), col("a_id"));
         let out = orient_eq_pair(pair, &left, &right).expect("should orient");
-        match &out.0.kind {
+        match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
         }
-        match &out.1.kind {
+        match &out.right.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "b_id"),
             _ => panic!("expected ColumnRef"),
         }
@@ -1272,7 +1307,7 @@ mod eq_pair_tests {
     fn orient_single_side_pair_returns_none() {
         let left = cols(&["a_id", "a_name"]);
         let right = cols(&["b_id"]);
-        let pair = (col("a_id"), col("a_name"));
+        let pair = eq_pair(col("a_id"), col("a_name"));
         assert!(orient_eq_pair(pair, &left, &right).is_none());
     }
 }
@@ -1397,7 +1432,12 @@ mod join_demotion_tests {
             "expected 1 eq pair in eq_conditions, got {:?}",
             phys.eq_conditions
         );
-        let (lhs, rhs) = &phys.eq_conditions[0];
+        let eq = &phys.eq_conditions[0];
+        assert!(
+            !eq.null_safe,
+            "regular equality should not be marked null-safe"
+        );
+        let (lhs, rhs) = (&eq.left, &eq.right);
         match &lhs.kind {
             ExprKind::ColumnRef { column, .. } => {
                 assert_eq!(column, "a_id", "left side of eq_condition should be a_id")
@@ -1443,6 +1483,42 @@ mod join_demotion_tests {
             }
             other => panic!("expected BinaryOp::Eq in other_condition, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn null_safe_join_pair_stays_hash_join_key() {
+        let mut memo = Memo::new();
+        let left_group = mk_scan_group(&mut memo, &["a_id"]);
+        let right_group = mk_scan_group(&mut memo, &["b_id"]);
+
+        let condition = bin(col("a_id"), BinOp::EqForNull, col("b_id"));
+        let join_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+
+        let rule = JoinToHashJoin;
+        let alternatives = rule.apply(&join_mexpr, &mut memo);
+        assert!(
+            !alternatives.is_empty(),
+            "expected null-safe equality to produce hash join alternatives"
+        );
+        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
+            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
+        };
+        assert_eq!(phys.eq_conditions.len(), 1);
+        assert!(
+            phys.eq_conditions[0].null_safe,
+            "<=> hash join key must retain null-safe semantics"
+        );
+        assert!(
+            phys.other_condition.is_none(),
+            "<=> should not be left as a residual-only predicate"
+        );
     }
 }
 

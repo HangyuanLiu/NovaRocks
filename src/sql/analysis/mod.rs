@@ -103,6 +103,7 @@ pub(crate) enum Relation {
     Subquery {
         query: Box<ResolvedQuery>,
         alias: String,
+        output_columns: Vec<OutputColumn>,
     },
     /// A join between two relations.
     Join(Box<JoinRelation>),

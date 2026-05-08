@@ -99,6 +99,7 @@ pub fn eval_string_function(
         "rpad" => super::pad_ops::eval_rpad(arena, expr, args, chunk),
         "rtrim" => super::trim_ops::eval_rtrim(arena, expr, args, chunk),
         "space" => super::space::eval_space(arena, expr, args, chunk),
+        "split" => super::split::eval_split(arena, args[0], args[1], chunk),
         "split_part" => super::split_part::eval_split_part(arena, expr, args, chunk),
         "strpos" => super::locate_ops::eval_strpos(arena, expr, args, chunk),
         "starts_with" => super::prefix_suffix_ops::eval_starts_with(arena, expr, args, chunk),
@@ -162,6 +163,7 @@ static STRING_FUNCTIONS: &[(&str, &str)] = &[
     ("rpad", "rpad"),
     ("rtrim", "rtrim"),
     ("space", "space"),
+    ("split", "split"),
     ("split_part", "split_part"),
     ("strpos", "strpos"),
     ("strpos_instance", "strpos"),
@@ -376,6 +378,11 @@ static STRING_METADATA: &[FunctionMeta] = &[
         name: "space",
         min_args: 1,
         max_args: 1,
+    },
+    FunctionMeta {
+        name: "split",
+        min_args: 2,
+        max_args: 2,
     },
     FunctionMeta {
         name: "split_part",
