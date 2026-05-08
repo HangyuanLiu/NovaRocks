@@ -283,6 +283,11 @@ fn extract_three_part_refs_from_factor(
 /// `catalog.database.table` to 2-part `database.table` by stripping the
 /// leading catalog element.
 pub(crate) fn strip_catalog_from_three_part_names(query: &mut sqlparser::ast::Query) {
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            strip_catalog_in_set_expr(cte.query.body.as_mut());
+        }
+    }
     strip_catalog_in_set_expr(query.body.as_mut());
 }
 
@@ -293,6 +298,21 @@ fn strip_catalog_in_set_expr(expr: &mut sqlparser::ast::SetExpr) {
                 strip_catalog_in_factor(&mut from.relation);
                 for join in &mut from.joins {
                     strip_catalog_in_factor(&mut join.relation);
+                }
+            }
+            if let Some(selection) = &mut select.selection {
+                strip_catalog_in_expr(selection);
+            }
+            if let Some(having) = &mut select.having {
+                strip_catalog_in_expr(having);
+            }
+            for projection in &mut select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        strip_catalog_in_expr(expr);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -310,12 +330,100 @@ fn strip_catalog_in_set_expr(expr: &mut sqlparser::ast::SetExpr) {
 fn strip_catalog_in_factor(factor: &mut sqlparser::ast::TableFactor) {
     match factor {
         sqlparser::ast::TableFactor::Table { name, .. } => {
-            if name.0.len() == 3 {
+            // Count parts logically (excluding any trailing __nr_meta_*__).
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let (base_parts, _) = split_metadata_suffix(&parts);
+            if base_parts.len() == 3 {
+                // Drop the leading catalog identifier; keep the remaining
+                // 2-part base name plus the (preserved) metadata suffix part.
                 name.0.remove(0);
             }
         }
         sqlparser::ast::TableFactor::Derived { subquery, .. } => {
             strip_catalog_in_set_expr(subquery.body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+fn strip_catalog_in_expr(expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            strip_catalog_in_set_expr(query.body.as_mut());
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            strip_catalog_in_set_expr(subquery.body.as_mut());
+            strip_catalog_in_expr(expr);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            strip_catalog_in_expr(left);
+            strip_catalog_in_expr(right);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            strip_catalog_in_expr(expr);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            strip_catalog_in_expr(expr);
+            strip_catalog_in_expr(low);
+            strip_catalog_in_expr(high);
+        }
+        Expr::Function(function) => {
+            if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut function.args {
+                for arg in &mut arg_list.args {
+                    let inner = match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => Some(e),
+                        sqlparser::ast::FunctionArg::Named {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => Some(e),
+                        sqlparser::ast::FunctionArg::ExprNamed {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => Some(e),
+                        _ => None,
+                    };
+                    if let Some(e) = inner {
+                        strip_catalog_in_expr(e);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                strip_catalog_in_expr(op);
+            }
+            for case_when in conditions {
+                strip_catalog_in_expr(&mut case_when.condition);
+                strip_catalog_in_expr(&mut case_when.result);
+            }
+            if let Some(else_expr) = else_result {
+                strip_catalog_in_expr(else_expr);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            strip_catalog_in_expr(expr);
         }
         _ => {}
     }
@@ -444,6 +552,64 @@ mod tests {
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
             vec![("c5".to_string(), "db5".to_string(), "t5".to_string())],
+        );
+    }
+
+    #[test]
+    fn strips_catalog_from_4part_metadata_table_factor() {
+        let mut query = parse_query("SELECT * FROM ice.db.t.__nr_meta_snapshots__");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "SELECT * FROM db.t.__nr_meta_snapshots__"
+        );
+    }
+
+    #[test]
+    fn leaves_3part_metadata_table_factor_alone() {
+        // base.len() == 2 — already not catalog-qualified; must not be touched.
+        let mut query = parse_query("SELECT * FROM db.t.__nr_meta_history__");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(query.to_string(), "SELECT * FROM db.t.__nr_meta_history__");
+    }
+
+    #[test]
+    fn strips_catalog_inside_projection_subquery() {
+        let mut query = parse_query("SELECT COALESCE((SELECT count(*) FROM c1.db1.t1), 0) AS a");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "SELECT COALESCE((SELECT count(*) FROM db1.t1), 0) AS a"
+        );
+    }
+
+    #[test]
+    fn strips_catalog_inside_where_in_subquery() {
+        let mut query = parse_query("SELECT 1 FROM dual WHERE x IN (SELECT y FROM c2.db2.t2)");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "SELECT 1 FROM dual WHERE x IN (SELECT y FROM db2.t2)"
+        );
+    }
+
+    #[test]
+    fn strips_catalog_inside_cte_body() {
+        let mut query = parse_query("WITH x AS (SELECT * FROM c5.db5.t5) SELECT * FROM x");
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "WITH x AS (SELECT * FROM db5.t5) SELECT * FROM x"
         );
     }
 }
