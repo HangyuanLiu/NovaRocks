@@ -120,9 +120,6 @@ pub struct NovaRocksConfig {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
-    pub iceberg: IcebergConfig,
-
-    #[serde(default)]
     pub debug: DebugConfig,
 
     #[serde(default)]
@@ -162,30 +159,11 @@ impl Default for NovaRocksConfig {
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
-            iceberg: IcebergConfig::default(),
             debug: DebugConfig::default(),
             jdbc: None,
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct IcebergConfig {
-    #[serde(default = "default_enable_embedded_jvm")]
-    pub enable_embedded_jvm: bool,
-}
-
-fn default_enable_embedded_jvm() -> bool {
-    false
-}
-
-impl Default for IcebergConfig {
-    fn default() -> Self {
-        Self {
-            enable_embedded_jvm: default_enable_embedded_jvm(),
         }
     }
 }
@@ -1062,8 +1040,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        IcebergConfig, NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig,
+        NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig, StandaloneObjectStoreConfig,
+        StandaloneServerConfig,
     };
 
     #[test]
@@ -1477,29 +1455,5 @@ internal_service_query_rpc_thread_num = 7
         );
         runtime.internal_service_query_rpc_thread_num = 5;
         assert_eq!(runtime.actual_internal_service_query_rpc_threads(), 5);
-    }
-
-    #[test]
-    fn test_iceberg_embedded_jvm_defaults_to_disabled() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-"#,
-        )
-        .expect("parse config");
-        assert!(!cfg.iceberg.enable_embedded_jvm);
-        assert!(!IcebergConfig::default().enable_embedded_jvm);
-    }
-
-    #[test]
-    fn test_iceberg_embedded_jvm_can_be_enabled() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[iceberg]
-enable_embedded_jvm = true
-"#,
-        )
-        .expect("parse config");
-        assert!(cfg.iceberg.enable_embedded_jvm);
     }
 }

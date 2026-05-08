@@ -24,7 +24,7 @@ use crate::connector::iceberg::position_delete::{
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
-    ensure_embedded_jvm_enabled, lookup_iceberg_table_location, snapshot_iceberg_table_locations,
+    lookup_iceberg_table_location, snapshot_iceberg_table_locations,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::ParquetReadCachePolicy;
