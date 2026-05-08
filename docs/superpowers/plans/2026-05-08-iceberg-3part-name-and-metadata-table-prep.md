@@ -874,6 +874,219 @@ correctly regardless of the session catalog."
 
 ---
 
+## Task 5b (added after Task 6 verification revealed the gap): widen the 3-part strip path in `src/engine/mod.rs` to fire under `current_catalog=Some`
+
+**Why this task exists:** Task 6's verification found that the `iceberg` suite runs with `-- @catalog=iceberg_cat_${suite_uuid0}` (`sql-tests/iceberg/init.sql:1`), so every query reaches the engine with `current_catalog=Some(iceberg_cat_*)`. Three call sites in `src/engine/mod.rs` gate the catalog-strip-and-rewrite branch on `current_catalog.is_none()`; under `is_some` mode the original 3-part / 4-part name reaches the analyzer, which cannot resolve `cat.db.tbl`. Tasks 1–5 set up registration correctly, but the analyzer still trips because the strip never fires.
+
+The plan's spec accepted "other 3-part cases under `current_catalog=Some`" as out-of-scope, but the failing test cases are exactly under that mode, so the strip must now fire in both modes. Registration is already covered (Task 5 makes the 3-part extractor always run; the existing `is_some` branch above each strip-gate has already called `register_iceberg_tables_for_query`).
+
+**Files:**
+- Modify: `src/engine/mod.rs` — three call sites (Query branch, time-travel branch, EXPLAIN branch).
+
+- [ ] **Step 5b.1: Modify the plain Query branch (around lines 724-758)**
+
+Replace this block:
+
+```rust
+// When current_catalog is an Iceberg catalog, materialize
+// referenced Iceberg tables into the local catalog first.
+if current_catalog.is_some() {
+    register_iceberg_tables_for_query(
+        &self.inner,
+        current_catalog,
+        current_database,
+        query,
+    )?;
+}
+
+// Handle 3-part table names (catalog.database.table) when no
+// current catalog context is set.  Clone the query, strip the
+// catalog prefix so the analyzer sees 2-part names, and register
+// the referenced Iceberg tables in the local catalog.
+let three_parts = extract_three_part_table_refs(query);
+if !three_parts.is_empty() && current_catalog.is_none() {
+    register_iceberg_tables_for_query(&self.inner, None, current_database, query)?;
+    let mut rewritten = query.as_ref().clone();
+    strip_catalog_from_three_part_names(&mut rewritten);
+    let catalog = self
+        .inner
+        .catalog
+        .read()
+        .expect("standalone catalog read lock");
+    let result = execute_query(
+        &rewritten,
+        &catalog,
+        current_database,
+        self.inner.exchange_port,
+        query_opts.clone(),
+    )?;
+    drop(catalog);
+    return Ok(StatementResult::Query(result));
+}
+```
+
+with:
+
+```rust
+// When current_catalog is an Iceberg catalog, materialize
+// referenced Iceberg tables into the local catalog first.
+if current_catalog.is_some() {
+    register_iceberg_tables_for_query(
+        &self.inner,
+        current_catalog,
+        current_database,
+        query,
+    )?;
+}
+
+// Handle fully-qualified 3-part table names (catalog.database.table).
+// Strip the leading catalog so the analyzer sees a 2-part name; the
+// registration above (or the explicit one below in current_catalog=None
+// mode) has already materialized the iceberg base table into the local
+// catalog. The strip also turns 4-part `cat.db.tbl.__nr_meta_*__`
+// metadata references into the 3-part form the analyzer's metadata
+// path expects.
+let three_parts = extract_three_part_table_refs(query);
+if !three_parts.is_empty() {
+    if current_catalog.is_none() {
+        register_iceberg_tables_for_query(&self.inner, None, current_database, query)?;
+    }
+    let mut rewritten = query.as_ref().clone();
+    strip_catalog_from_three_part_names(&mut rewritten);
+    let catalog = self
+        .inner
+        .catalog
+        .read()
+        .expect("standalone catalog read lock");
+    let result = execute_query(
+        &rewritten,
+        &catalog,
+        current_database,
+        self.inner.exchange_port,
+        query_opts.clone(),
+    )?;
+    drop(catalog);
+    return Ok(StatementResult::Query(result));
+}
+```
+
+- [ ] **Step 5b.2: Modify the time-travel branch (around lines 681-722)**
+
+Find the existing block (inside `if has_time_travel_refs(query)`):
+
+```rust
+let three_parts = extract_three_part_table_refs(&rewritten);
+if !three_parts.is_empty() && current_catalog.is_none() {
+    register_iceberg_tables_for_query(
+        &self.inner,
+        None,
+        current_database,
+        &rewritten,
+    )?;
+    strip_catalog_from_three_part_names(&mut rewritten);
+}
+```
+
+Replace with:
+
+```rust
+let three_parts = extract_three_part_table_refs(&rewritten);
+if !three_parts.is_empty() {
+    if current_catalog.is_none() {
+        register_iceberg_tables_for_query(
+            &self.inner,
+            None,
+            current_database,
+            &rewritten,
+        )?;
+    }
+    strip_catalog_from_three_part_names(&mut rewritten);
+}
+```
+
+- [ ] **Step 5b.3: Modify the EXPLAIN branch (around lines 634-652)**
+
+Find:
+
+```rust
+let mut rewritten_three_part_query;
+let query = if current_catalog.is_none() {
+    let three_parts = extract_three_part_table_refs(query);
+    if !three_parts.is_empty() {
+        register_iceberg_tables_for_query(
+            &self.inner,
+            None,
+            current_database,
+            query,
+        )?;
+        rewritten_three_part_query = query.clone();
+        strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
+        &rewritten_three_part_query
+    } else {
+        query
+    }
+} else {
+    query
+};
+```
+
+Replace with:
+
+```rust
+let mut rewritten_three_part_query;
+let three_parts = extract_three_part_table_refs(query);
+let query = if !three_parts.is_empty() {
+    if current_catalog.is_none() {
+        register_iceberg_tables_for_query(
+            &self.inner,
+            None,
+            current_database,
+            query,
+        )?;
+    }
+    rewritten_three_part_query = query.clone();
+    strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
+    &rewritten_three_part_query
+} else {
+    query
+};
+```
+
+- [ ] **Step 5b.4: Build and run lib tests**
+
+```
+cargo build 2>&1 | tail -10
+cargo test -p novarocks --lib engine sql::parser 2>&1 | tail -50
+```
+
+Expected: build clean. Lib tests pass (modulo the pre-existing `iceberg_refresh_load_failure_removes_stale_local_catalog_entry` env-related failure that was present before this branch).
+
+- [ ] **Step 5b.5: cargo fmt**
+
+```
+cargo fmt
+cargo fmt --check
+```
+
+Clean. Fold any fmt changes into the same commit.
+
+- [ ] **Step 5b.6: Commit**
+
+```bash
+git add src/engine/mod.rs
+git commit -m "fix(iceberg): strip 3-part catalog prefix in current_catalog=Some mode too
+
+The three call sites that catch 3-part table refs in src/engine/mod.rs
+(Query branch, time-travel branch, EXPLAIN branch) previously gated the
+strip-and-rewrite step on current_catalog.is_none(). Under is_some mode
+the original 3-part name (or 4-part __nr_meta_*__ metadata form) reached
+the analyzer, which only resolves 1- or 2-part names. Now strip in both
+modes; registration in is_some mode was already handled by the
+preceding register_iceberg_tables_for_query call."
+```
+
+---
+
 ## Task 6: SQL regression — verify both failing cases pass and no iceberg suite regression
 
 This task runs the live `docker/iceberg-rest/` fixture, builds the binary, runs the standalone server in the background, and exercises the SQL test runner. It produces no code changes; the only deliverable is verification.
