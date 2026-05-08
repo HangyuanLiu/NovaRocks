@@ -1,0 +1,5 @@
+id	label	category	metric
+1	before-a	NULL	10
+2	before-b	NULL	20
+3	after-c	hot	30
+4	after-d	cold	40

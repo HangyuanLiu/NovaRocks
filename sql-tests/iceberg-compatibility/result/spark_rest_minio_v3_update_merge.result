@@ -1,0 +1,5 @@
+id	label	metric
+1	base-a	10
+2	updated-b	120
+3	merged-c	330
+4	inserted-d	40
