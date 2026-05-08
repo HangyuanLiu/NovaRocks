@@ -705,19 +705,25 @@ impl StandaloneSession {
                         }
                         strip_catalog_from_three_part_names(&mut rewritten);
                     }
-                    let catalog = self
+                    // Clone-then-release: do not hold `state.catalog.read()`
+                    // across `execute_query`. Pipeline execution can run for
+                    // many seconds and would otherwise starve writers (e.g.
+                    // INSERT cleanup taking `state.catalog.write()` in
+                    // `invalidate_iceberg_caches`) on the std::sync::RwLock
+                    // writer queue.
+                    let catalog_snapshot = self
                         .inner
                         .catalog
                         .read()
-                        .expect("standalone catalog read lock");
+                        .expect("standalone catalog read lock")
+                        .clone();
                     let result = execute_query(
                         &rewritten,
-                        &catalog,
+                        &catalog_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
                     )?;
-                    drop(catalog);
                     return Ok(StatementResult::Query(result));
                 }
 
@@ -751,35 +757,41 @@ impl StandaloneSession {
                     }
                     let mut rewritten = query.as_ref().clone();
                     strip_catalog_from_three_part_names(&mut rewritten);
-                    let catalog = self
+                    // Clone-then-release: do not hold the catalog read lock
+                    // across pipeline execution; see comment on the
+                    // time-travel branch above.
+                    let catalog_snapshot = self
                         .inner
                         .catalog
                         .read()
-                        .expect("standalone catalog read lock");
+                        .expect("standalone catalog read lock")
+                        .clone();
                     let result = execute_query(
                         &rewritten,
-                        &catalog,
+                        &catalog_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
                     )?;
-                    drop(catalog);
                     return Ok(StatementResult::Query(result));
                 }
 
-                let catalog = self
+                // Clone-then-release: do not hold the catalog read lock
+                // across pipeline execution; see comment on the time-travel
+                // branch above.
+                let catalog_snapshot = self
                     .inner
                     .catalog
                     .read()
-                    .expect("standalone catalog read lock");
+                    .expect("standalone catalog read lock")
+                    .clone();
                 let result = execute_query(
                     query,
-                    &catalog,
+                    &catalog_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
                 )?;
-                drop(catalog);
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Insert(ref insert) => self.handle_sqlparser_insert(

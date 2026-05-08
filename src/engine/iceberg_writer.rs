@@ -323,16 +323,23 @@ pub(crate) fn run_select_to_chunks(
     let mut rewritten = query.clone();
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
 
-    let result = {
-        let in_mem = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(
-            &rewritten,
-            &in_mem,
-            &target.namespace,
-            state.exchange_port,
-            None,
-        )?
-    };
+    // Clone-then-release: do not hold `state.catalog.read()` across
+    // `execute_query`. The call drives a pipeline that may run for many
+    // seconds; concurrent writers (e.g. INSERT cleanup taking
+    // `state.catalog.write()` in `invalidate_iceberg_caches`) would
+    // otherwise block indefinitely on the std::sync::RwLock writer queue.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let result = crate::engine::execute_query(
+        &rewritten,
+        &catalog_snapshot,
+        &target.namespace,
+        state.exchange_port,
+        None,
+    )?;
     query_result_to_chunks(result)
 }
 
@@ -370,16 +377,19 @@ pub(crate) fn run_select_to_chunks_and_schema(
     )?;
     let mut rewritten = query.clone();
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
-    let result = {
-        let in_mem = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(
-            &rewritten,
-            &in_mem,
-            &target.namespace,
-            state.exchange_port,
-            None,
-        )?
-    };
+    // Clone-then-release: same rationale as `run_select_to_chunks` above.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let result = crate::engine::execute_query(
+        &rewritten,
+        &catalog_snapshot,
+        &target.namespace,
+        state.exchange_port,
+        None,
+    )?;
     let schema_cols = result.columns.clone();
     let chunks = query_result_to_chunks(result)?;
     Ok((chunks, schema_cols))

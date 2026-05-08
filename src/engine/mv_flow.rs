@@ -160,10 +160,16 @@ pub(crate) fn execute_query_for_mv_refresh(
     if !three_parts.is_empty() {
         strip_catalog_from_three_part_names(&mut executable);
     }
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    // Clone-then-release: pipeline execution must not hold
+    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
     execute_query(
         &executable,
-        &catalog,
+        &catalog_snapshot,
         current_database,
         state.exchange_port,
         None,
