@@ -843,6 +843,10 @@ impl StandaloneSession {
                 )
             }
             ref update_stmt @ sqlast::Statement::Update(_) => {
+                if let Some(result) = self::information_schema::try_update_be_configs(update_stmt)?
+                {
+                    return Ok(result);
+                }
                 let stmt =
                     crate::engine::statement::convert_sqlparser_update_to_custom(update_stmt)?;
                 crate::engine::mutation_flow::execute_update_statement(
