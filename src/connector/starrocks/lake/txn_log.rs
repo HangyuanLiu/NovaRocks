@@ -223,6 +223,9 @@ fn append_lake_txn_log_with_rowset_impl(
                     file_seq,
                     load_id,
                 )?;
+                if txn_log_contains_del_file(&txn_log, &del_file_name) {
+                    return Ok(());
+                }
                 let del_file_path = join_tablet_path(
                     &ctx.tablet_root_path,
                     &format!("{DATA_DIR}/{del_file_name}"),
@@ -253,6 +256,17 @@ fn append_lake_txn_log_with_rowset_impl(
                 )
             }
             LakeBatchWriteRouting::Upsert { data_batch } => {
+                let data_file_name = build_txn_upsert_data_file_name(
+                    ctx,
+                    txn_id,
+                    driver_id,
+                    file_seq,
+                    write_format,
+                    load_id,
+                )?;
+                if txn_log_contains_data_segment(&txn_log, &data_file_name) {
+                    return Ok(());
+                }
                 let rowset = build_rowset_for_upsert_batch(
                     ctx,
                     &data_batch,
@@ -268,9 +282,8 @@ fn append_lake_txn_log_with_rowset_impl(
                 upsert_batch,
                 delete_key_batch,
             } => {
-                let mut rowset = build_rowset_for_upsert_batch(
+                let data_file_name = build_txn_upsert_data_file_name(
                     ctx,
-                    &upsert_batch,
                     txn_id,
                     driver_id,
                     file_seq,
@@ -282,6 +295,20 @@ fn append_lake_txn_log_with_rowset_impl(
                     txn_id,
                     driver_id,
                     file_seq,
+                    load_id,
+                )?;
+                if txn_log_contains_data_segment(&txn_log, &data_file_name)
+                    || txn_log_contains_del_file(&txn_log, &del_file_name)
+                {
+                    return Ok(());
+                }
+                let mut rowset = build_rowset_for_upsert_batch(
+                    ctx,
+                    &upsert_batch,
+                    txn_id,
+                    driver_id,
+                    file_seq,
+                    write_format,
                     load_id,
                 )?;
                 let del_file_path = join_tablet_path(
@@ -442,6 +469,45 @@ fn append_lake_txn_log_with_rowset_impl(
         });
         Ok(())
     })
+}
+
+fn build_txn_upsert_data_file_name(
+    ctx: &TabletWriteContext,
+    txn_id: i64,
+    driver_id: i32,
+    file_seq: u64,
+    write_format: StarRocksWriteFormat,
+    load_id: Option<&PUniqueId>,
+) -> Result<String, String> {
+    let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
+    build_txn_data_file_name(
+        ctx.tablet_id,
+        txn_id,
+        driver_id,
+        file_seq,
+        write_format,
+        load_id,
+    )
+}
+
+fn txn_log_contains_data_segment(txn_log: &TxnLogPb, data_file_name: &str) -> bool {
+    txn_log
+        .op_write
+        .as_ref()
+        .and_then(|op_write| op_write.rowset.as_ref())
+        .is_some_and(|rowset| {
+            rowset
+                .segments
+                .iter()
+                .any(|segment| segment == data_file_name)
+        })
+}
+
+fn txn_log_contains_del_file(txn_log: &TxnLogPb, del_file_name: &str) -> bool {
+    txn_log
+        .op_write
+        .as_ref()
+        .is_some_and(|op_write| op_write.dels.iter().any(|del| del == del_file_name))
 }
 
 #[allow(dead_code)]
@@ -4022,7 +4088,7 @@ mod tests {
     };
     use crate::formats::starrocks::writer::StarRocksWriteFormat;
     use crate::formats::starrocks::writer::layout::{
-        txn_log_file_path, txn_log_file_path_with_load_id,
+        DATA_DIR, join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id,
     };
     use crate::frontend_service;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
@@ -5658,6 +5724,75 @@ mod tests {
             .expect("rowset should exist");
         assert_eq!(rowset.num_rows, Some(2));
         assert_eq!(rowset.segments.len(), 1);
+    }
+
+    #[test]
+    fn append_txn_log_retry_with_same_writer_does_not_overwrite_segment_file() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let tablet_id = 88010;
+        let txn_id = 6104;
+        let ctx = test_context(&root, 7010, tablet_id, 4010);
+
+        let first_batch = one_column_batch((0_i64..1024).collect());
+        append_lake_txn_log_with_rowset(
+            &ctx,
+            &first_batch,
+            txn_id,
+            0,
+            0,
+            StarRocksWriteFormat::Native,
+            1,
+            None,
+        )
+        .expect("append txn log first attempt");
+
+        let log_path = txn_log_file_path(&root, tablet_id, txn_id).expect("build log path");
+        let txn_log = read_txn_log_if_exists(&log_path)
+            .expect("read txn log")
+            .expect("txn log should exist");
+        let rowset = txn_log
+            .op_write
+            .and_then(|op| op.rowset)
+            .expect("rowset should exist");
+        assert_eq!(rowset.segments.len(), 1);
+        let segment_name = rowset.segments[0].clone();
+        let expected_segment_size = rowset.segment_size[0];
+        let segment_path = join_tablet_path(&root, &format!("{DATA_DIR}/{segment_name}"))
+            .expect("build segment path");
+        let first_file_size = std::fs::metadata(&segment_path)
+            .expect("segment file should exist")
+            .len();
+        assert_eq!(first_file_size, expected_segment_size);
+
+        let retry_batch = one_column_batch(vec![7]);
+        append_lake_txn_log_with_rowset(
+            &ctx,
+            &retry_batch,
+            txn_id,
+            0,
+            0,
+            StarRocksWriteFormat::Native,
+            1,
+            None,
+        )
+        .expect("append txn log duplicate retry");
+
+        let retry_file_size = std::fs::metadata(&segment_path)
+            .expect("segment file should still exist")
+            .len();
+        assert_eq!(retry_file_size, first_file_size);
+
+        let txn_log = read_txn_log_if_exists(&log_path)
+            .expect("read txn log")
+            .expect("txn log should exist");
+        let rowset = txn_log
+            .op_write
+            .and_then(|op| op.rowset)
+            .expect("rowset should exist");
+        assert_eq!(rowset.num_rows, Some(1024));
+        assert_eq!(rowset.segments.len(), 1);
+        assert_eq!(rowset.segment_size, vec![first_file_size]);
     }
 
     #[test]

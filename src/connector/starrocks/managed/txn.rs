@@ -476,10 +476,16 @@ enum VisibleCommitAction {
 
 fn write_chunks_into_managed_partition_inner(
     state: &Arc<StandaloneState>,
-    plan: ManagedInsertPlan,
+    mut plan: ManagedInsertPlan,
     chunks: &[Chunk],
     commit_action: VisibleCommitAction,
 ) -> Result<i64, String> {
+    let mut managed = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    revalidate_insert_plan_visible_version(&managed, &mut plan)?;
+
     let total_rows = chunks_total_rows(chunks)?;
     let metadata_store = state
         .metadata_store
@@ -563,9 +569,58 @@ fn write_chunks_into_managed_partition_inner(
             )?;
         }
     }
-    commit_catalog_visible_version(state, &plan, prepared.commit_version)?;
+    commit_catalog_visible_version(state, &mut managed, &plan, prepared.commit_version)?;
 
     Ok(total_rows)
+}
+
+fn revalidate_insert_plan_visible_version(
+    managed: &super::catalog::ManagedLakeCatalog,
+    plan: &mut ManagedInsertPlan,
+) -> Result<(), String> {
+    let partition = managed
+        .snapshot
+        .partitions
+        .iter()
+        .find(|partition| {
+            partition.table_id == plan.table_id && partition.partition_id == plan.partition_id
+        })
+        .ok_or_else(|| {
+            format!(
+                "managed insert target partition {} for table {} no longer exists",
+                plan.partition_id, plan.table_id
+            )
+        })?;
+    if matches!(
+        partition.state,
+        super::store::ManagedPartitionState::Retired
+    ) {
+        return Err(format!(
+            "managed insert target partition {} for table {} is no longer writable",
+            plan.partition_id, plan.table_id
+        ));
+    }
+
+    let current_tablet_ids = managed
+        .snapshot
+        .tablets
+        .iter()
+        .filter(|tablet| tablet.partition_id == plan.partition_id)
+        .map(|tablet| tablet.tablet_id)
+        .collect::<HashSet<_>>();
+    if !plan
+        .tablets
+        .iter()
+        .all(|tablet| current_tablet_ids.contains(&tablet.tablet_id))
+    {
+        return Err(format!(
+            "managed insert target tablets for partition {} changed before publish",
+            plan.partition_id
+        ));
+    }
+
+    plan.base_version = partition.visible_version;
+    Ok(())
 }
 
 fn chunks_total_rows(chunks: &[Chunk]) -> Result<i64, String> {
@@ -861,19 +916,15 @@ pub(crate) fn publish_tablets_at_version(
 
 fn commit_catalog_visible_version(
     state: &Arc<StandaloneState>,
+    managed: &mut super::catalog::ManagedLakeCatalog,
     plan: &ManagedInsertPlan,
     new_visible_version: i64,
 ) -> Result<(), String> {
-    let mut managed = state
-        .managed_lake
-        .write()
-        .expect("standalone managed lake write lock");
     let table_id = managed.advance_partition_version(plan.partition_id, new_visible_version)?;
     let runtime = managed
         .runtime_by_table_id(table_id)
         .cloned()
         .ok_or_else(|| format!("managed runtime missing for table_id={table_id}"))?;
-    drop(managed);
 
     let mut catalog = state
         .catalog
@@ -1342,6 +1393,50 @@ mod mv_target_tests {
         }
         row_counts.sort_unstable();
         assert_eq!(row_counts, vec![0, 1]);
+    }
+
+    #[test]
+    fn stale_insert_plan_revalidates_visible_version_before_publish() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_active_mv();
+        let resolved = ResolvedLocalTableName {
+            database: "analytics".to_string(),
+            table: "orders_mv".to_string(),
+        };
+        let stale_plan =
+            load_insert_plan(&fixture.state, &resolved, PartitionTarget::Active).expect("plan");
+        assert_eq!(stale_plan.base_version, 1);
+
+        write_chunks_into_managed_partition(
+            &fixture.state,
+            stale_plan.clone(),
+            &[single_i32_chunk("k1", &[1])],
+        )
+        .expect("first write");
+
+        let rows = write_chunks_into_managed_partition(
+            &fixture.state,
+            stale_plan,
+            &[single_i32_chunk("k1", &[2])],
+        )
+        .expect("second write with stale plan");
+        assert_eq!(rows, 1);
+
+        let snapshot = fixture
+            .state
+            .metadata_store
+            .as_ref()
+            .expect("store")
+            .load_snapshot()
+            .expect("snapshot")
+            .managed;
+        let partition = snapshot
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == 20)
+            .expect("partition");
+        assert_eq!(partition.visible_version, 3);
+        assert_eq!(partition.next_version, 4);
     }
 
     #[test]
