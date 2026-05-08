@@ -1,27 +1,48 @@
 # Iceberg REST + MinIO + Spark Test Environment
 
-Workspace-scoped local Iceberg REST Catalog + MinIO object store + Spark
-runtime for NovaRocks development and CI.
+Shared local Iceberg REST Catalog + MinIO object store + Spark runtime for
+NovaRocks development and CI.
 
 This environment is the canonical test fixture for the
 `iceberg-compatibility` SQL suite (cross-engine: Spark writes, NovaRocks
 reads) and is also used by the standard `iceberg` suite. The Codex workspace
-manifest at `.codex/environments/environment.toml` points its setup/cleanup
-hooks at `up.sh` / `down.sh --purge` here.
+manifest at `.codex/environments/environment.toml` points its setup hook at
+`up.sh --prepare-only` and its cleanup hook at
+`down.sh --runtime-only --purge`.
 
-The scripts derive a stable environment id from the current workspace path,
-so each workspace (and each git worktree) gets its own Docker Compose
-project, volumes, host ports, object-store prefix, Spark runtime, and
-generated NovaRocks test configs without colliding with peers.
+By default, all worktrees share one Docker Compose project
+(`nr-iceberg-rest`) on the services' conventional local ports: MinIO `9000`,
+MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each worktree
+still gets its own generated runtime entry, object-store prefixes, SQL test
+config, and allocated NovaRocks standalone-server port.
 
-## Start
+Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
+`NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose
+project, service ports, credentials, or NovaRocks port allocation range.
+Set `NOVA_ENV_SHARED_DOCKER=false` in the config file when a fully isolated
+per-worktree Docker project is required.
+
+## Prepare Runtime Only
+
+Generate this worktree's runtime entry and configs without starting Docker:
+
+```bash
+docker/iceberg-rest/up.sh --prepare-only
+source docker/iceberg-rest/runtime/current/env.sh
+```
+
+This is what Codex environment setup does. It records the shared Docker ports
+and the per-worktree NovaRocks server port, but it does not create or start
+containers.
+
+## Start Docker
 
 ```bash
 docker/iceberg-rest/up.sh
 ```
 
-The script writes generated state under a workspace-specific directory and
-publishes a fixed discovery entry:
+The script starts or reuses the shared Docker services, writes generated state
+under a workspace-specific directory, and publishes a fixed discovery entry:
 
 ```text
 docker/iceberg-rest/runtime/<env-id>/
@@ -82,22 +103,32 @@ docker/iceberg-rest/status.sh
 docker/iceberg-rest/down.sh
 ```
 
-Remove the workspace-specific Docker volume as well:
+In shared Docker mode this leaves the shared Docker services running. It is
+safe for a worktree cleanup because other worktrees may be using the same
+containers.
+
+Remove the current worktree runtime entry:
 
 ```bash
-docker/iceberg-rest/down.sh --volumes
+docker/iceberg-rest/down.sh --runtime-only --purge
 ```
 
-Codex workspace cleanup (and CI) uses the stronger purge mode:
+Stop the shared Docker services explicitly:
 
 ```bash
-docker/iceberg-rest/down.sh --purge
+docker/iceberg-rest/down.sh --docker
 ```
 
-That stops the workspace-specific Docker Compose project, removes its
-Docker volume, and deletes `docker/iceberg-rest/runtime/<env-id>/`. It also
-removes `docker/iceberg-rest/runtime/current` when that entry points at
-the purged workspace environment.
+Remove the shared Docker volume as well:
+
+```bash
+docker/iceberg-rest/down.sh --docker --volumes
+```
+
+`down.sh --runtime-only --purge` deletes
+`docker/iceberg-rest/runtime/<env-id>/` and removes
+`docker/iceberg-rest/runtime/current` when that entry points at the purged
+worktree environment. It does not stop or remove shared Docker services.
 
 ## Required Images
 
@@ -130,14 +161,19 @@ different runtime.
 
 ## CI Integration
 
-`up.sh` and `down.sh --purge` are designed to be safe to call from CI:
+`up.sh --prepare-only`, `up.sh`, and `down.sh --runtime-only --purge` are
+designed to be safe to call from CI:
 
+- `up.sh --prepare-only` is the Codex setup path. It only writes runtime
+  config and does not touch Docker.
 - `up.sh` is idempotent — re-runs reuse the existing runtime entry and
-  ports if `env.sh` already exists, otherwise allocate fresh free ports.
-- `down.sh --purge` removes the compose project, MinIO volume, and the
-  per-workspace runtime directory.
-- All ports are auto-discovered to avoid collisions with peer workspaces
-  on the same host.
+  allocated NovaRocks port if `env.sh` already exists.
+- Docker service ports come from `shared.env` and default to `9000`, `9001`,
+  `8181`, and `4040`.
+- The NovaRocks standalone-server port is allocated per worktree from
+  `NOVA_ENV_MYSQL_PORT_START` / `NOVA_ENV_MYSQL_PORT_RANGE`.
+- `down.sh --runtime-only --purge` removes only the per-worktree runtime
+  directory.
 - The runtime directory (`docker/iceberg-rest/runtime/`) is gitignored.
 
 A typical CI step:
@@ -145,12 +181,12 @@ A typical CI step:
 ```bash
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
-trap "docker/iceberg-rest/down.sh --purge" EXIT
+trap "docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
 NO_PROXY=127.0.0.1,localhost \
 cargo run --release -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG" &
 SERVER_PID=$!
-trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --purge" EXIT
+trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
 # wait for MySQL port to be open, then run the suite
 until nc -z 127.0.0.1 "$NOVA_ENV_MYSQL_PORT"; do sleep 1; done

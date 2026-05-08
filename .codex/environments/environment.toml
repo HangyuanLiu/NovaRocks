@@ -4,9 +4,9 @@ name = "NovaRocks"
 
 [setup]
 script = """
-docker/iceberg-rest/up.sh
+docker/iceberg-rest/up.sh --prepare-only
 . docker/iceberg-rest/runtime/current/env.sh
 """
 
 [cleanup]
-script = "docker/iceberg-rest/down.sh --purge"
+script = "docker/iceberg-rest/down.sh --runtime-only --purge"

@@ -25,6 +25,11 @@ if [[ ! -f "$sql_file" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$NOVAROCKS_SPARK_DEFAULTS" ]]; then
+  echo "Spark defaults file not found: $NOVAROCKS_SPARK_DEFAULTS" >&2
+  exit 1
+fi
+
 compose_args=(
   docker compose
   --env-file "$NOVA_ENV_COMPOSE_ENV"
@@ -32,13 +37,17 @@ compose_args=(
   -f "$NOVA_ENV_COMPOSE_FILE"
 )
 
-tmp_sql="/tmp/novarocks-spark-sql-$$.sql"
+tmp_dir="/tmp/novarocks-spark-sql-${NOVA_ENV_ID:-env}-$$"
+tmp_sql="$tmp_dir/query.sql"
+tmp_defaults="$tmp_dir/spark-defaults.conf"
 
 cd "$WORKSPACE_ROOT"
+"${compose_args[@]}" exec -T spark /bin/bash -lc "mkdir -p '$tmp_dir'"
+"${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_defaults'" < "$NOVAROCKS_SPARK_DEFAULTS"
+"${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_sql'" < "$sql_file"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "
   set -euo pipefail
-  trap 'rm -f $tmp_sql' EXIT
-  cat > '$tmp_sql'
+  trap 'rm -rf $tmp_dir' EXIT
   spark_sql_bin=\"\${SPARK_SQL_BIN:-}\"
   if [[ -z \"\$spark_sql_bin\" ]]; then
     spark_sql_bin=\"\$(command -v spark-sql || true)\"
@@ -50,5 +59,5 @@ cd "$WORKSPACE_ROOT"
     echo 'spark-sql binary not found' >&2
     exit 127
   fi
-  \"\$spark_sql_bin\" --properties-file /opt/novarocks-env/spark-defaults.conf -f '$tmp_sql'
-" < "$sql_file"
+  \"\$spark_sql_bin\" --properties-file '$tmp_defaults' -f '$tmp_sql'
+"

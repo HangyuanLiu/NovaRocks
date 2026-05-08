@@ -11,7 +11,6 @@ fi
 slug="$(printf '%s' "$slug" | cut -c1-24)"
 hash="$(printf '%s' "$WORKSPACE_ROOT" | shasum -a 1 | awk '{print substr($1, 1, 8)}')"
 env_id="${slug}-${hash}"
-compose_project="nr-${env_id}"
 runtime_base="$SCRIPT_DIR/runtime"
 runtime_dir="$runtime_base/$env_id"
 current_link="$runtime_base/current"
@@ -23,6 +22,35 @@ readme_file="$runtime_dir/README.md"
 spark_defaults_file="$runtime_dir/spark-defaults.conf"
 spark_v3_smoke_sql="$runtime_dir/spark-iceberg-v3-smoke.sql"
 spark_sql_script="$SCRIPT_DIR/spark-sql.sh"
+config_file="${NOVA_ENV_CONFIG_FILE:-$SCRIPT_DIR/shared.env}"
+prepare_only=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --prepare-only|--no-docker)
+      prepare_only=true
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      echo "usage: $0 [--prepare-only|--no-docker]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -f "$config_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$config_file"
+  set +a
+fi
+
+shared_docker="${NOVA_ENV_SHARED_DOCKER:-true}"
+if [[ "$shared_docker" == "true" ]]; then
+  compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
+else
+  compose_project="${NOVA_ENV_COMPOSE_PROJECT:-nr-${env_id}}"
+fi
 
 mkdir -p "$runtime_dir"
 
@@ -33,8 +61,9 @@ port_in_use() {
 
 choose_port() {
   local start="$1"
+  local range="${2:-200}"
   local port="$start"
-  local limit=$((start + 200))
+  local limit=$((start + range))
   while port_in_use "$port"; do
     port=$((port + 1))
     if (( port > limit )); then
@@ -43,6 +72,24 @@ choose_port() {
     fi
   done
   printf '%s\n' "$port"
+}
+
+choose_port_in_range() {
+  local base="$1"
+  local range="$2"
+  local offset="$3"
+  local slots=$((range + 1))
+  local i
+  local port
+  for ((i = 0; i < slots; i += 1)); do
+    port=$((base + ((offset + i) % slots)))
+    if ! port_in_use "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  echo "no free port in range $base-$((base + range))" >&2
+  return 1
 }
 
 docker_image_exists() {
@@ -66,21 +113,50 @@ docker_image_exists() {
 
 hash4="${hash:0:4}"
 offset=$((16#$hash4 % 1000))
+mysql_port_start="${NOVA_ENV_MYSQL_PORT_START:-9030}"
+mysql_port_range="${NOVA_ENV_MYSQL_PORT_RANGE:-200}"
+configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
+configured_minio_port="${NOVA_ENV_MINIO_PORT:-9000}"
+configured_minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT:-9001}"
+configured_rest_port="${NOVA_ENV_REST_PORT:-8181}"
+configured_spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
 
 if [[ -f "$exports_file" ]]; then
   # shellcheck disable=SC1090
   source "$exports_file"
-  minio_port="${NOVA_ENV_MINIO_PORT}"
-  minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT}"
-  rest_port="${NOVA_ENV_REST_PORT}"
+  if [[ "$shared_docker" == "true" ]]; then
+    minio_port="$configured_minio_port"
+    minio_console_port="$configured_minio_console_port"
+    rest_port="$configured_rest_port"
+    spark_ui_port="$configured_spark_ui_port"
+    compose_project="$configured_compose_project"
+  else
+    minio_port="${NOVA_ENV_MINIO_PORT}"
+    minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT}"
+    rest_port="${NOVA_ENV_REST_PORT}"
+    spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
+  fi
   mysql_port="${NOVA_ENV_MYSQL_PORT}"
-  spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-$(choose_port $((22000 + offset)))}"
 else
-  minio_port="$(choose_port $((19000 + offset)))"
-  minio_console_port="$(choose_port $((20000 + offset)))"
-  rest_port="$(choose_port $((21000 + offset)))"
-  spark_ui_port="$(choose_port $((22000 + offset)))"
-  mysql_port="$(choose_port $((23000 + offset)))"
+  if [[ "$shared_docker" == "true" ]]; then
+    minio_port="$configured_minio_port"
+    minio_console_port="$configured_minio_console_port"
+    rest_port="$configured_rest_port"
+    spark_ui_port="$configured_spark_ui_port"
+    mysql_port="$(choose_port_in_range "$mysql_port_start" "$mysql_port_range" "$offset")"
+  else
+    minio_port="$(choose_port $((19000 + offset)))"
+    minio_console_port="$(choose_port $((20000 + offset)))"
+    rest_port="$(choose_port $((21000 + offset)))"
+    spark_ui_port="$(choose_port $((22000 + offset)))"
+    mysql_port="$(choose_port $((23000 + offset)))"
+  fi
+fi
+shared_docker="${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
+if [[ "$shared_docker" == "true" ]]; then
+  compose_project="$configured_compose_project"
+else
+  compose_project="${NOVA_ENV_COMPOSE_PROJECT:-$compose_project}"
 fi
 
 minio_user="${MINIO_ROOT_USER:-admin}"
@@ -90,26 +166,27 @@ rest_mirror_image="dockerproxy.net/apache/iceberg-rest-fixture:1.8.1"
 spark_image="${SPARK_ICEBERG_IMAGE:-tabulario/spark-iceberg:3.5.5_1.8.1}"
 spark_mirror_image="docker.1panel.live/tabulario/spark-iceberg:3.5.5_1.8.1"
 
-if docker_image_exists "$rest_image"; then
-  rest_status=0
-else
-  rest_status="$?"
-fi
-if [[ "$rest_status" -ne 0 ]]; then
-  if [[ "$rest_status" -eq 124 ]]; then
-    cat >&2 <<EOF
+if [[ "$prepare_only" != true ]]; then
+  if docker_image_exists "$rest_image"; then
+    rest_status=0
+  else
+    rest_status="$?"
+  fi
+  if [[ "$rest_status" -ne 0 ]]; then
+    if [[ "$rest_status" -eq 124 ]]; then
+      cat >&2 <<EOF
 Docker image inspect timed out for: $rest_image
 
 Docker Desktop may be unhealthy. Check it manually before running setup again:
   docker image inspect $rest_image
 EOF
-    exit 1
-  fi
-  if [[ "$rest_image" == "apache/iceberg-rest-fixture:1.8.1" ]] \
-    && docker_image_exists "$rest_mirror_image"; then
-    docker tag "$rest_mirror_image" "$rest_image"
-  else
-    cat >&2 <<EOF
+      exit 1
+    fi
+    if [[ "$rest_image" == "apache/iceberg-rest-fixture:1.8.1" ]] \
+      && docker_image_exists "$rest_mirror_image"; then
+      docker tag "$rest_mirror_image" "$rest_image"
+    else
+      cat >&2 <<EOF
 Missing Iceberg REST image: $rest_image
 
 Pull it first, for example:
@@ -118,30 +195,30 @@ Pull it first, for example:
 
 Or set ICEBERG_REST_IMAGE to an already available image.
 EOF
-    exit 1
+      exit 1
+    fi
   fi
-fi
 
-if docker_image_exists "$spark_image"; then
-  spark_status=0
-else
-  spark_status="$?"
-fi
-if [[ "$spark_status" -ne 0 ]]; then
-  if [[ "$spark_status" -eq 124 ]]; then
-    cat >&2 <<EOF
+  if docker_image_exists "$spark_image"; then
+    spark_status=0
+  else
+    spark_status="$?"
+  fi
+  if [[ "$spark_status" -ne 0 ]]; then
+    if [[ "$spark_status" -eq 124 ]]; then
+      cat >&2 <<EOF
 Docker image inspect timed out for: $spark_image
 
 Docker Desktop may be unhealthy. Check it manually before running setup again:
   docker image inspect $spark_image
 EOF
-    exit 1
-  fi
-  if [[ "$spark_image" == "tabulario/spark-iceberg:3.5.5_1.8.1" ]] \
-    && docker_image_exists "$spark_mirror_image"; then
-    docker tag "$spark_mirror_image" "$spark_image"
-  else
-    cat >&2 <<EOF
+      exit 1
+    fi
+    if [[ "$spark_image" == "tabulario/spark-iceberg:3.5.5_1.8.1" ]] \
+      && docker_image_exists "$spark_mirror_image"; then
+      docker tag "$spark_mirror_image" "$spark_image"
+    else
+      cat >&2 <<EOF
 Missing Spark Iceberg image: $spark_image
 
 Pull it first, for example:
@@ -151,25 +228,33 @@ Pull it first, for example:
 Or set SPARK_ICEBERG_IMAGE to an already available image that contains spark-sql
 and the Iceberg Spark runtime.
 EOF
-    exit 1
+      exit 1
+    fi
   fi
 fi
 
 managed_warehouse="s3://novarocks/$env_id/sql-tests-managed-lake"
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
 rest_warehouse="s3://warehouse/$env_id/rest"
+shared_rest_warehouse="${NOVA_ENV_SHARED_REST_WAREHOUSE_URI:-s3://warehouse/shared/rest}"
+compose_rest_warehouse="$rest_warehouse"
+if [[ "$shared_docker" == "true" ]]; then
+  compose_rest_warehouse="$shared_rest_warehouse"
+fi
 minio_endpoint="http://127.0.0.1:$minio_port"
 rest_uri="http://127.0.0.1:$rest_port"
 spark_minio_endpoint="http://minio:9000"
 spark_rest_uri="http://rest:8181"
 
 cat > "$compose_env" <<EOF
+NOVA_ENV_SHARED_DOCKER=$shared_docker
+NOVA_ENV_COMPOSE_PROJECT=$compose_project
 NOVA_ENV_RUNTIME_DIR=$runtime_dir
 NOVA_ENV_MINIO_PORT=$minio_port
 NOVA_ENV_MINIO_CONSOLE_PORT=$minio_console_port
 NOVA_ENV_REST_PORT=$rest_port
 NOVA_ENV_SPARK_UI_PORT=$spark_ui_port
-NOVA_ENV_REST_WAREHOUSE_URI=$rest_warehouse
+NOVA_ENV_REST_WAREHOUSE_URI=$compose_rest_warehouse
 MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
 ICEBERG_REST_IMAGE=$rest_image
@@ -278,7 +363,9 @@ EOF
 
 cat > "$exports_file" <<EOF
 export NOVAROCKS_WORKSPACE_ROOT="$WORKSPACE_ROOT"
+export NOVA_ENV_CONFIG_FILE="$config_file"
 export NOVA_ENV_ID="$env_id"
+export NOVA_ENV_SHARED_DOCKER="$shared_docker"
 export NOVA_ENV_COMPOSE_PROJECT="$compose_project"
 export NOVA_ENV_RUNTIME_DIR="$runtime_dir"
 export NOVA_ENV_CURRENT_DIR="$current_link"
@@ -299,6 +386,8 @@ export MINIO_ROOT_PASSWORD="$minio_password"
 export CATALOG_WAREHOUSE_URI="$iceberg_warehouse"
 export NOVAROCKS_MANAGED_LAKE_WAREHOUSE="$managed_warehouse"
 export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"
+export NOVA_ENV_SHARED_REST_WAREHOUSE_URI="$shared_rest_warehouse"
+export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
 export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
@@ -316,7 +405,9 @@ EOF
 cat > "$manifest_file" <<EOF
 {
   "workspace_root": "$WORKSPACE_ROOT",
+  "config_file": "$config_file",
   "env_id": "$env_id",
+  "shared_docker": $shared_docker,
   "compose_project": "$compose_project",
   "runtime_dir": "$runtime_dir",
   "current_dir": "$current_link",
@@ -331,7 +422,8 @@ cat > "$manifest_file" <<EOF
   },
   "iceberg_rest": {
     "uri": "$rest_uri",
-    "warehouse": "$rest_warehouse"
+    "warehouse": "$rest_warehouse",
+    "server_default_warehouse": "$compose_rest_warehouse"
   },
   "spark": {
     "image": "$spark_image",
@@ -365,10 +457,13 @@ Do not guess ports.
 - Environment id: \`$env_id\`
 - Runtime dir: \`$runtime_dir\`
 - Compose project: \`$compose_project\`
+- Shared Docker: \`$shared_docker\`
+- Shared config: \`$config_file\`
 - MinIO endpoint: \`$minio_endpoint\`
 - MinIO console: \`http://127.0.0.1:$minio_console_port\`
 - Iceberg REST: \`$rest_uri\`
 - Iceberg REST warehouse: \`$rest_warehouse\`
+- REST server default warehouse: \`$compose_rest_warehouse\`
 - Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
 - Manifest: \`$manifest_file\`
@@ -383,6 +478,7 @@ Use:
 
 \`\`\`bash
 source "$current_link/env.sh"
+docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
 cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
@@ -393,46 +489,62 @@ EOF
 rm -rf "$current_link"
 ln -s "$env_id" "$current_link"
 
-docker compose \
-  --env-file "$compose_env" \
-  -p "$compose_project" \
-  -f "$compose_file" \
-  up -d --remove-orphans
+if [[ "$prepare_only" != true ]]; then
+  docker compose \
+    --env-file "$compose_env" \
+    -p "$compose_project" \
+    -f "$compose_file" \
+    up -d --remove-orphans
 
-wait_http() {
-  local url="$1"
-  local name="$2"
-  for _ in $(seq 1 60); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "$name did not become ready at $url" >&2
-  docker compose --env-file "$compose_env" -p "$compose_project" -f "$compose_file" logs --tail=120 >&2
-  return 1
-}
+  wait_http() {
+    local url="$1"
+    local name="$2"
+    for _ in $(seq 1 60); do
+      if curl -fsS "$url" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+    done
+    echo "$name did not become ready at $url" >&2
+    docker compose --env-file "$compose_env" -p "$compose_project" -f "$compose_file" logs --tail=120 >&2
+    return 1
+  }
 
-wait_http "$minio_endpoint/minio/health/live" "MinIO"
-wait_http "$rest_uri/v1/config" "Iceberg REST"
+  wait_http "$minio_endpoint/minio/health/live" "MinIO"
+  wait_http "$rest_uri/v1/config" "Iceberg REST"
+fi
+
+environment_state="ready"
+docker_state="Docker services are running or were reused."
+docker_start_hint=""
+if [[ "$prepare_only" == true ]]; then
+  environment_state="prepared"
+  docker_state="Docker services were not started by --prepare-only."
+  docker_start_hint="  docker/iceberg-rest/up.sh"
+fi
 
 cat <<EOF
-NovaRocks workspace environment is ready.
+NovaRocks workspace environment is $environment_state.
 
 Workspace: $WORKSPACE_ROOT
 Environment id: $env_id
 Runtime dir: $runtime_dir
 Current entry: $current_link
 Compose project: $compose_project
+Shared Docker: $shared_docker
+Shared config: $config_file
 
 MinIO endpoint: $minio_endpoint
 MinIO console: http://127.0.0.1:$minio_console_port
 Iceberg REST: $rest_uri
 Iceberg REST warehouse: $rest_warehouse
+REST server default warehouse: $compose_rest_warehouse
 Spark UI: http://127.0.0.1:$spark_ui_port
+$docker_state
 
 Use:
   source "$current_link/env.sh"
+$docker_start_hint
   cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
