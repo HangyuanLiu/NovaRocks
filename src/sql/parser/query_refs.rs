@@ -173,7 +173,10 @@ fn extract_three_part_refs_from_expr(
 ) {
     use sqlparser::ast::Expr;
     match expr {
-        Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
             extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
         }
         Expr::InSubquery { subquery, expr, .. } => {
@@ -187,7 +190,9 @@ fn extract_three_part_refs_from_expr(
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
             extract_three_part_refs_from_expr(expr, refs);
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             extract_three_part_refs_from_expr(expr, refs);
             extract_three_part_refs_from_expr(low, refs);
             extract_three_part_refs_from_expr(high, refs);
@@ -368,9 +373,7 @@ mod tests {
 
     #[test]
     fn extracts_three_part_refs_for_4part_metadata_table_factor() {
-        let query = parse_query(
-            "SELECT * FROM ice.db.t.__nr_meta_snapshots__"
-        );
+        let query = parse_query("SELECT * FROM ice.db.t.__nr_meta_snapshots__");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
@@ -381,9 +384,7 @@ mod tests {
     #[test]
     fn ignores_3part_metadata_table_factor_in_three_part_extractor() {
         // base.len() == 2 — not a fully-qualified 3-part ref, must not be emitted.
-        let query = parse_query(
-            "SELECT * FROM db.t.__nr_meta_history__"
-        );
+        let query = parse_query("SELECT * FROM db.t.__nr_meta_history__");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
@@ -395,9 +396,7 @@ mod tests {
     fn extracts_three_part_refs_from_projection_subquery() {
         // Mirrors the iceberg_in_list_predicate failure pattern: outer SELECT has
         // no FROM; the 3-part reference lives inside a COALESCE(SELECT ...) item.
-        let query = parse_query(
-            "SELECT COALESCE((SELECT count(*) FROM c1.db1.t1), 0) AS a"
-        );
+        let query = parse_query("SELECT COALESCE((SELECT count(*) FROM c1.db1.t1), 0) AS a");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
@@ -407,9 +406,7 @@ mod tests {
 
     #[test]
     fn extracts_three_part_refs_from_where_in_subquery() {
-        let query = parse_query(
-            "SELECT 1 FROM dual WHERE x IN (SELECT y FROM c2.db2.t2)"
-        );
+        let query = parse_query("SELECT 1 FROM dual WHERE x IN (SELECT y FROM c2.db2.t2)");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
@@ -419,9 +416,7 @@ mod tests {
 
     #[test]
     fn extracts_three_part_refs_from_exists_subquery() {
-        let query = parse_query(
-            "SELECT 1 FROM dual WHERE EXISTS (SELECT * FROM c3.db3.t3)"
-        );
+        let query = parse_query("SELECT 1 FROM dual WHERE EXISTS (SELECT * FROM c3.db3.t3)");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
@@ -433,7 +428,7 @@ mod tests {
     fn extracts_three_part_refs_from_having_subquery() {
         let query = parse_query(
             "SELECT k, count(*) FROM dual GROUP BY k \
-             HAVING count(*) > (SELECT avg(v) FROM c4.db4.t4)"
+             HAVING count(*) > (SELECT avg(v) FROM c4.db4.t4)",
         );
 
         assert_eq!(
@@ -444,9 +439,7 @@ mod tests {
 
     #[test]
     fn extracts_three_part_refs_from_cte_body() {
-        let query = parse_query(
-            "WITH x AS (SELECT * FROM c5.db5.t5) SELECT * FROM x"
-        );
+        let query = parse_query("WITH x AS (SELECT * FROM c5.db5.t5) SELECT * FROM x");
 
         assert_eq!(
             query_refs::extract_three_part_table_refs(&query),
