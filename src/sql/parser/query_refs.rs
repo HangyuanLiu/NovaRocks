@@ -1,3 +1,5 @@
+use crate::sql::analyzer::iceberg_metadata::split_metadata_suffix;
+
 /// Extract table names from a query AST, using the last object-name part and
 /// ignoring catalog/database qualifiers.
 pub(crate) fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
@@ -161,8 +163,16 @@ fn extract_three_part_refs_from_factor(
                     _ => None,
                 })
                 .collect();
-            if parts.len() == 3 {
-                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
+            // Strip a trailing `__nr_meta_*__` suffix so a 4-part metadata-table
+            // reference (cat.db.tbl.__nr_meta_*__) is treated as a fully-qualified
+            // 3-part base reference for registration.
+            let (base_parts, _) = split_metadata_suffix(&parts);
+            if base_parts.len() == 3 {
+                refs.push((
+                    base_parts[0].clone(),
+                    base_parts[1].clone(),
+                    base_parts[2].clone(),
+                ));
             }
         }
         sqlparser::ast::TableFactor::Derived { subquery, .. } => {
@@ -261,6 +271,31 @@ mod tests {
         assert_eq!(
             query_refs::extract_table_names_from_query(&query),
             vec!["seed".to_string(), "t1".to_string(), "t2".to_string()],
+        );
+    }
+
+    #[test]
+    fn extracts_three_part_refs_for_4part_metadata_table_factor() {
+        let query = parse_query(
+            "SELECT * FROM ice.db.t.__nr_meta_snapshots__"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            vec![("ice".to_string(), "db".to_string(), "t".to_string())],
+        );
+    }
+
+    #[test]
+    fn ignores_3part_metadata_table_factor_in_three_part_extractor() {
+        // base.len() == 2 — not a fully-qualified 3-part ref, must not be emitted.
+        let query = parse_query(
+            "SELECT * FROM db.t.__nr_meta_history__"
+        );
+
+        assert_eq!(
+            query_refs::extract_three_part_table_refs(&query),
+            Vec::<(String, String, String)>::new(),
         );
     }
 }
