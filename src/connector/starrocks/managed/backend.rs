@@ -98,6 +98,12 @@ impl CatalogBackend for ManagedLakeBackend {
         .map(|_| ())
     }
 
+    fn table_exists(&self, _catalog: &str, database: &str, table: &str) -> Result<bool, String> {
+        let state = self.state()?;
+        let logical = state.catalog.read().expect("standalone catalog read lock");
+        Ok(logical.get(database, table).is_ok())
+    }
+
     fn drop_table(
         &self,
         _catalog: &str,

@@ -1,0 +1,23 @@
+-- query 6
+id	v	c
+1	10	NULL
+2	20	NULL
+3	30	three
+
+-- query 8
+id	val	c
+1	10	NULL
+2	20	NULL
+3	30	three
+
+-- query 10
+id	val	c
+1	10	NULL
+2	20	NULL
+3	30	three
+
+-- query 12
+id	val
+1	10
+2	20
+3	30

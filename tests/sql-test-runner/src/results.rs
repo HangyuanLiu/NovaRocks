@@ -121,7 +121,10 @@ pub fn write_result_file(
             format!("{}\n", blocks.join("\n\n"))
         }
     } else {
-        let result_set = result_sets.get(&1).cloned().unwrap_or_default();
+        // Single-result mode: the file contains just the one result-bearing step.
+        // Use the first (and only) entry regardless of its query number — the step
+        // may not be query 1 (e.g., CREATE/INSERT/.../SELECT puts SELECT at step 4+).
+        let result_set = result_sets.values().next().cloned().unwrap_or_default();
         render_result_set(&result_set.header, &result_set.rows)
     };
 

@@ -3132,8 +3132,18 @@ impl TransactionAction for SchemaUpdateTxnAction {
                 .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
         let property_updates = build_property_updates(metadata.properties(), &self.change)
             .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+        // Iceberg REST `add-schema` carries `last-column-id` so the server
+        // can keep the monotonically-increasing high-watermark even when the
+        // new schema dropped the previously-highest field. Compute as
+        // max(table.last_column_id, schema.highest_field_id) — this matches
+        // table_metadata_builder.rs::add_schema.
+        let next_last_column_id =
+            std::cmp::max(metadata.last_column_id(), new_schema.highest_field_id());
         let mut updates = vec![
-            TableUpdate::AddSchema { schema: new_schema },
+            TableUpdate::AddSchema {
+                schema: new_schema,
+                last_column_id: Some(next_last_column_id),
+            },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
         updates.extend(property_updates.into_table_updates());
@@ -3213,10 +3223,11 @@ pub(crate) fn alter_table_schema(
                     // Each retry must start with a fresh metadata read; otherwise load_table()
                     // would serve the stale cached state that just produced the conflict.
                     entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
-                    // HadoopFileSystemCatalog is not Clone (holds a tokio::sync::Mutex);
-                    // rebuild per attempt rather than share a stale instance.
+                    // Catalog handles are not Clone (Hadoop holds a tokio::sync::Mutex,
+                    // REST holds an HTTP client builder); rebuild per attempt rather
+                    // than share a stale instance.
                     let catalog =
-                        crate::connector::iceberg::catalog::registry::build_hadoop_catalog(
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(
                             &entry_inner,
                         )
                         .map_err(|e| {
@@ -3244,7 +3255,7 @@ pub(crate) fn alter_table_schema(
                     .map_err(|e| {
                         iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
                     })?;
-                    tx.commit(&catalog).await.map(|_committed| ())
+                    tx.commit(catalog.as_ref()).await.map(|_committed| ())
                 }
             })
             .await
@@ -3478,9 +3489,9 @@ pub(crate) fn alter_table_properties(
                     // Each retry must start with a fresh metadata read to avoid stale-cache
                     // conflicts (mirrors the same pattern in alter_table_schema).
                     entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
-                    // HadoopFileSystemCatalog is not Clone; rebuild per attempt.
+                    // Catalog handles are not Clone; rebuild per attempt.
                     let catalog =
-                        crate::connector::iceberg::catalog::registry::build_hadoop_catalog(
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(
                             &entry_inner,
                         )
                         .map_err(|e| {
@@ -3536,7 +3547,7 @@ pub(crate) fn alter_table_properties(
                     let tx = action.apply(tx).map_err(|e| {
                         iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
                     })?;
-                    tx.commit(&catalog).await.map(|_| ())
+                    tx.commit(catalog.as_ref()).await.map(|_| ())
                 }
             })
             .await

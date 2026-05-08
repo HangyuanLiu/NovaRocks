@@ -33,6 +33,15 @@ mod tests {
             Ok(())
         }
 
+        fn table_exists(
+            &self,
+            _catalog: &str,
+            _namespace: &str,
+            _table: &str,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
         fn drop_table(
             &self,
             _catalog: &str,

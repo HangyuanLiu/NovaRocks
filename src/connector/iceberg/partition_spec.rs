@@ -6,6 +6,12 @@ use iceberg::spec::{
 use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::ast::IcebergPartitionFieldExpr;
 
+/// First partition field id by Iceberg spec convention.
+/// V2 metadata starts partition field ids at 1000; iceberg-rust matches via
+/// `UNPARTITIONED_LAST_ASSIGNED_ID = 999`. We assign explicitly because the
+/// REST CreateTableRequest schema requires `field-id` to be a non-null integer.
+const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
+
 pub(crate) fn build_initial_partition_spec(
     schema: &Schema,
     fields: &[IcebergPartitionFieldExpr],
@@ -14,12 +20,24 @@ pub(crate) fn build_initial_partition_spec(
         return Ok(None);
     }
 
-    let mut builder = UnboundPartitionSpec::builder();
-    for field in fields {
+    // The REST CreateTableRequest schema requires non-null `spec-id` and
+    // `field-id` integers; iceberg-rust's UnboundPartitionSpec defaults both to
+    // None, which serialize as JSON null and the REST server rejects with a
+    // Jackson deserialization error. Assign them explicitly. Hadoop catalog
+    // binds these via `unwrap_or(DEFAULT_PARTITION_SPEC_ID)` and field-id
+    // reassignment, so this is a no-op there.
+    let mut builder = UnboundPartitionSpec::builder().with_spec_id(0);
+    for (index, field) in fields.iter().enumerate() {
         let source_id = source_field_id(schema, field)?;
         validate_transform(schema, source_id, field)?;
+        let unbound = UnboundPartitionField {
+            source_id,
+            field_id: Some(INITIAL_PARTITION_FIELD_ID + index as i32),
+            name: stable_field_name(field),
+            transform: to_transform(field),
+        };
         builder = builder
-            .add_partition_field(source_id, stable_field_name(field), to_transform(field))
+            .add_partition_fields([unbound])
             .map_err(|e| format!("build iceberg partition spec failed: {e}"))?;
     }
     Ok(Some(builder.build()))

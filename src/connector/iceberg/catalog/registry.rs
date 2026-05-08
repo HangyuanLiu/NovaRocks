@@ -435,6 +435,15 @@ pub(crate) fn create_table(
     )?;
     all_properties.extend(build_logical_type_properties(columns)?);
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
+    // The iceberg-rust REST client serialises only the `properties` map of
+    // TableCreation; the typed `format_version` builder field never makes it
+    // to the wire, so v3 tables end up created as v2 on REST. Re-insert
+    // `format-version` into the property list. Hadoop catalog reads it
+    // through the typed builder, so the redundant property is harmless.
+    all_properties.push((
+        "format-version".to_string(),
+        format!("{}", format_version as u8),
+    ));
     let table_creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
@@ -446,8 +455,13 @@ pub(crate) fn create_table(
         table_creation.build()
     };
 
-    let catalog = build_hadoop_catalog(entry)?;
-    let _ = block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
+    let catalog = build_iceberg_catalog(entry)?;
+    // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
+    // REST catalogs manage namespace separately via CREATE DATABASE.
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let _ =
+            block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
+    }
     block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;
@@ -464,7 +478,7 @@ pub(crate) fn alter_partition_spec(
 
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
-    let catalog = build_hadoop_catalog(entry)?;
+    let catalog = build_iceberg_catalog(entry)?;
     let ident = TableIdent::new(namespace, table_name.clone());
     let table = block_on_iceberg(async { catalog.load_table(&ident).await })
         .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
@@ -735,24 +749,30 @@ pub(crate) fn insert_rows(
     reject_unsupported_iceberg_table_semantics(&loaded)?;
     let batch = build_insert_batch(&loaded, rows)?;
 
-    let catalog = build_hadoop_catalog(entry)?;
-    let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
-    let table_ident = TableIdent::from_strs([
-        normalize_identifier(namespace_name)?,
-        normalize_identifier(table_name)?,
-    ])
-    .map_err(|e| format!("build iceberg table ident: {e}"))?;
-    let metadata_location = loaded
-        .table
-        .metadata_location()
-        .ok_or_else(|| "no metadata location for table".to_string())?
-        .to_string();
-    let _ = block_on_iceberg(async {
-        catalog
-            .register_table(&table_ident, metadata_location)
-            .await
-    });
+    let catalog = build_iceberg_catalog(entry)?;
+
+    // For Hadoop/Memory catalogs: ensure namespace exists and register the table
+    // by its metadata location so the catalog can resolve it for the commit.
+    // REST catalogs already track tables through the REST API; skip registration.
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+        let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
+        let table_ident = TableIdent::from_strs([
+            normalize_identifier(namespace_name)?,
+            normalize_identifier(table_name)?,
+        ])
+        .map_err(|e| format!("build iceberg table ident: {e}"))?;
+        let metadata_location = loaded
+            .table
+            .metadata_location()
+            .ok_or_else(|| "no metadata location for table".to_string())?
+            .to_string();
+        let _ = block_on_iceberg(async {
+            catalog
+                .register_table(&table_ident, metadata_location)
+                .await
+        });
+    }
 
     block_on_iceberg(async {
         let data_files = write_record_batches_as_data_files(&loaded.table, [batch])
@@ -760,7 +780,7 @@ pub(crate) fn insert_rows(
             .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
         let tx = Transaction::new(&loaded.table);
         let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
-        tx.commit(&catalog).await
+        tx.commit(catalog.as_ref()).await
     })
     .map_err(|e| format!("insert iceberg rows runtime failed: {e}"))?
     .map_err(|e| format!("insert iceberg rows failed: {e}"))?;
