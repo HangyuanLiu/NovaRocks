@@ -3416,10 +3416,8 @@ impl TransactionAction for SchemaUpdateTxnAction {
         // new schema dropped the previously-highest field. Compute as
         // max(table.last_column_id, schema.highest_field_id) — this matches
         // table_metadata_builder.rs::add_schema.
-        let next_last_column_id = std::cmp::max(
-            metadata.last_column_id(),
-            new_schema.highest_field_id(),
-        );
+        let next_last_column_id =
+            std::cmp::max(metadata.last_column_id(), new_schema.highest_field_id());
         let mut updates = vec![
             TableUpdate::AddSchema {
                 schema: new_schema,
