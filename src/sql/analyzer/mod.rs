@@ -2856,6 +2856,81 @@ mod tests {
     }
 
     #[test]
+    fn test_group_concat_rejects_negative_order_by_position() {
+        let err = parse_raw_and_analyze(
+            "SELECT group_concat(distinct 3.1323, o_orderstatus order by 1, 2, -20) FROM orders GROUP BY o_orderkey",
+        )
+        .expect_err("negative group_concat ORDER BY position should be rejected");
+        assert!(
+            err.contains("ORDER BY position -20 is not in group_concat output list."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_empty_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat()")
+            .expect_err("group_concat without input should be rejected");
+        assert!(
+            err.contains("group_concat should have at least one input."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_non_string_separator() {
+        let err = parse_raw_and_analyze(
+            "SELECT group_concat(\"中国\" ORDER BY \"第一\" SEPARATOR 1) FROM orders",
+        )
+        .expect_err("group_concat should reject non-string separator");
+        assert!(
+            err.contains(
+                "group_concat requires separator to be of getType() STRING: group_concat('中国', 1)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_array_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat([1,2]) FROM orders")
+            .expect_err("group_concat should reject array input");
+        assert!(
+            err.contains(
+                "No matching function with signature: group_concat(array<tinyint(4)>, varchar)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_map_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat(map(2,3)) FROM orders")
+            .expect_err("group_concat should reject map input");
+        assert!(
+            err.contains(
+                "No matching function with signature: group_concat(map<tinyint(4),tinyint(4)>, varchar)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_array_map_lambda_cast_param_resolves_lambda_scope() {
+        let resolved = parse_raw_and_analyze(
+            "SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 3, 1))",
+        )
+        .expect("array_map lambda parameter should resolve in lambda scope");
+        assert_eq!(resolved.output_columns.len(), 1);
+        match &resolved.output_columns[0].data_type {
+            arrow::datatypes::DataType::List(item) => {
+                assert!(matches!(item.data_type(), arrow::datatypes::DataType::Utf8));
+            }
+            other => panic!("expected ARRAY<VARCHAR>, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_group_by_rollup() {
         // q5 pattern: GROUP BY ROLLUP(a, b)
         let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \

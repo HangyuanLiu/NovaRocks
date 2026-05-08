@@ -291,6 +291,33 @@ impl MannWhitneyState {
     }
 }
 
+enum TreatmentArrayView<'a> {
+    Boolean(&'a BooleanArray),
+    Int(IntArrayView<'a>),
+}
+
+impl<'a> TreatmentArrayView<'a> {
+    fn new(array: &'a ArrayRef) -> Result<Self, String> {
+        if matches!(array.data_type(), DataType::Boolean) {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+            return Ok(Self::Boolean(arr));
+        }
+        Ok(Self::Int(IntArrayView::new(array).map_err(|_| {
+            "mann_whitney_u_test expects boolean or integer treatment".to_string()
+        })?))
+    }
+
+    fn value_at(&self, row: usize) -> Option<bool> {
+        match self {
+            Self::Boolean(arr) => (!arr.is_null(row)).then(|| arr.value(row)),
+            Self::Int(arr) => arr.value_at(row).map(|value| value != 0),
+        }
+    }
+}
+
 fn mann_whitney_numeric_to_f64(value: &AggScalarValue) -> Option<f64> {
     match value {
         AggScalarValue::Int64(v) => Some(*v as f64),
@@ -426,11 +453,7 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         }
 
         let value_arr = struct_arr.column(0);
-        let treatment_arr = struct_arr
-            .column(1)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "mann_whitney_u_test expects boolean treatment".to_string())?;
+        let treatment_arr = TreatmentArrayView::new(struct_arr.column(1))?;
 
         let alternative_arr = if struct_arr.num_columns() >= 3 {
             Some(
@@ -477,9 +500,9 @@ impl AggregateFunction for MannWhitneyUTestAgg {
                 state.init(alternative, continuity);
             }
 
-            if treatment_arr.is_null(row) {
+            let Some(treatment) = treatment_arr.value_at(row) else {
                 continue;
-            }
+            };
             let Some(value) = scalar_from_array(value_arr, row)? else {
                 continue;
             };
@@ -489,7 +512,6 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             if x.is_nan() || x.is_infinite() {
                 continue;
             }
-            let treatment = treatment_arr.value(row);
             state.update(x, treatment);
         }
         Ok(())
@@ -557,7 +579,7 @@ impl AggregateFunction for MannWhitneyUTestAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, Float64Array, StringArray};
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Fields};
     use std::mem::MaybeUninit;
 
@@ -598,6 +620,57 @@ mod tests {
         MannWhitneyUTestAgg
             .update_batch(&spec, 0, &state_ptrs, &input)
             .unwrap();
+        let out = MannWhitneyUTestAgg
+            .build_array(&spec, 0, &[state_ptr], false)
+            .unwrap();
+        MannWhitneyUTestAgg.drop_state(&spec, state.as_mut_ptr() as *mut u8);
+
+        let out_arr = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let json_val: serde_json::Value = serde_json::from_str(out_arr.value(0)).unwrap();
+        let arr = json_val.as_array().unwrap();
+        let u2 = arr[0].as_f64().unwrap();
+        let p = arr[1].as_f64().unwrap();
+        assert!((u2 - 0.0).abs() < 1e-9);
+        assert!((p - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_mann_whitney_accepts_numeric_treatment() {
+        let values = Arc::new(Float64Array::from(vec![1.0, 2.0])) as ArrayRef;
+        let treatment = Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef;
+
+        let fields = vec![
+            Field::new("f0", DataType::Float64, true),
+            Field::new("f1", DataType::Int64, true),
+        ];
+        let struct_type = DataType::Struct(Fields::from(fields.clone()));
+        let struct_arr = StructArray::new(fields.into(), vec![values, treatment], None);
+        let array_ref = Arc::new(struct_arr) as ArrayRef;
+
+        let func = AggFunction {
+            name: "mann_whitney_u_test".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Utf8),
+                input_arg_type: Some(DataType::Float64),
+            }),
+        };
+
+        let spec = MannWhitneyUTestAgg
+            .build_spec_from_type(&func, Some(&struct_type), false)
+            .unwrap();
+
+        let mut state = MaybeUninit::<MannWhitneyState>::uninit();
+        MannWhitneyUTestAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+        let state_ptrs = vec![state_ptr; 2];
+        let input = AggInputView::Any(&array_ref);
+
+        MannWhitneyUTestAgg
+            .update_batch(&spec, 0, &state_ptrs, &input)
+            .expect("numeric 0/1 treatment should be accepted");
         let out = MannWhitneyUTestAgg
             .build_array(&spec, 0, &[state_ptr], false)
             .unwrap();

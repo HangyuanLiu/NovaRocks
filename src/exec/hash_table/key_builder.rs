@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    FixedSizeBinaryArray, Int32Array, ListArray, MapArray, StringArray, StructArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+    FixedSizeBinaryArray, Int32Array, LargeBinaryArray, ListArray, MapArray, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
@@ -294,6 +294,36 @@ fn encode_group_key_non_null_value(
             out.push(8);
             let value = arr.value(row).as_bytes();
             let len = value.len() as u32;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(value);
+            Ok(())
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast BinaryArray while encoding group key".to_string()
+                })?;
+            out.push(20);
+            let value = arr.value(row);
+            let len = u32::try_from(value.len())
+                .map_err(|_| "group key Binary length overflow".to_string())?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(value);
+            Ok(())
+        }
+        DataType::LargeBinary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast LargeBinaryArray while encoding group key".to_string()
+                })?;
+            out.push(21);
+            let value = arr.value(row);
+            let len = u32::try_from(value.len())
+                .map_err(|_| "group key LargeBinary length overflow".to_string())?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(value);
             Ok(())
@@ -1246,6 +1276,33 @@ fn hash_column(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn encode_group_key_row_accepts_binary_arrays() {
+        let binary: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(b"abc".as_slice()),
+            None,
+            Some(b"abc\0".as_slice()),
+        ]));
+        assert!(encode_group_key_row(&binary, 0).unwrap().is_some());
+        assert_eq!(encode_group_key_row(&binary, 1).unwrap(), None);
+        assert!(encode_group_key_row(&binary, 2).unwrap().is_some());
+
+        let large_binary: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"abc".as_slice()),
+            None,
+            Some(b"def".as_slice()),
+        ]));
+        assert!(encode_group_key_row(&large_binary, 0).unwrap().is_some());
+        assert_eq!(encode_group_key_row(&large_binary, 1).unwrap(), None);
+        assert!(encode_group_key_row(&large_binary, 2).unwrap().is_some());
+    }
 }
 
 pub(crate) fn build_compressed_flags(

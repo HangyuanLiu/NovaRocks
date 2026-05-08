@@ -15,6 +15,7 @@ use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 // Re-export from sql::catalog so callers can use either
 // `crate::engine::catalog::*` or `crate::sql::catalog::*`
 // interchangeably without double-defining the types.
+use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
     CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
 };
@@ -28,6 +29,7 @@ struct DatabaseDef {
 #[derive(Clone, Debug)]
 pub(crate) struct InMemoryCatalog {
     databases: HashMap<String, DatabaseDef>,
+    legacy_range_partitions: HashMap<(String, String), Vec<LegacyRangePartition>>,
 }
 
 pub(crate) const DEFAULT_DATABASE: &str = "default";
@@ -42,7 +44,10 @@ impl Default for InMemoryCatalog {
                 physical_layouts: HashMap::new(),
             },
         );
-        Self { databases }
+        Self {
+            databases,
+            legacy_range_partitions: HashMap::new(),
+        }
     }
 }
 
@@ -117,6 +122,7 @@ impl InMemoryCatalog {
             .remove(&table_key)
             .ok_or_else(|| format!("unknown table: {table_name}"))?;
         db.physical_layouts.remove(&table_key);
+        self.legacy_range_partitions.remove(&(db_key, table_key));
         Ok(())
     }
 
@@ -158,11 +164,114 @@ impl InMemoryCatalog {
             .get(&table_key)
             .cloned())
     }
+
+    pub(crate) fn set_legacy_range_partitions(
+        &mut self,
+        database_name: &str,
+        table_name: &str,
+        partitions: Vec<LegacyRangePartition>,
+    ) -> Result<(), String> {
+        let db_key = normalize_identifier(database_name)?;
+        let table_key = normalize_identifier(table_name)?;
+        if partitions.is_empty() {
+            self.legacy_range_partitions.remove(&(db_key, table_key));
+        } else {
+            self.legacy_range_partitions
+                .insert((db_key, table_key), partitions);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_legacy_range_partition(
+        &mut self,
+        database_name: &str,
+        table_name: &str,
+        partition: LegacyRangePartition,
+    ) -> Result<(), String> {
+        let db_key = normalize_identifier(database_name)?;
+        let table_key = normalize_identifier(table_name)?;
+        let partition_key = normalize_identifier(&partition.name)?;
+        let entries = self
+            .legacy_range_partitions
+            .entry((db_key, table_key))
+            .or_default();
+        entries.retain(|existing| {
+            normalize_identifier(&existing.name).ok().as_deref() != Some(&partition_key)
+        });
+        entries.push(partition);
+        Ok(())
+    }
+
+    pub(crate) fn rename_column(
+        &mut self,
+        database_name: &str,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let db_key = normalize_identifier(database_name)?;
+        let table_key = normalize_identifier(table_name)?;
+        let old_key = normalize_identifier(old_name)?;
+        let new_key = normalize_identifier(new_name)?;
+        let db = self
+            .databases
+            .get_mut(&db_key)
+            .ok_or_else(|| format!("unknown database: {database_name}"))?;
+        let table = db
+            .tables
+            .get_mut(&table_key)
+            .ok_or_else(|| format!("unknown table: {table_name}"))?;
+        if table
+            .columns
+            .iter()
+            .any(|column| normalize_identifier(&column.name).ok().as_deref() == Some(&new_key))
+        {
+            return Err(format!("column `{new_name}` already exists"));
+        }
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| normalize_identifier(&column.name).ok().as_deref() == Some(&old_key))
+            .ok_or_else(|| format!("unknown column `{old_name}`"))?;
+        column.name = new_key.clone();
+
+        if let Some(partitions) = self
+            .legacy_range_partitions
+            .get_mut(&(db_key.clone(), table_key.clone()))
+        {
+            for partition in partitions {
+                if normalize_identifier(&partition.column).ok().as_deref() == Some(&old_key) {
+                    partition.column = new_key.clone();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CatalogProvider for InMemoryCatalog {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
         self.get(database, table)
+    }
+
+    fn get_legacy_range_partition(
+        &self,
+        database: &str,
+        table: &str,
+        partition: &str,
+    ) -> Result<Option<LegacyRangePartition>, String> {
+        let db_key = normalize_identifier(database)?;
+        let table_key = normalize_identifier(table)?;
+        let partition_key = normalize_identifier(partition)?;
+        Ok(self
+            .legacy_range_partitions
+            .get(&(db_key, table_key))
+            .and_then(|partitions| {
+                partitions
+                    .iter()
+                    .find(|p| normalize_identifier(&p.name).ok().as_deref() == Some(&partition_key))
+                    .cloned()
+            }))
     }
 
     fn get_physical_layout(

@@ -1015,6 +1015,9 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::FunctionArguments::None => vec![],
             _ => vec![],
         };
+        if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
+            return Err("group_concat should have at least one input.".to_string());
+        }
         if matches!(
             name.as_str(),
             "array_agg" | "array_agg_distinct" | "array_unique_agg"
@@ -1027,6 +1030,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     "Unexpected input 'order', the most similar input is {',', ')'}.".to_string(),
                 );
             }
+        }
+        if let Some(rewritten) = self.try_analyze_array_map_cast_lambda(&name, &arg_exprs, scope)? {
+            return Ok(rewritten);
         }
 
         // Analyze arguments. For the narrow standalone lambda support needed by
@@ -1144,6 +1150,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 "Unexpected input '(', the most similar input is {<EOF>, ';'}.".to_string(),
             );
         }
+
+        validate_group_concat_separator_argument(&name, &arg_exprs, &args_typed)?;
+        validate_group_concat_value_arguments(&name, &args_typed)?;
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
@@ -1431,6 +1440,50 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
+    fn try_analyze_array_map_cast_lambda(
+        &self,
+        name: &str,
+        arg_exprs: &[&sqlast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<Option<TypedExpr>, String> {
+        if !matches!(name, "array_map" | "transform") {
+            return Ok(None);
+        }
+        if arg_exprs.len() != 2 {
+            return Ok(None);
+        }
+
+        let Some((param_name, lambda_body)) = parse_array_sortby_lambda(arg_exprs[0]) else {
+            return Ok(None);
+        };
+        if !lambda_body_casts_param_to_utf8(lambda_body, &param_name) {
+            return Err(
+                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)".to_string(),
+            );
+        }
+
+        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
+        if !matches!(array_expr.data_type, DataType::List(_)) {
+            return Err(format!(
+                "array_map lambda expects ARRAY input, got {:?}",
+                array_expr.data_type
+            ));
+        }
+        let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        Ok(Some(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(array_expr),
+                target: target.clone(),
+            },
+            data_type: target,
+            nullable: true,
+        }))
+    }
+
     fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
         match name {
             "percentile_cont" | "percentile_disc_lc" => {
@@ -1556,39 +1609,33 @@ impl<'a> super::AnalyzerContext<'a> {
             if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
                 let mut items = Vec::with_capacity(order_by_exprs.len());
                 for ob in order_by_exprs {
-                    let typed = match &ob.expr {
-                        sqlast::Expr::Value(v) => {
-                            if let sqlast::Value::Number(n, false) = &v.value {
-                                if let Ok(pos) = n.parse::<usize>() {
-                                    if (1..=visible_args.len()).contains(&pos) {
-                                        visible_args[pos - 1].clone()
-                                    } else if matches!(
-                                        func_name.as_str(),
-                                        "array_agg"
-                                            | "array_agg_distinct"
-                                            | "array_unique_agg"
-                                            | "group_concat"
-                                            | "string_agg"
-                                    ) {
-                                        let display_name = if func_name == "string_agg" {
-                                            "group_concat"
-                                        } else {
-                                            func_name.as_str()
-                                        };
-                                        return Err(format!(
-                                            "ORDER BY position {pos} is not in {display_name} output list."
-                                        ));
-                                    } else {
-                                        self.analyze_expr(&ob.expr, scope)?
-                                    }
-                                } else {
-                                    self.analyze_expr(&ob.expr, scope)?
-                                }
+                    let typed = if let Some(pos) = function_order_by_position(&ob.expr) {
+                        let pos_index = usize::try_from(pos).ok();
+                        if let Some(pos_index) = pos_index
+                            && (1..=visible_args.len()).contains(&pos_index)
+                        {
+                            visible_args[pos_index - 1].clone()
+                        } else if matches!(
+                            func_name.as_str(),
+                            "array_agg"
+                                | "array_agg_distinct"
+                                | "array_unique_agg"
+                                | "group_concat"
+                                | "string_agg"
+                        ) {
+                            let display_name = if func_name == "string_agg" {
+                                "group_concat"
                             } else {
-                                self.analyze_expr(&ob.expr, scope)?
-                            }
+                                func_name.as_str()
+                            };
+                            return Err(format!(
+                                "ORDER BY position {pos} is not in {display_name} output list."
+                            ));
+                        } else {
+                            self.analyze_expr(&ob.expr, scope)?
                         }
-                        _ => self.analyze_expr(&ob.expr, scope)?,
+                    } else {
+                        self.analyze_expr(&ob.expr, scope)?
                     };
                     let asc = ob.options.asc.unwrap_or(true);
                     let nulls_first = ob.options.nulls_first.unwrap_or(asc);
@@ -1881,6 +1928,32 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 }
 
+fn function_order_by_position(expr: &sqlast::Expr) -> Option<i64> {
+    match expr {
+        sqlast::Expr::Value(v) => {
+            if let sqlast::Value::Number(n, false) = &v.value {
+                n.parse::<i64>().ok()
+            } else {
+                None
+            }
+        }
+        sqlast::Expr::UnaryOp {
+            op: sqlast::UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            sqlast::Expr::Value(v) => {
+                if let sqlast::Value::Number(n, false) = &v.value {
+                    n.parse::<i64>().ok().map(|pos| -pos)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
     match &expr.kind {
         ExprKind::FunctionCall { name, .. }
@@ -2037,6 +2110,203 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         | "ltrim" | "repeat" | "reverse" | "right" | "rtrim" | "strleft" | "strright"
         | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
         _ => false,
+    }
+}
+
+fn validate_group_concat_separator_argument(
+    name: &str,
+    arg_exprs: &[&sqlast::Expr],
+    args: &[TypedExpr],
+) -> Result<(), String> {
+    if !matches!(name, "group_concat" | "string_agg") {
+        return Ok(());
+    }
+    let Some(separator) = args.last() else {
+        return Ok(());
+    };
+    if matches!(
+        separator.data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "group_concat requires separator to be of getType() STRING: {}.",
+        group_concat_separator_signature(arg_exprs)
+    ))
+}
+
+fn group_concat_separator_signature(arg_exprs: &[&sqlast::Expr]) -> String {
+    let args = arg_exprs
+        .iter()
+        .map(|arg| expr_display_name(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("group_concat({args})")
+}
+
+fn validate_group_concat_value_arguments(name: &str, args: &[TypedExpr]) -> Result<(), String> {
+    if !matches!(name, "group_concat" | "string_agg") || args.is_empty() {
+        return Ok(());
+    }
+    let value_args = &args[..args.len().saturating_sub(1)];
+    if value_args.iter().all(is_supported_group_concat_value_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "No matching function with signature: group_concat({}).",
+        args.iter()
+            .enumerate()
+            .map(|(idx, arg)| group_concat_signature_type(arg, idx == args.len() - 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn is_supported_group_concat_value_type(expr: &TypedExpr) -> bool {
+    !matches!(
+        expr.data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
+            | DataType::Struct(_)
+            | DataType::Union(_, _)
+    )
+}
+
+fn group_concat_signature_type(expr: &TypedExpr, separator: bool) -> String {
+    if separator && matches!(expr.data_type, DataType::Utf8 | DataType::LargeUtf8) {
+        return "varchar".to_string();
+    }
+    match &expr.kind {
+        ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
+            let item =
+                infer_literal_signature_type(args).unwrap_or_else(|| match &expr.data_type {
+                    DataType::List(item) => {
+                        group_concat_data_type_signature(item.data_type(), false)
+                    }
+                    _ => group_concat_data_type_signature(&expr.data_type, false),
+                });
+            format!("array<{item}>")
+        }
+        ExprKind::FunctionCall { name, args, .. } if name == "map" => {
+            let (keys, values): (Vec<_>, Vec<_>) = args
+                .chunks(2)
+                .filter_map(|chunk| match chunk {
+                    [key, value] => Some((key.clone(), value.clone())),
+                    _ => None,
+                })
+                .unzip();
+            let key_type = infer_literal_signature_type(&keys).unwrap_or_else(|| {
+                map_entry_data_type(&expr.data_type, 0)
+                    .map(|data_type| group_concat_data_type_signature(data_type, false))
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let value_type = infer_literal_signature_type(&values).unwrap_or_else(|| {
+                map_entry_data_type(&expr.data_type, 1)
+                    .map(|data_type| group_concat_data_type_signature(data_type, true))
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            format!("map<{key_type},{value_type}>")
+        }
+        _ => group_concat_data_type_signature(&expr.data_type, false),
+    }
+}
+
+fn infer_literal_signature_type(args: &[TypedExpr]) -> Option<String> {
+    let mut rank = None;
+    for arg in args {
+        let ExprKind::Literal(LiteralValue::Int(value)) = arg.kind else {
+            return None;
+        };
+        let current = integer_literal_signature_rank(value);
+        rank = Some(rank.map_or(current, |existing: usize| existing.max(current)));
+    }
+    rank.map(integer_literal_signature_type)
+}
+
+fn integer_literal_signature_rank(value: i64) -> usize {
+    if i8::try_from(value).is_ok() {
+        0
+    } else if i16::try_from(value).is_ok() {
+        1
+    } else if i32::try_from(value).is_ok() {
+        2
+    } else {
+        3
+    }
+}
+
+fn integer_literal_signature_type(rank: usize) -> String {
+    match rank {
+        0 => "tinyint(4)",
+        1 => "smallint(6)",
+        2 => "int(11)",
+        _ => "bigint(20)",
+    }
+    .to_string()
+}
+
+fn map_entry_data_type(data_type: &DataType, index: usize) -> Option<&DataType> {
+    let DataType::Map(entries, _) = data_type else {
+        return None;
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return None;
+    };
+    fields.get(index).map(|field| field.data_type())
+}
+
+fn group_concat_data_type_signature(data_type: &DataType, map_value_context: bool) -> String {
+    match data_type {
+        DataType::Null => "null_type".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint(4)".to_string(),
+        DataType::Int16 => "smallint(6)".to_string(),
+        DataType::Int32 => "int(11)".to_string(),
+        DataType::Int64 => "bigint(20)".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            if map_value_context {
+                "varchar(20)".to_string()
+            } else {
+                "varchar".to_string()
+            }
+        }
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            format!("decimal({precision},{scale})")
+        }
+        DataType::List(item) => {
+            format!(
+                "array<{}>",
+                group_concat_data_type_signature(item.data_type(), false)
+            )
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return "map<unknown,unknown>".to_string();
+            };
+            if fields.len() != 2 {
+                return "map<unknown,unknown>".to_string();
+            }
+            format!(
+                "map<{},{}>",
+                group_concat_data_type_signature(fields[0].data_type(), false),
+                group_concat_data_type_signature(fields[1].data_type(), true)
+            )
+        }
+        DataType::Struct(fields) => format!(
+            "struct<{}>",
+            fields
+                .iter()
+                .map(|field| group_concat_data_type_signature(field.data_type(), false))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -2223,5 +2493,30 @@ fn parse_array_sortby_lambda_param(expr: &sqlast::Expr) -> Option<String> {
         sqlast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
         sqlast::Expr::Nested(inner) => parse_array_sortby_lambda_param(inner),
         _ => None,
+    }
+}
+
+fn lambda_body_casts_param_to_utf8(expr: &sqlast::Expr, param_name: &str) -> bool {
+    match expr {
+        sqlast::Expr::Nested(inner) => lambda_body_casts_param_to_utf8(inner, param_name),
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } if lambda_expr_is_param(inner, param_name) => {
+            matches!(
+                sql_type_to_arrow(data_type),
+                Ok(DataType::Utf8 | DataType::LargeUtf8)
+            )
+        }
+        _ => false,
+    }
+}
+
+fn lambda_expr_is_param(expr: &sqlast::Expr, param_name: &str) -> bool {
+    match expr {
+        sqlast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
+        sqlast::Expr::Nested(inner) => lambda_expr_is_param(inner, param_name),
+        _ => false,
     }
 }

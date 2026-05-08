@@ -17,7 +17,9 @@ use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::reorder_insert_rows;
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
 
-use super::sql_expr::{cast_literal, eval_literal_arithmetic, sqlparser_expr_to_literal};
+use super::sql_expr::{
+    cast_literal, eval_array_generate_literal, eval_literal_arithmetic, sqlparser_expr_to_literal,
+};
 
 pub(crate) fn parse_generate_series_function_expr(
     expr: &sqlast::Expr,
@@ -290,6 +292,20 @@ fn evaluate_scalar_function(name: &str, args: &[Literal]) -> Result<Literal, Str
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
         }
+        "array_generate" => eval_array_generate_literal(args),
+        "map" => {
+            if args.len() % 2 != 0 {
+                return Err(format!(
+                    "map expects an even number of arguments, got {}",
+                    args.len()
+                ));
+            }
+            Ok(Literal::Map(
+                args.chunks_exact(2)
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect(),
+            ))
+        }
         other => Err(format!(
             "standalone generate_series insert-select does not support scalar function: {other}"
         )),
@@ -353,6 +369,62 @@ mod tests {
         let out = evaluate_generate_series_expr(&expr, "generate_series", 42)
             .expect("evaluate array expression");
         assert_eq!(out, Literal::Array(vec![Literal::Int(42)]));
+    }
+
+    #[test]
+    fn array_map_cast_string_over_array_generate_evaluates() {
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let raw = sqlparser::parser::Parser::parse_sql(
+            &dialect,
+            "SELECT array_map(x -> cast(x as string), array_generate(1, generate_series % 3, 1))",
+        )
+        .expect("parse sql");
+        let sqlparser::ast::Statement::Query(query) = &raw[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected expression");
+        };
+        let expr = crate::engine::sql_expr::sqlparser_expr_to_custom_expr(expr)
+            .expect("convert expression");
+
+        let out = evaluate_generate_series_expr(&expr, "generate_series", 5)
+            .expect("evaluate array_map cast");
+        assert_eq!(
+            out,
+            Literal::Array(vec![
+                Literal::String("1".to_string()),
+                Literal::String("2".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    fn scalar_function_map_evaluates_column_ref_values() {
+        let expr = Expr::ScalarFunction(ScalarFunctionExpr {
+            name: "map".to_string(),
+            args: vec![
+                Expr::Literal(Literal::Int(1)),
+                col("generate_series"),
+                Expr::Literal(Literal::Int(2)),
+                Expr::Arithmetic {
+                    left: Box::new(col("generate_series")),
+                    op: crate::sql::parser::ast::ArithmeticOp::Mul,
+                    right: Box::new(Expr::Literal(Literal::Int(2))),
+                },
+            ],
+        });
+        let out = evaluate_generate_series_expr(&expr, "generate_series", 7).expect("evaluate map");
+        assert_eq!(
+            out,
+            Literal::Map(vec![
+                (Literal::Int(1), Literal::Int(7)),
+                (Literal::Int(2), Literal::Int(14)),
+            ])
+        );
     }
 
     #[test]

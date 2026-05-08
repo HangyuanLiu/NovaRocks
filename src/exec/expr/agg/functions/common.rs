@@ -200,6 +200,7 @@ pub(crate) fn scalar_from_array(
     row: usize,
 ) -> Result<Option<AggScalarValue>, String> {
     match array.data_type() {
+        DataType::Null => Ok(None),
         DataType::Boolean => {
             let arr = array
                 .as_any()

@@ -393,6 +393,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
+        "array_generate" => infer_array_generate_return_type(arg_types),
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
@@ -457,6 +458,30 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,
     }
+}
+
+fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {
+    let is_datetime = arg_types.iter().any(|ty| {
+        matches!(
+            ty,
+            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
+        )
+    });
+    let item_type = if is_datetime {
+        arg_types
+            .iter()
+            .find_map(|ty| match ty {
+                DataType::Date32 => Some(DataType::Date32),
+                DataType::Timestamp(unit, tz) => Some(DataType::Timestamp(*unit, tz.clone())),
+                _ => None,
+            })
+            .unwrap_or(DataType::Date32)
+    } else {
+        DataType::Int64
+    };
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item", item_type, true,
+    )))
 }
 
 fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {

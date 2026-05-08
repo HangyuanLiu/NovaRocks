@@ -15,6 +15,7 @@ use crate::engine::{
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
+use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{
     CreateTableKind, DefaultLiteral, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
     SqlType,
@@ -48,10 +49,8 @@ fn convert_set_expr_to_insert_source(
                 let row: Vec<Literal> = select
                     .projection
                     .iter()
-                    .map(|item| match item {
-                        sqlast::SelectItem::UnnamedExpr(expr) => sqlparser_expr_to_literal(expr),
-                        _ => Err("INSERT SELECT source only supports unnamed expressions".into()),
-                    })
+                    .map(select_item_expr)
+                    .map(|expr| expr.and_then(sqlparser_expr_to_literal))
                     .collect::<Result<_, _>>()?;
                 Ok(InsertSource::SelectLiteralRow(row))
             } else if select.from.len() == 1 {
@@ -70,15 +69,8 @@ fn convert_set_expr_to_insert_source(
                         let projection: Vec<Expr> = select
                             .projection
                             .iter()
-                            .map(|item| match item {
-                                sqlast::SelectItem::UnnamedExpr(expr) => {
-                                    sqlparser_expr_to_custom_expr(expr)
-                                }
-                                _ => {
-                                    Err("INSERT SELECT source only supports unnamed expressions"
-                                        .into())
-                                }
-                            })
+                            .map(select_item_expr)
+                            .map(|expr| expr.and_then(sqlparser_expr_to_custom_expr))
                             .collect::<Result<_, _>>()?;
                         Ok(InsertSource::GenerateSeriesSelect(GenerateSeriesSelect {
                             column_name,
@@ -125,6 +117,16 @@ fn convert_set_expr_to_insert_source(
         }
         sqlast::SetExpr::Query(query) => convert_set_expr_to_insert_source(query.body.as_ref()),
         _ => Err("unsupported INSERT source".into()),
+    }
+}
+
+fn select_item_expr(item: &sqlparser::ast::SelectItem) -> Result<&sqlparser::ast::Expr, String> {
+    use sqlparser::ast as sqlast;
+    match item {
+        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+            Ok(expr)
+        }
+        _ => Err("INSERT SELECT source only supports expressions".into()),
     }
 }
 
@@ -877,6 +879,7 @@ pub(crate) fn execute_create_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
+    let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     // CTAS dispatch: when the statement carries an AS SELECT clause, the
     // schema/partition/properties/data flow is governed by iceberg_ctas. The
     // parser already rejected non-iceberg-compatible CTAS forms (branch
@@ -935,6 +938,17 @@ pub(crate) fn execute_create_table_statement(
                 partition_fields,
                 properties,
             })?;
+            if !legacy_range_partitions.is_empty() && target.backend_name == "managed" {
+                state
+                    .catalog
+                    .write()
+                    .expect("standalone catalog write lock")
+                    .set_legacy_range_partitions(
+                        &target.namespace,
+                        &target.table,
+                        legacy_range_partitions,
+                    )?;
+            }
             if target.backend_name == "iceberg" {
                 persist_iceberg_table_if_needed(
                     state,
@@ -1222,6 +1236,12 @@ pub(crate) struct ShowAlterTableOptimizeStmt {
     pub(crate) table_name: Option<String>,
     pub(crate) order_by_create_time_desc: bool,
     pub(crate) limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AlterLegacyRangePartitionStmt {
+    pub(crate) table: ObjectName,
+    pub(crate) partition: LegacyRangePartition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1823,6 +1843,65 @@ pub(crate) fn parse_show_alter_table_optimize_sql(
         table_name,
         order_by_create_time_desc,
         limit,
+    })
+}
+
+pub(crate) fn looks_like_add_legacy_range_partition(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.starts_with("ALTER TABLE")
+        && upper.contains(" ADD ")
+        && upper.contains(" PARTITION ")
+        && upper.contains(" VALUES ")
+}
+
+pub(crate) fn parse_add_legacy_range_partition_sql(
+    sql: &str,
+) -> Result<AlterLegacyRangePartitionStmt, String> {
+    let dialect = StarRocksDialect;
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|e| format!("parse ALTER TABLE ADD PARTITION: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| format!("expected ALTER: {e}"))?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| format!("expected TABLE: {e}"))?;
+    let table = crate::sql::parser::dialect::convert_object_name(
+        parser
+            .parse_object_name(false)
+            .map_err(|e| format!("parse ALTER TABLE name: {e}"))?,
+    )?;
+    expect_word(&mut parser, "ADD")?;
+    let _ = parser.parse_keyword(Keyword::TEMPORARY);
+    expect_word(&mut parser, "PARTITION")?;
+    let name = parser
+        .parse_identifier()
+        .map_err(|e| format!("expected partition name: {e}"))?
+        .value;
+    expect_word(&mut parser, "VALUES")?;
+    let (lower_sql, upper_sql) =
+        crate::sql::parser::dialect::create_table::parse_legacy_range_values(&mut parser)?;
+    if parser.consume_token(&Token::SemiColon) && parser.peek_token_ref().token != Token::EOF {
+        return Err(format!(
+            "unsupported trailing ALTER TABLE ADD PARTITION tokens: {}",
+            parser.peek_token_ref().token
+        ));
+    }
+    if parser.peek_token_ref().token != Token::EOF {
+        return Err(format!(
+            "unsupported trailing ALTER TABLE ADD PARTITION tokens: {}",
+            parser.peek_token_ref().token
+        ));
+    }
+    Ok(AlterLegacyRangePartitionStmt {
+        table,
+        partition: LegacyRangePartition {
+            name,
+            column: String::new(),
+            lower_sql,
+            upper_sql,
+        },
     })
 }
 
