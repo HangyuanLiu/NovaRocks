@@ -35,7 +35,7 @@ use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile,
     ensure_iceberg_write_supported, ensure_no_equality_deletes,
@@ -83,8 +83,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
