@@ -1429,18 +1429,30 @@ fn latest_table_metadata_location_local(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<String, String> {
-    let metadata_dir = entry
-        .warehouse_path
-        .join(normalize_identifier(namespace_name)?)
-        .join(normalize_identifier(table_name)?)
-        .join("metadata");
-    let file_names: Vec<String> = std::fs::read_dir(&metadata_dir)
-        .map_err(|e| {
-            format!(
+    let ns = normalize_identifier(namespace_name)?;
+    let tbl = normalize_identifier(table_name)?;
+    let metadata_dir = entry.warehouse_path.join(&ns).join(&tbl).join("metadata");
+    let read_dir = match std::fs::read_dir(&metadata_dir) {
+        Ok(read_dir) => read_dir,
+        // The Hadoop catalog stores table metadata under
+        // `<warehouse>/<ns>/<tbl>/metadata/`. A missing directory means the
+        // table no longer exists in this catalog (dropped, never created,
+        // or pruned externally). Surface this as an "unknown table" error
+        // so callers can distinguish absence from genuine I/O trouble —
+        // notably, `register_external_tables_for_query_impl` uses the
+        // distinction to evict a stale local-catalog entry instead of
+        // hanging onto it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("unknown iceberg table {ns}.{tbl}"));
+        }
+        Err(e) => {
+            return Err(format!(
                 "read iceberg metadata dir {} failed: {e}",
                 metadata_dir.display()
-            )
-        })?
+            ));
+        }
+    };
+    let file_names: Vec<String> = read_dir
         .filter_map(|item| item.ok())
         .filter_map(|item| {
             item.file_name()
@@ -1449,12 +1461,8 @@ fn latest_table_metadata_location_local(
                 .map(|name| name.to_string())
         })
         .collect();
-    let latest = choose_latest_metadata_filename(&file_names).map_err(|_| {
-        format!(
-            "no iceberg metadata files found under {}",
-            metadata_dir.display()
-        )
-    })?;
+    let latest = choose_latest_metadata_filename(&file_names)
+        .map_err(|_| format!("unknown iceberg table {ns}.{tbl}"))?;
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
 }
 

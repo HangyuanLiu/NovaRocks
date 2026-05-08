@@ -25,6 +25,7 @@ struct DatabaseDef {
     physical_layouts: HashMap<String, PhysicalTableLayout>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct InMemoryCatalog {
     databases: HashMap<String, DatabaseDef>,
 }

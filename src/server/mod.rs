@@ -216,6 +216,16 @@ async fn serve_forever(
         "standalone mysql server listening on {} (user={}, db={})",
         bind_addr, user, DEFAULT_DATABASE
     );
+    // Emit a parser-friendly readiness marker on stdout. Orchestration
+    // scripts must wait for this exact line before connecting; probing the
+    // mysql port alone cannot distinguish a freshly-bound server from a
+    // pre-existing process that already owned the port. The keyword
+    // `NOVAROCKS_READY` is the wait-for-ready contract — do not change it
+    // without updating callers (CLAUDE.md, sql-tests harness, etc.).
+    println!(
+        "NOVAROCKS_READY mysql_port={mysql_port} pid={}",
+        std::process::id()
+    );
     loop {
         let (stream, peer_addr) = listener
             .accept()

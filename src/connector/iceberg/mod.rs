@@ -23,7 +23,6 @@ pub(crate) mod compact;
 pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod equality_delete;
-mod jvm;
 pub mod metadata;
 pub(crate) mod partition_spec;
 pub mod position_delete;
@@ -33,8 +32,6 @@ pub mod schema;
 pub mod sink;
 mod state;
 pub(crate) mod variant_write;
-
-use crate::novarocks_config::config as novarocks_app_config;
 
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanOp,
@@ -48,20 +45,3 @@ pub use sink::IcebergTableSinkFactory;
 pub(crate) use state::{
     cache_iceberg_table_locations, lookup_iceberg_table_location, snapshot_iceberg_table_locations,
 };
-
-pub(crate) fn ensure_embedded_jvm_enabled(context: &str) -> Result<(), String> {
-    if !cfg!(feature = "embedded-jvm") {
-        return Err(format!(
-            "{context} requires embedded JVM support for Iceberg metadata scans, but this NovaRocks binary was built without the `embedded-jvm` feature; rebuild with `--features embedded-jvm`"
-        ));
-    }
-    let cfg = novarocks_app_config().map_err(|e| {
-        format!("load NovaRocks config failed while checking Iceberg JVM gate: {e}")
-    })?;
-    if cfg.iceberg.enable_embedded_jvm {
-        return Ok(());
-    }
-    Err(format!(
-        "{context} requires embedded JVM support for Iceberg metadata scans, but [iceberg].enable_embedded_jvm is disabled"
-    ))
-}

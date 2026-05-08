@@ -541,16 +541,20 @@ fn execute_update_match_query(
         current_database,
         &query,
     )?;
-    let result = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(
-            &query,
-            &catalog,
-            current_database,
-            state.exchange_port,
-            None,
-        )?
-    };
+    // Clone-then-release: pipeline execution must not hold
+    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let result = crate::engine::execute_query(
+        &query,
+        &catalog_snapshot,
+        current_database,
+        state.exchange_port,
+        None,
+    )?;
     matched_update_batch_from_query_result(result)
 }
 
@@ -1633,16 +1637,20 @@ fn execute_merge_match_query(
         current_database,
         &query,
     )?;
-    let result = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(
-            &query,
-            &catalog,
-            current_database,
-            state.exchange_port,
-            None,
-        )?
-    };
+    // Clone-then-release: pipeline execution must not hold
+    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let result = crate::engine::execute_query(
+        &query,
+        &catalog_snapshot,
+        current_database,
+        state.exchange_port,
+        None,
+    )?;
     let Some(first_chunk) = result.chunks.first() else {
         return Ok(MergeMatchRows::empty());
     };

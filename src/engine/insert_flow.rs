@@ -180,16 +180,21 @@ fn execute_insert_from_query_on_pipeline(
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
 ) -> Result<RecordBatch, String> {
-    let query_result = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(
-            query,
-            &catalog,
-            &target.namespace,
-            state.exchange_port,
-            None,
-        )?
-    };
+    // Clone-then-release: pipeline execution must not hold
+    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks for
+    // the full rationale (writer starvation under std::sync::RwLock).
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let query_result = crate::engine::execute_query(
+        query,
+        &catalog_snapshot,
+        &target.namespace,
+        state.exchange_port,
+        None,
+    )?;
 
     align_query_result_to_target(&query_result, insert_columns, &resolved.columns)
 }

@@ -665,21 +665,19 @@ impl StandaloneSession {
                     )?;
                 }
                 let mut rewritten_three_part_query;
-                let query = if current_catalog.is_none() {
-                    let three_parts = extract_three_part_table_refs(query);
-                    if !three_parts.is_empty() {
+                let three_parts = extract_three_part_table_refs(query);
+                let query = if !three_parts.is_empty() {
+                    if current_catalog.is_none() {
                         register_iceberg_tables_for_query(
                             &self.inner,
                             None,
                             current_database,
                             query,
                         )?;
-                        rewritten_three_part_query = query.clone();
-                        strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
-                        &rewritten_three_part_query
-                    } else {
-                        query
                     }
+                    rewritten_three_part_query = query.clone();
+                    strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
+                    &rewritten_three_part_query
                 } else {
                     query
                 };
@@ -729,28 +727,36 @@ impl StandaloneSession {
                         )?;
                     }
                     let three_parts = extract_three_part_table_refs(&rewritten);
-                    if !three_parts.is_empty() && current_catalog.is_none() {
-                        register_iceberg_tables_for_query(
-                            &self.inner,
-                            None,
-                            current_database,
-                            &rewritten,
-                        )?;
+                    if !three_parts.is_empty() {
+                        if current_catalog.is_none() {
+                            register_iceberg_tables_for_query(
+                                &self.inner,
+                                None,
+                                current_database,
+                                &rewritten,
+                            )?;
+                        }
                         strip_catalog_from_three_part_names(&mut rewritten);
                     }
-                    let catalog = self
+                    // Clone-then-release: do not hold `state.catalog.read()`
+                    // across `execute_query`. Pipeline execution can run for
+                    // many seconds and would otherwise starve writers (e.g.
+                    // INSERT cleanup taking `state.catalog.write()` in
+                    // `invalidate_iceberg_caches`) on the std::sync::RwLock
+                    // writer queue.
+                    let catalog_snapshot = self
                         .inner
                         .catalog
                         .read()
-                        .expect("standalone catalog read lock");
+                        .expect("standalone catalog read lock")
+                        .clone();
                     let result = execute_query(
                         &rewritten,
-                        &catalog,
+                        &catalog_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
                     )?;
-                    drop(catalog);
                     return Ok(StatementResult::Query(result));
                 }
 
@@ -765,44 +771,60 @@ impl StandaloneSession {
                     )?;
                 }
 
-                // Handle 3-part table names (catalog.database.table) when no
-                // current catalog context is set.  Clone the query, strip the
-                // catalog prefix so the analyzer sees 2-part names, and register
-                // the referenced Iceberg tables in the local catalog.
+                // Handle fully-qualified 3-part table names (catalog.database.table).
+                // Strip the leading catalog so the analyzer sees a 2-part name; the
+                // registration above (or the explicit one below in current_catalog=None
+                // mode) has already materialized the iceberg base table into the local
+                // catalog. The strip also turns 4-part `cat.db.tbl.__nr_meta_*__`
+                // metadata references into the 3-part form the analyzer's metadata
+                // path expects.
                 let three_parts = extract_three_part_table_refs(query);
-                if !three_parts.is_empty() && current_catalog.is_none() {
-                    register_iceberg_tables_for_query(&self.inner, None, current_database, query)?;
+                if !three_parts.is_empty() {
+                    if current_catalog.is_none() {
+                        register_iceberg_tables_for_query(
+                            &self.inner,
+                            None,
+                            current_database,
+                            query,
+                        )?;
+                    }
                     let mut rewritten = query.as_ref().clone();
                     strip_catalog_from_three_part_names(&mut rewritten);
-                    let catalog = self
+                    // Clone-then-release: do not hold the catalog read lock
+                    // across pipeline execution; see comment on the
+                    // time-travel branch above.
+                    let catalog_snapshot = self
                         .inner
                         .catalog
                         .read()
-                        .expect("standalone catalog read lock");
+                        .expect("standalone catalog read lock")
+                        .clone();
                     let result = execute_query(
                         &rewritten,
-                        &catalog,
+                        &catalog_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
                     )?;
-                    drop(catalog);
                     return Ok(StatementResult::Query(result));
                 }
 
-                let catalog = self
+                // Clone-then-release: do not hold the catalog read lock
+                // across pipeline execution; see comment on the time-travel
+                // branch above.
+                let catalog_snapshot = self
                     .inner
                     .catalog
                     .read()
-                    .expect("standalone catalog read lock");
+                    .expect("standalone catalog read lock")
+                    .clone();
                 let result = execute_query(
                     query,
-                    &catalog,
+                    &catalog_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
                 )?;
-                drop(catalog);
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Insert(ref insert) => self.handle_sqlparser_insert(
@@ -3383,7 +3405,7 @@ enable_path_style_access = true
         let err = session
             .query("select id from ice.db1.t")
             .expect_err("dropped backing table should not use stale local table");
-        assert!(err.contains("unknown table"), "err={err}");
+        assert!(err.contains("unknown iceberg table"), "err={err}");
         assert!(
             engine
                 .inner
