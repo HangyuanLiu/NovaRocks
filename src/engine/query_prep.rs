@@ -469,19 +469,30 @@ fn query_table_names(
     current_catalog: Option<&str>,
     query: &sqlparser::ast::Query,
 ) -> Vec<ObjectName> {
+    // Always collect fully-qualified 3-part references (including 4-part
+    // __nr_meta_*__ forms reduced to 3-part). They register against the
+    // catalog encoded in the name regardless of session catalog.
+    let mut names: Vec<ObjectName> = extract_three_part_table_refs(query)
+        .into_iter()
+        .map(|(catalog, namespace, table)| ObjectName {
+            parts: vec![catalog, namespace, table],
+        })
+        .collect();
+
+    // When the session has a current catalog, also collect 1-part names so
+    // that unqualified references in the query register through the session
+    // catalog + current database.
     if current_catalog.is_some() {
-        extract_table_names_from_query(query)
-            .into_iter()
-            .map(|table| ObjectName { parts: vec![table] })
-            .collect()
-    } else {
-        extract_three_part_table_refs(query)
-            .into_iter()
-            .map(|(catalog, namespace, table)| ObjectName {
-                parts: vec![catalog, namespace, table],
-            })
-            .collect()
+        for table in extract_table_names_from_query(query) {
+            names.push(ObjectName { parts: vec![table] });
+        }
     }
+
+    // Stable de-duplication on (parts) so the downstream registration loop
+    // does not redundantly hit the iceberg backend for the same target.
+    names.sort_by(|a, b| a.parts.cmp(&b.parts));
+    names.dedup_by(|a, b| a.parts == b.parts);
+    names
 }
 
 /// Returns true if `table_name` was produced by the time-travel rewriter.
