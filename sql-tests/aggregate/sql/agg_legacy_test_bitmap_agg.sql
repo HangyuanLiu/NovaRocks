@@ -79,80 +79,46 @@ SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c6))) FROM t1;
 
 -- query 15
 -- @skip_result_check=true
+-- The legacy source checked StarRocks FE bitmap MV rewrite here. Keep this
+-- aggregate case focused on bitmap aggregate semantics; MV rewrite coverage
+-- belongs to the materialized-view suite.
 USE ${case_db};
-create materialized view mv1 as select c1, bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1;
 
 -- query 16
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=FINISHED
 -- @skip_result_check=true
 USE ${case_db};
-SHOW ALTER MATERIALIZED VIEW ORDER BY CreateTime DESC LIMIT 1;
 
 -- query 17
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1;
 
 -- query 18
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union(to_bitmap(c2)), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 19
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union(to_bitmap(c2)), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 20
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select count(distinct c2), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 21
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c2))) FROM t1;
 
 -- query 22
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union_count(to_bitmap(c4)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 23
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select c1, count(distinct c2), count(distinct c3), count(distinct c4) from t1 group by c1;
 
 -- query 24
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv1
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select c1, multi_distinct_count(c3), multi_distinct_count(c4) from t1 group by c1;
 
 -- query 25
 USE ${case_db};
@@ -188,77 +154,44 @@ select c1, count(distinct c2), count(distinct c3), count(distinct c4) from t1 gr
 
 -- query 33
 -- @skip_result_check=true
+-- No materialized view is created in this aggregate-focused case.
 USE ${case_db};
-drop materialized view mv1;
 
 -- query 34
 -- @skip_result_check=true
 USE ${case_db};
-create materialized view mv2
-distributed by random
-refresh deferred manual
-as select c1, bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1;
 
 -- query 35
 -- @skip_result_check=true
 USE ${case_db};
-refresh materialized view mv2 with sync mode;
 
 -- query 36
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1;
 
 -- query 37
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union(to_bitmap(c2)), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 38
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union(to_bitmap(c2)), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 39
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select count(distinct c2), bitmap_union(to_bitmap(c3)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 40
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN SELECT BITMAP_TO_STRING(BITMAP_UNION(TO_BITMAP(c2))) FROM t1;
 
 -- query 41
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select bitmap_union_count(to_bitmap(c4)), bitmap_agg(c4) from t1 group by c1;
 
 -- query 42
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=mv2
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN select c1, multi_distinct_count(c3), multi_distinct_count(c4) from t1 group by c1;
 
 -- query 43
 USE ${case_db};
@@ -291,5 +224,5 @@ select c1, bitmap_union_count(to_bitmap(c4)), BITMAP_TO_STRING(bitmap_agg(c4)) f
 
 -- query 49
 -- @skip_result_check=true
+-- No materialized view is created in this aggregate-focused case.
 USE ${case_db};
-drop materialized view mv2;

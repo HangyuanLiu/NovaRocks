@@ -104,11 +104,11 @@ pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Resu
             inner,
         )?)?)),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_custom_expr(inner),
-        // An array literal like `[1, 2, 3]` has no natural non-constant lowering
-        // in this path (we don't run through the pipeline scalar-eval machinery
-        // here), so fold it to a Literal::Array if every element is itself a
-        // literal-convertible expression; otherwise fail fast with a clear error.
-        sqlast::Expr::Array(_) => Ok(Expr::Literal(sqlparser_expr_to_literal(expr)?)),
+        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(Expr::Array(
+            elem.iter()
+                .map(sqlparser_expr_to_custom_expr)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         // Function calls: try constant-folding via the INSERT-VALUES literal
         // helper first (covers `row(...)`, `map(...)`, fully-constant
         // `to_binary(...)`, etc.). If folding fails (e.g. args reference a
@@ -1098,14 +1098,23 @@ mod tests {
     }
 
     #[test]
-    fn array_literal_folds_to_literal_array() {
+    fn array_literal_lowers_to_array_expr() {
         let arr = sqlparser_expr_to_custom_expr(&parse_expr("[1, 2, 3]")).expect("array");
-        let Expr::Literal(Literal::Array(items)) = arr else {
-            panic!("expected Literal::Array");
+        let Expr::Array(items) = arr else {
+            panic!("expected Expr::Array");
         };
         assert_eq!(items.len(), 3);
-        assert!(matches!(items[0], Literal::Int(1)));
-        assert!(matches!(items[2], Literal::Int(3)));
+        assert!(matches!(items[0], Expr::Literal(Literal::Int(1))));
+        assert!(matches!(items[2], Expr::Literal(Literal::Int(3))));
+    }
+
+    #[test]
+    fn array_literal_preserves_column_ref_elements() {
+        let arr = sqlparser_expr_to_custom_expr(&parse_expr("[generate_series]")).expect("array");
+        let Expr::Array(items) = arr else {
+            panic!("expected Expr::Array");
+        };
+        assert!(matches!(items[0], Expr::Column(ref c) if c.name == "generate_series"));
     }
 
     #[test]

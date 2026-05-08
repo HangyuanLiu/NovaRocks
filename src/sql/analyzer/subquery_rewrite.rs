@@ -362,9 +362,11 @@ impl<'a> AnalyzerContext<'a> {
                 });
             }
 
+            let output_columns = modified_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
                 query: Box::new(modified_sub),
                 alias: sq_alias.clone(),
+                output_columns,
             };
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
@@ -439,9 +441,11 @@ impl<'a> AnalyzerContext<'a> {
                 }
             }
 
+            let output_columns = resolved_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
                 query: Box::new(resolved_sub),
                 alias: sq_alias.clone(),
+                output_columns,
             };
             select.from = Some(Relation::Join(Box::new(JoinRelation {
                 left: current_from,
@@ -522,9 +526,11 @@ impl<'a> AnalyzerContext<'a> {
             let scalar_data_type = modified_sub.output_columns[0].data_type.clone();
             let scalar_nullable = true;
 
+            let output_columns = modified_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
                 query: Box::new(modified_sub),
                 alias: sq_alias.clone(),
+                output_columns,
             };
 
             scope.add_column(
@@ -562,9 +568,11 @@ impl<'a> AnalyzerContext<'a> {
             );
         } else {
             let scalar_col = resolved_sub.output_columns[0].clone();
+            let output_columns = resolved_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
                 query: Box::new(resolved_sub),
                 alias: sq_alias.clone(),
+                output_columns,
             };
 
             scope.add_column(

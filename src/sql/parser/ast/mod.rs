@@ -392,6 +392,7 @@ pub(crate) enum Expr {
     },
     Aggregate(AggregateExpr),
     ScalarFunction(ScalarFunctionExpr),
+    Array(Vec<Expr>),
     Cast {
         expr: Box<Expr>,
         data_type: SqlType,

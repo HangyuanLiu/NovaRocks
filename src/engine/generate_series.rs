@@ -192,6 +192,11 @@ fn evaluate_generate_series_expr(
             }
         }
         Expr::Literal(literal) => Ok(literal.clone()),
+        Expr::Array(items) => items
+            .iter()
+            .map(|item| evaluate_generate_series_expr(item, column_name, current))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Literal::Array),
         Expr::Arithmetic { left, op, right } => {
             let left = evaluate_generate_series_expr(left, column_name, current)?;
             let right = evaluate_generate_series_expr(right, column_name, current)?;
@@ -340,6 +345,14 @@ mod tests {
         let out = evaluate_generate_series_expr(&to_bin, "generate_series", 42)
             .expect("evaluate to_binary(utf8)");
         assert_eq!(out, Literal::String("v_42".to_string()));
+    }
+
+    #[test]
+    fn array_expr_evaluates_column_ref_elements() {
+        let expr = Expr::Array(vec![col("generate_series")]);
+        let out = evaluate_generate_series_expr(&expr, "generate_series", 42)
+            .expect("evaluate array expression");
+        assert_eq!(out, Literal::Array(vec![Literal::Int(42)]));
     }
 
     #[test]

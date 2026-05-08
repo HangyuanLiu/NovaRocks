@@ -1148,8 +1148,11 @@ fn plan_relation_scoped(
                 required_columns: None,
             }))
         }
-        Relation::Subquery { query, alias } => {
-            let output_columns = query.output_columns.clone();
+        Relation::Subquery {
+            query,
+            alias,
+            output_columns,
+        } => {
             let inner_plan = plan_scoped_query(*query, cte_registry)?;
             Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Box::new(inner_plan),

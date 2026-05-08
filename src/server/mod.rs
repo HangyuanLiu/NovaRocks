@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio::task;
 use tracing::{info, warn};
 
+use crate::common::failpoint::{self, FailPointMode};
 use crate::novarocks_config::{
     NovaRocksConfig, StandaloneServerConfig as AppStandaloneServerConfig,
 };
@@ -628,6 +629,13 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some((name, mode)) =
+        parse_admin_failpoint_query(trimmed).map_err(|err| (classify_query_error(&err), err))?
+    {
+        failpoint::update(&name, mode).map_err(|err| (classify_query_error(&err), err))?;
+        return Ok(StatementResult::Ok);
+    }
+
     if is_session_noop(trimmed)
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
@@ -856,6 +864,45 @@ fn classify_query_error(err: &str) -> ErrorKind {
     }
 }
 
+fn parse_admin_failpoint_query(query: &str) -> Result<Option<(String, FailPointMode)>, String> {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    if parts.len() < 3
+        || !parts[0].eq_ignore_ascii_case("admin")
+        || !parts[2].eq_ignore_ascii_case("failpoint")
+    {
+        return Ok(None);
+    }
+
+    let mode = if parts[1].eq_ignore_ascii_case("enable") {
+        FailPointMode::Enable
+    } else if parts[1].eq_ignore_ascii_case("disable") {
+        FailPointMode::Disable
+    } else {
+        return Ok(None);
+    };
+
+    if parts.len() != 4 {
+        return Err("expected ADMIN ENABLE/DISABLE FAILPOINT '<failpoint_name>'".to_string());
+    }
+
+    let name = strip_string_quotes(parts[3])
+        .ok_or_else(|| "expected ADMIN ENABLE/DISABLE FAILPOINT '<failpoint_name>'".to_string())?;
+    if name.is_empty() {
+        return Err("failpoint name must not be empty".to_string());
+    }
+
+    Ok(Some((name.to_string(), mode)))
+}
+
+fn strip_string_quotes(raw: &str) -> Option<&str> {
+    raw.strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+        .or_else(|| {
+            raw.strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +971,34 @@ mod tests {
             "DELETE must reach the embedded engine so Iceberg row deletes are committed"
         );
         assert!(is_supported_embedded_statement(sql));
+    }
+
+    #[test]
+    fn parse_admin_failpoint_accepts_enable_disable() {
+        assert_eq!(
+            parse_admin_failpoint_query("admin enable failpoint 'agg_hash_set_bad_alloc'"),
+            Ok(Some((
+                "agg_hash_set_bad_alloc".to_string(),
+                FailPointMode::Enable
+            )))
+        );
+        assert_eq!(
+            parse_admin_failpoint_query(
+                "ADMIN DISABLE FAILPOINT \"aggregate_build_hash_map_bad_alloc\""
+            ),
+            Ok(Some((
+                "aggregate_build_hash_map_bad_alloc".to_string(),
+                FailPointMode::Disable
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_admin_failpoint_rejects_malformed_target() {
+        assert!(parse_admin_failpoint_query("admin enable failpoint").is_err());
+        assert!(
+            parse_admin_failpoint_query("admin enable failpoint agg_hash_set_bad_alloc").is_err()
+        );
+        assert_eq!(parse_admin_failpoint_query("admin show config"), Ok(None));
     }
 }
