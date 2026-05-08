@@ -407,12 +407,22 @@ SQL client / SQL test runner / one-shot CLI
 ### 7.3 Local Test Environment (Iceberg REST + MinIO + Spark)
 
 The canonical local test fixture lives at `docker/iceberg-rest/` and is also
-the CI fixture for the `iceberg` and `iceberg-compatibility` SQL suites. The
-Codex workspace manifest at `.codex/environments/environment.toml` points its
-setup/cleanup hooks at this directory.
+the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
+SQL suites. The Codex workspace manifest at
+`.codex/environments/environment.toml` points setup at this directory.
 
-Do not guess local ports such as `9000`, `8181`, or `9030`. Always discover the
-active workspace environment from the fixed generated entry:
+The Docker side is shared across worktrees by default. Codex environment setup
+only runs `docker/iceberg-rest/up.sh --prepare-only`, which generates this
+worktree's runtime entry and does not start Docker. When Docker-backed tests
+are actually needed, `docker/iceberg-rest/up.sh` starts or reuses one shared
+Docker Compose project configured by
+`docker/iceberg-rest/shared.env`; the default shared service ports are MinIO
+`9000`, MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each
+worktree still gets its own generated runtime entry and a separate NovaRocks
+standalone-server port.
+
+Do not guess the NovaRocks server port. Always discover the active worktree
+environment from the fixed generated entry:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
@@ -421,14 +431,15 @@ source docker/iceberg-rest/runtime/current/env.sh
 Important generated locations:
 
 - `docker/iceberg-rest/runtime/current/env.sh`
-  Shell exports for the active workspace. Prefer this for commands.
+  Shell exports for the active worktree. Prefer this for commands.
 - `docker/iceberg-rest/runtime/current/manifest.json`
   Machine-readable endpoints, ports, Docker Compose project, warehouses, and config paths.
 - `docker/iceberg-rest/runtime/current/README.md`
-  Human-readable summary of the active environment.
+  Human-readable summary of the active worktree environment.
 
 Important environment variables after sourcing `env.sh`:
 
+- `NOVA_ENV_SHARED_DOCKER`, `NOVA_ENV_COMPOSE_PROJECT`, `NOVA_ENV_CONFIG_FILE`
 - `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
 - `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
@@ -444,7 +455,7 @@ Important environment variables after sourcing `env.sh`:
 If the fixed entry is missing, initialize or inspect the environment with:
 
 ```bash
-docker/iceberg-rest/up.sh
+docker/iceberg-rest/up.sh --prepare-only
 docker/iceberg-rest/status.sh
 ```
 
@@ -488,6 +499,7 @@ Run SQL tests with the generated runner config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
@@ -498,6 +510,7 @@ Catalog + MinIO and NovaRocks reads the table:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
@@ -508,6 +521,7 @@ writes and reads):
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
@@ -518,6 +532,7 @@ and MinIO services:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
@@ -526,9 +541,12 @@ and `http://minio:9000` for object storage. NovaRocks should use the host
 endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
-Workspace cleanup uses `docker/iceberg-rest/down.sh --purge`, which removes
-the workspace-specific Docker Compose project, MinIO volume, and generated
-runtime entry.
+Workspace cleanup uses `docker/iceberg-rest/down.sh --runtime-only --purge`,
+which removes only this worktree's generated runtime entry. It deliberately
+leaves the shared Docker services running because other worktrees may be using
+them. Use `docker/iceberg-rest/down.sh --docker` only when you explicitly want
+to stop the shared Docker project, and `--docker --volumes` only when you also
+want to delete its shared MinIO volume.
 
 ---
 
@@ -581,6 +599,10 @@ source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
+
+When starting a server manually inside a Codex worktree, prefer the generated
+config or `--port "$NOVA_ENV_MYSQL_PORT"` instead of hard-coding `9030`,
+because another worktree may already be using the default MySQL port.
 
 **Run test suites:**
 

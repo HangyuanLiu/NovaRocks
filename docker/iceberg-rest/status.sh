@@ -17,12 +17,32 @@ current_link="$runtime_base/current"
 compose_file="$SCRIPT_DIR/compose.yml"
 compose_env="$runtime_dir/compose.env"
 exports_file="$runtime_dir/env.sh"
-compose_project="nr-${env_id}"
+config_file="${NOVA_ENV_CONFIG_FILE:-$SCRIPT_DIR/shared.env}"
+
+if [[ -f "$config_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$config_file"
+  set +a
+fi
+
+shared_docker="${NOVA_ENV_SHARED_DOCKER:-true}"
+configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
+if [[ "$shared_docker" == "true" ]]; then
+  compose_project="$configured_compose_project"
+else
+  compose_project="${NOVA_ENV_COMPOSE_PROJECT:-nr-${env_id}}"
+fi
 
 if [[ -f "$exports_file" ]]; then
   # shellcheck disable=SC1090
   source "$exports_file"
-  compose_project="${NOVA_ENV_COMPOSE_PROJECT:-$compose_project}"
+  shared_docker="${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
+  if [[ "$shared_docker" == "true" ]]; then
+    compose_project="$configured_compose_project"
+  else
+    compose_project="${NOVA_ENV_COMPOSE_PROJECT:-$compose_project}"
+  fi
 fi
 
 if [[ ! -f "$compose_env" ]]; then
@@ -41,6 +61,8 @@ echo "Fixed discovery entry:"
 echo "  current: $current_link"
 echo "  manifest: ${NOVA_ENV_MANIFEST:-$runtime_dir/manifest.json}"
 echo "  readme: ${NOVA_ENV_README:-$runtime_dir/README.md}"
+echo "  shared docker: ${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
+echo "  shared config: ${NOVA_ENV_CONFIG_FILE:-$config_file}"
 echo
 echo "Generated environment:"
 echo "  env: $exports_file"
@@ -48,6 +70,8 @@ echo "  standalone config: ${NOVAROCKS_STANDALONE_CONFIG:-$runtime_dir/standalon
 echo "  sql-test config: ${NOVAROCKS_SQL_TEST_CONFIG:-$runtime_dir/sql-test.conf}"
 echo "  REST catalog SQL: ${NOVAROCKS_ICE_REST_CATALOG_SQL:-$runtime_dir/ice-rest-catalog.sql}"
 echo "  REST warehouse: ${NOVAROCKS_ICEBERG_REST_WAREHOUSE:-unknown}"
+echo "  REST URI: ${NOVAROCKS_ICEBERG_REST_URI:-unknown}"
+echo "  NovaRocks MySQL port: ${NOVA_ENV_MYSQL_PORT:-unknown}"
 echo "  Spark defaults: ${NOVAROCKS_SPARK_DEFAULTS:-$runtime_dir/spark-defaults.conf}"
 echo "  Spark v3 smoke SQL: ${NOVAROCKS_SPARK_V3_SMOKE_SQL:-$runtime_dir/spark-iceberg-v3-smoke.sql}"
 echo "  Spark SQL helper: ${NOVAROCKS_SPARK_SQL:-$SCRIPT_DIR/spark-sql.sh}"

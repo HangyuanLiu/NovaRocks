@@ -73,8 +73,6 @@ services:
       SPARK_LOCAL_HOSTNAME: localhost
     ports:
       - "${NOVA_ENV_SPARK_UI_PORT}:4040"
-    volumes:
-      - "${NOVA_ENV_RUNTIME_DIR}:/opt/novarocks-env:ro"
     entrypoint: ["/bin/bash", "-lc"]
     command: ["trap 'exit 0' TERM INT; sleep infinity & wait"]
     networks:

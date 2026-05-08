@@ -25,7 +25,9 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortExpression;
-use crate::exec::operators::sort::{ChunksSorter, normalize_sort_key_array};
+use crate::exec::operators::sort::{
+    ChunksSorter, concat_sort_chunks, merged_sort_schema_for_chunks, normalize_sort_key_array,
+};
 
 use arrow::array::ArrayRef;
 use arrow::compute::{SortOptions, concat_batches};
@@ -157,7 +159,11 @@ impl TopNHeapKernel {
         selected.sort_unstable();
 
         let source_chunk = selected[0].chunk.clone();
-        let schema = selected[0].chunk.schema();
+        let selected_chunks = selected
+            .iter()
+            .map(|entry| entry.chunk.as_ref().clone())
+            .collect::<Vec<_>>();
+        let schema = merged_sort_schema_for_chunks(&selected_chunks)?;
         let row_batches = selected
             .into_iter()
             .map(|entry| entry.chunk.batch.slice(entry.row_idx, 1))
@@ -178,9 +184,7 @@ pub(crate) fn sort_chunks_topn_heap(
         return Ok(None);
     }
     if order_by.is_empty() {
-        let schema = chunks[0].schema();
-        let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
-        let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_sort_chunks(chunks)?;
         let keep = rows_to_keep.min(batch.num_rows());
         if keep == 0 {
             return Ok(None);

@@ -24,9 +24,9 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortExpression;
-use crate::exec::operators::sort::{ChunksSorter, normalize_sort_key_array};
+use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks, normalize_sort_key_array};
 
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 
 /// Full sort implementation used by `SORT` mode.
 pub(crate) struct ChunksSorterFullSort {
@@ -45,9 +45,7 @@ impl ChunksSorter for ChunksSorterFullSort {
         if chunks.is_empty() {
             return Ok(None);
         }
-        let schema = chunks[0].schema();
-        let batches: Vec<_> = chunks.iter().map(|c| c.batch.clone()).collect();
-        let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_sort_chunks(chunks)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -85,5 +83,66 @@ impl ChunksSorter for ChunksSorterFullSort {
         Chunk::try_new_like(sorted, &chunks[0])
             .map(Some)
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprNode;
+
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    fn make_chunk(values: Vec<Option<i32>>, nullable: bool) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            nullable,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
+            .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    #[test]
+    fn full_sort_reconciles_nullable_columns_across_chunks() {
+        let chunks = vec![
+            make_chunk(vec![Some(1), Some(2)], false),
+            make_chunk(vec![None, Some(3)], true),
+        ];
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let sorter = ChunksSorterFullSort::new(
+            Arc::new(arena),
+            vec![SortExpression {
+                expr,
+                asc: true,
+                nulls_first: true,
+            }],
+        );
+
+        let out = sorter.sort_chunks(&chunks).expect("sort").expect("chunk");
+        assert!(out.batch.schema().field(0).is_nullable());
+        let col = out
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32");
+        assert_eq!(col.len(), 4);
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 1);
+        assert_eq!(col.value(2), 2);
+        assert_eq!(col.value(3), 3);
     }
 }

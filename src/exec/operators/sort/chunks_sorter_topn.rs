@@ -25,12 +25,12 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
-use crate::exec::operators::sort::ChunksSorter;
 use crate::exec::operators::sort::chunks_sorter_heap_sort::sort_chunks_topn_heap;
 use crate::exec::operators::sort::normalize_sort_key_array;
+use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks};
 
 use arrow::array::{ArrayRef, UInt32Array};
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 
@@ -58,9 +58,7 @@ pub(crate) fn sort_chunks_topn(
         return Ok(None);
     }
     if order_by.is_empty() {
-        let schema = chunks[0].schema();
-        let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
-        let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_sort_chunks(chunks)?;
         let keep = rows_to_keep.min(batch.num_rows());
         if keep == 0 {
             return Ok(None);
@@ -121,9 +119,7 @@ pub(crate) fn sort_chunks_rank(
         return Ok(None);
     }
     if order_by.is_empty() {
-        let schema = chunks[0].schema();
-        let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
-        let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_sort_chunks(chunks)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -177,9 +173,7 @@ pub(crate) fn sort_chunks_dense_rank(
         return Ok(None);
     }
     if order_by.is_empty() {
-        let schema = chunks[0].schema();
-        let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
-        let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+        let batch = concat_sort_chunks(chunks)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -311,9 +305,7 @@ fn sort_chunks_by_order(
     if chunks.is_empty() {
         return Err("sort_chunks_by_order requires non-empty chunks".to_string());
     }
-    let schema = chunks[0].schema();
-    let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
-    let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+    let batch = concat_sort_chunks(chunks)?;
     if batch.num_rows() == 0 || order_by.is_empty() {
         return Chunk::try_new_like(batch, &chunks[0]).map_err(|e| e.to_string());
     }

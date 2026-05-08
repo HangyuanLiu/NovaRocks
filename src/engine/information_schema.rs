@@ -87,6 +87,50 @@ pub(crate) fn try_query_materialized_views(
         .map(Some)
 }
 
+pub(crate) fn try_update_be_configs(
+    statement: &sqlast::Statement,
+) -> Result<Option<StatementResult>, String> {
+    let sqlast::Statement::Update(update) = statement else {
+        return Ok(None);
+    };
+    if !is_information_schema_be_configs(&update.table.relation) {
+        return Ok(None);
+    }
+
+    if !update.table.joins.is_empty() {
+        return Err("information_schema.be_configs UPDATE does not support joins".to_string());
+    }
+    if update.optimizer_hint.is_some()
+        || update.from.is_some()
+        || update.returning.is_some()
+        || update.or.is_some()
+        || update.limit.is_some()
+    {
+        return Err(
+            "information_schema.be_configs UPDATE only supports simple SET assignments".to_string(),
+        );
+    }
+    if update.assignments.len() != 1 {
+        return Err(
+            "information_schema.be_configs UPDATE requires exactly one assignment".to_string(),
+        );
+    }
+
+    let sqlast::AssignmentTarget::ColumnName(column_name) = &update.assignments[0].target else {
+        return Err(
+            "information_schema.be_configs UPDATE target must be a column name".to_string(),
+        );
+    };
+    let column_parts = object_name_parts(column_name);
+    if !matches!(column_parts.as_slice(), [column] if column.eq_ignore_ascii_case("value")) {
+        return Err(
+            "information_schema.be_configs UPDATE only supports assigning `value`".to_string(),
+        );
+    }
+
+    Ok(Some(StatementResult::Ok))
+}
+
 fn materialized_view_rows(
     state: &Arc<StandaloneState>,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
@@ -121,6 +165,19 @@ fn materialized_view_rows(
         });
     }
     Ok(rows)
+}
+
+fn is_information_schema_be_configs(factor: &sqlast::TableFactor) -> bool {
+    let sqlast::TableFactor::Table { name, .. } = factor else {
+        return false;
+    };
+    let parts = object_name_parts(name);
+    matches!(
+        parts.as_slice(),
+        [schema, table]
+            if schema.eq_ignore_ascii_case("information_schema")
+                && table.eq_ignore_ascii_case("be_configs")
+    )
 }
 
 fn is_information_schema_materialized_views(factor: &sqlast::TableFactor) -> bool {
@@ -342,4 +399,44 @@ fn object_name_parts(name: &sqlast::ObjectName) -> Vec<String> {
 
 fn normalize_column_name(name: &str) -> String {
     name.trim_matches('`').to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_update_be_configs;
+    use crate::engine::StatementResult;
+    use crate::sql::parser::dialect::StarRocksDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_statement(sql: &str) -> sqlparser::ast::Statement {
+        let dialect = StarRocksDialect;
+        Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("parse sql")
+            .parse_statement()
+            .expect("parse statement")
+    }
+
+    #[test]
+    fn update_information_schema_be_configs_is_noop() {
+        let stmt = parse_statement(
+            r#"update information_schema.be_configs set value = "0" where name = "two_level_memory_threshold""#,
+        );
+
+        assert!(matches!(
+            try_update_be_configs(&stmt).expect("be_configs update"),
+            Some(StatementResult::Ok)
+        ));
+    }
+
+    #[test]
+    fn update_information_schema_be_configs_rejects_other_columns() {
+        let stmt = parse_statement(
+            r#"update information_schema.be_configs set name = "x" where name = "two_level_memory_threshold""#,
+        );
+        let err = try_update_be_configs(&stmt)
+            .expect_err("unsupported be_configs assignment should fail");
+
+        assert!(err.contains("only supports assigning `value`"), "err={err}");
+    }
 }

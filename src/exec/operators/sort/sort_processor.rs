@@ -33,11 +33,11 @@ use std::time::Instant;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
-use crate::exec::operators::sort::normalize_sort_key_array;
 use crate::exec::operators::sort::{
     ChunksSorter, ChunksSorterFullSort, ChunksSorterHeapSort, ChunksSorterTopN,
     SpillableChunksSorter,
 };
+use crate::exec::operators::sort::{concat_sort_chunks, normalize_sort_key_array};
 use crate::exec::spill::spiller::{SpillFile, Spiller};
 use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
 
@@ -47,7 +47,7 @@ use crate::novarocks_logging::warn;
 use crate::runtime::runtime_state::RuntimeState;
 
 use arrow::array::ArrayRef;
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, SortField};
 
@@ -899,9 +899,7 @@ impl SortProcessorOperator {
         &self,
         chunks: &[Chunk],
     ) -> Result<arrow::record_batch::RecordBatch, String> {
-        let schema = chunks[0].schema();
-        let batches: Vec<_> = chunks.iter().map(|c| c.batch.clone()).collect();
-        concat_batches(&schema, &batches).map_err(|e| e.to_string())
+        concat_sort_chunks(chunks)
     }
 
     fn sort_indices(

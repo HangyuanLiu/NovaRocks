@@ -417,13 +417,11 @@ pub(crate) fn drop_managed_table(
     database_name: &str,
     table_name: &str,
 ) -> Result<StatementResult, String> {
-    let runtime = {
-        let managed = state
-            .managed_lake
-            .read()
-            .expect("standalone managed lake read lock");
-        managed.table(database_name, table_name)?.clone()
-    };
+    let mut managed = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    let runtime = managed.table(database_name, table_name)?.clone();
     let managed_config = state
         .managed_lake_config
         .as_ref()
@@ -443,13 +441,7 @@ pub(crate) fn drop_managed_table(
 
     let snapshot = metadata_store.load_snapshot()?.managed;
     let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot)?;
-    {
-        let mut managed = state
-            .managed_lake
-            .write()
-            .expect("standalone managed lake write lock");
-        *managed = rebuilt;
-    }
+    *managed = rebuilt;
     let mut catalog = state
         .catalog
         .write()
@@ -550,13 +542,11 @@ where
     ) -> Result<(), String>,
     Refresh: FnOnce(&ManagedLakeCatalog) -> Result<(), String>,
 {
-    let runtime = {
-        let managed = state
-            .managed_lake
-            .read()
-            .expect("standalone managed lake read lock");
-        managed.table(database_name, table_name)?.clone()
-    };
+    let mut managed = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    let runtime = managed.table(database_name, table_name)?.clone();
     let managed_config = state
         .managed_lake_config
         .as_ref()
@@ -615,13 +605,7 @@ where
     let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), rebuilt_snapshot)?;
     refresh_runtimes(&rebuilt)?;
     let updated_runtime = rebuilt.table(database_name, table_name)?.clone();
-    {
-        let mut managed = state
-            .managed_lake
-            .write()
-            .expect("standalone managed lake write lock");
-        *managed = rebuilt;
-    }
+    *managed = rebuilt;
     let mut catalog = state
         .catalog
         .write()

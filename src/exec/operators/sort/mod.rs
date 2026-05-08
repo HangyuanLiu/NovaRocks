@@ -26,7 +26,9 @@ use arrow::array::{
     Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
     StructArray,
 };
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
 
@@ -41,6 +43,72 @@ mod spillable_chunks_sorter;
 /// Shared sorter abstraction for sort/topn operator implementations.
 pub(crate) trait ChunksSorter: Send + Sync {
     fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String>;
+}
+
+pub(crate) fn concat_sort_chunks(chunks: &[Chunk]) -> Result<RecordBatch, String> {
+    if chunks.is_empty() {
+        return Err("sort concat requires non-empty chunks".to_string());
+    }
+    let schema = merged_sort_schema_for_chunks(chunks)?;
+    let batches = chunks
+        .iter()
+        .map(|chunk| chunk.batch.clone())
+        .collect::<Vec<_>>();
+    concat_batches(&schema, &batches).map_err(|e| e.to_string())
+}
+
+pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRef, String> {
+    let first_schema = chunks
+        .first()
+        .ok_or_else(|| "sort schema merge requires non-empty chunks".to_string())?
+        .schema();
+    let field_count = first_schema.fields().len();
+    let mut fields = first_schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut changed = false;
+
+    for chunk in chunks {
+        let schema = chunk.schema();
+        if schema.fields().len() != field_count {
+            return Err(format!(
+                "sort schema field count mismatch: expected={} actual={}",
+                field_count,
+                schema.fields().len()
+            ));
+        }
+        for idx in 0..field_count {
+            let expected = &fields[idx];
+            let actual = schema.field(idx);
+            if expected.name() != actual.name() || expected.data_type() != actual.data_type() {
+                return Err(format!(
+                    "sort schema field mismatch at index {}: expected=({}, {:?}) actual=({}, {:?})",
+                    idx,
+                    expected.name(),
+                    expected.data_type(),
+                    actual.name(),
+                    actual.data_type()
+                ));
+            }
+            let nullable = expected.is_nullable()
+                || actual.is_nullable()
+                || chunk.batch.column(idx).null_count() > 0;
+            if nullable != expected.is_nullable() {
+                fields[idx] = expected.clone().with_nullable(nullable);
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(first_schema);
+    }
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        first_schema.metadata().clone(),
+    )))
 }
 
 pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, String> {
