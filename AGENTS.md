@@ -456,6 +456,34 @@ NO_PROXY=127.0.0.1,localhost \
 cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
+When backgrounding the server (e.g. inside an automated test driver), wait
+for the readiness marker before issuing the first query — probing the mysql
+port alone cannot distinguish a freshly-bound server from a leftover
+process that already owned the port:
+
+```bash
+LOG=/tmp/novarocks-server.log
+NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone-server \
+  --config "$NOVAROCKS_STANDALONE_CONFIG" >"$LOG" 2>&1 &
+SRV_PID=$!
+# Wait up to 60 s for the server to bind. If bind fails the line never
+# appears, the process exits with code 1, and `wait` surfaces the failure.
+for i in $(seq 1 60); do
+  if grep -q '^NOVAROCKS_READY ' "$LOG"; then break; fi
+  if ! kill -0 "$SRV_PID" 2>/dev/null; then
+    echo "standalone-server died during startup; tail of $LOG:" >&2
+    tail -20 "$LOG" >&2
+    exit 1
+  fi
+  sleep 1
+done
+grep -q '^NOVAROCKS_READY ' "$LOG" || { echo "timed out waiting for NOVAROCKS_READY" >&2; kill -9 "$SRV_PID"; exit 1; }
+```
+
+The marker line is emitted on stdout immediately after a successful bind:
+`NOVAROCKS_READY mysql_port=23223 pid=<pid>`. Any orchestration that
+backgrounds the server **must** gate its first connection on this line.
+
 Run SQL tests with the generated runner config:
 
 ```bash
