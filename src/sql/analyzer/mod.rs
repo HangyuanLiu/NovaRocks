@@ -2408,6 +2408,30 @@ mod tests {
     }
 
     #[test]
+    fn scalar_subquery_in_projection_without_outer_from_synthesizes_dummy() {
+        // Mirrors the iceberg_in_list_predicate failure pattern: outer SELECT
+        // has no FROM clause; the projection contains scalar subqueries.
+        // Without a synthetic single-row FROM, the subquery rewriter would
+        // bail out with `scalar subquery rewrite requires a FROM clause`.
+        let sql = "SELECT COALESCE((SELECT count(*) FROM customer WHERE c_acctbal > 0), 0) AS n_pos, \
+             COALESCE((SELECT count(*) FROM customer WHERE c_acctbal < 0), 0) AS n_neg";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel
+                .from
+                .as_ref()
+                .expect("rewriter should have synthesized a FROM");
+            // Each scalar subquery joins onto the dummy via CROSS JOIN.
+            assert!(
+                has_join_kind(from, JoinKind::Cross),
+                "scalar subquery without outer FROM should produce CROSS JOIN, got: {from:?}"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
     fn multiple_subqueries_exists_and_not_exists() {
         // q21 pattern: EXISTS + NOT EXISTS in the same WHERE
         let sql = "SELECT s_name FROM supplier, lineitem l1, orders, nation \

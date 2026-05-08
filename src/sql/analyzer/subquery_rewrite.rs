@@ -16,6 +16,31 @@ use crate::sql::analysis::*;
 use super::AnalyzerContext;
 use super::scope::AnalyzerScope;
 
+/// Take the outer SELECT's FROM relation, or synthesize a single-row
+/// "dummy" relation when the SELECT has no FROM clause.
+///
+/// A SELECT whose only sources are scalar subqueries (e.g.
+/// `SELECT (SELECT count(*) FROM t1) AS a, (SELECT max(x) FROM t2) AS b`)
+/// arrives here with `from = None`. The rewriter normally turns each
+/// scalar subquery into a CROSS / LEFT OUTER JOIN against the existing
+/// outer FROM; without an outer FROM the join has no left child. Since
+/// SQL semantics for a from-less SELECT are "evaluate the projection
+/// over a single virtual row", we synthesize that single row as
+/// `generate_series(1, 1)` so the join below has a valid left side.
+/// `GenerateSeries` is already in the analyzer's `Relation` vocabulary
+/// and lowers to a simple 1-row source operator.
+fn take_from_or_synthesize_single_row(from: &mut Option<Relation>) -> Relation {
+    from.take().unwrap_or_else(|| {
+        Relation::GenerateSeries(GenerateSeriesRelation {
+            start: 1,
+            end: 1,
+            step: 1,
+            column_name: "__nr_subquery_join_dummy".to_string(),
+            alias: None,
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -206,10 +231,7 @@ impl<'a> AnalyzerContext<'a> {
             (sub_rel, join_cond)
         };
 
-        let current_from = select
-            .from
-            .take()
-            .ok_or("EXISTS subquery rewrite requires a FROM clause")?;
+        let current_from = take_from_or_synthesize_single_row(&mut select.from);
 
         select.from = Some(Relation::Join(Box::new(JoinRelation {
             left: current_from,
@@ -298,10 +320,7 @@ impl<'a> AnalyzerContext<'a> {
             true, // nullable for LEFT OUTER JOIN
         );
 
-        let current_from = select
-            .from
-            .take()
-            .ok_or("IN subquery rewrite requires a FROM clause")?;
+        let current_from = take_from_or_synthesize_single_row(&mut select.from);
 
         if inside_or {
             // IN-inside-OR: use LEFT OUTER JOIN, replace placeholder with
@@ -515,10 +534,7 @@ impl<'a> AnalyzerContext<'a> {
                 scalar_nullable,
             );
 
-            let current_from = select
-                .from
-                .take()
-                .ok_or("scalar subquery rewrite requires a FROM clause")?;
+            let current_from = take_from_or_synthesize_single_row(&mut select.from);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
                 left: current_from,
@@ -558,10 +574,7 @@ impl<'a> AnalyzerContext<'a> {
                 scalar_col.nullable,
             );
 
-            let current_from = select
-                .from
-                .take()
-                .ok_or("scalar subquery rewrite requires a FROM clause")?;
+            let current_from = take_from_or_synthesize_single_row(&mut select.from);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
                 left: current_from,
