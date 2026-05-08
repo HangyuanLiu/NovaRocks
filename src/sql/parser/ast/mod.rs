@@ -3,6 +3,8 @@
 pub mod iceberg_ref;
 pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
+use crate::sql::catalog::LegacyRangePartition;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateCatalogStmt {
     pub name: String,
@@ -18,6 +20,7 @@ pub(crate) struct CreateDatabaseStmt {
 pub(crate) struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
+    pub legacy_range_partitions: Vec<LegacyRangePartition>,
     /// Present when the SQL was `CREATE TABLE ... AS <select>`. Schema and
     /// (optionally) partition spec are inferred from the query at engine
     /// time. `None` for plain `CREATE TABLE` (the existing path).

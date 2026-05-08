@@ -1703,6 +1703,7 @@ fn infer_scalar_function_return_type(
         | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
+        "array_generate" => Ok(infer_array_generate_return_type(arg_types)),
         "__array_element_at" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),
             _ => Ok(DataType::Null),
@@ -1770,6 +1771,30 @@ fn infer_scalar_function_return_type(
 
         _ => Err(format!("unknown scalar function: {name}")),
     }
+}
+
+fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {
+    let is_datetime = arg_types.iter().any(|ty| {
+        matches!(
+            ty,
+            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
+        )
+    });
+    let item_type = if is_datetime {
+        arg_types
+            .iter()
+            .find_map(|ty| match ty {
+                DataType::Date32 => Some(DataType::Date32),
+                DataType::Timestamp(unit, tz) => Some(DataType::Timestamp(*unit, tz.clone())),
+                _ => None,
+            })
+            .unwrap_or(DataType::Date32)
+    } else {
+        DataType::Int64
+    };
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item", item_type, true,
+    )))
 }
 
 fn infer_struct_constructor_return_type(arg_types: &[DataType]) -> DataType {

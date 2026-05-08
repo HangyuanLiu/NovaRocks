@@ -53,10 +53,11 @@ use self::statement::{
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
-    looks_like_alter_partition_column, looks_like_alter_table_expire_snapshots,
-    looks_like_alter_table_optimize, looks_like_alter_table_remove_orphan_files,
-    looks_like_alter_table_rewrite_manifests, looks_like_show_alter_table_optimize,
+    looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
+    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
+    looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
+    looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
+    looks_like_show_alter_table_optimize, parse_add_legacy_range_partition_sql,
     parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
     parse_alter_table_expire_snapshots_sql, parse_alter_table_optimize_sql,
     parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
@@ -77,7 +78,8 @@ pub struct StandaloneOptions {
 }
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-pub use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+use crate::sql::catalog::LegacyRangePartition;
+pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
 
 fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {
     static ENGINE: OnceLock<StandaloneNovaRocks> = OnceLock::new();
@@ -473,7 +475,13 @@ impl StandaloneSession {
         };
         use sqlparser::ast as sqlast;
 
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let mut normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        if looks_like_add_legacy_range_partition(&normalized) {
+            let stmt = parse_add_legacy_range_partition_sql(&normalized)?;
+            return self.handle_add_legacy_range_partition(stmt, current_catalog, current_database);
+        }
+        normalized =
+            rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         if looks_like_show_alter_table_optimize(&normalized) {
             let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
             return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
@@ -897,6 +905,44 @@ impl StandaloneSession {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
     }
 
+    fn handle_add_legacy_range_partition(
+        &self,
+        stmt: crate::engine::statement::AlterLegacyRangePartitionStmt,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &stmt.table,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name == "iceberg" {
+            return Err("ALTER TABLE ADD PARTITION only supports standalone managed tables".into());
+        }
+        let mut catalog = self
+            .inner
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        let table_def = catalog.get(&target.namespace, &target.table)?;
+        let mut partition = stmt.partition;
+        if partition.column.is_empty() {
+            partition.column = table_def
+                .columns
+                .first()
+                .map(|column| column.name.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "cannot infer range partition column for empty table schema {}.{}",
+                        target.namespace, target.table
+                    )
+                })?;
+        }
+        catalog.add_legacy_range_partition(&target.namespace, &target.table, partition)?;
+        Ok(StatementResult::Ok)
+    }
+
     fn handle_alter_table_optimize(
         &self,
         stmt: crate::engine::statement::AlterTableOptimizeStmt,
@@ -1080,6 +1126,15 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         let stmt = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &stmt.table,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return self.handle_local_schema_change(stmt, target);
+        }
         crate::connector::iceberg::catalog::alter_table_schema(
             &self.inner,
             &stmt,
@@ -1087,6 +1142,24 @@ impl StandaloneSession {
             current_database,
         )?;
         Ok(StatementResult::Ok)
+    }
+
+    fn handle_local_schema_change(
+        &self,
+        stmt: crate::engine::statement::AlterIcebergSchemaStmt,
+        target: crate::engine::backend_resolver::TargetBackend,
+    ) -> Result<StatementResult, String> {
+        match stmt.change {
+            crate::engine::statement::IcebergSchemaChange::RenameColumn { path, .. }
+                if path.segments().len() == 1 =>
+            {
+                Ok(StatementResult::Ok)
+            }
+            _ => Err(format!(
+                "ALTER TABLE schema change only supports top-level RENAME COLUMN for `{}` tables",
+                target.backend_name
+            )),
+        }
     }
 
     /// Handle ALTER TABLE ... ADD/DROP PARTITION COLUMN ...
@@ -2061,6 +2134,240 @@ fn execute_plan(
 // ---------------------------------------------------------------------------
 // EXPLAIN COSTS helper
 // ---------------------------------------------------------------------------
+
+fn rewrite_legacy_partition_references(
+    state: &Arc<StandaloneState>,
+    sql: &str,
+    current_database: &str,
+) -> Result<String, String> {
+    let sql = rewrite_insert_partition_target(sql);
+    rewrite_select_partition_table_refs(state, &sql, current_database)
+}
+
+fn rewrite_insert_partition_target(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let prefix_len = sql.len() - trimmed.len();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("insert into ") || lower.starts_with("insert overwrite ")) {
+        return sql.to_string();
+    }
+    let Some(marker) = find_partition_marker(trimmed, 0) else {
+        return sql.to_string();
+    };
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(&sql[..prefix_len + marker.marker_start]);
+    rewritten.push_str(&trimmed[marker.end..]);
+    rewritten
+}
+
+fn rewrite_select_partition_table_refs(
+    state: &Arc<StandaloneState>,
+    sql: &str,
+    current_database: &str,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    while let Some(marker) = find_partition_marker(sql, cursor) {
+        let table_end = marker.marker_start;
+        let table_end_trimmed = trim_ascii_whitespace_end(sql, table_end);
+        let table_start = find_table_ref_start(sql, table_end_trimmed);
+        if table_start == table_end_trimmed {
+            cursor = marker.end;
+            continue;
+        }
+        let table_ref = sql[table_start..table_end_trimmed].trim();
+        let Some((database, table, alias)) =
+            resolve_partition_table_ref(table_ref, current_database)
+        else {
+            cursor = marker.end;
+            continue;
+        };
+        let partition = {
+            let catalog = state.catalog.read().expect("standalone catalog read lock");
+            catalog
+                .get_legacy_range_partition(&database, &table, &marker.partition_name)?
+                .ok_or_else(|| {
+                    format!(
+                        "unknown partition `{}` for table {}.{}",
+                        marker.partition_name, database, table
+                    )
+                })?
+        };
+        out.push_str(&sql[cursor..table_start]);
+        out.push_str(&legacy_partition_subquery(table_ref, &alias, &partition));
+        cursor = marker.end;
+    }
+    out.push_str(&sql[cursor..]);
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+struct PartitionMarker {
+    marker_start: usize,
+    end: usize,
+    partition_name: String,
+}
+
+fn find_partition_marker(sql: &str, start: usize) -> Option<PartitionMarker> {
+    let bytes = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    let mut cursor = start;
+    while let Some(rel) = lower[cursor..].find("partition") {
+        let partition_start = cursor + rel;
+        let partition_end = partition_start + "partition".len();
+        if is_identifier_byte(bytes.get(partition_start.wrapping_sub(1)).copied())
+            || is_identifier_byte(bytes.get(partition_end).copied())
+        {
+            cursor = partition_end;
+            continue;
+        }
+        let paren = skip_ascii_whitespace(bytes, partition_end);
+        if bytes.get(paren) != Some(&b'(') {
+            cursor = partition_end;
+            continue;
+        }
+        let marker_start =
+            temporary_partition_marker_start(sql, partition_start).unwrap_or(partition_start);
+        let close = find_matching_paren(sql, paren)?;
+        let partition_name = sql[paren + 1..close]
+            .trim()
+            .trim_matches('`')
+            .to_ascii_lowercase();
+        return Some(PartitionMarker {
+            marker_start,
+            end: close + 1,
+            partition_name,
+        });
+    }
+    None
+}
+
+fn temporary_partition_marker_start(sql: &str, partition_start: usize) -> Option<usize> {
+    let before_partition = trim_ascii_whitespace_end(sql, partition_start);
+    let temp_end = before_partition;
+    let temp_start = find_word_start(sql, temp_end);
+    if temp_start == temp_end {
+        return None;
+    }
+    if sql[temp_start..temp_end].eq_ignore_ascii_case("temporary") {
+        Some(temp_start)
+    } else {
+        None
+    }
+}
+
+fn legacy_partition_subquery(
+    table_ref: &str,
+    alias: &str,
+    partition: &LegacyRangePartition,
+) -> String {
+    format!(
+        "(SELECT * FROM {table_ref} WHERE {column} >= {lower} AND {column} < {upper}) AS {alias}",
+        column = partition.column,
+        lower = partition.lower_sql,
+        upper = partition.upper_sql
+    )
+}
+
+fn resolve_partition_table_ref(
+    table_ref: &str,
+    current_database: &str,
+) -> Option<(String, String, String)> {
+    let parts = table_ref
+        .split('.')
+        .map(|part| part.trim().trim_matches('`').to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let (database, table) = match parts.as_slice() {
+        [table] => (current_database.to_ascii_lowercase(), table.clone()),
+        [database, table] => (database.clone(), table.clone()),
+        [.., database, table] => (database.clone(), table.clone()),
+        _ => return None,
+    };
+    Some((database, table.clone(), table))
+}
+
+fn trim_ascii_whitespace_end(sql: &str, mut idx: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
+        idx -= 1;
+    }
+    idx
+}
+
+fn find_table_ref_start(sql: &str, mut idx: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while idx > 0 {
+        let b = bytes[idx - 1];
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'`') {
+            idx -= 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+fn find_word_start(sql: &str, mut idx: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while idx > 0 && is_identifier_byte(Some(bytes[idx - 1])) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
+}
+
+fn is_identifier_byte(byte: Option<u8>) -> bool {
+    byte.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+}
+
+fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = open;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'"' {
+                in_double = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
 
 fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
     let trimmed = sql.trim_start();

@@ -1003,7 +1003,7 @@ fn collect_set_user_variable_assignments(
     Ok(())
 }
 
-fn substitute_user_variables(
+pub(crate) fn substitute_user_variables(
     sql: &str,
     assignments: &[(String, String)],
 ) -> Result<String, String> {
@@ -1133,20 +1133,29 @@ fn rewrite_group_concat_inner(inner: &str) -> Result<String, String> {
         let separator_start = separator_pos + "separator".len();
         let before_separator = inner[..separator_pos].trim_end();
         let separator_expr = inner[separator_start..].trim();
-        if before_separator.is_empty() || separator_expr.is_empty() {
+        if separator_expr.is_empty() {
             return Err("invalid GROUP_CONCAT separator syntax".to_string());
+        }
+        if before_separator.is_empty() {
+            return Err(format!(
+                "No viable statement for input 'group_concat(separator {separator_expr}'."
+            ));
         }
         if let Some(order_by_pos) = find_top_level_order_by(before_separator) {
             let args = before_separator[..order_by_pos].trim_end();
             let order_by = before_separator[order_by_pos..].trim_start();
-            Ok(format!("{args}, {separator_expr} {order_by}"))
+            if args.is_empty() || args.eq_ignore_ascii_case("distinct") {
+                Ok(inner.to_string())
+            } else {
+                Ok(format!("{args}, {separator_expr} {order_by}"))
+            }
         } else {
             Ok(format!("{before_separator}, {separator_expr}"))
         }
     } else if let Some(order_by_pos) = find_top_level_order_by(inner) {
         let args = inner[..order_by_pos].trim_end();
         let order_by = inner[order_by_pos..].trim_start();
-        if args.is_empty() {
+        if args.is_empty() || args.eq_ignore_ascii_case("distinct") {
             Ok(inner.to_string())
         } else {
             Ok(format!("{args}, ',' {order_by}"))

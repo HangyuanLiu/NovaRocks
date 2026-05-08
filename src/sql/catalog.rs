@@ -12,6 +12,14 @@ pub struct ColumnDef {
     pub write_default: Option<iceberg::spec::Literal>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyRangePartition {
+    pub name: String,
+    pub column: String,
+    pub lower_sql: String,
+    pub upper_sql: String,
+}
+
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
 #[derive(Clone, Debug)]
 pub struct IcebergColumnStats {
@@ -193,6 +201,15 @@ pub struct TableDef {
 /// Catalog abstraction for SQL analysis.
 pub trait CatalogProvider {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String>;
+
+    fn get_legacy_range_partition(
+        &self,
+        _database: &str,
+        _table: &str,
+        _partition: &str,
+    ) -> Result<Option<LegacyRangePartition>, String> {
+        Ok(None)
+    }
 
     fn get_physical_layout(
         &self,

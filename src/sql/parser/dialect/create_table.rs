@@ -5,6 +5,7 @@ use sqlparser::tokenizer::Token;
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
 use crate::engine::catalog::normalize_identifier;
 use crate::sql::analyzer::iceberg_ref::split_ref_suffix;
+use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
     SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
@@ -57,6 +58,7 @@ pub(crate) fn parse_create_table_statement(
     let mut key_desc = None;
     let mut bucket_count = None;
     let mut partition_fields = Vec::new();
+    let mut legacy_range_partitions = Vec::new();
     let mut parsed_iceberg_partition_clause = false;
     let mut properties = Vec::new();
     let mut as_select: Option<Box<sqlparser::ast::Query>> = None;
@@ -90,6 +92,8 @@ pub(crate) fn parse_create_table_statement(
             parser.next_token(); // string
         } else if peek_word_eq(parser, 0, "PARTITION") {
             if is_legacy_partition_clause(parser) {
+                legacy_range_partitions.extend(parse_legacy_range_partitions_or_skip(parser)?);
+            } else if key_desc.is_some() || _engine.as_deref() == Some("olap") {
                 skip_until_keyword_or_eof(
                     parser,
                     &["DISTRIBUTED", "ORDER", "PROPERTIES", "TBLPROPERTIES"],
@@ -174,6 +178,7 @@ pub(crate) fn parse_create_table_statement(
     Ok(CreateTableStmt {
         name,
         kind,
+        legacy_range_partitions,
         as_select,
         if_not_exists,
     })
@@ -199,6 +204,122 @@ fn is_legacy_partition_clause(parser: &Parser<'_>) -> bool {
                     "range" | "list" | "date_trunc" | "time_slice"
                 )
     )
+}
+
+fn parse_legacy_range_partitions_or_skip(
+    parser: &mut Parser<'_>,
+) -> Result<Vec<LegacyRangePartition>, String> {
+    if !peek_word_eq(parser, 0, "PARTITION")
+        || !peek_word_eq(parser, 1, "BY")
+        || !peek_word_eq(parser, 2, "RANGE")
+    {
+        skip_until_keyword_or_eof(
+            parser,
+            &["DISTRIBUTED", "ORDER", "PROPERTIES", "TBLPROPERTIES"],
+        );
+        return Ok(Vec::new());
+    }
+
+    parser.next_token(); // PARTITION
+    parser
+        .expect_keyword(Keyword::BY)
+        .map_err(|e| format!("expected BY after PARTITION: {e}"))?;
+    expect_word(parser, "RANGE")?;
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| format!("expected ( after PARTITION BY RANGE: {e}"))?;
+    let column = parser
+        .parse_identifier()
+        .map_err(|e| format!("expected RANGE partition column: {e}"))?
+        .value;
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| format!("expected ) after RANGE partition column: {e}"))?;
+
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| format!("expected partition list after RANGE column: {e}"))?;
+    let mut partitions = Vec::new();
+    loop {
+        if parser.consume_token(&Token::RParen) {
+            break;
+        }
+        expect_word(parser, "PARTITION")?;
+        let name = parser
+            .parse_identifier()
+            .map_err(|e| format!("expected partition name: {e}"))?
+            .value;
+        expect_word(parser, "VALUES")?;
+        if parser.peek_token_ref().token != Token::LBracket {
+            skip_until_keyword_or_eof(
+                parser,
+                &["DISTRIBUTED", "ORDER", "PROPERTIES", "TBLPROPERTIES"],
+            );
+            return Ok(Vec::new());
+        }
+        let (lower_sql, upper_sql) = parse_legacy_range_values(parser)?;
+        partitions.push(LegacyRangePartition {
+            name,
+            column: column.clone(),
+            lower_sql,
+            upper_sql,
+        });
+        if parser.consume_token(&Token::Comma) {
+            continue;
+        }
+        parser
+            .expect_token(&Token::RParen)
+            .map_err(|e| format!("expected , or ) after range partition: {e}"))?;
+        break;
+    }
+    Ok(partitions)
+}
+
+pub(crate) fn parse_legacy_range_values(
+    parser: &mut Parser<'_>,
+) -> Result<(String, String), String> {
+    parser
+        .expect_token(&Token::LBracket)
+        .map_err(|e| format!("expected [ before range partition lower bound: {e}"))?;
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| format!("expected ( before range partition lower bound: {e}"))?;
+    let lower = parser
+        .parse_expr()
+        .map_err(|e| format!("parse range partition lower bound: {e}"))?;
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| format!("expected ) after range partition lower bound: {e}"))?;
+    parser
+        .expect_token(&Token::Comma)
+        .map_err(|e| format!("expected , between range partition bounds: {e}"))?;
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| format!("expected ( before range partition upper bound: {e}"))?;
+    let upper = parser
+        .parse_expr()
+        .map_err(|e| format!("parse range partition upper bound: {e}"))?;
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| format!("expected ) after range partition upper bound: {e}"))?;
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| format!("expected ) after range partition interval: {e}"))?;
+    Ok((partition_bound_sql(&lower), partition_bound_sql(&upper)))
+}
+
+fn partition_bound_sql(expr: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+            Value::Number(n, _) => n.clone(),
+            _ => expr.to_string(),
+        },
+        _ => expr.to_string(),
+    }
 }
 
 fn ensure_partition_clause_boundary(parser: &mut Parser<'_>) -> Result<(), String> {
@@ -927,6 +1048,44 @@ mod tests {
         let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
         let CreateTableKind::Iceberg { bucket_count, .. } = stmt.kind;
         assert_eq!(bucket_count, Some(3));
+    }
+
+    #[test]
+    fn create_table_parser_accepts_olap_random_distribution_after_partition() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                "create table tbl (k int, v int) engine=olap duplicate key(k, v) \
+                 partition by (`k`) distributed by random properties('replication_num'='1')",
+            )
+            .expect("parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+        let CreateTableKind::Iceberg {
+            partition_fields, ..
+        } = stmt.kind;
+        assert!(partition_fields.is_empty());
+    }
+
+    #[test]
+    fn create_table_parser_captures_legacy_range_partitions() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                r#"create table tbl (c0 date, c1 int) duplicate key(c0)
+                   partition by range(c0) (
+                     partition p202401 values [("2024-01-01"), ("2024-02-01")),
+                     partition p202402 values [("2024-02-01"), ("2024-03-01"))
+                   )
+                   distributed by hash(c1) buckets 3"#,
+            )
+            .expect("parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+
+        assert_eq!(stmt.legacy_range_partitions.len(), 2);
+        assert_eq!(stmt.legacy_range_partitions[0].name, "p202401");
+        assert_eq!(stmt.legacy_range_partitions[0].column, "c0");
+        assert_eq!(stmt.legacy_range_partitions[0].lower_sql, "'2024-01-01'");
+        assert_eq!(stmt.legacy_range_partitions[0].upper_sql, "'2024-02-01'");
     }
 
     #[test]

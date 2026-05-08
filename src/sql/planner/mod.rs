@@ -8,6 +8,7 @@ pub(crate) mod plan;
 
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
+use crate::sql::codegen::helpers::typed_expr_display_name;
 use plan::*;
 
 // ---------------------------------------------------------------------------
@@ -906,11 +907,12 @@ fn rewrite_window_calls(
 /// - project items: the full SELECT list (may reference group-by columns and agg results)
 fn split_projection_for_aggregate(
     projection: &[ProjectItem],
-    _group_by: &[TypedExpr],
+    group_by: &[TypedExpr],
     having: Option<&TypedExpr>,
 ) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
     let mut agg_calls = Vec::new();
     let mut output_columns = Vec::new();
+    let mut project_items = Vec::with_capacity(projection.len());
 
     // Collect aggregate calls from projection
     for item in projection {
@@ -920,6 +922,10 @@ fn split_projection_for_aggregate(
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
         });
+        project_items.push(ProjectItem {
+            expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
+            output_name: item.output_name.clone(),
+        });
     }
 
     // Also collect aggregate calls from HAVING clause so the aggregate node
@@ -928,9 +934,24 @@ fn split_projection_for_aggregate(
         collect_aggregates(having_expr, &mut agg_calls);
     }
 
-    // The projection items remain as-is; the thrift emitter will handle
-    // mapping them to the aggregate output.
-    (projection.to_vec(), agg_calls, output_columns)
+    (project_items, agg_calls, output_columns)
+}
+
+fn rewrite_exact_group_by_expr_ref(expr: &TypedExpr, group_by: &[TypedExpr]) -> TypedExpr {
+    let expr_name = typed_expr_display_name(expr);
+    for gb in group_by {
+        if typed_expr_display_name(gb) == expr_name {
+            return TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: None,
+                    column: expr_name,
+                },
+                data_type: gb.data_type.clone(),
+                nullable: gb.nullable,
+            };
+        }
+    }
+    expr.clone()
 }
 
 /// Recursively collect AggregateCall from a TypedExpr tree.
@@ -1460,6 +1481,29 @@ mod tests {
             },
             other => panic!("expected Project root, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_by_alias_expression_projects_aggregate_group_key() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey % 2 AS g, count(*) FROM orders GROUP BY g ORDER BY g",
+        )
+        .expect("planner should succeed");
+
+        let LogicalPlan::Sort(sort) = plan else {
+            panic!("expected Sort root");
+        };
+        let LogicalPlan::Project(project) = *sort.input else {
+            panic!("expected Project under Sort");
+        };
+        let ExprKind::ColumnRef { qualifier, column } = &project.items[0].expr.kind else {
+            panic!(
+                "expected group key projection to be a ColumnRef, got {:?}",
+                project.items[0].expr
+            );
+        };
+        assert!(qualifier.is_none());
+        assert_eq!(column, "o_orderkey % 2");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
+use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
@@ -657,6 +658,17 @@ impl Rule for JoinToNestLoop {
 
 pub(crate) struct AggToHashAgg;
 
+fn aggregate_group_key_output_ref(expr: &TypedExpr) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            qualifier: None,
+            column: typed_expr_display_name(expr),
+        },
+        data_type: expr.data_type.clone(),
+        nullable: expr.nullable,
+    }
+}
+
 impl Rule for AggToHashAgg {
     fn name(&self) -> &str {
         "AggToHashAgg"
@@ -704,11 +716,16 @@ impl Rule for AggToHashAgg {
             children: expr.children.clone(),
         };
         let local_group_id = memo.new_group(local_mexpr);
+        let global_group_by = op
+            .group_by
+            .iter()
+            .map(aggregate_group_key_output_ref)
+            .collect();
 
         let global = NewExpr {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Global,
-                group_by: op.group_by.clone(),
+                group_by: global_group_by,
                 aggregates: op.aggregates.clone(),
                 output_columns: op.output_columns.clone(),
                 is_merge: vec![true; op.aggregates.len()],
@@ -1694,6 +1711,22 @@ mod two_phase_agg_tests {
         }
     }
 
+    fn modulo(left: TypedExpr, right: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Mod,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(right)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
     #[test]
     fn agg_to_hash_agg_produces_single_and_two_phase() {
         let mut memo = Memo::new();
@@ -1821,5 +1854,74 @@ mod two_phase_agg_tests {
             }
             other => panic!("expected PhysicalHashAggregate(Single), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn agg_to_hash_agg_global_reads_local_group_key_slots() {
+        let mut memo = Memo::new();
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+        let group_expr = modulo(col("city"), 2);
+
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp {
+                group_by: vec![group_expr.clone()],
+                aggregates: vec![AggregateCall {
+                    name: "min".into(),
+                    args: vec![col("amount")],
+                    distinct: false,
+                    result_type: DataType::Int32,
+                    order_by: vec![],
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        name: "city % 2".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "min(amount)".into(),
+                        data_type: DataType::Int32,
+                        nullable: true,
+                    },
+                ],
+            }),
+            children: vec![child_group],
+        };
+
+        let rule = AggToHashAgg;
+        let out = rule.apply(&expr, &mut memo);
+
+        let global = match &out[1].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected PhysicalHashAggregate(Global), got {:?}", other),
+        };
+        assert!(matches!(global.mode, AggMode::Global));
+        match &global.group_by[0].kind {
+            ExprKind::ColumnRef { qualifier, column } => {
+                assert!(qualifier.is_none());
+                assert_eq!(column, "city % 2");
+            }
+            other => panic!("expected Global group key to read Local output slot, got {other:?}"),
+        }
+
+        let local_group_id = out[1].children[0];
+        let local_group = &memo.groups[local_group_id];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected PhysicalHashAggregate(Local), got {:?}", other),
+        };
+        assert!(
+            matches!(local.group_by[0].kind, ExprKind::BinaryOp { .. }),
+            "Local aggregate should keep the original expression group key"
+        );
     }
 }

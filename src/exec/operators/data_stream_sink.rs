@@ -67,10 +67,10 @@ fn should_log_need_input() -> bool {
 mod data_stream_sink_hash_partition {
     use super::{Chunk, ExprArena, ExprId};
     use arrow::array::{
-        Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        ListArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow::compute::cast;
     use arrow::compute::take;
@@ -245,6 +245,34 @@ mod data_stream_sink_hash_partition {
                     } else {
                         let val = arr.value(i);
                         *hash_value ^= fnv_hash_value(val.as_bytes());
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    }
+                }
+            }
+            DataType::Binary => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if arr.is_null(i) {
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    } else {
+                        *hash_value ^= fnv_hash_value(arr.value(i));
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if arr.is_null(i) {
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
+                    } else {
+                        *hash_value ^= fnv_hash_value(arr.value(i));
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
@@ -537,6 +565,28 @@ mod data_stream_sink_hash_partition {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         *hash_value = crc32_hash_value(val.as_bytes());
+                    }
+                }
+            }
+            DataType::Binary => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if !arr.is_null(i) {
+                        *hash_value = crc32_hash_value(arr.value(i));
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
+                    if !arr.is_null(i) {
+                        *hash_value = crc32_hash_value(arr.value(i));
                     }
                 }
             }
@@ -1968,6 +2018,8 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::BinaryArray;
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatchOptions;
     use std::collections::BTreeMap;
 
@@ -2080,5 +2132,33 @@ mod tests {
         assert!(op.has_pending_data());
         assert!(!op.should_flush_pending_dest(0, false));
         assert!(op.should_flush_pending_dest(0, true));
+    }
+
+    #[test]
+    fn hash_partition_accepts_binary_arrays() {
+        let array = Arc::new(BinaryArray::from(vec![
+            Some(b"a".as_slice()),
+            Some(b"b".as_slice()),
+            None,
+        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Binary, true)]));
+        let batch = arrow::array::RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[crate::common::ids::SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+
+        let partitions =
+            partition_chunk_by_hash_arrays(&chunk, &[array], 2, false).expect("partition");
+
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|chunk| chunk.batch.num_rows())
+                .sum::<usize>(),
+            3
+        );
     }
 }
