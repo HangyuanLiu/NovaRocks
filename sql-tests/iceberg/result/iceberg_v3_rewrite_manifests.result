@@ -1,0 +1,80 @@
+-- query 7
+n
+5
+
+-- query 9
+id	v
+1	a
+2	b
+3	c
+4	d
+5	e
+
+-- query 12
+n
+3
+
+-- query 14
+n
+3
+
+-- query 16
+n
+0
+
+-- query 18
+n
+0
+
+-- query 24
+id	v
+1	p
+2	q
+3	r
+
+-- query 29
+id	_row_id
+10	0
+20	1
+30	2
+
+-- query 31
+id	_row_id
+10	0
+20	1
+30	2
+
+-- query 40
+id	v
+1	a
+3	c
+4	d
+5	e
+
+-- query 42
+id	v
+1	a
+3	c
+4	d
+5	e
+
+-- query 49
+id	v
+1	first
+2	second
+3	third
+4	fourth
+
+-- query 50
+n
+4
+
+-- query 57
+id	v
+1	one
+2	two
+3	three
+
+-- query 58
+n
+3

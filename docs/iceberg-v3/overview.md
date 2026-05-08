@@ -19,13 +19,13 @@
 - ✅ 需要在 Iceberg 上跑 INSERT / DELETE / UPDATE / MERGE INTO 全套 DML
 - ✅ 需要时间旅行（snapshot id / timestamp / branch / tag）
 - ✅ 需要在 Iceberg 上做物化视图，且关心 IVM（增量刷新）能跟上基表的 MERGE / UPDATE 变化
+- ✅ 已支持 EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS（同步执行，v2+v3）
 
 ## 当前不适合的场景
 
 - ❌ 需要走 Glue / HMS / Nessie / JDBC catalog（仅 Hadoop / In-memory / REST 基础）
 - ❌ 需要写 Azure / GCS / 腾讯 COS / 华为 OBS（仅本地 / HDFS / S3 / OSS）
 - ❌ 需要 V1 表读 / V1→V2 / V2→V3 升级
-- ❌ 需要 EXPIRE SNAPSHOTS / REMOVE ORPHAN / REWRITE MANIFESTS 之类的 snapshot 生命周期治理
 - ❌ 需要写 Iceberg variant / geometry / geography（variant 仅读）
 - ❌ 需要 MV 自动 query rewrite（基表查询自动命中物化视图，仍在路线图上）
 

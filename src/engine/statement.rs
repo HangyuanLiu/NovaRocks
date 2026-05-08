@@ -1178,6 +1178,31 @@ pub(crate) struct AlterTableOptimizeStmt {
     pub(crate) table: ObjectName,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableExpireSnapshotsStmt {
+    pub(crate) table: ObjectName,
+    /// epoch-ms threshold; expire only snapshots with timestamp_ms < this.
+    /// Mutually optional with retain_last but at least one must be Some
+    /// (parser enforces).
+    pub(crate) older_than_ms: Option<i64>,
+    /// Retain at least N most-recent snapshots in the main ancestor chain.
+    /// Must be >= 1 if Some (parser enforces).
+    pub(crate) retain_last: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableRemoveOrphanFilesStmt {
+    pub(crate) table: ObjectName,
+    /// Mandatory (parser enforces). epoch-ms threshold; only files with
+    /// last_modified_ms < this are eligible for removal.
+    pub(crate) older_than_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AlterTableRewriteManifestsStmt {
+    pub(crate) table: ObjectName,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShowAlterTableOptimizeStmt {
     pub(crate) catalog: Option<String>,
@@ -1347,6 +1372,333 @@ pub(crate) fn parse_alter_table_optimize_sql(sql: &str) -> Result<AlterTableOpti
         }
     })?;
     Ok(AlterTableOptimizeStmt { table })
+}
+
+/// Detect `ALTER TABLE <name> REWRITE MANIFESTS` without full parsing.
+///
+/// Used for fast early-routing in `execute_in_context` before dispatching
+/// to `parse_alter_table_rewrite_manifests_sql`.
+pub(crate) fn looks_like_alter_table_rewrite_manifests(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "REWRITE") && peek_token_word_eq_at(&parser, 1, "MANIFESTS")
+}
+
+/// Parse `ALTER TABLE <name> REWRITE MANIFESTS [;]`.
+///
+/// Rejects:
+/// * Table names whose last part starts with `branch_` or `tag_` AND there are
+///   at least 2 parts (spec §1.1: REWRITE MANIFESTS is table-level only).
+/// * Trailing tokens after MANIFESTS (excluding an optional final semicolon).
+pub(crate) fn parse_alter_table_rewrite_manifests_sql(
+    sql: &str,
+) -> Result<AlterTableRewriteManifestsStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE REWRITE MANIFESTS: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject branch / tag suffix per spec §1.1.
+    // Rule: the LAST part starts with `branch_` or `tag_` AND there are ≥ 2 parts.
+    // (A single-part table named `branch_x` is a legitimate table name, not a suffix.)
+    if table.parts.len() >= 2 {
+        if let Some(last) = table.parts.last() {
+            if last.starts_with("branch_") || last.starts_with("tag_") {
+                return Err(format!(
+                    "REWRITE MANIFESTS does not support branch/tag suffix on table name: {}",
+                    table.parts.join(".")
+                ));
+            }
+        }
+    }
+
+    expect_word(&mut parser, "REWRITE")?;
+    expect_word(&mut parser, "MANIFESTS")?;
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|err| {
+        format!("unsupported trailing ALTER TABLE REWRITE MANIFESTS tokens: {err}")
+    })?;
+    Ok(AlterTableRewriteManifestsStmt { table })
+}
+
+/// Detect `ALTER TABLE <name> EXPIRE SNAPSHOTS [OLDER THAN ...] [RETAIN LAST n]`
+/// without full parsing. Used for fast early-routing before dispatching to
+/// `parse_alter_table_expire_snapshots_sql`.
+pub(crate) fn looks_like_alter_table_expire_snapshots(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "EXPIRE") && peek_token_word_eq_at(&parser, 1, "SNAPSHOTS")
+}
+
+/// Parse `ALTER TABLE <name> EXPIRE SNAPSHOTS [OLDER THAN '<ts>'] [RETAIN LAST <n>] [;]`.
+///
+/// At least one of `OLDER THAN` or `RETAIN LAST` is required (spec §1.1).
+/// Both clauses may appear in either order. `RETAIN LAST 0` is rejected.
+///
+/// Rejects:
+/// * No clauses after SNAPSHOTS.
+/// * `RETAIN LAST 0`.
+/// * Branch/tag suffix (≥2 parts, last starts with `branch_` or `tag_`).
+/// * Duplicate `OLDER THAN` clause.
+/// * Trailing tokens after all clauses (excluding an optional final semicolon).
+pub(crate) fn parse_alter_table_expire_snapshots_sql(
+    sql: &str,
+) -> Result<AlterTableExpireSnapshotsStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE EXPIRE SNAPSHOTS: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject branch / tag suffix per spec §1.1.
+    // Rule: the LAST part starts with `branch_` or `tag_` AND there are ≥ 2 parts.
+    if table.parts.len() >= 2 {
+        if let Some(last) = table.parts.last() {
+            if last.starts_with("branch_") || last.starts_with("tag_") {
+                return Err(format!(
+                    "EXPIRE SNAPSHOTS does not support branch/tag suffix on table name: {}",
+                    table.parts.join(".")
+                ));
+            }
+        }
+    }
+
+    expect_word(&mut parser, "EXPIRE")?;
+    expect_word(&mut parser, "SNAPSHOTS")?;
+
+    // Parse optional clauses: OLDER THAN '<ts>' and RETAIN LAST <n>.
+    // Both optional but at least one required. Order doesn't matter.
+    let mut older_than_ms: Option<i64> = None;
+    let mut retain_last: Option<u32> = None;
+    loop {
+        if peek_token_word_eq(&parser, "OLDER") {
+            if older_than_ms.is_some() {
+                return Err("EXPIRE SNAPSHOTS: duplicate OLDER THAN clause".to_string());
+            }
+            expect_word(&mut parser, "OLDER")?;
+            expect_word(&mut parser, "THAN")?;
+            older_than_ms = Some(parse_expire_timestamp_ms(&mut parser)?);
+            continue;
+        }
+        if peek_token_word_eq(&parser, "RETAIN") {
+            if retain_last.is_some() {
+                return Err("EXPIRE SNAPSHOTS: duplicate RETAIN LAST clause".to_string());
+            }
+            expect_word(&mut parser, "RETAIN")?;
+            expect_word(&mut parser, "LAST")?;
+            let n = parse_expire_uint(&mut parser)?;
+            if n == 0 {
+                return Err("EXPIRE SNAPSHOTS: RETAIN LAST must be >= 1".to_string());
+            }
+            retain_last = Some(
+                n.try_into()
+                    .map_err(|_| "EXPIRE SNAPSHOTS: RETAIN LAST value too large".to_string())?,
+            );
+            continue;
+        }
+        break;
+    }
+    if older_than_ms.is_none() && retain_last.is_none() {
+        return Err(
+            "EXPIRE SNAPSHOTS requires at least OLDER THAN or RETAIN LAST clause".to_string(),
+        );
+    }
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|e| format!("unsupported trailing tokens: {e}"))?;
+    Ok(AlterTableExpireSnapshotsStmt {
+        table,
+        older_than_ms,
+        retain_last,
+    })
+}
+
+/// Parse a timestamp for OLDER THAN: accepts `'YYYY-MM-DD HH:MM:SS'`,
+/// `'<RFC 3339>'`, or a bare epoch-ms integer.
+///
+/// Duplicates the logic from `sql::analyzer::iceberg_ref::parse_timestamp_string`
+/// (which is private) to avoid introducing a cross-module public API for a
+/// one-off use. Both use the same chrono parsing strategy.
+fn parse_expire_timestamp_ms(parser: &mut Parser<'_>) -> Result<i64, String> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    let tok = parser.next_token();
+    match tok.token {
+        Token::SingleQuotedString(s) => {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+                return Ok(dt.with_timezone(&Utc).timestamp_millis());
+            }
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
+                return Ok(ndt.and_utc().timestamp_millis());
+            }
+            Err(format!(
+                "EXPIRE SNAPSHOTS: cannot parse timestamp '{s}'; \
+                 expected RFC 3339 (e.g. '2026-04-01T00:00:00Z') \
+                 or 'YYYY-MM-DD HH:MM:SS'"
+            ))
+        }
+        Token::Number(n, _) => n
+            .parse::<i64>()
+            .map_err(|e| format!("EXPIRE SNAPSHOTS: invalid epoch-ms integer '{n}': {e}")),
+        other => Err(format!(
+            "EXPIRE SNAPSHOTS: expected timestamp literal (quoted string or integer), got {other}"
+        )),
+    }
+}
+
+/// Parse a non-negative integer token (for RETAIN LAST <n>).
+fn parse_expire_uint(parser: &mut Parser<'_>) -> Result<u64, String> {
+    let tok = parser.next_token();
+    match tok.token {
+        Token::Number(n, _) => n
+            .parse::<u64>()
+            .map_err(|e| format!("EXPIRE SNAPSHOTS: invalid RETAIN LAST value '{n}': {e}")),
+        other => Err(format!(
+            "EXPIRE SNAPSHOTS: expected integer for RETAIN LAST, got {other}"
+        )),
+    }
+}
+
+/// Detector for `ALTER TABLE x REMOVE ORPHAN FILES [OLDER THAN ...]`.
+///
+/// Used by `mod.rs::execute_in_context` to route before generic sqlparser-rs.
+pub(crate) fn looks_like_alter_table_remove_orphan_files(sql: &str) -> bool {
+    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+        return false;
+    };
+    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
+        return false;
+    };
+    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
+        return false;
+    }
+    if parser.parse_object_name(false).is_err() {
+        return false;
+    }
+    peek_token_word_eq(&parser, "REMOVE")
+        && peek_token_word_eq_at(&parser, 1, "ORPHAN")
+        && peek_token_word_eq_at(&parser, 2, "FILES")
+}
+
+/// Parse `ALTER TABLE <name> REMOVE ORPHAN FILES OLDER THAN '<ts>' [;]`.
+///
+/// `OLDER THAN` is mandatory (spec §1.1; unlike EXPIRE SNAPSHOTS which can
+/// use RETAIN LAST instead).
+///
+/// Rejects:
+/// * No `OLDER THAN` clause.
+/// * Branch/tag suffix (≥2 parts, last starts with `branch_` or `tag_`).
+/// * Trailing tokens after the clause.
+pub(crate) fn parse_alter_table_remove_orphan_files_sql(
+    sql: &str,
+) -> Result<AlterTableRemoveOrphanFilesStmt, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse ALTER TABLE REMOVE ORPHAN FILES: {e}"))?;
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| e.to_string())?;
+    let mut table = crate::sql::parser::dialect::convert_object_name(
+        parser.parse_object_name(false).map_err(|e| e.to_string())?,
+    )?;
+    table.parts = table
+        .parts
+        .into_iter()
+        .map(|part| normalize_identifier(&part))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject branch / tag suffix per spec §1.1.
+    if table.parts.len() >= 2 {
+        if let Some(last) = table.parts.last() {
+            if last.starts_with("branch_") || last.starts_with("tag_") {
+                return Err(format!(
+                    "REMOVE ORPHAN FILES does not support branch/tag suffix on table name: {}",
+                    table.parts.join(".")
+                ));
+            }
+        }
+    }
+
+    expect_word(&mut parser, "REMOVE")?;
+    expect_word(&mut parser, "ORPHAN")?;
+    expect_word(&mut parser, "FILES")?;
+
+    // OLDER THAN is mandatory for REMOVE ORPHAN FILES (spec §1.1 / §4.1).
+    if !peek_token_word_eq(&parser, "OLDER") {
+        return Err(
+            "REMOVE ORPHAN FILES requires OLDER THAN clause (e.g. OLDER THAN '2026-01-01')"
+                .to_string(),
+        );
+    }
+    expect_word(&mut parser, "OLDER")?;
+    expect_word(&mut parser, "THAN")?;
+    let older_than_ms = parse_expire_timestamp_ms(&mut parser)?;
+
+    consume_optional_final_semicolon(&mut parser)?;
+    expect_parser_eof(&parser).map_err(|e| format!("unsupported trailing tokens: {e}"))?;
+    Ok(AlterTableRemoveOrphanFilesStmt {
+        table,
+        older_than_ms,
+    })
+}
+
+/// Peek at the token `offset` positions ahead of current position.
+///
+/// offset=0 is the same as `peek_token_word_eq`, offset=1 is one token ahead.
+fn peek_token_word_eq_at(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
+    matches!(
+        &parser.peek_nth_token(offset).token,
+        Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word)
+    )
 }
 
 pub(crate) fn parse_show_alter_table_optimize_sql(
@@ -2996,5 +3348,429 @@ mod insert_overwrite_partitions_parser_tests {
             crate::sql::parser::ast::OverwriteMode::DynamicPartitions
         );
         assert_eq!(stmt.table.parts, vec!["t", "branch_dev"]);
+    }
+
+    // ---- looks_like_alter_table_rewrite_manifests tests ----
+
+    #[test]
+    fn looks_like_alter_table_rewrite_manifests_positive() {
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE MANIFESTS"
+        ));
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "alter table x rewrite manifests;"
+        ));
+        assert!(super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS"
+        ));
+    }
+
+    #[test]
+    fn looks_like_alter_table_rewrite_manifests_negative() {
+        // Different action keyword.
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x OPTIMIZE"
+        ));
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x EXPIRE SNAPSHOTS"
+        ));
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE DATA FILES"
+        ));
+        // Missing MANIFESTS.
+        assert!(!super::looks_like_alter_table_rewrite_manifests(
+            "ALTER TABLE x REWRITE"
+        ));
+    }
+
+    // ---- parse_alter_table_rewrite_manifests_sql tests ----
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_basic() {
+        let stmt = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_single_part_table() {
+        let stmt =
+            super::parse_alter_table_rewrite_manifests_sql("ALTER TABLE orders REWRITE MANIFESTS")
+                .unwrap();
+        assert_eq!(stmt.table.parts, vec!["orders"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_accepts_trailing_semicolon() {
+        let stmt =
+            super::parse_alter_table_rewrite_manifests_sql("ALTER TABLE t REWRITE MANIFESTS;")
+                .unwrap();
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_rejects_branch_suffix() {
+        // Two-part name ending in branch_ → rejected.
+        let err = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE db.orders.branch_dev REWRITE MANIFESTS",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not support branch"),
+            "expected branch rejection, got: {err}"
+        );
+
+        // tag_ suffix also rejected.
+        let err2 = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE db.orders.tag_v1 REWRITE MANIFESTS",
+        )
+        .unwrap_err();
+        assert!(
+            err2.contains("does not support branch"),
+            "expected tag rejection, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_single_part_branch_name_accepted() {
+        // A single-part table literally named `branch_x` is a legitimate table
+        // name (there's no preceding table part, so it can't be a suffix).
+        let stmt = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE branch_x REWRITE MANIFESTS",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["branch_x"]);
+    }
+
+    #[test]
+    fn parse_alter_table_rewrite_manifests_rejects_trailing_tokens() {
+        let err = super::parse_alter_table_rewrite_manifests_sql(
+            "ALTER TABLE x REWRITE MANIFESTS WHERE size_in_bytes < 100",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsupported trailing"),
+            "expected trailing token rejection, got: {err}"
+        );
+    }
+
+    // ---- looks_like_alter_table_expire_snapshots tests ----
+
+    #[test]
+    fn looks_like_alter_table_expire_snapshots_positive() {
+        assert!(super::looks_like_alter_table_expire_snapshots(
+            "ALTER TABLE x EXPIRE SNAPSHOTS RETAIN LAST 5"
+        ));
+        assert!(super::looks_like_alter_table_expire_snapshots(
+            "alter table db.t expire snapshots older than '2026-01-01 00:00:00'"
+        ));
+        assert!(super::looks_like_alter_table_expire_snapshots(
+            "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS"
+        ));
+    }
+
+    #[test]
+    fn looks_like_alter_table_expire_snapshots_negative() {
+        // Different action keyword.
+        assert!(!super::looks_like_alter_table_expire_snapshots(
+            "ALTER TABLE x REWRITE MANIFESTS"
+        ));
+        assert!(!super::looks_like_alter_table_expire_snapshots(
+            "ALTER TABLE x OPTIMIZE"
+        ));
+        // Missing SNAPSHOTS.
+        assert!(!super::looks_like_alter_table_expire_snapshots(
+            "ALTER TABLE x EXPIRE"
+        ));
+        // Not an ALTER TABLE.
+        assert!(!super::looks_like_alter_table_expire_snapshots(
+            "SELECT * FROM t"
+        ));
+    }
+
+    // ---- parse_alter_table_expire_snapshots_sql tests ----
+
+    #[test]
+    fn parse_expire_older_than_only() {
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00'",
+        )
+        .unwrap();
+        assert!(stmt.older_than_ms.is_some(), "older_than_ms should be Some");
+        assert_eq!(stmt.retain_last, None);
+        assert_eq!(stmt.table.parts, vec!["db", "t"]);
+    }
+
+    #[test]
+    fn parse_expire_retain_last_only() {
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 5",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, None);
+        assert_eq!(stmt.retain_last, Some(5));
+    }
+
+    #[test]
+    fn parse_expire_both_clauses_older_then_retain() {
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS OLDER THAN '2026-04-01T00:00:00Z' RETAIN LAST 3",
+        )
+        .unwrap();
+        assert!(stmt.older_than_ms.is_some());
+        assert_eq!(stmt.retain_last, Some(3));
+    }
+
+    #[test]
+    fn parse_expire_both_clauses_retain_then_older() {
+        // Clauses in reverse order — both accepted.
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 2 OLDER THAN '2026-04-01 00:00:00'",
+        )
+        .unwrap();
+        assert!(stmt.older_than_ms.is_some());
+        assert_eq!(stmt.retain_last, Some(2));
+    }
+
+    #[test]
+    fn parse_expire_epoch_ms_int_accepted() {
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS OLDER THAN 1700000000000",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, Some(1_700_000_000_000));
+        assert_eq!(stmt.retain_last, None);
+    }
+
+    #[test]
+    fn parse_expire_no_clause_rejects() {
+        let err =
+            super::parse_alter_table_expire_snapshots_sql("ALTER TABLE db.t EXPIRE SNAPSHOTS")
+                .unwrap_err();
+        assert!(
+            err.contains("requires at least"),
+            "expected 'requires at least' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_expire_retain_zero_rejects() {
+        let err = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 0",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("RETAIN LAST must be >= 1"),
+            "expected retain-zero rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_expire_branch_suffix_rejects() {
+        let err = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t.branch_dev EXPIRE SNAPSHOTS RETAIN LAST 5",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not support branch/tag suffix"),
+            "expected branch suffix rejection, got: {err}"
+        );
+
+        // tag_ suffix also rejected.
+        let err2 = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t.tag_v1 EXPIRE SNAPSHOTS RETAIN LAST 5",
+        )
+        .unwrap_err();
+        assert!(
+            err2.contains("does not support branch/tag suffix"),
+            "expected tag suffix rejection, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn parse_expire_branch_name_single_part_accepted() {
+        // A single-part table literally named `branch_x` is valid.
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE branch_x EXPIRE SNAPSHOTS RETAIN LAST 5",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["branch_x"]);
+    }
+
+    #[test]
+    fn parse_expire_duplicate_older_than_rejects() {
+        let err = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' OLDER THAN '2026-02-01 00:00:00'",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicate OLDER THAN"),
+            "expected duplicate-clause rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_expire_accepts_trailing_semicolon() {
+        let stmt = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 1;",
+        )
+        .unwrap();
+        assert_eq!(stmt.retain_last, Some(1));
+    }
+
+    #[test]
+    fn parse_expire_rejects_trailing_tokens() {
+        let err = super::parse_alter_table_expire_snapshots_sql(
+            "ALTER TABLE db.t EXPIRE SNAPSHOTS RETAIN LAST 5 SOMETHING EXTRA",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsupported trailing tokens"),
+            "expected trailing token rejection, got: {err}"
+        );
+    }
+
+    // ---- looks_like_alter_table_remove_orphan_files tests ----
+
+    #[test]
+    fn looks_like_alter_table_remove_orphan_files_positive() {
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN FILES OLDER THAN '2026-01-01'"
+        ));
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "alter table db.t remove orphan files older than '2026-01-01 00:00:00'"
+        ));
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1700000000000"
+        ));
+        // Detector only checks REMOVE ORPHAN FILES — OLDER THAN is not required by detector.
+        assert!(super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN FILES"
+        ));
+    }
+
+    #[test]
+    fn looks_like_alter_table_remove_orphan_files_negative() {
+        // Different action keyword.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x EXPIRE SNAPSHOTS"
+        ));
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x OPTIMIZE"
+        ));
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REWRITE MANIFESTS"
+        ));
+        // Missing ORPHAN.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE FILES"
+        ));
+        // Missing FILES.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "ALTER TABLE x REMOVE ORPHAN"
+        ));
+        // Not an ALTER TABLE.
+        assert!(!super::looks_like_alter_table_remove_orphan_files(
+            "SELECT * FROM t"
+        ));
+    }
+
+    // ---- parse_alter_table_remove_orphan_files_sql tests ----
+
+    #[test]
+    fn parse_remove_orphan_files_basic() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+        // 2026-01-01 00:00:00 UTC in epoch-ms.
+        assert_eq!(stmt.older_than_ms, 1_767_225_600_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_rfc3339_timestamp() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN '2026-01-01T00:00:00Z'",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, 1_767_225_600_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_epoch_ms_int() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN 1700000000000",
+        )
+        .unwrap();
+        assert_eq!(stmt.older_than_ms, 1_700_000_000_000i64);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_accepts_trailing_semicolon() {
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE t REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00';",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_no_older_than_rejects() {
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("OLDER THAN"),
+            "expected OLDER THAN rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_branch_suffix_rejects() {
+        // Two-part name ending in branch_ → rejected.
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t.branch_dev REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not support branch"),
+            "expected branch rejection, got: {err}"
+        );
+
+        // tag_ suffix also rejected.
+        let err2 = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t.tag_v1 REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap_err();
+        assert!(
+            err2.contains("does not support branch"),
+            "expected tag rejection, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_single_part_branch_name_accepted() {
+        // A single-part table literally named `branch_x` is a valid table name.
+        let stmt = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE branch_x REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00'",
+        )
+        .unwrap();
+        assert_eq!(stmt.table.parts, vec!["branch_x"]);
+    }
+
+    #[test]
+    fn parse_remove_orphan_files_rejects_trailing_tokens() {
+        let err = super::parse_alter_table_remove_orphan_files_sql(
+            "ALTER TABLE db.t REMOVE ORPHAN FILES OLDER THAN '2026-01-01 00:00:00' EXTRA TOKEN",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsupported trailing tokens"),
+            "expected trailing token rejection, got: {err}"
+        );
     }
 }

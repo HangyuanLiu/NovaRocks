@@ -1,0 +1,68 @@
+-- query 5
+n
+3
+
+-- query 7
+id	v
+1	a
+2	b
+3	c
+
+-- query 8
+n
+3
+
+-- query 10
+n
+0
+
+-- query 12
+n
+0
+
+-- query 17
+n
+3
+
+-- query 20
+id	v
+10	x
+20	y
+30	z
+
+-- query 28
+n
+2
+
+-- query 30
+id	v
+1	first
+2	second
+
+-- query 35
+id	v
+1	one
+2	two
+
+-- query 41
+n
+2
+
+-- query 43
+n
+2
+
+-- query 48
+n
+3
+
+-- query 52
+id	v
+1	row1
+2	row2
+3	row3
+4	row4
+
+-- query 53
+n
+4

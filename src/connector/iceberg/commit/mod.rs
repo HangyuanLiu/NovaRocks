@@ -27,6 +27,7 @@ mod action;
 mod collector;
 mod data_file;
 mod equality_delete_writer;
+pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
 mod overwrite;
@@ -34,10 +35,14 @@ mod overwrite_partitions;
 mod position_delete_writer;
 mod puffin_dv;
 mod ref_action;
+pub mod remove_orphan_files;
+pub mod retry;
 mod rewrite_data_files;
+pub mod rewrite_manifests;
 mod row_delta;
 mod row_delta_dv;
 mod run;
+pub mod snapshot_lifecycle_helpers;
 #[cfg(test)]
 mod test_helpers;
 mod truncate;
@@ -58,6 +63,7 @@ pub use puffin_dv::{
     write_single_deletion_vector_puffin,
 };
 pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
+pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 pub(crate) use rewrite_data_files::count_current_live_files;
 pub use row_delta::RowDeltaCommit;

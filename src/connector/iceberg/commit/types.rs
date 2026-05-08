@@ -47,6 +47,11 @@ pub enum CommitOpKind {
     /// partition specs) and adds the new files. Other partitions are
     /// preserved untouched. v3 row-lineage tables only.
     OverwritePartitions,
+    /// Iceberg `ALTER TABLE x REWRITE MANIFESTS`: groups manifests by
+    /// (partition_spec_id, content_type) and merges each group into a
+    /// single manifest, emitting an `operation=replace` snapshot. No data
+    /// files are rewritten; sequence_number is preserved.
+    RewriteManifests,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +210,7 @@ mod tests {
             CommitOpKind::CowUpdate,
             CommitOpKind::Truncate,
             CommitOpKind::OverwritePartitions,
+            CommitOpKind::RewriteManifests,
         ];
         for (idx, left) in variants.iter().enumerate() {
             for right in variants.iter().skip(idx + 1) {

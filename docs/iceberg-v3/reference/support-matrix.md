@@ -177,9 +177,9 @@
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `parent-snapshot-id` / `summary` 正确记录 | ✅ | |
-| `EXPIRE SNAPSHOTS [OLDER THAN] [RETAIN LAST]` | ❌ | |
-| `REMOVE ORPHAN FILES` | ❌ | |
-| `REWRITE MANIFESTS` | ❌ | |
+| `EXPIRE SNAPSHOTS [OLDER THAN] [RETAIN LAST]` | ✅ | OLDER THAN / RETAIN LAST 子句，per-branch retention 属性未读取 |
+| `REMOVE ORPHAN FILES` | ✅ | OLDER THAN 强制；hdfs:// 暂不支持 |
+| `REWRITE MANIFESTS` | ✅ | 按 (spec_id, content_type) 分组合并；V3 row-lineage round-trip |
 
 ## 9. Metadata Tables
 
@@ -219,9 +219,9 @@
 | --- | --- | --- |
 | OPTIMIZE TABLE（whole-table） | ✅ | |
 | OPTIMIZE 增量（仅小文件 / 仅 partition） | ❌ | |
-| EXPIRE SNAPSHOTS | ❌ | |
-| REMOVE ORPHAN FILES | ❌ | |
-| REWRITE MANIFESTS | ❌ | |
+| EXPIRE SNAPSHOTS | ✅ | OLDER THAN / RETAIN LAST 子句，per-branch retention 属性未读取 |
+| REMOVE ORPHAN FILES | ✅ | OLDER THAN 强制；hdfs:// 暂不支持 |
+| REWRITE MANIFESTS | ✅ | 按 (spec_id, content_type) 分组合并；V3 row-lineage round-trip |
 | REWRITE POSITION DELETES（v2→DV） | ❌ | |
 | REWRITE DATA FILES BY SORT ORDER | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
