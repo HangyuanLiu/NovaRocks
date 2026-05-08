@@ -648,6 +648,7 @@ impl TableMetadataBuilder {
             if self.last_added_schema_id != Some(new_schema_id) {
                 self.changes.push(TableUpdate::AddSchema {
                     schema: schema.clone(),
+                    last_column_id: None,
                 });
                 self.last_added_schema_id = Some(new_schema_id);
             }
@@ -670,7 +671,10 @@ impl TableMetadataBuilder {
             .schemas
             .insert(new_schema_id, schema.clone().into());
 
-        self.changes.push(TableUpdate::AddSchema { schema });
+        self.changes.push(TableUpdate::AddSchema {
+            schema,
+            last_column_id: None,
+        });
 
         self.last_added_schema_id = Some(new_schema_id);
 
@@ -1732,7 +1736,10 @@ mod tests {
             TableUpdate::SetLocation {
                 location: TEST_LOCATION.to_string()
             },
-            TableUpdate::AddSchema { schema: schema() },
+            TableUpdate::AddSchema {
+                schema: schema(),
+                last_column_id: None,
+            },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
             TableUpdate::AddSpec {
                 // Because this is a new tables, field-ids are assigned
@@ -1786,6 +1793,7 @@ mod tests {
             },
             TableUpdate::AddSchema {
                 schema: Schema::builder().build().unwrap(),
+                last_column_id: None,
             },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
             TableUpdate::AddSpec {
@@ -2041,7 +2049,8 @@ mod tests {
             Some(&Arc::new(added_schema.clone()))
         );
         pretty_assertions::assert_eq!(build_result.changes[0], TableUpdate::AddSchema {
-            schema: added_schema
+            schema: added_schema,
+            last_column_id: None,
         });
         assert_eq!(build_result.changes[1], TableUpdate::SetCurrentSchema {
             schema_id: -1

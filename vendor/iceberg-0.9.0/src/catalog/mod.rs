@@ -482,6 +482,14 @@ pub enum TableUpdate {
     AddSchema {
         /// The schema to add.
         schema: Schema,
+        /// Iceberg REST `add-schema` MetadataUpdate carries the new
+        /// `last-column-id` so a server applying the update knows the
+        /// monotonically-increasing high-watermark even if the schema
+        /// itself dropped the previously-highest field. `None` omits the
+        /// field on the wire (used for create-table where the server
+        /// derives it from `schema.highest_field_id()`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_column_id: Option<i32>,
     },
     /// Set table's current schema
     #[serde(rename_all = "kebab-case")]
@@ -1537,6 +1545,7 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
+                last_column_id: Some(3),
             },
         );
 
@@ -1575,6 +1584,7 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
+                last_column_id: None,
             },
         );
     }
