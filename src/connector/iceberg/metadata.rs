@@ -27,8 +27,18 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use base64::Engine;
 use serde::Deserialize;
 
-use super::{ensure_embedded_jvm_enabled, jvm::scan_metadata};
+use iceberg::spec::{SnapshotRetention, TableMetadata};
+
 use crate::common::ids::SlotId;
+
+/// Decode the JSON payload that the planner stamps onto
+/// `IcebergMetadataScanConfig::serialized_table` back into an iceberg-rust
+/// `TableMetadata`. Producer side is `serde_json::to_string` over the same
+/// crate's `TableMetadata`, so this is a round-trip.
+fn parse_table_metadata(serialized: &str) -> Result<TableMetadata, String> {
+    serde_json::from_str::<TableMetadata>(serialized)
+        .map_err(|e| format!("parse iceberg table metadata for metadata-scan failed: {e}"))
+}
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
@@ -107,7 +117,28 @@ pub struct IcebergMetadataScanOp {
 
 impl IcebergMetadataScanOp {
     pub fn new(cfg: IcebergMetadataScanConfig) -> Result<Self, String> {
-        ensure_embedded_jvm_enabled("Iceberg metadata scan")?;
+        // Reject metadata-table flavors that the native-Rust path cannot
+        // produce. Snapshots / History / Refs read directly off
+        // `TableMetadata`; Files / Manifests / Partitions / Logical require
+        // walking the manifest list (data-file scan). The earlier embedded
+        // JVM bridge handled all of these by delegating to the Iceberg Java
+        // SDK, but that path has been removed in favor of iceberg-rust.
+        match cfg.metadata_table_type {
+            IcebergMetadataTableType::Snapshots
+            | IcebergMetadataTableType::History
+            | IcebergMetadataTableType::Refs => {}
+            IcebergMetadataTableType::Files
+            | IcebergMetadataTableType::Manifests
+            | IcebergMetadataTableType::Partitions
+            | IcebergMetadataTableType::LogicalIcebergMetadata => {
+                return Err(format!(
+                    "Iceberg metadata table `{}` is not yet implemented in the \
+                     native-Rust scan path; only Snapshots / History / Refs are \
+                     currently supported",
+                    cfg.metadata_table_type.as_jvm_scanner_type()
+                ));
+            }
+        }
         let fields = cfg
             .output_columns
             .iter()
@@ -199,7 +230,6 @@ impl ScanOp for IcebergMetadataScanOp {
         profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
-        ensure_embedded_jvm_enabled("Iceberg metadata scan")?;
         let ScanMorsel::IcebergMetadata { index } = morsel else {
             return Err("iceberg metadata scan received unexpected morsel".to_string());
         };
@@ -212,39 +242,17 @@ impl ScanOp for IcebergMetadataScanOp {
             .get(index)
             .ok_or_else(|| format!("iceberg metadata range index out of bounds: {index}"))?;
         let chunks = match self.cfg.metadata_table_type {
-            IcebergMetadataTableType::Files => {
-                let rows = load_file_rows(&self.cfg, range, false)?;
-                build_file_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                    false,
-                    self.cfg.load_column_stats,
-                )?
-            }
-            IcebergMetadataTableType::LogicalIcebergMetadata => {
-                let rows = load_file_rows(&self.cfg, range, true)?;
-                build_file_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                    true,
-                    self.cfg.load_column_stats,
-                )?
-            }
-            IcebergMetadataTableType::Manifests => {
-                let rows = load_manifest_rows(&self.cfg, range)?;
-                build_manifest_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
+            IcebergMetadataTableType::Files
+            | IcebergMetadataTableType::Manifests
+            | IcebergMetadataTableType::Partitions
+            | IcebergMetadataTableType::LogicalIcebergMetadata => {
+                // Constructor (`IcebergMetadataScanOp::new`) already rejects
+                // these flavors; reaching here means construction was bypassed.
+                return Err(format!(
+                    "iceberg metadata scan reached execution for unsupported \
+                     flavor `{}`",
+                    self.cfg.metadata_table_type.as_jvm_scanner_type()
+                ));
             }
             IcebergMetadataTableType::Snapshots => {
                 let rows = load_snapshot_rows(&self.cfg)?;
@@ -269,16 +277,6 @@ impl ScanOp for IcebergMetadataScanOp {
             IcebergMetadataTableType::Refs => {
                 let rows = load_ref_rows(&self.cfg)?;
                 build_ref_chunks(
-                    &rows,
-                    &self.cfg.output_columns,
-                    &self.output_schema,
-                    &self.output_chunk_schema,
-                    self.cfg.batch_size,
-                )?
-            }
-            IcebergMetadataTableType::Partitions => {
-                let rows = load_partition_rows(&self.cfg)?;
-                build_partition_chunks(
                     &rows,
                     &self.cfg.output_columns,
                     &self.output_schema,
@@ -424,43 +422,12 @@ struct RawManifestMetadataRow {
     partitions: Option<Vec<RawManifestPartitionSummary>>,
 }
 
-fn load_file_rows(
-    cfg: &IcebergMetadataScanConfig,
-    range: &IcebergMetadataScanRange,
-    logical_metadata: bool,
-) -> Result<Vec<FileMetadataRow>, String> {
-    let scanner_type = if logical_metadata {
-        IcebergMetadataTableType::LogicalIcebergMetadata.as_jvm_scanner_type()
-    } else {
-        IcebergMetadataTableType::Files.as_jvm_scanner_type()
-    };
-    let payload = scan_metadata(
-        scanner_type,
-        &cfg.serialized_table,
-        &range.serialized_split,
-        &cfg.serialized_predicate,
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawFileMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg file metadata rows failed: {e}"))?;
-    rows.into_iter().map(FileMetadataRow::try_from).collect()
-}
-
-fn load_manifest_rows(
-    cfg: &IcebergMetadataScanConfig,
-    range: &IcebergMetadataScanRange,
-) -> Result<Vec<ManifestMetadataRow>, String> {
-    let payload = scan_metadata(
-        IcebergMetadataTableType::Manifests.as_jvm_scanner_type(),
-        &cfg.serialized_table,
-        &range.serialized_split,
-        "",
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawManifestMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg manifest metadata rows failed: {e}"))?;
-    Ok(rows.into_iter().map(ManifestMetadataRow::from).collect())
-}
+// `load_file_rows` / `load_manifest_rows` were JVM-bridge backed (Files /
+// Manifests / LogicalIcebergMetadata flavors). The native-Rust path
+// rejects those flavors at `IcebergMetadataScanOp::new`, so these
+// functions are no longer reachable. They will be deleted along with the
+// File*/Manifest* row types in the same cleanup commit that removes
+// `src/connector/iceberg/jvm.rs`.
 
 impl TryFrom<RawFileMetadataRow> for FileMetadataRow {
     type Error = String;
@@ -1035,16 +1002,34 @@ impl From<RawSnapshotMetadataRow> for SnapshotMetadataRow {
 }
 
 fn load_snapshot_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<SnapshotMetadataRow>, String> {
-    let payload = scan_metadata(
-        IcebergMetadataTableType::Snapshots.as_jvm_scanner_type(),
-        &cfg.serialized_table,
-        "",
-        "",
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawSnapshotMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg snapshots metadata rows failed: {e}"))?;
-    Ok(rows.into_iter().map(SnapshotMetadataRow::from).collect())
+    let metadata = parse_table_metadata(&cfg.serialized_table)?;
+    let mut rows = Vec::with_capacity(metadata.snapshots().len());
+    for snapshot in metadata.snapshots() {
+        let summary = snapshot.summary();
+        let summary_pairs = if summary.additional_properties.is_empty() {
+            None
+        } else {
+            let mut pairs: Vec<(String, String)> = summary
+                .additional_properties
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            // Stable key order so chunked output is deterministic across runs.
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            Some(pairs)
+        };
+        rows.push(SnapshotMetadataRow {
+            // Iceberg snapshot timestamps are millisecond-resolution; the
+            // analyzer surfaces this column as Int64 microseconds.
+            committed_at_micros: snapshot.timestamp_ms().saturating_mul(1_000),
+            snapshot_id: snapshot.snapshot_id(),
+            parent_id: snapshot.parent_snapshot_id(),
+            operation: Some(summary.operation.as_str().to_string()),
+            manifest_list: snapshot.manifest_list().to_string(),
+            summary: summary_pairs,
+        });
+    }
+    Ok(rows)
 }
 
 fn build_snapshot_chunks(
@@ -1162,16 +1147,38 @@ impl From<RawHistoryMetadataRow> for HistoryMetadataRow {
 }
 
 fn load_history_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<HistoryMetadataRow>, String> {
-    let payload = scan_metadata(
-        IcebergMetadataTableType::History.as_jvm_scanner_type(),
-        &cfg.serialized_table,
-        "",
-        "",
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawHistoryMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg history metadata rows failed: {e}"))?;
-    Ok(rows.into_iter().map(HistoryMetadataRow::from).collect())
+    let metadata = parse_table_metadata(&cfg.serialized_table)?;
+    // `is_current_ancestor` is true for any snapshot reachable from the
+    // current head by walking parent_snapshot_id pointers. Build the set
+    // up front so each history row can be tagged in O(1).
+    let mut current_ancestors: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut walker = metadata.current_snapshot_id();
+    while let Some(id) = walker {
+        if !current_ancestors.insert(id) {
+            // Defensive: stop on any cycle in parent pointers.
+            break;
+        }
+        walker = metadata
+            .snapshot_by_id(id)
+            .and_then(|snap| snap.parent_snapshot_id());
+    }
+
+    let history = metadata.history();
+    let mut rows = Vec::with_capacity(history.len());
+    for entry in history {
+        // Resolve parent_snapshot_id by looking the snapshot up; the
+        // history log itself only carries (snapshot_id, timestamp_ms).
+        let parent_id = metadata
+            .snapshot_by_id(entry.snapshot_id)
+            .and_then(|snap| snap.parent_snapshot_id());
+        rows.push(HistoryMetadataRow {
+            made_current_at_micros: entry.timestamp_ms.saturating_mul(1_000),
+            snapshot_id: entry.snapshot_id,
+            parent_id,
+            is_current_ancestor: current_ancestors.contains(&entry.snapshot_id),
+        });
+    }
+    Ok(rows)
 }
 
 fn build_history_chunks(
@@ -1261,16 +1268,40 @@ impl From<RawRefMetadataRow> for RefMetadataRow {
 }
 
 fn load_ref_rows(cfg: &IcebergMetadataScanConfig) -> Result<Vec<RefMetadataRow>, String> {
-    let payload = scan_metadata(
-        IcebergMetadataTableType::Refs.as_jvm_scanner_type(),
-        &cfg.serialized_table,
-        "",
-        "",
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawRefMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg refs metadata rows failed: {e}"))?;
-    Ok(rows.into_iter().map(RefMetadataRow::from).collect())
+    let metadata = parse_table_metadata(&cfg.serialized_table)?;
+    let refs = metadata.refs();
+    let mut rows: Vec<RefMetadataRow> = refs
+        .iter()
+        .map(|(name, reference)| {
+            let (type_, max_reference_age_in_ms, min_snapshots_to_keep, max_snapshot_age_in_ms) =
+                match &reference.retention {
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep,
+                        max_snapshot_age_ms,
+                        max_ref_age_ms,
+                    } => (
+                        "BRANCH",
+                        *max_ref_age_ms,
+                        *min_snapshots_to_keep,
+                        *max_snapshot_age_ms,
+                    ),
+                    SnapshotRetention::Tag { max_ref_age_ms } => {
+                        ("TAG", *max_ref_age_ms, None, None)
+                    }
+                };
+            RefMetadataRow {
+                name: name.clone(),
+                type_: type_.to_string(),
+                snapshot_id: reference.snapshot_id,
+                max_reference_age_in_ms,
+                min_snapshots_to_keep,
+                max_snapshot_age_in_ms,
+            }
+        })
+        .collect();
+    // Stable name order so output is deterministic across runs.
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
 }
 
 fn build_ref_chunks(
@@ -1384,20 +1415,8 @@ impl From<RawPartitionMetadataRow> for PartitionMetadataRow {
     }
 }
 
-fn load_partition_rows(
-    cfg: &IcebergMetadataScanConfig,
-) -> Result<Vec<PartitionMetadataRow>, String> {
-    let payload = scan_metadata(
-        IcebergMetadataTableType::Partitions.as_jvm_scanner_type(),
-        &cfg.serialized_table,
-        "",
-        "",
-        cfg.load_column_stats,
-    )?;
-    let rows: Vec<RawPartitionMetadataRow> = serde_json::from_slice(&payload)
-        .map_err(|e| format!("parse JVM iceberg partitions metadata rows failed: {e}"))?;
-    Ok(rows.into_iter().map(PartitionMetadataRow::from).collect())
-}
+// `load_partition_rows` was JVM-bridge backed; same fate as
+// load_file_rows / load_manifest_rows above.
 
 fn build_partition_struct_array(
     column: &IcebergMetadataOutputColumn,

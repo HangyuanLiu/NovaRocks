@@ -593,9 +593,12 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         ));
     }
-    if iceberg_metadata_table_type.is_some() {
-        ensure_embedded_jvm_enabled(&format!("HDFS_SCAN_NODE node_id={}", node.node_id))?;
-    }
+    // The metadata-table scan path used to require an embedded JVM bridge
+    // for the Iceberg Java SDK; it now runs natively against
+    // iceberg-rust's `TableMetadata`. The operator constructor itself
+    // (`IcebergMetadataScanOp::new`) rejects flavors the native path does
+    // not yet implement (Files / Manifests / Partitions /
+    // LogicalIcebergMetadata).
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
     let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
