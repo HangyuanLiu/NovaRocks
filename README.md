@@ -307,18 +307,24 @@ The standalone server supports session context such as `USE <db>`,
 
 ## Local Iceberg REST + MinIO + Spark Environment
 
-The `docker/iceberg-rest/` directory contains a workspace-scoped Iceberg REST
-+ MinIO + Spark environment used by both local development and CI. Bring it
-up, then discover the active ports and generated configs from the fixed
-entry:
+The `docker/iceberg-rest/` directory contains the shared local Iceberg REST
+Catalog, MinIO, and Spark environment used by both local development and CI.
+Bring it up, then discover the active worktree ports and generated configs
+from the fixed entry:
 
 ```bash
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 ```
 
+Codex environment setup uses `docker/iceberg-rest/up.sh --prepare-only`
+instead. That only writes `runtime/current/env.sh` and related config files;
+it does not start Docker.
+
 Useful generated values:
 
+- `NOVA_ENV_COMPOSE_PROJECT`
+- `NOVA_ENV_MYSQL_PORT`
 - `NOVAROCKS_ICEBERG_REST_URI`
 - `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `AWS_S3_ENDPOINT`
@@ -342,16 +348,21 @@ and MinIO object store:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
 Spark uses the Docker-network endpoints `http://rest:8181` and
 `http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
+The Docker services are shared across worktrees by default and use the
+service-default host ports configured in `docker/iceberg-rest/shared.env`;
+the NovaRocks standalone-server port is allocated per worktree.
 
 Run the cross-engine Iceberg compatibility SQL suite:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-rest/up.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
