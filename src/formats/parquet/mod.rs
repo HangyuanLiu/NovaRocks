@@ -673,7 +673,14 @@ impl ParquetScanIter {
             // for row group filtering to avoid re-parsing
             let app_io_before_footer = self.profile.as_ref().map(read_app_io_time_ns);
             let footer_read_start = std::time::Instant::now();
-            let builder = self.new_parquet_builder(&cached_reader)?;
+            // Annotate footer-parse failures with the offending file path —
+            // an unannotated "Corrupt footer" makes it impossible to tell
+            // which range produced the error when a scan covers many files
+            // or when the path comes from an iceberg manifest the user did
+            // not write directly.
+            let builder = self
+                .new_parquet_builder(&cached_reader)
+                .map_err(|e| format!("parquet open {path} (file_len={file_len}): {e}"))?;
             let footer_read_ns = footer_read_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 let footer_read_ns = clamp_u128_to_i64(footer_read_ns);

@@ -3295,7 +3295,7 @@ enable_path_style_access = true
         let err = session
             .query("select id from ice.db1.t")
             .expect_err("dropped backing table should not use stale local table");
-        assert!(err.contains("unknown table"), "err={err}");
+        assert!(err.contains("unknown iceberg table"), "err={err}");
         assert!(
             engine
                 .inner
