@@ -53,14 +53,25 @@ fn extract_table_names_from_table_factor(
 ) {
     match factor {
         sqlparser::ast::TableFactor::Table { name, .. } => {
-            if let Some(last) = name.0.last() {
-                let name = match last {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
                     sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        ident.value.to_ascii_lowercase()
+                        Some(ident.value.to_ascii_lowercase())
                     }
-                    other => other.to_string().to_ascii_lowercase(),
-                };
-                names.push(name);
+                    _ => None,
+                })
+                .collect();
+            // Skip synthetic iceberg-metadata factors; they are handled by
+            // extract_three_part_refs (which strips the trailing
+            // __nr_meta_*__ suffix and routes to the iceberg backend).
+            let (_, metadata_suffix) = split_metadata_suffix(&parts);
+            if metadata_suffix.is_some() {
+                return;
+            }
+            if let Some(last) = parts.last() {
+                names.push(last.clone());
             }
         }
         sqlparser::ast::TableFactor::Derived { subquery, .. } => {
@@ -610,6 +621,19 @@ mod tests {
         assert_eq!(
             query.to_string(),
             "WITH x AS (SELECT * FROM db5.t5) SELECT * FROM x"
+        );
+    }
+
+    #[test]
+    fn one_part_extractor_skips_nr_meta_last_part() {
+        // 4-part metadata factor must not surface as a 1-part name (the last part
+        // is a synthetic suffix, not a real table name). The 3-part extractor
+        // handles the real registration.
+        let query = parse_query("SELECT * FROM ice.db.t.__nr_meta_snapshots__");
+
+        assert_eq!(
+            query_refs::extract_table_names_from_query(&query),
+            Vec::<String>::new(),
         );
     }
 }
