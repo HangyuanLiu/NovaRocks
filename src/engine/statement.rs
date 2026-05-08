@@ -918,6 +918,13 @@ pub(crate) fn execute_create_table_statement(
                 .read()
                 .expect("connector registry read")
                 .catalog_backend(target.backend_name)?;
+            // Honour `IF NOT EXISTS`: skip creation when the table already
+            // exists. CTAS has its own existence check in `iceberg_ctas`.
+            if stmt.if_not_exists
+                && backend.table_exists(&target.catalog, &target.namespace, &target.table)?
+            {
+                return Ok(StatementResult::Ok);
+            }
             backend.create_table(crate::connector::backend::CreateTableRequest {
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),

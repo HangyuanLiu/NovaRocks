@@ -75,6 +75,13 @@ impl CatalogBackend for IcebergCatalogBackend {
         )
     }
 
+    fn table_exists(&self, catalog: &str, namespace: &str, table: &str) -> Result<bool, String> {
+        let entry = self.entry(catalog)?;
+        let normalized = crate::engine::catalog::normalize_identifier(table)?;
+        let tables = reg_list_tables(&entry, namespace)?;
+        Ok(tables.iter().any(|t| t.eq_ignore_ascii_case(&normalized)))
+    }
+
     fn alter_iceberg_partition_spec(
         &self,
         catalog: &str,

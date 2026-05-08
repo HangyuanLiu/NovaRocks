@@ -53,6 +53,7 @@ pub(crate) trait CatalogBackend: Send + Sync {
     fn drop_namespace(&self, catalog: &str, namespace: &str, force: bool) -> Result<(), String>;
 
     fn create_table(&self, req: CreateTableRequest) -> Result<(), String>;
+    fn table_exists(&self, catalog: &str, namespace: &str, table: &str) -> Result<bool, String>;
     fn alter_iceberg_partition_spec(
         &self,
         _catalog: &str,
