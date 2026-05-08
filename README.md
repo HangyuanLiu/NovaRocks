@@ -383,7 +383,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 ```
 
 Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
-`sort`, and `iceberg`.
+`sort`, `iceberg`, and `iceberg-rest`.
 
 ## Development Workflow
 

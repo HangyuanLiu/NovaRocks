@@ -475,6 +475,16 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite iceberg-compatibility --mode verify
 ```
 
+Run NovaRocks-only Iceberg REST end-to-end smoke (no Spark, NovaRocks both
+writes and reads):
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-rest --mode verify
+```
+
 Generate an Iceberg format-v3 table through Spark against the same REST Catalog
 and MinIO services:
 
