@@ -3421,7 +3421,7 @@ pub(crate) fn build_rowset_for_upsert_batch(
                 build_starrocks_native_segment_bytes(&write_batch, &ctx.tablet_schema)?;
             let segment_size = segment_bytes.len() as u64;
             write_bytes(&data_file_path, segment_bytes)?;
-            (segment_size, vec![0], vec![segment_meta])
+            (segment_size, Vec::new(), vec![segment_meta])
         }
         StarRocksWriteFormat::Parquet => {
             let parquet_size = write_parquet_file(&data_file_path, &write_batch)?;
@@ -3854,7 +3854,7 @@ pub(crate) fn append_bundle_meta_with_rowset(
                 build_starrocks_native_segment_bytes(&sorted_batch, &ctx.tablet_schema)?;
             let segment_size = segment_bytes.len() as u64;
             write_bytes(&data_file_path, segment_bytes)?;
-            (sorted_batch, segment_size, vec![0], vec![segment_meta])
+            (sorted_batch, segment_size, Vec::new(), vec![segment_meta])
         }
         StarRocksWriteFormat::Parquet => {
             let aligned_batch = sort_batch_for_native_write(batch, &ctx.tablet_schema)?;
@@ -5724,6 +5724,10 @@ mod tests {
             .expect("rowset should exist");
         assert_eq!(rowset.num_rows, Some(2));
         assert_eq!(rowset.segments.len(), 1);
+        assert!(
+            rowset.bundle_file_offsets.is_empty(),
+            "standalone segments must not carry bundle offsets"
+        );
     }
 
     #[test]

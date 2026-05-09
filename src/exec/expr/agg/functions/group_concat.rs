@@ -818,7 +818,7 @@ impl AggregateFunction for GroupConcatAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, NullArray, StringArray};
     use std::mem::MaybeUninit;
 
     fn intermediate_type(arg_types: &[DataType]) -> DataType {
@@ -973,6 +973,52 @@ mod tests {
         )) as ArrayRef;
         let out = run_update_then_finalize(&spec, input);
         assert_eq!(out, "x1,y2");
+    }
+
+    #[test]
+    fn test_group_concat_null_output_argument_skips_rows() {
+        let input_type = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Utf8, true)),
+            Arc::new(Field::new("b", DataType::Null, true)),
+            Arc::new(Field::new("sep", DataType::Utf8, true)),
+        ]));
+        let func = make_func(
+            "group_concat|d=1|a=|n=",
+            false,
+            intermediate_type(&[DataType::Utf8, DataType::Null, DataType::Utf8]),
+            input_type.clone(),
+        );
+        let spec = GroupConcatAgg
+            .build_spec_from_type(&func, Some(&input_type), false)
+            .unwrap();
+
+        let input = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Arc::new(Field::new("a", DataType::Utf8, true)),
+                Arc::new(Field::new("b", DataType::Null, true)),
+                Arc::new(Field::new("sep", DataType::Utf8, true)),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])) as ArrayRef,
+                Arc::new(NullArray::new(2)) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some(","), Some(",")])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        let view = AggInputView::Any(&input);
+        let mut state = MaybeUninit::<GroupConcatState>::uninit();
+        GroupConcatAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+
+        GroupConcatAgg
+            .update_batch(&spec, 0, &vec![state_ptr; input.len()], &view)
+            .expect("null output argument rows should be skipped");
+        let out = GroupConcatAgg
+            .build_array(&spec, 0, &[state_ptr], false)
+            .expect("finalize should succeed");
+        GroupConcatAgg.drop_state(&spec, state.as_mut_ptr() as *mut u8);
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(out.is_null(0));
     }
 
     #[test]

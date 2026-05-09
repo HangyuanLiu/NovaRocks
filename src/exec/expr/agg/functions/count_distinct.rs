@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
     Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    Int64Builder, ListArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    Int64Builder, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
@@ -75,27 +75,6 @@ fn encode_le<T: Copy>(v: T) -> Vec<u8> {
     unsafe {
         std::slice::from_raw_parts((&v as *const T) as *const u8, std::mem::size_of::<T>()).to_vec()
     }
-}
-
-fn encode_list_utf8_value(list: &ListArray, values: &StringArray, row: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let offsets = list.value_offsets();
-    let start = offsets[row] as usize;
-    let end = offsets[row + 1] as usize;
-    let len = u32::try_from(end.saturating_sub(start)).unwrap_or(u32::MAX);
-    out.extend_from_slice(&len.to_le_bytes());
-    for idx in start..end {
-        if values.is_null(idx) {
-            out.push(0);
-            continue;
-        }
-        out.push(1);
-        let bytes = values.value(idx).as_bytes();
-        let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&byte_len.to_le_bytes());
-        out.extend_from_slice(bytes);
-    }
-    out
 }
 
 fn encode_scalar_value(value: &Option<AggScalarValue>) -> Vec<u8> {
@@ -324,6 +303,7 @@ impl AggregateFunction for CountDistinctAgg {
             return Err("count_distinct batch input type mismatch".to_string());
         };
         match array.data_type() {
+            DataType::Null => Ok(()),
             DataType::Int64 => {
                 let arr = array
                     .as_any()
@@ -572,23 +552,19 @@ impl AggregateFunction for CountDistinctAgg {
                 }
                 Ok(())
             }
-            DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
-                let values = arr
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
+            DataType::List(_) => {
                 for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
+                    if array.is_null(row) {
                         continue;
                     }
+                    let value = scalar_from_any_array(array, row)?;
+                    let Some(value) = value else {
+                        continue;
+                    };
+
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_list_utf8_value(arr, values, row));
+                    set.insert(encode_scalar_value(&Some(value)));
                 }
                 Ok(())
             }
@@ -685,15 +661,18 @@ impl AggregateFunction for CountDistinctAgg {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::mem::MaybeUninit;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, ListArray, NullArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
+    use super::{AggregateFunction, CountDistinctAgg, DistinctSet};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+    use crate::exec::expr::agg::{AggInputView, AggStatePtr};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::values::ValuesNode;
@@ -705,6 +684,78 @@ mod tests {
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    #[test]
+    fn count_distinct_supports_int_list_values() {
+        let values = vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(2), Some(1)]),
+            None,
+        ];
+        let array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(values)) as ArrayRef;
+        let func = AggFunction {
+            name: "multi_distinct_count".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Int64),
+                input_arg_type: None,
+            }),
+        };
+        let spec = CountDistinctAgg
+            .build_spec_from_type(&func, Some(array.data_type()), false)
+            .expect("count distinct spec");
+
+        let mut state = MaybeUninit::<*mut DistinctSet>::uninit();
+        CountDistinctAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+        let state_ptrs = vec![state_ptr; array.len()];
+        CountDistinctAgg
+            .update_batch(&spec, 0, &state_ptrs, &AggInputView::Any(&array))
+            .expect("update list values");
+        let out = CountDistinctAgg
+            .build_array(&spec, 0, &[state_ptr], false)
+            .expect("output");
+        CountDistinctAgg.drop_state(&spec, state.as_mut_ptr() as *mut u8);
+
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), 2);
+    }
+
+    #[test]
+    fn count_distinct_ignores_null_typed_input() {
+        let array = Arc::new(NullArray::new(3)) as ArrayRef;
+        let func = AggFunction {
+            name: "multi_distinct_count".to_string(),
+            inputs: vec![],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Int64),
+                input_arg_type: None,
+            }),
+        };
+        let spec = CountDistinctAgg
+            .build_spec_from_type(&func, Some(array.data_type()), false)
+            .expect("count distinct spec");
+
+        let mut state = MaybeUninit::<*mut DistinctSet>::uninit();
+        CountDistinctAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+        let state_ptrs = vec![state_ptr; array.len()];
+        CountDistinctAgg
+            .update_batch(&spec, 0, &state_ptrs, &AggInputView::Any(&array))
+            .expect("update null values");
+        let out = CountDistinctAgg
+            .build_array(&spec, 0, &[state_ptr], false)
+            .expect("output");
+        CountDistinctAgg.drop_state(&spec, state.as_mut_ptr() as *mut u8);
+
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), 0);
     }
 
     #[test]

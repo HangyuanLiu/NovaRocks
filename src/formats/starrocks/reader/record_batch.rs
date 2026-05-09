@@ -74,7 +74,7 @@ use super::constants::{
     LOGICAL_TYPE_VARCHAR,
 };
 use super::indexed_column::decode_indexed_binary_values;
-use super::io::{TabletRoot, build_operator, read_range_bytes};
+use super::io::{TabletRoot, build_operator, read_range_bytes, read_segment_bytes};
 use super::page::{DecodedDataPageValues, DecodedPageValuePayload};
 use super::schema_map::{
     decimal_output_meta_from_arrow_type, expected_logical_type_from_schema_type,
@@ -265,7 +265,8 @@ pub(super) fn build_dup_record_batch(
                 segment.path, segment.bundle_file_offset, segment.segment_size
             )
         })?;
-        let segment_bytes = read_range_bytes(rt.as_ref(), &op, &segment.relative_path, start, end)?;
+        let segment_bytes =
+            read_segment_bytes(rt.as_ref(), &op, &segment.relative_path, start, end)?;
 
         let selected_ranges = selected_ranges_for_segment(
             &predicate_bindings,

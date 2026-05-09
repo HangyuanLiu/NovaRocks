@@ -169,6 +169,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_sql_raw_normalizes_group_concat_missing_argument_error() {
+        let err = parse_sql_raw("SELECT group_concat(  order by score) from ss order by 1")
+            .expect_err("should fail");
+        assert_eq!(
+            err,
+            "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_group_concat_distinct_missing_argument_error() {
+        let err = parse_sql_raw("SELECT group_concat(distinct  order by score) from ss order by 1")
+            .expect_err("should fail");
+        assert_eq!(
+            err,
+            "Unexpected input 'order', the most similar input is {a legal identifier}.",
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_group_concat_missing_argument_with_separator_error() {
+        let err =
+            parse_sql_raw("SELECT group_concat(order by 1 separator '')").expect_err("should fail");
+        assert_eq!(
+            err,
+            "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_normalizes_group_concat_separator_without_argument_error() {
+        let err = parse_sql_raw("SELECT group_concat(separator NULL)").expect_err("should fail");
+        assert_eq!(
+            err,
+            "No viable statement for input 'group_concat(separator NULL'.",
+        );
+    }
+
+    #[test]
     fn parse_sql_raw_parses_array_sortby_lambda_argument_shape() {
         let stmt =
             parse_sql_raw("SELECT array_sortby((x) -> x.item, x)").expect("parse should succeed");

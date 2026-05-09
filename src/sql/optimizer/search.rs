@@ -426,12 +426,12 @@ pub(super) fn required_input_properties(
                 let all_cols: Vec<ColumnRef> = j
                     .eq_conditions
                     .iter()
-                    .flat_map(|(l, r)| {
+                    .flat_map(|eq| {
                         let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_ref(l) {
+                        if let Some(c) = typed_expr_to_column_ref(&eq.left) {
                             v.push(c);
                         }
-                        if let Some(c) = typed_expr_to_column_ref(r) {
+                        if let Some(c) = typed_expr_to_column_ref(&eq.right) {
                             v.push(c);
                         }
                         v
@@ -675,18 +675,15 @@ enum Side {
 
 /// Extract `ColumnRef`s from the left or right side of equi-join conditions.
 fn eq_keys_to_column_refs(
-    eq_conditions: &[(
-        crate::sql::analysis::TypedExpr,
-        crate::sql::analysis::TypedExpr,
-    )],
+    eq_conditions: &[crate::sql::optimizer::operator::PhysicalHashJoinEqCondition],
     side: Side,
 ) -> Vec<ColumnRef> {
     eq_conditions
         .iter()
-        .filter_map(|(left, right)| {
+        .filter_map(|eq| {
             let expr = match side {
-                Side::Left => left,
-                Side::Right => right,
+                Side::Left => &eq.left,
+                Side::Right => &eq.right,
             };
             typed_expr_to_column_ref(expr)
         })
@@ -957,7 +954,11 @@ mod tests {
         };
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![(left_key, right_key)],
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key,
+                right: right_key,
+                null_safe: false,
+            }],
             other_condition: None,
             distribution: JoinDistribution::Shuffle,
         });

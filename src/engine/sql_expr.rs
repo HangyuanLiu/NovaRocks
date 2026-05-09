@@ -104,17 +104,20 @@ pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Resu
             inner,
         )?)?)),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_custom_expr(inner),
-        // An array literal like `[1, 2, 3]` has no natural non-constant lowering
-        // in this path (we don't run through the pipeline scalar-eval machinery
-        // here), so fold it to a Literal::Array if every element is itself a
-        // literal-convertible expression; otherwise fail fast with a clear error.
-        sqlast::Expr::Array(_) => Ok(Expr::Literal(sqlparser_expr_to_literal(expr)?)),
+        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(Expr::Array(
+            elem.iter()
+                .map(sqlparser_expr_to_custom_expr)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         // Function calls: try constant-folding via the INSERT-VALUES literal
         // helper first (covers `row(...)`, `map(...)`, fully-constant
         // `to_binary(...)`, etc.). If folding fails (e.g. args reference a
         // column), fall back to a ScalarFunction node that the row-wise
         // evaluator can dispatch on.
         sqlast::Expr::Function(func) => {
+            if let Some(expr) = try_array_map_cast_string_custom_expr(func)? {
+                return Ok(expr);
+            }
             if let Ok(lit) = sqlparser_function_to_literal(func) {
                 return Ok(Expr::Literal(lit));
             }
@@ -305,7 +308,17 @@ pub(crate) fn sqlparser_function_to_literal(
 
     let args = function_expr_args(&func.args)?;
     let name = func.name.to_string().to_ascii_lowercase();
+    if let Some(value) = try_array_map_cast_string_literal(&name, &args)? {
+        return Ok(value);
+    }
     match name.as_str() {
+        "array_generate" => {
+            let values = args
+                .iter()
+                .map(|arg| sqlparser_expr_to_literal(arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            eval_array_generate_literal(&values)
+        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err("to_binary expects 1 or 2 arguments".to_string());
@@ -381,6 +394,110 @@ pub(crate) fn sqlparser_function_to_literal(
             "unsupported expression in INSERT VALUES: {}",
             sqlast::Expr::Function(func.clone())
         )),
+    }
+}
+
+fn try_array_map_cast_string_custom_expr(
+    func: &sqlparser::ast::Function,
+) -> Result<Option<Expr>, String> {
+    let name = func.name.to_string().to_ascii_lowercase();
+    if name != "array_map" && name != "transform" {
+        return Ok(None);
+    }
+    let args = function_expr_args(&func.args)?;
+    if !array_map_cast_string_lambda_matches(&args)? {
+        return Ok(None);
+    }
+    Ok(Some(Expr::Cast {
+        expr: Box::new(sqlparser_expr_to_custom_expr(args[1])?),
+        data_type: SqlType::Array(Box::new(SqlType::String)),
+    }))
+}
+
+fn try_array_map_cast_string_literal(
+    name: &str,
+    args: &[&sqlparser::ast::Expr],
+) -> Result<Option<Literal>, String> {
+    if name != "array_map" && name != "transform" {
+        return Ok(None);
+    }
+    if !array_map_cast_string_lambda_matches(args)? {
+        return Ok(None);
+    }
+    let array_value = sqlparser_expr_to_literal(args[1])?;
+    match array_value {
+        Literal::Null => Ok(Some(Literal::Null)),
+        Literal::Array(values) => values
+            .into_iter()
+            .map(|value| cast_literal(value, &SqlType::String))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Literal::Array)
+            .map(Some),
+        other => Err(format!("array_map expects ARRAY input, got {other:?}")),
+    }
+}
+
+fn array_map_cast_string_lambda_matches(args: &[&sqlparser::ast::Expr]) -> Result<bool, String> {
+    if args.len() != 2 {
+        return Ok(false);
+    }
+    let Some((param_name, body)) = parse_single_arrow_lambda(args[0]) else {
+        return Ok(false);
+    };
+    Ok(lambda_body_casts_param_to_string(body, &param_name)?)
+}
+
+fn parse_single_arrow_lambda(
+    expr: &sqlparser::ast::Expr,
+) -> Option<(String, &sqlparser::ast::Expr)> {
+    use sqlparser::ast as sqlast;
+    match expr {
+        sqlast::Expr::Lambda(lambda) => lambda
+            .params
+            .first()
+            .map(|ident| (ident.value.to_lowercase(), lambda.body.as_ref())),
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => parse_single_lambda_param(left).map(|param| (param, right.as_ref())),
+        sqlast::Expr::Nested(inner) => parse_single_arrow_lambda(inner),
+        _ => None,
+    }
+}
+
+fn parse_single_lambda_param(expr: &sqlparser::ast::Expr) -> Option<String> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+        sqlparser::ast::Expr::Nested(inner) => parse_single_lambda_param(inner),
+        _ => None,
+    }
+}
+
+fn lambda_body_casts_param_to_string(
+    expr: &sqlparser::ast::Expr,
+    param_name: &str,
+) -> Result<bool, String> {
+    use sqlparser::ast as sqlast;
+    match expr {
+        sqlast::Expr::Nested(inner) => lambda_body_casts_param_to_string(inner, param_name),
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } if lambda_expr_is_param(inner, param_name) => {
+            let sql_type = crate::sql::parser::dialect::convert_sql_type(data_type.clone())?;
+            Ok(matches!(sql_type, SqlType::String))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn lambda_expr_is_param(expr: &sqlparser::ast::Expr, param_name: &str) -> bool {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
+        sqlparser::ast::Expr::Nested(inner) => lambda_expr_is_param(inner, param_name),
+        _ => false,
     }
 }
 
@@ -493,11 +610,64 @@ pub(crate) fn cast_literal(
             Literal::Float(_) => Ok(value),
             other => Err(format!("cannot cast {:?} to floating point", other)),
         },
+        SqlType::Array(inner) => match value {
+            Literal::Null => Ok(Literal::Null),
+            Literal::Array(values) => values
+                .into_iter()
+                .map(|item| cast_literal(item, inner))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Literal::Array),
+            other => Err(format!("cannot cast {:?} to array", other)),
+        },
         other => Err(format!(
             "standalone generate_series does not support CAST to {:?}",
             other
         )),
     }
+}
+
+pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err("array_generate expects 1 to 3 numeric arguments".to_string());
+    }
+    let literal_to_i64 = |value: &Literal| match value {
+        Literal::Int(v) => Ok(*v),
+        other => Err(format!(
+            "array_generate expects integer arguments, got {other:?}"
+        )),
+    };
+    let (start, stop, step) = match args.len() {
+        1 => (1, literal_to_i64(&args[0])?, 1),
+        2 => (literal_to_i64(&args[0])?, literal_to_i64(&args[1])?, 1),
+        3 => (
+            literal_to_i64(&args[0])?,
+            literal_to_i64(&args[1])?,
+            literal_to_i64(&args[2])?,
+        ),
+        _ => unreachable!(),
+    };
+    if step == 0 {
+        return Err("array_generate step must not be zero".to_string());
+    }
+
+    let mut values = Vec::new();
+    let mut current = start;
+    if step > 0 {
+        while current <= stop {
+            values.push(Literal::Int(current));
+            current = current
+                .checked_add(step)
+                .ok_or_else(|| "array_generate value overflow".to_string())?;
+        }
+    } else {
+        while current >= stop {
+            values.push(Literal::Int(current));
+            current = current
+                .checked_add(step)
+                .ok_or_else(|| "array_generate value overflow".to_string())?;
+        }
+    }
+    Ok(Literal::Array(values))
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,14 +1268,23 @@ mod tests {
     }
 
     #[test]
-    fn array_literal_folds_to_literal_array() {
+    fn array_literal_lowers_to_array_expr() {
         let arr = sqlparser_expr_to_custom_expr(&parse_expr("[1, 2, 3]")).expect("array");
-        let Expr::Literal(Literal::Array(items)) = arr else {
-            panic!("expected Literal::Array");
+        let Expr::Array(items) = arr else {
+            panic!("expected Expr::Array");
         };
         assert_eq!(items.len(), 3);
-        assert!(matches!(items[0], Literal::Int(1)));
-        assert!(matches!(items[2], Literal::Int(3)));
+        assert!(matches!(items[0], Expr::Literal(Literal::Int(1))));
+        assert!(matches!(items[2], Expr::Literal(Literal::Int(3))));
+    }
+
+    #[test]
+    fn array_literal_preserves_column_ref_elements() {
+        let arr = sqlparser_expr_to_custom_expr(&parse_expr("[generate_series]")).expect("array");
+        let Expr::Array(items) = arr else {
+            panic!("expected Expr::Array");
+        };
+        assert!(matches!(items[0], Expr::Column(ref c) if c.name == "generate_series"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio::task;
 use tracing::{info, warn};
 
+use crate::common::failpoint::{self, FailPointMode};
 use crate::novarocks_config::{
     NovaRocksConfig, StandaloneServerConfig as AppStandaloneServerConfig,
 };
@@ -259,6 +260,7 @@ struct NovaRocksMysqlShim {
     /// Per-session group_concat limit (in bytes).
     /// Set via `SET group_concat_max_len = N`.
     group_concat_max_len: i64,
+    user_variables: BTreeMap<String, String>,
 }
 
 impl NovaRocksMysqlShim {
@@ -271,6 +273,7 @@ impl NovaRocksMysqlShim {
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
             group_concat_max_len: 1024,
+            user_variables: BTreeMap::new(),
         }
     }
 }
@@ -538,6 +541,48 @@ fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
+fn parse_set_user_variable_query(query: &str) -> Option<(String, String)> {
+    let trimmed = query.trim();
+    if !trimmed
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case("set"))
+    {
+        return None;
+    }
+    let rest = trimmed[3..].trim_start();
+    if !rest.starts_with('@') {
+        return None;
+    }
+
+    let name_end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| {
+            (idx > 0 && !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '@')).then_some(idx)
+        })
+        .unwrap_or(rest.len());
+    let name = rest[..name_end].to_ascii_lowercase();
+    let after_name = rest[name_end..].trim_start();
+    let value = after_name.strip_prefix('=')?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some((name, value.to_string()))
+}
+
+fn substitute_session_user_variables(
+    query: &str,
+    user_variables: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if user_variables.is_empty() {
+        return Ok(query.to_string());
+    }
+    let assignments = user_variables
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    crate::sql::parser::dialect::substitute_user_variables(query, &assignments)
+}
+
 fn is_supported_embedded_statement(query: &str) -> bool {
     // Skip leading SQL line comments (-- ...)
     let trimmed = query
@@ -628,6 +673,18 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some((name, value)) = parse_set_user_variable_query(trimmed) {
+        shim.user_variables.insert(name, value);
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some((name, mode)) =
+        parse_admin_failpoint_query(trimmed).map_err(|err| (classify_query_error(&err), err))?
+    {
+        failpoint::update(&name, mode).map_err(|err| (classify_query_error(&err), err))?;
+        return Ok(StatementResult::Ok);
+    }
+
     if is_session_noop(trimmed)
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
@@ -648,9 +705,12 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if !is_supported_embedded_statement(trimmed)
-        && !is_materialized_view_management_statement(trimmed)
-        && !looks_like_show_alter_table_optimize(trimmed)
+    let rewritten = substitute_session_user_variables(trimmed, &shim.user_variables)
+        .map_err(|err| (ErrorKind::ER_PARSE_ERROR, err))?;
+
+    if !is_supported_embedded_statement(&rewritten)
+        && !is_materialized_view_management_statement(&rewritten)
+        && !looks_like_show_alter_table_optimize(&rewritten)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -659,7 +719,7 @@ async fn execute_statement_text(
     }
 
     let session = shim.engine.session();
-    let sql = trimmed.to_string();
+    let sql = rewritten;
     let current_catalog = shim.current_catalog.clone();
     let current_db = shim.current_db.clone();
     let query_timeout = shim.query_timeout_secs;
@@ -856,6 +916,45 @@ fn classify_query_error(err: &str) -> ErrorKind {
     }
 }
 
+fn parse_admin_failpoint_query(query: &str) -> Result<Option<(String, FailPointMode)>, String> {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    if parts.len() < 3
+        || !parts[0].eq_ignore_ascii_case("admin")
+        || !parts[2].eq_ignore_ascii_case("failpoint")
+    {
+        return Ok(None);
+    }
+
+    let mode = if parts[1].eq_ignore_ascii_case("enable") {
+        FailPointMode::Enable
+    } else if parts[1].eq_ignore_ascii_case("disable") {
+        FailPointMode::Disable
+    } else {
+        return Ok(None);
+    };
+
+    if parts.len() != 4 {
+        return Err("expected ADMIN ENABLE/DISABLE FAILPOINT '<failpoint_name>'".to_string());
+    }
+
+    let name = strip_string_quotes(parts[3])
+        .ok_or_else(|| "expected ADMIN ENABLE/DISABLE FAILPOINT '<failpoint_name>'".to_string())?;
+    if name.is_empty() {
+        return Err("failpoint name must not be empty".to_string());
+    }
+
+    Ok(Some((name.to_string(), mode)))
+}
+
+fn strip_string_quotes(raw: &str) -> Option<&str> {
+    raw.strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+        .or_else(|| {
+            raw.strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1016,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_set_user_variable_accepts_expression_assignment() {
+        assert_eq!(
+            parse_set_user_variable_query(
+                "SET @var = array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1))"
+            ),
+            Some((
+                "@var".to_string(),
+                "array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1))".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn delete_is_dispatched_to_embedded_engine_not_session_noop() {
         let sql = "DELETE FROM ice.ns.orders WHERE id = 1";
         assert!(
@@ -924,5 +1036,34 @@ mod tests {
             "DELETE must reach the embedded engine so Iceberg row deletes are committed"
         );
         assert!(is_supported_embedded_statement(sql));
+    }
+
+    #[test]
+    fn parse_admin_failpoint_accepts_enable_disable() {
+        assert_eq!(
+            parse_admin_failpoint_query("admin enable failpoint 'agg_hash_set_bad_alloc'"),
+            Ok(Some((
+                "agg_hash_set_bad_alloc".to_string(),
+                FailPointMode::Enable
+            )))
+        );
+        assert_eq!(
+            parse_admin_failpoint_query(
+                "ADMIN DISABLE FAILPOINT \"aggregate_build_hash_map_bad_alloc\""
+            ),
+            Ok(Some((
+                "aggregate_build_hash_map_bad_alloc".to_string(),
+                FailPointMode::Disable
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_admin_failpoint_rejects_malformed_target() {
+        assert!(parse_admin_failpoint_query("admin enable failpoint").is_err());
+        assert!(
+            parse_admin_failpoint_query("admin enable failpoint agg_hash_set_bad_alloc").is_err()
+        );
+        assert_eq!(parse_admin_failpoint_query("admin show config"), Ok(None));
     }
 }

@@ -57,7 +57,7 @@ pub struct SqlCase {
     /// Empty when the case does not use per-case database isolation.
     pub case_dbs: Vec<String>,
     /// When true, this case must run sequentially (not in parallel with other cases).
-    /// Set by file-level `@sequential = true` metadata.
+    /// Set by file-level `@sequential = true` metadata or a legacy `-- name: ... @sequential` tag.
     pub sequential: bool,
 }
 

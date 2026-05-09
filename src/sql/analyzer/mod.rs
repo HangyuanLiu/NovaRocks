@@ -1231,8 +1231,12 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 Ok(())
             }
-            Relation::Subquery { query, alias } => {
-                for col in &query.output_columns {
+            Relation::Subquery {
+                alias,
+                output_columns,
+                ..
+            } => {
+                for col in output_columns {
                     scope.add_column(
                         Some(alias.as_str()),
                         &col.name,
@@ -2224,6 +2228,41 @@ mod tests {
         Ok(resolved)
     }
 
+    #[test]
+    fn derived_values_column_alias_is_visible() {
+        let sql = "SELECT col1 FROM (VALUES (1)) AS tmp(col1)";
+        let (resolved, _) = parse_and_analyze_with_registry(sql).expect("analysis should succeed");
+        assert_eq!(resolved.output_columns[0].name, "col1");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        let Relation::Subquery {
+            query,
+            output_columns,
+            ..
+        } = select.from.as_ref().expect("expected FROM relation")
+        else {
+            panic!("expected derived subquery");
+        };
+        assert_eq!(query.output_columns[0].name, "column_0");
+        assert_eq!(output_columns[0].name, "col1");
+        let ExprKind::ColumnRef { qualifier, column } = &select.projection[0].expr.kind else {
+            panic!("expected column ref projection");
+        };
+        assert_eq!(qualifier.as_deref(), None);
+        assert_eq!(column, "col1");
+    }
+
+    #[test]
+    fn derived_table_column_alias_count_must_match() {
+        let sql = "SELECT a FROM (VALUES (1, 2)) AS tmp(a)";
+        let err = parse_and_analyze_with_registry(sql).expect_err("analysis must fail");
+        assert!(
+            err.contains("has 1 column aliases but subquery produces 2 columns"),
+            "err={err}"
+        );
+    }
+
     /// Helper to check that a Relation tree contains a JOIN of a given kind.
     fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
         match rel {
@@ -2817,6 +2856,81 @@ mod tests {
     }
 
     #[test]
+    fn test_group_concat_rejects_negative_order_by_position() {
+        let err = parse_raw_and_analyze(
+            "SELECT group_concat(distinct 3.1323, o_orderstatus order by 1, 2, -20) FROM orders GROUP BY o_orderkey",
+        )
+        .expect_err("negative group_concat ORDER BY position should be rejected");
+        assert!(
+            err.contains("ORDER BY position -20 is not in group_concat output list."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_empty_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat()")
+            .expect_err("group_concat without input should be rejected");
+        assert!(
+            err.contains("group_concat should have at least one input."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_non_string_separator() {
+        let err = parse_raw_and_analyze(
+            "SELECT group_concat(\"中国\" ORDER BY \"第一\" SEPARATOR 1) FROM orders",
+        )
+        .expect_err("group_concat should reject non-string separator");
+        assert!(
+            err.contains(
+                "group_concat requires separator to be of getType() STRING: group_concat('中国', 1)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_array_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat([1,2]) FROM orders")
+            .expect_err("group_concat should reject array input");
+        assert!(
+            err.contains(
+                "No matching function with signature: group_concat(array<tinyint(4)>, varchar)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_group_concat_rejects_map_input() {
+        let err = parse_raw_and_analyze("SELECT group_concat(map(2,3)) FROM orders")
+            .expect_err("group_concat should reject map input");
+        assert!(
+            err.contains(
+                "No matching function with signature: group_concat(map<tinyint(4),tinyint(4)>, varchar)."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_array_map_lambda_cast_param_resolves_lambda_scope() {
+        let resolved = parse_raw_and_analyze(
+            "SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 3, 1))",
+        )
+        .expect("array_map lambda parameter should resolve in lambda scope");
+        assert_eq!(resolved.output_columns.len(), 1);
+        match &resolved.output_columns[0].data_type {
+            arrow::datatypes::DataType::List(item) => {
+                assert!(matches!(item.data_type(), arrow::datatypes::DataType::Utf8));
+            }
+            other => panic!("expected ARRAY<VARCHAR>, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_group_by_rollup() {
         // q5 pattern: GROUP BY ROLLUP(a, b)
         let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \
@@ -2987,6 +3101,136 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Boolean);
         assert_eq!(args[0].data_type, arrow::datatypes::DataType::Boolean);
+    }
+
+    #[test]
+    fn length_casts_numeric_argument_to_varchar() {
+        let resolved = parse_and_analyze("select length(o_orderkey) from orders")
+            .expect("length should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &sel.projection[0].expr.kind else {
+            panic!(
+                "expected FunctionCall, got {:?}",
+                sel.projection[0].expr.kind
+            );
+        };
+        assert_eq!(name, "length");
+        let ExprKind::Cast { target, expr } = &args[0].kind else {
+            panic!("expected length argument cast, got {:?}", args[0].kind);
+        };
+        assert_eq!(target, &arrow::datatypes::DataType::Utf8);
+        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Utf8);
+        assert_eq!(expr.data_type, arrow::datatypes::DataType::Int64);
+    }
+
+    #[test]
+    fn left_casts_value_argument_but_preserves_length_type() {
+        let resolved = parse_and_analyze("select left(o_totalprice, 6) from orders")
+            .expect("left should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &sel.projection[0].expr.kind else {
+            panic!(
+                "expected FunctionCall, got {:?}",
+                sel.projection[0].expr.kind
+            );
+        };
+        assert_eq!(name, "left");
+        let ExprKind::Cast { target, expr } = &args[0].kind else {
+            panic!("expected left value argument cast, got {:?}", args[0].kind);
+        };
+        assert_eq!(target, &arrow::datatypes::DataType::Utf8);
+        assert_eq!(expr.data_type, arrow::datatypes::DataType::Float64);
+        assert_eq!(args[1].data_type, arrow::datatypes::DataType::Int64);
+    }
+
+    #[test]
+    fn date_trunc_return_type_comes_from_value_argument() {
+        let resolved = parse_and_analyze(
+            "select date_trunc('week', o_orderstatus), date_trunc('week', o_orderdate) from orders",
+        )
+        .expect("date_trunc should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        assert_eq!(
+            sel.projection[0].expr.data_type,
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            sel.projection[1].expr.data_type,
+            arrow::datatypes::DataType::Date32
+        );
+    }
+
+    #[test]
+    fn date_trunc_casts_numeric_value_argument_to_datetime() {
+        let resolved = parse_and_analyze("select date_trunc('week', o_orderkey) from orders")
+            .expect("date_trunc should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let ExprKind::FunctionCall { args, .. } = &sel.projection[0].expr.kind else {
+            panic!(
+                "expected FunctionCall, got {:?}",
+                sel.projection[0].expr.kind
+            );
+        };
+        let ExprKind::Cast { target, expr } = &args[1].kind else {
+            panic!(
+                "expected date_trunc value argument cast, got {:?}",
+                args[1].kind
+            );
+        };
+        assert_eq!(
+            target,
+            &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(expr.data_type, arrow::datatypes::DataType::Int64);
+    }
+
+    #[test]
+    fn split_returns_varchar_array_and_casts_arguments() {
+        let resolved = parse_and_analyze("select split(o_orderkey, 1) from orders")
+            .expect("split should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let arrow::datatypes::DataType::List(item) = &sel.projection[0].expr.data_type else {
+            panic!("expected ARRAY return type");
+        };
+        assert_eq!(item.data_type(), &arrow::datatypes::DataType::Utf8);
+        let ExprKind::FunctionCall { args, .. } = &sel.projection[0].expr.kind else {
+            panic!(
+                "expected FunctionCall, got {:?}",
+                sel.projection[0].expr.kind
+            );
+        };
+        assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
+        assert!(matches!(args[1].kind, ExprKind::Cast { .. }));
+        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Utf8);
+        assert_eq!(args[1].data_type, arrow::datatypes::DataType::Utf8);
+    }
+
+    #[test]
+    fn ceil_expression_analyzes_as_scalar_function() {
+        let resolved = parse_and_analyze("select ceil(sum(o_totalprice)) from orders")
+            .expect("ceil should analyze");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &sel.projection[0].expr.kind else {
+            panic!(
+                "expected FunctionCall, got {:?}",
+                sel.projection[0].expr.kind
+            );
+        };
+        assert_eq!(name, "ceil");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::AggregateCall { .. }));
     }
 
     #[test]

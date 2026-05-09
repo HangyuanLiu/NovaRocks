@@ -247,10 +247,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     .ok_or("subquery in FROM requires an alias")?;
 
                 let resolved_query = self.analyze_query(subquery)?;
+                let output_columns =
+                    derived_table_output_columns(&resolved_query.output_columns, alias.as_ref())?;
 
                 // Build scope from subquery output columns
                 let mut scope = AnalyzerScope::new();
-                for col in &resolved_query.output_columns {
+                for col in &output_columns {
                     scope.add_column(
                         Some(&alias_name),
                         &col.name,
@@ -262,6 +264,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let relation = Relation::Subquery {
                     query: Box::new(resolved_query),
                     alias: alias_name,
+                    output_columns,
                 };
 
                 Ok((relation, scope))
@@ -335,4 +338,33 @@ impl<'a> super::AnalyzerContext<'a> {
         });
         Ok((relation, scope))
     }
+}
+
+fn derived_table_output_columns(
+    columns: &[OutputColumn],
+    alias: Option<&sqlast::TableAlias>,
+) -> Result<Vec<OutputColumn>, String> {
+    let Some(alias) = alias else {
+        return Ok(columns.to_vec());
+    };
+    if alias.columns.is_empty() {
+        return Ok(columns.to_vec());
+    }
+    if alias.columns.len() != columns.len() {
+        return Err(format!(
+            "derived table alias '{}' has {} column aliases but subquery produces {} columns",
+            alias.name.value,
+            alias.columns.len(),
+            columns.len()
+        ));
+    }
+    Ok(columns
+        .iter()
+        .zip(alias.columns.iter())
+        .map(|(col, alias_col)| OutputColumn {
+            name: alias_col.name.value.clone(),
+            data_type: col.data_type.clone(),
+            nullable: col.nullable,
+        })
+        .collect())
 }

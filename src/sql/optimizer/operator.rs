@@ -194,9 +194,16 @@ pub(crate) struct PhysicalProjectOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinOp {
     pub join_type: JoinKind,
-    pub eq_conditions: Vec<(TypedExpr, TypedExpr)>,
+    pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
     pub distribution: JoinDistribution,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalHashJoinEqCondition {
+    pub left: TypedExpr,
+    pub right: TypedExpr,
+    pub null_safe: bool,
 }
 
 #[derive(Clone, Debug)]

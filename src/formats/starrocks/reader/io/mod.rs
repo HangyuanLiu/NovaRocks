@@ -26,5 +26,5 @@ mod range_read;
 mod tablet_root;
 
 pub(super) use operator::build_operator;
-pub(super) use range_read::read_range_bytes;
+pub(super) use range_read::{read_range_bytes, read_segment_bytes};
 pub(super) use tablet_root::TabletRoot;

@@ -342,11 +342,11 @@ pub(crate) fn derive_statistics(
 
             // Compute max NDV from equi-join keys.
             let mut max_ndv = 1.0f64;
-            for (l_key, r_key) in &join.eq_conditions {
-                let l_ndv = get_expr_ndv(l_key, &left_stats.column_statistics)
-                    .max(get_expr_ndv(l_key, &right_stats.column_statistics));
-                let r_ndv = get_expr_ndv(r_key, &left_stats.column_statistics)
-                    .max(get_expr_ndv(r_key, &right_stats.column_statistics));
+            for eq in &join.eq_conditions {
+                let l_ndv = get_expr_ndv(&eq.left, &left_stats.column_statistics)
+                    .max(get_expr_ndv(&eq.left, &right_stats.column_statistics));
+                let r_ndv = get_expr_ndv(&eq.right, &left_stats.column_statistics)
+                    .max(get_expr_ndv(&eq.right, &right_stats.column_statistics));
                 max_ndv = max_ndv.max(l_ndv).max(r_ndv);
             }
 
