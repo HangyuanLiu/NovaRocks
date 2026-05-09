@@ -1582,7 +1582,7 @@ fn write_rewritten_rowset(
         del_files: Vec::new(),
         segment_encryption_metas: Vec::new(),
         next_compaction_offset: source_rowset.next_compaction_offset,
-        bundle_file_offsets: vec![0],
+        bundle_file_offsets: Vec::new(),
         shared_segments: vec![false],
         record_predicate: source_rowset.record_predicate.clone(),
         segment_metas: vec![segment_meta],

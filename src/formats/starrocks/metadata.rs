@@ -249,7 +249,7 @@ pub fn load_bundle_segment_footers(
                     segment.path, bundle_offset, segment_size
                 )
             })?;
-            read_range_bytes(rt.as_ref(), &op, &segment.relative_path, start, end)?
+            read_segment_bytes_for_footer(rt.as_ref(), &op, segment, start, end)?
         } else {
             read_all_bytes(rt.as_ref(), &op, &segment.relative_path)?
         };
@@ -264,6 +264,26 @@ pub fn load_bundle_segment_footers(
     );
 
     Ok(footers)
+}
+
+fn read_segment_bytes_for_footer(
+    rt: &tokio::runtime::Runtime,
+    op: &Operator,
+    segment: &StarRocksSegmentFile,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, String> {
+    match read_range_bytes(rt, op, &segment.relative_path, start, end) {
+        Ok(bytes) => Ok(bytes),
+        Err(range_err)
+            if start == 0
+                && (range_err.contains("too little data")
+                    || range_err.contains("unexpected length")) =>
+        {
+            read_all_bytes(rt, op, &segment.relative_path)
+        }
+        Err(range_err) => Err(range_err),
+    }
 }
 
 fn parse_standalone_snapshot(

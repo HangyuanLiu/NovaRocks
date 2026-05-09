@@ -520,12 +520,7 @@ pub fn build_native_read_plan_with_output_hints(
         .zip(segment_footers.iter())
         .enumerate()
     {
-        let bundle_file_offset = segment.bundle_file_offset.ok_or_else(|| {
-            format!(
-                "segment bundle_file_offset missing in snapshot: index={}, path={}",
-                idx, segment.path
-            )
-        })?;
+        let bundle_file_offset = segment.bundle_file_offset.unwrap_or(0);
         let segment_size = segment.segment_size.ok_or_else(|| {
             format!(
                 "segment size missing in snapshot: index={}, path={}",
