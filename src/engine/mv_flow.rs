@@ -362,11 +362,16 @@ fn write_mv_delete_temp_parquet(
         .close()
         .map_err(|e| format!("close temp parquet writer for delete-side mv refresh: {e}"))?;
 
-    let total_size: i64 = deleted_rows
-        .iter()
-        .flat_map(|batch| batch.columns())
-        .map(|column| column.get_array_memory_size() as i64)
-        .sum();
+    // The downstream HDFS_SCAN treats this size as `range.file_len` and seeks
+    // to `(file_len - 8)` to read the parquet footer magic. We must report the
+    // actual on-disk parquet size, not the in-memory Arrow column footprint —
+    // the latter is materially smaller (one row of a couple of i64/string
+    // columns is ~200-400 bytes in memory but ~700+ bytes as a parquet file
+    // including magic + schema + footer), which makes the reader truncate and
+    // surface "Invalid Parquet file. Corrupt footer".
+    let total_size = std::fs::metadata(&path)
+        .map(|m| m.len() as i64)
+        .map_err(|e| format!("stat temp parquet for delete-side mv refresh: {e}"))?;
     let total_rows = Some(
         deleted_rows
             .iter()
@@ -487,6 +492,42 @@ mod tests {
                 .get(PARQUET_FIELD_ID_META_KEY)
                 .map(String::as_str),
             Some("7")
+        );
+    }
+
+    /// Regression: the returned `total_size` must equal the on-disk parquet
+    /// file length, not the in-memory Arrow column footprint. The downstream
+    /// HDFS_SCAN treats this value as `range.file_len` and seeks to
+    /// `(file_len - 8)` to read the parquet footer magic; a smaller value
+    /// (Arrow buffer size) makes the reader read into data bytes and report
+    /// "Invalid Parquet file. Corrupt footer".
+    #[test]
+    fn mv_delete_temp_parquet_size_matches_on_disk_length() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let (path, total_size, _) =
+            super::write_mv_delete_temp_parquet("ns", "orders", &[batch]).expect("write");
+        let local_path = path.strip_prefix("file://").expect("file path");
+        let on_disk = std::fs::metadata(local_path)
+            .expect("stat temp parquet")
+            .len() as i64;
+
+        assert_eq!(
+            total_size, on_disk,
+            "write_mv_delete_temp_parquet must return on-disk file length \
+             (got total_size={total_size}, on_disk={on_disk}); a smaller value \
+             causes downstream HDFS_SCAN to treat the file as truncated"
         );
     }
 }

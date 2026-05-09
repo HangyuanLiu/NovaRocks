@@ -437,13 +437,18 @@ pub(crate) fn create_table(
     all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
     // The iceberg-rust REST client serialises only the `properties` map of
     // TableCreation; the typed `format_version` builder field never makes it
-    // to the wire, so v3 tables end up created as v2 on REST. Re-insert
-    // `format-version` into the property list. Hadoop catalog reads it
-    // through the typed builder, so the redundant property is harmless.
-    all_properties.push((
-        "format-version".to_string(),
-        format!("{}", format_version as u8),
-    ));
+    // to the wire, so v3 tables would otherwise be created as v2 on REST.
+    // Re-insert `format-version` into the property list for REST only.
+    // Hadoop / Memory catalogs route through `TableMetadataBuilder::from_
+    // table_creation`, which calls `set_properties` and rejects reserved
+    // properties (`format-version` is reserved); the typed `format_version`
+    // builder field is the supported channel there.
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        all_properties.push((
+            "format-version".to_string(),
+            format!("{}", format_version as u8),
+        ));
+    }
     let table_creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
