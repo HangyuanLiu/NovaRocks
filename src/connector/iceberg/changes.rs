@@ -16,7 +16,7 @@ pub(crate) enum ChangeError {
     LineageBroken { previous_snapshot: i64 },
 
     /// Snapshot operation is not understood or not in scope for this phase
-    /// (e.g. `overwrite`, vendor-specific ops).
+    /// (e.g. vendor-specific ops).
     UnsupportedOperation { snapshot_id: i64, op: String },
 
     /// Schema evolution between `previous_snapshot` and `current_snapshot`
@@ -59,22 +59,17 @@ pub(crate) enum IcebergChangePolicySignal {
 
 pub(crate) fn policy_signal_from_change_error(err: &ChangeError) -> IcebergChangePolicySignal {
     match err {
-        ChangeError::UnsupportedOperation { op, .. } if op == "overwrite" => {
-            IcebergChangePolicySignal::FullRefresh {
-                reason: "insert overwrite requires full refresh".to_string(),
-            }
-        }
         ChangeError::LineageBroken { .. } => IcebergChangePolicySignal::FullRefresh {
             reason: "previous snapshot is not reachable".to_string(),
         },
+        ChangeError::ReplaceValidationFailed { reason, .. } => {
+            IcebergChangePolicySignal::FullRefresh {
+                reason: format!("replace snapshot is not a provably safe compaction: {reason}"),
+            }
+        }
         ChangeError::SchemaEvolutionUnsupported { detail } => {
             IcebergChangePolicySignal::Unsupported {
                 reason: format!("schema evolution is not supported by IVM: {detail}"),
-            }
-        }
-        ChangeError::ReplaceValidationFailed { reason, .. } => {
-            IcebergChangePolicySignal::Unsupported {
-                reason: format!("replace snapshot is not a safe compaction: {reason}"),
             }
         }
         other => IcebergChangePolicySignal::Unsupported {
@@ -91,18 +86,10 @@ impl std::fmt::Display for ChangeError {
                 "iceberg lineage broken: previous snapshot {previous_snapshot} is unreachable from current snapshot"
             ),
             ChangeError::UnsupportedOperation { snapshot_id, op } => {
-                if op == "overwrite" {
-                    write!(
-                        f,
-                        "iceberg snapshot {snapshot_id} is an INSERT OVERWRITE; IVM cannot bridge across an overwrite snapshot. \
-                         Either rewrite the workload as DELETE + INSERT, or DROP and re-CREATE the materialized view to reset its lineage."
-                    )
-                } else {
-                    write!(
-                        f,
-                        "iceberg snapshot {snapshot_id} has unsupported operation `{op}`"
-                    )
-                }
+                write!(
+                    f,
+                    "iceberg snapshot {snapshot_id} has unsupported operation `{op}`"
+                )
             }
             ChangeError::SchemaEvolutionUnsupported { detail } => {
                 write!(f, "iceberg schema evolution not supported: {detail}")
@@ -147,6 +134,19 @@ impl std::error::Error for ChangeError {}
 /// expose Iceberg v3 metadata columns while scanning only the appended files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DataFileRef {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_key: Option<String>,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+}
+
+/// Reference to a data file removed by an Iceberg overwrite snapshot. Reading
+/// these files back produces the delete side of the logical change stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeletedDataFileRef {
     pub path: String,
     pub size: i64,
     pub record_count: Option<i64>,
@@ -255,10 +255,10 @@ impl PositionDeleteRef {
 }
 
 /// Output of `plan_changes`: a flattened, in-order projection of every
-/// data-file insert and every position-delete-file ref in the lineage
-/// from `previous_snapshot_id` (exclusive) to `current_snapshot_id`
-/// (inclusive). REPLACE compaction snapshots are validated and skipped;
-/// they contribute to neither vector.
+/// data-file insert, every row-level delete file, and every overwrite-deleted
+/// data file in the lineage from `previous_snapshot_id` (exclusive) to
+/// `current_snapshot_id` (inclusive). REPLACE compaction snapshots are
+/// validated and skipped; they contribute to no delta vector.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergChangeBatch {
     pub previous_snapshot_id: i64,
@@ -266,28 +266,7 @@ pub(crate) struct IcebergChangeBatch {
     pub inserts: Vec<DataFileRef>,
     pub deletes: Vec<PositionDeleteRef>,
     pub equality_deletes: Vec<EqualityDeleteRef>,
-    /// One entry per copy-on-write UPDATE snapshot in the lineage. The
-    /// MV materializer reads each sidecar to recover the (old_row,
-    /// new_row) pairs that drove the snapshot.
-    pub cow_updates: Vec<CowUpdateRef>,
-    /// One entry per merge-on-read UPDATE snapshot in the lineage. The
-    /// inserts and deletes vectors carry the snapshot's contributions —
-    /// this vector lets the materializer pair them as old/new rows
-    /// (rather than treating them as unrelated deletes + inserts).
-    pub mor_updates: Vec<MorUpdateRef>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct CowUpdateRef {
-    pub snapshot_id: i64,
-    pub sidecar_path: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct MorUpdateRef {
-    pub snapshot_id: i64,
+    pub deleted_data_files: Vec<DeletedDataFileRef>,
 }
 
 /// Per-row Change action: this row got inserted or deleted relative to
@@ -330,21 +309,14 @@ pub(crate) enum LineageAction {
     /// Walk the snapshot's data manifests, collect entries with
     /// `added_snapshot_id == this`, project to `DataFileRef`.
     CollectInserts { snapshot_id: i64 },
-    /// Walk the snapshot's delete manifests, collect entries whose
-    /// `DataFile.content_type()` is `PositionDeletes`. Reject equality
-    /// deletes.
+    /// Walk the snapshot's delete manifests, collect row-level delete
+    /// files, and also collect any added data files from the same row-delta
+    /// snapshot.
     CollectDeletes { snapshot_id: i64 },
-    /// Marked NovaRocks copy-on-write UPDATE (overwrite operation with
-    /// `novarocks.row-level-op=update` + `novarocks.update.mode=copy-on-write`
-    /// in the snapshot summary). The MV planner reads the recorded
-    /// sidecar to materialize old/new row pairs instead of treating it as
-    /// a full overwrite.
-    CollectCowUpdate { snapshot_id: i64 },
-    /// Marked NovaRocks merge-on-read UPDATE (delete operation with
-    /// `novarocks.row-level-op=update` + `novarocks.update.mode=merge-on-read`
-    /// in the snapshot summary). Both the added data files and the
-    /// added DV / position-delete files contribute to the change batch.
-    CollectMorUpdate { snapshot_id: i64 },
+    /// Walk the snapshot's data manifests and collect both added data files
+    /// and deleted data files. This is the standard Iceberg representation
+    /// of full-table overwrite and COW row updates.
+    CollectOverwriteDiff { snapshot_id: i64 },
 }
 
 /// Output of `classify_lineage`: a chronologically-ordered list of
@@ -363,7 +335,7 @@ pub(crate) struct LineagePlan {
 ///   collector,
 /// - `Ok(None)` when the snapshot is a validated REPLACE compaction and
 ///   should be silently absorbed,
-/// - `Err(ChangeError)` for OVERWRITE, REPLACE-validation failure, etc.
+/// - `Err(ChangeError)` for REPLACE-validation failure, etc.
 ///
 /// `parent` is required for REPLACE (the validator compares
 /// `total-records` and `schema_id` against the parent). It can be
@@ -377,12 +349,7 @@ fn classify_snapshot(
     let snapshot_id = snapshot.snapshot_id();
     match &snapshot.summary().operation {
         Operation::Append => Ok(Some(LineageAction::CollectInserts { snapshot_id })),
-        Operation::Delete => match update_marker_mode(snapshot) {
-            Some(mode) if mode == crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE_MOR => {
-                Ok(Some(LineageAction::CollectMorUpdate { snapshot_id }))
-            }
-            _ => Ok(Some(LineageAction::CollectDeletes { snapshot_id })),
-        },
+        Operation::Delete => Ok(Some(LineageAction::CollectDeletes { snapshot_id })),
         Operation::Replace => {
             let parent = parent.ok_or_else(|| ChangeError::ReplaceValidationFailed {
                 snapshot_id,
@@ -392,35 +359,8 @@ fn classify_snapshot(
             validate_replace_snapshot(snapshot, parent)?;
             Ok(None)
         }
-        Operation::Overwrite => match update_marker_mode(snapshot) {
-            Some(mode) if mode == crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE_COW => {
-                Ok(Some(LineageAction::CollectCowUpdate { snapshot_id }))
-            }
-            _ => Err(ChangeError::UnsupportedOperation {
-                snapshot_id,
-                op: "overwrite".to_string(),
-            }),
-        },
+        Operation::Overwrite => Ok(Some(LineageAction::CollectOverwriteDiff { snapshot_id })),
     }
-}
-
-/// Read the NovaRocks UPDATE marker pair out of a snapshot's summary,
-/// returning the recorded mode (`copy-on-write` / `merge-on-read`) when
-/// the snapshot was produced by a NovaRocks UPDATE. Returns `None` for
-/// any other snapshot (regular INSERT, DELETE, OVERWRITE, or third-party
-/// writers).
-fn update_marker_mode(snapshot: &iceberg::spec::Snapshot) -> Option<&str> {
-    let props = &snapshot.summary().additional_properties;
-    if props
-        .get(crate::connector::iceberg::commit::NOVAROCKS_ROW_LEVEL_OP)
-        .map(String::as_str)
-        != Some(crate::connector::iceberg::commit::NOVAROCKS_ROW_LEVEL_OP_UPDATE)
-    {
-        return None;
-    }
-    props
-        .get(crate::connector::iceberg::commit::NOVAROCKS_UPDATE_MODE)
-        .map(String::as_str)
 }
 
 /// Validate that a `Replace` snapshot is a compaction (file rewrite that
@@ -597,14 +537,13 @@ pub(crate) fn plan_changes(
             inserts: Vec::new(),
             deletes: Vec::new(),
             equality_deletes: Vec::new(),
-            cow_updates: Vec::new(),
-            mor_updates: Vec::new(),
+            deleted_data_files: Vec::new(),
         });
     }
 
     let file_io = table.file_io();
     let collect = collect_files(metadata, file_io, &plan.actions);
-    let (inserts, deletes, equality_deletes, cow_updates, mor_updates) =
+    let (inserts, deletes, equality_deletes, deleted_data_files) =
         crate::connector::iceberg::catalog::registry::block_on_iceberg(collect).map_err(
             |e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")),
         )??;
@@ -615,8 +554,7 @@ pub(crate) fn plan_changes(
         inserts,
         deletes,
         equality_deletes,
-        cow_updates,
-        mor_updates,
+        deleted_data_files,
     })
 }
 
@@ -664,7 +602,7 @@ pub(crate) fn materialize_changes(
 
     let needs_deletes_scan = !batch.deletes.is_empty()
         || !batch.equality_deletes.is_empty()
-        || !batch.cow_updates.is_empty();
+        || !batch.deleted_data_files.is_empty();
     let deletes = if !needs_deletes_scan {
         crate::engine::QueryResult::empty()
     } else {
@@ -696,10 +634,10 @@ pub(crate) fn materialize_changes(
                 object_store_config,
             )?);
         }
-        if !batch.cow_updates.is_empty() {
-            deleted_rows.extend(scan_cow_update_old_rows(
+        if !batch.deleted_data_files.is_empty() {
+            deleted_rows.extend(scan_deleted_data_file_rows(
                 base_table,
-                &batch.cow_updates,
+                &batch.deleted_data_files,
                 object_store_config,
             )?);
         }
@@ -799,63 +737,34 @@ fn equality_change_to_delete_spec(
     )
 }
 
-/// Read and parse a NovaRocks COW UPDATE sidecar JSON document. The
-/// sidecar is written by `CowUpdateCommit` next to the snapshot's
-/// metadata directory and lists the old/new data files plus the row
-/// IDs touched by the UPDATE.
-async fn read_mutation_sidecar(
-    file_io: &iceberg::io::FileIO,
-    path: &str,
-) -> Result<crate::connector::iceberg::commit::MutationSidecar, String> {
-    let bytes = file_io
-        .new_input(path)
-        .map_err(|e| format!("open mutation sidecar input failed: {e}"))?
-        .read()
-        .await
-        .map_err(|e| format!("read mutation sidecar failed: {e}"))?;
-    serde_json::from_slice::<crate::connector::iceberg::commit::MutationSidecar>(bytes.as_ref())
-        .map_err(|e| format!("parse mutation sidecar failed: {e}"))
-}
-
-/// Read every COW UPDATE old data file recorded in `cow_updates` and
-/// return their row content as `RecordBatch`es. The MV refresh path
-/// feeds these to `execute_query_for_mv_incremental_deletes` so the MV
-/// SELECT projects the pre-update rows; the corresponding new-row
-/// projection comes from the COW snapshot's added data files (already
-/// surfaced as `batch.inserts` by `collect_files`).
-fn scan_cow_update_old_rows(
+/// Read every data file removed by an overwrite snapshot and return its row
+/// content as `RecordBatch`es. The MV refresh path feeds these to
+/// `execute_query_for_mv_incremental_deletes`, so the MV SELECT projects the
+/// pre-overwrite rows using only standard Iceberg manifest diff information.
+fn scan_deleted_data_file_rows(
     base_table: &iceberg::table::Table,
-    cow_updates: &[CowUpdateRef],
+    deleted_data_files: &[DeletedDataFileRef],
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    use crate::connector::iceberg::catalog::registry::block_on_iceberg;
-
-    if cow_updates.is_empty() {
+    if deleted_data_files.is_empty() {
         return Ok(Vec::new());
     }
-    let file_io = base_table.file_io();
     let factory = build_factory_for_table(base_table, object_store_config)?;
 
-    let mut old_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for cow_update in cow_updates {
-        let sidecar = block_on_iceberg(read_mutation_sidecar(file_io, &cow_update.sidecar_path))
-            .map_err(|e| {
-            format!(
-                "scan_cow_update_old_rows: block_on_iceberg for sidecar at {}: {e}",
-                cow_update.sidecar_path
-            )
-        })??;
-        for file in sidecar.touched_data_files {
-            old_paths.insert(file.old_file);
-        }
+    let mut old_paths: std::collections::BTreeMap<String, Option<u64>> =
+        std::collections::BTreeMap::new();
+    for file in deleted_data_files {
+        old_paths
+            .entry(file.path.clone())
+            .or_insert_with(|| u64::try_from(file.size).ok());
     }
 
     let mut out = Vec::new();
-    for path in old_paths {
+    for (path, size) in old_paths {
         let normalized = normalize_delete_projection_path(&path, object_store_config)
-            .map_err(|e| format!("normalize COW UPDATE old file `{path}`: {e}"))?;
-        let batches = read_full_data_file(&normalized, &factory)
-            .map_err(|e| format!("read COW UPDATE old file `{path}`: {e}"))?;
+            .map_err(|e| format!("normalize deleted data file `{path}`: {e}"))?;
+        let batches = read_full_data_file(&normalized, size, &factory)
+            .map_err(|e| format!("read deleted data file `{path}`: {e}"))?;
         out.extend(batches);
     }
     Ok(out)
@@ -863,6 +772,7 @@ fn scan_cow_update_old_rows(
 
 fn read_full_data_file(
     path: &str,
+    size: Option<u64>,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     use crate::cache::CachedRangeReader;
@@ -870,8 +780,8 @@ fn read_full_data_file(
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let reader = factory
-        .open_with_len(path, None)
-        .map_err(|e| format!("open data file {path} for COW UPDATE old-row scan: {e}"))?;
+        .open_with_len(path, size)
+        .map_err(|e| format!("open data file {path} for overwrite delete-row scan: {e}"))?;
     let reader = ParquetCachedReader::new(
         CachedRangeReader::new(reader, None),
         ParquetReadCachePolicy::with_flags(false, false, None),
@@ -970,11 +880,10 @@ fn normalize_delete_projection_path(
 }
 
 /// Async file collection for one `LineagePlan`. Loads each snapshot's
-/// manifest list, walks data manifests for `CollectInserts` /
-/// `CollectMorUpdate` actions, walks delete manifests for `CollectDeletes`
-/// / `CollectMorUpdate` actions, and records `CollectCowUpdate` sidecar
-/// references. Order of the returned vectors matches the lineage order
-/// in `actions`.
+/// manifest list, walks data manifests for added data rows, walks delete
+/// manifests for row-level deletes, and walks overwrite data manifests for
+/// deleted data files. Order of the returned vectors matches the lineage
+/// order in `actions`.
 async fn collect_files(
     metadata: &iceberg::spec::TableMetadata,
     file_io: &iceberg::io::FileIO,
@@ -984,23 +893,20 @@ async fn collect_files(
         Vec<DataFileRef>,
         Vec<PositionDeleteRef>,
         Vec<EqualityDeleteRef>,
-        Vec<CowUpdateRef>,
-        Vec<MorUpdateRef>,
+        Vec<DeletedDataFileRef>,
     ),
     ChangeError,
 > {
     let mut inserts: Vec<DataFileRef> = Vec::new();
     let mut deletes: Vec<PositionDeleteRef> = Vec::new();
     let mut equality_deletes: Vec<EqualityDeleteRef> = Vec::new();
-    let mut cow_updates: Vec<CowUpdateRef> = Vec::new();
-    let mut mor_updates: Vec<MorUpdateRef> = Vec::new();
+    let mut deleted_data_files: Vec<DeletedDataFileRef> = Vec::new();
 
     for action in actions {
         let snapshot_id = match action {
             LineageAction::CollectInserts { snapshot_id }
             | LineageAction::CollectDeletes { snapshot_id }
-            | LineageAction::CollectCowUpdate { snapshot_id }
-            | LineageAction::CollectMorUpdate { snapshot_id } => *snapshot_id,
+            | LineageAction::CollectOverwriteDiff { snapshot_id } => *snapshot_id,
         };
         let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
             ChangeError::InternalInconsistency(format!(
@@ -1027,42 +933,6 @@ async fn collect_files(
                 .await?;
             }
             LineageAction::CollectDeletes { .. } => {
-                collect_added_delete_files_for_manifest_list(
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut deletes,
-                    &mut equality_deletes,
-                )
-                .await?;
-            }
-            LineageAction::CollectCowUpdate { .. } => {
-                let props = &snapshot.summary().additional_properties;
-                let sidecar_path = props
-                    .get(crate::connector::iceberg::commit::NOVAROCKS_UPDATE_SIDECAR)
-                    .ok_or_else(|| {
-                        ChangeError::InternalInconsistency(format!(
-                            "COW update snapshot {snapshot_id} missing novarocks.update.sidecar"
-                        ))
-                    })?
-                    .clone();
-                // The COW snapshot's data manifests contain the rewritten
-                // (replacement) data files added by the UPDATE. Treat them
-                // as fresh inserts for MV refresh — the materializer pairs
-                // them with the recorded old rows by reading the sidecar.
-                collect_added_data_files_for_manifest_list(
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut inserts,
-                )
-                .await?;
-                cow_updates.push(CowUpdateRef {
-                    snapshot_id,
-                    sidecar_path,
-                });
-            }
-            LineageAction::CollectMorUpdate { .. } => {
                 collect_added_data_files_for_manifest_list(
                     snapshot_id,
                     file_io,
@@ -1078,12 +948,27 @@ async fn collect_files(
                     &mut equality_deletes,
                 )
                 .await?;
-                mor_updates.push(MorUpdateRef { snapshot_id });
+            }
+            LineageAction::CollectOverwriteDiff { .. } => {
+                collect_added_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                )
+                .await?;
+                collect_deleted_data_files_for_manifest_list(
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut deleted_data_files,
+                )
+                .await?;
             }
         }
     }
 
-    Ok((inserts, deletes, equality_deletes, cow_updates, mor_updates))
+    Ok((inserts, deletes, equality_deletes, deleted_data_files))
 }
 
 async fn collect_added_data_files_for_manifest_list(
@@ -1153,6 +1038,57 @@ async fn collect_added_data_files_for_manifest_list(
                 partition_spec_id: Some(manifest_file.partition_spec_id),
                 partition_key: iceberg_partition_key(df.partition()),
                 first_row_id,
+                data_sequence_number: Some(
+                    entry
+                        .sequence_number()
+                        .unwrap_or(manifest_file.sequence_number),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn collect_deleted_data_files_for_manifest_list(
+    snapshot_id: i64,
+    file_io: &iceberg::io::FileIO,
+    manifest_list: &iceberg::spec::ManifestList,
+    deleted_data_files: &mut Vec<DeletedDataFileRef>,
+) -> Result<(), ChangeError> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+        if manifest_file.added_snapshot_id != snapshot_id {
+            continue;
+        }
+        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "load data manifest {} for overwrite snapshot {snapshot_id}: {e}",
+                manifest_file.manifest_path
+            ))
+        })?;
+        for entry in manifest.entries() {
+            if entry.status != ManifestStatus::Deleted {
+                continue;
+            }
+            if entry.snapshot_id() != Some(snapshot_id) {
+                continue;
+            }
+            let df = entry.data_file();
+            if df.content_type() != DataContentType::Data {
+                continue;
+            }
+            let record_count = i64::try_from(df.record_count()).unwrap_or(i64::MAX);
+            deleted_data_files.push(DeletedDataFileRef {
+                path: df.file_path().to_string(),
+                size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
+                record_count: Some(record_count),
+                partition_spec_id: Some(manifest_file.partition_spec_id),
+                partition_key: iceberg_partition_key(df.partition()),
+                first_row_id: df.first_row_id(),
                 data_sequence_number: Some(
                     entry
                         .sequence_number()
@@ -1301,8 +1237,11 @@ async fn collect_added_delete_files_for_manifest_list(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
     use iceberg::spec::{Operation, Snapshot, Summary};
 
     use super::{
@@ -1312,8 +1251,11 @@ mod tests {
     };
 
     use crate::connector::iceberg::catalog::registry::{
-        IcebergCatalogEntry, build_catalog_entry, create_namespace, create_table, insert_rows,
-        load_table,
+        IcebergCatalogEntry, block_on_iceberg, build_catalog_entry, build_hadoop_catalog,
+        create_namespace, create_table, insert_rows, load_table,
+    };
+    use crate::connector::iceberg::commit::{
+        CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use crate::sql::{Literal, SqlType, TableColumnDef};
@@ -1321,16 +1263,19 @@ mod tests {
     use super::plan_changes;
 
     #[test]
-    fn overwrite_error_policy_signal_is_full_refresh() {
-        let err = ChangeError::UnsupportedOperation {
+    fn replace_validation_policy_signal_is_full_refresh() {
+        let err = ChangeError::ReplaceValidationFailed {
             snapshot_id: 1,
-            op: "overwrite".to_string(),
+            reason: "records changed".to_string(),
         };
-        assert_eq!(
-            policy_signal_from_change_error(&err),
-            IcebergChangePolicySignal::FullRefresh {
-                reason: "insert overwrite requires full refresh".to_string(),
-            }
+        let IcebergChangePolicySignal::FullRefresh { reason } =
+            policy_signal_from_change_error(&err)
+        else {
+            panic!("expected full refresh signal");
+        };
+        assert!(
+            reason.contains("not a provably safe compaction"),
+            "{reason}"
         );
     }
 
@@ -1505,17 +1450,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_snapshot_overwrite_is_rejected() {
+    fn classify_snapshot_overwrite_emits_collect_overwrite_diff() {
         let s = snap(7, Some(1), Operation::Overwrite, &[], 0);
-        let err = classify_snapshot(&s, None).expect_err("err");
-        assert!(matches!(
-            err,
-            ChangeError::UnsupportedOperation { snapshot_id: 7, ref op } if op == "overwrite"
-        ));
+        let action = classify_snapshot(&s, None).expect("ok");
+        assert_eq!(
+            action,
+            Some(LineageAction::CollectOverwriteDiff { snapshot_id: 7 })
+        );
     }
 
     #[test]
-    fn classify_marked_cow_update_overwrite_as_update() {
+    fn classify_marked_cow_update_overwrite_ignores_private_marker() {
         let s = snap(
             7,
             Some(6),
@@ -1523,18 +1468,17 @@ mod tests {
             &[
                 ("novarocks.row-level-op", "update"),
                 ("novarocks.update.mode", "copy-on-write"),
-                ("novarocks.update.sidecar", "file:///tmp/sidecar.json"),
             ],
             0,
         );
         assert_eq!(
             classify_snapshot(&s, None).expect("classify"),
-            Some(LineageAction::CollectCowUpdate { snapshot_id: 7 })
+            Some(LineageAction::CollectOverwriteDiff { snapshot_id: 7 })
         );
     }
 
     #[test]
-    fn classify_marked_mor_update_delete_as_update() {
+    fn classify_marked_mor_update_delete_ignores_private_marker() {
         let s = snap(
             7,
             Some(6),
@@ -1547,18 +1491,17 @@ mod tests {
         );
         assert_eq!(
             classify_snapshot(&s, None).expect("classify"),
-            Some(LineageAction::CollectMorUpdate { snapshot_id: 7 })
+            Some(LineageAction::CollectDeletes { snapshot_id: 7 })
         );
     }
 
     #[test]
-    fn ordinary_overwrite_still_maps_to_full_refresh_signal() {
+    fn ordinary_overwrite_uses_standard_diff_path() {
         let s = snap(7, Some(6), Operation::Overwrite, &[], 0);
-        let err = classify_snapshot(&s, None).expect_err("ordinary overwrite");
-        assert!(matches!(
-            err,
-            ChangeError::UnsupportedOperation { ref op, .. } if op == "overwrite"
-        ));
+        assert_eq!(
+            classify_snapshot(&s, None).expect("classify"),
+            Some(LineageAction::CollectOverwriteDiff { snapshot_id: 7 })
+        );
     }
 
     #[test]
@@ -1795,6 +1738,126 @@ mod tests {
             .map(|f| f.record_count.unwrap_or_default())
             .sum();
         assert_eq!(returned_rows, 1);
+    }
+
+    #[test]
+    fn plan_changes_collects_overwrite_added_and_deleted_data_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(
+            &entry,
+            "ns",
+            "orders",
+            &[vec![Literal::Int(1)], vec![Literal::Int(2)]],
+        )
+        .expect("seed insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load seed");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        let catalog = build_hadoop_catalog(&entry).expect("catalog");
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "k1",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![3]))],
+        )
+        .expect("replacement batch");
+        let data_files = block_on_iceberg(async {
+            crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                &loaded.table,
+                [batch],
+            )
+            .await
+        })
+        .expect("write runtime")
+        .expect("write data file");
+
+        let metadata = loaded.table.metadata();
+        let table_ident = iceberg::TableIdent::from_strs(["ns", "orders"]).expect("ident");
+        let collector = Arc::new(IcebergCommitCollector::new(
+            CommitOpKind::Overwrite,
+            table_ident,
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test-overwrite", metadata.location()),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        ));
+        for df in data_files {
+            collector.inject_written_file(
+                crate::engine::iceberg_writer::data_file_to_written_file(
+                    &df,
+                    metadata.default_partition_spec_id(),
+                )
+                .expect("written file"),
+            );
+        }
+        block_on_iceberg(async {
+            let file_io = loaded.table.file_io().clone();
+            let ctx = CommitCtx {
+                collector: &collector,
+                table: &loaded.table,
+                catalog: &catalog,
+                file_io: &file_io,
+                commit_uuid: uuid::Uuid::new_v4(),
+                abort_handle: collector.abort_log.clone(),
+                target_ref: "main",
+            };
+            OverwriteCommit.commit(ctx).await
+        })
+        .expect("overwrite runtime")
+        .expect("overwrite commit");
+
+        entry.invalidate_table_cache("ns", "orders");
+        let loaded = load_table(&entry, "ns", "orders").expect("load overwrite");
+        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan overwrite");
+
+        assert_eq!(batch.inserts.len(), 1);
+        assert_eq!(batch.deleted_data_files.len(), 1);
+        assert!(batch.deletes.is_empty());
+        assert!(batch.equality_deletes.is_empty());
+        assert_eq!(
+            batch
+                .inserts
+                .iter()
+                .map(|f| f.record_count.unwrap_or_default())
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            batch
+                .deleted_data_files
+                .iter()
+                .map(|f| f.record_count.unwrap_or_default())
+                .sum::<i64>(),
+            2
+        );
     }
 
     #[test]

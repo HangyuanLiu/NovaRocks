@@ -67,10 +67,7 @@ use super::puffin_dv::{
     DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-use super::types::{
-    CommitOutcome, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE, NOVAROCKS_UPDATE_MODE,
-    NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
-};
+use super::types::{CommitOutcome, WrittenFile};
 
 pub struct RowDeltaDvCommit;
 
@@ -358,23 +355,13 @@ impl TransactionAction for RowDeltaDvTxnAction {
         )
         .map_err(to_iceberg_unexpected)?;
 
-        let mut summary_props = dv_summary(
+        let summary_props = dv_summary(
             &written_dvs,
             total_records,
             newly_deleted_records,
             index.replaced_delete_files,
             index.replaced_delete_records,
         );
-        if !self.written.is_empty() {
-            summary_props.insert(
-                NOVAROCKS_ROW_LEVEL_OP.to_string(),
-                NOVAROCKS_ROW_LEVEL_OP_UPDATE.to_string(),
-            );
-            summary_props.insert(
-                NOVAROCKS_UPDATE_MODE.to_string(),
-                NOVAROCKS_UPDATE_MODE_MOR.to_string(),
-            );
-        }
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(parent_snapshot_id)

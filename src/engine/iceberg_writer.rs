@@ -214,7 +214,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_sidecar: None,
+            cow_update_rewrite: None,
             target_ref: target_ref.to_string(),
         })
         .await

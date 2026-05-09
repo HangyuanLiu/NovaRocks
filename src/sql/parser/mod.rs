@@ -294,10 +294,9 @@ mod tests {
         // inside the function's argument list. sqlparser exposes that as
         // FunctionArgumentClause::IgnoreOrRespectNulls; this requires
         // StarRocksDialect to opt in via supports_window_function_null_treatment_arg().
-        let stmt = parse_sql_raw(
-            "SELECT first_value(v IGNORE NULLS) OVER (ORDER BY x) AS w FROM t",
-        )
-        .expect("IGNORE NULLS inside function args must parse");
+        let stmt =
+            parse_sql_raw("SELECT first_value(v IGNORE NULLS) OVER (ORDER BY x) AS w FROM t")
+                .expect("IGNORE NULLS inside function args must parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query statement");
         };
@@ -335,10 +334,8 @@ mod tests {
         // between the value and the offset, *before* the comma. sqlparser only
         // parses null-treatment after the last arg, so this needs an explicit
         // normalizer rewrite.
-        let stmt = parse_sql_raw(
-            "SELECT LEAD(v IGNORE NULLS, 3) OVER (ORDER BY x) AS w FROM t",
-        )
-        .expect("LEAD(v IGNORE NULLS, 3) must parse");
+        let stmt = parse_sql_raw("SELECT LEAD(v IGNORE NULLS, 3) OVER (ORDER BY x) AS w FROM t")
+            .expect("LEAD(v IGNORE NULLS, 3) must parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
@@ -373,10 +370,8 @@ mod tests {
 
     #[test]
     fn parse_sql_raw_recognizes_respect_nulls_inside_window_function_args() {
-        let stmt = parse_sql_raw(
-            "SELECT lead(v, 1) RESPECT NULLS OVER (ORDER BY x) AS w FROM t",
-        )
-        .expect("RESPECT NULLS after function call must parse");
+        let stmt = parse_sql_raw("SELECT lead(v, 1) RESPECT NULLS OVER (ORDER BY x) AS w FROM t")
+            .expect("RESPECT NULLS after function call must parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query statement");
         };

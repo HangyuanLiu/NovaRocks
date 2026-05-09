@@ -18,9 +18,8 @@
 //! `CowUpdateCommit` — the Iceberg v3 copy-on-write UPDATE commit action.
 //!
 //! This module stages the metadata-only transaction action for COW UPDATE:
-//! delete touched live data files, add rewritten data files, and publish a
-//! sidecar JSON that records row-level update intent. Execution routing is
-//! intentionally left to the follow-up task.
+//! delete touched live data files and add rewritten data files while preserving
+//! row-lineage metadata.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -41,14 +40,25 @@ use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
-use super::types::{
-    CommitOutcome, MutationSidecar, MutationSidecarFile, NOVAROCKS_ROW_LEVEL_OP,
-    NOVAROCKS_ROW_LEVEL_OP_UPDATE, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
-    NOVAROCKS_UPDATE_SIDECAR, WrittenFile,
-};
+use super::types::{CommitOutcome, WrittenFile};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CowUpdateRewriteSet {
+    pub base_snapshot_id: i64,
+    pub target_table_uuid: String,
+    pub updated_row_ids: Vec<i64>,
+    pub touched_data_files: Vec<CowUpdateTouchedFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CowUpdateTouchedFile {
+    pub old_file: String,
+    pub new_files: Vec<String>,
+    pub row_ids: Vec<i64>,
+}
 
 pub struct CowUpdateCommit {
-    pub sidecar: MutationSidecar,
+    pub rewrite: CowUpdateRewriteSet,
 }
 
 #[async_trait]
@@ -64,8 +74,8 @@ impl IcebergCommitAction for CowUpdateCommit {
             }
         }
         if written.is_empty()
-            && self.sidecar.touched_data_files.is_empty()
-            && self.sidecar.updated_row_ids.is_empty()
+            && self.rewrite.touched_data_files.is_empty()
+            && self.rewrite.updated_row_ids.is_empty()
         {
             let id = ctx
                 .table
@@ -82,7 +92,7 @@ impl IcebergCommitAction for CowUpdateCommit {
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = CowUpdateTxnAction {
             written,
-            sidecar: self.sidecar.clone(),
+            rewrite: self.rewrite.clone(),
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             abort_handle: ctx.abort_handle.clone(),
@@ -116,7 +126,7 @@ impl IcebergCommitAction for CowUpdateCommit {
 
 struct CowUpdateTxnAction {
     written: Vec<WrittenFile>,
-    sidecar: MutationSidecar,
+    rewrite: CowUpdateRewriteSet,
     commit_uuid: Uuid,
     file_io: FileIO,
     abort_handle: Arc<AbortLog>,
@@ -154,13 +164,13 @@ impl TransactionAction for CowUpdateTxnAction {
         let row_lineage_first_row_id = m.next_row_id();
 
         validate_cow_update_inputs(
-            &self.sidecar,
+            &self.rewrite,
             &self.written,
             parent_snapshot_id,
             &m.uuid().to_string(),
         )
         .map_err(to_iceberg_data_invalid)?;
-        let touched_paths = touched_old_file_paths(&self.sidecar);
+        let touched_paths = touched_old_file_paths(&self.rewrite);
         let index = build_cow_snapshot_index(table, &self.file_io, &touched_paths, target_ref)
             .await
             .map_err(to_iceberg_unexpected)?;
@@ -173,12 +183,6 @@ impl TransactionAction for CowUpdateTxnAction {
             )));
         }
         let touched_delete_groups = group_live_files_by_partition_spec(&index.touched_live);
-
-        let sidecar_path = format!("{metadata_dir}/{}-update-sidecar.json", self.commit_uuid);
-        self.abort_handle.record_manifest(sidecar_path.clone());
-        write_mutation_sidecar(&self.file_io, &sidecar_path, &self.sidecar)
-            .await
-            .map_err(to_iceberg_unexpected)?;
 
         let mut new_manifests: Vec<ManifestFile> = index.untouched_manifests;
         for (idx, carried) in index.carried_live.iter().enumerate() {
@@ -234,7 +238,7 @@ impl TransactionAction for CowUpdateTxnAction {
             .iter()
             .map(|file| (file.path.clone(), file.clone()))
             .collect::<HashMap<_, _>>();
-        for (idx, sidecar_file) in self.sidecar.touched_data_files.iter().enumerate() {
+        for (idx, rewrite_file) in self.rewrite.touched_data_files.iter().enumerate() {
             let data_manifest_path = format!(
                 "{metadata_dir}/{}-cow-update-data-{idx}.avro",
                 self.commit_uuid
@@ -245,13 +249,13 @@ impl TransactionAction for CowUpdateTxnAction {
                 .lock()
                 .expect("manifest_paths_out poisoned")
                 .push(data_manifest_path.clone());
-            let replacement_files = sidecar_file
+            let replacement_files = rewrite_file
                 .new_files
                 .iter()
                 .map(|path| {
                     written_by_path.get(path).cloned().ok_or_else(|| {
                         to_iceberg_data_invalid(format!(
-                            "CowUpdateCommit sidecar replacement data file {path} was not written"
+                            "CowUpdateCommit rewrite replacement data file {path} was not written"
                         ))
                     })
                 })
@@ -270,7 +274,7 @@ impl TransactionAction for CowUpdateTxnAction {
             .map_err(to_iceberg_unexpected)?;
             new_manifests.push(mark_replacement_manifest_row_id_assigned(
                 data_manifest,
-                replacement_manifest_first_row_id(sidecar_file).map_err(to_iceberg_data_invalid)?,
+                replacement_manifest_first_row_id(rewrite_file).map_err(to_iceberg_data_invalid)?,
             ));
         }
 
@@ -304,7 +308,7 @@ impl TransactionAction for CowUpdateTxnAction {
 
         let summary = Summary {
             operation: Operation::Overwrite,
-            additional_properties: cow_update_summary(&sidecar_path),
+            additional_properties: HashMap::new(),
         };
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
@@ -554,110 +558,100 @@ fn mark_replacement_manifest_row_id_assigned(
 }
 
 fn validate_cow_update_inputs(
-    sidecar: &MutationSidecar,
+    rewrite: &CowUpdateRewriteSet,
     written: &[WrittenFile],
     parent_snapshot_id: Option<i64>,
     table_uuid: &str,
 ) -> Result<(), String> {
-    if sidecar.operation != NOVAROCKS_ROW_LEVEL_OP_UPDATE {
-        return Err(format!(
-            "CowUpdateCommit sidecar operation must be {NOVAROCKS_ROW_LEVEL_OP_UPDATE}"
-        ));
-    }
-    if sidecar.mode != NOVAROCKS_UPDATE_MODE_COW {
-        return Err(format!(
-            "CowUpdateCommit sidecar mode must be {NOVAROCKS_UPDATE_MODE_COW}"
-        ));
-    }
     let parent_snapshot_id = parent_snapshot_id
         .ok_or_else(|| "CowUpdateCommit requires a current snapshot".to_string())?;
-    if sidecar.base_snapshot_id != parent_snapshot_id {
+    if rewrite.base_snapshot_id != parent_snapshot_id {
         return Err(format!(
-            "CowUpdateCommit sidecar base snapshot {} does not match current snapshot {}",
-            sidecar.base_snapshot_id, parent_snapshot_id
+            "CowUpdateCommit rewrite base snapshot {} does not match current snapshot {}",
+            rewrite.base_snapshot_id, parent_snapshot_id
         ));
     }
-    if sidecar.target_table_uuid != table_uuid {
+    if rewrite.target_table_uuid != table_uuid {
         return Err(format!(
-            "CowUpdateCommit sidecar target table UUID {} does not match current table UUID {}",
-            sidecar.target_table_uuid, table_uuid
+            "CowUpdateCommit rewrite target table UUID {} does not match current table UUID {}",
+            rewrite.target_table_uuid, table_uuid
         ));
     }
-    if sidecar.touched_data_files.is_empty() || written.is_empty() {
+    if rewrite.touched_data_files.is_empty() || written.is_empty() {
         return Err(
             "CowUpdateCommit requires touched data files and replacement data files".to_string(),
         );
     }
-    if sidecar.updated_row_ids.is_empty() {
-        return Err("CowUpdateCommit sidecar updated_row_ids must not be empty".to_string());
+    if rewrite.updated_row_ids.is_empty() {
+        return Err("CowUpdateCommit rewrite updated_row_ids must not be empty".to_string());
     }
 
     let mut updated_row_ids = HashSet::new();
-    for row_id in &sidecar.updated_row_ids {
+    for row_id in &rewrite.updated_row_ids {
         if !updated_row_ids.insert(*row_id) {
             return Err(format!(
-                "CowUpdateCommit sidecar contains duplicate updated row id {row_id}"
+                "CowUpdateCommit rewrite contains duplicate updated row id {row_id}"
             ));
         }
     }
 
     let mut old_files = HashSet::new();
-    let mut sidecar_row_ids = HashSet::new();
-    let mut sidecar_new_files = HashSet::new();
-    for file in &sidecar.touched_data_files {
+    let mut rewrite_row_ids = HashSet::new();
+    let mut rewrite_new_files = HashSet::new();
+    for file in &rewrite.touched_data_files {
         if !old_files.insert(file.old_file.clone()) {
             return Err(format!(
-                "CowUpdateCommit sidecar contains duplicate touched data file {}",
+                "CowUpdateCommit rewrite contains duplicate touched data file {}",
                 file.old_file
             ));
         }
         if file.row_ids.is_empty() {
             return Err(format!(
-                "CowUpdateCommit sidecar touched data file {} has no row ids",
+                "CowUpdateCommit rewrite touched data file {} has no row ids",
                 file.old_file
             ));
         }
         if file.new_files.is_empty() {
             return Err(format!(
-                "CowUpdateCommit sidecar touched data file {} has no replacement data files",
+                "CowUpdateCommit rewrite touched data file {} has no replacement data files",
                 file.old_file
             ));
         }
         for row_id in &file.row_ids {
-            if !sidecar_row_ids.insert(*row_id) {
+            if !rewrite_row_ids.insert(*row_id) {
                 return Err(format!(
-                    "CowUpdateCommit sidecar contains duplicate touched row id {row_id}"
+                    "CowUpdateCommit rewrite contains duplicate touched row id {row_id}"
                 ));
             }
         }
         for new_file in &file.new_files {
-            if !sidecar_new_files.insert(new_file.clone()) {
+            if !rewrite_new_files.insert(new_file.clone()) {
                 return Err(format!(
-                    "CowUpdateCommit sidecar contains duplicate replacement data file {new_file}"
+                    "CowUpdateCommit rewrite contains duplicate replacement data file {new_file}"
                 ));
             }
         }
     }
-    for row_id in updated_row_ids.difference(&sidecar_row_ids) {
+    for row_id in updated_row_ids.difference(&rewrite_row_ids) {
         return Err(format!(
-            "CowUpdateCommit sidecar updated_row_ids contains row id {row_id}, but touched files are missing touched row id {row_id}"
+            "CowUpdateCommit rewrite updated_row_ids contains row id {row_id}, but touched files are missing touched row id {row_id}"
         ));
     }
     let written_files: HashSet<String> = written.iter().map(|f| f.path.clone()).collect();
     if written_files.len() != written.len() {
         return Err("CowUpdateCommit received duplicate replacement data file paths".to_string());
     }
-    for new_file in &sidecar_new_files {
+    for new_file in &rewrite_new_files {
         if !written_files.contains(new_file) {
             return Err(format!(
-                "CowUpdateCommit sidecar replacement data file {new_file} was not written"
+                "CowUpdateCommit rewrite replacement data file {new_file} was not written"
             ));
         }
     }
     for written_file in &written_files {
-        if !sidecar_new_files.contains(written_file) {
+        if !rewrite_new_files.contains(written_file) {
             return Err(format!(
-                "CowUpdateCommit written data file {written_file} is missing from sidecar"
+                "CowUpdateCommit written data file {written_file} is missing from rewrite"
             ));
         }
     }
@@ -665,19 +659,19 @@ fn validate_cow_update_inputs(
     Ok(())
 }
 
-fn replacement_manifest_first_row_id(sidecar_file: &MutationSidecarFile) -> Result<u64, String> {
-    let first = sidecar_file
+fn replacement_manifest_first_row_id(rewrite_file: &CowUpdateTouchedFile) -> Result<u64, String> {
+    let first = rewrite_file
         .row_ids
         .iter()
         .copied()
         .min()
-        .ok_or_else(|| "CowUpdateCommit sidecar has no replacement row ids".to_string())?;
+        .ok_or_else(|| "CowUpdateCommit rewrite has no replacement row ids".to_string())?;
     u64::try_from(first)
-        .map_err(|_| format!("CowUpdateCommit sidecar contains negative row id {first}"))
+        .map_err(|_| format!("CowUpdateCommit rewrite contains negative row id {first}"))
 }
 
-fn touched_old_file_paths(sidecar: &MutationSidecar) -> HashSet<String> {
-    sidecar
+fn touched_old_file_paths(rewrite: &CowUpdateRewriteSet) -> HashSet<String> {
+    rewrite
         .touched_data_files
         .iter()
         .map(|f| f.old_file.clone())
@@ -698,39 +692,6 @@ fn partition_spec_by_id(
         })
 }
 
-pub async fn write_mutation_sidecar(
-    file_io: &FileIO,
-    path: &str,
-    sidecar: &MutationSidecar,
-) -> Result<(), String> {
-    let bytes = serde_json::to_vec(sidecar)
-        .map_err(|e| format!("serialize mutation sidecar failed: {e}"))?;
-    file_io
-        .new_output(path)
-        .map_err(|e| format!("create mutation sidecar output failed: {e}"))?
-        .write(bytes.into())
-        .await
-        .map_err(|e| format!("write mutation sidecar failed: {e}"))?;
-    Ok(())
-}
-
-fn cow_update_summary(sidecar_path: &str) -> HashMap<String, String> {
-    HashMap::from_iter([
-        (
-            NOVAROCKS_ROW_LEVEL_OP.to_string(),
-            NOVAROCKS_ROW_LEVEL_OP_UPDATE.to_string(),
-        ),
-        (
-            NOVAROCKS_UPDATE_MODE.to_string(),
-            NOVAROCKS_UPDATE_MODE_COW.to_string(),
-        ),
-        (
-            NOVAROCKS_UPDATE_SIDECAR.to_string(),
-            sidecar_path.to_string(),
-        ),
-    ])
-}
-
 fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
 }
@@ -741,55 +702,44 @@ fn to_iceberg_data_invalid(s: String) -> iceberg::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{IcebergUpdateMode, MutationSidecarFile};
     use super::*;
     use iceberg::spec::{DataFileFormat, Struct};
 
     #[test]
     fn type_compiles() {
-        let sidecar = MutationSidecar::update(
-            IcebergUpdateMode::CopyOnWrite,
-            7,
-            "table-uuid".to_string(),
-            vec![1],
-            vec![MutationSidecarFile {
-                old_file: "old.parquet".to_string(),
-                new_files: vec!["new.parquet".to_string()],
-                row_ids: vec![1],
-            }],
-        );
+        let rewrite = cow_rewrite();
 
-        let commit = CowUpdateCommit { sidecar };
-        assert_eq!(commit.sidecar.mode, NOVAROCKS_UPDATE_MODE_COW);
+        let commit = CowUpdateCommit { rewrite };
+        assert_eq!(commit.rewrite.base_snapshot_id, 7);
     }
 
     #[test]
-    fn validate_cow_update_inputs_accepts_consistent_sidecar() {
-        let sidecar = cow_sidecar();
+    fn validate_cow_update_inputs_accepts_consistent_rewrite() {
+        let rewrite = cow_rewrite();
         let written = vec![written_file("new.parquet")];
 
-        validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
-            .expect("valid sidecar");
+        validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
+            .expect("valid rewrite");
     }
 
     #[test]
     fn validate_cow_update_inputs_rejects_duplicate_row_ids() {
-        let mut sidecar = cow_sidecar();
-        sidecar.updated_row_ids = vec![1, 1];
+        let mut rewrite = cow_rewrite();
+        rewrite.updated_row_ids = vec![1, 1];
         let written = vec![written_file("new.parquet")];
 
-        let err = validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
+        let err = validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect_err("duplicate row ids must fail");
 
         assert!(err.contains("duplicate updated row id 1"));
     }
 
     #[test]
-    fn validate_cow_update_inputs_rejects_written_sidecar_mismatch() {
-        let sidecar = cow_sidecar();
+    fn validate_cow_update_inputs_rejects_written_rewrite_mismatch() {
+        let rewrite = cow_rewrite();
         let written = vec![written_file("other.parquet")];
 
-        let err = validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
+        let err = validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect_err("replacement file mismatch must fail");
 
         assert!(err.contains("new.parquet was not written"));
@@ -797,12 +747,12 @@ mod tests {
 
     #[test]
     fn validate_cow_update_inputs_rejects_updated_row_id_missing_from_touched_files() {
-        let mut sidecar = cow_sidecar();
-        sidecar.updated_row_ids = vec![1, 2];
-        sidecar.touched_data_files[0].row_ids = vec![1];
+        let mut rewrite = cow_rewrite();
+        rewrite.updated_row_ids = vec![1, 2];
+        rewrite.touched_data_files[0].row_ids = vec![1];
         let written = vec![written_file("new.parquet")];
 
-        let err = validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
+        let err = validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect_err("updated row id mismatch must fail");
 
         assert!(err.contains("missing touched row id 2"));
@@ -810,27 +760,26 @@ mod tests {
 
     #[test]
     fn validate_cow_update_inputs_allows_rewritten_row_ids_in_touched_files() {
-        let mut sidecar = cow_sidecar();
-        sidecar.updated_row_ids = vec![1];
-        sidecar.touched_data_files[0].row_ids = vec![1, 2];
+        let mut rewrite = cow_rewrite();
+        rewrite.updated_row_ids = vec![1];
+        rewrite.touched_data_files[0].row_ids = vec![1, 2];
         let written = vec![written_file("new.parquet")];
 
-        validate_cow_update_inputs(&sidecar, &written, Some(7), "table-uuid")
+        validate_cow_update_inputs(&rewrite, &written, Some(7), "table-uuid")
             .expect("rewritten row ids may include unchanged rows");
     }
 
-    fn cow_sidecar() -> MutationSidecar {
-        MutationSidecar::update(
-            IcebergUpdateMode::CopyOnWrite,
-            7,
-            "table-uuid".to_string(),
-            vec![1],
-            vec![MutationSidecarFile {
+    fn cow_rewrite() -> CowUpdateRewriteSet {
+        CowUpdateRewriteSet {
+            base_snapshot_id: 7,
+            target_table_uuid: "table-uuid".to_string(),
+            updated_row_ids: vec![1],
+            touched_data_files: vec![CowUpdateTouchedFile {
                 old_file: "old.parquet".to_string(),
                 new_files: vec!["new.parquet".to_string()],
                 row_ids: vec![1],
             }],
-        )
+        }
     }
 
     fn written_file(path: &str) -> WrittenFile {

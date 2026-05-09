@@ -42,8 +42,9 @@ use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
 use super::truncate::TruncateCommit;
-use super::types::{CommitOpKind, CommitOutcome, MutationSidecar};
+use super::types::{CommitOpKind, CommitOutcome};
 use super::update_cow::CowUpdateCommit;
+use super::update_cow::CowUpdateRewriteSet;
 
 pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
@@ -54,7 +55,7 @@ pub struct RunInput {
     pub fs: Operator,
     pub file_io: FileIO,
     pub cleanup_path_mapper: Option<CleanupPathMapper>,
-    pub cow_update_sidecar: Option<MutationSidecar>,
+    pub cow_update_rewrite: Option<CowUpdateRewriteSet>,
     /// Iceberg ref to commit to. `"main"` is the default; branch-qualified
     /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
     pub target_ref: String,
@@ -75,7 +76,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         fs,
         file_io,
         cleanup_path_mapper,
-        cow_update_sidecar,
+        cow_update_rewrite,
         target_ref,
     } = input;
 
@@ -86,8 +87,8 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
         CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
         CommitOpKind::CowUpdate => Box::new(CowUpdateCommit {
-            sidecar: cow_update_sidecar
-                .ok_or_else(|| "CowUpdate commit requires a mutation sidecar".to_string())?,
+            rewrite: cow_update_rewrite
+                .ok_or_else(|| "CowUpdate commit requires a rewrite set".to_string())?,
         }),
         CommitOpKind::Truncate => Box::new(TruncateCommit),
         CommitOpKind::OverwritePartitions => {
