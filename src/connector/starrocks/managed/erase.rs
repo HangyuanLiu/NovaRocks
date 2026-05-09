@@ -97,15 +97,20 @@ fn erase_root(root_path: &str, config: &ManagedLakeConfig) -> Result<(), String>
     let (operator, rel_path) =
         resolve_oss_operator_and_path_with_config(root_path, &object_store_cfg)
             .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
-    if rel_path.trim_matches('/').is_empty() {
-        return Err(format!(
-            "refuse to erase empty managed lake root resolved from `{root_path}`"
-        ));
-    }
-    let remove_result = oss_block_on(operator.remove_all(&rel_path))
+    let erase_prefix = erase_prefix_path(&rel_path)
+        .map_err(|e| format!("refuse to erase managed lake root `{root_path}`: {e}"))?;
+    let remove_result = oss_block_on(operator.remove_all(&erase_prefix))
         .map_err(|e| format!("run erase root `{root_path}` failed: {e}"))?;
     remove_result.map_err(|e| format!("erase root `{root_path}` failed: {e}"))?;
     Ok(())
+}
+
+fn erase_prefix_path(rel_path: &str) -> Result<String, String> {
+    let trimmed = rel_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("empty managed lake root".to_string());
+    }
+    Ok(format!("{trimmed}/"))
 }
 
 fn current_time_ms() -> i64 {
@@ -396,6 +401,23 @@ mod tests {
                 .last_error
                 .as_deref()
                 .is_some_and(|msg| msg.contains("injected erase failure"))
+        );
+    }
+
+    #[test]
+    fn erase_prefix_path_keeps_directory_boundary() {
+        assert_eq!(
+            super::erase_prefix_path("warehouse/db_70/table_124").expect("prefix"),
+            "warehouse/db_70/table_124/"
+        );
+        assert_eq!(
+            super::erase_prefix_path("warehouse/db_70/table_124/").expect("prefix"),
+            "warehouse/db_70/table_124/"
+        );
+        assert!(
+            super::erase_prefix_path("/")
+                .expect_err("empty root must be rejected")
+                .contains("empty")
         );
     }
 }

@@ -331,11 +331,11 @@ impl ManagedLakeCatalog {
                 .collect::<HashSet<_>>();
 
             for tablet in &runtime.tablets {
-                let _ = remove_tablet_runtime(tablet.tablet_id);
-                if runtime.table.state != ManagedTableState::Active
-                    || !active_partition_ids.contains(&tablet.partition_id)
-                    || !active_index_ids.contains(&tablet.index_id)
-                {
+                let active = runtime.table.state == ManagedTableState::Active
+                    && active_partition_ids.contains(&tablet.partition_id)
+                    && active_index_ids.contains(&tablet.index_id);
+                if !active {
+                    let _ = remove_tablet_runtime(tablet.tablet_id);
                     continue;
                 }
                 let ctx = TabletWriteContext {

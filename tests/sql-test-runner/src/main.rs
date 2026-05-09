@@ -2019,7 +2019,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::config::substitute_placeholders;
-    use crate::parser::extract_suite_hook;
+    use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::ResultSet;
@@ -2036,6 +2036,19 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!(
             "novarocks_sql_tests_{}_{}_{}.result",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn temp_sql_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "novarocks_sql_tests_{}_{}_{}.sql",
             name,
             std::process::id(),
             nanos
@@ -2189,6 +2202,30 @@ mod tests {
         let message =
             "ERROR 5904 (42000) at line 10: Warehouse default_warehouse is not available.";
         assert!(!is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn legacy_name_sequential_tag_marks_case_sequential() {
+        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").expect("meta regex");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let path = temp_sql_path("legacy_sequential");
+        fs::write(
+            &path,
+            "-- query 1\nSELECT 1;\n\n-- name: legacy_agg @sequential\n-- query 2\nSELECT 2;\n",
+        )
+        .expect("write sql file");
+
+        let case = load_sql_case_from_file(
+            &path,
+            &meta_re,
+            &marker_re,
+            &std::collections::HashMap::new(),
+        )
+        .expect("load sql case")
+        .expect("case should be loaded");
+
+        assert!(case.sequential);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

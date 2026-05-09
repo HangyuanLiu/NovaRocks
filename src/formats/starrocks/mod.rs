@@ -39,6 +39,7 @@ pub mod cache;
 pub mod data;
 pub mod metadata;
 pub mod plan;
+pub(crate) mod range_read;
 pub mod reader;
 pub mod segment;
 pub mod writer;

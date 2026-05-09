@@ -24,6 +24,8 @@
 
 use opendal::{ErrorKind, Operator};
 
+use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expected_range_len};
+
 /// Read `[start, end)` bytes from object storage.
 pub(crate) fn read_range_bytes(
     rt: &tokio::runtime::Runtime,
@@ -38,10 +40,27 @@ pub(crate) fn read_range_bytes(
             path, start, end
         ));
     }
+    let expected_len = expected_range_len(path, start, end)?;
     const MAX_READ_ATTEMPTS: usize = 4;
     for attempt in 1..=MAX_READ_ATTEMPTS {
         match rt.block_on(op.read_with(path).range(start..end).into_future()) {
-            Ok(v) => return Ok(v.to_vec()),
+            Ok(v) => {
+                let bytes = v.to_vec();
+                match ensure_exact_range_read_len(path, start, end, bytes.len()) {
+                    Ok(()) => return Ok(bytes),
+                    Err(err) if attempt < MAX_READ_ATTEMPTS => {
+                        let backoff_ms =
+                            (100_u64).saturating_mul(1_u64 << (attempt - 1)).min(2_000);
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "read segment file range failed in native data loader: {err}, expected_bytes={expected_len}"
+                        ));
+                    }
+                }
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(format!("segment file not found: {}", path));
             }

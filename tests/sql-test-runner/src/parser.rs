@@ -44,6 +44,28 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
     Some((key, value))
 }
 
+fn legacy_name_line_has_sequential_tag(line: &str) -> bool {
+    let Some(body) = line.trim().strip_prefix("--").map(str::trim_start) else {
+        return false;
+    };
+    if !body
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("name:"))
+    {
+        return false;
+    }
+    body.split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("@sequential"))
+}
+
+fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re: &Regex) -> bool {
+    file_meta_lines.iter().any(|line| {
+        parse_meta_line(line, meta_re)
+            .map(|(k, v)| k == "sequential" && parse_bool(&v).unwrap_or(false))
+            .unwrap_or(false)
+    }) || lines.iter().any(|line| legacy_name_line_has_sequential_tag(line))
+}
+
 pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
     let mut meta = QueryMeta::default();
     for line in lines {
@@ -268,12 +290,9 @@ pub fn load_sql_case_from_file(
     let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
         .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
 
-    // Detect file-level @sequential flag (case-level, not step-level).
-    let is_sequential = file_meta_lines.iter().any(|line| {
-        parse_meta_line(line, meta_re)
-            .map(|(k, v)| k == "sequential" && parse_bool(&v).unwrap_or(false))
-            .unwrap_or(false)
-    });
+    // Detect case-level sequential flags from the native runner metadata and
+    // from migrated legacy `-- name: ... @sequential` markers.
+    let is_sequential = detect_case_sequential(&lines, &file_meta_lines, meta_re);
 
     let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
         // No query markers: split by semicolons into separate statements.

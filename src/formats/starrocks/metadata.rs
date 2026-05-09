@@ -29,6 +29,7 @@ use prost::Message;
 
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
+use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expected_range_len};
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::service::grpc_client::proto::starrocks::{
@@ -1006,10 +1007,27 @@ fn read_range_bytes(
             path, start, end
         ));
     }
+    let expected_len = expected_range_len(path, start, end)?;
     const MAX_READ_ATTEMPTS: usize = 4;
     for attempt in 1..=MAX_READ_ATTEMPTS {
         match rt.block_on(op.read_with(path).range(start..end).into_future()) {
-            Ok(v) => return Ok(v.to_vec()),
+            Ok(v) => {
+                let bytes = v.to_vec();
+                match ensure_exact_range_read_len(path, start, end, bytes.len()) {
+                    Ok(()) => return Ok(bytes),
+                    Err(err) if attempt < MAX_READ_ATTEMPTS => {
+                        let backoff_ms =
+                            (100_u64).saturating_mul(1_u64 << (attempt - 1)).min(2_000);
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "read segment file range failed: {err}, expected_bytes={expected_len}"
+                        ));
+                    }
+                }
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(format!("segment file not found: {}", path));
             }
@@ -1594,9 +1612,94 @@ mod tests {
     }
 
     #[test]
-    fn accept_unique_table_model() {
+    fn load_bundle_segment_footers_reads_single_offset_zero_segment_as_whole_file() {
         let tablet_id = 10004_i64;
         let version = 45_i64;
+        let temp_dir = TempDir::new().expect("create temp dir");
+        std::fs::create_dir_all(temp_dir.path().join("meta")).expect("create meta dir");
+        std::fs::create_dir_all(temp_dir.path().join("data")).expect("create data dir");
+
+        let segment = build_test_segment_bytes(3, 11, 12);
+        let actual_segment_size = u64::try_from(segment.len()).expect("segment size fit u64");
+        std::fs::write(temp_dir.path().join("data/standalone.dat"), segment)
+            .expect("write standalone segment file");
+
+        let tablet_metadata = TabletMetadataPb {
+            id: Some(tablet_id),
+            version: Some(version),
+            rowsets: vec![RowsetMetadataPb {
+                segments: vec!["standalone.dat".to_string()],
+                num_rows: Some(11),
+                segment_size: vec![actual_segment_size + 9],
+                bundle_file_offsets: vec![0],
+                ..Default::default()
+            }],
+            rowset_to_schema: [(1_u32, 8_i64)].into_iter().collect(),
+            ..Default::default()
+        };
+        let tablet_metadata_bytes = tablet_metadata.encode_to_vec();
+
+        let bundle = BundleTabletMetadataPb {
+            tablet_to_schema: [(tablet_id, 8_i64)].into_iter().collect(),
+            schemas: [(
+                8_i64,
+                TabletSchemaPb {
+                    keys_type: Some(KeysType::DupKeys as i32),
+                    id: Some(8_i64),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            tablet_meta_pages: [(
+                tablet_id,
+                PagePointerPb {
+                    offset: 0_u64,
+                    size: u32::try_from(tablet_metadata_bytes.len())
+                        .expect("metadata bytes fit u32"),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let bundle_bytes = bundle.encode_to_vec();
+        let mut metadata_file_bytes = Vec::new();
+        metadata_file_bytes.extend_from_slice(&tablet_metadata_bytes);
+        metadata_file_bytes.extend_from_slice(&bundle_bytes);
+        metadata_file_bytes.extend_from_slice(
+            &u64::try_from(bundle_bytes.len())
+                .expect("bundle bytes fit u64")
+                .to_le_bytes(),
+        );
+
+        let bundle_metadata_file = temp_dir
+            .path()
+            .join(metadata_rel_path(0, version).expect("bundle metadata rel path"));
+        std::fs::write(&bundle_metadata_file, metadata_file_bytes).expect("write bundle metadata");
+
+        let snapshot = load_tablet_snapshot(
+            tablet_id,
+            version,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect("load bundle snapshot");
+        let footers = load_bundle_segment_footers(
+            &snapshot,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect("load standalone segment footer");
+
+        assert_eq!(footers.len(), 1);
+        assert_eq!(footers[0].version, 3);
+        assert_eq!(footers[0].num_rows, Some(11));
+    }
+
+    #[test]
+    fn accept_unique_table_model() {
+        let tablet_id = 10005_i64;
+        let version = 46_i64;
         let temp_dir = TempDir::new().expect("create temp dir");
         std::fs::create_dir_all(temp_dir.path().join("meta")).expect("create meta dir");
 
