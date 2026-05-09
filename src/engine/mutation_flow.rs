@@ -11,9 +11,9 @@ use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, IcebergUpdateMode, MutationSidecar, MutationSidecarFile,
-    RunInput, ensure_no_variant_columns_for_row_level_mutation, run_iceberg_commit,
-    select_iceberg_update_mode,
+    CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, IcebergCommitCollector,
+    IcebergUpdateMode, RunInput, ensure_no_variant_columns_for_row_level_mutation,
+    run_iceberg_commit, select_iceberg_update_mode,
 };
 use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteBatch};
 use crate::engine::{StandaloneState, StatementResult};
@@ -313,7 +313,7 @@ fn execute_mor_update(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_sidecar: None,
+            cow_update_rewrite: None,
             target_ref: target_ref.to_string(),
         })
         .await
@@ -459,7 +459,7 @@ fn execute_cow_update(
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
-    let (data_files, sidecar) = block_on_iceberg(async {
+    let (data_files, rewrite) = block_on_iceberg(async {
         write_cow_update_files(&table, matched, entry.object_store_config(), target_ref).await
     })??;
 
@@ -507,7 +507,7 @@ fn execute_cow_update(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_sidecar: Some(sidecar),
+            cow_update_rewrite: Some(rewrite),
             target_ref: target_ref.to_string(),
         })
         .await
@@ -684,9 +684,9 @@ async fn write_cow_update_files(
     matched: &MatchedUpdateBatch,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     target_ref: &str,
-) -> Result<(Vec<iceberg::spec::DataFile>, MutationSidecar), String> {
+) -> Result<(Vec<iceberg::spec::DataFile>, CowUpdateRewriteSet), String> {
     if matched.row_ids.is_empty() {
-        return Ok((Vec::new(), empty_sidecar(table, target_ref)?));
+        return Ok((Vec::new(), empty_cow_rewrite(table, target_ref)?));
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
     let rewrite_files = build_cow_rewrite_batches(table, matched, object_store_config).await?;
@@ -708,14 +708,14 @@ async fn write_cow_update_files(
         data_files.extend(written.clone());
         data_files_by_old_file.push((rewrite.old_file.clone(), written));
     }
-    let sidecar = build_cow_sidecar(
+    let rewrite = build_cow_rewrite_set(
         table,
         matched,
         &data_files_by_old_file,
         &rewrite_files,
         target_ref,
     )?;
-    Ok((data_files, sidecar))
+    Ok((data_files, rewrite))
 }
 
 struct CowRewriteFile {
@@ -952,17 +952,17 @@ fn load_data_file_lineage(
     Ok(out)
 }
 
-fn build_cow_sidecar(
+fn build_cow_rewrite_set(
     table: &iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     data_files_by_old_file: &[(String, Vec<iceberg::spec::DataFile>)],
     rewrite_files: &[CowRewriteFile],
     target_ref: &str,
-) -> Result<MutationSidecar, String> {
+) -> Result<CowUpdateRewriteSet, String> {
     let metadata = table.metadata();
-    // For branch DML, record the branch head snapshot as the sidecar base.
-    // The sidecar validation in CowUpdateCommit checks that the base matches
-    // the parent snapshot, so these must agree.
+    // For branch DML, record the branch head snapshot as the rewrite base.
+    // CowUpdateCommit checks that the base matches the parent snapshot, so
+    // these must agree.
     let base_snapshot_id = if target_ref == "main" {
         metadata
             .current_snapshot()
@@ -1000,12 +1000,12 @@ fn build_cow_sidecar(
     let mut touched_data_files = Vec::with_capacity(rows_by_file.len());
     for (old_file, matched_row_ids) in rows_by_file {
         let new_files = new_files_by_old_file.get(&old_file).ok_or_else(|| {
-            format!("COW UPDATE sidecar missing replacement data files for `{old_file}`")
+            format!("COW UPDATE rewrite missing replacement data files for `{old_file}`")
         })?;
         let row_ids = replacement_row_ids_by_old_file
             .get(&old_file)
             .ok_or_else(|| {
-                format!("COW UPDATE sidecar missing replacement row ids for `{old_file}`")
+                format!("COW UPDATE rewrite missing replacement row ids for `{old_file}`")
             })?;
         for row_id in &matched_row_ids {
             if !row_ids.contains(row_id) {
@@ -1014,25 +1014,24 @@ fn build_cow_sidecar(
                 ));
             }
         }
-        touched_data_files.push(MutationSidecarFile {
+        touched_data_files.push(CowUpdateTouchedFile {
             old_file,
             new_files: new_files.clone(),
             row_ids: row_ids.clone(),
         });
     }
-    Ok(MutationSidecar::update(
-        IcebergUpdateMode::CopyOnWrite,
+    Ok(CowUpdateRewriteSet {
         base_snapshot_id,
-        table.metadata().uuid().to_string(),
-        matched.row_ids.clone(),
+        target_table_uuid: table.metadata().uuid().to_string(),
+        updated_row_ids: matched.row_ids.clone(),
         touched_data_files,
-    ))
+    })
 }
 
-fn empty_sidecar(
+fn empty_cow_rewrite(
     table: &iceberg::table::Table,
     target_ref: &str,
-) -> Result<MutationSidecar, String> {
+) -> Result<CowUpdateRewriteSet, String> {
     let metadata = table.metadata();
     let base_snapshot_id = if target_ref == "main" {
         metadata
@@ -1043,13 +1042,12 @@ fn empty_sidecar(
         crate::engine::delete_flow::resolve_branch_head_snapshot_id(metadata, target_ref)?
             .unwrap_or(0)
     };
-    Ok(MutationSidecar::update(
-        IcebergUpdateMode::CopyOnWrite,
+    Ok(CowUpdateRewriteSet {
         base_snapshot_id,
-        metadata.uuid().to_string(),
-        Vec::new(),
-        Vec::new(),
-    ))
+        target_table_uuid: metadata.uuid().to_string(),
+        updated_row_ids: Vec::new(),
+        touched_data_files: Vec::new(),
+    })
 }
 
 fn iceberg_table_columns(
@@ -1770,7 +1768,7 @@ fn execute_merge_matched_delete(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_sidecar: None,
+            cow_update_rewrite: None,
             target_ref: "main".to_string(),
         })
         .await
@@ -1830,7 +1828,7 @@ fn execute_merge_unmatched_insert(
             fs: abort_cleanup.fs,
             file_io,
             cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_sidecar: None,
+            cow_update_rewrite: None,
             target_ref: "main".to_string(),
         })
         .await

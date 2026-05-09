@@ -5260,10 +5260,12 @@ enable_path_style_access = true
     #[test]
     fn iceberg_v3_cow_update_preserves_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
             .expect("insert");
+        let previous_snapshot_id =
+            current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("previous snapshot");
         let before = collect_id_rowid_seq(
             &session,
             "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
@@ -5284,6 +5286,38 @@ enable_path_style_access = true
             before[1].2, after[1].2,
             "updated row sequence should advance"
         );
+
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get("ice").expect("entry");
+        entry.invalidate_table_cache("db1", "t");
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "db1", "t").expect("load");
+        let current = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot");
+        let summary_props = &current.summary().additional_properties;
+        assert!(
+            !summary_props.contains_key("novarocks.row-level-op"),
+            "COW UPDATE must not publish NovaRocks private row-level markers"
+        );
+        assert!(
+            !summary_props.contains_key("novarocks.update.mode"),
+            "COW UPDATE must not publish NovaRocks private update-mode markers"
+        );
+        assert!(
+            summary_props.keys().all(|key| !key.contains("sidecar")),
+            "COW UPDATE must not publish private sidecar metadata"
+        );
+        let change_batch = crate::connector::iceberg::changes::plan_changes(
+            &loaded.table,
+            previous_snapshot_id,
+            &[],
+        )
+        .expect("plan COW update from standard manifest diff");
+        assert!(!change_batch.inserts.is_empty());
+        assert!(!change_batch.deleted_data_files.is_empty());
     }
 
     #[test]

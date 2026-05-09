@@ -1193,13 +1193,15 @@ impl<'a> super::AnalyzerContext<'a> {
             // Per sqlparser, only one form can be set on a given function.
             let post_args_treatment = func.null_treatment;
             let inside_args_treatment = match &func.args {
-                sqlparser::ast::FunctionArguments::List(list) => list.clauses.iter().find_map(|c| {
-                    if let sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(t) = c {
-                        Some(*t)
-                    } else {
-                        None
-                    }
-                }),
+                sqlparser::ast::FunctionArguments::List(list) => {
+                    list.clauses.iter().find_map(|c| {
+                        if let sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(t) = c {
+                            Some(*t)
+                        } else {
+                            None
+                        }
+                    })
+                }
                 _ => None,
             };
             let ignore_nulls = matches!(
@@ -2469,7 +2471,9 @@ fn is_signed_literal(expr: &TypedExpr) -> bool {
 fn is_constant_default_expression(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::Literal(_) => true,
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => is_constant_default_expression(expr),
+        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
+            is_constant_default_expression(expr)
+        }
         ExprKind::BinaryOp { left, right, .. } => {
             is_constant_default_expression(left) && is_constant_default_expression(right)
         }
@@ -2489,8 +2493,12 @@ fn lead_lag_family_compatible(value: &DataType, default: &DataType) -> bool {
     if is_str(value) && is_str(default) {
         return true;
     }
-    let is_temporal =
-        |t: &DataType| matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _));
+    let is_temporal = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+        )
+    };
     if is_temporal(value) && is_temporal(default) {
         return true;
     }

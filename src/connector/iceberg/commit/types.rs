@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 
 use iceberg::spec::{DataContentType, DataFileFormat, Struct};
-use serde::{Deserialize, Serialize};
 
 /// Selects which Iceberg commit action to run for a given write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,50 +88,9 @@ impl IcebergUpdateMode {
     }
 }
 
-pub const NOVAROCKS_ROW_LEVEL_OP: &str = "novarocks.row-level-op";
-pub const NOVAROCKS_ROW_LEVEL_OP_UPDATE: &str = "update";
 pub const NOVAROCKS_UPDATE_MODE: &str = "novarocks.update.mode";
 pub const NOVAROCKS_UPDATE_MODE_COW: &str = "copy-on-write";
 pub const NOVAROCKS_UPDATE_MODE_MOR: &str = "merge-on-read";
-pub const NOVAROCKS_UPDATE_SIDECAR: &str = "novarocks.update.sidecar";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MutationSidecar {
-    pub version: u32,
-    pub operation: String,
-    pub mode: String,
-    pub base_snapshot_id: i64,
-    pub target_table_uuid: String,
-    pub updated_row_ids: Vec<i64>,
-    pub touched_data_files: Vec<MutationSidecarFile>,
-}
-
-impl MutationSidecar {
-    pub fn update(
-        mode: IcebergUpdateMode,
-        base_snapshot_id: i64,
-        target_table_uuid: String,
-        updated_row_ids: Vec<i64>,
-        touched_data_files: Vec<MutationSidecarFile>,
-    ) -> Self {
-        Self {
-            version: 1,
-            operation: NOVAROCKS_ROW_LEVEL_OP_UPDATE.to_string(),
-            mode: mode.as_property_value().to_string(),
-            base_snapshot_id,
-            target_table_uuid,
-            updated_row_ids,
-            touched_data_files,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MutationSidecarFile {
-    pub old_file: String,
-    pub new_files: Vec<String>,
-    pub row_ids: Vec<i64>,
-}
 
 /// Metadata about a single Parquet file produced by `IcebergSink` during a
 /// pipeline run. Mirrors the subset of `TIcebergDataFile` we need for commit
@@ -220,54 +178,19 @@ mod tests {
     }
 
     #[test]
-    fn mutation_sidecar_update_uses_typed_markers() {
-        let sidecar = MutationSidecar::update(
-            IcebergUpdateMode::MergeOnRead,
-            42,
-            "table-uuid".to_string(),
-            vec![7, 9],
-            vec![MutationSidecarFile {
-                old_file: "old.parquet".to_string(),
-                new_files: vec!["new.parquet".to_string()],
-                row_ids: vec![7],
-            }],
-        );
-
-        assert_eq!(NOVAROCKS_ROW_LEVEL_OP, "novarocks.row-level-op");
+    fn update_mode_property_values_round_trip() {
         assert_eq!(NOVAROCKS_UPDATE_MODE, "novarocks.update.mode");
-        assert_eq!(NOVAROCKS_UPDATE_SIDECAR, "novarocks.update.sidecar");
-        assert_eq!(sidecar.operation, NOVAROCKS_ROW_LEVEL_OP_UPDATE);
-        assert_eq!(sidecar.mode, NOVAROCKS_UPDATE_MODE_MOR);
         assert_eq!(
-            IcebergUpdateMode::from_property_value(&sidecar.mode),
+            IcebergUpdateMode::from_property_value(
+                IcebergUpdateMode::MergeOnRead.as_property_value()
+            ),
             Some(IcebergUpdateMode::MergeOnRead)
         );
-
-        let json = serde_json::to_string(&sidecar).expect("serialize sidecar");
-        let decoded: MutationSidecar = serde_json::from_str(&json).expect("deserialize sidecar");
-        assert_eq!(decoded, sidecar);
-    }
-
-    #[test]
-    fn mutation_sidecar_round_trips_json() {
-        let sidecar = MutationSidecar::update(
-            IcebergUpdateMode::CopyOnWrite,
-            101,
-            "table-uuid".to_string(),
-            vec![11, 12, 13],
-            vec![MutationSidecarFile {
-                old_file: "s3://bucket/table/data/old.parquet".to_string(),
-                new_files: vec![
-                    "s3://bucket/table/data/new-1.parquet".to_string(),
-                    "s3://bucket/table/data/new-2.parquet".to_string(),
-                ],
-                row_ids: vec![11, 12, 13],
-            }],
+        assert_eq!(
+            IcebergUpdateMode::from_property_value(
+                IcebergUpdateMode::CopyOnWrite.as_property_value()
+            ),
+            Some(IcebergUpdateMode::CopyOnWrite)
         );
-
-        let json = serde_json::to_string(&sidecar).expect("serialize sidecar");
-        let decoded: MutationSidecar = serde_json::from_str(&json).expect("deserialize sidecar");
-
-        assert_eq!(decoded, sidecar);
     }
 }

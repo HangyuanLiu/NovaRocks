@@ -222,7 +222,7 @@ pub(crate) fn refresh_mv(
                 },
             };
             let has_inserts = !batch.inserts.is_empty();
-            let has_deletes = !batch.deletes.is_empty() || !batch.equality_deletes.is_empty();
+            let has_deletes = change_batch_has_deletes(&batch);
             let apply_policy = apply_policy_for_change(
                 &projection_apply_shape,
                 has_inserts,
@@ -246,11 +246,6 @@ pub(crate) fn refresh_mv(
                         run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
                     });
                 }
-                MvApplyPolicy::Unsupported { reason } => {
-                    return Err(format!(
-                        "iceberg materialized view refresh unsupported: {reason}"
-                    ));
-                }
             }
 
             let select_sql =
@@ -267,19 +262,7 @@ pub(crate) fn refresh_mv(
             )?;
             let (insert_result, delete_result) = change_stream.into_results();
             let (chunks, row_delta) = if has_deletes {
-                let insert_chunks = query_result_to_mv_op_chunks(insert_result, MV_OP_UPSERT)?;
-                let delete_chunks = query_result_to_mv_op_chunks(delete_result, MV_OP_DELETE)?;
-                let insert_rows = chunks_row_count(&insert_chunks)?;
-                let delete_rows = chunks_row_count(&delete_chunks)?;
-                let mut chunks = Vec::with_capacity(insert_chunks.len() + delete_chunks.len());
-                chunks.extend(insert_chunks);
-                chunks.extend(delete_chunks);
-                let row_delta = insert_rows.checked_sub(delete_rows).ok_or_else(|| {
-                    format!(
-                        "projection/filter MV row-count delta overflow: inserts={insert_rows} deletes={delete_rows}"
-                    )
-                })?;
-                (chunks, row_delta)
+                projection_delete_bearing_change_chunks(insert_result, delete_result)?
             } else {
                 let chunks = query_result_to_chunks(insert_result)?;
                 let row_delta = chunks_row_count(&chunks)?;
@@ -453,6 +436,14 @@ fn refresh_aggregate_mv_full(
     })
 }
 
+fn change_batch_has_deletes(
+    batch: &crate::connector::iceberg::changes::IcebergChangeBatch,
+) -> bool {
+    !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.deleted_data_files.is_empty()
+}
+
 struct AggregateMvIncrementalRefreshContext<'a> {
     state: &'a Arc<StandaloneState>,
     database: &'a str,
@@ -536,11 +527,6 @@ fn refresh_aggregate_mv_incremental(
                 "mv_refresh fall-back to Full from apply policy"
             );
             return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
-        }
-        MvApplyPolicy::Unsupported { reason } => {
-            return Err(format!(
-                "iceberg materialized view refresh unsupported: {reason}"
-            ));
         }
     }
 
@@ -844,6 +830,28 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
 const MV_OP_UPSERT: i8 = 0;
 const MV_OP_DELETE: i8 = 1;
 const MV_OP_COLUMN: &str = "__op";
+
+fn projection_delete_bearing_change_chunks(
+    insert_result: QueryResult,
+    delete_result: QueryResult,
+) -> Result<(Vec<Chunk>, i64), String> {
+    let insert_chunks = query_result_to_mv_op_chunks(insert_result, MV_OP_UPSERT)?;
+    let delete_chunks = query_result_to_mv_op_chunks(delete_result, MV_OP_DELETE)?;
+    let insert_rows = chunks_row_count(&insert_chunks)?;
+    let delete_rows = chunks_row_count(&delete_chunks)?;
+    let mut chunks = Vec::with_capacity(delete_chunks.len() + insert_chunks.len());
+    // COW/overwrite and MOR updates can produce delete and insert branches
+    // for the same primary key. Apply deletes first so following upserts are
+    // the final visible row state.
+    chunks.extend(delete_chunks);
+    chunks.extend(insert_chunks);
+    let row_delta = insert_rows.checked_sub(delete_rows).ok_or_else(|| {
+        format!(
+            "projection/filter MV row-count delta overflow: inserts={insert_rows} deletes={delete_rows}"
+        )
+    })?;
+    Ok((chunks, row_delta))
+}
 
 fn query_result_to_mv_op_chunks(result: QueryResult, op: i8) -> Result<Vec<Chunk>, String> {
     result
@@ -1268,20 +1276,14 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_change_error_routes_projection_mv_to_full_refresh_policy() {
+    fn replace_validation_change_error_routes_projection_mv_to_full_refresh_policy() {
         let policy = policy_from_change_error(
-            crate::connector::iceberg::changes::ChangeError::UnsupportedOperation {
+            crate::connector::iceberg::changes::ChangeError::ReplaceValidationFailed {
                 snapshot_id: 99,
-                op: "overwrite".to_string(),
+                reason: "records changed".to_string(),
             },
         );
-        assert_eq!(
-            policy,
-            MvRefreshPolicy::FullRefresh {
-                target_snapshot_id: Some(99),
-                reason: FullRefreshReason::InsertOverwrite { snapshot_id: 99 },
-            }
-        );
+        assert!(matches!(policy, MvRefreshPolicy::FullRefresh { .. }));
     }
 
     #[test]
@@ -1629,6 +1631,64 @@ mod tests {
         );
 
         drop(engine);
+    }
+
+    #[test]
+    fn aggregate_mv_incremental_refresh_treats_deleted_data_files_as_delete_bearing() {
+        let batch = crate::connector::iceberg::changes::IcebergChangeBatch {
+            previous_snapshot_id: 1,
+            current_snapshot_id: 2,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+            equality_deletes: Vec::new(),
+            deleted_data_files: vec![crate::connector::iceberg::changes::DeletedDataFileRef {
+                path: "file:///tmp/old.parquet".to_string(),
+                size: 128,
+                record_count: Some(1),
+                partition_spec_id: Some(0),
+                partition_key: None,
+                first_row_id: Some(0),
+                data_sequence_number: Some(1),
+            }],
+        };
+
+        assert!(change_batch_has_deletes(&batch));
+    }
+
+    #[test]
+    fn projection_delete_bearing_change_applies_deletes_before_upserts() {
+        use arrow::array::Int64Array;
+
+        fn one_row_result(value: i64) -> QueryResult {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            )
+            .expect("record batch");
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+            }
+        }
+
+        fn op_value(chunk: &Chunk) -> i8 {
+            let op_column = chunk
+                .batch
+                .column(chunk.batch.num_columns() - 1)
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .expect("op column");
+            op_column.value(0)
+        }
+
+        let (chunks, row_delta) =
+            projection_delete_bearing_change_chunks(one_row_result(1), one_row_result(1))
+                .expect("projection chunks");
+
+        assert_eq!(row_delta, 0);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(op_value(&chunks[0]), MV_OP_DELETE);
+        assert_eq!(op_value(&chunks[1]), MV_OP_UPSERT);
     }
 
     #[test]

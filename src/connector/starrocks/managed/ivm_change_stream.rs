@@ -117,8 +117,7 @@ mod tests {
             inserts: Vec::new(),
             deletes: Vec::new(),
             equality_deletes: Vec::new(),
-            cow_updates: Vec::new(),
-            mor_updates: Vec::new(),
+            deleted_data_files: Vec::new(),
         };
 
         let err = validate_change_batch_current_snapshot(&batch, 13).expect_err("mismatch");

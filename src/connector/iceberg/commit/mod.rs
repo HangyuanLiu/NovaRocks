@@ -72,11 +72,9 @@ pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
 pub use truncate::TruncateCommit;
 pub use types::{
     CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode,
-    MutationSidecar, MutationSidecarFile, NOVAROCKS_ROW_LEVEL_OP, NOVAROCKS_ROW_LEVEL_OP_UPDATE,
-    NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR,
-    NOVAROCKS_UPDATE_SIDECAR, WrittenFile,
+    NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
 };
-pub use update_cow::{CowUpdateCommit, write_mutation_sidecar};
+pub use update_cow::{CowUpdateCommit, CowUpdateRewriteSet, CowUpdateTouchedFile};
 pub use validation::{
     classify_iceberg_write_mode, classify_sql_delete_strategy,
     ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,

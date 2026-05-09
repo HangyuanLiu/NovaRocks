@@ -10,7 +10,9 @@ use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 
-use crate::connector::iceberg::changes::plan_changes;
+use crate::connector::iceberg::changes::{
+    IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
+};
 use crate::connector::iceberg::commit::{
     CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
@@ -528,7 +530,7 @@ async fn commit_overwrite_iceberg_mv(
         fs,
         file_io: table.file_io().clone(),
         cleanup_path_mapper: Some(path_mapper),
-        cow_update_sidecar: None,
+        cow_update_rewrite: None,
         target_ref: "main".to_string(),
     })
     .await
@@ -563,15 +565,62 @@ fn incremental_refresh_iceberg_mv(
     base_table: &iceberg::table::Table,
     current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
-    // 1. Plan the change batch.
-    let batch = plan_changes(base_table, previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
-    if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
-        return Err(format!(
-            "iceberg-stored materialized view incremental refresh does not yet support \
-             delete snapshots; {} position-delete file(s), {} equality-delete file(s) seen in lineage",
+    // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
+    // safely, rebuild instead of risking an incorrect incremental result.
+    let batch = match plan_changes(base_table, previous_snapshot_id, &[]) {
+        Ok(batch) => batch,
+        Err(err) => match policy_signal_from_change_error(&err) {
+            IcebergChangePolicySignal::FullRefresh { reason } => {
+                tracing::info!(
+                    "iceberg mv {db_name}.{mv_name}: incremental planner requested full refresh: {reason}"
+                );
+                return rebuild_iceberg_mv(
+                    state,
+                    cfg,
+                    metadata_store,
+                    db_name,
+                    mv_name,
+                    mv_row,
+                    base_ref,
+                    Some(current_snapshot_id),
+                    current_table_uuid,
+                );
+            }
+            IcebergChangePolicySignal::Unsupported { reason } => {
+                return Err(format!(
+                    "iceberg-stored materialized view refresh unsupported: {reason}"
+                ));
+            }
+            IcebergChangePolicySignal::Incremental => {
+                return Err(
+                    "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
+                        .to_string(),
+                );
+            }
+        },
+    };
+    if !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.deleted_data_files.is_empty()
+    {
+        tracing::info!(
+            "iceberg mv {db_name}.{mv_name}: falling back to full refresh for delete-bearing change batch: \
+             position_deletes={}, equality_deletes={}, deleted_data_files={}",
             batch.deletes.len(),
-            batch.equality_deletes.len()
-        ));
+            batch.equality_deletes.len(),
+            batch.deleted_data_files.len()
+        );
+        return rebuild_iceberg_mv(
+            state,
+            cfg,
+            metadata_store,
+            db_name,
+            mv_name,
+            mv_row,
+            base_ref,
+            Some(current_snapshot_id),
+            current_table_uuid,
+        );
     }
     if batch.current_snapshot_id != current_snapshot_id {
         return Err(format!(

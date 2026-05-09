@@ -4,7 +4,6 @@ use super::mv_shape::{AggregateFunctionKind, AggregateMvShape, IncrementalMvShap
 pub(crate) enum MvApplyPolicy {
     Incremental,
     FullRefresh { reason: String },
-    Unsupported { reason: String },
 }
 
 pub(crate) fn apply_policy_for_change(
@@ -16,8 +15,9 @@ pub(crate) fn apply_policy_for_change(
     match shape {
         IncrementalMvShape::ProjectionFilter(_) => {
             if has_deletes && !row_identity_available {
-                MvApplyPolicy::Unsupported {
-                    reason: "projection/filter MV DELETE requires base row identity".to_string(),
+                MvApplyPolicy::FullRefresh {
+                    reason: "projection/filter MV DELETE without base row identity requires full refresh"
+                        .to_string(),
                 }
             } else {
                 MvApplyPolicy::Incremental
@@ -85,11 +85,13 @@ mod tests {
     }
 
     #[test]
-    fn projection_delete_without_row_identity_is_unsupported() {
+    fn projection_delete_without_row_identity_falls_back_to_full_refresh() {
         assert_eq!(
             apply_policy_for_change(&projection_shape(), false, true, false),
-            MvApplyPolicy::Unsupported {
-                reason: "projection/filter MV DELETE requires base row identity".to_string(),
+            MvApplyPolicy::FullRefresh {
+                reason:
+                    "projection/filter MV DELETE without base row identity requires full refresh"
+                        .to_string(),
             }
         );
     }
@@ -98,6 +100,14 @@ mod tests {
     fn projection_delete_with_row_identity_is_incremental() {
         assert_eq!(
             apply_policy_for_change(&projection_shape(), false, true, true),
+            MvApplyPolicy::Incremental
+        );
+    }
+
+    #[test]
+    fn projection_mixed_insert_delete_remains_incremental_red_path() {
+        assert_eq!(
+            apply_policy_for_change(&projection_shape(), true, true, true),
             MvApplyPolicy::Incremental
         );
     }
