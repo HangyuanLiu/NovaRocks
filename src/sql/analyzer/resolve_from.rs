@@ -272,6 +272,15 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::TableFactor::TableFunction { expr, alias } => {
                 self.analyze_table_function(expr, alias.as_ref())
             }
+            sqlast::TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                if alias.is_some() {
+                    return Err("alias on parenthesized JOIN is not yet supported".into());
+                }
+                self.analyze_from(table_with_joins)
+            }
             other => Err(format!("unsupported table factor: {other}")),
         }
     }

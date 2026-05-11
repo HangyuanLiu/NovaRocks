@@ -2084,6 +2084,23 @@ mod tests {
     }
 
     #[test]
+    fn load_expected_result_accepts_single_step_marker() {
+        let path = temp_result_path("single_marker");
+        fs::write(&path, "-- query 2\ncount(*)\n3\n").expect("write result file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded =
+            load_expected_results(&path, false, &marker_re, None).expect("must parse result file");
+        assert_eq!(
+            loaded.get(&2).expect("query 2"),
+            &ResultSet {
+                header: vec!["count(*)".to_string()],
+                rows: vec![vec!["3".to_string()]],
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn multi_step_result_round_trip() {
         let path = temp_result_path("multi_step");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
