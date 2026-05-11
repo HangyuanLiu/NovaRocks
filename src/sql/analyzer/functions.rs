@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
+use crate::common::largeint;
 use crate::sql::types::wider_type;
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
@@ -498,6 +499,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         },
         "percentile_hash" | "percentile_empty" => DataType::Binary,
         "percentile_approx_raw" => DataType::Float64,
+        "get_json_bool" | "get_variant_bool" | "json_exists" => DataType::Boolean,
+        "get_json_int" | "get_variant_int" => DataType::Int64,
+        "get_json_double" | "get_variant_double" => DataType::Float64,
+        "json_query" | "json_extract" | "get_json_string" | "get_json_object" | "json_object"
+        | "json_array" | "to_json" | "parse_json" | "variant_typeof" => DataType::Utf8,
         "__array_struct_subfield" => DataType::Null,
         "__array_element_at" => match arg_types.first() {
             Some(DataType::List(item)) => item.data_type().clone(),
@@ -670,6 +676,9 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             | DataType::Int32
             | DataType::Int64 => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
+            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+                DataType::FixedSizeBinary(*width)
+            }
             DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
             _ => DataType::Float64,
         },
@@ -797,6 +806,26 @@ mod tests {
     }
 
     #[test]
+    fn infer_scalar_return_type_for_json_getters() {
+        assert_eq!(
+            infer_scalar_return_type("get_json_bool", &[DataType::Utf8, DataType::Utf8]),
+            DataType::Boolean
+        );
+        assert_eq!(
+            infer_scalar_return_type("get_json_int", &[DataType::Utf8, DataType::Utf8]),
+            DataType::Int64
+        );
+        assert_eq!(
+            infer_scalar_return_type("get_json_double", &[DataType::Utf8, DataType::Utf8]),
+            DataType::Float64
+        );
+        assert_eq!(
+            infer_scalar_return_type("get_json_string", &[DataType::Utf8, DataType::Utf8]),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
     fn infer_scalar_return_type_for_row_constructor() {
         let actual = infer_scalar_return_type("row", &[DataType::Int32, DataType::Float64]);
         let DataType::Struct(fields) = actual else {
@@ -827,6 +856,16 @@ mod tests {
         assert_eq!(
             infer_agg_return_type("sum_map", std::slice::from_ref(&map_type)),
             map_type
+        );
+    }
+
+    #[test]
+    fn sum_largeint_returns_largeint() {
+        let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
+
+        assert_eq!(
+            infer_agg_return_type("sum", std::slice::from_ref(&largeint_type)),
+            largeint_type
         );
     }
 

@@ -944,6 +944,11 @@ fn parse_string_default(
     use crate::sql::parser::ast::{DefaultLiteral, SqlType};
     match data_type {
         SqlType::String => Ok(DefaultLiteral::String(s.to_string())),
+        SqlType::Json => {
+            serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| format!("invalid JSON DEFAULT literal: {e}"))?;
+            Ok(DefaultLiteral::String(s.to_string()))
+        }
         SqlType::Date => {
             let days = crate::engine::parquet::parse_date_string_to_days(s)?;
             Ok(DefaultLiteral::Date(days))
@@ -982,7 +987,9 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use super::parse_create_table_statement;
-    use crate::sql::parser::ast::{CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr};
+    use crate::sql::parser::ast::{
+        CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
+    };
     use crate::sql::parser::dialect::StarRocksDialect;
 
     /// Parse a single `CREATE TABLE` statement from `sql` and return the result.
@@ -1010,6 +1017,20 @@ mod tests {
             .expect("build parser");
         let stmt = parse_create_table_statement(&mut parser);
         assert!(stmt.is_ok(), "expected complex type DDL to parse: {stmt:?}");
+    }
+
+    #[test]
+    fn parse_create_table_preserves_json_logical_type() {
+        let stmt =
+            parse_create_table_one("CREATE TABLE t1 (id INT, payload JSON, nested ARRAY<JSON>)")
+                .expect("create table with json columns");
+
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert_eq!(columns[1].data_type, SqlType::Json);
+        assert_eq!(
+            columns[2].data_type,
+            SqlType::Array(Box::new(SqlType::Json))
+        );
     }
 
     #[test]

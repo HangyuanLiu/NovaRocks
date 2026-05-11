@@ -567,7 +567,7 @@ pub(crate) fn cast_literal(
 ) -> Result<Literal, String> {
     use crate::sql::SqlType;
     match data_type {
-        SqlType::String => match &value {
+        SqlType::String | SqlType::Json => match &value {
             Literal::Null => Ok(Literal::Null),
             Literal::Bool(v) => Ok(Literal::String(if *v {
                 "1".to_string()
@@ -871,7 +871,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
         )),
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
-        SqlType::String => Ok(DataType::Utf8),
+        SqlType::String | SqlType::Json => Ok(DataType::Utf8),
         SqlType::Binary => Ok(DataType::Binary),
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::Date => Ok(DataType::Date32),

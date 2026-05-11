@@ -1601,7 +1601,7 @@ pub(crate) fn iceberg_type_for_sql_type(
             precision: 38,
             scale: 0,
         }),
-        SqlType::String => Type::Primitive(PrimitiveType::String),
+        SqlType::String | SqlType::Json => Type::Primitive(PrimitiveType::String),
         SqlType::Binary => Type::Primitive(PrimitiveType::Binary),
         SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         SqlType::Date => Type::Primitive(PrimitiveType::Date),

@@ -60,7 +60,9 @@ pub(crate) fn default_literal_to_iceberg(
             }
             PrimitiveLiteral::Int128(*unscaled)
         }
-        (DefaultLiteral::String(s), SqlType::String) => PrimitiveLiteral::String(s.clone()),
+        (DefaultLiteral::String(s), SqlType::String | SqlType::Json) => {
+            PrimitiveLiteral::String(s.clone())
+        }
         (DefaultLiteral::Date(d), SqlType::Date) => PrimitiveLiteral::Int(*d),
         (DefaultLiteral::DateTime(t), SqlType::DateTime) => PrimitiveLiteral::Long(*t),
         (DefaultLiteral::Binary(b), SqlType::Binary) => PrimitiveLiteral::Binary(b.clone()),
@@ -104,9 +106,10 @@ pub(crate) fn iceberg_literal_to_ast(
         (IcebergLiteral::Primitive(PrimitiveLiteral::Double(v)), SqlType::Double) => {
             Ok(AstLiteral::Float(v.0))
         }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::String(s)), SqlType::String) => {
-            Ok(AstLiteral::String(s.clone()))
-        }
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::String(s)),
+            SqlType::String | SqlType::Json,
+        ) => Ok(AstLiteral::String(s.clone())),
         (IcebergLiteral::Primitive(PrimitiveLiteral::Int(days)), SqlType::Date) => {
             // Convert days-since-epoch back to "YYYY-MM-DD" string.
             use chrono::NaiveDate;

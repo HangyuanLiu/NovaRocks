@@ -12,6 +12,7 @@ use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_targ
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::insert::reorder_insert_rows;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::exec::expr::cast_with_special_rules;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{InsertSource, ObjectName, OverwriteMode};
@@ -248,7 +249,7 @@ fn align_query_result_to_target(
                     if src.data_type() == &target_type {
                         src.clone()
                     } else {
-                        arrow::compute::cast(src.as_ref(), &target_type).map_err(|e| {
+                        cast_with_special_rules(src, &target_type).map_err(|e| {
                             format!(
                                 "INSERT SELECT cannot cast column `{}` from {:?} to {:?}: {}",
                                 target_column.name,
