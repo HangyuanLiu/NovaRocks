@@ -97,6 +97,7 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
         | sqlast::DataType::Text => Ok(SqlType::String),
         sqlast::DataType::Char(_) | sqlast::DataType::Character(_) => Ok(SqlType::String),
         sqlast::DataType::String(_) => Ok(SqlType::String),
+        sqlast::DataType::JSON | sqlast::DataType::JSONB => Ok(SqlType::Json),
         sqlast::DataType::Date => Ok(SqlType::Date),
         sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
         sqlast::DataType::Decimal(info)
@@ -153,7 +154,7 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
             match n.as_str() {
                 "string" => Ok(SqlType::String),
                 "largeint" => Ok(SqlType::LargeInt),
-                "json" | "jsonb" => Ok(SqlType::String),
+                "json" | "jsonb" => Ok(SqlType::Json),
                 "varbinary" | "binary" => Ok(SqlType::Binary),
                 "variant" => Ok(SqlType::Variant),
                 "decimal32" | "decimal64" | "decimal128" => {

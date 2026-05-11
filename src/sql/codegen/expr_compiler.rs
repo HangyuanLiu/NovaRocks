@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
+use crate::common::largeint;
 use crate::exprs;
 use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::opcodes;
@@ -1763,9 +1764,11 @@ fn infer_scalar_function_return_type(
             )),
             _ => Ok(DataType::Null),
         },
-        "json_query" | "json_extract" | "get_json_string" | "get_json_int" | "get_json_double"
-        | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json"
-        | "variant_typeof" => Ok(DataType::Utf8),
+        "get_json_bool" | "get_variant_bool" | "json_exists" => Ok(DataType::Boolean),
+        "get_json_int" | "get_variant_int" => Ok(DataType::Int64),
+        "get_json_double" | "get_variant_double" => Ok(DataType::Float64),
+        "json_query" | "json_extract" | "get_json_string" | "get_json_object" | "json_object"
+        | "json_array" | "to_json" | "parse_json" | "variant_typeof" => Ok(DataType::Utf8),
         "__struct_subfield" | "__array_struct_subfield" => Ok(DataType::Null),
         "row" | "struct" => Ok(infer_struct_constructor_return_type(arg_types)),
         "named_struct" => Ok(infer_named_struct_return_type(arg_types)),
@@ -1884,6 +1887,9 @@ fn infer_agg_function_types(
                 | DataType::Int32
                 | DataType::Int64 => DataType::Int64,
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
+                DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+                    DataType::FixedSizeBinary(*width)
+                }
                 DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
                 _ => DataType::Float64,
             };
@@ -2007,6 +2013,9 @@ fn infer_agg_function_types(
                     DataType::Int64
                 }
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
+                DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+                    DataType::FixedSizeBinary(*width)
+                }
                 DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
                 _ => DataType::Float64,
             };
@@ -2132,7 +2141,7 @@ fn list_output_type(item_type: DataType) -> DataType {
 mod tests {
     use super::{
         aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type,
-        infer_scalar_function_return_type,
+        infer_scalar_function_return_type, largeint,
     };
     use arrow::datatypes::{DataType, TimeUnit};
 
@@ -2161,6 +2170,18 @@ mod tests {
     }
 
     #[test]
+    fn sum_largeint_uses_largeint_signature() {
+        let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
+
+        let (output, intermediate) =
+            infer_agg_function_types("sum", std::slice::from_ref(&largeint_type), false)
+                .expect("sum largeint type inference");
+
+        assert_eq!(output, largeint_type);
+        assert_eq!(intermediate, Some(largeint_type));
+    }
+
+    #[test]
     fn sum_avg_cast_varchar_inputs_to_float64() {
         assert_eq!(
             aggregate_arg_cast_type("sum", &DataType::Utf8),
@@ -2183,6 +2204,30 @@ mod tests {
         assert_eq!(
             infer_date_trunc_return_type(&[DataType::Utf8, DataType::Date32]),
             DataType::Date32
+        );
+    }
+
+    #[test]
+    fn json_getter_type_inference_uses_starrocks_return_types() {
+        assert_eq!(
+            infer_scalar_function_return_type("get_json_bool", &[DataType::Utf8, DataType::Utf8])
+                .expect("get_json_bool type inference"),
+            DataType::Boolean
+        );
+        assert_eq!(
+            infer_scalar_function_return_type("get_json_int", &[DataType::Utf8, DataType::Utf8])
+                .expect("get_json_int type inference"),
+            DataType::Int64
+        );
+        assert_eq!(
+            infer_scalar_function_return_type("get_json_double", &[DataType::Utf8, DataType::Utf8])
+                .expect("get_json_double type inference"),
+            DataType::Float64
+        );
+        assert_eq!(
+            infer_scalar_function_return_type("get_json_string", &[DataType::Utf8, DataType::Utf8])
+                .expect("get_json_string type inference"),
+            DataType::Utf8
         );
     }
 

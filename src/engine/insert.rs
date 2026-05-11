@@ -488,8 +488,20 @@ fn build_local_literal_array(
                 .iter()
                 .enumerate()
                 .map(|(idx, field)| {
-                    let refs = child_values[idx].iter().collect::<Vec<_>>();
-                    build_local_literal_array(field.data_type(), &refs, field.is_nullable())
+                    if matches!(field.data_type(), DataType::List(_)) {
+                        let normalized = child_values[idx]
+                            .iter()
+                            .map(|literal| match literal {
+                                Literal::Null | Literal::Array(_) => literal.clone(),
+                                other => Literal::Array(vec![other.clone()]),
+                            })
+                            .collect::<Vec<_>>();
+                        let refs = normalized.iter().collect::<Vec<_>>();
+                        build_local_literal_array(field.data_type(), &refs, field.is_nullable())
+                    } else {
+                        let refs = child_values[idx].iter().collect::<Vec<_>>();
+                        build_local_literal_array(field.data_type(), &refs, field.is_nullable())
+                    }
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(Arc::new(StructArray::new(
@@ -646,6 +658,45 @@ mod tests {
             .expect("LargeBinaryArray");
         assert_eq!(arr.len(), 1);
         assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn build_struct_literal_wraps_scalar_array_field_as_singleton() {
+        use std::sync::Arc;
+
+        use arrow::array::{Array, ListArray, StringArray, StructArray};
+        use arrow::datatypes::Field;
+
+        let array_field = Arc::new(Field::new(
+            "col1",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ));
+        let data_type = DataType::Struct(vec![array_field].into());
+        let lit_owned = vec![Literal::Struct(vec![Literal::String("val1".to_string())])];
+        let lit_refs = lit_owned.iter().collect::<Vec<_>>();
+
+        let array =
+            build_local_literal_array(&data_type, &lit_refs, true).expect("build struct array");
+
+        let struct_array = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("StructArray");
+        let list_array = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("ListArray");
+        assert_eq!(list_array.len(), 1);
+        assert!(!list_array.is_null(0));
+        let values = list_array.value(0);
+        let strings = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings.value(0), "val1");
     }
 
     #[test]

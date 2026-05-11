@@ -328,6 +328,7 @@ pub enum SqlType {
         scale: i8,
     },
     String,
+    Json,
     Binary,
     Boolean,
     Date,

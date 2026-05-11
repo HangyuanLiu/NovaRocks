@@ -625,7 +625,7 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
         "TIME" => Ok(DataType::Time64(TimeUnit::Microsecond)),
-        "CHAR" | "VARCHAR" | "STRING" => Ok(DataType::Utf8),
+        "CHAR" | "VARCHAR" | "STRING" | "JSON" => Ok(DataType::Utf8),
         "BINARY" | "VARBINARY" => Ok(DataType::Binary),
         "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
             let precision = column
@@ -908,6 +908,21 @@ mod tests {
         assert_eq!(
             arrow_type_from_tablet_column(&column).expect("time arrow type"),
             DataType::Time64(TimeUnit::Microsecond)
+        );
+    }
+
+    #[test]
+    fn arrow_type_from_tablet_column_maps_json_to_utf8() {
+        let column = ColumnPb {
+            unique_id: 8,
+            name: Some("payload".to_string()),
+            r#type: "JSON".to_string(),
+            is_nullable: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            arrow_type_from_tablet_column(&column).expect("json arrow type"),
+            DataType::Utf8
         );
     }
 

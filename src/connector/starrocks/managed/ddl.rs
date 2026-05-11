@@ -384,6 +384,7 @@ fn key_eligible_type(data_type: &SqlType) -> bool {
         data_type,
         SqlType::Float
             | SqlType::Double
+            | SqlType::Json
             | SqlType::Binary
             | SqlType::Array(_)
             | SqlType::Map(_, _)
@@ -400,6 +401,7 @@ fn short_key_index_size(data_type: &SqlType) -> usize {
         SqlType::BigInt | SqlType::DateTime | SqlType::Time => 8,
         SqlType::LargeInt | SqlType::Decimal { .. } => 16,
         SqlType::String | SqlType::Binary => 20,
+        SqlType::Json => 16,
         SqlType::Float => 4,
         SqlType::Double => 8,
         SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) | SqlType::Variant => {
@@ -1027,6 +1029,7 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
             None,
             None,
         ),
+        SqlType::Json => (crate::types::TPrimitiveType::JSON, Some(16), None, None),
         SqlType::Boolean => (crate::types::TPrimitiveType::BOOLEAN, Some(1), None, None),
         SqlType::Date => (crate::types::TPrimitiveType::DATE, Some(4), None, None),
         SqlType::DateTime => (crate::types::TPrimitiveType::DATETIME, Some(8), None, None),
@@ -1140,6 +1143,7 @@ fn append_sql_type_nodes(
 fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
     match data_type {
         SqlType::String => Some(10),
+        SqlType::Json => None,
         SqlType::TinyInt => Some(1),
         SqlType::SmallInt => Some(2),
         SqlType::Int => Some(4),
@@ -1168,6 +1172,7 @@ pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
         SqlType::Float => "FLOAT".to_string(),
         SqlType::Double => "DOUBLE".to_string(),
         SqlType::String => "STRING".to_string(),
+        SqlType::Json => "JSON".to_string(),
         SqlType::Boolean => "BOOLEAN".to_string(),
         SqlType::Date => "DATE".to_string(),
         SqlType::DateTime => "DATETIME".to_string(),
@@ -1230,6 +1235,7 @@ fn parse_managed_logical_type(raw: &str) -> Result<SqlType, String> {
         "FLOAT" => Ok(SqlType::Float),
         "DOUBLE" => Ok(SqlType::Double),
         "STRING" => Ok(SqlType::String),
+        "JSON" => Ok(SqlType::Json),
         "BOOLEAN" => Ok(SqlType::Boolean),
         "DATE" => Ok(SqlType::Date),
         "DATETIME" => Ok(SqlType::DateTime),
@@ -1281,9 +1287,10 @@ mod tests {
     };
 
     use super::{
-        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,
-        managed_physical_column, patch_tablet_schema_column_flags, request_schema_from_runtime,
-        resolve_managed_create_defaults, stored_columns_from_physical_columns,
+        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table, logical_type_name,
+        managed_physical_column, parse_managed_logical_type, patch_tablet_schema_column_flags,
+        request_schema_from_runtime, resolve_managed_create_defaults, sql_type_to_tcolumn_type,
+        sql_type_to_ttype_desc, stored_columns_from_physical_columns,
         table_columns_from_physical_columns, truncate_managed_table_with_hooks,
     };
 
@@ -1650,6 +1657,27 @@ mod tests {
         assert_eq!(request_schema.columns[1].column_name, "__hidden");
         assert_eq!(request_schema.columns[1].is_key, Some(false));
         assert_eq!(request_schema.short_key_column_count, 1);
+    }
+
+    #[test]
+    fn managed_json_type_uses_starrocks_json_primitive() {
+        let column_type = sql_type_to_tcolumn_type(&SqlType::Json).expect("json column type");
+        assert_eq!(column_type.type_, crate::types::TPrimitiveType::JSON);
+        assert_eq!(column_type.len, Some(16));
+        assert_eq!(logical_type_name(&SqlType::Json), "JSON");
+        assert_eq!(
+            parse_managed_logical_type("JSON").expect("logical json"),
+            SqlType::Json
+        );
+
+        let desc = sql_type_to_ttype_desc(&SqlType::Array(Box::new(SqlType::Json)))
+            .expect("array<json> type desc");
+        let nodes = desc.types.expect("type nodes");
+        assert_eq!(nodes[0].type_, crate::types::TTypeNodeType::ARRAY);
+        assert_eq!(
+            nodes[1].scalar_type.as_ref().expect("scalar").type_,
+            crate::types::TPrimitiveType::JSON
+        );
     }
 
     #[test]

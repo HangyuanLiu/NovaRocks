@@ -36,6 +36,7 @@ use crate::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     execute_query, record_batch_to_chunk, reorder_insert_rows,
 };
+use crate::exec::expr::cast_with_special_rules;
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,
@@ -1029,7 +1030,7 @@ fn align_query_result_to_target(
                     if src.data_type() == &target_type {
                         src.clone()
                     } else {
-                        arrow::compute::cast(src.as_ref(), &target_type).map_err(|e| {
+                        cast_with_special_rules(src, &target_type).map_err(|e| {
                             format!(
                                 "INSERT SELECT cannot cast column `{}` from {:?} to {:?}: {}",
                                 target_column.name,
@@ -1123,6 +1124,73 @@ fn build_target_column_mapping(
         ));
     }
     Ok(mapping)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::common::{ids::SlotId, largeint};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::runtime::query_result::QueryResultColumn;
+
+    #[test]
+    fn align_insert_select_uses_largeint_special_cast() {
+        let source_field = Field::new("v3", DataType::Int64, false);
+        let source_array: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, -2, i64::MAX]));
+        let source_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![source_field.clone()])),
+            vec![source_array],
+        )
+        .expect("source batch");
+        let source_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(SlotId::new(1), &source_field, None)
+                    .expect("source slot"),
+            ])
+            .expect("source chunk schema"),
+        );
+        let source_chunk =
+            Chunk::try_new_with_chunk_schema(source_batch, source_schema).expect("source chunk");
+        let result = QueryResult {
+            columns: vec![QueryResultColumn {
+                name: "v3".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                logical_type: None,
+            }],
+            chunks: vec![source_chunk],
+        };
+        let target_columns = vec![ColumnDef {
+            name: "v3".to_string(),
+            data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
+            nullable: false,
+            write_default: None,
+        }];
+
+        let aligned =
+            align_query_result_to_target(&result, &[], &target_columns).expect("aligned batch");
+
+        assert_eq!(
+            aligned.column(0).data_type(),
+            &DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH)
+        );
+        let values = aligned
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint array");
+        assert_eq!(largeint::value_at(values, 0).expect("row 0"), 1);
+        assert_eq!(largeint::value_at(values, 1).expect("row 1"), -2);
+        assert_eq!(
+            largeint::value_at(values, 2).expect("row 2"),
+            i64::MAX as i128
+        );
+    }
 }
 
 fn resolve_managed_name(
