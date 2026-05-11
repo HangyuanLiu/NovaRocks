@@ -301,7 +301,7 @@ pub(crate) fn arrow_schema_to_table_column_defs(
 }
 
 /// Recursive Arrow DataType → SqlType conversion for CTAS schema inference.
-fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
+pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
     use arrow::datatypes::TimeUnit;
     Ok(match dt {
         DataType::Boolean => SqlType::Boolean,

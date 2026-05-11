@@ -59,13 +59,14 @@ pub fn load_expected_results(
         }
     };
 
+    let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
+    let markers: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
+        .collect();
+
     if multi_step {
-        let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-        let markers: Vec<(usize, usize)> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
-            .collect();
         if markers.is_empty() {
             println!(
                 "Warning: multi-step expected result must use '-- query N' sections: {}",
@@ -84,6 +85,12 @@ pub fn load_expected_results(
             result_sets.insert(*query_number, parse_result_set(&body_lines));
         }
         return Some(result_sets);
+    }
+
+    if markers.len() == 1 && lines[..markers[0].0].iter().all(|line| line.trim().is_empty()) {
+        let (start, query_number) = markers[0];
+        let body_lines = lines[start + 1..].to_vec();
+        return Some(BTreeMap::from([(query_number, parse_result_set(&body_lines))]));
     }
 
     // Single-result mode: the entire file is the result of the one

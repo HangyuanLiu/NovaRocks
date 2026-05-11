@@ -37,6 +37,7 @@ pub(crate) mod parquet;
 pub(crate) mod query_prep;
 pub(crate) mod sql_expr;
 pub(crate) mod statement;
+pub(crate) mod statistics;
 pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
@@ -174,6 +175,7 @@ pub(crate) struct StandaloneState {
     pub(crate) catalog: RwLock<InMemoryCatalog>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
@@ -188,6 +190,7 @@ impl Default for StandaloneState {
             catalog: RwLock::new(InMemoryCatalog::default()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            statistics: RwLock::new(statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
             metadata_store: None,
@@ -480,6 +483,20 @@ impl StandaloneSession {
         }
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
+        normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
+        if let Some(result) =
+            self::statistics::try_handle_statement(&self.inner, &normalized, current_database)?
+        {
+            return Ok(result);
+        }
+        if let Some((target, source)) = parse_create_table_like(&normalized)? {
+            return self.handle_create_table_like(
+                target,
+                source,
+                current_catalog,
+                current_database,
+            );
+        }
         if looks_like_show_alter_table_optimize(&normalized) {
             let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
             return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
@@ -705,6 +722,12 @@ impl StandaloneSession {
             }
             sqlast::Statement::Query(ref query) => {
                 if let Some(result) =
+                    self::statistics::try_query(&self.inner, &normalized, query, current_database)?
+                {
+                    return Ok(StatementResult::Query(result));
+                }
+                self::statistics::observe_query(&self.inner, query, current_database)?;
+                if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
                     return Ok(result);
@@ -855,12 +878,14 @@ impl StandaloneSession {
                 }
                 let stmt =
                     crate::engine::statement::convert_sqlparser_update_to_custom(update_stmt)?;
-                crate::engine::mutation_flow::execute_update_statement(
+                let result = crate::engine::mutation_flow::execute_update_statement(
                     &self.inner,
                     &stmt,
                     current_catalog,
                     current_database,
-                )
+                )?;
+                self::statistics::observe_update(&self.inner, &normalized, current_database)?;
+                Ok(result)
             }
             ref merge_stmt @ sqlast::Statement::Merge(_) => {
                 let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(merge_stmt)?;
@@ -1242,6 +1267,65 @@ impl StandaloneSession {
         Ok(StatementResult::Ok)
     }
 
+    fn handle_create_table_like(
+        &self,
+        target: crate::sql::parser::ast::ObjectName,
+        source: crate::sql::parser::ast::ObjectName,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let source_target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &source,
+            current_catalog,
+            current_database,
+        )?;
+        let backend = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read")
+            .catalog_backend(source_target.backend_name)?;
+        let source_table = backend.load_table(
+            &source_target.catalog,
+            &source_target.namespace,
+            &source_target.table,
+        )?;
+        let columns = source_table
+            .columns
+            .iter()
+            .map(|column| {
+                Ok(crate::sql::parser::ast::TableColumnDef {
+                    name: column.name.clone(),
+                    data_type: crate::engine::iceberg_ctas::arrow_data_type_to_sql_type(
+                        &column.data_type,
+                    )?,
+                    nullable: column.nullable,
+                    aggregation: None,
+                    default: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        execute_create_table_statement(
+            &self.inner,
+            crate::sql::parser::ast::CreateTableStmt {
+                name: target,
+                kind: crate::sql::parser::ast::CreateTableKind::Iceberg {
+                    columns,
+                    key_desc: None,
+                    bucket_count: None,
+                    partition_fields: Vec::new(),
+                    properties: Vec::new(),
+                },
+                legacy_range_partitions: Vec::new(),
+                as_select: None,
+                if_not_exists: false,
+            },
+            current_catalog,
+            current_database,
+        )
+    }
+
     /// Handle DROP TABLE/DATABASE/CATALOG result.
     fn handle_drop(
         &self,
@@ -1254,21 +1338,38 @@ impl StandaloneSession {
             DropResult::Catalog(stmt) => {
                 execute_drop_catalog_statement(&self.inner, &stmt.name, stmt.if_exists)
             }
-            DropResult::Database(stmt) => execute_drop_database_statement(
-                &self.inner,
-                &stmt.name,
-                current_catalog,
-                stmt.if_exists,
-                stmt.force,
-            ),
-            DropResult::Table(stmt) => execute_drop_table_statement(
-                &self.inner,
-                &stmt.name,
-                current_catalog,
-                current_database,
-                stmt.if_exists,
-                stmt.force,
-            ),
+            DropResult::Database(stmt) => {
+                let result = execute_drop_database_statement(
+                    &self.inner,
+                    &stmt.name,
+                    current_catalog,
+                    stmt.if_exists,
+                    stmt.force,
+                )?;
+                if let Some(database) = stmt.name.parts.last() {
+                    self::statistics::drop_database(&self.inner, database);
+                }
+                Ok(result)
+            }
+            DropResult::Table(stmt) => {
+                let result = execute_drop_table_statement(
+                    &self.inner,
+                    &stmt.name,
+                    current_catalog,
+                    current_database,
+                    stmt.if_exists,
+                    stmt.force,
+                )?;
+                match stmt.name.parts.as_slice() {
+                    [table] => self::statistics::drop_table(&self.inner, current_database, table),
+                    [database, table] => self::statistics::drop_table(&self.inner, database, table),
+                    [_, database, table] => {
+                        self::statistics::drop_table(&self.inner, database, table)
+                    }
+                    _ => {}
+                }
+                Ok(result)
+            }
         }
     }
 
@@ -1313,6 +1414,66 @@ fn standalone_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String> {
+    let re = regex::Regex::new(
+        r#"(?is)^\s*insert\s+overwrite\s+(?:table\s+)?(?P<table>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+partition\s*\([^)]*\)\s+(?P<rest>.*)$"#,
+    )
+    .map_err(|e| format!("compile INSERT OVERWRITE partition rewrite regex failed: {e}"))?;
+    let Some(captures) = re.captures(sql) else {
+        return Ok(sql.to_string());
+    };
+    let table = captures.name("table").expect("table capture").as_str();
+    let rest = captures.name("rest").expect("rest capture").as_str();
+    Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
+}
+
+fn parse_create_table_like(
+    sql: &str,
+) -> Result<
+    Option<(
+        crate::sql::parser::ast::ObjectName,
+        crate::sql::parser::ast::ObjectName,
+    )>,
+    String,
+> {
+    let re = regex::Regex::new(
+        r#"(?is)^\s*create\s+table\s+(?P<target>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+like\s+(?P<source>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s*$"#,
+    )
+    .map_err(|e| format!("compile CREATE TABLE LIKE regex failed: {e}"))?;
+    let Some(captures) = re.captures(sql) else {
+        return Ok(None);
+    };
+    let target = parse_simple_object_name(captures.name("target").expect("target").as_str())?;
+    let source = parse_simple_object_name(captures.name("source").expect("source").as_str())?;
+    Ok(Some((target, source)))
+}
+
+fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::ObjectName, String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_backtick = false;
+    for ch in token.chars() {
+        match ch {
+            '`' => in_backtick = !in_backtick,
+            '.' if !in_backtick => {
+                if cur.is_empty() {
+                    return Err(format!("empty object name segment in `{token}`"));
+                }
+                parts.push(cur.clone());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    if parts.is_empty() {
+        return Err(format!("empty object name `{token}`"));
+    }
+    Ok(crate::sql::parser::ast::ObjectName { parts })
 }
 
 fn build_show_alter_table_optimize_result(

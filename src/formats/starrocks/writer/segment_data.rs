@@ -1066,6 +1066,8 @@ fn build_short_key_index_page(
         )
     })?;
 
+    let short_key_columns = prepare_short_key_columns(batch, tablet_schema, &short_key_indexes)?;
+
     let mut key_buf = Vec::new();
     let mut offset_buf = Vec::new();
     let mut num_items: u32 = 0;
@@ -1078,8 +1080,7 @@ fn build_short_key_index_page(
             )
         })?;
         append_varint_u32(&mut offset_buf, offset);
-        let key_bytes =
-            encode_short_key_for_row(batch, tablet_schema, &short_key_indexes, row_idx)?;
+        let key_bytes = encode_short_key_for_row(&short_key_columns, row_idx)?;
         key_buf.extend_from_slice(&key_bytes);
         num_items = num_items.saturating_add(1);
     }
@@ -1147,35 +1148,170 @@ fn resolve_short_key_indexes(
     Ok(indexes.into_iter().take(take).collect())
 }
 
-fn encode_short_key_for_row(
+struct PreparedShortKeyColumn {
+    column: ArrayRef,
+    column_index: usize,
+    column_name: String,
+    writer_type: NativeWriterType,
+}
+
+fn prepare_short_key_columns(
     batch: &RecordBatch,
     tablet_schema: &TabletSchemaPb,
     short_key_indexes: &[usize],
+) -> Result<Vec<PreparedShortKeyColumn>, String> {
+    short_key_indexes
+        .iter()
+        .map(|col_idx| {
+            let schema_col = tablet_schema.column.get(*col_idx).ok_or_else(|| {
+                format!(
+                    "short key column index out of range in tablet schema: idx={} columns={}",
+                    col_idx,
+                    tablet_schema.column.len()
+                )
+            })?;
+            let writer_type = map_schema_type_to_writer_type(schema_col)?;
+            let column_name = schema_col.name.as_deref().unwrap_or("<unknown>");
+            let column = prepare_short_key_value_column(
+                batch.column(*col_idx),
+                writer_type,
+                *col_idx,
+                column_name,
+            )?;
+            Ok(PreparedShortKeyColumn {
+                column,
+                column_index: *col_idx,
+                column_name: column_name.to_string(),
+                writer_type,
+            })
+        })
+        .collect()
+}
+
+fn prepare_short_key_value_column(
+    column: &ArrayRef,
+    writer_type: NativeWriterType,
+    column_index: usize,
+    column_name: &str,
+) -> Result<ArrayRef, String> {
+    match writer_type {
+        NativeWriterType::TinyInt => cast_column_to_int8_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::SmallInt => cast_column_to_int16_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Int => cast_column_to_int32_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Date => cast_column_to_date32_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::BigInt => cast_column_to_int64_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::LargeInt => {
+            if let Some(typed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                if typed.value_length() != crate::common::largeint::LARGEINT_BYTE_WIDTH {
+                    return Err(format!(
+                        "invalid LARGEINT fixed-size binary width for short key writer: column_index={}, expected={}, actual={}",
+                        column_index,
+                        crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                        typed.value_length()
+                    ));
+                }
+                Ok(column.clone())
+            } else {
+                cast(column.as_ref(), &arrow::datatypes::DataType::Decimal128(38, 0)).map_err(
+                    |e| {
+                        format!(
+                            "cast short key column to Decimal128(38,0) for LARGEINT failed: column_index={}, error={}",
+                            column_index, e
+                        )
+                    },
+                )
+            }
+        }
+        NativeWriterType::Decimal32
+        | NativeWriterType::Decimal64
+        | NativeWriterType::Decimal128
+        | NativeWriterType::Decimal256 => Ok(column.clone()),
+        NativeWriterType::Datetime => cast_column_to_timestamp_micros_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Float => cast_column_to_float32_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Double => cast_column_to_float64_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Boolean => cast_column_to_boolean_for_native_writer(
+            column,
+            column_index,
+            column_name,
+            "short key writer",
+        ),
+        NativeWriterType::Varchar => cast(column.as_ref(), &arrow::datatypes::DataType::Utf8)
+            .map_err(|e| {
+                format!(
+                    "cast short key column to Utf8 failed: column_index={}, error={}",
+                    column_index, e
+                )
+            }),
+        NativeWriterType::Binary
+        | NativeWriterType::VarBinary
+        | NativeWriterType::Hll
+        | NativeWriterType::Percentile
+        | NativeWriterType::Object => cast(column.as_ref(), &arrow::datatypes::DataType::Binary)
+            .map_err(|e| {
+                format!(
+                    "cast short key column to Binary failed: column_index={}, error={}",
+                    column_index, e
+                )
+            }),
+    }
+}
+
+fn encode_short_key_for_row(
+    short_key_columns: &[PreparedShortKeyColumn],
     row_idx: usize,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    for col_idx in short_key_indexes {
-        let schema_col = tablet_schema.column.get(*col_idx).ok_or_else(|| {
-            format!(
-                "short key column index out of range in tablet schema: idx={} columns={}",
-                col_idx,
-                tablet_schema.column.len()
-            )
-        })?;
-        let writer_type = map_schema_type_to_writer_type(schema_col)?;
-        let column = batch.column(*col_idx);
-        let column_name = schema_col.name.as_deref().unwrap_or("<unknown>");
-        if column.is_null(row_idx) {
+    for column in short_key_columns {
+        if column.column.is_null(row_idx) {
             out.push(SHORT_KEY_NULL_FIRST_MARKER);
             continue;
         }
         out.push(SHORT_KEY_NORMAL_MARKER);
-        let value =
-            encode_short_key_value_bytes(column, row_idx, writer_type, *col_idx, column_name)?;
+        let value = encode_short_key_value_bytes(column, row_idx)?;
         let value_len = u32::try_from(value.len()).map_err(|_| {
             format!(
                 "short key value too large at column_index={} row_index={} size={}",
-                col_idx,
+                column.column_index,
                 row_idx,
                 value.len()
             )
@@ -1187,38 +1323,30 @@ fn encode_short_key_for_row(
 }
 
 fn encode_short_key_value_bytes(
-    column: &ArrayRef,
+    column: &PreparedShortKeyColumn,
     row_idx: usize,
-    writer_type: NativeWriterType,
-    column_index: usize,
-    column_name: &str,
 ) -> Result<Vec<u8>, String> {
-    match writer_type {
+    let column_index = column.column_index;
+    let column_name = column.column_name.as_str();
+    match column.writer_type {
         NativeWriterType::TinyInt => {
-            let casted = cast_column_to_int8_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
-                format!(
-                    "downcast short key Int8 column failed: column_index={}, column_name={}",
-                    column_index, column_name
-                )
-            })?;
+            let typed = column
+                .column
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| {
+                    format!(
+                        "downcast short key Int8 column failed: column_index={}, column_name={}",
+                        column_index, column_name
+                    )
+                })?;
             let v = typed.value(row_idx);
             let sortable = (v as u8) ^ 0x80;
             Ok(vec![sortable])
         }
         NativeWriterType::SmallInt => {
-            let casted = cast_column_to_int16_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .ok_or_else(|| {
@@ -1232,13 +1360,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::Int => {
-            let casted = cast_column_to_int32_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| {
@@ -1252,13 +1375,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::Date => {
-            let casted = cast_column_to_date32_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| {
@@ -1272,13 +1390,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::BigInt => {
-            let casted = cast_column_to_int64_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
@@ -1292,16 +1405,11 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::LargeInt => {
-            let value = if let Some(typed) = column.as_any().downcast_ref::<FixedSizeBinaryArray>()
+            let value = if let Some(typed) = column
+                .column
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
             {
-                if typed.value_length() != crate::common::largeint::LARGEINT_BYTE_WIDTH {
-                    return Err(format!(
-                        "invalid LARGEINT fixed-size binary width for short key writer: column_index={}, expected={}, actual={}",
-                        column_index,
-                        crate::common::largeint::LARGEINT_BYTE_WIDTH,
-                        typed.value_length()
-                    ));
-                }
                 crate::common::largeint::i128_from_be_bytes(typed.value(row_idx)).map_err(|e| {
                     format!(
                         "decode LARGEINT fixed-size binary failed for short key writer: column_index={}, row_index={}, error={}",
@@ -1309,14 +1417,8 @@ fn encode_short_key_value_bytes(
                     )
                 })?
             } else {
-                let casted = cast(column.as_ref(), &arrow::datatypes::DataType::Decimal128(38, 0))
-                    .map_err(|e| {
-                    format!(
-                        "cast short key column to Decimal128(38,0) for LARGEINT failed: column_index={}, error={}",
-                        column_index, e
-                    )
-                })?;
-                let typed = casted
+                let typed = column
+                    .column
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
@@ -1333,9 +1435,10 @@ fn encode_short_key_value_bytes(
         NativeWriterType::Decimal32
         | NativeWriterType::Decimal64
         | NativeWriterType::Decimal128
-        | NativeWriterType::Decimal256 => match writer_type {
+        | NativeWriterType::Decimal256 => match column.writer_type {
             NativeWriterType::Decimal256 => {
                 let typed = column
+                    .column
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
                     .ok_or_else(|| {
@@ -1352,6 +1455,7 @@ fn encode_short_key_value_bytes(
             | NativeWriterType::Decimal64
             | NativeWriterType::Decimal128 => {
                 let typed = column
+                    .column
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
@@ -1361,7 +1465,7 @@ fn encode_short_key_value_bytes(
                         )
                     })?;
                 let value = typed.value(row_idx);
-                match writer_type {
+                match column.writer_type {
                     NativeWriterType::Decimal32 => {
                         let narrowed = i32::try_from(value).map_err(|_| {
                             format!(
@@ -1392,13 +1496,8 @@ fn encode_short_key_value_bytes(
             _ => unreachable!("invalid decimal short key writer type"),
         },
         NativeWriterType::Datetime => {
-            let casted = cast_column_to_timestamp_micros_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| {
@@ -1412,13 +1511,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::Float => {
-            let casted = cast_column_to_float32_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| {
@@ -1436,13 +1530,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::Double => {
-            let casted = cast_column_to_float64_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| {
@@ -1460,13 +1549,8 @@ fn encode_short_key_value_bytes(
             Ok(sortable.to_be_bytes().to_vec())
         }
         NativeWriterType::Boolean => {
-            let casted = cast_column_to_boolean_for_native_writer(
-                column,
-                column_index,
-                column_name,
-                "short key writer",
-            )?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
@@ -1478,13 +1562,8 @@ fn encode_short_key_value_bytes(
             Ok(vec![u8::from(typed.value(row_idx))])
         }
         NativeWriterType::Varchar => {
-            let casted = cast(column.as_ref(), &arrow::datatypes::DataType::Utf8).map_err(|e| {
-                format!(
-                    "cast short key column to Utf8 failed: column_index={}, error={}",
-                    column_index, e
-                )
-            })?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| {
@@ -1500,14 +1579,8 @@ fn encode_short_key_value_bytes(
         | NativeWriterType::Hll
         | NativeWriterType::Percentile
         | NativeWriterType::Object => {
-            let casted =
-                cast(column.as_ref(), &arrow::datatypes::DataType::Binary).map_err(|e| {
-                    format!(
-                        "cast short key column to Binary failed: column_index={}, error={}",
-                        column_index, e
-                    )
-                })?;
-            let typed = casted
+            let typed = column
+                .column
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
