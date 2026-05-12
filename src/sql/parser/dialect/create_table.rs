@@ -2,7 +2,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use super::{convert_object_name, convert_sql_type, peek_word_eq};
+use super::{StarRocksDialect, convert_object_name, convert_sql_type, peek_word_eq};
 use crate::engine::catalog::normalize_identifier;
 use crate::sql::analyzer::iceberg_ref::split_ref_suffix;
 use crate::sql::catalog::LegacyRangePartition;
@@ -182,6 +182,23 @@ pub(crate) fn parse_create_table_statement(
         as_select,
         if_not_exists,
     })
+}
+
+pub(crate) fn parse_sql_type_string(sql: &str) -> Result<SqlType, String> {
+    let normalized = super::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| e.to_string())?;
+    let data_type = parse_sql_type_definition(&mut parser)?;
+    if parser.peek_token_ref().token != Token::EOF
+        && parser.peek_token_ref().token != Token::SemiColon
+    {
+        return Err(format!(
+            "unexpected token after SQL type: {:?}",
+            parser.peek_token_ref().token
+        ));
+    }
+    Ok(data_type)
 }
 
 fn is_legacy_partition_clause(parser: &Parser<'_>) -> bool {

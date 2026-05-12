@@ -35,6 +35,16 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     });
                 }
+                if let Some(param) = scope.resolve_lambda_param(&ident.value) {
+                    return Ok(TypedExpr {
+                        kind: ExprKind::LambdaParamRef {
+                            name: param.name,
+                            slot_id: param.slot_id,
+                        },
+                        data_type: param.data_type,
+                        nullable: param.nullable,
+                    });
+                }
                 let (data_type, nullable) = scope.resolve(None, &ident.value)?;
                 Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -656,6 +666,20 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         let base_name = &parts[0].value;
+        if let Some(param) = scope.resolve_lambda_param(base_name) {
+            let mut current = TypedExpr {
+                kind: ExprKind::LambdaParamRef {
+                    name: param.name,
+                    slot_id: param.slot_id,
+                },
+                data_type: param.data_type,
+                nullable: param.nullable,
+            };
+            for field in &parts[1..] {
+                current = self.analyze_struct_field_access(current, field.value.clone())?;
+            }
+            return Ok(current);
+        }
         let (data_type, nullable) = scope.resolve(None, base_name)?;
         let mut current = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -1197,6 +1221,17 @@ impl<'a> super::AnalyzerContext<'a> {
             time_slice_rewrites.iter().collect()
         };
 
+        if let Some(rewritten) =
+            self.try_analyze_higher_order_function(&name, &effective_arg_exprs, scope)?
+        {
+            return Ok(rewritten);
+        }
+        if let Some(rewritten) =
+            self.try_analyze_array_map_cast_lambda(&name, &effective_arg_exprs, scope)?
+        {
+            return Ok(rewritten);
+        }
+
         // Analyze arguments. For the narrow standalone lambda support needed by
         // aggregate suite, rewrite `array_sortby((x) -> x.field, arr)` into
         // `array_sortby(arr, __array_struct_subfield(arr, 'field'))`.
@@ -1474,7 +1509,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if is_aggregate_function(&name) {
             validate_aggregate_function_call(&name, &arg_types)?;
         } else {
-            validate_scalar_function_call(&name, &arg_types)?;
+            validate_scalar_function_call_typed(&name, &args_typed)?;
         }
 
         match original_name.as_str() {
@@ -1641,9 +1676,162 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
+    fn try_analyze_higher_order_function(
+        &self,
+        name: &str,
+        arg_exprs: &[&sqlast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<Option<TypedExpr>, String> {
+        if !matches!(
+            name,
+            "array_map" | "transform" | "any_match" | "all_match" | "array_filter" | "filter"
+        ) {
+            return Ok(None);
+        }
+
+        let Some((lambda_pos, params, lambda_body)) = find_lambda_argument(arg_exprs) else {
+            return Ok(None);
+        };
+        let array_exprs = arg_exprs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, expr)| (idx != lambda_pos).then_some(*expr))
+            .collect::<Vec<_>>();
+        if array_exprs.is_empty() {
+            return Err(format!("{name} expects at least one ARRAY argument"));
+        }
+
+        let mut array_args = Vec::with_capacity(array_exprs.len());
+        let mut lambda_params = Vec::with_capacity(params.len());
+        for (idx, array_expr) in array_exprs.iter().enumerate() {
+            let typed = self.analyze_expr(array_expr, scope)?;
+            let (data_type, nullable) = match &typed.data_type {
+                DataType::List(item) => (item.data_type().clone(), item.is_nullable()),
+                DataType::Null => (DataType::Null, true),
+                other => return Err(format!("{name} expects ARRAY argument, got {other:?}")),
+            };
+            let Some(param_name) = params.get(idx) else {
+                return Err(format!(
+                    "{name} lambda argument count {} does not match ARRAY argument count {}",
+                    params.len(),
+                    array_exprs.len()
+                ));
+            };
+            lambda_params.push(LambdaParam {
+                name: param_name.clone(),
+                slot_id: self.alloc_lambda_slot_id(),
+                data_type,
+                nullable,
+            });
+            array_args.push(typed);
+        }
+        if params.len() != array_args.len() {
+            return Err(format!(
+                "{name} lambda argument count {} does not match ARRAY argument count {}",
+                params.len(),
+                array_args.len()
+            ));
+        }
+
+        let mut lambda_scope = scope.clone();
+        for param in &lambda_params {
+            lambda_scope.add_lambda_param(param.clone());
+        }
+        let body = self.analyze_expr(lambda_body, &lambda_scope)?;
+        let lambda = TypedExpr {
+            data_type: body.data_type.clone(),
+            nullable: body.nullable,
+            kind: ExprKind::LambdaFunction {
+                params: lambda_params,
+                body: Box::new(body),
+            },
+        };
+
+        match name {
+            "array_map" | "transform" => {
+                let body_type = lambda.data_type.clone();
+                let mapped_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item", body_type, true,
+                )));
+                let mut args = Vec::with_capacity(array_args.len() + 1);
+                args.push(lambda);
+                args.extend(array_args);
+                Ok(Some(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "array_map".to_string(),
+                        args,
+                        distinct: false,
+                    },
+                    data_type: mapped_type,
+                    nullable: true,
+                }))
+            }
+            "any_match" | "all_match" => {
+                let mapped_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    lambda.data_type.clone(),
+                    true,
+                )));
+                let mut map_args = Vec::with_capacity(array_args.len() + 1);
+                map_args.push(lambda);
+                map_args.extend(array_args);
+                let mapped = TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "array_map".to_string(),
+                        args: map_args,
+                        distinct: false,
+                    },
+                    data_type: mapped_type,
+                    nullable: true,
+                };
+                Ok(Some(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: name.to_string(),
+                        args: vec![mapped],
+                        distinct: false,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: true,
+                }))
+            }
+            "array_filter" | "filter" => {
+                let source = array_args
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "array_filter missing ARRAY argument".to_string())?;
+                let filter_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    lambda.data_type.clone(),
+                    true,
+                )));
+                let mut map_args = Vec::with_capacity(array_args.len() + 1);
+                map_args.push(lambda);
+                map_args.extend(array_args);
+                let filter = TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "array_map".to_string(),
+                        args: map_args,
+                        distinct: false,
+                    },
+                    data_type: filter_type,
+                    nullable: true,
+                };
+                Ok(Some(TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        name: "array_filter".to_string(),
+                        args: vec![source.clone(), filter],
+                        distinct: false,
+                    },
+                    data_type: source.data_type,
+                    nullable: true,
+                }))
+            }
+            _ => unreachable!("higher-order function match is exhaustive"),
+        }
+    }
+
     /// Analyze the arguments of a higher-order function whose first argument
-    /// is a lambda (e.g. `array_map(x -> ..., arr)` or
-    /// `array_filter((x, y) -> ..., arr1, arr2)`).
+    /// is a lambda (e.g. `array_map(x -> ..., arr)`).
     ///
     /// The lambda parameter count must match the number of trailing array
     /// arguments. Each parameter is bound to the element type of the
@@ -1671,7 +1859,6 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
-        // Analyze each array argument first so we know its element type.
         let mut analyzed_arrays = Vec::with_capacity(array_count);
         let mut element_types = Vec::with_capacity(array_count);
         for sql_expr in &arg_exprs[1..] {
@@ -1689,7 +1876,6 @@ impl<'a> super::AnalyzerContext<'a> {
             analyzed_arrays.push(typed);
         }
 
-        // Build a scope that contains outer columns plus the lambda params.
         let mut inner_scope = scope.clone();
         for (param_name, elem_type) in param_names.iter().zip(element_types.iter()) {
             inner_scope.add_column(None, param_name, elem_type.clone(), true);
@@ -1716,6 +1902,50 @@ impl<'a> super::AnalyzerContext<'a> {
             args_typed.push(arr);
         }
         Ok((args_typed, arg_types))
+    }
+
+    fn try_analyze_array_map_cast_lambda(
+        &self,
+        name: &str,
+        arg_exprs: &[&sqlast::Expr],
+        scope: &AnalyzerScope,
+    ) -> Result<Option<TypedExpr>, String> {
+        if !matches!(name, "array_map" | "transform") {
+            return Ok(None);
+        }
+        if arg_exprs.len() != 2 {
+            return Ok(None);
+        }
+
+        let Some((param_name, lambda_body)) = parse_array_sortby_lambda(arg_exprs[0]) else {
+            return Ok(None);
+        };
+        if !lambda_body_casts_param_to_utf8(lambda_body, &param_name) {
+            return Err(
+                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)".to_string(),
+            );
+        }
+
+        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
+        if !matches!(array_expr.data_type, DataType::List(_)) {
+            return Err(format!(
+                "array_map lambda expects ARRAY input, got {:?}",
+                array_expr.data_type
+            ));
+        }
+        let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        Ok(Some(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(array_expr),
+                target: target.clone(),
+            },
+            data_type: target,
+            nullable: true,
+        }))
     }
 
     fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
@@ -2853,11 +3083,94 @@ fn parse_array_sortby_lambda(expr: &sqlast::Expr) -> Option<(String, &sqlast::Ex
     }
 }
 
+fn find_lambda_argument<'a>(
+    arg_exprs: &[&'a sqlast::Expr],
+) -> Option<(usize, Vec<String>, &'a sqlast::Expr)> {
+    if let Some((idx, params, body)) = arg_exprs
+        .first()
+        .and_then(|expr| parse_lambda_expr(expr))
+        .map(|(params, body)| (0, params, body))
+    {
+        return Some((idx, params, body));
+    }
+    arg_exprs
+        .last()
+        .and_then(|expr| parse_lambda_expr(expr))
+        .map(|(params, body)| (arg_exprs.len() - 1, params, body))
+}
+
+fn parse_lambda_expr(expr: &sqlast::Expr) -> Option<(Vec<String>, &sqlast::Expr)> {
+    match expr {
+        sqlast::Expr::Lambda(lambda) => Some((
+            lambda
+                .params
+                .iter()
+                .map(|ident| ident.value.to_lowercase())
+                .collect(),
+            lambda.body.as_ref(),
+        )),
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => parse_lambda_params(left).map(|params| (params, right.as_ref())),
+        sqlast::Expr::Nested(inner) => parse_lambda_expr(inner),
+        _ => None,
+    }
+}
+
+fn parse_lambda_params(expr: &sqlast::Expr) -> Option<Vec<String>> {
+    match expr {
+        sqlast::Expr::Identifier(ident) => Some(vec![ident.value.to_lowercase()]),
+        sqlast::Expr::Tuple(items) => items
+            .iter()
+            .map(|item| match item {
+                sqlast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+                sqlast::Expr::Nested(inner) => parse_lambda_params(inner).and_then(|params| {
+                    if params.len() == 1 {
+                        params.into_iter().next()
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .collect(),
+        sqlast::Expr::Nested(inner) => parse_lambda_params(inner),
+        _ => None,
+    }
+}
+
 fn parse_array_sortby_lambda_param(expr: &sqlast::Expr) -> Option<String> {
     match expr {
         sqlast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
         sqlast::Expr::Nested(inner) => parse_array_sortby_lambda_param(inner),
         _ => None,
+    }
+}
+
+fn lambda_body_casts_param_to_utf8(expr: &sqlast::Expr, param_name: &str) -> bool {
+    match expr {
+        sqlast::Expr::Nested(inner) => lambda_body_casts_param_to_utf8(inner, param_name),
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } if lambda_expr_is_param(inner, param_name) => {
+            matches!(
+                sql_type_to_arrow(data_type),
+                Ok(DataType::Utf8 | DataType::LargeUtf8)
+            )
+        }
+        _ => false,
+    }
+}
+
+fn lambda_expr_is_param(expr: &sqlast::Expr, param_name: &str) -> bool {
+    match expr {
+        sqlast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
+        sqlast::Expr::Nested(inner) => lambda_expr_is_param(inner, param_name),
+        _ => false,
     }
 }
 
@@ -3115,7 +3428,7 @@ fn parse_lambda_param_list(expr: &sqlast::Expr) -> Option<Vec<String>> {
 /// and the first argument is a parseable lambda. Used to dispatch into the
 /// dedicated analyzer that binds lambda parameters before walking the body.
 fn is_higher_order_function_with_lambda(name: &str, arg_exprs: &[&sqlast::Expr]) -> bool {
-    matches!(name, "array_map" | "transform" | "array_filter" | "filter")
+    matches!(name, "array_map" | "transform")
         && arg_exprs
             .first()
             .and_then(|expr| parse_multi_param_lambda(expr))

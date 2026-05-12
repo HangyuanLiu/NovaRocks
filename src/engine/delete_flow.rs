@@ -87,6 +87,9 @@ pub(crate) fn execute_delete_statement(
     // 1. Resolve target.
     let target =
         resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
+    if target.backend_name == "managed" {
+        return execute_managed_delete_statement(state, &target, stmt, &target_ref);
+    }
     if target.backend_name != "iceberg" {
         return Err(format!(
             "phase 1 DELETE only supports iceberg backends, got `{}`",
@@ -346,6 +349,49 @@ fn translate_where(
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
         )),
     }
+}
+
+fn execute_managed_delete_statement(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+    target_ref: &str,
+) -> Result<StatementResult, String> {
+    if target_ref != "main" {
+        return Err(format!(
+            "DELETE: branch target `{target_ref}` is only supported for iceberg tables"
+        ));
+    }
+
+    let (catalog, sink) = {
+        let reg = state.connectors.read().expect("connector registry read");
+        (
+            reg.catalog_backend(target.backend_name)?,
+            reg.table_sink(target.backend_name)?,
+        )
+    };
+    let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+    let rewritten_sql = format!(
+        "SELECT * FROM {} WHERE NOT COALESCE(({}), FALSE)",
+        target.table, stmt.where_clause
+    );
+    let statement = crate::sql::parser::parse_sql_raw(&rewritten_sql)?;
+    let sqlast::Statement::Query(query) = statement else {
+        return Err("internal: managed DELETE rewrite did not parse as SELECT".to_string());
+    };
+    let batch = crate::engine::insert_flow::execute_insert_from_query_on_pipeline(
+        state,
+        target,
+        &resolved,
+        &[],
+        query.as_ref(),
+    )?;
+
+    crate::connector::truncate_managed_table(state, &target.namespace, &target.table)?;
+    if batch.num_rows() > 0 {
+        sink.append_batch(&resolved, batch)?;
+    }
+    Ok(StatementResult::Ok)
 }
 
 /// One side of a comparison must be a column reference and the other a literal.

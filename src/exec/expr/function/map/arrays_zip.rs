@@ -18,6 +18,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, ListArray, StringBuilder, StructArray, make_array,
+    new_empty_array,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields};
@@ -91,18 +92,21 @@ pub fn eval_arrays_zip(
         return Err("arrays_zip expects at least one argument".to_string());
     }
 
-    let mut list_arrays: Vec<ArrayRef> = Vec::with_capacity(args.len());
+    let mut list_arrays: Vec<Option<ArrayRef>> = Vec::with_capacity(args.len());
     let mut value_arrays: Vec<ArrayRef> = Vec::with_capacity(args.len());
     for arg in args {
         let arr = arena.eval(*arg, chunk)?;
-        let list_values = arr
+        if arr.data_type() == &DataType::Null {
+            list_arrays.push(None);
+            value_arrays.push(new_empty_array(&DataType::Null));
+            continue;
+        }
+        let list = arr
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| format!("arrays_zip expects ListArray, got {:?}", arr.data_type()))?
-            .values()
-            .clone();
-        list_arrays.push(arr);
-        value_arrays.push(list_values);
+            .ok_or_else(|| format!("arrays_zip expects ListArray, got {:?}", arr.data_type()))?;
+        value_arrays.push(list.values().clone());
+        list_arrays.push(Some(arr));
     }
 
     let (list_field, struct_fields) = resolve_output_type(arena.data_type(expr), &value_arrays)?;
@@ -149,6 +153,10 @@ pub fn eval_arrays_zip(
         let mut max_len = 0usize;
 
         for list_arr in &list_arrays {
+            let Some(list_arr) = list_arr else {
+                row_is_null = true;
+                break;
+            };
             let list = list_arr
                 .as_any()
                 .downcast_ref::<ListArray>()
@@ -174,6 +182,9 @@ pub fn eval_arrays_zip(
 
         for element_idx in 0..max_len {
             for (array_idx, list_arr) in list_arrays.iter().enumerate() {
+                let Some(list_arr) = list_arr else {
+                    continue;
+                };
                 let list = list_arr
                     .as_any()
                     .downcast_ref::<ListArray>()

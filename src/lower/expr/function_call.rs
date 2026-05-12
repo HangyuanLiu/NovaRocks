@@ -36,6 +36,25 @@ fn is_numeric_like_type(data_type: &DataType) -> bool {
     ) || largeint::is_largeint_data_type(data_type)
 }
 
+fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::Binary
+    ) || largeint::is_largeint_data_type(data_type)
+}
+
 fn is_null_literal(arena: &ExprArena, expr_id: ExprId) -> bool {
     matches!(
         arena.node(expr_id),
@@ -54,7 +73,41 @@ fn is_array_element_compatible(
     if matches!(actual, DataType::Null) || actual_is_null_literal {
         return true;
     }
-    is_numeric_like_type(expected) && is_numeric_like_type(actual)
+    match (expected, actual) {
+        (DataType::List(expected_item), DataType::List(actual_item)) => {
+            is_array_element_compatible(
+                expected_item.data_type(),
+                actual_item.data_type(),
+                actual_is_null_literal,
+            )
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            expected_fields.len() == actual_fields.len()
+                && expected_fields.iter().zip(actual_fields.iter()).all(
+                    |(expected_field, actual_field)| {
+                        is_array_element_compatible(
+                            expected_field.data_type(),
+                            actual_field.data_type(),
+                            actual_is_null_literal,
+                        )
+                    },
+                )
+        }
+        (DataType::Map(expected_entries, _), DataType::Map(actual_entries, _)) => {
+            is_array_element_compatible(
+                expected_entries.data_type(),
+                actual_entries.data_type(),
+                actual_is_null_literal,
+            )
+        }
+        (DataType::List(_), _)
+        | (_, DataType::List(_))
+        | (DataType::Struct(_), _)
+        | (_, DataType::Struct(_))
+        | (DataType::Map(_, _), _)
+        | (_, DataType::Map(_, _)) => false,
+        _ => is_numeric_like_type(expected) && is_numeric_like_type(actual),
+    }
 }
 
 fn is_array_pair_compatible(left: &DataType, right: &DataType) -> bool {
@@ -64,7 +117,75 @@ fn is_array_pair_compatible(left: &DataType, right: &DataType) -> bool {
     if matches!(left, DataType::Null) || matches!(right, DataType::Null) {
         return true;
     }
-    is_numeric_like_type(left) && is_numeric_like_type(right)
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item)) => {
+            is_array_pair_compatible(left_item.data_type(), right_item.data_type())
+        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            left_fields.len() == right_fields.len()
+                && left_fields
+                    .iter()
+                    .zip(right_fields.iter())
+                    .all(|(left_field, right_field)| {
+                        is_array_pair_compatible(left_field.data_type(), right_field.data_type())
+                    })
+        }
+        (DataType::Map(left_entries, _), DataType::Map(right_entries, _)) => {
+            is_array_pair_compatible(left_entries.data_type(), right_entries.data_type())
+        }
+        (DataType::List(_), _)
+        | (_, DataType::List(_))
+        | (DataType::Struct(_), _)
+        | (_, DataType::Struct(_))
+        | (DataType::Map(_, _), _)
+        | (_, DataType::Map(_, _)) => false,
+        _ => is_numeric_like_type(left) && is_numeric_like_type(right),
+    }
+}
+
+fn is_arrays_overlap_pair_compatible(left: &DataType, right: &DataType) -> bool {
+    if left == right {
+        return true;
+    }
+    if matches!(left, DataType::Null) || matches!(right, DataType::Null) {
+        return true;
+    }
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item)) => {
+            is_arrays_overlap_pair_compatible(left_item.data_type(), right_item.data_type())
+        }
+        (DataType::List(_), _) | (_, DataType::List(_)) => false,
+        _ => {
+            (is_numeric_like_type(left) && is_numeric_like_type(right))
+                || (matches!(left, DataType::Utf8) && is_varchar_castable_scalar(right))
+                || (matches!(right, DataType::Utf8) && is_varchar_castable_scalar(left))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Field;
+    use std::sync::Arc;
+
+    fn array_type(inner: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("item", inner, true)))
+    }
+
+    #[test]
+    fn nested_array_element_compatible_accepts_decimal_arrays() {
+        let expected = array_type(DataType::Decimal128(38, 5));
+        let actual = array_type(DataType::Decimal128(2, 1));
+        assert!(is_array_element_compatible(&expected, &actual, false));
+    }
+
+    #[test]
+    fn nested_array_pair_compatible_accepts_decimal_arrays() {
+        let left = array_type(DataType::Decimal128(38, 5));
+        let right = array_type(DataType::Decimal128(2, 1));
+        assert!(is_array_pair_compatible(&left, &right));
+    }
 }
 
 /// Lower FUNCTION_CALL expression to ExprNode::FunctionCall or ExprNode::Literal.
@@ -230,6 +351,8 @@ pub(crate) fn lower_function_call(
                         );
                     };
                     let return_compatible = item0.data_type() == item1.data_type()
+                        || matches!(item0.data_type(), DataType::Null)
+                        || matches!(item1.data_type(), DataType::Null)
                         || matches!(
                             (item0.data_type(), item1.data_type()),
                             (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
@@ -243,6 +366,7 @@ pub(crate) fn lower_function_call(
                     }
                     let target_type = item1.data_type();
                     let arg_compatible = target_type == arg1
+                        || matches!(arg1, DataType::Null)
                         || matches!(
                             (target_type, arg1),
                             (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
@@ -382,26 +506,32 @@ pub(crate) fn lower_function_call(
                     let arg1 = arena
                         .data_type(children[1])
                         .ok_or_else(|| "array_filter missing arg1 type".to_string())?;
-                    let (DataType::List(item0), DataType::List(item_out)) = (arg0, &data_type)
-                    else {
+                    let DataType::List(item_out) = &data_type else {
                         return Err(
                             "array_filter expects ARRAY as first argument and return ARRAY"
                                 .to_string(),
                         );
                     };
-                    if item0.data_type() != item_out.data_type() {
-                        return Err(format!(
-                            "array_filter return element type mismatch: {:?} vs {:?}",
-                            item0.data_type(),
-                            item_out.data_type()
-                        ));
-                    }
-                    match arg1 {
-                        DataType::List(item) if matches!(item.data_type(), DataType::Boolean) => {}
-                        _ => {
-                            return Err("array_filter expects ARRAY<BOOLEAN> as second argument"
-                                .to_string());
+                    match arg0 {
+                        DataType::List(item0) => {
+                            if item0.data_type() != item_out.data_type() {
+                                return Err(format!(
+                                    "array_filter return element type mismatch: {:?} vs {:?}",
+                                    item0.data_type(),
+                                    item_out.data_type()
+                                ));
+                            }
                         }
+                        DataType::Null => {}
+                        _ => {
+                            return Err(
+                                "array_filter expects ARRAY as first argument and return ARRAY"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if !matches!(arg1, DataType::List(_) | DataType::Null) {
+                        return Err("array_filter expects ARRAY as second argument".to_string());
                     }
                 }
                 "array_flatten" => {
@@ -432,7 +562,7 @@ pub(crate) fn lower_function_call(
                     let arg0 = arena
                         .data_type(children[0])
                         .ok_or_else(|| "array_length missing arg0 type".to_string())?;
-                    if !matches!(arg0, DataType::List(_)) {
+                    if !matches!(arg0, DataType::List(_) | DataType::Null) {
                         return Err("array_length expects ARRAY as first argument".to_string());
                     }
                     if !matches!(data_type, DataType::Int32) {
@@ -461,6 +591,7 @@ pub(crate) fn lower_function_call(
                                 arg1
                             ));
                         }
+                        DataType::Null => {}
                         _ => {
                             return Err(
                                 "array_contains expects ARRAY as first argument".to_string()
@@ -489,6 +620,9 @@ pub(crate) fn lower_function_call(
                                 item1.data_type()
                             ));
                         }
+                        (DataType::Null, DataType::List(_))
+                        | (DataType::List(_), DataType::Null)
+                        | (DataType::Null, DataType::Null) => {}
                         _ => return Err(format!("{} expects ARRAY arguments", name)),
                     }
                     if !matches!(data_type, DataType::Boolean) {
@@ -504,7 +638,10 @@ pub(crate) fn lower_function_call(
                         .ok_or_else(|| "arrays_overlap missing arg1 type".to_string())?;
                     match (arg0, arg1) {
                         (DataType::List(item0), DataType::List(item1))
-                            if is_array_pair_compatible(item0.data_type(), item1.data_type()) => {}
+                            if is_arrays_overlap_pair_compatible(
+                                item0.data_type(),
+                                item1.data_type(),
+                            ) => {}
                         (DataType::List(item0), DataType::List(item1)) => {
                             return Err(format!(
                                 "arrays_overlap expects same element type, got {:?} and {:?}",
@@ -542,6 +679,7 @@ pub(crate) fn lower_function_call(
                                 arg1
                             ));
                         }
+                        DataType::Null => {}
                         _ => {
                             return Err(
                                 "array_position expects ARRAY as first argument".to_string()
@@ -1293,7 +1431,7 @@ pub(crate) fn lower_function_call(
                         return Err("to_base64 must return VARCHAR type".to_string());
                     }
                 }
-                "md5" | "md5sum" | "sm3" => {
+                "md5" | "sm3" => {
                     for (idx, child) in children.iter().enumerate() {
                         let arg_ty = arena
                             .data_type(*child)
@@ -1306,14 +1444,31 @@ pub(crate) fn lower_function_call(
                         return Err(format!("{} must return VARCHAR type", name));
                     }
                 }
+                "md5sum" => {
+                    for (idx, child) in children.iter().enumerate() {
+                        let arg_ty = arena
+                            .data_type(*child)
+                            .ok_or_else(|| format!("md5sum missing arg{} type", idx))?;
+                        if !is_varchar_castable_scalar(arg_ty) {
+                            return Err(
+                                "md5sum expects VARCHAR/VARBINARY or castable scalar arguments"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if !matches!(data_type, DataType::Utf8) {
+                        return Err("md5sum must return VARCHAR type".to_string());
+                    }
+                }
                 "md5sum_numeric" => {
                     for (idx, child) in children.iter().enumerate() {
                         let arg_ty = arena
                             .data_type(*child)
                             .ok_or_else(|| format!("md5sum_numeric missing arg{} type", idx))?;
-                        if !is_varchar_or_binary(arg_ty) {
+                        if !is_varchar_castable_scalar(arg_ty) {
                             return Err(
-                                "md5sum_numeric expects VARCHAR/VARBINARY arguments".to_string()
+                                "md5sum_numeric expects VARCHAR/VARBINARY or castable scalar arguments"
+                                    .to_string(),
                             );
                         }
                     }

@@ -7,8 +7,11 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use sqlparser::ast as sqlast;
 
+use crate::engine::sql_expr::sqlparser_expr_to_custom_expr;
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
-use crate::sql::parser::ast::{InsertSource, Literal, ObjectName, OverwriteMode};
+use crate::sql::parser::ast::{
+    ArithmeticOp, Expr, InsertSource, Literal, ObjectName, OverwriteMode,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct TableKey {
@@ -50,6 +53,14 @@ struct AnalyzeStatusRow {
     analyze_type: String,
     status: String,
     is_new: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GenerateSeriesQueryStats {
+    start: i64,
+    end: i64,
+    step: i64,
+    projection: Vec<Expr>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -944,16 +955,13 @@ fn observe_test_overwrite_stats_table(
     if matches!(overwrite_mode, OverwriteMode::FullTable) {
         drop_column_stats_only(state, key);
     }
-    let max = match source {
-        InsertSource::SelectLiteralRow(row) => row
-            .first()
-            .map(literal_to_stat_value)
-            .unwrap_or_else(|| "123".to_string()),
-        InsertSource::Values(rows) if rows.len() == 1 => rows[0]
-            .first()
-            .map(literal_to_stat_value)
-            .unwrap_or_else(|| "123".to_string()),
-        _ => "123".to_string(),
+    let max = {
+        let (_, estimated_max) = estimate_column_min_max(source, 0, &DataType::Int64);
+        if estimated_max.is_empty() {
+            "123".to_string()
+        } else {
+            estimated_max
+        }
     };
     let existing = filtered_column_stats_by_key(state, key).len();
     let count = if existing == 0 && max == "123" { 3 } else { 1 };
@@ -1771,7 +1779,9 @@ fn estimated_source_row_count(source: &InsertSource) -> i64 {
         InsertSource::Values(rows) => rows.len() as i64,
         InsertSource::SelectLiteralRow(_) => 1,
         InsertSource::UnionAll(parts) => parts.iter().map(estimated_source_row_count).sum(),
-        InsertSource::FromQuery(_) => 0,
+        InsertSource::FromQuery(query) => estimate_generate_series_query(query)
+            .map(|series| generate_series_row_count(series.start, series.end, series.step))
+            .unwrap_or(0),
     }
 }
 
@@ -1820,7 +1830,255 @@ fn estimate_column_min_max(
                 maxes.last().cloned().unwrap_or_default(),
             )
         }
-        InsertSource::FromQuery(_) => (String::new(), String::new()),
+        InsertSource::FromQuery(query) => {
+            let Some(series) = estimate_generate_series_query(query) else {
+                return (String::new(), String::new());
+            };
+            let Some(expr) = series.projection.get(column_idx) else {
+                return (String::new(), String::new());
+            };
+            estimate_generate_expr_min_max(expr, series.start, series.end, data_type)
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn estimate_generate_series_query(query: &sqlast::Query) -> Option<GenerateSeriesQueryStats> {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+    {
+        return None;
+    }
+    let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || select.selection.is_some()
+        || select.having.is_some()
+    {
+        return None;
+    }
+    let sqlast::TableFactor::TableFunction { expr, .. } = &select.from[0].relation else {
+        return None;
+    };
+    let (start, end, step) = parse_generate_series_function_expr(expr).ok()?;
+    let projection = select
+        .projection
+        .iter()
+        .map(select_item_expr)
+        .map(|expr| expr.and_then(sqlparser_expr_to_custom_expr))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(GenerateSeriesQueryStats {
+        start,
+        end,
+        step,
+        projection,
+    })
+}
+
+fn select_item_expr(item: &sqlast::SelectItem) -> Result<&sqlast::Expr, String> {
+    match item {
+        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+            Ok(expr)
+        }
+        _ => Err("INSERT SELECT source only supports expressions".into()),
+    }
+}
+
+fn parse_generate_series_function_expr(expr: &sqlast::Expr) -> Result<(i64, i64, i64), String> {
+    let sqlast::Expr::Function(function) = expr else {
+        return Err(format!("TABLE() requires a function call, got: {expr}"));
+    };
+    let func_name = function
+        .name
+        .0
+        .last()
+        .map(|p| p.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    if func_name != "generate_series" {
+        return Err(format!("unsupported table function: {func_name}"));
+    }
+    let sqlast::FunctionArguments::List(ref arg_list) = function.args else {
+        return Err("generate_series requires parenthesized arguments".into());
+    };
+    let values = arg_list
+        .args
+        .iter()
+        .map(|arg| match arg {
+            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => eval_const_i64(e),
+            other => Err(format!(
+                "generate_series expects positional args, got {other}"
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match values.as_slice() {
+        [start, end] => Ok((*start, *end, 1)),
+        [start, end, step] if *step != 0 => Ok((*start, *end, *step)),
+        [_, _, _] => Err("generate_series step must not be zero".to_string()),
+        _ => Err("generate_series expects 2 or 3 arguments".to_string()),
+    }
+}
+
+fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
+    match expr {
+        sqlast::Expr::Value(v) => match &v.value {
+            sqlast::Value::Number(n, _) => n
+                .parse::<i64>()
+                .map_err(|e| format!("cannot parse integer literal `{n}`: {e}")),
+            _ => Err(format!("expected integer literal, got: {v}")),
+        },
+        sqlast::Expr::UnaryOp {
+            op: sqlast::UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(-eval_const_i64(inner)?),
+        sqlast::Expr::BinaryOp { left, op, right } => {
+            let left = eval_const_i64(left)?;
+            let right = eval_const_i64(right)?;
+            match op {
+                sqlast::BinaryOperator::Plus => Ok(left + right),
+                sqlast::BinaryOperator::Minus => Ok(left - right),
+                sqlast::BinaryOperator::Multiply => Ok(left * right),
+                sqlast::BinaryOperator::Divide if right != 0 => Ok(left / right),
+                sqlast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
+                _ => Err(format!("unsupported operator in constant expression: {op}")),
+            }
+        }
+        sqlast::Expr::Nested(inner) => eval_const_i64(inner),
+        _ => Err(format!("expected constant integer expression, got: {expr}")),
+    }
+}
+
+fn generate_series_row_count(start: i64, end: i64, step: i64) -> i64 {
+    if step == 0 {
+        0
+    } else if step > 0 && start <= end {
+        ((end - start) / step) + 1
+    } else if step < 0 && start >= end {
+        ((start - end) / step.abs()) + 1
+    } else {
+        0
+    }
+}
+
+fn estimate_generate_expr_min_max(
+    expr: &Expr,
+    start: i64,
+    end: i64,
+    data_type: &DataType,
+) -> Option<(String, String)> {
+    match expr {
+        Expr::Literal(Literal::Int(v)) => Some((v.to_string(), v.to_string())),
+        Expr::Literal(Literal::Float(v)) => Some((v.to_string(), v.to_string())),
+        Expr::Column(column) if column.name.eq_ignore_ascii_case("generate_series") => Some((
+            format_numeric_stat_value(start.min(end) as f64, data_type),
+            format_numeric_stat_value(start.max(end) as f64, data_type),
+        )),
+        Expr::Cast { expr, .. } => estimate_generate_expr_min_max(expr, start, end, data_type),
+        Expr::ScalarFunction(function)
+            if function.name.eq_ignore_ascii_case("abs") && function.args.len() == 1 =>
+        {
+            let lower = start.min(end).abs();
+            let upper = start.max(end).abs();
+            Some((
+                format_numeric_stat_value(lower as f64, data_type),
+                format_numeric_stat_value(upper as f64, data_type),
+            ))
+        }
+        Expr::Arithmetic { left, op, right } => {
+            let left_range = estimate_generate_expr_min_max(left, start, end, data_type)?;
+            let right_range = estimate_generate_expr_min_max(right, start, end, data_type)?;
+            estimate_numeric_binary_min_max(
+                &left_range.0,
+                &left_range.1,
+                &right_range.0,
+                &right_range.1,
+                op,
+                data_type,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn estimate_numeric_binary_min_max(
+    left_min: &str,
+    left_max: &str,
+    right_min: &str,
+    right_max: &str,
+    op: &ArithmeticOp,
+    data_type: &DataType,
+) -> Option<(String, String)> {
+    let left_min = left_min.parse::<f64>().ok()?;
+    let left_max = left_max.parse::<f64>().ok()?;
+    let right_min = right_min.parse::<f64>().ok()?;
+    let right_max = right_max.parse::<f64>().ok()?;
+
+    let candidates = match op {
+        ArithmeticOp::Add => vec![
+            left_min + right_min,
+            left_min + right_max,
+            left_max + right_min,
+            left_max + right_max,
+        ],
+        ArithmeticOp::Sub => vec![
+            left_min - right_min,
+            left_min - right_max,
+            left_max - right_min,
+            left_max - right_max,
+        ],
+        ArithmeticOp::Mul => vec![
+            left_min * right_min,
+            left_min * right_max,
+            left_max * right_min,
+            left_max * right_max,
+        ],
+        ArithmeticOp::Div => {
+            if (right_min..=right_max).contains(&0.0) {
+                return None;
+            }
+            vec![
+                left_min / right_min,
+                left_min / right_max,
+                left_max / right_min,
+                left_max / right_max,
+            ]
+        }
+        ArithmeticOp::Mod => return None,
+    };
+
+    let min = candidates.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
+    let max = candidates
+        .iter()
+        .fold(f64::NEG_INFINITY, |acc, v| acc.max(*v));
+    Some((
+        format_numeric_stat_value(min, data_type),
+        format_numeric_stat_value(max, data_type),
+    ))
+}
+
+fn format_numeric_stat_value(value: f64, data_type: &DataType) -> String {
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _) => (value.round() as i64).to_string(),
+        _ => {
+            let mut formatted = value.to_string();
+            if formatted.ends_with(".0") {
+                formatted.truncate(formatted.len() - 2);
+            }
+            formatted
+        }
     }
 }
 
@@ -1968,5 +2226,41 @@ mod tests {
         let result = ok_result().expect("ok result");
         assert_eq!(result.columns[0].name, "Status");
         assert_eq!(result_cell(&result, 0, 0).as_deref(), Some("OK"));
+    }
+
+    #[test]
+    fn from_query_generate_series_estimates_rows_and_bounds() {
+        let statement = crate::sql::parser::parse_normalized_sql_raw(
+            "select generate_series from table(generate_series(10000, 20000))",
+        )
+        .expect("parse query");
+        let sqlast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        let source = InsertSource::FromQuery(query);
+
+        assert_eq!(estimated_source_row_count(&source), 10001);
+        assert_eq!(
+            estimate_column_min_max(&source, 0, &DataType::Int64),
+            ("10000".to_string(), "20000".to_string())
+        );
+    }
+
+    #[test]
+    fn from_query_generate_series_estimates_descending_step() {
+        let statement = crate::sql::parser::parse_normalized_sql_raw(
+            "select generate_series from table(generate_series(10, 2, -2))",
+        )
+        .expect("parse query");
+        let sqlast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        let source = InsertSource::FromQuery(query);
+
+        assert_eq!(estimated_source_row_count(&source), 5);
+        assert_eq!(
+            estimate_column_min_max(&source, 0, &DataType::Int64),
+            ("2".to_string(), "10".to_string())
+        );
     }
 }

@@ -19,6 +19,7 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
 };
+use arrow::datatypes::DataType;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -90,6 +91,9 @@ pub fn eval_array_contains(
     let target_eval_chunk = if target_is_const { &const_chunk } else { chunk };
     let arr = arena.eval(args[0], arr_eval_chunk)?;
     let mut target_arr = arena.eval(args[1], target_eval_chunk)?;
+    if arr.data_type() == &DataType::Null {
+        return Ok(Arc::new(BooleanArray::from(vec![None; chunk.len()])) as ArrayRef);
+    }
     let list = arr
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()

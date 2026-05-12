@@ -71,6 +71,22 @@ pub(crate) fn arithmetic_result_type_with_op(
         return DataType::Float64;
     }
 
+    let left_largeint = crate::common::largeint::is_largeint_data_type(left);
+    let right_largeint = crate::common::largeint::is_largeint_data_type(right);
+    let left_integral = left_largeint
+        || matches!(
+            left,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        );
+    let right_integral = right_largeint
+        || matches!(
+            right,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        );
+    if (left_largeint || right_largeint) && left_integral && right_integral {
+        return DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+    }
+
     match (left, right) {
         (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
             DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
@@ -276,6 +292,13 @@ mod tests {
         let result =
             arithmetic_result_type_with_op(&DataType::Decimal128(7, 2), &DataType::Int32, "add");
         assert_eq!(result, DataType::Decimal128(22, 2));
+    }
+
+    #[test]
+    fn largeint_plus_integer_returns_largeint() {
+        let largeint = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let result = arithmetic_result_type_with_op(&DataType::Int64, &largeint, "add");
+        assert_eq!(result, largeint);
     }
 
     #[test]

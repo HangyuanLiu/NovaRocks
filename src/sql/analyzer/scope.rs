@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
+use crate::sql::analysis::LambdaParam;
 use crate::sql::catalog::ColumnDef;
 
 /// Tracks column names and types visible at the current query level.
@@ -16,6 +17,8 @@ pub(super) struct AnalyzerScope {
     /// Ordered columns for SELECT * expansion:
     /// (qualifier, col_name, DataType, nullable)
     ordered: Vec<(Option<String>, String, DataType, bool)>,
+    /// Lambda parameters visible in the current expression scope.
+    lambda_params: HashMap<String, LambdaParam>,
 }
 
 impl AnalyzerScope {
@@ -24,6 +27,7 @@ impl AnalyzerScope {
             qualified: HashMap::new(),
             unqualified: HashMap::new(),
             ordered: Vec::new(),
+            lambda_params: HashMap::new(),
         }
     }
 
@@ -73,6 +77,14 @@ impl AnalyzerScope {
             data_type,
             nullable,
         ));
+    }
+
+    pub(super) fn add_lambda_param(&mut self, param: LambdaParam) {
+        self.lambda_params.insert(param.name.to_lowercase(), param);
+    }
+
+    pub(super) fn resolve_lambda_param(&self, name: &str) -> Option<LambdaParam> {
+        self.lambda_params.get(&name.to_lowercase()).cloned()
     }
 
     /// Resolve a column reference. Returns a spec-aligned error message when

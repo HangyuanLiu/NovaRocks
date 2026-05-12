@@ -28,7 +28,7 @@ pub fn eval_element_at(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-    let subscript_arr = arena.eval(args[1], chunk)?;
+    let mut subscript_arr = arena.eval(args[1], chunk)?;
     let check_arr = if args.len() == 3 {
         Some(arena.eval(args[2], chunk)?)
     } else {
@@ -39,6 +39,13 @@ pub fn eval_element_at(
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| format!("element_at expects ListArray, got {:?}", arr.data_type()))?;
+    if subscript_arr.data_type() != &arrow::datatypes::DataType::Int32 {
+        subscript_arr = super::common::cast_with_special_rules(
+            &subscript_arr,
+            &arrow::datatypes::DataType::Int32,
+            "element_at",
+        )?;
+    }
     let subscript_arr = subscript_arr
         .as_any()
         .downcast_ref::<Int32Array>()

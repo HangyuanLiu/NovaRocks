@@ -640,6 +640,7 @@ impl<'a> AnalyzerContext<'a> {
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };

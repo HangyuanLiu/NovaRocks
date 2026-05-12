@@ -1240,7 +1240,8 @@ fn parse_managed_logical_type(raw: &str) -> Result<SqlType, String> {
         "DATE" => Ok(SqlType::Date),
         "DATETIME" => Ok(SqlType::DateTime),
         "TIME" => Ok(SqlType::Time),
-        _ => parse_decimal_logical_type(&normalized),
+        _ => parse_decimal_logical_type(&normalized)
+            .or_else(|_| parse_complex_managed_logical_type(raw.trim())),
     }
 }
 
@@ -1261,6 +1262,11 @@ fn parse_decimal_logical_type(raw: &str) -> Result<SqlType, String> {
         .parse::<i8>()
         .map_err(|e| format!("parse DECIMAL scale from `{raw}` failed: {e}"))?;
     Ok(SqlType::Decimal { precision, scale })
+}
+
+fn parse_complex_managed_logical_type(raw: &str) -> Result<SqlType, String> {
+    crate::sql::parser::dialect::create_table::parse_sql_type_string(raw)
+        .map_err(|_| format!("unsupported managed logical type `{raw}`"))
 }
 
 #[cfg(test)]
@@ -1343,6 +1349,20 @@ mod tests {
             schema.columns[1].aggregation_type,
             Some(crate::types::TAggregationType::SUM)
         );
+    }
+
+    #[test]
+    fn parse_managed_logical_type_round_trips_complex_types() {
+        let cases = [
+            SqlType::Array(Box::new(SqlType::BigInt)),
+            SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+        ];
+
+        for data_type in cases {
+            let raw = logical_type_name(&data_type);
+            let reparsed = parse_managed_logical_type(&raw).expect("reparse managed logical type");
+            assert_eq!(reparsed, data_type, "raw={raw}");
+        }
     }
 
     fn snapshot_seed() -> ManagedSnapshot {

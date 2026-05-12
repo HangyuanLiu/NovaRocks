@@ -316,6 +316,39 @@ pub(crate) fn sqlparser_function_to_literal(
                 .collect::<Result<Vec<_>, _>>()?;
             eval_array_generate_literal(&values)
         }
+        "array_repeat" => {
+            if args.len() != 2 {
+                return Err("array_repeat expects 2 arguments".to_string());
+            }
+            let value = sqlparser_expr_to_literal(args[0])?;
+            let repeat = match sqlparser_expr_to_literal(args[1])? {
+                Literal::Int(v) => v,
+                other => return Err(format!("array_repeat expects integer count, got {other:?}")),
+            };
+            if repeat <= 0 {
+                return Ok(Literal::Array(Vec::new()));
+            }
+            let repeat = usize::try_from(repeat)
+                .map_err(|_| "array_repeat count is too large".to_string())?;
+            Ok(Literal::Array(vec![value; repeat]))
+        }
+        "array_append" => {
+            if args.len() != 2 {
+                return Err("array_append expects 2 arguments".to_string());
+            }
+            let array = sqlparser_expr_to_literal(args[0])?;
+            let value = sqlparser_expr_to_literal(args[1])?;
+            match array {
+                Literal::Null => Ok(Literal::Null),
+                Literal::Array(mut values) => {
+                    values.push(value);
+                    Ok(Literal::Array(values))
+                }
+                other => Err(format!(
+                    "array_append expects ARRAY argument, got {other:?}"
+                )),
+            }
+        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err("to_binary expects 1 or 2 arguments".to_string());
@@ -352,6 +385,18 @@ pub(crate) fn sqlparser_function_to_literal(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
         }
+        "md5sum" => {
+            use md5::Digest;
+            let mut hasher = md5::Md5::new();
+            for arg in args {
+                let literal = sqlparser_expr_to_literal(arg)?;
+                let Some(bytes) = literal_to_varchar_bytes(&literal)? else {
+                    continue;
+                };
+                hasher.update(bytes);
+            }
+            Ok(Literal::String(hex::encode(hasher.finalize())))
+        }
         "parse_json" => {
             if args.len() != 1 {
                 return Err("parse_json expects 1 argument".to_string());
@@ -371,6 +416,21 @@ pub(crate) fn sqlparser_function_to_literal(
                 .map(sqlparser_expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
+        "named_struct" => {
+            if args.len() % 2 != 0 {
+                return Err(format!(
+                    "named_struct literal requires an even number of arguments, got {}",
+                    args.len()
+                ));
+            }
+            Ok(Literal::Struct(
+                args.into_iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(sqlparser_expr_to_literal)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
         "map" => {
             if args.len() % 2 != 0 {
                 return Err(format!(
@@ -391,6 +451,19 @@ pub(crate) fn sqlparser_function_to_literal(
             "unsupported expression in INSERT VALUES: {}",
             sqlast::Expr::Function(func.clone())
         )),
+    }
+}
+
+fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, String> {
+    match value {
+        Literal::Null => Ok(None),
+        Literal::Bool(v) => Ok(Some(if *v { b"1".to_vec() } else { b"0".to_vec() })),
+        Literal::Int(v) => Ok(Some(v.to_string().into_bytes())),
+        Literal::Float(v) => Ok(Some(v.to_string().into_bytes())),
+        Literal::String(v) | Literal::Date(v) => Ok(Some(v.as_bytes().to_vec())),
+        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
+            Err("md5sum literal folding does not support complex arguments".to_string())
+        }
     }
 }
 
@@ -1262,6 +1335,64 @@ mod tests {
 
         let map = sqlparser_expr_to_custom_expr(&parse_expr("map(1, 5.5)")).expect("map");
         assert!(matches!(map, Expr::Literal(Literal::Map(ref v)) if v.len() == 1));
+    }
+
+    #[test]
+    fn constant_array_repeat_folds_to_array_literal() {
+        let arr =
+            sqlparser_expr_to_custom_expr(&parse_expr("array_repeat('abc', 3)")).expect("array");
+        assert!(matches!(
+            arr,
+            Expr::Literal(Literal::Array(ref values))
+                if values == &vec![
+                    Literal::String("abc".to_string()),
+                    Literal::String("abc".to_string()),
+                    Literal::String("abc".to_string())
+                ]
+        ));
+    }
+
+    #[test]
+    fn constant_named_struct_folds_values_positionally() {
+        let value = sqlparser_expr_to_custom_expr(&parse_expr("named_struct('A', 1, 'B', 'x')"))
+            .expect("named_struct");
+        assert!(matches!(
+            value,
+            Expr::Literal(Literal::Struct(ref values))
+                if values == &vec![Literal::Int(1), Literal::String("x".to_string())]
+        ));
+    }
+
+    #[test]
+    fn constant_array_append_folds_to_array_literal() {
+        let value =
+            sqlparser_expr_to_custom_expr(&parse_expr("array_append(array_generate(3), NULL)"))
+                .expect("array_append");
+        assert!(matches!(
+            value,
+            Expr::Literal(Literal::Array(ref values))
+                if values
+                    == &vec![
+                        Literal::Int(1),
+                        Literal::Int(2),
+                        Literal::Int(3),
+                        Literal::Null
+                    ]
+        ));
+    }
+
+    #[test]
+    fn constant_md5sum_casts_scalar_to_varchar() {
+        let value =
+            sqlparser_expr_to_custom_expr(&parse_expr("md5sum(10000)")).expect("md5sum fold");
+        let Expr::Literal(Literal::String(actual)) = value else {
+            panic!("expected folded md5sum string literal");
+        };
+
+        use md5::{Digest, Md5};
+        let mut hasher = Md5::new();
+        hasher.update(b"10000");
+        assert_eq!(actual, hex::encode(hasher.finalize()));
     }
 
     #[test]
