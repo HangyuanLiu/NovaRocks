@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use arrow::array::{ArrayRef, Int8Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::iceberg::catalog::load_table;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
-use crate::connector::starrocks::managed::ivm_change_stream::{
-    materialize_iceberg_change_batch, plan_iceberg_change_batch_for_ivm,
+use crate::connector::starrocks::managed::ivm_change_stream::plan_iceberg_change_batch_for_ivm;
+use crate::connector::starrocks::managed::ivm_delta_source::{
+    IvmDeltaSourceInput, build_delta_source_files, execute_delta_source_query,
+    projection_select_with_change_op,
 };
 use crate::connector::starrocks::managed::mv_apply_policy::{
     MvApplyPolicy, apply_policy_for_change,
@@ -19,6 +22,7 @@ use crate::connector::starrocks::managed::mv_refresh_strategy::{
 };
 use crate::engine::mv_flow::{analyze_visible_output_types, execute_query_for_mv_refresh};
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
+use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
@@ -247,26 +251,52 @@ pub(crate) fn refresh_mv(
                 }
             }
 
-            let select_sql =
-                projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
-            let change_stream = materialize_iceberg_change_batch(
-                state,
-                &db_name,
-                &select_sql,
-                base_ref,
-                &loaded.table,
+            let source_files = build_delta_source_files(
+                IvmDeltaSourceInput {
+                    state,
+                    current_database: &db_name,
+                    base_ref,
+                    loaded: &loaded,
+                },
                 batch,
-                loaded.object_store_config.as_ref(),
-                &mv_row.primary_key_columns,
             )?;
-            let (insert_result, delete_result) = change_stream.into_results();
-            let (chunks, row_delta) = if has_deletes {
-                projection_delete_bearing_change_chunks(insert_result, delete_result)?
-            } else {
-                let chunks = query_result_to_chunks(insert_result)?;
-                let row_delta = chunks_row_count(&chunks)?;
-                (chunks, row_delta)
-            };
+            if source_files.previous_snapshot_id != previous_snapshot_id
+                || source_files.current_snapshot_id != current_snapshot_id
+            {
+                return Err(format!(
+                    "projection/filter MV incremental refresh delta source snapshot window mismatch: expected {} -> {}, got {} -> {}",
+                    previous_snapshot_id,
+                    current_snapshot_id,
+                    source_files.previous_snapshot_id,
+                    source_files.current_snapshot_id
+                ));
+            }
+            if source_files.files.is_empty() {
+                advance_mv_refresh_metadata_without_writes(
+                    metadata_store,
+                    runtime.table.table_id,
+                    base_ref,
+                    current_snapshot_id,
+                    &current_table_uuid,
+                    mv_row.last_refresh_rows.unwrap_or(0),
+                )?;
+                refresh_managed_catalog(state)?;
+                return Ok(StatementResult::Ok);
+            }
+            let physical_select_sql =
+                projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
+            let tagged_select_sql = projection_select_with_change_op(&physical_select_sql)?;
+            let delta_result = execute_delta_source_query(
+                IvmDeltaSourceInput {
+                    state,
+                    current_database: &db_name,
+                    base_ref,
+                    loaded: &loaded,
+                },
+                &tagged_select_sql,
+                source_files,
+            )?;
+            let (chunks, row_delta) = tagged_projection_change_chunks(delta_result)?;
             let resolved_mv = crate::engine::ResolvedLocalTableName {
                 database: db_name.clone(),
                 table: mv_name.clone(),
@@ -334,15 +364,13 @@ pub(crate) fn refresh_mv(
                 table_id: runtime.table.table_id,
                 select_sql: &mv_row.select_sql,
                 base_ref,
-                base_table: &loaded.table,
-                object_store_config: loaded.object_store_config.as_ref(),
                 shape,
-                primary_key_columns: &mv_row.primary_key_columns,
                 change_batch,
                 previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
                 current_table_uuid: current_table_uuid.clone(),
+                loaded: &loaded,
             })
         },
     )
@@ -450,46 +478,67 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     table_id: i64,
     select_sql: &'a str,
     base_ref: &'a IcebergTableRef,
-    base_table: &'a iceberg::table::Table,
-    object_store_config: Option<&'a crate::fs::object_store::ObjectStoreConfig>,
     shape: &'a super::mv_shape::AggregateMvShape,
-    primary_key_columns: &'a [String],
     change_batch: crate::connector::iceberg::changes::IcebergChangeBatch,
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     current_table_uuid: String,
+    loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
-    let state_sql = super::mv_shape::rewrite_select_sql_for_state(ctx.select_sql, ctx.shape)?;
-    let change_stream = materialize_iceberg_change_batch(
-        ctx.state,
-        ctx.database,
-        &state_sql,
-        ctx.base_ref,
-        ctx.base_table,
+    let has_inserts = !ctx.change_batch.inserts.is_empty();
+    let has_deletes = change_batch_has_deletes(&ctx.change_batch);
+    let apply_policy = apply_policy_for_change(
+        &super::mv_shape::IncrementalMvShape::Aggregate(ctx.shape.clone()),
+        has_inserts,
+        has_deletes,
+        false,
+    );
+    match apply_policy {
+        MvApplyPolicy::Incremental => {}
+        MvApplyPolicy::FullRefresh { reason } => {
+            tracing::info!(
+                target: "mv_refresh",
+                mv = %format!("{}.{}", ctx.database, ctx.mv_name),
+                base = %ctx.base_ref.fqn(),
+                snapshot_from = ctx.previous_snapshot_id,
+                snapshot_to = ctx.current_snapshot_id,
+                has_deletes,
+                reason = %reason,
+                "mv_refresh fall-back to Full from apply policy"
+            );
+            return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+        }
+    }
+
+    let source_files = build_delta_source_files(
+        IvmDeltaSourceInput {
+            state: ctx.state,
+            current_database: ctx.database,
+            base_ref: ctx.base_ref,
+            loaded: ctx.loaded,
+        },
         ctx.change_batch,
-        ctx.object_store_config,
-        ctx.primary_key_columns,
     )?;
 
-    if change_stream.previous_snapshot_id != ctx.previous_snapshot_id
-        || change_stream.current_snapshot_id != ctx.current_snapshot_id
+    if source_files.previous_snapshot_id != ctx.previous_snapshot_id
+        || source_files.current_snapshot_id != ctx.current_snapshot_id
     {
         return Err(format!(
-            "aggregate MV incremental refresh change stream snapshot window mismatch: expected {} -> {}, got {} -> {}",
+            "aggregate MV incremental refresh delta source snapshot window mismatch: expected {} -> {}, got {} -> {}",
             ctx.previous_snapshot_id,
             ctx.current_snapshot_id,
-            change_stream.previous_snapshot_id,
-            change_stream.current_snapshot_id
+            source_files.previous_snapshot_id,
+            source_files.current_snapshot_id
         ));
     }
 
     // Empty-input early return: nothing to merge, just advance lineage.
-    if change_stream.is_empty() {
+    if source_files.files.is_empty() {
         let metadata_store =
             ctx.state.metadata_store.as_ref().ok_or_else(|| {
                 "managed lake mv refresh requires sqlite metadata store".to_string()
@@ -506,29 +555,6 @@ fn refresh_aggregate_mv_incremental(
         return Ok(StatementResult::Ok);
     }
 
-    let apply_policy = apply_policy_for_change(
-        &super::mv_shape::IncrementalMvShape::Aggregate(ctx.shape.clone()),
-        change_stream.inserts.row_count() > 0,
-        change_stream.deletes.row_count() > 0,
-        false,
-    );
-    match apply_policy {
-        MvApplyPolicy::Incremental => {}
-        MvApplyPolicy::FullRefresh { reason } => {
-            tracing::info!(
-                target: "mv_refresh",
-                mv = %format!("{}.{}", ctx.database, ctx.mv_name),
-                base = %ctx.base_ref.fqn(),
-                snapshot_from = ctx.previous_snapshot_id,
-                snapshot_to = ctx.current_snapshot_id,
-                delete_rows = change_stream.deletes.row_count(),
-                reason = %reason,
-                "mv_refresh fall-back to Full from apply policy"
-            );
-            return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
-        }
-    }
-
     // The rewritten state SQL (AVG -> SUM + COUNT) produces state-shaped columns whose
     // count does not match shape.visible_outputs. Sourcing types from the analyzer
     // avoids this mismatch before materializing state chunks.
@@ -537,17 +563,40 @@ fn refresh_aggregate_mv_incremental(
     let layout =
         super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
 
-    let (inserts, deletes) = change_stream.into_results();
-    let insert_delta =
-        super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout, ctx.shape)?;
-    let delete_delta_positive =
-        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout, ctx.shape)?;
-    let delete_delta =
-        super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
-
-    let mut delta_chunks = Vec::with_capacity(insert_delta.len() + delete_delta.len());
-    delta_chunks.extend(insert_delta);
-    delta_chunks.extend(delete_delta);
+    let signed_state_sql =
+        match super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
+            ctx.select_sql,
+            ctx.shape,
+        ) {
+            Ok(sql) => sql,
+            Err(err)
+                if err.contains("MIN/MAX") && err.contains("delete-bearing signed delta state") =>
+            {
+                tracing::info!(
+                    target: "mv_refresh",
+                    mv = %format!("{}.{}", ctx.database, ctx.mv_name),
+                    base = %ctx.base_ref.fqn(),
+                    snapshot_from = ctx.previous_snapshot_id,
+                    snapshot_to = ctx.current_snapshot_id,
+                    error = %err,
+                    "mv_refresh fall-back to Full from signed delta aggregate rewrite"
+                );
+                return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+            }
+            Err(err) => return Err(err),
+        };
+    let delta_result = execute_delta_source_query(
+        IvmDeltaSourceInput {
+            state: ctx.state,
+            current_database: ctx.database,
+            base_ref: ctx.base_ref,
+            loaded: ctx.loaded,
+        },
+        &signed_state_sql,
+        source_files,
+    )?;
+    let delta_chunks =
+        super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout, ctx.shape)?;
 
     let plan = load_physical_insert_plan(
         ctx.state,
@@ -566,8 +615,7 @@ fn refresh_aggregate_mv_incremental(
         &layout,
         MvRefreshWriteMetadata {
             table_id: ctx.table_id,
-            // Upsert writes the full merged active aggregate state, not an append delta.
-            previous_refresh_rows: 0,
+            previous_refresh_rows: ctx.previous_refresh_rows,
             snapshots,
             table_uuids,
         },
@@ -830,18 +878,76 @@ const MV_OP_UPSERT: i8 = 0;
 const MV_OP_DELETE: i8 = 1;
 const MV_OP_COLUMN: &str = "__op";
 
-fn projection_delete_bearing_change_chunks(
-    insert_result: QueryResult,
-    delete_result: QueryResult,
-) -> Result<(Vec<Chunk>, i64), String> {
-    let insert_chunks = query_result_to_mv_op_chunks(insert_result, MV_OP_UPSERT)?;
-    let delete_chunks = query_result_to_mv_op_chunks(delete_result, MV_OP_DELETE)?;
-    let insert_rows = chunks_row_count(&insert_chunks)?;
-    let delete_rows = chunks_row_count(&delete_chunks)?;
+fn tagged_projection_change_chunks(result: QueryResult) -> Result<(Vec<Chunk>, i64), String> {
+    let mut delete_chunks = Vec::new();
+    let mut insert_chunks = Vec::new();
+    let mut delete_rows = 0_i64;
+    let mut insert_rows = 0_i64;
+
+    for chunk in result.chunks {
+        let batch = chunk.batch;
+        let change_op_index = find_change_op_column(&batch)?;
+        let change_ops = batch
+            .column(change_op_index)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| {
+                format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` must be Int8"
+                )
+            })?;
+
+        let mut delete_mask = Vec::with_capacity(batch.num_rows());
+        let mut insert_mask = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            if change_ops.is_null(row) {
+                return Err(format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` contains NULL"
+                ));
+            }
+            match change_ops.value(row) {
+                CHANGE_OP_DELETE => {
+                    delete_mask.push(true);
+                    insert_mask.push(false);
+                }
+                CHANGE_OP_INSERT => {
+                    delete_mask.push(false);
+                    insert_mask.push(true);
+                }
+                op => {
+                    return Err(format!(
+                        "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` contains invalid value {op}; expected {CHANGE_OP_INSERT} or {CHANGE_OP_DELETE}"
+                    ));
+                }
+            }
+        }
+
+        let delete_count = delete_mask.iter().filter(|keep| **keep).count();
+        if delete_count > 0 {
+            delete_rows = add_row_count(delete_rows, delete_count)?;
+            let filtered = filter_record_batch(&batch, &BooleanArray::from(delete_mask))
+                .map_err(|e| format!("filter projection MV deletes failed: {e}"))?;
+            let without_change_op = record_batch_without_column(filtered, change_op_index)?;
+            delete_chunks.push(record_batch_to_chunk(append_mv_op_column(
+                without_change_op,
+                MV_OP_DELETE,
+            )?)?);
+        }
+
+        let insert_count = insert_mask.iter().filter(|keep| **keep).count();
+        if insert_count > 0 {
+            insert_rows = add_row_count(insert_rows, insert_count)?;
+            let filtered = filter_record_batch(&batch, &BooleanArray::from(insert_mask))
+                .map_err(|e| format!("filter projection MV upserts failed: {e}"))?;
+            let without_change_op = record_batch_without_column(filtered, change_op_index)?;
+            insert_chunks.push(record_batch_to_chunk(append_mv_op_column(
+                without_change_op,
+                MV_OP_UPSERT,
+            )?)?);
+        }
+    }
+
     let mut chunks = Vec::with_capacity(delete_chunks.len() + insert_chunks.len());
-    // COW/overwrite and MOR updates can produce delete and insert branches
-    // for the same primary key. Apply deletes first so following upserts are
-    // the final visible row state.
     chunks.extend(delete_chunks);
     chunks.extend(insert_chunks);
     let row_delta = insert_rows.checked_sub(delete_rows).ok_or_else(|| {
@@ -852,12 +958,55 @@ fn projection_delete_bearing_change_chunks(
     Ok((chunks, row_delta))
 }
 
-fn query_result_to_mv_op_chunks(result: QueryResult, op: i8) -> Result<Vec<Chunk>, String> {
-    result
-        .chunks
-        .into_iter()
-        .map(|chunk| append_mv_op_column(chunk.batch, op).and_then(record_batch_to_chunk))
-        .collect()
+fn find_change_op_column(batch: &RecordBatch) -> Result<usize, String> {
+    let mut found = None;
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        if field.name().eq_ignore_ascii_case(CHANGE_OP_COLUMN) {
+            if found.is_some() {
+                return Err(format!(
+                    "projection/filter MV delta source contains duplicate `{CHANGE_OP_COLUMN}` columns"
+                ));
+            }
+            if field.data_type() != &DataType::Int8 {
+                return Err(format!(
+                    "projection/filter MV delta source column `{CHANGE_OP_COLUMN}` must be Int8, got {:?}",
+                    field.data_type()
+                ));
+            }
+            found = Some(index);
+        }
+    }
+    found.ok_or_else(|| {
+        format!("projection/filter MV delta source must include `{CHANGE_OP_COLUMN}` column")
+    })
+}
+
+fn record_batch_without_column(
+    batch: RecordBatch,
+    column_index: usize,
+) -> Result<RecordBatch, String> {
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (index != column_index).then(|| field.as_ref().clone()))
+        .collect::<Vec<_>>();
+    let columns = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| (index != column_index).then(|| Arc::clone(column)))
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("remove projection MV change-op column failed: {e}"))
+}
+
+fn add_row_count(acc: i64, rows: usize) -> Result<i64, String> {
+    let rows = i64::try_from(rows)
+        .map_err(|_| "materialized view refresh row count overflow".to_string())?;
+    acc.checked_add(rows)
+        .ok_or_else(|| "materialized view refresh row count overflow".to_string())
 }
 
 fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String> {
@@ -881,15 +1030,6 @@ fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String
     columns.push(Arc::new(Int8Array::from(vec![op; row_count])) as ArrayRef);
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("append MV op column failed: {e}"))
-}
-
-fn chunks_row_count(chunks: &[Chunk]) -> Result<i64, String> {
-    chunks.iter().try_fold(0_i64, |acc, chunk| {
-        let rows = i64::try_from(chunk.len())
-            .map_err(|_| "materialized view refresh row count overflow".to_string())?;
-        acc.checked_add(rows)
-            .ok_or_else(|| "materialized view refresh row count overflow".to_string())
-    })
 }
 
 #[cfg(test)]
@@ -1218,7 +1358,7 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use prost::Message;
@@ -1590,6 +1730,11 @@ mod tests {
             ],
             "MV state after full refresh must reflect the 3 seeded base rows"
         );
+        assert_eq!(
+            show_mv_last_refresh_rows(&session, "agg_mv").expect("show full refresh rows"),
+            Some(2),
+            "full refresh metadata row count tracks MV group count"
+        );
 
         // Trigger a DELETE-bearing snapshot on the base.
         session
@@ -1629,6 +1774,11 @@ mod tests {
             "MV state after delete-bearing incremental refresh must drop \
              count and sum for the affected group; other groups untouched"
         );
+        assert_eq!(
+            show_mv_last_refresh_rows(&session, "agg_mv").expect("show incremental refresh rows"),
+            Some(2),
+            "incremental refresh metadata row count tracks active MV rows, not the row delta"
+        );
 
         drop(engine);
     }
@@ -1657,12 +1807,22 @@ mod tests {
 
     #[test]
     fn projection_delete_bearing_change_applies_deletes_before_upserts() {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int8Array, Int64Array};
 
-        fn one_row_result(value: i64) -> QueryResult {
+        fn tagged_result(values: Vec<i64>, ops: Vec<i8>) -> QueryResult {
             let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new(
+                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        DataType::Int8,
+                        false,
+                    ),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(values)) as ArrayRef,
+                    Arc::new(Int8Array::from(ops)) as ArrayRef,
+                ],
             )
             .expect("record batch");
             QueryResult {
@@ -1682,13 +1842,91 @@ mod tests {
         }
 
         let (chunks, row_delta) =
-            projection_delete_bearing_change_chunks(one_row_result(1), one_row_result(1))
+            tagged_projection_change_chunks(tagged_result(vec![10, 20, 30], vec![1, -1, 1]))
                 .expect("projection chunks");
+
+        assert_eq!(row_delta, 1);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].batch.num_rows(), 1);
+        assert_eq!(chunks[1].batch.num_rows(), 2);
+        assert_eq!(
+            chunks[0].batch.schema().field(0).name(),
+            chunks[1].batch.schema().field(0).name()
+        );
+        assert_eq!(chunks[0].batch.num_columns(), 2);
+        assert_eq!(op_value(&chunks[0]), MV_OP_DELETE);
+        assert_eq!(op_value(&chunks[1]), MV_OP_UPSERT);
+    }
+
+    #[test]
+    fn projection_change_op_can_be_non_last_and_is_removed_before_mv_op() {
+        use arrow::array::{Int8Array, StringArray};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    false,
+                ),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![1, -1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let result = QueryResult {
+            columns: Vec::new(),
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let (chunks, row_delta) = tagged_projection_change_chunks(result).expect("chunks");
 
         assert_eq!(row_delta, 0);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(op_value(&chunks[0]), MV_OP_DELETE);
-        assert_eq!(op_value(&chunks[1]), MV_OP_UPSERT);
+        for chunk in chunks {
+            let names = chunk
+                .batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["id", "name", MV_OP_COLUMN]);
+        }
+    }
+
+    #[test]
+    fn projection_change_op_rejects_null_value() {
+        use arrow::array::Int8Array;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![Some(1), None])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let result = QueryResult {
+            columns: Vec::new(),
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let err = tagged_projection_change_chunks(result).expect_err("null op must fail");
+
+        assert!(err.contains("contains NULL"));
     }
 
     #[test]
@@ -2191,6 +2429,53 @@ mod tests {
             }
         }
         Ok(out)
+    }
+
+    fn show_mv_last_refresh_rows(
+        session: &crate::engine::StandaloneSession,
+        mv_name: &str,
+    ) -> Result<Option<i64>, String> {
+        let result = session.execute_in_context(
+            "show materialized views from analytics",
+            None,
+            "analytics",
+            None,
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("show materialized views must return rows".to_string());
+        };
+        for chunk in &query_result.chunks {
+            let names = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "SHOW MATERIALIZED VIEWS Name column not Utf8".to_string())?;
+            let refresh_rows = chunk
+                .batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    "SHOW MATERIALIZED VIEWS LastRefreshRows column not Utf8".to_string()
+                })?;
+            for row in 0..chunk.batch.num_rows() {
+                if names.value(row).eq_ignore_ascii_case(mv_name) {
+                    if refresh_rows.is_null(row) {
+                        return Ok(None);
+                    }
+                    return refresh_rows.value(row).parse::<i64>().map(Some).map_err(|e| {
+                        format!(
+                            "SHOW MATERIALIZED VIEWS LastRefreshRows value `{}` is not i64: {e}",
+                            refresh_rows.value(row)
+                        )
+                    });
+                }
+            }
+        }
+        Err(format!(
+            "SHOW MATERIALIZED VIEWS did not return `{mv_name}`"
+        ))
     }
 
     /// Build a TOML config file that points the standalone server at

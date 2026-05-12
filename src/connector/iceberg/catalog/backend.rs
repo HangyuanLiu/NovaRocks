@@ -270,6 +270,7 @@ fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats
         partition_key: file.partition_key,
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
+        ivm_change_op: None,
         delete_files: file.delete_files,
         manifest_path: file.manifest_path,
         partition_values: file.partition_field_values,
@@ -462,6 +463,7 @@ mod tests {
         assert_eq!(s3_file.partition_key.as_deref(), Some("city=A"));
         assert_eq!(s3_file.first_row_id, Some(100));
         assert_eq!(s3_file.data_sequence_number, Some(11));
+        assert_eq!(s3_file.ivm_change_op, None);
         assert_eq!(
             s3_file.manifest_path.as_deref(),
             Some("s3://bucket/table/metadata/manifest.avro")

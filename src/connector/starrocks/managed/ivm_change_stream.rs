@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use crate::connector::iceberg::changes::{
-    ChangeError, IcebergChangeBatch, MaterializedChanges, materialize_changes, plan_changes,
+    ChangeError, IcebergChangeBatch, MaterializedChanges, plan_changes,
 };
-use crate::connector::starrocks::managed::store::IcebergTableRef;
-use crate::engine::{QueryResult, StandaloneState};
+use crate::engine::QueryResult;
 
+// Compatibility wrapper for the older two-branch materialized change stream.
+#[allow(dead_code)]
 pub(crate) struct IvmChangeStream {
     pub(crate) previous_snapshot_id: i64,
     pub(crate) current_snapshot_id: i64,
@@ -13,6 +12,7 @@ pub(crate) struct IvmChangeStream {
     pub(crate) deletes: QueryResult,
 }
 
+#[allow(dead_code)]
 impl IvmChangeStream {
     pub(crate) fn from_materialized(changes: MaterializedChanges) -> Self {
         Self {
@@ -55,30 +55,6 @@ pub(crate) fn plan_iceberg_change_batch_for_ivm(
     validate_change_batch_current_snapshot(&batch, expected_current_snapshot_id)
         .map_err(ChangeError::InternalInconsistency)?;
     Ok(batch)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn materialize_iceberg_change_batch(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    select_sql: &str,
-    base_ref: &IcebergTableRef,
-    base_table: &iceberg::table::Table,
-    batch: IcebergChangeBatch,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-    pk_columns: &[String],
-) -> Result<IvmChangeStream, String> {
-    let materialized = materialize_changes(
-        state,
-        current_database,
-        select_sql,
-        base_ref,
-        base_table,
-        batch,
-        object_store_config,
-        pk_columns,
-    )?;
-    Ok(IvmChangeStream::from_materialized(materialized))
 }
 
 #[cfg(test)]

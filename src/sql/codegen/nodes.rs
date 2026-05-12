@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::descriptors;
@@ -26,6 +26,7 @@ pub(crate) struct PlannedScanTable {
     pub(crate) resolved: ResolvedTable,
     pub(crate) min_max_conjuncts: Vec<exprs::TExpr>,
     pub(crate) slot_to_column: HashMap<types::TSlotId, String>,
+    pub(crate) iceberg_metadata_pseudo_column_slots: BTreeSet<types::TSlotId>,
 }
 
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
@@ -539,17 +540,20 @@ pub(crate) fn build_exec_params_multi(
                         file_len,
                         None,
                         None,
+                        None,
+                        None,
                         &[],
                     )?]
                 }
                 TableStorage::S3ParquetFiles { files, .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
+                    let change_op_slot = planned_change_op_slot(planned);
                     let mut ranges = Vec::new();
                     for file in files
                         .iter()
                         .filter(|f| file_may_satisfy_min_max(f, &file_predicates))
                     {
-                        ranges.extend(build_hdfs_scan_range_params_for_file(file)?);
+                        ranges.extend(build_hdfs_scan_range_params_for_file(file, change_op_slot)?);
                     }
                     ranges
                 }
@@ -601,6 +605,22 @@ fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredica
         }
     }
     predicates
+}
+
+fn planned_change_op_slot(planned: &PlannedScanTable) -> Option<types::TSlotId> {
+    planned
+        .iceberg_metadata_pseudo_column_slots
+        .iter()
+        .copied()
+        .find(|slot_id| {
+            planned.slot_to_column.get(slot_id).is_some_and(|column| {
+                column.eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            })
+        })
+}
+
+fn int_literal_expr(value: i64) -> exprs::TExpr {
+    exprs::TExpr::new(vec![super::expr_compiler::int_literal_node(value)])
 }
 
 fn file_may_satisfy_min_max(file: &S3FileInfo, predicates: &[MinMaxPredicate]) -> bool {
@@ -847,6 +867,7 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
 
 fn build_hdfs_scan_range_params_for_file(
     file: &S3FileInfo,
+    change_op_slot: Option<types::TSlotId>,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
     let splits = plan_hdfs_file_splits(file);
@@ -860,6 +881,8 @@ fn build_hdfs_scan_range_params_for_file(
                 length,
                 file.first_row_id,
                 file.data_sequence_number,
+                file.ivm_change_op,
+                change_op_slot,
                 &file.delete_files,
             )
         })
@@ -966,6 +989,8 @@ fn build_hdfs_scan_range_params(
     length: i64,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    change_op_slot: Option<types::TSlotId>,
     delete_files: &[IcebergDeleteFileInfo],
 ) -> Result<internal_service::TScanRangeParams, String> {
     let mut parquet_delete_files = Vec::new();
@@ -1025,6 +1050,13 @@ fn build_hdfs_scan_range_params(
     } else {
         Some(parquet_delete_files)
     };
+    let extended_columns = match (ivm_change_op, change_op_slot) {
+        (Some(op), Some(slot_id)) => {
+            crate::exec::change_op::validate_change_op_value(op)?;
+            Some(BTreeMap::from([(slot_id, int_literal_expr(op as i64))]))
+        }
+        _ => None,
+    };
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
         Some(offset),
@@ -1053,7 +1085,7 @@ fn build_hdfs_scan_range_params(
         None::<String>,
         None::<String>,
         None::<plan_nodes::TPaimonDeletionFile>,
-        None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+        extended_columns,
         None::<descriptors::THdfsPartition>,
         None::<types::TTableId>,
         deletion_vector_descriptor,
@@ -1142,6 +1174,182 @@ fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangePar
         Some(false),
         Some(false),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use arrow::datatypes::DataType;
+
+    use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::codegen::resolve::ResolvedTable;
+
+    fn hdfs_range(
+        params: &crate::internal_service::TScanRangeParams,
+    ) -> &crate::plan_nodes::THdfsScanRange {
+        params
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range")
+    }
+
+    #[test]
+    fn change_op_tag_without_projected_slot_does_not_emit_extended_columns() {
+        let params = build_hdfs_scan_range_params(
+            "s3://bucket/path/file.parquet",
+            1024,
+            0,
+            1024,
+            None,
+            None,
+            Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            None,
+            &[],
+        )
+        .expect("tagged file without __change_op projection should scan ordinary columns");
+
+        assert!(hdfs_range(&params).extended_columns.is_none());
+    }
+
+    #[test]
+    fn change_op_tag_with_projected_slot_emits_extended_columns() {
+        let params = build_hdfs_scan_range_params(
+            "s3://bucket/path/file.parquet",
+            1024,
+            0,
+            1024,
+            None,
+            None,
+            Some(crate::exec::change_op::CHANGE_OP_DELETE),
+            Some(9),
+            &[],
+        )
+        .expect("tagged file with __change_op projection should emit metadata");
+
+        let extended_columns = hdfs_range(&params)
+            .extended_columns
+            .as_ref()
+            .expect("extended_columns");
+        assert_eq!(extended_columns.len(), 1);
+        assert!(extended_columns.contains_key(&9));
+    }
+
+    #[test]
+    fn physical_change_op_column_does_not_emit_extended_columns() {
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            resolved: ResolvedTable {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        write_default: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![S3FileInfo {
+                            path: "s3://bucket/path/file.parquet".to_string(),
+                            size: 1024,
+                            row_count: Some(1),
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+                            delete_files: vec![],
+                            manifest_path: None,
+                            partition_values: vec![],
+                        }],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                physical_layout: None,
+                alias: None,
+            },
+            min_max_conjuncts: vec![],
+            slot_to_column: HashMap::from([(
+                9,
+                crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            )]),
+            iceberg_metadata_pseudo_column_slots: Default::default(),
+        };
+
+        let params = build_exec_params_multi(&[planned]).expect("build scan ranges");
+        let ranges = params
+            .per_node_scan_ranges
+            .get(&3)
+            .expect("scan node ranges");
+
+        assert_eq!(ranges.len(), 1);
+        assert!(hdfs_range(&ranges[0]).extended_columns.is_none());
+    }
+
+    #[test]
+    fn metadata_change_op_column_emits_extended_columns() {
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            resolved: ResolvedTable {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![ColumnDef {
+                        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        write_default: None,
+                    }],
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![S3FileInfo {
+                            path: "s3://bucket/path/file.parquet".to_string(),
+                            size: 1024,
+                            row_count: Some(1),
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+                            delete_files: vec![],
+                            manifest_path: None,
+                            partition_values: vec![],
+                        }],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                physical_layout: None,
+                alias: None,
+            },
+            min_max_conjuncts: vec![],
+            slot_to_column: HashMap::from([(
+                9,
+                crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            )]),
+            iceberg_metadata_pseudo_column_slots: [9].into(),
+        };
+
+        let params = build_exec_params_multi(&[planned]).expect("build scan ranges");
+        let ranges = params
+            .per_node_scan_ranges
+            .get(&3)
+            .expect("scan node ranges");
+        let extended_columns = hdfs_range(&ranges[0])
+            .extended_columns
+            .as_ref()
+            .expect("extended columns");
+
+        assert_eq!(extended_columns.len(), 1);
+        assert!(extended_columns.contains_key(&9));
+    }
 }
 
 // ---------------------------------------------------------------------------

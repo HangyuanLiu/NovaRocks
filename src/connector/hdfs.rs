@@ -108,6 +108,7 @@ impl HdfsScanOp {
                 range.scan_range_id < 0
                     && range.first_row_id.is_none()
                     && range.data_sequence_number.is_none()
+                    && range.ivm_change_op.is_none()
                     && range.delete_files.is_empty()
             })
     }
@@ -128,6 +129,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             data_sequence_number,
+            ivm_change_op,
             external_datacache,
             delete_files,
         } = morsel
@@ -142,6 +144,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             data_sequence_number,
+            ivm_change_op,
             external_datacache: external_datacache.clone(),
             delete_files,
         }];
@@ -189,6 +192,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: r.scan_range_id,
                 first_row_id: r.first_row_id,
                 data_sequence_number: r.data_sequence_number,
+                ivm_change_op: r.ivm_change_op,
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
             });
@@ -298,6 +302,7 @@ impl ScanOp for HdfsScanOp {
                 &format!("HDFS_SCAN incremental morsel (scan_range_id={scan_range_id})"),
                 hdfs_range,
             )?;
+            let ivm_change_op = extract_incremental_change_op(scan_range_id, hdfs_range)?;
             // data_sequence_number is not carried in THdfsScanRange (FE
             // incremental path). It is populated at initial lowering time from
             // the Iceberg manifest entry for V3 row-lineage tables.
@@ -310,6 +315,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache: build_external_datacache_options(hdfs_range),
                 delete_files,
             });
@@ -359,6 +365,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id: -1,
             first_row_id: None,
             data_sequence_number: None,
+            ivm_change_op: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -371,6 +378,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: -1,
                 first_row_id: None,
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -437,6 +445,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id: -1,
             first_row_id: None,
             data_sequence_number: None,
+            ivm_change_op: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -449,6 +458,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: -1,
                 first_row_id: None,
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -482,6 +492,38 @@ impl ScanOp for HdfsScanOp {
             Ok(Some(sets))
         }
     }
+}
+
+fn extract_incremental_change_op(
+    scan_range_id: i32,
+    hdfs_range: &crate::plan_nodes::THdfsScanRange,
+) -> Result<Option<i8>, String> {
+    let Some(extended_columns) = hdfs_range.extended_columns.as_ref() else {
+        return Ok(None);
+    };
+    if extended_columns.is_empty() {
+        return Ok(None);
+    }
+    if extended_columns.len() != 1 {
+        return Err(format!(
+            "incremental hdfs scan range scan_range_id={scan_range_id} expects exactly one __change_op extended column, got {}",
+            extended_columns.len()
+        ));
+    }
+    let slot_id = *extended_columns
+        .keys()
+        .next()
+        .expect("non-empty extended_columns has a first key");
+    let slot = crate::common::ids::SlotId::try_from(slot_id).map_err(|e| {
+        format!(
+            "incremental hdfs scan range scan_range_id={scan_range_id} has invalid __change_op slot_id={slot_id}: {e}"
+        )
+    })?;
+    crate::lower::node::hdfs_scan::extract_change_op_from_extended_columns(
+        scan_range_id,
+        hdfs_range,
+        Some(slot),
+    )
 }
 
 fn build_external_datacache_options(
@@ -518,17 +560,28 @@ fn build_external_datacache_options(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::descriptors;
     use crate::exec::node::scan::{ScanMorsel, ScanOp};
     use crate::fs::scan_context::FileScanRange;
     use crate::internal_service;
     use crate::plan_nodes;
+    use crate::{exprs, types};
 
     use super::{HdfsScanConfig, HdfsScanOp};
 
     fn make_hdfs_range(
         path: &str,
         first_row_id: Option<i64>,
+    ) -> internal_service::TScanRangeParams {
+        make_hdfs_range_with_extended(path, first_row_id, None)
+    }
+
+    fn make_hdfs_range_with_extended(
+        path: &str,
+        first_row_id: Option<i64>,
+        extended_columns: Option<BTreeMap<crate::types::TSlotId, crate::exprs::TExpr>>,
     ) -> internal_service::TScanRangeParams {
         let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
             None::<String>,
@@ -558,7 +611,7 @@ mod tests {
             None::<String>,
             None::<String>,
             None::<plan_nodes::TPaimonDeletionFile>,
-            None::<std::collections::BTreeMap<crate::types::TSlotId, crate::exprs::TExpr>>,
+            extended_columns,
             None::<descriptors::THdfsPartition>,
             None::<crate::types::TTableId>,
             None::<plan_nodes::TDeletionVectorDescriptor>,
@@ -601,6 +654,53 @@ mod tests {
             Some(true),
             Some(has_more),
         )
+    }
+
+    fn int_expr(value: i64) -> exprs::TExpr {
+        exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: Some(exprs::TIntLiteral { value }),
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }])
     }
 
     #[test]
@@ -650,6 +750,7 @@ mod tests {
                 scan_range_id: 7,
                 first_row_id: Some(10),
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],
@@ -698,6 +799,63 @@ mod tests {
     }
 
     #[test]
+    fn incremental_hdfs_ranges_propagate_change_op_extended_column() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![],
+            original_range_count: 0,
+            has_more: true,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let morsels = op
+            .build_incremental_morsels(&[make_hdfs_range_with_extended(
+                "s3://bucket/path/file.parquet",
+                None,
+                Some(BTreeMap::from([(9, int_expr(-1))])),
+            )])
+            .expect("build incremental morsels");
+
+        assert_eq!(morsels.morsels.len(), 1);
+        match &morsels.morsels[0] {
+            ScanMorsel::FileRange { ivm_change_op, .. } => {
+                assert_eq!(*ivm_change_op, Some(-1));
+            }
+            other => panic!("unexpected morsel: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn incremental_hdfs_ranges_reject_malformed_change_op_extended_column() {
+        let cfg = HdfsScanConfig {
+            ranges: vec![],
+            original_range_count: 0,
+            has_more: true,
+            limit: None,
+            profile_label: None,
+            format: None,
+            object_store_config: None,
+            iceberg_table_locations: std::collections::HashMap::new(),
+        };
+        let op = HdfsScanOp::new(cfg);
+
+        let error = op
+            .build_incremental_morsels(&[make_hdfs_range_with_extended(
+                "s3://bucket/path/file.parquet",
+                None,
+                Some(BTreeMap::from([(9, int_expr(0))])),
+            )])
+            .unwrap_err();
+
+        assert!(error.contains("__change_op"));
+        assert!(error.contains("invalid value"));
+    }
+
+    #[test]
     fn build_morsels_prioritizes_large_plain_ranges() {
         let cfg = HdfsScanConfig {
             ranges: vec![
@@ -709,6 +867,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -720,6 +879,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -731,6 +891,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
