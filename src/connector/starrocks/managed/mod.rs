@@ -15,20 +15,19 @@ pub(crate) mod ivm_change_stream;
 pub(crate) mod ivm_delta_aggregate;
 pub(crate) mod ivm_delta_source;
 pub(crate) mod ivm_row_identity;
+pub(crate) mod model;
 pub(crate) mod mv_agg_state;
 pub(crate) mod mv_apply_policy;
 pub(crate) mod mv_ddl;
 pub(crate) mod mv_refresh;
-pub(crate) mod mv_refresh_iceberg;
 pub(crate) mod mv_refresh_strategy;
 pub(crate) mod mv_shape;
-pub(crate) mod store;
 pub(crate) mod txn;
 
 pub(crate) use backend::{
     ManagedLakeBackend, ManagedLakeMvBackend, ManagedLakeTableSink, ManagedLakeTableSource,
 };
 pub(crate) use catalog::{
-    ManagedLakeCatalog, reconcile_on_open, register_managed_tables_in_catalog, runtime_registered,
+    ManagedLakeCatalog, register_managed_tables_in_catalog, runtime_registered,
 };
 pub(crate) use config::ManagedLakeConfig;

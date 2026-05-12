@@ -23,6 +23,8 @@ use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tabl
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::meta::repository::managed_txn::StoredManagedTxn;
+use crate::meta::repository::mv::UpdateManagedMvRefreshSummaryRequest;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
@@ -221,7 +223,7 @@ fn load_insert_plan_with_column_mode(
             let partition = runtime
                 .partitions
                 .iter()
-                .find(|partition| partition.state == super::store::ManagedPartitionState::Active)
+                .find(|partition| partition.state == super::model::ManagedPartitionState::Active)
                 .cloned()
                 .ok_or_else(|| {
                     format!(
@@ -234,7 +236,7 @@ fn load_insert_plan_with_column_mode(
                 .iter()
                 .find(|index| {
                     index.partition_id == partition.partition_id
-                        && index.state == super::store::ManagedIndexState::Active
+                        && index.state == super::model::ManagedIndexState::Active
                 })
                 .cloned()
                 .ok_or_else(|| {
@@ -553,12 +555,7 @@ fn write_chunks_into_managed_partition_inner(
     revalidate_insert_plan_visible_version(&managed, &mut plan)?;
 
     let total_rows = chunks_total_rows(chunks)?;
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "managed lake insert requires sqlite metadata store".to_string())?;
-    let prepared =
-        metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
+    let prepared = prepare_managed_txn(state, &plan)?;
 
     let mut written_tablet_ids = Vec::new();
     let mut next_file_seq = 0_u64;
@@ -568,7 +565,7 @@ fn write_chunks_into_managed_partition_inner(
         let chunk_written_ids = match write_outcome {
             Ok(ids) => ids,
             Err(err) => {
-                if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+                if let Err(abort_err) = mark_managed_txn_aborted(state, prepared.txn_id) {
                     return Err(format!(
                         "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
                     ));
@@ -586,7 +583,7 @@ fn write_chunks_into_managed_partition_inner(
     if let Err(err) =
         append_empty_txn_logs_for_unwritten_tablets(state, &plan, prepared.txn_id, &written)
     {
-        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+        if let Err(abort_err) = mark_managed_txn_aborted(state, prepared.txn_id) {
             return Err(format!(
                 "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
             ));
@@ -594,10 +591,10 @@ fn write_chunks_into_managed_partition_inner(
         return Err(err);
     }
 
-    metadata_store.mark_txn_written(prepared.txn_id)?;
+    mark_managed_txn_written(state, prepared.txn_id)?;
 
     publish_managed_txn(&plan, &prepared).map_err(|err| {
-        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+        if let Err(abort_err) = mark_managed_txn_aborted(state, prepared.txn_id) {
             return format!(
                 "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
             );
@@ -607,7 +604,7 @@ fn write_chunks_into_managed_partition_inner(
 
     match commit_action {
         VisibleCommitAction::Plain => {
-            metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
+            mark_managed_txn_visible(state, prepared.txn_id)?;
         }
         VisibleCommitAction::MvRefresh {
             metadata,
@@ -623,21 +620,146 @@ fn write_chunks_into_managed_partition_inner(
                         metadata.previous_refresh_rows, delta
                     )
                 })?;
-            metadata_store.mark_txn_visible_with_mv_refresh_metadata(
+            mark_managed_txn_visible_with_mv_refresh_metadata(
+                state,
                 prepared.txn_id,
-                prepared.commit_version,
-                super::store::UpdateMvRefreshMetadataRequest {
-                    table_id: metadata.table_id,
-                    last_refresh_rows,
-                    snapshots: metadata.snapshots,
-                    table_uuids: metadata.table_uuids,
-                },
+                metadata.table_id,
+                last_refresh_rows,
+                metadata.snapshots,
+                metadata.table_uuids,
             )?;
         }
     }
     commit_catalog_visible_version(state, &mut managed, &plan, prepared.commit_version)?;
 
     Ok(total_rows)
+}
+
+fn prepare_managed_txn(
+    state: &Arc<StandaloneState>,
+    plan: &ManagedInsertPlan,
+) -> Result<StoredManagedTxn, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("prepare managed lake txn")
+        .map_err(|e| format!("open managed txn prepare transaction failed: {e}"))?;
+    let prepared = state
+        .managed_txn_repo
+        .prepare(
+            &state.managed_repo,
+            txn.as_mut(),
+            plan.table_id,
+            plan.partition_id,
+        )
+        .map_err(|e| format!("prepare managed txn metadata failed: {e}"))?;
+    if prepared.base_version != plan.base_version {
+        return Err(format!(
+            "managed txn base version is {}, expected {}",
+            prepared.base_version, plan.base_version
+        ));
+    }
+    txn.commit()
+        .map_err(|e| format!("commit managed txn prepare metadata failed: {e}"))?;
+    Ok(prepared)
+}
+
+fn mark_managed_txn_written(state: &Arc<StandaloneState>, txn_id: i64) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("mark managed lake txn written")
+        .map_err(|e| format!("open managed txn written transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .mark_written(txn.as_mut(), txn_id)
+        .map_err(|e| format!("mark managed txn written failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed txn written metadata failed: {e}"))?;
+    Ok(())
+}
+
+fn mark_managed_txn_visible(state: &Arc<StandaloneState>, txn_id: i64) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("mark managed lake txn visible")
+        .map_err(|e| format!("open managed txn visible transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .mark_visible(&state.managed_repo, txn.as_mut(), txn_id)
+        .map_err(|e| format!("mark managed txn visible failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed txn visible metadata failed: {e}"))?;
+    Ok(())
+}
+
+fn mark_managed_txn_visible_with_mv_refresh_metadata(
+    state: &Arc<StandaloneState>,
+    txn_id: i64,
+    mv_id: i64,
+    last_refresh_rows: i64,
+    snapshots: BTreeMap<String, i64>,
+    table_uuids: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("mark managed lake mv refresh txn visible")
+        .map_err(|e| format!("open managed mv refresh visible transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .mark_visible(&state.managed_repo, txn.as_mut(), txn_id)
+        .map_err(|e| format!("mark managed mv refresh txn visible failed: {e}"))?;
+    state
+        .mv_repo
+        .update_managed_refresh_summary_if_present(
+            txn.as_mut(),
+            UpdateManagedMvRefreshSummaryRequest {
+                mv_id,
+                last_refresh_ms: current_time_ms(),
+                last_refresh_rows,
+                base_snapshots: snapshots,
+                base_table_uuids: table_uuids,
+            },
+        )
+        .map_err(|e| format!("update managed mv refresh metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed mv refresh visible metadata failed: {e}"))?;
+    Ok(())
+}
+
+fn mark_managed_txn_aborted(state: &Arc<StandaloneState>, txn_id: i64) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("abort managed lake txn")
+        .map_err(|e| format!("open managed txn abort transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .mark_aborted(txn.as_mut(), txn_id)
+        .map_err(|e| format!("mark managed txn aborted failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed txn abort metadata failed: {e}"))?;
+    Ok(())
+}
+
+fn current_time_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn revalidate_insert_plan_visible_version(
@@ -659,7 +781,7 @@ fn revalidate_insert_plan_visible_version(
         })?;
     if matches!(
         partition.state,
-        super::store::ManagedPartitionState::Retired
+        super::model::ManagedPartitionState::Retired
     ) {
         return Err(format!(
             "managed insert target partition {} for table {} is no longer writable",
@@ -738,7 +860,7 @@ fn derive_column_defs_from_runtime(
 
 fn derive_distributed_slot_ids<'a>(
     columns: &[ColumnDef],
-    stored_columns: impl IntoIterator<Item = &'a super::store::StoredManagedColumn>,
+    stored_columns: impl IntoIterator<Item = &'a super::model::StoredManagedColumn>,
 ) -> Vec<SlotId> {
     let mut slot_ids = Vec::new();
     for column in stored_columns {
@@ -874,7 +996,7 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
 
 fn publish_managed_txn(
     plan: &ManagedInsertPlan,
-    prepared: &super::store::PreparedManagedTxn,
+    prepared: &StoredManagedTxn,
 ) -> Result<(), String> {
     // Publish the whole partition in one batch. Splitting written and empty
     // tablets into separate publish calls can make the second bundle write
@@ -1290,11 +1412,11 @@ mod mv_target_tests {
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
-    use crate::connector::starrocks::managed::store::{
+    use crate::connector::starrocks::managed::model::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-        SqliteMetadataStore, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
-        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
@@ -1304,6 +1426,12 @@ mod mv_target_tests {
         empty_tablet_metadata, write_bundle_meta_file,
     };
     use crate::formats::starrocks::writer::layout::txn_log_file_path;
+    use crate::meta::repository::encode_json_payload;
+    use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvMetaRepository};
+    use crate::meta::{
+        ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
+        SqliteMetaStoreProvider,
+    };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
@@ -1377,14 +1505,24 @@ mod mv_target_tests {
             vec![SlotId::new(1), SlotId::new(3)],
         );
 
-        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
-        let prepared = metadata_store
-            .prepare_txn(
-                physical_plan.table_id,
-                physical_plan.partition_id,
-                physical_plan.base_version,
-            )
-            .expect("prepare txn");
+        let prepared = {
+            let provider = fixture.state.metadata_provider.as_ref().expect("provider");
+            let mut txn = provider
+                .begin_write("prepare hidden key txn")
+                .expect("write");
+            let prepared = fixture
+                .state
+                .managed_txn_repo
+                .prepare(
+                    &fixture.state.managed_repo,
+                    txn.as_mut(),
+                    physical_plan.table_id,
+                    physical_plan.partition_id,
+                )
+                .expect("prepare txn");
+            txn.commit().expect("commit prepared txn");
+            prepared
+        };
         let chunk = physical_hidden_key_chunk(&[1, 2, 3], &[101, 102, 103]);
         let mut next_file_seq = 0_u64;
         let written_tablet_ids = write_routed_chunks(
@@ -1455,12 +1593,18 @@ mod mv_target_tests {
         .expect("write");
         assert_eq!(rows, 0);
 
-        let store = fixture.state.metadata_store.as_ref().expect("store");
-        let loaded = store.load_snapshot().expect("snapshot").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let mv = fixture
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), 10)
+            .expect("load mv")
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(3));
         assert_eq!(mv.last_refresh_snapshots, snapshots);
@@ -1481,10 +1625,24 @@ mod mv_target_tests {
         .expect("plan");
         assert_eq!(plan.tablets.len(), 2);
 
-        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
-        let prepared = metadata_store
-            .prepare_txn(plan.table_id, plan.partition_id, plan.base_version)
-            .expect("prepare txn");
+        let prepared = {
+            let provider = fixture.state.metadata_provider.as_ref().expect("provider");
+            let mut txn = provider
+                .begin_write("prepare mv refresh txn")
+                .expect("write");
+            let prepared = fixture
+                .state
+                .managed_txn_repo
+                .prepare(
+                    &fixture.state.managed_repo,
+                    txn.as_mut(),
+                    plan.table_id,
+                    plan.partition_id,
+                )
+                .expect("prepare txn");
+            txn.commit().expect("commit prepared txn");
+            prepared
+        };
         let chunk = single_i32_chunk("k1", &[1]);
         let mut next_file_seq = 0_u64;
         let mut written_tablet_ids = write_routed_chunks(
@@ -1555,14 +1713,18 @@ mod mv_target_tests {
         .expect("second write with stale plan");
         assert_eq!(rows, 1);
 
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
         let snapshot = fixture
             .state
-            .metadata_store
-            .as_ref()
-            .expect("store")
-            .load_snapshot()
-            .expect("snapshot")
-            .managed;
+            .managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("snapshot");
         let partition = snapshot
             .partitions
             .iter()
@@ -1607,12 +1769,18 @@ mod mv_target_tests {
         .expect("write");
         assert_eq!(rows, 3);
 
-        let store = fixture.state.metadata_store.as_ref().expect("store");
-        let loaded = store.load_snapshot().expect("snapshot").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let mv = fixture
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), 10)
+            .expect("load mv")
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(10));
         assert_eq!(mv.last_refresh_snapshots, snapshots);
@@ -1705,12 +1873,18 @@ mod mv_target_tests {
         }
         assert_eq!(seen, Some((expected_row_id, 5, 100)));
 
-        let store = fixture.state.metadata_store.as_ref().expect("store");
-        let loaded = store.load_snapshot().expect("snapshot").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let mv = fixture
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), 10)
+            .expect("load mv")
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(1));
     }
@@ -1773,12 +1947,18 @@ mod mv_target_tests {
             "fully retracted aggregate group must be deleted from the PK table"
         );
 
-        let store = fixture.state.metadata_store.as_ref().expect("store");
-        let loaded = store.load_snapshot().expect("snapshot").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let mv = fixture
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), 10)
+            .expect("load mv")
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(0));
     }
@@ -1797,6 +1977,197 @@ mod mv_target_tests {
     struct MvTestFixture {
         state: Arc<StandaloneState>,
         _metadata_dir: tempfile::TempDir,
+    }
+
+    fn seed_repository_snapshot(
+        provider: &SqliteMetaStoreProvider,
+        snapshot: &ManagedSnapshot,
+    ) -> Result<(), String> {
+        let mut txn = provider
+            .begin_write("seed managed txn test repositories")
+            .map_err(|e| format!("begin seed txn failed: {e}"))?;
+        for database in &snapshot.databases {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["database".to_string(), database.db_id.to_string()],
+                "managed.database",
+                serde_json::json!({
+                    "db_id": database.db_id,
+                    "name": database.name,
+                }),
+            )?;
+        }
+        for table in &snapshot.tables {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["table".to_string(), table.table_id.to_string()],
+                "managed.table",
+                serde_json::json!({
+                    "table_id": table.table_id,
+                    "db_id": table.db_id,
+                    "name": table.name,
+                    "keys_type": table.keys_type,
+                    "bucket_num": table.bucket_num,
+                    "current_schema_id": table.current_schema_id,
+                    "state": table_state(table.state),
+                    "kind": table_kind(table.kind),
+                }),
+            )?;
+        }
+        for schema in &snapshot.schemas {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["schema".to_string(), schema.schema_id.to_string()],
+                "managed.schema",
+                serde_json::json!({
+                    "schema_id": schema.schema_id,
+                    "table_id": schema.table_id,
+                    "schema_version": schema.schema_version,
+                    "tablet_schema_pb": schema.tablet_schema_pb,
+                }),
+            )?;
+        }
+        for column in &snapshot.columns {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec![
+                    "column".to_string(),
+                    column.schema_id.to_string(),
+                    column.ordinal.to_string(),
+                ],
+                "managed.column",
+                serde_json::json!({
+                    "schema_id": column.schema_id,
+                    "ordinal": column.ordinal,
+                    "column_name": column.column_name,
+                    "logical_type": column.logical_type,
+                    "nullable": column.nullable,
+                    "visible": column.visible,
+                    "is_key": column.is_key,
+                }),
+            )?;
+        }
+        for partition in &snapshot.partitions {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["partition".to_string(), partition.partition_id.to_string()],
+                "managed.partition",
+                serde_json::json!({
+                    "partition_id": partition.partition_id,
+                    "table_id": partition.table_id,
+                    "name": partition.name,
+                    "visible_version": partition.visible_version,
+                    "next_version": partition.next_version,
+                    "state": partition_state(partition.state),
+                }),
+            )?;
+        }
+        for index in &snapshot.indexes {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["index".to_string(), index.index_id.to_string()],
+                "managed.index",
+                serde_json::json!({
+                    "index_id": index.index_id,
+                    "table_id": index.table_id,
+                    "partition_id": index.partition_id,
+                    "index_type": index.index_type,
+                    "state": index_state(index.state),
+                }),
+            )?;
+        }
+        for tablet in &snapshot.tablets {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["tablet".to_string(), tablet.tablet_id.to_string()],
+                "managed.tablet",
+                serde_json::json!({
+                    "tablet_id": tablet.tablet_id,
+                    "partition_id": tablet.partition_id,
+                    "index_id": tablet.index_id,
+                    "bucket_seq": tablet.bucket_seq,
+                    "tablet_root_path": tablet.tablet_root_path,
+                }),
+            )?;
+        }
+        for mv in &snapshot.materialized_views {
+            MvMetaRepository::default()
+                .create_definition_with_id(
+                    txn.as_mut(),
+                    mv.mv_id,
+                    CreateMvDefinitionRequest {
+                        select_sql: mv.select_sql.clone(),
+                        base_table_refs: mv.base_table_refs.iter().map(|r| r.fqn()).collect(),
+                        primary_key_columns: mv.primary_key_columns.clone(),
+                        storage_engine: "managed_lake".to_string(),
+                        target_catalog: mv.target_catalog.clone(),
+                        target_namespace: mv.target_namespace.clone(),
+                        target_table: mv.target_table.clone(),
+                        created_at_ms: mv.created_at_ms,
+                    },
+                )
+                .map_err(|e| format!("seed mv repository failed: {e}"))?;
+        }
+        txn.commit()
+            .map_err(|e| format!("commit seed txn failed: {e}"))?;
+        Ok(())
+    }
+
+    fn put_seed_record(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        namespace: &str,
+        path: Vec<String>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        txn.put(MetaRecordPut::new(
+            MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
+            MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    fn table_state(state: ManagedTableState) -> &'static str {
+        match state {
+            ManagedTableState::Creating => "CREATING",
+            ManagedTableState::Active => "ACTIVE",
+            ManagedTableState::Dropping => "DROPPING",
+            ManagedTableState::Failed => "FAILED",
+        }
+    }
+
+    fn table_kind(kind: ManagedTableKind) -> &'static str {
+        match kind {
+            ManagedTableKind::Table => "TABLE",
+            ManagedTableKind::MaterializedView => "MATERIALIZED_VIEW",
+        }
+    }
+
+    fn partition_state(state: ManagedPartitionState) -> &'static str {
+        match state {
+            ManagedPartitionState::Creating => "CREATING",
+            ManagedPartitionState::Active => "ACTIVE",
+            ManagedPartitionState::Retired => "RETIRED",
+            ManagedPartitionState::Failed => "FAILED",
+        }
+    }
+
+    fn index_state(state: ManagedIndexState) -> &'static str {
+        match state {
+            ManagedIndexState::Creating => "CREATING",
+            ManagedIndexState::Active => "ACTIVE",
+            ManagedIndexState::Retired => "RETIRED",
+            ManagedIndexState::Failed => "FAILED",
+        }
     }
 
     fn seed_state_with_staged_mv() -> MvTestFixture {
@@ -1854,7 +2225,7 @@ mod mv_target_tests {
         let active_tablet_root = format!("{metadata_root}/db_1/table_10/partition_20");
         let tablet_schema = aggregate_primary_key_tablet_schema();
         let columns = vec![
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 0,
                 column_name: "__row_id__".to_string(),
@@ -1863,7 +2234,7 @@ mod mv_target_tests {
                 visible: false,
                 is_key: true,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 1,
                 column_name: "k1".to_string(),
@@ -1872,7 +2243,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 2,
                 column_name: "c".to_string(),
@@ -1881,7 +2252,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 3,
                 column_name: "s".to_string(),
@@ -1890,7 +2261,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 4,
                 column_name: "__agg_state_c".to_string(),
@@ -1899,7 +2270,7 @@ mod mv_target_tests {
                 visible: false,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 5,
                 column_name: "__agg_state_s".to_string(),
@@ -1996,12 +2367,10 @@ mod mv_target_tests {
             }],
         };
 
-        let metadata_store =
-            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
-                .expect("open store");
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist snapshot");
+        let metadata_provider =
+            SqliteMetaStoreProvider::open(format!("{metadata_root}/standalone.sqlite"))
+                .expect("open provider");
+        seed_repository_snapshot(&metadata_provider, &snapshot).expect("seed repositories");
 
         for tablet_id in [40_i64, 43_i64] {
             let runtime_ctx = TabletWriteContext {
@@ -2037,7 +2406,7 @@ mod mv_target_tests {
                 catalog: std::sync::RwLock::new(catalog),
                 managed_lake: std::sync::RwLock::new(managed),
                 managed_lake_config: Some(config),
-                metadata_store: Some(metadata_store),
+                metadata_provider: Some(Arc::new(metadata_provider)),
                 ..Default::default()
             }),
             _metadata_dir: metadata_dir,
@@ -2309,7 +2678,7 @@ mod mv_target_tests {
         }
 
         let mut columns = vec![
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 0,
                 column_name: "k1".to_string(),
@@ -2318,7 +2687,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: visible_key,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 1,
                 column_name: "total".to_string(),
@@ -2330,7 +2699,7 @@ mod mv_target_tests {
         ];
         if include_hidden_physical_column {
             columns.push(
-                crate::connector::starrocks::managed::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::model::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 2,
                     column_name: "__nr_shadow_total".to_string(),
@@ -2465,12 +2834,10 @@ mod mv_target_tests {
             },
         };
 
-        let metadata_store =
-            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
-                .map_err(|e| format!("open store failed: {e}"))?;
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .map_err(|e| format!("persist snapshot failed: {e}"))?;
+        let metadata_provider =
+            SqliteMetaStoreProvider::open(format!("{metadata_root}/standalone.sqlite"))
+                .map_err(|e| format!("open provider failed: {e}"))?;
+        seed_repository_snapshot(&metadata_provider, &snapshot)?;
 
         for tablet_id in [40_i64, 43_i64] {
             let runtime_ctx = TabletWriteContext {
@@ -2510,7 +2877,7 @@ mod mv_target_tests {
                 catalog: std::sync::RwLock::new(catalog),
                 managed_lake: std::sync::RwLock::new(managed),
                 managed_lake_config: Some(config),
-                metadata_store: Some(metadata_store),
+                metadata_provider: Some(Arc::new(metadata_provider)),
                 ..Default::default()
             }),
             _metadata_dir: metadata_dir,

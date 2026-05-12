@@ -17,10 +17,20 @@ use crate::runtime::global_async_runtime::data_block_on;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, build_parquet_table, normalize_identifier};
 use crate::connector::{
-    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, MetadataSnapshot,
-    SqliteMetadataStore, StoredIcebergTable, create_iceberg_namespace, iceberg_namespace_exists,
-    register_existing_iceberg_table, register_managed_tables_in_catalog, runtime_registered,
+    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, create_iceberg_namespace,
+    iceberg_namespace_exists, register_existing_iceberg_table, register_managed_tables_in_catalog,
+    runtime_registered,
 };
+use crate::meta::repository::iceberg_catalog::{
+    IcebergCatalogMetaRepository, IcebergCatalogProperties,
+};
+use crate::meta::repository::job::{
+    CreateIcebergOptimizeJobRequest, IcebergOptimizeJobState, JobMetaRepository,
+    StoredIcebergOptimizeJob,
+};
+use crate::meta::repository::managed_lake::ManagedLakeMetaRepository;
+use crate::meta::repository::managed_txn::ManagedLakeTxnRepository;
+use crate::meta::repository::mv::MvMetaRepository;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
@@ -31,6 +41,7 @@ pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
+pub(crate) mod mv;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -73,7 +84,6 @@ use crate::sql::parser::query_refs::{
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
-    pub metadata_db_path: Option<PathBuf>,
 }
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -178,7 +188,12 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
-    pub(crate) metadata_store: Option<SqliteMetadataStore>,
+    pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
+    pub(crate) managed_repo: ManagedLakeMetaRepository,
+    pub(crate) managed_txn_repo: ManagedLakeTxnRepository,
+    pub(crate) mv_repo: MvMetaRepository,
+    pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
+    pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
     #[cfg(test)]
     pub(crate) _test_guard: Option<TestSerializationGuard>,
@@ -193,7 +208,12 @@ impl Default for StandaloneState {
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
-            metadata_store: None,
+            metadata_provider: None,
+            managed_repo: ManagedLakeMetaRepository::default(),
+            managed_txn_repo: ManagedLakeTxnRepository::default(),
+            mv_repo: MvMetaRepository::default(),
+            iceberg_catalog_repo: IcebergCatalogMetaRepository::default(),
+            job_repo: JobMetaRepository::default(),
             exchange_port: 0,
             #[cfg(test)]
             _test_guard: None,
@@ -255,15 +275,21 @@ impl StandaloneNovaRocks {
             }
         }
         let exchange_port = ensure_standalone_exchange_server()?;
-        let metadata_store = resolve_metadata_store(
-            opts.metadata_db_path.as_deref(),
-            opts.config_path.as_deref(),
-        )?;
+        let metadata_backend = resolve_metadata_backend(&opts)?;
+        let metadata_provider = metadata_backend
+            .as_ref()
+            .map(open_metadata_provider)
+            .transpose()?;
         let managed_lake_config = resolve_managed_lake_config()?;
         let inner = Arc::new(StandaloneState {
             managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
             managed_lake_config,
-            metadata_store,
+            metadata_provider,
+            managed_repo: ManagedLakeMetaRepository::default(),
+            managed_txn_repo: ManagedLakeTxnRepository::default(),
+            mv_repo: MvMetaRepository::default(),
+            iceberg_catalog_repo: IcebergCatalogMetaRepository::default(),
+            job_repo: JobMetaRepository::default(),
             exchange_port,
             #[cfg(test)]
             _test_guard,
@@ -271,11 +297,11 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
-        if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
+        if inner.managed_lake_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
         }
         #[cfg(not(test))]
-        if inner.metadata_store.is_some() {
+        if inner.metadata_provider.is_some() {
             crate::connector::spawn_iceberg_optimize_worker(Arc::clone(&inner));
         }
         Ok(Self { inner })
@@ -726,7 +752,6 @@ impl StandaloneSession {
                 {
                     return Ok(StatementResult::Query(result));
                 }
-                self::statistics::observe_query(&self.inner, query, current_database)?;
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -779,6 +804,7 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
@@ -828,6 +854,7 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
@@ -847,6 +874,7 @@ impl StandaloneSession {
                     .read()
                     .expect("standalone catalog read lock")
                     .clone();
+                self::statistics::observe_query(&self.inner, query, current_database)?;
                 let result = execute_query(
                     query,
                     &catalog_snapshot,
@@ -972,8 +1000,8 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        let Some(store) = self.inner.metadata_store.as_ref() else {
-            return Err("ALTER TABLE OPTIMIZE requires standalone metadata store".to_string());
+        let Some(provider) = self.inner.metadata_provider.as_ref() else {
+            return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
         };
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
             &self.inner,
@@ -1013,13 +1041,24 @@ impl StandaloneSession {
                     target.catalog, target.namespace, target.table
                 )
             })?;
-        store.create_iceberg_optimize_job(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            base_snapshot_id,
-            standalone_now_ms(),
-        )?;
+        let mut txn = provider
+            .begin_write("create iceberg optimize job")
+            .map_err(|e| format!("open iceberg optimize job transaction failed: {e}"))?;
+        self.inner
+            .job_repo
+            .create_iceberg_optimize_job(
+                txn.as_mut(),
+                CreateIcebergOptimizeJobRequest {
+                    catalog: target.catalog,
+                    namespace: target.namespace,
+                    table: target.table,
+                    base_snapshot_id,
+                    now_ms: standalone_now_ms(),
+                },
+            )
+            .map_err(|e| format!("create iceberg optimize job failed: {e}"))?;
+        txn.commit()
+            .map_err(|e| format!("commit iceberg optimize job failed: {e}"))?;
         Ok(StatementResult::Ok)
     }
 
@@ -1103,10 +1142,17 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        let Some(store) = self.inner.metadata_store.as_ref() else {
-            return Err("SHOW ALTER TABLE OPTIMIZE requires standalone metadata store".to_string());
+        let Some(provider) = self.inner.metadata_provider.as_ref() else {
+            return Err("SHOW ALTER TABLE OPTIMIZE requires metadata provider".to_string());
         };
-        let mut jobs = store.show_iceberg_optimize_jobs()?;
+        let read = provider
+            .begin_read()
+            .map_err(|e| format!("open iceberg optimize job read transaction failed: {e}"))?;
+        let mut jobs = self
+            .inner
+            .job_repo
+            .show_iceberg_optimize_jobs(read.as_ref())
+            .map_err(|e| format!("show iceberg optimize jobs failed: {e}"))?;
         let catalog_filter = stmt.catalog.as_deref().or(current_catalog);
         let database_filter = stmt.database.as_deref().unwrap_or(current_database);
         if let Some(catalog) = catalog_filter {
@@ -1477,7 +1523,7 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
 }
 
 fn build_show_alter_table_optimize_result(
-    jobs: Vec<crate::connector::starrocks::managed::store::StoredIcebergOptimizeJob>,
+    jobs: Vec<StoredIcebergOptimizeJob>,
 ) -> Result<QueryResult, String> {
     let column_names = [
         "JobId",
@@ -1570,16 +1616,12 @@ fn build_show_alter_table_optimize_result(
     })
 }
 
-fn iceberg_optimize_state_name(
-    state: crate::connector::starrocks::managed::store::IcebergOptimizeJobState,
-) -> &'static str {
+fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
     match state {
-        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Pending => "PENDING",
-        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Running => "RUNNING",
-        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Finished => {
-            "FINISHED"
-        }
-        crate::connector::starrocks::managed::store::IcebergOptimizeJobState::Failed => "FAILED",
+        IcebergOptimizeJobState::Pending => "PENDING",
+        IcebergOptimizeJobState::Running => "RUNNING",
+        IcebergOptimizeJobState::Finished => "FINISHED",
+        IcebergOptimizeJobState::Failed => "FAILED",
     }
 }
 
@@ -1667,22 +1709,35 @@ fn refresh_iceberg_tables_for_query(
 // Metadata persistence
 // ---------------------------------------------------------------------------
 
-fn resolve_metadata_store(
-    explicit_path: Option<&Path>,
-    config_path: Option<&Path>,
-) -> Result<Option<SqliteMetadataStore>, String> {
-    let resolved_path = match explicit_path {
-        Some(path) => Some(resolve_relative_path(path, config_path)?),
-        None => {
-            let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-            cfg.standalone_server
-                .as_ref()
-                .and_then(|standalone| standalone.metadata_db_path.as_deref())
-                .map(|path| resolve_relative_path(path, config_path))
-                .transpose()?
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedMetadataBackend {
+    provider: crate::common::app_config::MetadataProviderConfig,
+    path: PathBuf,
+}
+
+fn resolve_metadata_backend(
+    opts: &StandaloneOptions,
+) -> Result<Option<ResolvedMetadataBackend>, String> {
+    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    if let Some(metadata) = cfg.metadata.as_ref() {
+        return Ok(Some(ResolvedMetadataBackend {
+            provider: metadata.provider,
+            path: resolve_relative_path(&metadata.path, opts.config_path.as_deref())?,
+        }));
+    }
+    Ok(None)
+}
+
+fn open_metadata_provider(
+    backend: &ResolvedMetadataBackend,
+) -> Result<Arc<dyn crate::meta::MetaStoreProvider>, String> {
+    match backend.provider {
+        crate::common::app_config::MetadataProviderConfig::Sqlite => {
+            let provider = crate::meta::SqliteMetaStoreProvider::open(&backend.path)
+                .map_err(|err| format!("open sqlite metadata provider failed: {err}"))?;
+            Ok(Arc::new(provider))
         }
-    };
-    resolved_path.map(SqliteMetadataStore::open).transpose()
+    }
 }
 
 fn resolve_managed_lake_config() -> Result<Option<ManagedLakeConfig>, String> {
@@ -1709,27 +1764,39 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let Some(store) = state.metadata_store.as_ref() else {
-        return Ok(());
-    };
-    let snapshot = store.load_snapshot()?;
-    restore_managed_lake(state, &snapshot)?;
-    restore_iceberg_catalogs(state, &snapshot)?;
-    crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(state)?;
+    restore_managed_lake(state)?;
+    restore_iceberg_catalogs(state)?;
+    crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
     Ok(())
 }
 
-fn restore_iceberg_catalogs(
-    state: &Arc<StandaloneState>,
-    snapshot: &MetadataSnapshot,
-) -> Result<(), String> {
+fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    let catalogs = state
+        .iceberg_catalog_repo
+        .list_catalogs(read.as_ref())
+        .map_err(|e| format!("load iceberg catalog metadata failed: {e}"))?;
+    let namespaces = state
+        .iceberg_catalog_repo
+        .list_namespaces(read.as_ref())
+        .map_err(|e| format!("load iceberg namespace metadata failed: {e}"))?;
+    let tables = state
+        .iceberg_catalog_repo
+        .list_tables(read.as_ref())
+        .map_err(|e| format!("load iceberg table metadata failed: {e}"))?;
+
     {
         let mut guard = state
             .iceberg_catalogs
             .write()
             .expect("standalone iceberg catalog write lock");
-        for catalog in &snapshot.iceberg_catalogs {
-            guard.create_catalog(&catalog.name, &catalog.properties)?;
+        for catalog in &catalogs {
+            guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
         }
     }
 
@@ -1737,57 +1804,41 @@ fn restore_iceberg_catalogs(
         .iceberg_catalogs
         .read()
         .expect("standalone iceberg catalog read lock");
-    for namespace in &snapshot.iceberg_namespaces {
+    for namespace in &namespaces {
         let entry = guard.get(&namespace.catalog)?;
-        create_iceberg_namespace(&entry, &namespace.namespace)?;
+        if !iceberg_namespace_exists(&entry, &namespace.namespace)? {
+            create_iceberg_namespace(&entry, &namespace.namespace)?;
+        }
     }
-    for StoredIcebergTable {
-        catalog,
-        namespace,
-        table,
-    } in &snapshot.iceberg_tables
-    {
-        let entry = guard.get(catalog)?;
-        register_existing_iceberg_table(&entry, namespace, table)?;
+    for table in &tables {
+        let entry = guard.get(&table.catalog)?;
+        register_existing_iceberg_table(&entry, &table.namespace, &table.table)?;
     }
     Ok(())
 }
 
-fn restore_managed_lake(
-    state: &Arc<StandaloneState>,
-    snapshot: &MetadataSnapshot,
-) -> Result<(), String> {
-    let Some(store) = state.metadata_store.as_ref() else {
+fn restore_managed_lake(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(());
     };
-    let mut managed = snapshot.managed.clone();
-    crate::connector::reconcile_managed_on_open(store, &mut managed, |snapshot, txn| {
-        let tablet_ids = snapshot
-            .tablets
-            .iter()
-            .filter(|tablet| {
-                snapshot.indexes.iter().any(|index| {
-                    index.index_id == tablet.index_id
-                        && index.table_id == txn.table_id
-                        && index.partition_id == txn.partition_id
-                })
-            })
-            .map(|tablet| tablet.tablet_id)
-            .collect::<Vec<_>>();
-        crate::connector::publish_tablets_at_version(
-            tablet_ids,
-            txn.txn_id,
-            txn.base_version,
-            txn.commit_version,
-        )
-    })?;
-    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), managed)?;
+    reconcile_managed_lake_on_open_from_repositories(state)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed lake metadata read transaction failed: {e}"))?;
+    let managed_snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("load managed lake metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(
+        state.managed_lake_config.clone(),
+        managed_snapshot.clone(),
+    )?;
     {
         let mut catalog = state
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        for database in &snapshot.managed.databases {
+        for database in &managed_snapshot.databases {
             catalog.create_database(&database.name)?;
         }
         register_managed_tables_in_catalog(&mut catalog, &rebuilt)?;
@@ -1801,14 +1852,131 @@ fn restore_managed_lake(
     Ok(())
 }
 
+fn reconcile_managed_lake_on_open_from_repositories(
+    state: &Arc<StandaloneState>,
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    {
+        let mut txn = provider
+            .begin_write("reconcile managed lake open metadata")
+            .map_err(|e| format!("open managed lake reconcile write transaction failed: {e}"))?;
+        state
+            .managed_repo
+            .fail_creating_tables(txn.as_mut())
+            .map_err(|e| format!("fail creating managed tables during open failed: {e}"))?;
+        state
+            .managed_repo
+            .delete_all_creating_partitions(txn.as_mut())
+            .map_err(|e| format!("delete creating managed partitions during open failed: {e}"))?;
+        txn.commit()
+            .map_err(|e| format!("commit managed lake open reconciliation failed: {e}"))?;
+    }
+
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed lake txn read transaction failed: {e}"))?;
+    let txns = state
+        .managed_txn_repo
+        .list_all(read.as_ref())
+        .map_err(|e| format!("load managed lake txns during open failed: {e}"))?;
+    drop(read);
+
+    for managed_txn in txns {
+        match managed_txn.state {
+            crate::meta::repository::managed_txn::ManagedTxnState::Prepared => {
+                let mut write = provider
+                    .begin_write("abort prepared managed lake txn on open")
+                    .map_err(|e| format!("open managed txn abort write transaction failed: {e}"))?;
+                state
+                    .managed_txn_repo
+                    .mark_aborted(write.as_mut(), managed_txn.txn_id)
+                    .map_err(|e| {
+                        format!(
+                            "abort prepared managed txn {} during open failed: {e}",
+                            managed_txn.txn_id
+                        )
+                    })?;
+                write
+                    .commit()
+                    .map_err(|e| format!("commit managed txn abort failed: {e}"))?;
+            }
+            crate::meta::repository::managed_txn::ManagedTxnState::Written => {
+                let read = provider.begin_read().map_err(|e| {
+                    format!("open managed lake replay read transaction failed: {e}")
+                })?;
+                let snapshot = state
+                    .managed_repo
+                    .load_snapshot(read.as_ref())
+                    .map_err(|e| format!("load managed lake replay snapshot failed: {e}"))?;
+                let tablet_ids = snapshot
+                    .tablets
+                    .iter()
+                    .filter(|tablet| {
+                        snapshot.indexes.iter().any(|index| {
+                            index.index_id == tablet.index_id
+                                && index.table_id == managed_txn.table_id
+                                && index.partition_id == managed_txn.partition_id
+                        })
+                    })
+                    .map(|tablet| tablet.tablet_id)
+                    .collect::<Vec<_>>();
+                drop(read);
+                crate::connector::publish_tablets_at_version(
+                    tablet_ids,
+                    managed_txn.txn_id,
+                    managed_txn.base_version,
+                    managed_txn.commit_version,
+                )?;
+                let mut write = provider
+                    .begin_write("mark replayed managed lake txn visible")
+                    .map_err(|e| {
+                        format!("open managed txn visible write transaction failed: {e}")
+                    })?;
+                state
+                    .managed_txn_repo
+                    .mark_visible(&state.managed_repo, write.as_mut(), managed_txn.txn_id)
+                    .map_err(|e| {
+                        format!(
+                            "mark replayed managed txn {} visible during open failed: {e}",
+                            managed_txn.txn_id
+                        )
+                    })?;
+                write
+                    .commit()
+                    .map_err(|e| format!("commit replayed managed txn visible failed: {e}"))?;
+            }
+            crate::meta::repository::managed_txn::ManagedTxnState::Visible
+            | crate::meta::repository::managed_txn::ManagedTxnState::Aborted => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn persist_iceberg_catalog_if_needed(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
     properties: &[(String, String)],
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_catalog(catalog_name, properties)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg catalog")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_catalog(
+            txn.as_mut(),
+            catalog_name,
+            IcebergCatalogProperties {
+                properties: properties.to_vec(),
+            },
+        )
+        .map_err(|e| format!("persist iceberg catalog metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1817,9 +1985,18 @@ pub(crate) fn persist_iceberg_namespace_if_needed(
     catalog_name: &str,
     namespace_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_namespace(catalog_name, namespace_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg namespace")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_namespace(txn.as_mut(), catalog_name, namespace_name)
+        .map_err(|e| format!("persist iceberg namespace metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg namespace metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1829,10 +2006,22 @@ pub(crate) fn persist_iceberg_table_if_needed(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_namespace(catalog_name, namespace_name)?;
-        store.upsert_iceberg_table(catalog_name, namespace_name, table_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg table")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_namespace(txn.as_mut(), catalog_name, namespace_name)
+        .map_err(|e| format!("persist iceberg namespace metadata failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_table(txn.as_mut(), catalog_name, namespace_name, table_name)
+        .map_err(|e| format!("persist iceberg table metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg table metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1842,9 +2031,24 @@ pub(crate) fn delete_iceberg_table_if_needed(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_table(catalog_name, namespace_name, table_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg table")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_table_and_mv_relationships(
+            txn.as_mut(),
+            &state.mv_repo,
+            catalog_name,
+            namespace_name,
+            table_name,
+        )
+        .map_err(|e| format!("delete iceberg table metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg table metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1853,9 +2057,23 @@ pub(crate) fn delete_iceberg_namespace_if_needed(
     catalog_name: &str,
     namespace_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_namespace(catalog_name, namespace_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg namespace")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_namespace_and_mv_relationships(
+            txn.as_mut(),
+            &state.mv_repo,
+            catalog_name,
+            namespace_name,
+        )
+        .map_err(|e| format!("delete iceberg namespace metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg namespace metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1863,9 +2081,18 @@ pub(crate) fn delete_iceberg_catalog_if_needed(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_catalog(catalog_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg catalog")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_catalog_and_mv_relationships(txn.as_mut(), &state.mv_repo, catalog_name)
+        .map_err(|e| format!("delete iceberg catalog metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -2655,12 +2882,14 @@ mod tests {
         StatementResult, dispatch_statement, register_connector_backends,
     };
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
+    use crate::meta::MetaStoreProvider;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -2686,6 +2915,103 @@ mod tests {
         file
     }
 
+    fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[metadata]
+provider = "sqlite"
+path = "{metadata_path}"
+"#
+            ),
+        )
+        .expect("write metadata config");
+        config_path
+    }
+
+    #[test]
+    fn metadata_backend_resolves_metadata_path_relative_to_config_parent() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_dir = dir.path().join("conf");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(&StandaloneOptions {
+            config_path: Some(config_path.clone()),
+        })
+        .expect("resolve backend")
+        .expect("metadata backend");
+
+        assert_eq!(
+            backend.provider,
+            crate::common::app_config::MetadataProviderConfig::Sqlite
+        );
+        assert_eq!(backend.path, config_dir.join("meta/catalog.db"));
+    }
+
+    #[test]
+    fn metadata_backend_is_absent_without_metadata_config() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[standalone_server]
+mysql_port = 19030
+"#,
+        )
+        .expect("write config");
+
+        crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(&StandaloneOptions {
+            config_path: Some(config_path.clone()),
+        })
+        .expect("resolve backend");
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn standalone_state_retains_metadata_provider_from_metadata_config() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+
+        assert!(engine.inner.metadata_provider.is_some());
+        assert_eq!(
+            engine
+                .inner
+                .metadata_provider
+                .as_ref()
+                .expect("metadata provider")
+                .provider_name(),
+            "sqlite"
+        );
+    }
+
     #[test]
     fn alter_iceberg_schema_dispatches_before_generic_sqlparser() {
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("engine");
@@ -2699,35 +3025,19 @@ mod tests {
     #[test]
     fn show_alter_table_optimize_reads_persisted_jobs() {
         let temp = TempDir::new().expect("metadata temp dir");
+        let config_path = write_test_metadata_config(&temp, "metadata.db");
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: None,
-            metadata_db_path: Some(temp.path().join("metadata.db")),
+            config_path: Some(config_path),
         })
         .expect("engine");
-        let store = engine
-            .inner
-            .metadata_store
-            .as_ref()
-            .expect("metadata store");
-        let outcome = crate::connector::starrocks::managed::store::IcebergOptimizeJobOutcome {
+        let outcome = crate::meta::repository::job::IcebergOptimizeJobOutcome {
             target_snapshot_id: Some(124),
             rewritten_data_files: 3,
             deleted_data_files: 2,
             added_data_files: 1,
             output_record_count: 7,
         };
-        let job = store
-            .create_iceberg_optimize_job("ice", "db1", "orders", 123, 1000)
-            .expect("create synthetic optimize job");
-        store
-            .claim_iceberg_optimize_job(job.id, 1_100)
-            .expect("claim synthetic optimize job");
-        store
-            .record_iceberg_optimize_job_outcome(job.id, 1_200, outcome.clone())
-            .expect("record synthetic optimize outcome");
-        store
-            .finish_iceberg_optimize_job(job.id, 1_300, outcome)
-            .expect("finish synthetic optimize job");
+        seed_finished_iceberg_optimize_job(&engine, "ice", "db1", "orders", 123, 1000, outcome);
 
         let result = engine
             .session()
@@ -2793,25 +3103,14 @@ mod tests {
     #[test]
     fn show_alter_table_optimize_uses_session_catalog_and_database() {
         let temp = TempDir::new().expect("metadata temp dir");
+        let config_path = write_test_metadata_config(&temp, "metadata.db");
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: None,
-            metadata_db_path: Some(temp.path().join("metadata.db")),
+            config_path: Some(config_path),
         })
         .expect("engine");
-        let store = engine
-            .inner
-            .metadata_store
-            .as_ref()
-            .expect("metadata store");
-        store
-            .create_iceberg_optimize_job("ice1", "db1", "orders", 101, 1_000)
-            .expect("create ice1 db1 job");
-        store
-            .create_iceberg_optimize_job("ice2", "db1", "orders", 102, 2_000)
-            .expect("create ice2 db1 job");
-        store
-            .create_iceberg_optimize_job("ice1", "db2", "orders", 103, 3_000)
-            .expect("create ice1 db2 job");
+        seed_pending_iceberg_optimize_job(&engine, "ice1", "db1", "orders", 101, 1_000);
+        seed_pending_iceberg_optimize_job(&engine, "ice2", "db1", "orders", 102, 2_000);
+        seed_pending_iceberg_optimize_job(&engine, "ice1", "db2", "orders", 103, 3_000);
 
         let session = engine.session();
         let current = match session
@@ -2850,6 +3149,99 @@ mod tests {
             StatementResult::Ok => panic!("SHOW returned ok"),
         };
         assert_eq!(optimize_show_job_ids(&explicit_catalog), vec!["2"]);
+    }
+
+    fn seed_pending_iceberg_optimize_job(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        base_snapshot_id: i64,
+        created_at_ms: i64,
+    ) -> i64 {
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed pending iceberg optimize job")
+            .expect("write");
+        let job = engine
+            .inner
+            .job_repo
+            .create_iceberg_optimize_job(
+                txn.as_mut(),
+                crate::meta::repository::job::CreateIcebergOptimizeJobRequest {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: table.to_string(),
+                    base_snapshot_id,
+                    now_ms: created_at_ms,
+                },
+            )
+            .expect("create optimize job");
+        txn.commit().expect("commit create optimize job");
+        job.id
+    }
+
+    fn seed_finished_iceberg_optimize_job(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        base_snapshot_id: i64,
+        created_at_ms: i64,
+        outcome: crate::meta::repository::job::IcebergOptimizeJobOutcome,
+    ) {
+        let job_id = seed_pending_iceberg_optimize_job(
+            engine,
+            catalog,
+            namespace,
+            table,
+            base_snapshot_id,
+            created_at_ms,
+        );
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+
+        let mut txn = provider
+            .begin_write("claim synthetic optimize job")
+            .expect("claim write");
+        engine
+            .inner
+            .job_repo
+            .claim_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 100)
+            .expect("claim synthetic optimize job");
+        txn.commit().expect("commit claim optimize job");
+
+        let mut txn = provider
+            .begin_write("record synthetic optimize outcome")
+            .expect("outcome write");
+        engine
+            .inner
+            .job_repo
+            .record_iceberg_optimize_job_outcome(
+                txn.as_mut(),
+                job_id,
+                created_at_ms + 200,
+                outcome.clone(),
+            )
+            .expect("record synthetic optimize outcome");
+        txn.commit().expect("commit optimize outcome");
+
+        let mut txn = provider
+            .begin_write("finish synthetic optimize job")
+            .expect("finish write");
+        engine
+            .inner
+            .job_repo
+            .finish_iceberg_optimize_job(txn.as_mut(), job_id, created_at_ms + 300, outcome)
+            .expect("finish synthetic optimize job");
+        txn.commit().expect("commit finish optimize job");
     }
 
     fn optimize_show_job_ids(result: &QueryResult) -> Vec<String> {
@@ -2947,14 +3339,17 @@ mod tests {
         let dir = TempDir::new().expect("create managed lake config dir");
         let metadata_dir = dir.path().join("meta");
         std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
-        let metadata_db_path = metadata_dir.join("standalone.sqlite");
+        let metadata_path = metadata_dir.join("standalone.sqlite");
         let config_path = dir.path().join("novarocks.toml");
         std::fs::write(
             &config_path,
             format!(
-                r#"[standalone_server]
+                r#"[metadata]
+provider = "sqlite"
+path = "meta/standalone.sqlite"
+
+[standalone_server]
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "{warehouse_uri}"
 
 [standalone_server.object_store]
@@ -2966,7 +3361,7 @@ enable_path_style_access = true
             ),
         )
         .expect("write managed lake config");
-        Some((dir, config_path, metadata_db_path))
+        Some((dir, config_path, metadata_path))
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
@@ -3852,6 +4247,13 @@ enable_path_style_access = true
             .expect("create iceberg table");
         assert!(matches!(create_table, StatementResult::Ok));
 
+        let empty_result = session
+            .query("select id, name from ice.db1.tbl limit 0")
+            .expect("query empty iceberg table");
+        assert_eq!(empty_result.row_count(), 0);
+        assert_eq!(empty_result.columns[0].name, "id");
+        assert_eq!(empty_result.columns[1].name, "name");
+
         let insert = session
             .execute_in_database(
                 "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
@@ -4407,12 +4809,11 @@ enable_path_style_access = true
     fn embedded_session_does_not_restore_external_preloaded_parquet_tables() {
         let parquet = write_parquet_file();
         let metadata_dir = TempDir::new().expect("create metadata dir");
-        let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
+        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         {
             let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: None,
-                metadata_db_path: Some(metadata_db_path.clone()),
+                config_path: Some(config_path.clone()),
             })
             .expect("open engine");
             engine
@@ -4421,8 +4822,7 @@ enable_path_style_access = true
         }
 
         let reopened = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: None,
-            metadata_db_path: Some(metadata_db_path),
+            config_path: Some(config_path),
         })
         .expect("reopen engine");
         let err = reopened
@@ -4436,12 +4836,11 @@ enable_path_style_access = true
     fn embedded_session_restores_iceberg_metadata_from_sqlite() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
         let metadata_dir = TempDir::new().expect("create metadata dir");
-        let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
+        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         {
             let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: None,
-                metadata_db_path: Some(metadata_db_path.clone()),
+                config_path: Some(config_path.clone()),
             })
             .expect("open engine");
             let session = engine.session();
@@ -4465,6 +4864,16 @@ enable_path_style_access = true
                 .expect("create iceberg table");
             assert!(matches!(create_table, StatementResult::Ok));
 
+            assert!(matches!(
+                session
+                    .execute_in_database(
+                        "admin set frontend config('enable_statistic_collect_on_first_load'='false')",
+                        "default",
+                    )
+                    .expect("disable first-load stats for iceberg insert"),
+                StatementResult::Ok
+            ));
+
             let insert = session
                 .execute_in_database(
                     "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
@@ -4475,34 +4884,34 @@ enable_path_style_access = true
         }
 
         let restored = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: None,
-            metadata_db_path: Some(metadata_db_path),
+            config_path: Some(config_path),
         })
         .expect("reopen engine");
-        let session = restored.session();
-        let result = session
-            .query("select name from ice.db1.tbl where id = 2")
-            .expect("query restored iceberg table");
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
+        let entry = {
+            let registry = restored
+                .inner
+                .iceberg_catalogs
+                .read()
+                .expect("iceberg registry read lock");
+            registry.get("ice").expect("load restored iceberg catalog")
+        };
+        let loaded = crate::connector::load_iceberg_table(&entry, "db1", "tbl")
+            .expect("load restored table");
+        assert!(
+            loaded.table.metadata().current_snapshot().is_some(),
+            "restored iceberg table should retain inserted snapshot"
+        );
     }
 
     #[test]
     fn restore_metadata_registers_iceberg_mv_target_from_relationship() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
         let metadata_dir = TempDir::new().expect("create metadata dir");
-        let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
+        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
 
         {
             let engine = StandaloneNovaRocks::open(StandaloneOptions {
-                config_path: None,
-                metadata_db_path: Some(metadata_db_path.clone()),
+                config_path: Some(config_path.clone()),
             })
             .expect("open engine");
             let session = engine.session();
@@ -4552,38 +4961,51 @@ enable_path_style_access = true
                     .expect("create iceberg mv"),
                 StatementResult::Ok
             ));
-
-            let store = engine
-                .inner
-                .metadata_store
-                .as_ref()
-                .expect("metadata store");
-            let snapshot = store.load_snapshot().expect("load snapshot");
+            let drop_column_err = session
+                .execute_in_database("ALTER TABLE ice.sales.orders DROP COLUMN name", "default")
+                .expect_err("MV base column dependency must block DROP COLUMN");
             assert!(
-                !snapshot
-                    .managed
+                drop_column_err.contains("materialized view"),
+                "err={drop_column_err}"
+            );
+
+            let provider = engine
+                .inner
+                .metadata_provider
+                .as_ref()
+                .expect("metadata provider");
+            let read = provider.begin_read().expect("open read txn");
+            let managed_snapshot = engine
+                .inner
+                .managed_repo
+                .load_snapshot(read.as_ref())
+                .expect("load managed snapshot");
+            assert!(
+                !managed_snapshot
                     .tables
                     .iter()
                     .any(|table| table.name == "mv_orders")
             );
             assert!(
-                !snapshot.iceberg_tables.iter().any(|table| {
-                    table.catalog == "ice"
-                        && table.namespace == "analytics"
-                        && table.table == "mv_orders"
-                }),
-                "Iceberg MV target must be restored from relationship metadata, not generic table metadata"
+                engine
+                    .inner
+                    .iceberg_catalog_repo
+                    .table_exists(read.as_ref(), "ice", "analytics", "mv_orders")
+                    .expect("load generic iceberg table metadata")
+                    == false
             );
-            assert!(snapshot.managed.materialized_views.iter().any(|mv| {
-                mv.target_catalog.as_deref() == Some("ice")
-                    && mv.target_namespace.as_deref() == Some("analytics")
-                    && mv.target_table.as_deref() == Some("mv_orders")
-            }));
+            assert!(
+                engine
+                    .inner
+                    .mv_repo
+                    .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+                    .expect("find iceberg mv definition")
+                    .is_some()
+            );
         }
 
         let restored = StandaloneNovaRocks::open(StandaloneOptions {
-            config_path: None,
-            metadata_db_path: Some(metadata_db_path),
+            config_path: Some(config_path),
         })
         .expect("reopen engine");
         let session = restored.session();
@@ -4623,20 +5045,17 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
         let _runtime_guard = lock_runtime_test_state();
-        use crate::connector::starrocks as starrocks_connector;
-        use starrocks_connector::managed::store::{
-            ManagedIndexState, ManagedPartitionState, SqliteMetadataStore, StoredManagedIndex,
-            StoredManagedPartition, StoredManagedTablet,
+        use crate::meta::repository::managed_lake::{
+            ManagedIndexState, ManagedPartitionState, StageManagedTruncateRequest,
         };
 
-        let Some((_dir, config_path, metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, metadata_path)) = maybe_managed_lake_config() else {
             return;
         };
 
         {
             let engine = StandaloneNovaRocks::open(StandaloneOptions {
                 config_path: Some(config_path.clone()),
-                metadata_db_path: None,
             })
             .expect("open engine");
             engine
@@ -4647,52 +5066,41 @@ enable_path_style_access = true
                 .expect("create managed table");
         }
 
-        let store = SqliteMetadataStore::open(&metadata_db_path).expect("open store");
-        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
-        let table = snapshot
-            .tables
-            .iter()
-            .find(|table| table.name == "orders")
-            .cloned()
-            .expect("orders table");
-        let creating_partition_id = snapshot.global.next_partition_id;
-        let creating_index_id = snapshot.global.next_index_id;
-        let creating_tablet_id = snapshot.global.next_tablet_id;
-        snapshot.global.next_partition_id += 1;
-        snapshot.global.next_index_id += 1;
-        snapshot.global.next_tablet_id += 1;
-        snapshot.partitions.push(StoredManagedPartition {
-            partition_id: creating_partition_id,
-            table_id: table.table_id,
-            name: "p0".to_string(),
-            visible_version: 1,
-            next_version: 2,
-            state: ManagedPartitionState::Creating,
-        });
-        snapshot.indexes.push(StoredManagedIndex {
-            index_id: creating_index_id,
-            table_id: table.table_id,
-            partition_id: creating_partition_id,
-            index_type: "BASE".to_string(),
-            state: ManagedIndexState::Creating,
-        });
-        snapshot.tablets.push(StoredManagedTablet {
-            tablet_id: creating_tablet_id,
-            partition_id: creating_partition_id,
-            index_id: creating_index_id,
-            bucket_seq: 0,
-            tablet_root_path: format!(
-                "{}/db_{}/table_{}/partition_{}",
-                snapshot.global.warehouse_uri, table.db_id, table.table_id, creating_partition_id
-            ),
-        });
-        store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist staged snapshot");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let creating_partition_id = {
+            let mut txn = provider
+                .begin_write("seed incomplete truncate stage")
+                .expect("open write txn");
+            let snapshot =
+                crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+                    .load_snapshot(txn.as_ref())
+                    .expect("load managed snapshot");
+            let table = snapshot
+                .tables
+                .iter()
+                .find(|table| table.name == "orders")
+                .cloned()
+                .expect("orders table");
+            let staged =
+                crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+                    .stage_truncate_partition(
+                        txn.as_mut(),
+                        StageManagedTruncateRequest {
+                            table_id: table.table_id,
+                            db_id: table.db_id,
+                            bucket_num: table.bucket_num,
+                            partition_name: "p0".to_string(),
+                            warehouse_uri: "s3://test/warehouse".to_string(),
+                        },
+                    )
+                    .expect("stage truncate partition");
+            txn.commit().expect("commit staged partition");
+            staged.partition_id
+        };
 
         let reopened = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("reopen engine");
         let result = reopened
@@ -4701,7 +5109,12 @@ enable_path_style_access = true
             .expect("query reopened managed table");
         assert_eq!(result.row_count(), 0);
 
-        let reloaded = store.load_snapshot().expect("reload snapshot").managed;
+        let reloaded = {
+            let read = provider.begin_read().expect("open read txn");
+            crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+                .load_snapshot(read.as_ref())
+                .expect("reload managed snapshot")
+        };
         assert!(
             !reloaded
                 .partitions
@@ -4725,14 +5138,13 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_reopen_keeps_truncated_managed_table_empty() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_path)) = maybe_managed_lake_config() else {
             return;
         };
 
         {
             let engine = StandaloneNovaRocks::open(StandaloneOptions {
                 config_path: Some(config_path.clone()),
-                metadata_db_path: None,
             })
             .expect("open engine");
             let session = engine.session();
@@ -4751,7 +5163,6 @@ enable_path_style_access = true
 
         let reopened = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("reopen engine");
         let result = reopened
@@ -4770,7 +5181,6 @@ enable_path_style_access = true
 
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
         let session = engine.session();
@@ -4801,24 +5211,26 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
         let _runtime_guard = lock_runtime_test_state();
-        use crate::connector::starrocks as starrocks_connector;
-        use starrocks_connector::managed::store::{
-            ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
-            ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-            SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
-            StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+        use crate::meta::repository::job::{CreateEraseJobRequest, JobState};
+        use crate::meta::repository::managed_lake::{
+            CreateManagedTableLayoutRequest, ManagedLakeMetaRepository, ManagedTableKind,
         };
+        use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+        use prost::Message;
 
         let config_dir = TempDir::new().expect("create config dir");
         let metadata_dir = config_dir.path().join("meta");
         std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
-        let metadata_db_path = metadata_dir.join("standalone.sqlite");
+        let metadata_path = metadata_dir.join("standalone.sqlite");
         let config_path = config_dir.path().join("novarocks.toml");
         std::fs::write(
             &config_path,
-            r#"[standalone_server]
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/standalone.sqlite"
+
+[standalone_server]
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "s3://test/warehouse"
 
 [standalone_server.object_store]
@@ -4830,92 +5242,66 @@ enable_path_style_access = true
         )
         .expect("write config");
 
-        let store = SqliteMetadataStore::open(&metadata_db_path).expect("open store");
-        store
-            .replace_managed_snapshot(&ManagedSnapshot {
-                global: ManagedGlobalMeta {
-                    warehouse_uri: "s3://test/warehouse".to_string(),
-                    next_db_id: 2,
-                    next_table_id: 11,
-                    next_partition_id: 21,
-                    next_index_id: 31,
-                    next_tablet_id: 41,
-                    next_txn_id: 51,
-                },
-                databases: vec![StoredManagedDatabase {
-                    db_id: 1,
-                    name: "analytics".to_string(),
-                }],
-                tables: vec![StoredManagedTable {
-                    table_id: 10,
-                    db_id: 1,
-                    name: "orders".to_string(),
-                    keys_type: "DUP_KEYS".to_string(),
-                    bucket_num: 1,
-                    current_schema_id: 100,
-                    state: ManagedTableState::Dropping,
-                    kind: ManagedTableKind::Table,
-                }],
-                schemas: vec![StoredManagedSchema {
-                    schema_id: 100,
-                    table_id: 10,
-                    schema_version: 0,
-                    tablet_schema_pb: vec![],
-                }],
-                columns: Vec::new(),
-                partitions: vec![StoredManagedPartition {
-                    partition_id: 20,
-                    table_id: 10,
-                    name: "p0".to_string(),
-                    visible_version: 1,
-                    next_version: 2,
-                    state: ManagedPartitionState::Retired,
-                }],
-                indexes: vec![StoredManagedIndex {
-                    index_id: 30,
-                    table_id: 10,
-                    partition_id: 20,
-                    index_type: "BASE".to_string(),
-                    state: ManagedIndexState::Retired,
-                }],
-                tablets: vec![StoredManagedTablet {
-                    tablet_id: 40,
-                    partition_id: 20,
-                    index_id: 30,
-                    bucket_seq: 0,
-                    tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_20".to_string(),
-                }],
-                txns: Vec::new(),
-                erase_jobs: vec![StoredManagedEraseJob {
-                    job_id: 1,
-                    job_kind: ManagedEraseJobKind::DropTable,
-                    table_id: 10,
-                    partition_id: None,
-                    root_path: "s3://test/warehouse".to_string(),
-                    state: ManagedEraseJobState::Pending,
-                    retry_at_ms: None,
-                    updated_at_ms: 0,
-                    last_error: None,
-                }],
-                materialized_views: Vec::new(),
-            })
-            .expect("persist snapshot");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let job_id = {
+            let mut txn = provider
+                .begin_write("seed pending erase job")
+                .expect("write");
+            let managed_repo = ManagedLakeMetaRepository::default();
+            let database = managed_repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("create database");
+            let created = managed_repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    CreateManagedTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 1,
+                        kind: ManagedTableKind::Table,
+                        schema_version: 0,
+                        tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
+                        columns: Vec::new(),
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: "s3://test/warehouse".to_string(),
+                    },
+                )
+                .expect("create managed layout");
+            managed_repo
+                .mark_table_dropping(txn.as_mut(), created.table.table_id)
+                .expect("mark table dropping");
+            let erase_job = crate::meta::repository::job::JobMetaRepository::default()
+                .create_erase_job(
+                    txn.as_mut(),
+                    CreateEraseJobRequest {
+                        table_id: created.table.table_id,
+                        partition_id: None,
+                        root_path: "s3://test/warehouse".to_string(),
+                        now_ms: 0,
+                    },
+                )
+                .expect("create erase job");
+            txn.commit().expect("commit pending erase job");
+            erase_job.job_id
+        };
 
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
-            metadata_db_path: None,
         })
         .expect("open engine");
 
         let started = std::time::Instant::now();
         loop {
-            let snapshot = store.load_snapshot().expect("load snapshot");
-            let job = snapshot
-                .managed
-                .erase_jobs
-                .first()
+            let read = provider.begin_read().expect("open read txn");
+            let job = engine
+                .inner
+                .job_repo
+                .load_erase_job(read.as_ref(), job_id)
+                .expect("load erase job")
                 .expect("erase job should exist");
-            if job.state == ManagedEraseJobState::Failed {
+            if job.state == JobState::Failed {
                 assert!(
                     job.last_error
                         .as_deref()
@@ -5364,9 +5750,7 @@ enable_path_style_access = true
 
     #[test]
     fn iceberg_row_lineage_optimize_does_not_advance_next_row_id() {
-        use crate::connector::starrocks::managed::store::{
-            IcebergOptimizeJobState, StoredIcebergOptimizeJob,
-        };
+        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
 
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
@@ -5407,7 +5791,6 @@ enable_path_style_access = true
             base_snapshot_id,
             state: IcebergOptimizeJobState::Pending,
             created_at_ms: 0,
-            updated_at_ms: 0,
             started_at_ms: None,
             finished_at_ms: None,
             error_message: None,

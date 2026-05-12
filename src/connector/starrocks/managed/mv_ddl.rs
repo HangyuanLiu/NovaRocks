@@ -7,12 +7,19 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::connector::starrocks::ObjectStoreProfile;
-use crate::connector::starrocks::lake::context::get_tablet_runtime;
+use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_registered_external_table;
 use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use crate::meta::repository::managed_lake::{
+    CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
+    ManagedTableKind as RepoManagedTableKind,
+};
+use crate::meta::repository::mv::{CreateMvDefinitionRequest, StoredMvDefinition};
+use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
@@ -27,19 +34,16 @@ use crate::connector::starrocks::managed::catalog::{
     ManagedLakeCatalog, register_managed_table_in_catalog,
 };
 use crate::connector::starrocks::managed::ddl::{
-    ManagedPhysicalColumn, build_create_tablet_request, build_tablet_schema,
-    initialize_global_meta_if_needed, keys_type_name, managed_physical_column,
-    patch_tablet_schema_column_flags, reclaim_dropping_table_for_reuse,
+    ManagedPhysicalColumn, build_create_tablet_request, build_tablet_schema, keys_type_name,
+    managed_physical_column, patch_tablet_schema_column_flags,
     stored_columns_from_physical_columns, table_columns_from_physical_columns,
+};
+use crate::connector::starrocks::managed::model::{
+    IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedTableKind,
+    ManagedTableState,
 };
 use crate::connector::starrocks::managed::mv_shape::{
     AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
-};
-use crate::connector::starrocks::managed::store::{
-    IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedPartitionState,
-    ManagedTableKind, ManagedTableState, ManagedTxnState, StoredManagedIndex,
-    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
-    StoredManagedTxn, StoredMaterializedView,
 };
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
@@ -136,7 +140,7 @@ pub(crate) fn create_mv(
     }
 
     if storage_engine == ManagedMvStorageEngine::Iceberg {
-        return crate::connector::starrocks::managed::mv_refresh_iceberg::create_iceberg_mv(
+        return crate::engine::mv::iceberg_refresh::create_iceberg_mv(
             state,
             current_catalog,
             current_database,
@@ -148,8 +152,8 @@ pub(crate) fn create_mv(
         .managed_lake_config
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed lake create materialized view requires sqlite metadata store".to_string()
+    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
+        "managed lake create materialized view requires metadata provider".to_string()
     })?;
 
     let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
@@ -214,128 +218,175 @@ pub(crate) fn create_mv(
         ));
     }
 
-    let mut snapshot = managed.snapshot.clone();
-    initialize_global_meta_if_needed(&mut snapshot, &managed_config);
-    let database = find_or_create_managed_database(&mut snapshot, &db_name);
-    reclaim_dropping_table_for_reuse(&mut snapshot, database.db_id, &mv_name)?;
-
-    let table_id = alloc_id(&mut snapshot.global.next_table_id);
-    let schema_id = table_id;
-    let partition_id = alloc_id(&mut snapshot.global.next_partition_id);
-    let index_id = alloc_id(&mut snapshot.global.next_index_id);
     let bucket_num = i64::from(bucket_count);
     if bucket_num <= 0 {
         return Err("CREATE MATERIALIZED VIEW requires BUCKETS > 0".to_string());
     }
 
     let table_columns = table_columns_from_physical_columns(&physical_columns);
-    let request_schema = build_tablet_schema(&table_columns, &key_desc, schema_id)?;
-    let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
-    let mut tablets = Vec::new();
-    for bucket_seq in 0..bucket_num {
-        let tablet_id = alloc_id(&mut snapshot.global.next_tablet_id);
-        let tablet_root_path =
-            managed_config.tablet_root_path(database.db_id, table_id, partition_id);
-        let request =
-            build_create_tablet_request(tablet_id, table_id, partition_id, request_schema.clone());
-        create_lake_tablet_from_req_with_schema_patch(
-            &request,
-            &tablet_root_path,
-            Some(managed_config.s3.clone()),
-            |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
-        )?;
-        let runtime_schema = get_tablet_runtime(tablet_id)?.schema;
-        let loaded =
-            load_tablet_snapshot(tablet_id, 1, &tablet_root_path, Some(&object_store_profile))?;
-        if loaded.tablet_schema != runtime_schema {
-            return Err(format!(
-                "managed tablet schema mismatch after bootstrap: tablet_id={tablet_id}"
-            ));
-        }
-        tablets.push(StoredManagedTablet {
-            tablet_id,
-            partition_id,
-            index_id,
-            bucket_seq,
-            tablet_root_path,
-        });
+    let stored_columns = stored_columns_from_physical_columns(0, &key_desc, &physical_columns)
+        .into_iter()
+        .map(|column| CreateManagedColumnRequest {
+            column_name: column.column_name,
+            logical_type: column.logical_type,
+            nullable: column.nullable,
+            visible: column.visible,
+            is_key: column.is_key,
+        })
+        .collect::<Vec<_>>();
+
+    let mut txn = provider
+        .begin_write("create managed lake materialized view")
+        .map_err(|e| format!("open managed materialized view create transaction failed: {e}"))?;
+    let database = state
+        .managed_repo
+        .get_or_create_database(txn.as_mut(), &db_name)
+        .map_err(|e| format!("create managed database metadata failed: {e}"))?;
+    let reclaimed = state
+        .managed_repo
+        .purge_dropping_table_for_reuse(txn.as_mut(), database.db_id, &mv_name)
+        .map_err(|e| format!("reclaim dropping managed table metadata failed: {e}"))?;
+    for table_id in &reclaimed {
+        state
+            .managed_txn_repo
+            .delete_for_table(txn.as_mut(), *table_id)
+            .map_err(|e| format!("delete reclaimed managed txns failed: {e}"))?;
+        state
+            .job_repo
+            .delete_for_table(txn.as_mut(), *table_id)
+            .map_err(|e| format!("delete reclaimed erase jobs failed: {e}"))?;
+        state
+            .mv_repo
+            .drop_by_id(txn.as_mut(), *table_id)
+            .map_err(|e| format!("delete reclaimed materialized view definition failed: {e}"))?;
     }
 
-    snapshot.tables.push(StoredManagedTable {
-        table_id,
-        db_id: database.db_id,
-        name: mv_name.clone(),
-        keys_type: keys_type_name(key_desc.kind).to_string(),
-        bucket_num,
-        current_schema_id: schema_id,
-        state: ManagedTableState::Active,
-        kind: ManagedTableKind::MaterializedView,
-    });
-    snapshot.schemas.push(StoredManagedSchema {
-        schema_id,
-        table_id,
-        schema_version: 0,
-        tablet_schema_pb: get_tablet_runtime(tablets[0].tablet_id)?
-            .schema
-            .encode_to_vec(),
-    });
-    snapshot
-        .columns
-        .extend(stored_columns_from_physical_columns(
-            schema_id,
-            &key_desc,
-            &physical_columns,
-        ));
-    snapshot.partitions.push(StoredManagedPartition {
-        partition_id,
-        table_id,
-        name: "p0".to_string(),
-        visible_version: 1,
-        next_version: 2,
-        state: ManagedPartitionState::Active,
-    });
-    snapshot.indexes.push(StoredManagedIndex {
-        index_id,
-        table_id,
-        partition_id,
-        index_type: "BASE".to_string(),
-        state: crate::connector::starrocks::managed::store::ManagedIndexState::Active,
-    });
-    snapshot.tablets.extend(tablets);
-    let txn_id = alloc_id(&mut snapshot.global.next_txn_id);
-    snapshot.txns.push(StoredManagedTxn {
-        txn_id,
-        table_id,
-        partition_id,
-        base_version: 0,
-        commit_version: 1,
-        state: ManagedTxnState::Visible,
-        retry_at_ms: None,
-        updated_at_ms: 0,
-    });
-    snapshot.materialized_views.push(StoredMaterializedView {
-        mv_id: table_id,
-        select_sql: stmt.select_sql.clone(),
-        refresh_mode: ManagedMvRefreshMode::DeferredManual,
-        base_table_refs: base_refs,
-        last_refresh_ms: None,
-        last_refresh_rows: None,
-        last_refresh_snapshots: Default::default(),
-        last_refresh_table_uuids: Default::default(),
-        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
-        created_at_ms: now_ms(),
-        storage_engine: ManagedMvStorageEngine::ManagedLake,
-        iceberg_table_identifier: None,
-        target_catalog: None,
-        target_namespace: None,
-        target_table: None,
-        last_refreshed_iceberg_snapshot_id: None,
-        refresh_in_progress: false,
-        refresh_target_snapshots: Default::default(),
-    });
+    let created = state
+        .managed_repo
+        .create_table_layout(
+            txn.as_mut(),
+            CreateManagedTableLayoutRequest {
+                db_id: database.db_id,
+                table_name: mv_name.clone(),
+                keys_type: keys_type_name(key_desc.kind).to_string(),
+                bucket_num,
+                kind: RepoManagedTableKind::MaterializedView,
+                schema_version: 0,
+                tablet_schema_pb: Vec::new(),
+                columns: stored_columns,
+                partition_name: "p0".to_string(),
+                warehouse_uri: managed_config.warehouse_uri.clone(),
+            },
+        )
+        .map_err(|e| format!("create managed materialized view metadata failed: {e}"))?;
+    let request_schema = build_tablet_schema(&table_columns, &key_desc, created.schema.schema_id)?;
+    let mut tablet_schema_pb =
+        crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+            &request_schema,
+        )?;
+    patch_tablet_schema_column_flags(&mut tablet_schema_pb, &physical_columns)?;
+    state
+        .managed_repo
+        .update_schema_payload(
+            txn.as_mut(),
+            created.schema.schema_id,
+            tablet_schema_pb.encode_to_vec(),
+        )
+        .map_err(|e| format!("update managed materialized view schema metadata failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .record_visible_bootstrap(
+            txn.as_mut(),
+            created.table.table_id,
+            created.partition.partition_id,
+        )
+        .map_err(|e| {
+            format!("create managed materialized view bootstrap txn metadata failed: {e}")
+        })?;
+    let created_at_ms = now_ms();
+    state
+        .mv_repo
+        .create_definition_with_id(
+            txn.as_mut(),
+            created.table.table_id,
+            CreateMvDefinitionRequest {
+                select_sql: stmt.select_sql.clone(),
+                base_table_refs: iceberg_table_ref_fqns(&base_refs),
+                primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
+                storage_engine: ManagedMvStorageEngine::ManagedLake.as_sql_str().to_string(),
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
+                created_at_ms,
+            },
+        )
+        .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
 
-    let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot.clone())?;
-    metadata_store.replace_managed_snapshot(&snapshot)?;
+    let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
+    let mut bootstrapped_tablet_ids = Vec::new();
+    for tablet in &created.tablets {
+        let request = build_create_tablet_request(
+            tablet.tablet_id,
+            created.table.table_id,
+            created.partition.partition_id,
+            request_schema.clone(),
+        );
+        if let Err(err) = create_lake_tablet_from_req_with_schema_patch(
+            &request,
+            &tablet.tablet_root_path,
+            Some(managed_config.s3.clone()),
+            |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
+        ) {
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+            let _ = txn.abort();
+            return Err(err);
+        }
+        bootstrapped_tablet_ids.push(tablet.tablet_id);
+        let runtime_schema = match get_tablet_runtime(tablet.tablet_id) {
+            Ok(runtime) => runtime.schema,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
+        let loaded = match load_tablet_snapshot(
+            tablet.tablet_id,
+            1,
+            &tablet.tablet_root_path,
+            Some(&object_store_profile),
+        ) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
+        if loaded.tablet_schema != runtime_schema {
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+            let _ = txn.abort();
+            return Err(format!(
+                "managed tablet schema mismatch after bootstrap: tablet_id={}",
+                tablet.tablet_id
+            ));
+        }
+    }
+    if let Err(err) = txn.commit() {
+        cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+        return Err(format!(
+            "commit managed materialized view metadata failed: {err}"
+        ));
+    }
+
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed materialized view reload transaction failed: {e}"))?;
+    let snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("reload managed materialized view metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(Some(managed_config), snapshot)?;
     rebuilt.re_register_active_tablet_runtimes()?;
     let runtime = rebuilt.table(&db_name, &mv_name)?.clone();
     *managed = rebuilt;
@@ -710,16 +761,16 @@ pub(crate) fn drop_mv(
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed lake drop materialized view requires sqlite metadata store".to_string()
-    })?;
     if let Some(catalog) = current_catalog {
         let catalog = normalize_identifier(catalog)?;
-        if metadata_store
-            .find_iceberg_mv_by_target(&catalog, &db_name, &mv_name)?
-            .is_some()
+        if find_mv_definition_by_target(state, &catalog, &db_name, &mv_name)?
+            .as_ref()
+            .is_some_and(|mv| {
+                mv.storage_engine
+                    .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+            })
         {
-            return crate::connector::starrocks::managed::mv_refresh_iceberg::drop_iceberg_mv(
+            return crate::engine::mv::iceberg_refresh::drop_iceberg_mv(
                 state,
                 current_catalog,
                 current_database,
@@ -760,8 +811,41 @@ pub(crate) fn drop_mv(
         ));
     }
 
-    crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
+    crate::connector::starrocks::managed::ddl::drop_managed_table_with_metadata(
+        state,
+        &db_name,
+        &mv_name,
+        |txn, table_id| {
+            state
+                .mv_repo
+                .drop_by_id(txn, table_id)
+                .map_err(|e| format!("delete materialized view definition failed: {e}"))?;
+            Ok(())
+        },
+    )?;
     Ok(StatementResult::Ok)
+}
+
+fn find_mv_definition_by_target(
+    state: &Arc<StandaloneState>,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Option<StoredMvDefinition>, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(None);
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .find_by_target(read.as_ref(), catalog, namespace, table)
+        .map_err(|e| format!("load materialized view definition failed: {e}"))
+}
+
+pub(crate) fn iceberg_table_ref_fqns(base_refs: &[IcebergTableRef]) -> Vec<String> {
+    base_refs.iter().map(IcebergTableRef::fqn).collect()
 }
 
 pub(crate) fn list_mvs(
@@ -769,14 +853,29 @@ pub(crate) fn list_mvs(
     current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
 ) -> Result<StatementResult, String> {
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed lake show materialized views requires sqlite metadata store".to_string()
-    })?;
-    let snapshot = metadata_store.load_snapshot()?.managed;
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(StatementResult::Query(build_mv_rows_result(&[])?));
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load materialized view definitions failed: {e}"))?;
+    let snapshot = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .snapshot
+        .clone();
 
     let mut rows = Vec::new();
-    for mv in &snapshot.materialized_views {
-        if mv.storage_engine == ManagedMvStorageEngine::Iceberg {
+    for mv in &definitions {
+        if mv
+            .storage_engine
+            .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+        {
             let Some(target_catalog) = mv.target_catalog.as_deref() else {
                 continue;
             };
@@ -799,16 +898,13 @@ pub(crate) fn list_mvs(
             rows.push(ShowMvRow {
                 name: target_table,
                 database: target_namespace,
-                storage_engine: mv.storage_engine.as_sql_str().to_string(),
-                refresh_mode: mv.refresh_mode.as_sql_str().to_string(),
+                storage_engine: mv.storage_engine.clone(),
+                refresh_mode: ManagedMvRefreshMode::DeferredManual
+                    .as_sql_str()
+                    .to_string(),
                 last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
-                base_tables: mv
-                    .base_table_refs
-                    .iter()
-                    .map(IcebergTableRef::fqn)
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
             });
             continue;
@@ -837,16 +933,13 @@ pub(crate) fn list_mvs(
         rows.push(ShowMvRow {
             name: table.name.clone(),
             database,
-            storage_engine: mv.storage_engine.as_sql_str().to_string(),
-            refresh_mode: mv.refresh_mode.as_sql_str().to_string(),
+            storage_engine: mv.storage_engine.clone(),
+            refresh_mode: ManagedMvRefreshMode::DeferredManual
+                .as_sql_str()
+                .to_string(),
             last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
-            base_tables: mv
-                .base_table_refs
-                .iter()
-                .map(IcebergTableRef::fqn)
-                .collect::<Vec<_>>()
-                .join(", "),
+            base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
         });
     }
@@ -1504,35 +1597,6 @@ fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
     })
 }
 
-pub(crate) fn alloc_id(next_id: &mut i64) -> i64 {
-    if *next_id <= 0 {
-        *next_id = 1;
-    }
-    let id = *next_id;
-    *next_id += 1;
-    id
-}
-
-pub(crate) fn find_or_create_managed_database(
-    snapshot: &mut crate::connector::starrocks::managed::store::ManagedSnapshot,
-    database_name: &str,
-) -> crate::connector::starrocks::managed::store::StoredManagedDatabase {
-    if let Some(found) = snapshot
-        .databases
-        .iter()
-        .find(|database| database.name == database_name)
-        .cloned()
-    {
-        return found;
-    }
-    let database = crate::connector::starrocks::managed::store::StoredManagedDatabase {
-        db_id: alloc_id(&mut snapshot.global.next_db_id),
-        name: database_name.to_string(),
-    };
-    snapshot.databases.push(database.clone());
-    database
-}
-
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1540,12 +1604,34 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
+    if tablet_ids.is_empty() {
+        return;
+    }
+    if let Err(err) = delete_tablet(&DeleteTabletRequest {
+        tablet_ids: tablet_ids.to_vec(),
+    }) {
+        tracing::warn!(
+            "managed materialized view create cleanup failed to delete bootstrapped tablets: tablet_ids={:?} error={}",
+            tablet_ids,
+            err
+        );
+        for tablet_id in tablet_ids {
+            let _ = remove_tablet_runtime(*tablet_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::model::StoredManagedTable;
     use super::*;
     use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
     use crate::engine::catalog::InMemoryCatalog;
+    use crate::meta::MetaStoreProvider;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use arrow::array::Array;
+    use std::sync::RwLock;
     use tempfile::TempDir;
 
     fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
@@ -1558,23 +1644,162 @@ mod tests {
 
     fn open_state_with_sqlite_store() -> (Arc<StandaloneState>, TempDir) {
         let dir = TempDir::new().expect("metadata tempdir");
-        let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(
-                dir.path().join("standalone.sqlite"),
-            )
-            .expect("open sqlite store");
-        let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
-        snapshot.global.warehouse_uri = format!("file://{}", dir.path().join("managed").display());
-        snapshot.global.next_db_id = 1;
-        snapshot.global.next_table_id = 1;
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("initialize metadata snapshot");
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let metadata_provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
         let state = Arc::new(StandaloneState {
-            metadata_store: Some(metadata_store),
+            metadata_provider: Some(Arc::new(metadata_provider)),
             ..StandaloneState::default()
         });
         (state, dir)
+    }
+
+    fn test_managed_config(warehouse_uri: String) -> super::super::config::ManagedLakeConfig {
+        super::super::config::ManagedLakeConfig {
+            warehouse_uri,
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+            mv_default_storage_engine: "managed_lake".to_string(),
+        }
+    }
+
+    fn state_with_inflight_managed_mv() -> (Arc<StandaloneState>, TempDir) {
+        let dir = TempDir::new().expect("metadata tempdir");
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let metadata_provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
+        let warehouse_uri = format!("file://{}", dir.path().join("managed").display());
+        let config = test_managed_config(warehouse_uri.clone());
+        let request_schema = build_tablet_schema(
+            &[
+                TableColumnDef {
+                    name: "k1".to_string(),
+                    data_type: SqlType::Int,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                TableColumnDef {
+                    name: "v1".to_string(),
+                    data_type: SqlType::String,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            &TableKeyDesc {
+                kind: TableKeyKind::Duplicate,
+                columns: vec!["k1".to_string()],
+            },
+            0,
+        )
+        .expect("build request schema");
+        let tablet_schema_pb =
+            crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+                &request_schema,
+            )
+            .expect("build tablet schema pb")
+            .encode_to_vec();
+        let mut write = metadata_provider
+            .begin_write("seed inflight managed mv")
+            .expect("open write txn");
+        let database = crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+            .get_or_create_database(write.as_mut(), "analytics")
+            .expect("create managed database");
+        let created = crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+            .create_table_layout(
+                write.as_mut(),
+                CreateManagedTableLayoutRequest {
+                    db_id: database.db_id,
+                    table_name: "orders_mv".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 1,
+                    kind: RepoManagedTableKind::MaterializedView,
+                    schema_version: 0,
+                    tablet_schema_pb,
+                    columns: vec![
+                        CreateManagedColumnRequest {
+                            column_name: "k1".to_string(),
+                            logical_type: "INT".to_string(),
+                            nullable: false,
+                            visible: true,
+                            is_key: true,
+                        },
+                        CreateManagedColumnRequest {
+                            column_name: "v1".to_string(),
+                            logical_type: "STRING".to_string(),
+                            nullable: true,
+                            visible: true,
+                            is_key: false,
+                        },
+                    ],
+                    partition_name: "p0".to_string(),
+                    warehouse_uri,
+                },
+            )
+            .expect("create managed mv layout");
+        crate::meta::repository::managed_txn::ManagedLakeTxnRepository::default()
+            .record_visible_bootstrap(
+                write.as_mut(),
+                created.table.table_id,
+                created.partition.partition_id,
+            )
+            .expect("record bootstrap txn");
+        crate::meta::repository::managed_txn::ManagedLakeTxnRepository::default()
+            .prepare(
+                &crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default(),
+                write.as_mut(),
+                created.table.table_id,
+                created.partition.partition_id,
+            )
+            .expect("record inflight txn");
+        crate::meta::repository::mv::MvMetaRepository::default()
+            .create_definition_with_id(
+                write.as_mut(),
+                created.table.table_id,
+                CreateMvDefinitionRequest {
+                    select_sql: "SELECT k1, v1 FROM ice.ns.orders".to_string(),
+                    base_table_refs: vec!["ice.ns.orders".to_string()],
+                    primary_key_columns: Vec::new(),
+                    storage_engine: ManagedMvStorageEngine::ManagedLake.as_sql_str().to_string(),
+                    target_catalog: None,
+                    target_namespace: None,
+                    target_table: None,
+                    created_at_ms: now_ms(),
+                },
+            )
+            .expect("create mv definition");
+        write.commit().expect("commit seeded metadata");
+        let read = metadata_provider.begin_read().expect("open read txn");
+        let snapshot = crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+            .load_snapshot(read.as_ref())
+            .expect("load managed snapshot");
+        let managed = ManagedLakeCatalog::rebuild_from_repository(Some(config.clone()), snapshot)
+            .expect("rebuild managed catalog");
+        let state = Arc::new(StandaloneState {
+            managed_lake: RwLock::new(managed),
+            managed_lake_config: Some(config),
+            metadata_provider: Some(Arc::new(metadata_provider)),
+            ..StandaloneState::default()
+        });
+        (state, dir)
+    }
+
+    fn mv_definition_exists(state: &Arc<StandaloneState>, mv_id: i64) -> bool {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let txn = provider.begin_read().expect("open read txn");
+        state
+            .mv_repo
+            .load_by_id(txn.as_ref(), mv_id)
+            .expect("load mv definition")
+            .is_some()
     }
 
     fn insert_iceberg_mv_relationship(
@@ -1584,28 +1809,25 @@ mod tests {
         table: &str,
         select_sql: &str,
     ) {
-        let store = state.metadata_store.as_ref().expect("metadata store");
-        let mv_id = store
-            .allocate_materialized_view_id()
-            .expect("allocate mv id");
-        store
-            .insert_iceberg_mv_row(
-                crate::connector::starrocks::managed::store::InsertIcebergMvRowRequest {
-                    mv_id,
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider.begin_write("seed iceberg mv").expect("write txn");
+        state
+            .mv_repo
+            .create_definition(
+                txn.as_mut(),
+                CreateMvDefinitionRequest {
                     select_sql: select_sql.to_string(),
-                    base_table_refs: vec![IcebergTableRef {
-                        catalog: catalog.to_string(),
-                        namespace: "sales".to_string(),
-                        table: "orders".to_string(),
-                    }],
+                    base_table_refs: vec![format!("{catalog}.sales.orders")],
                     primary_key_columns: Vec::new(),
-                    target_catalog: catalog.to_string(),
-                    target_namespace: namespace.to_string(),
-                    target_table: table.to_string(),
+                    storage_engine: ManagedMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    target_catalog: Some(catalog.to_string()),
+                    target_namespace: Some(namespace.to_string()),
+                    target_table: Some(table.to_string()),
                     created_at_ms: now_ms(),
                 },
             )
             .expect("insert iceberg mv relationship");
+        txn.commit().expect("commit iceberg mv relationship");
     }
 
     fn assert_query_result_contains(result: &QueryResult, expected: &str) {
@@ -1653,6 +1875,34 @@ mod tests {
 
         assert_query_result_contains(&result, "mv_orders");
         assert_query_result_contains(&result, "iceberg");
+    }
+
+    #[test]
+    fn drop_managed_mv_preserves_repo_definition_when_legacy_drop_rejects() {
+        let (state, _dir) = state_with_inflight_managed_mv();
+        let mv_id = state
+            .managed_lake
+            .read()
+            .expect("managed lake read lock")
+            .table("analytics", "orders_mv")
+            .expect("managed mv runtime")
+            .table
+            .table_id;
+        assert!(mv_definition_exists(&state, mv_id));
+
+        let stmt = DropMaterializedViewStmt {
+            name: ObjectName {
+                parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+            },
+            if_exists: false,
+        };
+        let err = drop_mv(&state, None, "analytics", &stmt).expect_err("drop should reject");
+
+        assert!(err.contains("inflight managed txns"), "err={err}");
+        assert!(
+            mv_definition_exists(&state, mv_id),
+            "legacy-owned MV must remain visible through repository reads when legacy drop rejects"
+        );
     }
 
     #[test]

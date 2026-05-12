@@ -126,6 +126,9 @@ pub struct NovaRocksConfig {
     pub jdbc: Option<JdbcConfig>,
 
     #[serde(default)]
+    pub metadata: Option<MetadataConfig>,
+
+    #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
@@ -161,6 +164,7 @@ impl Default for NovaRocksConfig {
             runtime: RuntimeConfig::default(),
             debug: DebugConfig::default(),
             jdbc: None,
+            metadata: None,
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
@@ -225,6 +229,20 @@ pub struct StandaloneTableConfig {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct MetadataConfig {
+    #[serde(default)]
+    pub provider: MetadataProviderConfig,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProviderConfig {
+    #[default]
+    Sqlite,
+}
+
 #[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
 pub struct StandaloneObjectStoreConfig {
     #[serde(default)]
@@ -245,8 +263,6 @@ pub struct StandaloneServerConfig {
     pub mysql_port: u16,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
-    #[serde(default)]
-    pub metadata_db_path: Option<PathBuf>,
     #[serde(default)]
     pub warehouse_uri: Option<String>,
     #[serde(default)]
@@ -270,7 +286,6 @@ impl Default for StandaloneServerConfig {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
             user: default_standalone_server_user(),
-            metadata_db_path: None,
             warehouse_uri: None,
             object_store: None,
             mv_default_storage_engine: None,
@@ -1035,8 +1050,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig, StandaloneObjectStoreConfig,
-        StandaloneServerConfig,
+        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig,
     };
 
     #[test]
@@ -1114,7 +1129,6 @@ starlet_port = 19070
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
                 user: "root".to_string(),
-                metadata_db_path: None,
                 warehouse_uri: None,
                 object_store: None,
                 mv_default_storage_engine: None,
@@ -1124,13 +1138,28 @@ starlet_port = 19070
     }
 
     #[test]
+    fn test_metadata_config_parses_sqlite_provider() {
+        let toml = r#"
+[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+
+[standalone_server]
+mysql_port = 19030
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse config");
+        let metadata = cfg.metadata.expect("metadata config");
+        assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
+        assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
+    }
+
+    #[test]
     fn test_standalone_server_tables_can_be_overridden() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [standalone_server]
 mysql_port = 19030
 user = "root"
-metadata_db_path = "meta/catalog.db"
 
 [[standalone_server.tables]]
 name = "tbl"
@@ -1141,10 +1170,6 @@ path = "data/tbl.parquet"
         let standalone = cfg.standalone_server.expect("standalone server config");
         assert_eq!(standalone.mysql_port, 19030);
         assert_eq!(standalone.user, "root");
-        assert_eq!(
-            standalone.metadata_db_path,
-            Some(PathBuf::from("meta/catalog.db"))
-        );
         assert_eq!(standalone.tables.len(), 1);
         assert_eq!(standalone.tables[0].name, "tbl");
         assert_eq!(standalone.tables[0].path, PathBuf::from("data/tbl.parquet"));
@@ -1157,7 +1182,6 @@ path = "data/tbl.parquet"
 [standalone_server]
 mysql_port = 9030
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "s3://novarocks/standalone"
 
 [standalone_server.object_store]
