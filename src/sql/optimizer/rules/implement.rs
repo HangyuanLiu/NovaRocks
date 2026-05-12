@@ -40,6 +40,7 @@ fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
         ExprKind::ColumnRef { column, .. } => {
             out.insert(column.to_lowercase());
         }
+        ExprKind::LambdaParamRef { .. } => {}
         ExprKind::BinaryOp { left, right, .. } => {
             walk_column_refs(left, out);
             walk_column_refs(right, out);
@@ -52,6 +53,7 @@ fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
                 walk_column_refs(a, out);
             }
         }
+        ExprKind::LambdaFunction { body, .. } => walk_column_refs(body, out),
         ExprKind::AggregateCall { args, order_by, .. } => {
             for a in args {
                 walk_column_refs(a, out);

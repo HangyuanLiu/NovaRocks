@@ -17,6 +17,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
@@ -87,6 +88,10 @@ pub fn eval_array_position(
     let target_eval_chunk = if target_is_const { &const_chunk } else { chunk };
     let arr = arena.eval(args[0], arr_eval_chunk)?;
     let mut target_arr = arena.eval(args[1], target_eval_chunk)?;
+    if arr.data_type() == &DataType::Null {
+        let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
+        return super::common::cast_output(out, arena.data_type(expr), "array_position");
+    }
     let list = arr
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()

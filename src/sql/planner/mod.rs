@@ -1003,6 +1003,7 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
                 collect_aggregates(arg, out);
             }
         }
+        ExprKind::LambdaFunction { body, .. } => collect_aggregates(body, out),
         ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out),
         ExprKind::Case {
             operand,
@@ -1041,7 +1042,7 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         }
         ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
         // Leaves
-        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => {}
+        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
         // Window calls themselves are not aggregates, but their args may
         // contain aggregate calls that must be collected so the aggregate node
         // computes them (e.g. sum(sum(x)) OVER (...)).

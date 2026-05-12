@@ -52,6 +52,7 @@ pub(crate) fn analyze(
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
+        next_lambda_slot_id: std::cell::Cell::new(0),
         collected_subqueries: std::cell::RefCell::new(Vec::new()),
         cte_registry: std::cell::RefCell::new(crate::sql::analysis::cte::CTERegistry::new()),
     };
@@ -75,6 +76,8 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) pending_ctes: std::collections::HashSet<String>,
     /// Counter for generating unique subquery placeholder IDs.
     pub(super) next_subquery_id: std::cell::Cell<usize>,
+    /// Counter for generating synthetic slot ids used only inside lambda expressions.
+    pub(super) next_lambda_slot_id: std::cell::Cell<i32>,
     /// Subqueries collected during expression analysis.
     /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
     pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
@@ -88,6 +91,13 @@ impl<'a> AnalyzerContext<'a> {
         let id = self.next_subquery_id.get();
         self.next_subquery_id.set(id + 1);
         id
+    }
+
+    pub(super) fn alloc_lambda_slot_id(&self) -> i32 {
+        const LAMBDA_SLOT_ID_BASE: i32 = 1_900_000_000;
+        let offset = self.next_lambda_slot_id.get();
+        self.next_lambda_slot_id.set(offset + 1);
+        LAMBDA_SLOT_ID_BASE - offset
     }
 
     fn build_with_clause_context(
@@ -108,6 +118,7 @@ impl<'a> AnalyzerContext<'a> {
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
@@ -582,6 +593,127 @@ impl<'a> AnalyzerContext<'a> {
                     },
                 }
             }
+            ExprKind::LambdaFunction { params, body } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::LambdaFunction {
+                    params,
+                    body: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *body, projection, from_scope, inside_agg,
+                    )),
+                },
+            },
+            ExprKind::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::AggregateCall {
+                    name,
+                    args: args
+                        .into_iter()
+                        .map(|arg| {
+                            self.substitute_select_aliases_for_select_inner(
+                                arg, projection, from_scope, true,
+                            )
+                        })
+                        .collect(),
+                    distinct,
+                    order_by: order_by
+                        .into_iter()
+                        .map(|item| SortItem {
+                            expr: self.substitute_select_aliases_for_select_inner(
+                                item.expr, projection, from_scope, true,
+                            ),
+                            ..item
+                        })
+                        .collect(),
+                },
+            },
+            ExprKind::Cast {
+                expr: inner,
+                target,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Cast {
+                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *inner, projection, from_scope, inside_agg,
+                    )),
+                    target,
+                },
+            },
+            ExprKind::Nested(inner) => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Nested(Box::new(self.substitute_select_aliases_for_select_inner(
+                    *inner, projection, from_scope, inside_agg,
+                ))),
+            },
+            ExprKind::IsNull {
+                expr: inner,
+                negated,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::IsNull {
+                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *inner, projection, from_scope, inside_agg,
+                    )),
+                    negated,
+                },
+            },
+            ExprKind::IsTruthValue {
+                expr: inner,
+                value,
+                negated,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::IsTruthValue {
+                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *inner, projection, from_scope, inside_agg,
+                    )),
+                    value,
+                    negated,
+                },
+            },
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Case {
+                    operand: operand.map(|expr| {
+                        Box::new(self.substitute_select_aliases_for_select_inner(
+                            *expr, projection, from_scope, inside_agg,
+                        ))
+                    }),
+                    when_then: when_then
+                        .into_iter()
+                        .map(|(when, then)| {
+                            (
+                                self.substitute_select_aliases_for_select_inner(
+                                    when, projection, from_scope, inside_agg,
+                                ),
+                                self.substitute_select_aliases_for_select_inner(
+                                    then, projection, from_scope, inside_agg,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    else_expr: else_expr.map(|expr| {
+                        Box::new(self.substitute_select_aliases_for_select_inner(
+                            *expr, projection, from_scope, inside_agg,
+                        ))
+                    }),
+                },
+            },
             _ => expr,
         }
     }
@@ -645,6 +777,16 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     distinct,
+                },
+            },
+            ExprKind::LambdaFunction { params, body } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::LambdaFunction {
+                    params,
+                    body: Box::new(
+                        self.substitute_select_aliases_inner(*body, projection, inside_agg),
+                    ),
                 },
             },
             ExprKind::AggregateCall {
@@ -3064,6 +3206,121 @@ mod tests {
             }
             other => panic!("expected ARRAY<VARCHAR>, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_array_map_multi_param_lambda_analyzes() {
+        let resolved = parse_raw_and_analyze("SELECT array_map((x, y) -> x + y, [1,2], [3,4])")
+            .expect("array_map should analyze multi-parameter lambda");
+        assert_eq!(resolved.output_columns.len(), 1);
+        match &resolved.output_columns[0].data_type {
+            arrow::datatypes::DataType::List(item) => {
+                assert!(matches!(
+                    item.data_type(),
+                    arrow::datatypes::DataType::Int64
+                ));
+            }
+            other => panic!("expected ARRAY<BIGINT>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_any_match_lambda_analyzes_as_boolean() {
+        let resolved = parse_raw_and_analyze("SELECT any_match(x -> x < 10, [1,2])")
+            .expect("any_match should analyze lambda predicate");
+        assert_eq!(resolved.output_columns.len(), 1);
+        assert!(matches!(
+            resolved.output_columns[0].data_type,
+            arrow::datatypes::DataType::Boolean
+        ));
+    }
+
+    #[test]
+    fn select_alias_is_visible_to_later_projection_expression() {
+        let resolved = parse_raw_and_analyze("SELECT 1 AS l, l + 1")
+            .expect("later projection item should resolve earlier alias");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        assert_eq!(sel.projection.len(), 2);
+        let ExprKind::BinaryOp { left, .. } = &sel.projection[1].expr.kind else {
+            panic!("expected binary op in second projection");
+        };
+        let ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(value)) = &left.kind else {
+            panic!("expected alias to be substituted with original literal");
+        };
+        assert_eq!(*value, 1);
+    }
+
+    #[test]
+    fn select_alias_is_visible_inside_lambda_body() {
+        parse_raw_and_analyze("SELECT 'x' AS l, array_map(arg -> concat(arg, l), ['a'])")
+            .expect("lambda body should resolve earlier select alias");
+    }
+
+    #[test]
+    fn select_alias_without_as_is_visible_inside_lambda_body() {
+        parse_raw_and_analyze(
+            "SELECT cast(if (1 > rand(), '[]', '') as array<string>) l, \
+             array_map(x -> concat(x, l), ['a'])",
+        )
+        .expect("lambda body should resolve earlier select alias without AS");
+    }
+
+    #[test]
+    fn select_alias_inside_lambda_body_is_fully_substituted() {
+        fn contains_unresolved_l(expr: &TypedExpr) -> bool {
+            match &expr.kind {
+                ExprKind::ColumnRef { qualifier, column } => {
+                    qualifier.is_none() && column.eq_ignore_ascii_case("l")
+                }
+                ExprKind::BinaryOp { left, right, .. } => {
+                    contains_unresolved_l(left) || contains_unresolved_l(right)
+                }
+                ExprKind::UnaryOp { expr, .. }
+                | ExprKind::Cast { expr, .. }
+                | ExprKind::Nested(expr)
+                | ExprKind::IsNull { expr, .. }
+                | ExprKind::IsTruthValue { expr, .. } => contains_unresolved_l(expr),
+                ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                    args.iter().any(contains_unresolved_l)
+                }
+                ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+                    contains_unresolved_l(body)
+                }
+                ExprKind::Case {
+                    operand,
+                    when_then,
+                    else_expr,
+                } => {
+                    operand
+                        .as_ref()
+                        .is_some_and(|expr| contains_unresolved_l(expr))
+                        || when_then.iter().any(|(when, then)| {
+                            contains_unresolved_l(when) || contains_unresolved_l(then)
+                        })
+                        || else_expr
+                            .as_ref()
+                            .is_some_and(|expr| contains_unresolved_l(expr))
+                }
+                _ => false,
+            }
+        }
+
+        let resolved = parse_raw_and_analyze(
+            "SELECT cast(if (1 > rand(), '[]', '') as array<string>) l, \
+             array_map(x -> concat(x, l), ['a'])",
+        )
+        .expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        assert_eq!(sel.projection.len(), 2);
+        assert!(
+            !contains_unresolved_l(&sel.projection[1].expr),
+            "projection still contains unresolved alias reference: {:?}",
+            sel.projection[1].expr
+        );
     }
 
     #[test]

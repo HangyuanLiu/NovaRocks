@@ -85,6 +85,20 @@ pub(super) fn to_owned_bytes_array(
     ))
 }
 
+pub(super) fn to_owned_bytes_array_with_varchar_cast(
+    array: ArrayRef,
+    fn_name: &str,
+    arg_idx: usize,
+) -> Result<OwnedBytesArray, String> {
+    match to_owned_bytes_array(array.clone(), fn_name, arg_idx) {
+        Ok(bytes) => Ok(bytes),
+        Err(original) => {
+            let casted = cast(&array, &DataType::Utf8).map_err(|_| original)?;
+            to_owned_bytes_array(casted, fn_name, arg_idx)
+        }
+    }
+}
+
 pub(super) fn to_i64_array(
     array: &ArrayRef,
     fn_name: &str,

@@ -17,6 +17,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BooleanArray, ListArray};
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 pub fn eval_array_contains_seq(
@@ -27,6 +28,9 @@ pub fn eval_array_contains_seq(
 ) -> Result<ArrayRef, String> {
     let left_arr = arena.eval(args[0], chunk)?;
     let right_arr = arena.eval(args[1], chunk)?;
+    if left_arr.data_type() == &DataType::Null || right_arr.data_type() == &DataType::Null {
+        return Ok(Arc::new(BooleanArray::from(vec![None; chunk.len()])) as ArrayRef);
+    }
     let left = left_arr
         .as_any()
         .downcast_ref::<ListArray>()

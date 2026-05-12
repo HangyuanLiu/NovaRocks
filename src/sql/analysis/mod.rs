@@ -216,12 +216,22 @@ pub(crate) struct TypedExpr {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LambdaParam {
+    pub name: String,
+    pub slot_id: i32,
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ExprKind {
     /// Resolved column reference.
     ColumnRef {
         qualifier: Option<String>,
         column: String,
     },
+    /// Resolved lambda parameter reference.
+    LambdaParamRef { name: String, slot_id: i32 },
     /// Literal value.
     Literal(LiteralValue),
     /// Binary operation (arithmetic, comparison, logical).
@@ -237,6 +247,11 @@ pub(crate) enum ExprKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+    },
+    /// Higher-order function lambda expression.
+    LambdaFunction {
+        params: Vec<LambdaParam>,
+        body: Box<TypedExpr>,
     },
     /// Aggregate function call.
     AggregateCall {

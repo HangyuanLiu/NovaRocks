@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, make_array};
+use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, make_array, new_null_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -31,6 +31,17 @@ pub fn eval_array_filter(
 ) -> Result<ArrayRef, String> {
     let src_arr = arena.eval(args[0], chunk)?;
     let filter_arr = arena.eval(args[1], chunk)?;
+    if src_arr.data_type() == &DataType::Null || filter_arr.data_type() == &DataType::Null {
+        let output_type = arena
+            .data_type(expr)
+            .cloned()
+            .or_else(|| match src_arr.data_type() {
+                DataType::List(field) => Some(DataType::List(field.clone())),
+                _ => None,
+            })
+            .ok_or_else(|| "array_filter output type must be List".to_string())?;
+        return Ok(new_null_array(&output_type, chunk.len()));
+    }
     let src = src_arr
         .as_any()
         .downcast_ref::<ListArray>()

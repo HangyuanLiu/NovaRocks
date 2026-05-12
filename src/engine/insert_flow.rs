@@ -180,7 +180,7 @@ pub(crate) fn run_insert(
     Ok(StatementResult::Ok)
 }
 
-fn execute_insert_from_query_on_pipeline(
+pub(crate) fn execute_insert_from_query_on_pipeline(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     resolved: &ResolvedTable,

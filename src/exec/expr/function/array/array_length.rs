@@ -77,6 +77,10 @@ pub fn eval_array_length(
     }
 
     let arr = arena.eval(args[0], chunk)?;
+    if arr.data_type() == &arrow::datatypes::DataType::Null {
+        let out = Arc::new(Int64Array::from(vec![None; chunk.len()])) as ArrayRef;
+        return super::common::cast_output(out, arena.data_type(expr), "array_length");
+    }
     let list = arr
         .as_any()
         .downcast_ref::<ListArray>()

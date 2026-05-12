@@ -29,7 +29,7 @@ pub fn eval_md5sum_numeric(
 ) -> Result<ArrayRef, String> {
     let mut inputs = Vec::with_capacity(args.len());
     for (idx, arg) in args.iter().enumerate() {
-        inputs.push(super::common::to_owned_bytes_array(
+        inputs.push(super::common::to_owned_bytes_array_with_varchar_cast(
             arena.eval(*arg, chunk)?,
             "md5sum_numeric",
             idx,

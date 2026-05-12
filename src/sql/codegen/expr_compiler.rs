@@ -390,6 +390,13 @@ impl<'a> ExprCompiler<'a> {
                 self.last_nullable = binding.nullable;
                 Ok(binding.data_type.clone())
             }
+            ExprKind::LambdaParamRef { slot_id, .. } => {
+                let type_desc = arrow_type_to_type_desc(&expr.data_type)?;
+                self.nodes.push(slot_ref_node(*slot_id, 0, type_desc));
+                self.last_type = expr.data_type.clone();
+                self.last_nullable = expr.nullable;
+                Ok(expr.data_type.clone())
+            }
             ExprKind::Literal(lit) => self.compile_literal(lit, &expr.data_type),
             ExprKind::BinaryOp { left, op, right } => {
                 self.compile_typed_binary_op(left, *op, right)
@@ -728,6 +735,27 @@ impl<'a> ExprCompiler<'a> {
                     // the input type alone.
                     self.compile_typed_function_call_with_hint(name, args, &expr.data_type)
                 }
+            }
+            ExprKind::LambdaFunction { params, body } => {
+                let parent_idx = self.nodes.len();
+                self.nodes.push(default_expr_node());
+                self.compile_typed_inner(body)?;
+                for param in params {
+                    let type_desc = arrow_type_to_type_desc(&param.data_type)?;
+                    self.nodes.push(slot_ref_node(param.slot_id, 0, type_desc));
+                }
+                let type_desc = arrow_type_to_type_desc(&expr.data_type)?;
+                self.nodes[parent_idx] = exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::LAMBDA_FUNCTION_EXPR,
+                    type_: type_desc,
+                    num_children: (params.len() + 1) as i32,
+                    output_column: Some(0),
+                    is_nondeterministic: Some(false),
+                    ..default_expr_node()
+                };
+                self.last_type = expr.data_type.clone();
+                self.last_nullable = expr.nullable;
+                Ok(expr.data_type.clone())
             }
             ExprKind::AggregateCall {
                 name,
@@ -1513,7 +1541,7 @@ pub(crate) fn build_cast_texpr(child: exprs::TExpr, target_type: types::TTypeDes
 
 /// Names of higher-order functions whose first argument is a lambda.
 fn is_higher_order_function(name: &str) -> bool {
-    matches!(name, "array_map" | "transform" | "array_filter" | "filter")
+    matches!(name, "array_map" | "transform")
 }
 
 /// Default return type inference for higher-order functions, used only when
@@ -2108,22 +2136,23 @@ fn infer_scalar_function_return_type(
             DataType::Utf8,
             true,
         )))),
-        "array_min" | "array_max" => match arg_types.first() {
-            Some(DataType::List(item)) => Ok(item.data_type().clone()),
-            _ => Ok(DataType::Null),
-        },
-        "array_contains" | "array_distinct" => {
+        "array_min" | "array_max" => {
+            Ok(array_item_type(arg_types.first()).unwrap_or(DataType::Null))
+        }
+        "all_match" | "any_match" | "array_contains" | "array_contains_all"
+        | "array_contains_seq" | "arrays_overlap" => Ok(DataType::Boolean),
+        "array_distinct" | "array_sort" | "array_sortby" | "array_reverse" | "array_slice"
+        | "array_remove" | "array_filter" | "array_map" | "array_top_n" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
-        "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
-        | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
-        }
-        "array_repeat" => Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            arg_types.first().cloned().unwrap_or(DataType::Null),
-            true,
-        )))),
+        "array_append" => Ok(infer_array_append_return_type(arg_types)),
+        "array_concat" => Ok(infer_array_concat_return_type(arg_types)),
+        "array_flatten" => Ok(infer_array_flatten_return_type(arg_types)),
+        "array_intersect" => Ok(infer_array_intersect_return_type(arg_types)),
+        "array_repeat" => Ok(infer_array_repeat_return_type(arg_types)),
+        "array_difference" | "array_cum_sum" => Ok(infer_array_numeric_list_return_type(arg_types)),
+        "array_sum" => Ok(infer_array_sum_return_type(arg_types)),
+        "array_avg" => Ok(infer_array_avg_return_type(arg_types)),
         "array_generate" => Ok(infer_array_generate_return_type(arg_types)),
         "__array_element_at" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),
@@ -2158,6 +2187,11 @@ fn infer_scalar_function_return_type(
             },
             _ => Ok(DataType::Null),
         },
+        "map_entries" => Ok(infer_map_entries_return_type(arg_types)),
+        "arrays_zip" => Ok(infer_arrays_zip_return_type(arg_types)),
+        "map_concat" => Ok(infer_map_concat_return_type(arg_types)),
+        "map_filter" | "distinct_map_keys" | "map_apply" | "transform_keys"
+        | "transform_values" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "map" => Ok(infer_map_constructor_return_type(arg_types)),
         "map_from_arrays" => match (arg_types.first(), arg_types.get(1)) {
             (Some(DataType::List(keys)), Some(DataType::List(values))) => Ok(DataType::Map(
@@ -2219,6 +2253,181 @@ fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item", item_type, true,
     )))
+}
+
+fn list_type(item_type: DataType) -> DataType {
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item", item_type, true,
+    )))
+}
+
+fn array_item_type(data_type: Option<&DataType>) -> Option<DataType> {
+    match data_type {
+        Some(DataType::List(item)) => Some(item.data_type().clone()),
+        _ => None,
+    }
+}
+
+fn infer_array_append_return_type(arg_types: &[DataType]) -> DataType {
+    let Some(DataType::List(item)) = arg_types.first() else {
+        return DataType::Null;
+    };
+    let item_type = arg_types
+        .get(1)
+        .map(|target| wider_type(item.data_type(), target))
+        .unwrap_or_else(|| item.data_type().clone());
+    list_type(item_type)
+}
+
+fn infer_array_concat_return_type(arg_types: &[DataType]) -> DataType {
+    let item_type = arg_types
+        .iter()
+        .filter_map(|ty| array_item_type(Some(ty)))
+        .reduce(|acc, ty| wider_type(&acc, &ty));
+    item_type.map(list_type).unwrap_or(DataType::Null)
+}
+
+fn infer_array_flatten_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.first() {
+        Some(DataType::List(outer)) => match outer.data_type() {
+            DataType::List(inner) => list_type(inner.data_type().clone()),
+            _ => arg_types[0].clone(),
+        },
+        _ => DataType::Null,
+    }
+}
+
+fn infer_array_intersect_return_type(arg_types: &[DataType]) -> DataType {
+    let item_type = arg_types
+        .iter()
+        .filter_map(|ty| array_item_type(Some(ty)))
+        .reduce(|acc, ty| wider_type(&acc, &ty));
+    item_type.map(list_type).unwrap_or(DataType::Null)
+}
+
+fn infer_array_repeat_return_type(arg_types: &[DataType]) -> DataType {
+    list_type(arg_types.first().cloned().unwrap_or(DataType::Null))
+}
+
+fn infer_array_numeric_list_return_type(arg_types: &[DataType]) -> DataType {
+    list_type(match array_item_type(arg_types.first()) {
+        Some(
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64,
+        ) => DataType::Int64,
+        Some(DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _)) => {
+            DataType::Float64
+        }
+        Some(other) => other,
+        None => DataType::Null,
+    })
+}
+
+fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
+    match array_item_type(arg_types.first()) {
+        Some(
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64,
+        ) => DataType::Int64,
+        Some(DataType::Float32 | DataType::Float64) => DataType::Float64,
+        Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
+        Some(DataType::FixedSizeBinary(width))
+            if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            DataType::FixedSizeBinary(width)
+        }
+        _ => DataType::Null,
+    }
+}
+
+fn infer_array_avg_return_type(arg_types: &[DataType]) -> DataType {
+    match array_item_type(arg_types.first()) {
+        Some(DataType::Decimal128(_precision, scale)) => {
+            let new_scale = if scale <= 6 {
+                scale + 6
+            } else if scale <= 12 {
+                12
+            } else {
+                scale
+            };
+            DataType::Decimal128(38, new_scale)
+        }
+        Some(_) => DataType::Float64,
+        None => DataType::Null,
+    }
+}
+
+fn map_key_value_types_for_inference(data_type: &DataType) -> Option<(DataType, DataType)> {
+    let DataType::Map(entries, _) = data_type else {
+        return None;
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return None;
+    };
+    if fields.len() != 2 {
+        return None;
+    }
+    Some((fields[0].data_type().clone(), fields[1].data_type().clone()))
+}
+
+fn map_type(key_type: DataType, value_type: DataType) -> DataType {
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
+}
+
+fn infer_map_entries_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.first() {
+        Some(DataType::Map(entries, _)) => list_type(entries.data_type().clone()),
+        _ => DataType::Null,
+    }
+}
+
+fn infer_arrays_zip_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            let item_type = array_item_type(Some(data_type)).unwrap_or(DataType::Null);
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                item_type,
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    list_type(DataType::Struct(arrow::datatypes::Fields::from(fields)))
+}
+
+fn infer_map_concat_return_type(arg_types: &[DataType]) -> DataType {
+    let mut iter = arg_types
+        .iter()
+        .filter_map(map_key_value_types_for_inference);
+    let Some((mut key_type, mut value_type)) = iter.next() else {
+        return DataType::Null;
+    };
+    for (next_key, next_value) in iter {
+        key_type = wider_type(&key_type, &next_key);
+        value_type = wider_type(&value_type, &next_value);
+    }
+    map_type(key_type, value_type)
 }
 
 fn infer_struct_constructor_return_type(arg_types: &[DataType]) -> DataType {
@@ -2625,6 +2834,7 @@ mod tests {
         infer_scalar_function_return_type, largeint,
     };
     use arrow::datatypes::{DataType, TimeUnit};
+    use std::sync::Arc;
 
     #[test]
     fn percentile_family_uses_binary_intermediate_state() {
@@ -2719,5 +2929,63 @@ mod tests {
                 .expect("assert_true type inference"),
             DataType::Boolean
         );
+    }
+
+    #[test]
+    fn complex_scalar_type_inference_covers_registered_array_map_functions() {
+        let int_array = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        )));
+        let string_int_map = DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Utf8, true)),
+                        Arc::new(arrow::datatypes::Field::new("value", DataType::Int32, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        assert_eq!(
+            infer_scalar_function_return_type("array_sum", std::slice::from_ref(&int_array))
+                .expect("array_sum type inference"),
+            DataType::Int64
+        );
+        assert_eq!(
+            infer_scalar_function_return_type(
+                "arrays_overlap",
+                &[int_array.clone(), int_array.clone()],
+            )
+            .expect("arrays_overlap type inference"),
+            DataType::Boolean
+        );
+        assert!(matches!(
+            infer_scalar_function_return_type(
+                "arrays_zip",
+                &[int_array.clone(), int_array.clone()],
+            )
+            .expect("arrays_zip type inference"),
+            DataType::List(_)
+        ));
+        assert_eq!(
+            infer_scalar_function_return_type(
+                "map_concat",
+                &[string_int_map.clone(), string_int_map.clone()],
+            )
+            .expect("map_concat type inference"),
+            string_int_map
+        );
+        assert!(matches!(
+            infer_scalar_function_return_type("map_entries", &[string_int_map])
+                .expect("map_entries type inference"),
+            DataType::List(_)
+        ));
     }
 }

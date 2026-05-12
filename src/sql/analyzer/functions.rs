@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::common::largeint;
+use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 use crate::sql::types::wider_type;
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
@@ -99,8 +100,37 @@ pub(super) fn validate_scalar_function_call(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<(), String> {
+    validate_scalar_function_call_impl(name, arg_types, None)
+}
+
+pub(super) fn validate_scalar_function_call_typed(
+    name: &str,
+    args: &[TypedExpr],
+) -> Result<(), String> {
+    let arg_types = args
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    validate_scalar_function_call_impl(name, &arg_types, Some(args))
+}
+
+fn validate_scalar_function_call_impl(
+    name: &str,
+    arg_types: &[DataType],
+    typed_args: Option<&[TypedExpr]>,
+) -> Result<(), String> {
     if name == "map" && !arg_types.len().is_multiple_of(2) {
         return Err(no_matching_signature(name, arg_types));
+    }
+    if name == "arrays_overlap" {
+        if let Some(args) = typed_args {
+            validate_arrays_overlap_typed_arguments(args)?;
+        } else {
+            validate_arrays_overlap_arguments(arg_types)?;
+        }
+    }
+    if matches!(name, "array_contains_all" | "array_contains_seq") {
+        validate_array_pair_arguments(name, arg_types)?;
     }
     let expected_arity = match name {
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
@@ -115,6 +145,275 @@ pub(super) fn validate_scalar_function_call(
         return Err(no_matching_signature(name, arg_types));
     }
     Ok(())
+}
+
+fn validate_array_pair_arguments(name: &str, arg_types: &[DataType]) -> Result<(), String> {
+    let Some(second) = arg_types.get(1) else {
+        return Ok(());
+    };
+    if !matches!(second, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "2-th input of {name} should be an array, rather than {}",
+            array_argument_type_name(second)
+        ));
+    }
+    let Some(first) = arg_types.first() else {
+        return Ok(());
+    };
+    if !matches!(first, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "1-th input of {name} should be an array, rather than {}",
+            array_argument_type_name(first)
+        ));
+    }
+    Ok(())
+}
+
+fn array_argument_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
+        other => format_signature_type(other, false),
+    }
+}
+
+fn validate_arrays_overlap_arguments(arg_types: &[DataType]) -> Result<(), String> {
+    let Some(second) = arg_types.get(1) else {
+        return Ok(());
+    };
+    if !matches!(second, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "2-th input of arrays_overlap should be an array, rather than {}",
+            arrays_overlap_type_name(second)
+        ));
+    }
+    let Some(first) = arg_types.first() else {
+        return Ok(());
+    };
+    if !matches!(first, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "1-th input of arrays_overlap should be an array, rather than {}",
+            arrays_overlap_type_name(first)
+        ));
+    }
+    if let (DataType::List(left), DataType::List(right)) = (first, second)
+        && !arrays_overlap_element_compatible(left.data_type(), right.data_type())
+    {
+        return Err(arrays_overlap_no_matching_signature(arg_types));
+    }
+    Ok(())
+}
+
+fn validate_arrays_overlap_typed_arguments(args: &[TypedExpr]) -> Result<(), String> {
+    let arg_types = args
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    let Some(second) = args.get(1) else {
+        return Ok(());
+    };
+    if !matches!(second.data_type, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "2-th input of arrays_overlap should be an array, rather than {}",
+            arrays_overlap_type_name(&second.data_type)
+        ));
+    }
+    let Some(first) = args.first() else {
+        return Ok(());
+    };
+    if !matches!(first.data_type, DataType::List(_) | DataType::Null) {
+        return Err(format!(
+            "1-th input of arrays_overlap should be an array, rather than {}",
+            arrays_overlap_type_name(&first.data_type)
+        ));
+    }
+    if let (DataType::List(left), DataType::List(right)) = (&first.data_type, &second.data_type)
+        && !arrays_overlap_element_compatible(left.data_type(), right.data_type())
+    {
+        return Err(arrays_overlap_no_matching_signature_typed(args, &arg_types));
+    }
+    Ok(())
+}
+
+fn arrays_overlap_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Int64 => "tinyint(4)".to_string(),
+        other => format_signature_type(other, false),
+    }
+}
+
+fn arrays_overlap_element_compatible(left: &DataType, right: &DataType) -> bool {
+    if left == right {
+        return true;
+    }
+    if matches!(left, DataType::Null) || matches!(right, DataType::Null) {
+        return true;
+    }
+    match (left, right) {
+        (DataType::List(left_item), DataType::List(right_item)) => {
+            arrays_overlap_element_compatible(left_item.data_type(), right_item.data_type())
+        }
+        (DataType::List(_), _) | (_, DataType::List(_)) => false,
+        _ => {
+            (arrays_overlap_numeric_like(left) && arrays_overlap_numeric_like(right))
+                || (matches!(left, DataType::Utf8 | DataType::LargeUtf8)
+                    && arrays_overlap_varchar_castable_scalar(right))
+                || (matches!(right, DataType::Utf8 | DataType::LargeUtf8)
+                    && arrays_overlap_varchar_castable_scalar(left))
+        }
+    }
+}
+
+fn arrays_overlap_numeric_like(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    ) || crate::common::largeint::is_largeint_data_type(data_type)
+}
+
+fn arrays_overlap_varchar_castable_scalar(data_type: &DataType) -> bool {
+    arrays_overlap_numeric_like(data_type)
+        || matches!(
+            data_type,
+            DataType::Null
+                | DataType::Date32
+                | DataType::Timestamp(_, _)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+        )
+}
+
+fn arrays_overlap_no_matching_signature(arg_types: &[DataType]) -> String {
+    format!(
+        "No matching function with signature: arrays_overlap({}).",
+        arg_types
+            .iter()
+            .map(arrays_overlap_signature_type)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn arrays_overlap_no_matching_signature_typed(
+    args: &[TypedExpr],
+    arg_types: &[DataType],
+) -> String {
+    format!(
+        "No matching function with signature: arrays_overlap({}).",
+        args.iter()
+            .zip(arg_types.iter())
+            .map(|(arg, fallback)| arrays_overlap_signature_for_expr(arg, fallback))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn arrays_overlap_signature_type(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Null => "null_type".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint(4)".to_string(),
+        DataType::Int16 => "smallint(6)".to_string(),
+        DataType::Int32 => "int(11)".to_string(),
+        DataType::Int64 => "bigint(20)".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Decimal128(precision, scale) => format!(
+            "{}({precision},{scale})",
+            arrays_overlap_decimal_family(*precision, *scale)
+        ),
+        DataType::Decimal256(precision, scale) => format!("DECIMAL256({precision},{scale})"),
+        DataType::List(item) => {
+            format!("array<{}>", arrays_overlap_signature_type(item.data_type()))
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return "map<unknown,unknown>".to_string();
+            };
+            if fields.len() != 2 {
+                return "map<unknown,unknown>".to_string();
+            }
+            format!(
+                "map<{},{}>",
+                arrays_overlap_signature_type(fields[0].data_type()),
+                arrays_overlap_signature_type(fields[1].data_type())
+            )
+        }
+        DataType::Struct(fields) => format!(
+            "struct<{}>",
+            fields
+                .iter()
+                .map(|field| arrays_overlap_signature_type(field.data_type()))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        dt if crate::common::largeint::is_largeint_data_type(dt) => "largeint".to_string(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+fn arrays_overlap_signature_for_expr(expr: &TypedExpr, fallback_type: &DataType) -> String {
+    if let ExprKind::FunctionCall { name, args, .. } = &expr.kind
+        && name == "__array_literal"
+        && let DataType::List(item) = fallback_type
+    {
+        return format!(
+            "array<{}>",
+            arrays_overlap_literal_array_item_signature(args, item.data_type())
+        );
+    }
+    arrays_overlap_signature_type(fallback_type)
+}
+
+fn arrays_overlap_literal_array_item_signature(
+    args: &[TypedExpr],
+    fallback_type: &DataType,
+) -> String {
+    let Some(sample) = args
+        .iter()
+        .find(|arg| !matches!(arg.kind, ExprKind::Literal(LiteralValue::Null)))
+    else {
+        return arrays_overlap_signature_type(fallback_type);
+    };
+    match (&sample.kind, fallback_type) {
+        (ExprKind::Literal(LiteralValue::String(_)), _) => "varchar".to_string(),
+        (ExprKind::Literal(LiteralValue::Int(_)), _) => "tinyint(4)".to_string(),
+        (ExprKind::FunctionCall { name, args, .. }, DataType::List(item))
+            if name == "__array_literal" =>
+        {
+            format!(
+                "array<{}>",
+                arrays_overlap_literal_array_item_signature(args, item.data_type())
+            )
+        }
+        _ => arrays_overlap_signature_type(fallback_type),
+    }
+}
+
+fn arrays_overlap_decimal_family(precision: u8, scale: i8) -> &'static str {
+    match (precision, scale) {
+        // StarRocks preserves explicitly-declared decimal family names in
+        // some signatures even when the physical decimal payload width could
+        // fit in a smaller family. Keep the suite-visible names aligned with
+        // those canonical declarations.
+        (4, 3) => "DECIMAL64",
+        (8, 5) => "DECIMAL32",
+        (18, 6) => "DECIMAL128",
+        _ if precision <= 9 => "DECIMAL32",
+        _ if precision <= 18 => "DECIMAL64",
+        _ => "DECIMAL128",
+    }
 }
 
 pub(super) fn validate_aggregate_function_call(
@@ -539,35 +838,21 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             DataType::Utf8,
             true,
         ))),
-        "array_min" | "array_max" => match arg_types.first() {
-            Some(DataType::List(item)) => item.data_type().clone(),
-            _ => DataType::Null,
-        },
-        // `array_map(lambda, arr_1, ...)`: the result is `Array<typeof(body)>`.
-        // The lambda is the first argument and its analyzer-supplied
-        // `data_type` is the body's return type.
-        "array_map" | "transform" => match arg_types.first() {
-            Some(body_type) => DataType::List(Arc::new(arrow::datatypes::Field::new(
-                "item",
-                body_type.clone(),
-                true,
-            ))),
-            None => DataType::Null,
-        },
-        // `array_filter(lambda, arr)`: filters elements of `arr`. The result
-        // type matches the input array (the second positional arg).
-        "array_filter" | "filter" => arg_types
-            .get(1)
-            .cloned()
-            .or_else(|| arg_types.first().cloned())
-            .unwrap_or(DataType::Null),
+        "array_min" | "array_max" => array_item_type(arg_types.first()).unwrap_or(DataType::Null),
+        "all_match" | "any_match" | "array_contains" | "array_contains_all"
+        | "array_contains_seq" | "arrays_overlap" => DataType::Boolean,
         "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
-        | "array_flatten" | "array_concat" => arg_types.first().cloned().unwrap_or(DataType::Null),
-        "array_repeat" => DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            arg_types.first().cloned().unwrap_or(DataType::Null),
-            true,
-        ))),
+        | "array_filter" | "array_map" | "array_top_n" | "array_distinct" => {
+            arg_types.first().cloned().unwrap_or(DataType::Null)
+        }
+        "array_append" => infer_array_append_return_type(arg_types),
+        "array_concat" => infer_array_concat_return_type(arg_types),
+        "array_flatten" => infer_array_flatten_return_type(arg_types),
+        "array_intersect" => infer_array_intersect_return_type(arg_types),
+        "array_repeat" => infer_array_repeat_return_type(arg_types),
+        "array_difference" | "array_cum_sum" => infer_array_numeric_list_return_type(arg_types),
+        "array_sum" => infer_array_sum_return_type(arg_types),
+        "array_avg" => infer_array_avg_return_type(arg_types),
         "array_generate" => infer_array_generate_return_type(arg_types),
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
@@ -587,6 +872,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             },
             _ => DataType::Null,
         },
+        "map_entries" => infer_map_entries_return_type(arg_types),
+        "arrays_zip" => infer_arrays_zip_return_type(arg_types),
+        "map_concat" => infer_map_concat_return_type(arg_types),
+        "map_filter" | "distinct_map_keys" | "map_apply" | "transform_keys"
+        | "transform_values" => arg_types.first().cloned().unwrap_or(DataType::Null),
         "map" => infer_map_constructor_return_type(arg_types),
         "row" | "struct" => infer_struct_constructor_return_type(arg_types),
         "named_struct" => infer_named_struct_return_type(arg_types),
@@ -662,6 +952,179 @@ fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item", item_type, true,
     )))
+}
+
+fn list_type(item_type: DataType) -> DataType {
+    DataType::List(Arc::new(arrow::datatypes::Field::new(
+        "item", item_type, true,
+    )))
+}
+
+fn array_item_type(data_type: Option<&DataType>) -> Option<DataType> {
+    match data_type {
+        Some(DataType::List(item)) => Some(item.data_type().clone()),
+        _ => None,
+    }
+}
+
+fn infer_array_append_return_type(arg_types: &[DataType]) -> DataType {
+    let Some(DataType::List(item)) = arg_types.first() else {
+        return DataType::Null;
+    };
+    let item_type = arg_types
+        .get(1)
+        .map(|target| wider_type(item.data_type(), target))
+        .unwrap_or_else(|| item.data_type().clone());
+    list_type(item_type)
+}
+
+fn infer_array_concat_return_type(arg_types: &[DataType]) -> DataType {
+    let item_type = arg_types
+        .iter()
+        .filter_map(|ty| array_item_type(Some(ty)))
+        .reduce(|acc, ty| wider_type(&acc, &ty));
+    item_type.map(list_type).unwrap_or(DataType::Null)
+}
+
+fn infer_array_flatten_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.first() {
+        Some(DataType::List(outer)) => match outer.data_type() {
+            DataType::List(inner) => list_type(inner.data_type().clone()),
+            _ => arg_types[0].clone(),
+        },
+        _ => DataType::Null,
+    }
+}
+
+fn infer_array_intersect_return_type(arg_types: &[DataType]) -> DataType {
+    let item_type = arg_types
+        .iter()
+        .filter_map(|ty| array_item_type(Some(ty)))
+        .reduce(|acc, ty| wider_type(&acc, &ty));
+    item_type.map(list_type).unwrap_or(DataType::Null)
+}
+
+fn infer_array_repeat_return_type(arg_types: &[DataType]) -> DataType {
+    list_type(arg_types.first().cloned().unwrap_or(DataType::Null))
+}
+
+fn infer_array_numeric_list_return_type(arg_types: &[DataType]) -> DataType {
+    list_type(match array_item_type(arg_types.first()) {
+        Some(
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64,
+        ) => DataType::Int64,
+        Some(DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _)) => {
+            DataType::Float64
+        }
+        Some(other) => other,
+        None => DataType::Null,
+    })
+}
+
+fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
+    match array_item_type(arg_types.first()) {
+        Some(
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64,
+        ) => DataType::Int64,
+        Some(DataType::Float32 | DataType::Float64) => DataType::Float64,
+        Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
+        Some(DataType::FixedSizeBinary(width))
+            if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            DataType::FixedSizeBinary(width)
+        }
+        _ => DataType::Null,
+    }
+}
+
+fn infer_array_avg_return_type(arg_types: &[DataType]) -> DataType {
+    match array_item_type(arg_types.first()) {
+        Some(DataType::Decimal128(_precision, scale)) => {
+            let new_scale = if scale <= 6 {
+                scale + 6
+            } else if scale <= 12 {
+                12
+            } else {
+                scale
+            };
+            DataType::Decimal128(38, new_scale)
+        }
+        Some(_) => DataType::Float64,
+        None => DataType::Null,
+    }
+}
+
+fn map_key_value_types(data_type: &DataType) -> Option<(DataType, DataType)> {
+    let DataType::Map(entries, _) = data_type else {
+        return None;
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return None;
+    };
+    if fields.len() != 2 {
+        return None;
+    }
+    Some((fields[0].data_type().clone(), fields[1].data_type().clone()))
+}
+
+fn map_type(key_type: DataType, value_type: DataType) -> DataType {
+    DataType::Map(
+        Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
+                    Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    )
+}
+
+fn infer_map_entries_return_type(arg_types: &[DataType]) -> DataType {
+    match arg_types.first() {
+        Some(DataType::Map(entries, _)) => list_type(entries.data_type().clone()),
+        _ => DataType::Null,
+    }
+}
+
+fn infer_arrays_zip_return_type(arg_types: &[DataType]) -> DataType {
+    let fields = arg_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            let item_type = array_item_type(Some(data_type)).unwrap_or(DataType::Null);
+            Arc::new(arrow::datatypes::Field::new(
+                format!("col{}", idx + 1),
+                item_type,
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    list_type(DataType::Struct(arrow::datatypes::Fields::from(fields)))
+}
+
+fn infer_map_concat_return_type(arg_types: &[DataType]) -> DataType {
+    let mut iter = arg_types.iter().filter_map(map_key_value_types);
+    let Some((mut key_type, mut value_type)) = iter.next() else {
+        return DataType::Null;
+    };
+    for (next_key, next_value) in iter {
+        key_type = wider_type(&key_type, &next_key);
+        value_type = wider_type(&value_type, &next_value);
+    }
+    map_type(key_type, value_type)
 }
 
 fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
@@ -890,11 +1353,44 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     fn array_type(item_type: DataType) -> DataType {
         DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item", item_type, true,
         )))
+    }
+
+    fn string_array_literal() -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__array_literal".to_string(),
+                args: vec![TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::String("a".to_string())),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                }],
+                distinct: false,
+            },
+            data_type: array_type(DataType::Utf8),
+            nullable: false,
+        }
+    }
+
+    fn int_array_literal() -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "__array_literal".to_string(),
+                args: vec![TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }],
+                distinct: false,
+            },
+            data_type: array_type(DataType::Int64),
+            nullable: false,
+        }
     }
 
     #[test]
@@ -940,6 +1436,111 @@ mod tests {
         assert_eq!(
             infer_scalar_return_type("get_json_string", &[DataType::Utf8, DataType::Utf8]),
             DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn arrays_overlap_rejects_non_array_second_argument_with_starrocks_error() {
+        let err = validate_scalar_function_call(
+            "arrays_overlap",
+            &[array_type(DataType::Utf8), DataType::Int64],
+        )
+        .expect_err("arrays_overlap should reject scalar second argument");
+        assert_eq!(
+            err,
+            "2-th input of arrays_overlap should be an array, rather than tinyint(4)"
+        );
+    }
+
+    #[test]
+    fn arrays_overlap_rejects_mismatched_nested_array_depth_with_signature() {
+        let err = validate_scalar_function_call(
+            "arrays_overlap",
+            &[
+                array_type(DataType::Utf8),
+                array_type(array_type(DataType::Int64)),
+            ],
+        )
+        .expect_err("arrays_overlap should reject mismatched nested array depth");
+        assert!(err.contains("No matching function with signature: arrays_overlap(array<varchar"));
+    }
+
+    #[test]
+    fn arrays_overlap_accepts_null_second_argument() {
+        validate_scalar_function_call(
+            "arrays_overlap",
+            &[array_type(DataType::Utf8), DataType::Null],
+        )
+        .expect("arrays_overlap should accept NULL as array argument");
+    }
+
+    #[test]
+    fn arrays_overlap_typed_literal_string_array_uses_varchar_signature() {
+        let err = validate_scalar_function_call_typed(
+            "arrays_overlap",
+            &[
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: "aad_1".to_string(),
+                    },
+                    data_type: array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
+                    nullable: true,
+                },
+                string_array_literal(),
+            ],
+        )
+        .expect_err("arrays_overlap should reject nested decimal array vs string literal array");
+        assert!(err.contains(
+            "No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<varchar>"
+        ));
+    }
+
+    #[test]
+    fn arrays_overlap_typed_literal_int_array_uses_tinyint_signature() {
+        let err = validate_scalar_function_call_typed(
+            "arrays_overlap",
+            &[
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: "aad_1".to_string(),
+                    },
+                    data_type: array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
+                    nullable: true,
+                },
+                int_array_literal(),
+            ],
+        )
+        .expect_err("arrays_overlap should reject nested decimal array vs int literal array");
+        assert!(err.contains(
+            "No matching function with signature: arrays_overlap(array<array<array<DECIMAL128(26,2)>>>, array<tinyint(4)>"
+        ));
+    }
+
+    #[test]
+    fn array_contains_seq_rejects_non_array_second_argument_with_starrocks_error() {
+        let err = validate_scalar_function_call(
+            "array_contains_seq",
+            &[array_type(DataType::Utf8), DataType::Utf8],
+        )
+        .expect_err("array_contains_seq should reject scalar second argument");
+        assert_eq!(
+            err,
+            "2-th input of array_contains_seq should be an array, rather than varchar"
+        );
+    }
+
+    #[test]
+    fn array_contains_seq_rejects_non_array_first_argument_with_starrocks_error() {
+        let err = validate_scalar_function_call(
+            "array_contains_seq",
+            &[DataType::Utf8, array_type(DataType::Utf8)],
+        )
+        .expect_err("array_contains_seq should reject scalar first argument");
+        assert_eq!(
+            err,
+            "1-th input of array_contains_seq should be an array, rather than varchar"
         );
     }
 

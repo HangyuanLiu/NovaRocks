@@ -37,6 +37,7 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             qualifier: None,
             column,
         } => column.clone(),
+        ExprKind::LambdaParamRef { name, .. } => name.clone(),
         ExprKind::Literal(query_ir::LiteralValue::Null) => "NULL".to_string(),
         ExprKind::Literal(query_ir::LiteralValue::Bool(true)) => "TRUE".to_string(),
         ExprKind::Literal(query_ir::LiteralValue::Bool(false)) => "FALSE".to_string(),
@@ -73,6 +74,14 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
         }
         ExprKind::FunctionCall { name, args, .. } => {
             format_typed_function_call_display_name(name, args)
+        }
+        ExprKind::LambdaFunction { params, body } => {
+            let params = params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({params}) -> {}", typed_expr_display_name(body))
         }
         ExprKind::AggregateCall {
             name,
@@ -125,7 +134,9 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
 
 fn typed_expr_display_name_with_parens(expr: &TypedExpr) -> String {
     match &expr.kind {
-        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => typed_expr_display_name(expr),
+        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
+            typed_expr_display_name(expr)
+        }
         ExprKind::FunctionCall { .. } | ExprKind::AggregateCall { .. } => {
             typed_expr_display_name(expr)
         }
@@ -206,6 +217,7 @@ fn typed_expr_path_display_name(expr: &TypedExpr) -> String {
             qualifier: None,
             column,
         } => column.clone(),
+        ExprKind::LambdaParamRef { name, .. } => name.clone(),
         ExprKind::FunctionCall { name, args, .. } => {
             format_typed_function_call_display_name(name, args)
         }

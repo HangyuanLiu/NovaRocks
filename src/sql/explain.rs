@@ -832,6 +832,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             Some(q) => format!("{q}.{column}"),
             None => column.clone(),
         },
+        ExprKind::LambdaParamRef { name, .. } => name.clone(),
         ExprKind::Literal(lit) => match lit {
             LiteralValue::Null => "NULL".to_string(),
             LiteralValue::Bool(b) => b.to_string(),
@@ -877,6 +878,14 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             let args_str: Vec<String> = args.iter().map(format_expr).collect();
             let distinct_str = if *distinct { "DISTINCT " } else { "" };
             format!("{name}({distinct_str}{})", args_str.join(", "))
+        }
+        ExprKind::LambdaFunction { params, body } => {
+            let params = params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({params}) -> {}", format_expr(body))
         }
         ExprKind::AggregateCall {
             name,

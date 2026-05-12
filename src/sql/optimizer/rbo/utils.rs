@@ -58,6 +58,7 @@ pub(crate) fn collect_column_refs(expr: &TypedExpr) -> Vec<&str> {
 fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
     match &expr.kind {
         ExprKind::ColumnRef { column, .. } => out.push(column.as_str()),
+        ExprKind::LambdaParamRef { .. } => {}
         ExprKind::BinaryOp { left, right, .. } => {
             collect_column_refs_inner(left, out);
             collect_column_refs_inner(right, out);
@@ -68,6 +69,7 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
                 collect_column_refs_inner(arg, out);
             }
         }
+        ExprKind::LambdaFunction { body, .. } => collect_column_refs_inner(body, out),
         ExprKind::AggregateCall { args, order_by, .. } => {
             for arg in args {
                 collect_column_refs_inner(arg, out);
@@ -287,6 +289,7 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
                 column.to_lowercase(),
             ));
         }
+        ExprKind::LambdaParamRef { .. } => {}
         ExprKind::BinaryOp { left, right, .. } => {
             collect_qualified_column_refs_inner(left, out);
             collect_qualified_column_refs_inner(right, out);
@@ -296,6 +299,9 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
             for arg in args {
                 collect_qualified_column_refs_inner(arg, out);
             }
+        }
+        ExprKind::LambdaFunction { body, .. } => {
+            collect_qualified_column_refs_inner(body, out);
         }
         ExprKind::AggregateCall { args, order_by, .. } => {
             for arg in args {

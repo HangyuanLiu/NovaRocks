@@ -99,13 +99,17 @@ pub fn eval_array_map(
 
     let mut list_refs = Vec::with_capacity(input_arrays.len());
     for array in &input_arrays {
+        if array.data_type() == &DataType::Null {
+            list_refs.push(None);
+            continue;
+        }
         let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
             format!(
                 "array_map input must be ListArray, got {:?}",
                 array.data_type()
             )
         })?;
-        list_refs.push(list);
+        list_refs.push(Some(list));
     }
 
     let mut row_valid = vec![true; num_rows];
@@ -116,6 +120,10 @@ pub fn eval_array_map(
         let mut len_opt: Option<usize> = None;
         let mut row_null = false;
         for list in &list_refs {
+            let Some(list) = list else {
+                row_null = true;
+                break;
+            };
             if list.is_null(row) {
                 row_null = true;
                 break;
@@ -225,6 +233,9 @@ pub fn eval_array_map(
 
     let mut flat_args = Vec::with_capacity(list_refs.len());
     for list in &list_refs {
+        let Some(list) = list else {
+            continue;
+        };
         let flat = flatten_list_values(list, &row_valid)?;
         if flat.len() != total_elements {
             return Err("array_map flattened argument length mismatch".to_string());
