@@ -102,61 +102,6 @@ pub(crate) fn ensure_base_row_lineage_contract(
     Ok(())
 }
 
-pub(crate) fn ensure_target_apply_key_contract(
-    table: &iceberg::table::Table,
-    expected: &crate::meta::repository::mv::MvTargetApplyKey,
-) -> Result<(), String> {
-    let metadata = table.metadata();
-    if metadata.format_version() != iceberg::spec::FormatVersion::V3
-        || !row_lineage_property_enabled(metadata.properties())
-    {
-        return Err("iceberg MV target must be Iceberg v3 with write.row-lineage=true".to_string());
-    }
-    if expected.column_name != ICEBERG_MV_APPLY_KEY_COLUMN {
-        return Err(format!(
-            "iceberg MV target apply-key metadata expects column {}, got {}",
-            ICEBERG_MV_APPLY_KEY_COLUMN, expected.column_name
-        ));
-    }
-    if expected.source != crate::meta::repository::mv::MvTargetApplyKeySource::BaseRowId {
-        return Err("iceberg MV target apply-key source must be BASE_ROW_ID".to_string());
-    }
-
-    let mut matches = metadata
-        .current_schema()
-        .as_struct()
-        .fields()
-        .iter()
-        .filter(|field| field.name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN));
-    let Some(field) = matches.next() else {
-        return Err(format!(
-            "iceberg MV target schema is missing apply-key column {ICEBERG_MV_APPLY_KEY_COLUMN}"
-        ));
-    };
-    if matches.next().is_some() {
-        return Err(format!(
-            "iceberg MV target schema has duplicate apply-key column {ICEBERG_MV_APPLY_KEY_COLUMN}"
-        ));
-    }
-    if field.id != expected.field_id {
-        return Err(format!(
-            "iceberg MV target apply-key field id mismatch for {ICEBERG_MV_APPLY_KEY_COLUMN}: expected {}, got {}",
-            expected.field_id, field.id
-        ));
-    }
-    if !field.required {
-        return Err(format!(
-            "iceberg MV target apply-key column {ICEBERG_MV_APPLY_KEY_COLUMN} must be required"
-        ));
-    }
-    match field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long) => Ok(()),
-        other => Err(format!(
-            "iceberg MV target apply-key column {ICEBERG_MV_APPLY_KEY_COLUMN} must be BIGINT, got {other:?}"
-        )),
-    }
-}
-
 fn row_lineage_property_enabled(props: &std::collections::HashMap<String, String>) -> bool {
     props
         .get("write.row-lineage")
