@@ -363,35 +363,192 @@ fn execute_managed_delete_statement(
         ));
     }
 
-    let (catalog, sink) = {
-        let reg = state.connectors.read().expect("connector registry read");
-        (
-            reg.catalog_backend(target.backend_name)?,
-            reg.table_sink(target.backend_name)?,
-        )
-    };
-    let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
-    let rewritten_sql = format!(
-        "SELECT * FROM {} WHERE NOT COALESCE(({}), FALSE)",
-        target.table, stmt.where_clause
-    );
-    let statement = crate::sql::parser::parse_sql_raw(&rewritten_sql)?;
-    let sqlast::Statement::Query(query) = statement else {
-        return Err("internal: managed DELETE rewrite did not parse as SELECT".to_string());
-    };
-    let batch = crate::engine::insert_flow::execute_insert_from_query_on_pipeline(
-        state,
-        target,
-        &resolved,
-        &[],
-        query.as_ref(),
+    let table_info = resolve_managed_table_info(state, target)?;
+    if table_info.is_materialized_view {
+        return Err(format!(
+            "The data of '{}' cannot be deleted because it is a materialized view; \
+             the data of materialized view must be consistent with the base table.",
+            target.table
+        ));
+    }
+
+    if table_info.keys_type == "PRIMARY_KEYS" {
+        return execute_managed_pk_delete(state, target, stmt, &table_info);
+    }
+
+    let keys_type =
+        crate::engine::delete_predicate_translate::KeysType::from_meta_str(&table_info.keys_type)
+            .ok_or_else(|| {
+            format!(
+                "DELETE not supported for managed-lake keys_type `{}`",
+                table_info.keys_type
+            )
+        })?;
+    execute_managed_predicate_delete(state, target, stmt, &table_info, keys_type)
+}
+
+struct ManagedTableInfo {
+    keys_type: String,
+    is_materialized_view: bool,
+    columns: Vec<crate::engine::catalog::ColumnDef>,
+    key_columns: Vec<String>,
+}
+
+fn resolve_managed_table_info(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+) -> Result<ManagedTableInfo, String> {
+    use crate::connector::starrocks::managed::catalog::arrow_type_from_tablet_column;
+    use crate::engine::catalog::ColumnDef;
+
+    let managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock");
+    let runtime = managed.table(&target.namespace, &target.table)?;
+
+    let key_columns: Vec<String> = runtime
+        .columns
+        .iter()
+        .filter(|column| column.is_key)
+        .map(|column| column.column_name.clone())
+        .collect();
+
+    let mut columns = Vec::with_capacity(runtime.columns.len());
+    for column in &runtime.columns {
+        if !column.visible {
+            continue;
+        }
+        let schema_column = runtime
+            .tablet_schema
+            .column
+            .iter()
+            .find(|sc| {
+                sc.name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column.column_name))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "managed table {}.{} missing tablet schema column `{}`",
+                    runtime.database_name, runtime.table.name, column.column_name
+                )
+            })?;
+        columns.push(ColumnDef {
+            name: column.column_name.clone(),
+            data_type: arrow_type_from_tablet_column(schema_column)?,
+            nullable: column.nullable,
+            write_default: None,
+        });
+    }
+
+    Ok(ManagedTableInfo {
+        keys_type: runtime.table.keys_type.clone(),
+        is_materialized_view: matches!(
+            runtime.table.kind,
+            crate::connector::starrocks::managed::model::ManagedTableKind::MaterializedView
+        ),
+        columns,
+        key_columns,
+    })
+}
+
+fn execute_managed_predicate_delete(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+    table_info: &ManagedTableInfo,
+    keys_type: crate::engine::delete_predicate_translate::KeysType,
+) -> Result<StatementResult, String> {
+    use crate::connector::starrocks::lake::delete_predicate_proto::build_delete_predicate_pb;
+    use crate::engine::delete_predicate_translate::translate_to_delete_predicate;
+
+    let terms = translate_to_delete_predicate(
+        &stmt.where_clause,
+        &table_info.columns,
+        &table_info.key_columns,
+        keys_type,
     )?;
 
-    crate::connector::truncate_managed_table(state, &target.namespace, &target.table)?;
-    if batch.num_rows() > 0 {
-        sink.append_batch(&resolved, batch)?;
-    }
+    // The version field is informational on the wire; backends derive the
+    // actual rowset version from the txn publish. StarRocks emits the next
+    // partition version here for parity, so do the same.
+    let predicate_version = 0_i32;
+    let predicate_pb = build_delete_predicate_pb(&terms, predicate_version);
+
+    crate::connector::starrocks::managed::txn::delete_managed_lake_table_by_predicate(
+        state,
+        &target.namespace,
+        &target.table,
+        predicate_pb,
+    )?;
     Ok(StatementResult::Ok)
+}
+
+/// Rewrite `DELETE FROM pk_t WHERE cond` into `SELECT <pk_cols> FROM pk_t
+/// WHERE cond`, run it through the standalone pipeline, then route the
+/// resulting chunks through the managed-lake sink with `__op = 1` appended.
+/// The sink's `parse_op_batch` recognizes the control column and emits a
+/// `.del` file per tablet; the PK-applier consumes it at publish time.
+///
+/// WHERE accepts any plannable form (non-key columns, functions, joins,
+/// subqueries) — same surface as StarRocks PK DELETE, no DeleteAnalyzer
+/// restrictions.
+fn execute_managed_pk_delete(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &DeleteStmt,
+    table_info: &ManagedTableInfo,
+) -> Result<StatementResult, String> {
+    if table_info.key_columns.is_empty() {
+        return Err(format!(
+            "managed-lake PRIMARY KEY table '{}' has no key columns",
+            target.table
+        ));
+    }
+    let pk_list = table_info.key_columns.join(", ");
+    let qualified = qualify_managed_table(target);
+    let where_sql = stmt.where_clause.to_string();
+    let select_sql = format!("SELECT {pk_list} FROM {qualified} WHERE {where_sql}");
+
+    let parsed = crate::sql::parser::parse_sql_raw(&select_sql)?;
+    let sqlast::Statement::Query(query) = parsed else {
+        return Err(format!(
+            "internal: managed PK DELETE rewrite did not parse as SELECT: {select_sql}"
+        ));
+    };
+
+    // Run the SELECT through the standalone pipeline. Clone-then-release the
+    // catalog read lock the same way insert_flow does, so the pipeline cannot
+    // starve concurrent writers.
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let query_result = crate::engine::execute_query(
+        query.as_ref(),
+        &catalog_snapshot,
+        &target.namespace,
+        state.exchange_port,
+        None,
+    )?;
+
+    crate::connector::starrocks::managed::txn::delete_managed_lake_pk_rows(
+        state,
+        &target.namespace,
+        &target.table,
+        &query_result.chunks,
+    )?;
+    Ok(StatementResult::Ok)
+}
+
+fn qualify_managed_table(target: &crate::engine::backend_resolver::TargetBackend) -> String {
+    if target.namespace.is_empty() {
+        target.table.clone()
+    } else {
+        format!("{}.{}", target.namespace, target.table)
+    }
 }
 
 /// One side of a comparison must be a column reference and the other a literal.

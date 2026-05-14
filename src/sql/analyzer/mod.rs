@@ -5,6 +5,8 @@
 
 mod functions;
 mod helpers;
+mod literal_coercion;
+pub mod load_op_column;
 mod resolve_expr;
 mod resolve_from;
 mod scope;

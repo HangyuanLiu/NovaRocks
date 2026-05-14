@@ -28,7 +28,8 @@ use crate::meta::repository::mv::UpdateManagedMvRefreshSummaryRequest;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    KeysType, PublishVersionRequest, TabletSchemaPb,
+    DeleteDataRequest, DeletePredicatePb, KeysType, PublishVersionRequest, TableSchemaKeyPb,
+    TabletSchemaPb,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
@@ -488,6 +489,86 @@ pub(crate) fn write_chunks_into_managed_partition_for_aggregate_mv_upsert(
 const MANAGED_PK_OP_COLUMN: &str = "__op";
 const MANAGED_PK_OP_UPSERT: i8 = 0;
 const MANAGED_PK_OP_DELETE: i8 = 1;
+
+/// Drive a PRIMARY KEY DELETE through the existing managed-lake sink path.
+///
+/// `pk_chunks` come from running `SELECT <pk_cols> FROM t WHERE cond` through
+/// the standalone pipeline. Each chunk is appended a constant `__op = 1`
+/// control column so the lake writer (`parse_op_batch`) classifies the rows
+/// as deletes and emits a `.del` file via `encode_delete_keys_payload`.
+///
+/// Chunks coming out of the SELECT pipeline carry slot IDs that are
+/// local to that plan, not to the table's column layout. The routing path
+/// in `write_routed_chunks` resolves the distribution slot by looking up
+/// `plan.distributed_slot_ids` (1-indexed positions in `plan.columns`) inside
+/// the chunk schema, so we rebuild each chunk with slot IDs matching the
+/// destination plan's column order before appending `__op`.
+pub(crate) fn delete_managed_lake_pk_rows(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    pk_chunks: &[Chunk],
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database_name)?,
+        table: normalize_identifier(table_name)?,
+    };
+    let plan = load_physical_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if plan.tablet_schema.keys_type != Some(KeysType::PrimaryKeys as i32) {
+        return Err(format!(
+            "delete_managed_lake_pk_rows called on non-PRIMARY_KEYS table {database_name}.{table_name}"
+        ));
+    }
+
+    let mut rebuilt = Vec::with_capacity(pk_chunks.len());
+    for chunk in pk_chunks {
+        if chunk.len() == 0 {
+            continue;
+        }
+        rebuilt.push(rebuild_pk_chunk_for_plan(chunk, &plan)?);
+    }
+    if rebuilt.is_empty() {
+        // No survivors matched the WHERE clause — nothing to delete.
+        return Ok(());
+    }
+    let op_chunks = append_primary_key_op_column(&rebuilt, MANAGED_PK_OP_DELETE)?;
+    write_chunks_into_managed_partition(state, plan, &op_chunks)?;
+    Ok(())
+}
+
+/// Reassign each column of `chunk` to its 1-indexed slot in `plan.columns`,
+/// matching the slot layout that `derive_distributed_slot_ids` expects. The
+/// chunk must contain only columns named in `plan.columns`; the order is
+/// preserved as-is but slot IDs are remapped by name.
+fn rebuild_pk_chunk_for_plan(
+    chunk: &Chunk,
+    plan: &ManagedInsertPlan,
+) -> Result<Chunk, String> {
+    let batch_fields = chunk
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut slot_ids = Vec::with_capacity(batch_fields.len());
+    for field in &batch_fields {
+        let idx = plan
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(field.name()))
+            .ok_or_else(|| {
+                format!(
+                    "PK delete chunk column `{}` is not present in destination plan",
+                    field.name()
+                )
+            })?;
+        slot_ids.push(SlotId::new(idx as u32 + 1));
+    }
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(chunk.batch.schema().as_ref(), &slot_ids)?;
+    Ok(Chunk::new_with_chunk_schema(chunk.batch.clone(), chunk_schema))
+}
 
 fn append_primary_key_op_column(chunks: &[Chunk], op: i8) -> Result<Vec<Chunk>, String> {
     chunks
@@ -992,6 +1073,102 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
         batch,
         chunk.chunk_schema_ref(),
     ))
+}
+
+/// Apply a `DeletePredicatePb` to every tablet of a DUP/UNIQUE/AGG managed-lake
+/// table's active partition. Writes one `op_write { rowset.delete_predicate }`
+/// txn log per tablet via [`crate::connector::starrocks::lake::transactions::delete_data`],
+/// then publishes the txn and refreshes the in-memory catalog.
+///
+/// PRIMARY_KEYS tables do not use this path: their DELETE is rewritten into
+/// a `SELECT pk_cols, 1 AS __op` insert that flows through the regular sink
+/// path so the PK-applier consumes `.del` files.
+pub(crate) fn delete_managed_lake_table_by_predicate(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    delete_predicate_pb: DeletePredicatePb,
+) -> Result<(), String> {
+    // MV rejection before doing any txn work.
+    {
+        let managed = state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock");
+        let runtime = managed.table(database_name, table_name)?;
+        if matches!(
+            runtime.table.kind,
+            super::model::ManagedTableKind::MaterializedView
+        ) {
+            return Err(format!(
+                "The data of '{}.{}' cannot be deleted because it is a materialized view; \
+                 the data of materialized view must be consistent with the base table.",
+                database_name, table_name
+            ));
+        }
+    }
+
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database_name)?,
+        table: normalize_identifier(table_name)?,
+    };
+    let plan = load_physical_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    let tablet_ids: Vec<i64> = plan.tablets.iter().map(|t| t.tablet_id).collect();
+    if tablet_ids.is_empty() {
+        return Err(format!(
+            "managed table {database_name}.{table_name} active partition has no tablets"
+        ));
+    }
+
+    let prepared = prepare_managed_txn(state, &plan)?;
+
+    let abort = |txn_id: i64, err: String| -> String {
+        if let Err(abort_err) = mark_managed_txn_aborted(state, txn_id) {
+            return format!(
+                "managed delete failed: {err}; additionally mark_managed_txn_aborted failed: {abort_err}"
+            );
+        }
+        err
+    };
+
+    let request = DeleteDataRequest {
+        tablet_ids: tablet_ids.clone(),
+        txn_id: Some(prepared.txn_id),
+        delete_predicate: Some(delete_predicate_pb),
+        schema_key: Some(TableSchemaKeyPb {
+            db_id: Some(plan.db_id),
+            table_id: Some(plan.table_id),
+            schema_id: plan.tablet_schema.id,
+        }),
+    };
+
+    let response = crate::connector::starrocks::lake::transactions::delete_data(&request)
+        .map_err(|e| abort(prepared.txn_id, e))?;
+    if !response.failed_tablets.is_empty() {
+        return Err(abort(
+            prepared.txn_id,
+            format!("delete_data failed for tablets {:?}", response.failed_tablets),
+        ));
+    }
+
+    mark_managed_txn_written(state, prepared.txn_id)?;
+
+    publish_tablets_at_version(
+        tablet_ids,
+        prepared.txn_id,
+        prepared.base_version,
+        prepared.commit_version,
+    )
+    .map_err(|e| abort(prepared.txn_id, format!("managed delete publish failed: {e}")))?;
+
+    mark_managed_txn_visible(state, prepared.txn_id)?;
+
+    let mut managed = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    commit_catalog_visible_version(state, &mut managed, &plan, prepared.commit_version)?;
+    Ok(())
 }
 
 fn publish_managed_txn(

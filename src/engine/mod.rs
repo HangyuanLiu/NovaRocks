@@ -1630,6 +1630,7 @@ fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod delete_flow;
+pub(crate) mod delete_predicate_translate;
 pub(crate) mod equality_delete_flow;
 pub(crate) mod iceberg_expire_snapshots;
 pub(crate) mod iceberg_remove_orphan_files;
@@ -5175,12 +5176,42 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn managed_delete_rewrites_remaining_rows_for_primary_key_table() {
+    fn managed_pk_delete_via_op_column_path() {
         let _runtime_guard = lock_runtime_test_state();
         let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
             return;
         };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+        let session = engine.session();
 
+        session
+            .execute(
+                "create table t_pk (id bigint not null, payload string) primary key(id) \
+                 distributed by hash(id) buckets 2",
+            )
+            .expect("create pk");
+        session
+            .execute("insert into t_pk values (1,'a'),(2,'b'),(3,'c')")
+            .expect("insert");
+        session
+            .execute("delete from t_pk where id = 2")
+            .expect("delete pk row");
+
+        let remaining = session
+            .query("select id from t_pk order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
+    }
+
+    #[test]
+    fn managed_pk_delete_complex_where() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: Some(config_path),
         })
@@ -5188,25 +5219,88 @@ enable_path_style_access = true
         let session = engine.session();
         session
             .execute(
-                "create table t (k bigint not null, arr_0 array<bigint> not null, arr_1 array<bigint> null, arr_2 array<bigint> null) primary key(k) distributed by hash(k) buckets 1",
+                "create table t_pk_cmplx (id int not null, k int, label string) primary key(id) \
+                 distributed by hash(id) buckets 2",
             )
-            .expect("create managed primary key table");
+            .expect("create cmplx");
+        session
+            .execute("insert into t_pk_cmplx values (1,10,'x'),(2,20,'y'),(3,30,'z')")
+            .expect("insert");
+        session
+            .execute("delete from t_pk_cmplx where lower(label) = 'y'")
+            .expect("delete by function on non-key");
+        let remaining = session
+            .query("select id from t_pk_cmplx order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
+    }
+
+    #[test]
+    fn managed_pk_delete_then_insert_same_pk_visible() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+        let session = engine.session();
         session
             .execute(
-                "insert into t values (1, [1,2], [1,2],[2,3]), (2, [1,2], null, [2,3]), (3, [1,2],[1,2],null), (4, [1,2],[null,null],[2,3]), (5, [1], [1,2], [3])",
+                "create table t_pk_cycle (id int not null, label string) primary key(id) \
+                 distributed by hash(id) buckets 1",
             )
-            .expect("insert managed rows");
+            .expect("create cycle");
         session
-            .execute("delete from t where k = 5")
-            .expect("delete managed row");
+            .execute("insert into t_pk_cycle values (1, 'old')")
+            .expect("insert old");
+        session
+            .execute("delete from t_pk_cycle where id = 1")
+            .expect("delete old");
+        session
+            .execute("insert into t_pk_cycle values (1, 'new')")
+            .expect("insert new");
+        let r = session
+            .query("select id, label from t_pk_cycle")
+            .expect("query");
+        assert_eq!(
+            r.row_count(),
+            1,
+            "expected exactly one row after delete-then-insert"
+        );
+    }
 
+    #[test]
+    fn managed_dup_delete_via_delete_predicate_path() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+        let session = engine.session();
+        session
+            .execute(
+                "create table t_dup (id int, name string) duplicate key(id) \
+                 distributed by hash(id) buckets 2",
+            )
+            .expect("create dup");
+        session
+            .execute("insert into t_dup values (1, 'a'), (2, 'b'), (3, 'c')")
+            .expect("insert");
+        session
+            .execute("delete from t_dup where id = 2")
+            .expect("delete via predicate");
         let remaining = session
-            .query("select * from t order by k")
-            .expect("query remaining rows");
-        assert_eq!(remaining.row_count(), 4);
+            .query("select id from t_dup order by id")
+            .expect("query remaining");
+        assert_eq!(remaining.row_count(), 2);
         let deleted = session
-            .query("select k from t where k = 5")
-            .expect("query deleted row");
+            .query("select id from t_dup where id = 2")
+            .expect("query deleted");
         assert_eq!(deleted.row_count(), 0);
     }
 
@@ -6509,5 +6603,75 @@ enable_path_style_access = true
         );
 
         drop(engine);
+    }
+
+    #[test]
+    fn select_with_datetime_literal_matches_microsecond_precision() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+        let session = engine.session();
+
+        session
+            .execute(
+                "CREATE TABLE t_dt_coerce (c1 INT, c2 DATETIME) \
+                 DUPLICATE KEY(c1) DISTRIBUTED BY HASH(c1) BUCKETS 1 \
+                 PROPERTIES('replication_num'='1')",
+            )
+            .expect("create table");
+        session
+            .execute("INSERT INTO t_dt_coerce VALUES (4, '2020-01-01 00:00:00.012')")
+            .expect("insert row");
+
+        let r = session
+            .query("SELECT c1 FROM t_dt_coerce WHERE c2 = '2020-01-01 00:00:00.012'")
+            .expect("query with datetime literal");
+        assert_eq!(
+            r.row_count(),
+            1,
+            "implicit STRING→DATETIME coercion should match"
+        );
+    }
+
+    #[test]
+    fn select_with_datetime_literal_in_list_matches() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+        })
+        .expect("open engine");
+        let session = engine.session();
+
+        session
+            .execute(
+                "CREATE TABLE t_in_coerce (c1 INT, c2 DATETIME) \
+                 DUPLICATE KEY(c1) DISTRIBUTED BY HASH(c1) BUCKETS 1 \
+                 PROPERTIES('replication_num'='1')",
+            )
+            .expect("create");
+        session
+            .execute(
+                "INSERT INTO t_in_coerce VALUES \
+                 (1, '2020-01-01 00:00:00.001'), (2, '2020-01-01 00:00:00.002')",
+            )
+            .expect("insert");
+
+        let r = session
+            .query(
+                "SELECT c1 FROM t_in_coerce \
+                 WHERE c2 IN ('2020-01-01 00:00:00.001', '2020-01-01 00:00:00.002') \
+                 ORDER BY c1",
+            )
+            .expect("in list query");
+        assert_eq!(r.row_count(), 2);
     }
 }
