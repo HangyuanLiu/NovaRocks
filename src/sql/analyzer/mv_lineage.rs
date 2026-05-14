@@ -136,10 +136,10 @@ fn collect_column_refs(
             kind.saw_literal();
         }
         ExprKind::Cast { expr, .. } => {
-            // A CAST over a plain column is common in projection MVs (e.g.
-            // CAST(amount AS DOUBLE)); treat as Func so the kind reflects
-            // a non-trivial expression while still collecting the inner refs.
-            kind.saw_func();
+            // A CAST over a plain column or literal (e.g. CAST(amount AS DOUBLE))
+            // is a common projection; mark as cast so the kind can be classified
+            // as ExpressionKind::Cast when no other operations are present.
+            kind.saw_cast();
             collect_column_refs(expr, out, kind);
         }
         ExprKind::BinaryOp { left, right, .. } => {
@@ -217,6 +217,7 @@ struct ExpressionKindHint {
     saw_column: bool,
     saw_literal: bool,
     saw_func: bool,
+    saw_cast: bool,
 }
 
 impl ExpressionKindHint {
@@ -229,11 +230,17 @@ impl ExpressionKindHint {
     fn saw_func(&mut self) {
         self.saw_func = true;
     }
+    fn saw_cast(&mut self) {
+        self.saw_cast = true;
+    }
     fn into_kind(self) -> ExpressionKind {
-        match (self.saw_column, self.saw_literal, self.saw_func) {
-            (true, false, false) => ExpressionKind::Column,
-            (false, true, false) => ExpressionKind::Literal,
-            (false, false, true) => ExpressionKind::Func,
+        match (self.saw_column, self.saw_literal, self.saw_func, self.saw_cast) {
+            (true, false, false, false) => ExpressionKind::Column,
+            (false, true, false, false) => ExpressionKind::Literal,
+            (false, false, true, false) => ExpressionKind::Func,
+            // Cast over a column or literal with no other operations → Cast
+            (_, _, false, true) => ExpressionKind::Cast,
+            // All other combinations → Mixed
             _ => ExpressionKind::Mixed,
         }
     }
@@ -267,6 +274,45 @@ mod tests {
             ])
             .build()
             .expect("build schema")
+    }
+
+    #[test]
+    fn expression_kind_hint_cast_over_column_is_cast() {
+        let mut h = ExpressionKindHint::default();
+        h.saw_cast();
+        h.saw_column();
+        assert_eq!(h.into_kind(), ExpressionKind::Cast);
+    }
+
+    #[test]
+    fn expression_kind_hint_cast_over_literal_is_cast() {
+        let mut h = ExpressionKindHint::default();
+        h.saw_cast();
+        h.saw_literal();
+        assert_eq!(h.into_kind(), ExpressionKind::Cast);
+    }
+
+    #[test]
+    fn expression_kind_hint_cast_plus_func_is_mixed() {
+        let mut h = ExpressionKindHint::default();
+        h.saw_cast();
+        h.saw_func();
+        h.saw_column();
+        assert_eq!(h.into_kind(), ExpressionKind::Mixed);
+    }
+
+    #[test]
+    fn expression_kind_hint_pure_column_is_column() {
+        let mut h = ExpressionKindHint::default();
+        h.saw_column();
+        assert_eq!(h.into_kind(), ExpressionKind::Column);
+    }
+
+    #[test]
+    fn expression_kind_hint_pure_literal_is_literal() {
+        let mut h = ExpressionKindHint::default();
+        h.saw_literal();
+        assert_eq!(h.into_kind(), ExpressionKind::Literal);
     }
 
     #[test]
