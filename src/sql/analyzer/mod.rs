@@ -15,6 +15,7 @@ mod subquery_rewrite;
 pub mod alter_iceberg_ref;
 pub mod iceberg_metadata;
 pub mod iceberg_ref;
+pub(crate) mod mv_lineage;
 
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;

@@ -78,6 +78,12 @@ pub(crate) fn refresh_mv(
         }
     }
 
+    if stmt.full {
+        return Err(
+            "REFRESH MATERIALIZED VIEW ... FULL is only supported for Iceberg-backed materialized views".to_string(),
+        );
+    }
+
     let runtime = {
         let managed = state
             .managed_lake
@@ -2944,6 +2950,7 @@ enable_path_style_access = true
                 name: ObjectName {
                     parts: vec!["orders_mv".to_string()],
                 },
+                full: false,
             },
         )
         .expect_err("missing iceberg catalog should fail after stale progress cleanup");
@@ -2958,6 +2965,28 @@ enable_path_style_access = true
             .expect("mv definition");
         assert!(!mv.refresh_in_progress);
         assert!(mv.refresh_target_snapshots.is_empty());
+    }
+
+    #[test]
+    fn refresh_mv_rejects_full_for_managed_lake_mv() {
+        let (_dir, state, _table_id) = seed_mv_refresh_state();
+
+        let err = refresh_mv(
+            &state,
+            None,
+            "analytics",
+            &RefreshMaterializedViewStmt {
+                name: ObjectName {
+                    parts: vec!["orders_mv".to_string()],
+                },
+                full: true,
+            },
+        )
+        .expect_err("REFRESH FULL must be rejected for managed-lake MVs");
+        assert!(
+            err.contains("FULL is only supported for Iceberg-backed"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -3035,7 +3064,7 @@ enable_path_style_access = true
                         target_catalog: None,
                         target_namespace: None,
                         target_table: None,
-                        target_apply_key: None,
+                        schema_contract: None,
                         created_at_ms: super::super::mv_ddl::now_ms(),
                     },
                 )
@@ -3334,7 +3363,7 @@ enable_path_style_access = true
                         target_catalog: mv.target_catalog.clone(),
                         target_namespace: mv.target_namespace.clone(),
                         target_table: mv.target_table.clone(),
-                        target_apply_key: None,
+                        schema_contract: None,
                         created_at_ms: mv.created_at_ms,
                     },
                 )

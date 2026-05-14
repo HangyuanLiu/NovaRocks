@@ -198,6 +198,13 @@ fn build_iceberg_table_def_with_data_files(
 ) -> Result<TableDef, String> {
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let has_data_files = !data_files.is_empty();
+    // Row-lineage metadata columns (_row_id etc.) are only usable when every
+    // data file in the snapshot carries a first_row_id.  Files written by
+    // engines that do not support Iceberg v3 row-lineage (e.g. Spark 3.5 /
+    // iceberg-spark 1.8.1) leave first_row_id unset.  Advertising _row_id as a
+    // virtual column for such a snapshot would cause the lower to fail with
+    // "missing first_row_id" for every file that lacks it.
+    let all_files_have_first_row_id = data_files.iter().all(|f| f.first_row_id.is_some());
     let columns =
         hide_novarocks_mv_apply_key_columns(loaded.table.metadata(), loaded.columns.clone())?;
     let storage = if entry.is_s3() {
@@ -225,37 +232,51 @@ fn build_iceberg_table_def_with_data_files(
         register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
     };
 
-    let iceberg_row_lineage_metadata_columns =
-        if has_data_files && is_v3_row_lineage(loaded.table.metadata()) {
-            vec![
-                ColumnDef {
-                    name: "_file".to_string(),
-                    data_type: arrow::datatypes::DataType::Utf8,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_pos".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_row_id".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_last_updated_sequence_number".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-            ]
-        } else {
-            vec![]
-        };
+    let iceberg_row_lineage_metadata_columns = if has_data_files
+        && is_v3_row_lineage(loaded.table.metadata())
+        && all_files_have_first_row_id
+    {
+        vec![
+            ColumnDef {
+                name: "_file".to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_pos".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_row_id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+        ]
+    } else {
+        if has_data_files
+            && is_v3_row_lineage(loaded.table.metadata())
+            && !all_files_have_first_row_id
+        {
+            tracing::warn!(
+                table = %format!("{}.{}", namespace, table_name),
+                "iceberg table declares write.row-lineage=true but at least one data file lacks \
+                 first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number, \
+                 _file, _pos) are hidden — downstream features depending on row lineage \
+                 (e.g. IVM apply-key) will not see correct data for those rows"
+            );
+        }
+        vec![]
+    };
 
     Ok(TableDef {
         name: table_name.to_string(),

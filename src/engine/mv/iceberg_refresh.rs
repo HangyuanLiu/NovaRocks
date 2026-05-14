@@ -37,17 +37,16 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
     ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    ensure_target_apply_key_contract, extract_apply_key_values_from_chunks,
-    find_apply_key_field_id, iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
-    locate_target_rows_by_apply_key,
+    extract_apply_key_values_from_chunks, find_apply_key_field_id, iceberg_mv_physical_select_sql,
+    load_target_apply_locator_inputs, locate_target_rows_by_apply_key,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
 use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
-    MvRefreshState, MvTargetApplyKey, MvTargetApplyKeySource, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvDefinition, StoredMvRefresh,
+    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    StoredMvDefinition, StoredMvRefresh,
 };
 use crate::runtime::global_async_runtime::data_block_on;
 #[cfg(test)]
@@ -176,7 +175,13 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
 
-    // 3. Persist MV metadata in the repository.
+    // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
+    let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+        &analysis.resolved_query,
+        loaded_base.table.metadata().current_schema(),
+    )?;
+
+    // 4. Persist MV metadata in the repository.
     let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
     let created_at_ms = now_ms();
     if let Err(err) = (|| {
@@ -199,11 +204,71 @@ pub(crate) fn create_iceberg_mv(
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
-                    target_apply_key: Some(MvTargetApplyKey {
-                        column_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-                        field_id: actual_apply_key_field_id,
-                        source: MvTargetApplyKeySource::BaseRowId,
-                    }),
+                    schema_contract: {
+                        let contract = crate::meta::repository::mv_contract::MvSchemaContract {
+                            contract_version: 1,
+                            base: crate::meta::repository::mv_contract::BaseContract {
+                                table_fqn: base_ref.fqn(),
+                                table_uuid: loaded_base.table.metadata().uuid().to_string(),
+                                schema_id_at_create: loaded_base
+                                    .table
+                                    .metadata()
+                                    .current_schema_id(),
+                                schema_at_create:
+                                    crate::meta::repository::mv_contract::BaseSchemaSnapshot {
+                                        fields: lineage.base_fields.clone(),
+                                    },
+                            },
+                            output: crate::meta::repository::mv_contract::OutputContract {
+                                columns: lineage.output_columns.clone(),
+                                filter: lineage.filter.clone(),
+                            },
+                            target: crate::meta::repository::mv_contract::TargetContract {
+                                table_fqn: format!(
+                                    "{}.{}.{}",
+                                    target.catalog, target.namespace, target.table
+                                ),
+                                table_uuid: target_loaded.table.metadata().uuid().to_string(),
+                                schema_id_at_create: target_loaded
+                                    .table
+                                    .metadata()
+                                    .current_schema_id(),
+                                visible_columns: analysis
+                                    .output_columns
+                                    .iter()
+                                    .map(|col| {
+                                        let field = target_loaded
+                                            .table
+                                            .metadata()
+                                            .current_schema()
+                                            .as_struct()
+                                            .fields()
+                                            .iter()
+                                            .find(|f| f.name.eq_ignore_ascii_case(&col.name))
+                                            .expect("target schema was built from the same output_columns; name lookup cannot fail");
+                                        crate::meta::repository::mv_contract::TargetVisibleColumn {
+                                            output_name: col.name.clone(),
+                                            target_field_id: field.id,
+                                            type_signature: format!("{}", field.field_type),
+                                            nullable: !field.required,
+                                        }
+                                    })
+                                    .collect(),
+                                hidden_apply_key:
+                                    crate::meta::repository::mv_contract::HiddenApplyKeyContract {
+                                        column_name: crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                                        target_field_id: actual_apply_key_field_id,
+                                        source: crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
+                                    },
+                            },
+                        };
+                        contract
+                            .ensure_self_consistent()
+                            .map_err(|e| {
+                                format!("Iceberg MV schema contract is self-inconsistent: {e}")
+                            })?;
+                        Some(contract)
+                    },
                     created_at_ms,
                 },
             )
@@ -496,17 +561,61 @@ pub(crate) fn refresh_iceberg_mv(
 ) -> Result<StatementResult, String> {
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
+    if stmt.full {
+        return refresh_full_iceberg_mv(state, current_catalog, current_database, stmt, &target);
+    }
     recover_iceberg_mv_refreshes(state)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    let target_apply_key = mv_definition.target_apply_key.as_ref().ok_or_else(|| {
+    // Single base-table load shared by the A11 contract guard and the
+    // refresh flow below (Task 11: collapses the double load from Task 10).
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+    let [base_ref] = base_refs.as_slice() else {
+        return Err(
+            "iceberg materialized view refresh requires exactly one base table reference"
+                .to_string(),
+        );
+    };
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+
+    // A11 contract guard. Validate the full base ↔ output ↔ target
+    // contract before any incremental work. validate_schema_contract
+    // subsumes the earlier ensure_base_row_lineage_contract check
+    // (it already enforces v3 + row-lineage).
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
-            "iceberg MV target {}.{}.{} is missing target apply-key metadata; rebuild or recreate the MV",
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
             target.catalog, target.namespace, target.table
         )
     })?;
-    ensure_target_apply_key_contract(&target_loaded.table, target_apply_key)?;
+    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(format!("{err}"));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns,
+        } => {
+            tracing::info!(
+                target = ?target,
+                rebound = ?rebound_columns,
+                "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+            );
+            let rewritten_sql =
+                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+            let mut def = mv_definition.clone();
+            def.select_sql = rewritten_sql;
+            def
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+            mv_definition.clone()
+        }
+    };
+    let mv_definition = &effective_definition;
     let expected_main_snapshot_id = target_loaded
         .table
         .metadata()
@@ -518,18 +627,6 @@ pub(crate) fn refresh_iceberg_mv(
         uuid::Uuid::new_v4().simple()
     );
 
-    // We only handle single-base-table MVs in phase4a.
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let [base_ref] = base_refs.as_slice() else {
-        return Err(
-            "iceberg materialized view refresh requires exactly one base table reference"
-                .to_string(),
-        );
-    };
-
-    // Load the base iceberg table to get its current snapshot.
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    ensure_base_row_lineage_contract(&loaded.table, &base_ref.fqn())?;
     let current_snapshot_id = loaded
         .table
         .metadata()
@@ -581,7 +678,7 @@ pub(crate) fn refresh_iceberg_mv(
                 &staging_branch,
                 refresh_id,
                 current_database,
-                &mv_definition,
+                mv_definition,
                 base_ref,
                 cur,
                 &current_table_uuid,
@@ -598,7 +695,7 @@ pub(crate) fn refresh_iceberg_mv(
             );
             let snapshots = single_snapshot_map(base_ref, cur);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
-            let target_snapshot_id = recorded_target_snapshot_id(&target, &mv_definition)?;
+            let target_snapshot_id = recorded_target_snapshot_id(&target, mv_definition)?;
             let refresh_id =
                 begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
             finalize_iceberg_mv_refresh(
@@ -620,7 +717,7 @@ pub(crate) fn refresh_iceberg_mv(
             &iceberg_catalog,
             expected_main_snapshot_id,
             current_database,
-            &mv_definition,
+            mv_definition,
             base_ref,
             prev,
             cur,
@@ -635,6 +732,116 @@ pub(crate) fn refresh_iceberg_mv(
             target.catalog, target.namespace, target.table
         )),
     }
+}
+
+/// Full rebuild of an Iceberg-backed materialized view:
+/// 1. Drop the existing Iceberg target table.
+/// 2. Delete the MV definition from the repository.
+/// 3. Unregister the target from the standalone catalog.
+/// 4. Re-run `create_iceberg_mv` which rebuilds the A11 lineage from the
+///    current base schema, constructs a new `MvSchemaContract`, runs
+///    `ensure_self_consistent`, re-creates the target table, writes data,
+///    and persists fresh metadata atomically.
+///
+/// Non-atomicity note: the drop and the re-create are in separate
+/// transactions. If the second step fails, the MV will be gone until the
+/// user retries `REFRESH FULL` (which will then be a cold CREATE).
+fn refresh_full_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    target: &IcebergMvTarget,
+) -> Result<StatementResult, String> {
+    let mv_definition = load_iceberg_mv_definition_by_target(state, target)?;
+
+    // 1. Drop the existing Iceberg target table if it exists.
+    //    The pre-flight check makes this step idempotent: a previous FULL
+    //    refresh that dropped the table but failed before deleting the
+    //    definition will not hard-fail on a retry.
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&target.catalog)?
+    };
+    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
+        crate::connector::iceberg::catalog::registry::drop_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        // drop_table invalidates the catalog entry's table cache internally.
+    }
+
+    // 2. Delete the MV definition from the repository.
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for iceberg mv full refresh".to_string())?;
+    let mut txn = provider
+        .begin_write("drop iceberg materialized view definition for refresh full")
+        .map_err(|e| format!("open iceberg mv definition transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .drop_by_id(txn.as_mut(), mv_definition.mv_id)
+        .map_err(|e| format!("delete iceberg MV repository metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit delete iceberg MV repository metadata failed: {e}"))?;
+
+    // 3. Unregister the target from the standalone catalog so create_iceberg_mv
+    //    can re-register it without seeing a stale catalog entry.
+    crate::engine::query_prep::drop_registered_external_table(
+        state,
+        &target.namespace,
+        &target.table,
+    )?;
+
+    // 4. Re-parse the stored (already-canonicalized) SELECT SQL and reconstruct
+    //    a CreateMaterializedViewStmt context, then re-run create_iceberg_mv.
+    //    The select_sql is canonical: we use the same normalize+parse path as
+    //    iceberg_mv_physical_select_sql.
+    let normalized =
+        crate::sql::parser::dialect::normalize_for_raw_parse(&mv_definition.select_sql)
+            .map_err(|e| format!("re-normalize stored MV select_sql failed: {e}"))?;
+    let sqlparser_stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("re-parse stored MV select_sql failed: {e}"))?;
+    let select_query = match sqlparser_stmt {
+        sqlparser::ast::Statement::Query(q) => *q,
+        other => {
+            return Err(format!(
+                "MV definition select_sql is not a SELECT query: {other:?}"
+            ));
+        }
+    };
+    let recreate_stmt = CreateMaterializedViewStmt {
+        if_not_exists: false,
+        name: stmt.name.clone(),
+        // partition_by is not stored in StoredMvDefinition; if it was specified
+        // originally it is lost here. For A11 phase 1 (projection/filter MVs
+        // without custom partitioning) this is acceptable. See follow-up note.
+        partition_by: None,
+        distribution: None,
+        refresh_manual_explicit: false,
+        select_sql: mv_definition.select_sql.clone(),
+        select_query,
+        properties: vec![],
+        primary_key: if mv_definition.primary_key_columns.is_empty() {
+            None
+        } else {
+            Some(mv_definition.primary_key_columns.clone())
+        },
+    };
+
+    tracing::info!(
+        target = ?target,
+        mv_id = mv_definition.mv_id,
+        partition_by = "lost on refresh full; not stored in MV definition",
+        "iceberg mv full refresh: target dropped and definition deleted; re-running create_iceberg_mv",
+    );
+
+    create_iceberg_mv(state, current_catalog, current_database, &recreate_stmt)
 }
 
 fn load_iceberg_mv_definition_by_target(
@@ -1210,6 +1417,7 @@ fn ensure_iceberg_mv_staging_branch(
     .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
@@ -1576,6 +1784,7 @@ async fn commit_iceberg_mv_target_files(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_target_files_with_ref(
     table: &iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
@@ -1679,6 +1888,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_apply_with_ref(
     table: &iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
@@ -1937,8 +2147,7 @@ fn incremental_refresh_iceberg_mv(
             base_ref,
             added_files,
         )
-        .and_then(query_result_to_chunks)
-        .map_err(|err| err)?;
+        .and_then(query_result_to_chunks)?;
         (chunks, Vec::new())
     };
     let added_rows = chunks
@@ -2864,9 +3073,11 @@ mod tests {
         assert_eq!(
             find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
                 .expect("mv definition")
-                .target_apply_key
-                .expect("target apply key")
-                .field_id,
+                .schema_contract
+                .expect("schema contract")
+                .target
+                .hidden_apply_key
+                .target_field_id,
             3
         );
     }
@@ -4459,5 +4670,242 @@ mod tests {
             .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQL rewrite helper for CompatibleSafeWithRebind
+// ---------------------------------------------------------------------------
+
+/// Rewrite the stored MV SELECT SQL so that base column references use
+/// the column's current name (per `rebound_columns`) rather than the name
+/// captured at CREATE time. Only identifiers that appear at
+/// "column-reference" positions in the AST are rewritten; string literals
+/// and table identifiers are left alone.
+///
+/// `rebound_columns` is `[(field_id, name_at_create, current_name)]`.
+/// `field_id` is informational here — the rewrite is purely by
+/// case-insensitive name matching.
+///
+/// Limitation: this rewrite operates on the serialized SQL text, not on
+/// a bound semantic graph. If the stored MV SELECT contains subqueries,
+/// CTEs, or expressions where the same identifier appears in multiple
+/// roles (e.g. a base column shadowing a CTE alias), identifiers in all
+/// those positions will be rewritten. For A11 phase 1 (single-base
+/// projection/filter MVs, no CTEs, no subqueries), this is safe: A9's
+/// classification rejects unsupported shapes before reaching this code.
+pub(crate) fn rewrite_select_sql_for_rebind(
+    stored_sql: &str,
+    rebound_columns: &[(i32, String, String)],
+) -> Result<String, String> {
+    if rebound_columns.is_empty() {
+        return Ok(stored_sql.to_string());
+    }
+
+    let rename_map: std::collections::HashMap<String, String> = rebound_columns
+        .iter()
+        .map(|(_field_id, old_name, new_name)| (old_name.to_ascii_lowercase(), new_name.clone()))
+        .collect();
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
+        .map_err(|e| format!("rebind rewrite: normalize_for_raw_parse: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("rebind rewrite: parse: {e}"))?;
+
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("rebind rewrite: expected SELECT query".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("rebind rewrite: expected SELECT body".to_string());
+    };
+
+    // Rewrite projection.
+    for item in &mut select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                rewrite_expr_idents(e, &rename_map);
+            }
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
+                // Wildcards don't carry column names; left alone.
+            }
+        }
+    }
+
+    // Rewrite WHERE.
+    if let Some(filter) = &mut select.selection {
+        rewrite_expr_idents(filter, &rename_map);
+    }
+
+    // Note: GROUP BY / HAVING / ORDER BY are not rewritten because A11 phase 1
+    // MV shape is projection/filter only. A9's classification rejects MVs with
+    // aggregates / window / order-by before reaching this code path.
+
+    Ok(stmt.to_string())
+}
+
+fn rewrite_expr_idents(
+    expr: &mut sqlparser::ast::Expr,
+    rename_map: &std::collections::HashMap<String, String>,
+) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => {
+            if let Some(new_name) = rename_map.get(&ident.value.to_ascii_lowercase()) {
+                ident.value = new_name.clone();
+            }
+        }
+        Expr::CompoundIdentifier(parts) => {
+            // Only rewrite the last part (the column name), not table/schema
+            // qualifiers.
+            if let Some(last) = parts.last_mut()
+                && let Some(new_name) = rename_map.get(&last.value.to_ascii_lowercase())
+            {
+                last.value = new_name.clone();
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_idents(left, rename_map);
+            rewrite_expr_idents(right, rename_map);
+        }
+        Expr::UnaryOp { expr, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+        }
+        Expr::Cast { expr, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+        }
+        Expr::Nested(inner) => {
+            rewrite_expr_idents(inner, rename_map);
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = arg
+                    {
+                        rewrite_expr_idents(inner, rename_map);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                rewrite_expr_idents(op, rename_map);
+            }
+            for c in conditions {
+                rewrite_expr_idents(&mut c.condition, rename_map);
+                rewrite_expr_idents(&mut c.result, rename_map);
+            }
+            if let Some(e) = else_result {
+                rewrite_expr_idents(e, rename_map);
+            }
+        }
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => {
+            rewrite_expr_idents(inner, rename_map);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+            for e in list {
+                rewrite_expr_idents(e, rename_map);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_expr_idents(expr, rename_map);
+            rewrite_expr_idents(low, rename_map);
+            rewrite_expr_idents(high, rename_map);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+            rewrite_expr_idents(pattern, rename_map);
+        }
+        // Other variants (Subquery, Tuple, Array, etc.) are not expected in
+        // A11 phase 1 projection/filter MVs. Leave them alone — if they
+        // contain unrewritten column refs, the analyzer will surface a clear
+        // error.
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_no_rebind_returns_input_unchanged() {
+        let sql = "SELECT id, region FROM base WHERE region = 'US'";
+        let rewritten = rewrite_select_sql_for_rebind(sql, &[]).unwrap();
+        assert_eq!(rewritten, sql);
+    }
+
+    #[test]
+    fn rewrite_renames_column_in_projection_and_where() {
+        let sql = "SELECT id, region, amount FROM base WHERE region = 'US'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        // After rewrite, 'region' is replaced with 'area' in both
+        // projection and WHERE clause. The literal 'US' is unchanged.
+        assert!(
+            rewritten.contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_lowercase().contains("region"),
+            "expected no 'region' in: {rewritten}"
+        );
+        assert!(rewritten.contains("'US'"));
+    }
+
+    #[test]
+    fn rewrite_preserves_string_literals_matching_old_name() {
+        let sql = "SELECT id FROM base WHERE region = 'region'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        // The literal 'region' (string value) must be preserved.
+        assert!(
+            rewritten.contains("'region'"),
+            "string literal should not be rewritten: {rewritten}"
+        );
+        // But the column ref `region` in WHERE LHS gets rewritten to `area`.
+        assert!(rewritten.contains("area"));
+    }
+
+    #[test]
+    fn rewrite_is_case_insensitive_on_old_name() {
+        let sql = "SELECT id, REGION FROM base";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        assert!(
+            rewritten.to_ascii_lowercase().contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_handles_compound_identifier() {
+        let sql = "SELECT base.id, base.region FROM base WHERE base.region = 'US'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        assert!(
+            rewritten.contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_lowercase().contains(".region"),
+            "expected no '.region' in: {rewritten}"
+        );
     }
 }

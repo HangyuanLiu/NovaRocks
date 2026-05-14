@@ -1,0 +1,12 @@
+-- query 4
+id	region	amount
+1	US	100
+2	EU	50
+3	AP	300
+
+-- query 8
+id	region	amount
+1	US	100
+2	EU	50
+3	AP	300
+4	US	400
