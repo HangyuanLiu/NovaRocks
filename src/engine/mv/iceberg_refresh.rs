@@ -566,10 +566,21 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
+    // Single base-table load shared by the A11 contract guard and the
+    // refresh flow below (Task 11: collapses the double load from Task 10).
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+    let [base_ref] = base_refs.as_slice() else {
+        return Err(
+            "iceberg materialized view refresh requires exactly one base table reference"
+                .to_string(),
+        );
+    };
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+
     // A11 contract guard. Validate the full base ↔ output ↔ target
-    // contract before any incremental work. This subsumes A9's
-    // ensure_target_apply_key_contract / ensure_base_row_lineage_contract
-    // checks at this site (Task 10).
+    // contract before any incremental work. validate_schema_contract
+    // subsumes the earlier ensure_base_row_lineage_contract check
+    // (it already enforces v3 + row-lineage).
     let schema_contract = mv_definition
         .schema_contract
         .as_ref()
@@ -579,17 +590,9 @@ pub(crate) fn refresh_iceberg_mv(
                 target.catalog, target.namespace, target.table
             )
         })?;
-    let base_refs_parsed = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let [base_for_guard_ref] = base_refs_parsed.as_slice() else {
-        return Err(
-            "iceberg materialized view refresh requires exactly one base table reference"
-                .to_string(),
-        );
-    };
-    let base_for_guard = load_current_iceberg_base_table(state, base_for_guard_ref)?;
     match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
-        &base_for_guard.table,
+        &loaded.table,
         &target_loaded.table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
@@ -617,18 +620,6 @@ pub(crate) fn refresh_iceberg_mv(
         uuid::Uuid::new_v4().simple()
     );
 
-    // We only handle single-base-table MVs in phase4a.
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let [base_ref] = base_refs.as_slice() else {
-        return Err(
-            "iceberg materialized view refresh requires exactly one base table reference"
-                .to_string(),
-        );
-    };
-
-    // Load the base iceberg table to get its current snapshot.
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    ensure_base_row_lineage_contract(&loaded.table, &base_ref.fqn())?;
     let current_snapshot_id = loaded
         .table
         .metadata()
