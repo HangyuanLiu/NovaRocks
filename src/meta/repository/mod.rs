@@ -8,6 +8,7 @@ pub mod job;
 pub mod managed_lake;
 pub mod managed_txn;
 pub mod mv;
+pub mod mv_contract;
 
 pub use crate::meta::payload::{decode_json_payload, encode_json_payload};
 
