@@ -107,15 +107,74 @@ fn path_covers(prefix: &str, target: &str) -> bool {
 }
 
 fn parse_bucket_from_object_store_path(path: &str) -> Option<&str> {
+    split_object_store_path(path).map(|(bucket, _)| bucket)
+}
+
+fn split_object_store_path(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim();
     let rest = trimmed
         .strip_prefix("s3://")
         .or_else(|| trimmed.strip_prefix("oss://"))?;
-    let bucket = rest.split('/').next()?.trim();
+    let mut parts = rest.splitn(2, '/');
+    let bucket = parts.next()?.trim();
     if bucket.is_empty() {
-        None
+        return None;
+    }
+    let key = parts.next().unwrap_or_default().trim_matches('/');
+    Some((bucket, key))
+}
+
+fn key_matches_root(key: &str, root: &str) -> bool {
+    let root = root.trim_matches('/');
+    if root.is_empty() {
+        return true;
+    }
+    key == root
+        || key
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn s3_config_covers_path(cfg: &S3StoreConfig, path: &str) -> bool {
+    let Some((bucket, key)) = split_object_store_path(path) else {
+        return false;
+    };
+    cfg.bucket == bucket && key_matches_root(key, &cfg.root)
+}
+
+fn choose_unique_config(
+    selected: &mut Option<S3StoreConfig>,
+    has_conflict: &mut bool,
+    cfg: &S3StoreConfig,
+) {
+    match selected.as_ref() {
+        None => *selected = Some(cfg.clone()),
+        Some(existing) if existing == cfg => {}
+        Some(_) => *has_conflict = true,
+    }
+}
+
+fn choose_best_covering_config(
+    best: &mut Option<(usize, S3StoreConfig)>,
+    cfg: &S3StoreConfig,
+    path: &str,
+) {
+    if !s3_config_covers_path(cfg, path) {
+        return;
+    }
+    let score = cfg.root.trim_matches('/').len();
+    match best.as_ref() {
+        Some((best_score, _)) if *best_score >= score => {}
+        _ => *best = Some((score, cfg.clone())),
+    }
+}
+
+fn preserve_s3_for_path(old: Option<&StarletShardInfo>, full_path: &str) -> Option<S3StoreConfig> {
+    let cfg = old.and_then(|old| old.s3.clone())?;
+    if s3_config_covers_path(&cfg, full_path) {
+        Some(cfg)
     } else {
-        Some(bucket)
+        None
     }
 }
 
@@ -146,7 +205,7 @@ pub(crate) fn upsert_many_infos(
         let Some(full_path) = normalize_full_path(&info.full_path) else {
             continue;
         };
-        let preserved_s3 = guard.active.get(&tablet_id).and_then(|old| old.s3.clone());
+        let preserved_s3 = preserve_s3_for_path(guard.active.get(&tablet_id), &full_path);
         guard.active.insert(
             tablet_id,
             StarletShardInfo {
@@ -257,22 +316,35 @@ pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
 
     let target_bucket = parse_bucket_from_object_store_path(path);
     let guard = shard_registry().lock().ok()?;
-    let mut unique_cfg: Option<S3StoreConfig> = None;
-    let mut has_conflict = false;
+    let mut covering_cfg: Option<(usize, S3StoreConfig)> = None;
+    let mut bucket_unique_cfg: Option<S3StoreConfig> = None;
+    let mut bucket_has_conflict = false;
+    let mut global_unique_cfg: Option<S3StoreConfig> = None;
+    let mut global_has_conflict = false;
     for info in guard.active.values() {
         let Some(cfg) = info.s3.as_ref() else {
             continue;
         };
-        if target_bucket.is_some_and(|bucket| cfg.bucket == bucket) {
-            return Some(cfg.clone());
-        }
-        match unique_cfg.as_ref() {
-            None => unique_cfg = Some(cfg.clone()),
-            Some(existing) if existing == cfg => {}
-            Some(_) => has_conflict = true,
+        choose_best_covering_config(&mut covering_cfg, cfg, path);
+        if let Some(bucket) = target_bucket {
+            if cfg.bucket == bucket {
+                choose_unique_config(&mut bucket_unique_cfg, &mut bucket_has_conflict, cfg);
+            }
+        } else {
+            choose_unique_config(&mut global_unique_cfg, &mut global_has_conflict, cfg);
         }
     }
-    if !has_conflict && let Some(cfg) = unique_cfg {
+
+    if let Some((_, cfg)) = covering_cfg {
+        return Some(cfg);
+    }
+    if target_bucket.is_some() {
+        if !bucket_has_conflict && let Some(cfg) = bucket_unique_cfg {
+            return Some(cfg);
+        }
+        return None;
+    }
+    if !global_has_conflict && let Some(cfg) = global_unique_cfg {
         return Some(cfg);
     }
     None
@@ -402,6 +474,88 @@ mod tests {
             .expect("infer config by bucket");
         assert_eq!(cfg.bucket, bucket);
         assert_eq!(cfg.access_key_id, "ak");
+    }
+
+    #[test]
+    fn path_update_drops_s3_config_that_no_longer_covers_path() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let _ = upsert_many_infos(vec![(
+            3002,
+            StarletShardInfo {
+                full_path: "s3://bucket-infer-3002/old/root/tablet-3002".to_string(),
+                s3: Some(S3StoreConfig {
+                    endpoint: "http://127.0.0.1:9000".to_string(),
+                    bucket: "bucket-infer-3002".to_string(),
+                    root: "old/root".to_string(),
+                    access_key_id: "ak_old".to_string(),
+                    access_key_secret: "sk_old".to_string(),
+                    region: Some("us-east-1".to_string()),
+                    enable_path_style_access: Some(true),
+                }),
+            },
+        )]);
+
+        let updated = upsert_many(vec![(
+            3002,
+            "s3://bucket-infer-3002/new/root/tablet-3002".to_string(),
+        )]);
+        assert_eq!(updated, 1);
+
+        let infos = select_infos(&[3002]);
+        let info = infos.get(&3002).expect("updated shard should exist");
+        assert_eq!(
+            info.full_path,
+            "s3://bucket-infer-3002/new/root/tablet-3002"
+        );
+        assert!(
+            info.s3.is_none(),
+            "stale S3 config from old root must not survive path update"
+        );
+    }
+
+    #[test]
+    fn infer_s3_config_does_not_guess_when_bucket_has_conflicting_roots() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let bucket = "bucket-infer-3003";
+        let _ = upsert_many_infos(vec![
+            (
+                3003,
+                StarletShardInfo {
+                    full_path: format!("s3://{bucket}/old/root/tablet-3003"),
+                    s3: Some(S3StoreConfig {
+                        endpoint: "http://127.0.0.1:9000".to_string(),
+                        bucket: bucket.to_string(),
+                        root: "old/root".to_string(),
+                        access_key_id: "ak_old".to_string(),
+                        access_key_secret: "sk_old".to_string(),
+                        region: Some("us-east-1".to_string()),
+                        enable_path_style_access: Some(true),
+                    }),
+                },
+            ),
+            (
+                3004,
+                StarletShardInfo {
+                    full_path: format!("s3://{bucket}/other/root/tablet-3004"),
+                    s3: Some(S3StoreConfig {
+                        endpoint: "http://127.0.0.1:9000".to_string(),
+                        bucket: bucket.to_string(),
+                        root: "other/root".to_string(),
+                        access_key_id: "ak_other".to_string(),
+                        access_key_secret: "sk_other".to_string(),
+                        region: Some("us-east-1".to_string()),
+                        enable_path_style_access: Some(true),
+                    }),
+                },
+            ),
+        ]);
+
+        assert!(
+            infer_s3_config_for_path(&format!("s3://{bucket}/new/root/tablet-3005")).is_none(),
+            "same-bucket fallback is unsafe when multiple roots are present"
+        );
     }
 
     #[test]
