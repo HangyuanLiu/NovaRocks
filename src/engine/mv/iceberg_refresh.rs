@@ -566,7 +566,46 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    // TODO(A11-Task-10): call validate_schema_contract here.
+    // A11 contract guard. Validate the full base ↔ output ↔ target
+    // contract before any incremental work. This subsumes A9's
+    // ensure_target_apply_key_contract / ensure_base_row_lineage_contract
+    // checks at this site (Task 10).
+    let schema_contract = mv_definition
+        .schema_contract
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    let base_refs_parsed = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+    let [base_for_guard_ref] = base_refs_parsed.as_slice() else {
+        return Err(
+            "iceberg materialized view refresh requires exactly one base table reference"
+                .to_string(),
+        );
+    };
+    let base_for_guard = load_current_iceberg_base_table(state, base_for_guard_ref)?;
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &base_for_guard.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(format!("{err}"));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns,
+        } => {
+            tracing::info!(
+                target = ?target,
+                rebound = ?rebound_columns,
+                "iceberg MV refresh: base columns rebound by field id; continuing",
+            );
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
+    }
     let expected_main_snapshot_id = target_loaded
         .table
         .metadata()
