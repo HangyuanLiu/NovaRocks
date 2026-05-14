@@ -263,6 +263,18 @@ fn build_iceberg_table_def_with_data_files(
             },
         ]
     } else {
+        if has_data_files
+            && is_v3_row_lineage(loaded.table.metadata())
+            && !all_files_have_first_row_id
+        {
+            tracing::warn!(
+                table = %format!("{}.{}", namespace, table_name),
+                "iceberg table declares write.row-lineage=true but at least one data file lacks \
+                 first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number, \
+                 _file, _pos) are hidden — downstream features depending on row lineage \
+                 (e.g. IVM apply-key) will not see correct data for those rows"
+            );
+        }
         vec![]
     };
 
