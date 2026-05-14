@@ -105,6 +105,7 @@ pub enum ContractSelfCheckError {
     OutputTargetLenMismatch { output_len: usize, target_len: usize },
     HiddenApplyKeyColumnNameWrong { expected: String, actual: String },
     OutputReferencesUnknownBaseFieldId { output_index: usize, field_id: i32 },
+    FilterReferencesUnknownBaseFieldId { field_id: i32 },
     EmptyBaseTableUuid,
     NegativeBaseSchemaId(i32),
     DuplicateBaseFieldIdWithDifferentType { field_id: i32, first: String, second: String },
@@ -122,6 +123,9 @@ impl std::fmt::Display for ContractSelfCheckError {
             Self::OutputReferencesUnknownBaseFieldId { output_index, field_id } => {
                 write!(f, "MV contract output column #{output_index} references base field id {field_id} that is not in base.schema_at_create")
             }
+            Self::FilterReferencesUnknownBaseFieldId { field_id } => {
+                write!(f, "MV contract WHERE filter references base field id {field_id} that is not in base.schema_at_create")
+            }
             Self::EmptyBaseTableUuid => write!(f, "MV contract base.table_uuid is empty"),
             Self::NegativeBaseSchemaId(id) => write!(f, "MV contract base.schema_id_at_create is negative: {id}"),
             Self::DuplicateBaseFieldIdWithDifferentType { field_id, first, second } => {
@@ -130,6 +134,8 @@ impl std::fmt::Display for ContractSelfCheckError {
         }
     }
 }
+
+impl std::error::Error for ContractSelfCheckError {}
 
 pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
 
@@ -178,8 +184,7 @@ impl MvSchemaContract {
         if let Some(filter) = &self.output.filter {
             for fid in &filter.referenced_base_field_ids {
                 if !known_field_ids.contains(fid) {
-                    return Err(ContractSelfCheckError::OutputReferencesUnknownBaseFieldId {
-                        output_index: usize::MAX, // sentinel for filter
+                    return Err(ContractSelfCheckError::FilterReferencesUnknownBaseFieldId {
                         field_id: *fid,
                     });
                 }
@@ -306,6 +311,18 @@ mod tests {
         assert!(matches!(
             c.ensure_self_consistent(),
             Err(ContractSelfCheckError::EmptyBaseTableUuid)
+        ));
+    }
+
+    #[test]
+    fn self_check_rejects_filter_referencing_unknown_field_id() {
+        let mut c = sample_contract();
+        c.output.filter = Some(FilterLineage {
+            referenced_base_field_ids: vec![999],
+        });
+        assert!(matches!(
+            c.ensure_self_consistent(),
+            Err(ContractSelfCheckError::FilterReferencesUnknownBaseFieldId { field_id: 999 })
         ));
     }
 }
