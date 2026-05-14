@@ -751,7 +751,10 @@ fn refresh_full_iceberg_mv(
 ) -> Result<StatementResult, String> {
     let mv_definition = load_iceberg_mv_definition_by_target(state, target)?;
 
-    // 1. Drop the existing Iceberg target table.
+    // 1. Drop the existing Iceberg target table if it exists.
+    //    The pre-flight check makes this step idempotent: a previous FULL
+    //    refresh that dropped the table but failed before deleting the
+    //    definition will not hard-fail on a retry.
     let entry = {
         let catalogs = state
             .iceberg_catalogs
@@ -759,12 +762,14 @@ fn refresh_full_iceberg_mv(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         catalogs.get(&target.catalog)?
     };
-    crate::connector::iceberg::catalog::registry::drop_table(
-        &entry,
-        &target.namespace,
-        &target.table,
-    )?;
-    entry.invalidate_table_cache(&target.namespace, &target.table);
+    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
+        crate::connector::iceberg::catalog::registry::drop_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        // drop_table invalidates the catalog entry's table cache internally.
+    }
 
     // 2. Delete the MV definition from the repository.
     let provider = state
@@ -828,6 +833,7 @@ fn refresh_full_iceberg_mv(
     tracing::info!(
         target = ?target,
         mv_id = mv_definition.mv_id,
+        partition_by = "lost on refresh full; not stored in MV definition",
         "iceberg mv full refresh: target dropped and definition deleted; re-running create_iceberg_mv",
     );
 
