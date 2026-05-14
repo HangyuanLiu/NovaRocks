@@ -347,6 +347,12 @@ pub(crate) fn parse_refresh_materialized_view(
 
     let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
 
+    // Optional FULL keyword: `REFRESH MATERIALIZED VIEW <name> FULL [WITH SYNC MODE]`.
+    let full = peek_word_eq(parser, 0, "FULL") && {
+        parser.next_token();
+        true
+    };
+
     if parser.parse_keyword(Keyword::PARTITION) {
         return Err(
             "REFRESH MATERIALIZED VIEW ... PARTITION START(...) END(...) is not supported yet"
@@ -373,7 +379,7 @@ pub(crate) fn parse_refresh_materialized_view(
     }
 
     Ok(Statement::RefreshMaterializedView(
-        RefreshMaterializedViewStmt { name },
+        RefreshMaterializedViewStmt { name, full },
     ))
 }
 
@@ -604,6 +610,7 @@ mod tests {
         match stmt {
             Statement::RefreshMaterializedView(r) => {
                 assert_eq!(r.name.parts, vec!["mv1"]);
+                assert!(!r.full, "expected full=false for plain REFRESH WITH SYNC MODE");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -617,6 +624,42 @@ mod tests {
             err.to_lowercase().contains("async") || err.to_lowercase().contains("not supported"),
             "err={err}"
         );
+    }
+
+    #[test]
+    fn parse_refresh_mv_full_sets_full_flag() {
+        let stmt = parse_one("REFRESH MATERIALIZED VIEW foo FULL");
+        match stmt {
+            Statement::RefreshMaterializedView(r) => {
+                assert!(r.full, "expected full=true for REFRESH ... FULL");
+                assert_eq!(r.name.parts, vec!["foo"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_mv_without_full_has_full_false() {
+        let stmt = parse_one("REFRESH MATERIALIZED VIEW foo");
+        match stmt {
+            Statement::RefreshMaterializedView(r) => {
+                assert!(!r.full, "expected full=false for plain REFRESH");
+                assert_eq!(r.name.parts, vec!["foo"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_mv_full_with_sync_mode() {
+        let stmt = parse_one("REFRESH MATERIALIZED VIEW foo FULL WITH SYNC MODE");
+        match stmt {
+            Statement::RefreshMaterializedView(r) => {
+                assert!(r.full, "expected full=true");
+                assert_eq!(r.name.parts, vec!["foo"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

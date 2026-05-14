@@ -5337,6 +5337,7 @@ enable_path_style_access = true
                     name: crate::sql::parser::ast::ObjectName {
                         parts: vec!["analytics".to_string(), "orders_mv".to_string()],
                     },
+                    full: false,
                 },
             ),
         )

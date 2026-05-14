@@ -2944,6 +2944,7 @@ enable_path_style_access = true
                 name: ObjectName {
                     parts: vec!["orders_mv".to_string()],
                 },
+                full: false,
             },
         )
         .expect_err("missing iceberg catalog should fail after stale progress cleanup");

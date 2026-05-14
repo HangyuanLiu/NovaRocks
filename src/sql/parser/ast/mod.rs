@@ -127,6 +127,10 @@ pub(crate) struct DropMaterializedViewStmt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshMaterializedViewStmt {
     pub name: ObjectName,
+    /// `true` when `REFRESH MATERIALIZED VIEW <name> FULL` was parsed.
+    /// Full rebuild drops the existing target, deletes the MV definition, then
+    /// re-runs `create_iceberg_mv` to regenerate the A11 schema contract.
+    pub full: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
