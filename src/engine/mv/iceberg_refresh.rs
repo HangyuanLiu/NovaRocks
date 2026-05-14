@@ -176,7 +176,13 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
 
-    // 3. Persist MV metadata in the repository.
+    // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
+    let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+        &analysis.resolved_query,
+        &**loaded_base.table.metadata().current_schema(),
+    )?;
+
+    // 4. Persist MV metadata in the repository.
     let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
     let created_at_ms = now_ms();
     if let Err(err) = (|| {
@@ -211,24 +217,12 @@ pub(crate) fn create_iceberg_mv(
                                     .current_schema_id(),
                                 schema_at_create:
                                     crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                                        fields: Vec::new(), // populated in Task 8
+                                        fields: lineage.base_fields.clone(),
                                     },
                             },
                             output: crate::meta::repository::mv_contract::OutputContract {
-                                columns: analysis
-                                    .output_columns
-                                    .iter()
-                                    .map(|_| {
-                                        crate::meta::repository::mv_contract::OutputColumnLineage {
-                                            expression:
-                                                crate::meta::repository::mv_contract::ExpressionLineage {
-                                                    kind: crate::meta::repository::mv_contract::ExpressionKind::Column,
-                                                    referenced_base_field_ids: Vec::new(), // populated in Task 8
-                                                },
-                                        }
-                                    })
-                                    .collect(),
-                                filter: None, // populated in Task 8
+                                columns: lineage.output_columns.clone(),
+                                filter: lineage.filter.clone(),
                             },
                             target: crate::meta::repository::mv_contract::TargetContract {
                                 table_fqn: format!(
