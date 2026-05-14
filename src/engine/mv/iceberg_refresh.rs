@@ -562,7 +562,26 @@ pub(crate) fn refresh_iceberg_mv(
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     if stmt.full {
-        return refresh_full_iceberg_mv(state, current_catalog, current_database, stmt, &target);
+        // REFRESH FULL is intentionally disabled. The previous implementation
+        // dropped the target table, deleted the MV definition, and re-ran
+        // create_iceberg_mv — but create_iceberg_mv leaves the new target
+        // empty, so the user-visible effect was "MV is now empty" rather
+        // than the intuitive "MV is fully repopulated". On top of that the
+        // operation was non-atomic and silently lost partition_by metadata.
+        // This is too misleading to ship as a single keyword and needs a
+        // ground-up redesign (clearer name like REBUILD, atomic semantics,
+        // explicit data-repopulation step, full DDL preservation).
+        //
+        // Until that redesign lands, fail fast and require the operator to
+        // do the recovery by hand — no silent high-risk side effects.
+        return Err(
+            "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+             its previous behavior (drop target + delete definition + recreate empty target) \
+             was misleading and non-atomic. To recover from a broken contract or corrupted \
+             target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
+             REFRESH MATERIALIZED VIEW <name>; manually."
+                .to_string(),
+        );
     }
     recover_iceberg_mv_refreshes(state)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -734,115 +753,21 @@ pub(crate) fn refresh_iceberg_mv(
     }
 }
 
-/// Full rebuild of an Iceberg-backed materialized view:
-/// 1. Drop the existing Iceberg target table.
-/// 2. Delete the MV definition from the repository.
-/// 3. Unregister the target from the standalone catalog.
-/// 4. Re-run `create_iceberg_mv` which rebuilds the A11 lineage from the
-///    current base schema, constructs a new `MvSchemaContract`, runs
-///    `ensure_self_consistent`, re-creates the target table, writes data,
-///    and persists fresh metadata atomically.
-///
-/// Non-atomicity note: the drop and the re-create are in separate
-/// transactions. If the second step fails, the MV will be gone until the
-/// user retries `REFRESH FULL` (which will then be a cold CREATE).
-fn refresh_full_iceberg_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    target: &IcebergMvTarget,
-) -> Result<StatementResult, String> {
-    let mv_definition = load_iceberg_mv_definition_by_target(state, target)?;
-
-    // 1. Drop the existing Iceberg target table if it exists.
-    //    The pre-flight check makes this step idempotent: a previous FULL
-    //    refresh that dropped the table but failed before deleting the
-    //    definition will not hard-fail on a retry.
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
-    };
-    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
-        crate::connector::iceberg::catalog::registry::drop_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
-        // drop_table invalidates the catalog entry's table cache internally.
-    }
-
-    // 2. Delete the MV definition from the repository.
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "metadata provider required for iceberg mv full refresh".to_string())?;
-    let mut txn = provider
-        .begin_write("drop iceberg materialized view definition for refresh full")
-        .map_err(|e| format!("open iceberg mv definition transaction failed: {e}"))?;
-    state
-        .mv_repo
-        .drop_by_id(txn.as_mut(), mv_definition.mv_id)
-        .map_err(|e| format!("delete iceberg MV repository metadata failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit delete iceberg MV repository metadata failed: {e}"))?;
-
-    // 3. Unregister the target from the standalone catalog so create_iceberg_mv
-    //    can re-register it without seeing a stale catalog entry.
-    crate::engine::query_prep::drop_registered_external_table(
-        state,
-        &target.namespace,
-        &target.table,
-    )?;
-
-    // 4. Re-parse the stored (already-canonicalized) SELECT SQL and reconstruct
-    //    a CreateMaterializedViewStmt context, then re-run create_iceberg_mv.
-    //    The select_sql is canonical: we use the same normalize+parse path as
-    //    iceberg_mv_physical_select_sql.
-    let normalized =
-        crate::sql::parser::dialect::normalize_for_raw_parse(&mv_definition.select_sql)
-            .map_err(|e| format!("re-normalize stored MV select_sql failed: {e}"))?;
-    let sqlparser_stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("re-parse stored MV select_sql failed: {e}"))?;
-    let select_query = match sqlparser_stmt {
-        sqlparser::ast::Statement::Query(q) => *q,
-        other => {
-            return Err(format!(
-                "MV definition select_sql is not a SELECT query: {other:?}"
-            ));
-        }
-    };
-    let recreate_stmt = CreateMaterializedViewStmt {
-        if_not_exists: false,
-        name: stmt.name.clone(),
-        // partition_by is not stored in StoredMvDefinition; if it was specified
-        // originally it is lost here. For A11 phase 1 (projection/filter MVs
-        // without custom partitioning) this is acceptable. See follow-up note.
-        partition_by: None,
-        distribution: None,
-        refresh_manual_explicit: false,
-        select_sql: mv_definition.select_sql.clone(),
-        select_query,
-        properties: vec![],
-        primary_key: if mv_definition.primary_key_columns.is_empty() {
-            None
-        } else {
-            Some(mv_definition.primary_key_columns.clone())
-        },
-    };
-
-    tracing::info!(
-        target = ?target,
-        mv_id = mv_definition.mv_id,
-        partition_by = "lost on refresh full; not stored in MV definition",
-        "iceberg mv full refresh: target dropped and definition deleted; re-running create_iceberg_mv",
-    );
-
-    create_iceberg_mv(state, current_catalog, current_database, &recreate_stmt)
-}
+// Previous implementation of REFRESH FULL — `refresh_full_iceberg_mv` —
+// was removed. It dropped the target table + deleted the MV definition +
+// re-ran create_iceberg_mv (which leaves the new target empty), and the
+// drop and the create were in separate transactions. The user-visible
+// outcome was misleading ("MV is now empty" rather than "MV is fully
+// repopulated") and the operation could leave behind an inconsistent
+// state on partial failure. It also silently dropped partition_by.
+//
+// Re-introduce only after a redesign that clarifies:
+//   - the keyword name (probably REBUILD rather than REFRESH FULL),
+//   - atomic drop+create+populate semantics,
+//   - a deterministic data-repopulation step,
+//   - faithful preservation of the original DDL (partition_by,
+//     distribution, properties).
+// See the rejection in refresh_iceberg_mv for the user-facing error.
 
 fn load_iceberg_mv_definition_by_target(
     state: &Arc<StandaloneState>,

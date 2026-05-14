@@ -79,8 +79,17 @@ pub(crate) fn refresh_mv(
     }
 
     if stmt.full {
+        // REFRESH FULL is universally disabled pending redesign — see the
+        // matching rejection in iceberg_refresh::refresh_iceberg_mv for the
+        // rationale. Both backends produce the same error so behavior is
+        // consistent regardless of MV storage engine.
         return Err(
-            "REFRESH MATERIALIZED VIEW ... FULL is only supported for Iceberg-backed materialized views".to_string(),
+            "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+             its previous behavior (drop target + delete definition + recreate empty target) \
+             was misleading and non-atomic. To recover a corrupted MV, run \
+             DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
+             REFRESH MATERIALIZED VIEW <name>; manually."
+                .to_string(),
         );
     }
 
@@ -2969,6 +2978,10 @@ enable_path_style_access = true
 
     #[test]
     fn refresh_mv_rejects_full_for_managed_lake_mv() {
+        // REFRESH FULL is currently disabled for both managed-lake and
+        // iceberg-backed MVs pending redesign. This test locks in the
+        // managed-lake rejection path; the iceberg rejection is exercised
+        // by the iceberg-ivm SQL suite.
         let (_dir, state, _table_id) = seed_mv_refresh_state();
 
         let err = refresh_mv(
@@ -2982,9 +2995,9 @@ enable_path_style_access = true
                 full: true,
             },
         )
-        .expect_err("REFRESH FULL must be rejected for managed-lake MVs");
+        .expect_err("REFRESH FULL must be rejected pending redesign");
         assert!(
-            err.contains("FULL is only supported for Iceberg-backed"),
+            err.contains("currently disabled pending redesign"),
             "err={err}"
         );
     }
