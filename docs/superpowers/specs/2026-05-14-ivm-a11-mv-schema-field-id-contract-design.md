@@ -99,12 +99,10 @@ OutputColumnLineage {
 ExpressionLineage {
   kind: ExpressionKind,                  // Column | Cast | Func | Literal | Mixed
   referenced_base_field_ids: Vec<i32>,   // 排序去重
-  expression_fingerprint: String,        // 见下文规范
 }
 
 FilterLineage {
   referenced_base_field_ids: Vec<i32>,
-  expression_fingerprint: String,
 }
 
 TargetContract {
@@ -139,23 +137,6 @@ HiddenApplyKeyContract {
 
 刻意与 NovaRocks SQL 层 type display 解耦，避免 SQL display 演化影响 contract 签名。
 
-### expression_fingerprint 规范
-
-1. 把表达式 AST 规范化：
-   - 列引用替换成 `col(field_id, type_signature)` 占位（**不带列名**）。
-   - 字面量保留为 `lit(value, type_signature)`。
-   - 函数 / 运算符保留名与参数顺序。
-   - Cast 保留目标类型。
-2. 序列化为 stable 字符串（按 AST pre-order）。
-3. SHA-256 → hex。
-
-性质：
-
-- base 列 rename 不改指纹（不含列名）。
-- 被引用列类型变化会改指纹（type_signature 被嵌入）。
-- 字面量值变化会改指纹。
-- 同一 AST 不同空白 / 括号 / 解析位置不影响指纹。
-
 ### referenced_base_field_ids 计算
 
 按输出列单独收集（不跨列去重），同一表达式内部排序去重。filter 单独维护。
@@ -176,7 +157,6 @@ build_projection_filter_lineage(analysis, base_iceberg_schema)  ◄── 新模
    │   遍历每个 ProjectItem.expr 与 WHERE expr：
    │     - 收集 referenced_base_field_ids
    │     - 推导 ExpressionKind
-   │     - 规范化 AST → expression_fingerprint
    ▼
 load_base_schema_snapshot(base_iceberg_schema, referenced_ids)
    │   仅截取被引用 field 的 BaseFieldRecord
@@ -271,7 +251,7 @@ enum ContractDecision {
   - 找到、type 匹配、name 改变 → 加入 `rebound_columns`，继续。
 - **不检查未被引用的 base 列**。新增 / 删除 / rename 未被引用列自动通过。
 
-**段 3：target field-id 精确比对 + 重算 lineage 指纹**
+**段 3：target schema 精确比对**
 
 - 对 `contract.target.visible_columns` 中每个 `TargetVisibleColumn` 按 `target_field_id`
   查 target 当前 schema：
@@ -281,13 +261,9 @@ enum ContractDecision {
 - 对 `contract.target.hidden_apply_key` 按 field id 查：
   - column_name 必须仍是 `__nova_base_row_id`、type=BIGINT required → 否则
     `HiddenApplyKeyContractBroken`。
-- 重算 lineage 指纹：
-  - 用 contract 中的 `name_at_create + field id` 映射到当前 base schema 的当前 name。
-  - 调用 `build_projection_filter_lineage()` 重新分析 SELECT SQL。
-  - 每个 output column / filter 比对 `expression_fingerprint`。
-  - 不匹配 → `ExpressionSemanticsChanged { output_name, from, to }`。
-  - 段 2 全过、段 3 指纹不一致通常意味着 lineage builder 自身 bug；用 `tracing::error!`
-    标记。
+
+段 3 不重新分析 SELECT SQL：在 SQL 文本不可变、被引用 base 列类型已被段 2 接住的前提下，
+表达式语义不会自漂移；表达式重分析在 refresh 后续 plan 阶段自然发生，guard 不重复做。
 
 ### Analyzer rebind hint
 
@@ -423,7 +399,6 @@ enum SchemaEvolutionError {
     TargetVisibleFieldRenamed { target_field_id: i32, expected: String, actual: String },
     TargetVisibleFieldTypeChanged { target_field_id: i32, from: String, to: String },
     HiddenApplyKeyContractBroken { reason: String },
-    ExpressionSemanticsChanged { output_name: String, from: String, to: String },
 }
 ```
 
@@ -452,7 +427,7 @@ iceberg MV refresh blocked: target hidden apply-key column missing or altered; r
 
 ### 3. schema_contract（refresh guard）
 位置：`src/engine/mv/schema_contract.rs`。`validate_schema_contract` 单一入口。
-依赖 mv_lineage 重算指纹，依赖 iceberg crate 读 schema。
+依赖 iceberg crate 读 schema。
 
 ### 4. iceberg_refresh（CREATE / REFRESH / REFRESH FULL 触发）
 位置：`src/engine/mv/iceberg_refresh.rs`。
@@ -490,12 +465,6 @@ iceberg MV refresh blocked: target hidden apply-key column missing or altered; r
    - Hidden apply-key 丢失 → `Incompatible(HiddenApplyKeyContractBroken)`。
    - Reorder（field id 不变）→ `CompatibleSafe`。
    - Schema id 快路命中 → `CompatibleSafe`（不进段 2 / 3）。
-4. **expression_fingerprint 稳定性**：
-   - 同义 AST 不同空白 → 同指纹。
-   - 列 rename → 同指纹。
-   - 字面量值变 → 指纹变。
-   - 引用列 type_signature 变 → 指纹变。
-
 ### SQL / Integration
 
 加在 `tests/sql-tests/suites/iceberg-ivm/`：
