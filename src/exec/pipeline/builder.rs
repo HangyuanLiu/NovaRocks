@@ -1220,6 +1220,12 @@ fn build_pipeline_for_node(
                 |shared, id| Box::new(ExceptSourceFactory::new(shared, id)),
             ),
         },
+        ExecNodeKind::IcebergDeltaScan(_) => {
+            return Err(
+                "IcebergDeltaScan pipeline build not yet implemented; expected in Phase 2"
+                    .to_string(),
+            );
+        }
         ExecNodeKind::Values(ValuesNode { chunk, node_id }) => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk.clone(), *node_id));

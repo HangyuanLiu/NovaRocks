@@ -133,6 +133,7 @@ fn collect_glm_metadata(
             }
         }
         ExecNodeKind::Values(_) => {}
+        ExecNodeKind::IcebergDeltaScan(_) => {}
     }
     Ok(())
 }
