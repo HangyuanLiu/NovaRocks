@@ -199,61 +199,83 @@ pub(crate) fn create_iceberg_mv(
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
-                    schema_contract: Some(crate::meta::repository::mv_contract::MvSchemaContract {
-                        contract_version: 1,
-                        base: crate::meta::repository::mv_contract::BaseContract {
-                            table_fqn: base_ref.fqn(),
-                            table_uuid: loaded_base.table.metadata().uuid().to_string(),
-                            schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
-                            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                                fields: Vec::new(), // populated in Task 8
-                            },
-                        },
-                        output: crate::meta::repository::mv_contract::OutputContract {
-                            columns: analysis
-                                .output_columns
-                                .iter()
-                                .map(|_| crate::meta::repository::mv_contract::OutputColumnLineage {
-                                    expression: crate::meta::repository::mv_contract::ExpressionLineage {
-                                        kind: crate::meta::repository::mv_contract::ExpressionKind::Column,
-                                        referenced_base_field_ids: Vec::new(), // populated in Task 8
+                    schema_contract: {
+                        let contract = crate::meta::repository::mv_contract::MvSchemaContract {
+                            contract_version: 1,
+                            base: crate::meta::repository::mv_contract::BaseContract {
+                                table_fqn: base_ref.fqn(),
+                                table_uuid: loaded_base.table.metadata().uuid().to_string(),
+                                schema_id_at_create: loaded_base
+                                    .table
+                                    .metadata()
+                                    .current_schema_id(),
+                                schema_at_create:
+                                    crate::meta::repository::mv_contract::BaseSchemaSnapshot {
+                                        fields: Vec::new(), // populated in Task 8
                                     },
-                                })
-                                .collect(),
-                            filter: None, // populated in Task 8
-                        },
-                        target: crate::meta::repository::mv_contract::TargetContract {
-                            table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-                            table_uuid: target_loaded.table.metadata().uuid().to_string(),
-                            schema_id_at_create: target_loaded.table.metadata().current_schema_id(),
-                            visible_columns: analysis
-                                .output_columns
-                                .iter()
-                                .map(|col| {
-                                    let field = target_loaded
-                                        .table
-                                        .metadata()
-                                        .current_schema()
-                                        .as_struct()
-                                        .fields()
-                                        .iter()
-                                        .find(|f| f.name.eq_ignore_ascii_case(&col.name))
-                                        .expect("Task 8 self-check verifies output ↔ target alignment");
-                                    crate::meta::repository::mv_contract::TargetVisibleColumn {
-                                        output_name: col.name.clone(),
-                                        target_field_id: field.id,
-                                        type_signature: format!("{}", field.field_type),
-                                        nullable: !field.required,
-                                    }
-                                })
-                                .collect(),
-                            hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
-                                column_name: crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-                                target_field_id: actual_apply_key_field_id,
-                                source: crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
                             },
-                        },
-                    }),
+                            output: crate::meta::repository::mv_contract::OutputContract {
+                                columns: analysis
+                                    .output_columns
+                                    .iter()
+                                    .map(|_| {
+                                        crate::meta::repository::mv_contract::OutputColumnLineage {
+                                            expression:
+                                                crate::meta::repository::mv_contract::ExpressionLineage {
+                                                    kind: crate::meta::repository::mv_contract::ExpressionKind::Column,
+                                                    referenced_base_field_ids: Vec::new(), // populated in Task 8
+                                                },
+                                        }
+                                    })
+                                    .collect(),
+                                filter: None, // populated in Task 8
+                            },
+                            target: crate::meta::repository::mv_contract::TargetContract {
+                                table_fqn: format!(
+                                    "{}.{}.{}",
+                                    target.catalog, target.namespace, target.table
+                                ),
+                                table_uuid: target_loaded.table.metadata().uuid().to_string(),
+                                schema_id_at_create: target_loaded
+                                    .table
+                                    .metadata()
+                                    .current_schema_id(),
+                                visible_columns: analysis
+                                    .output_columns
+                                    .iter()
+                                    .map(|col| {
+                                        let field = target_loaded
+                                            .table
+                                            .metadata()
+                                            .current_schema()
+                                            .as_struct()
+                                            .fields()
+                                            .iter()
+                                            .find(|f| f.name.eq_ignore_ascii_case(&col.name))
+                                            .expect("target schema was built from the same output_columns; name lookup cannot fail");
+                                        crate::meta::repository::mv_contract::TargetVisibleColumn {
+                                            output_name: col.name.clone(),
+                                            target_field_id: field.id,
+                                            type_signature: format!("{}", field.field_type),
+                                            nullable: !field.required,
+                                        }
+                                    })
+                                    .collect(),
+                                hidden_apply_key:
+                                    crate::meta::repository::mv_contract::HiddenApplyKeyContract {
+                                        column_name: crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                                        target_field_id: actual_apply_key_field_id,
+                                        source: crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
+                                    },
+                            },
+                        };
+                        contract
+                            .ensure_self_consistent()
+                            .map_err(|e| {
+                                format!("Iceberg MV schema contract is self-inconsistent: {e}")
+                            })?;
+                        Some(contract)
+                    },
                     created_at_ms,
                 },
             )
