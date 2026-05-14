@@ -1,0 +1,10 @@
+-- query 4
+id	region	amount
+1	US	100
+3	US	200
+
+-- query 8
+id	region	amount
+1	US	100
+3	US	200
+4	US	300

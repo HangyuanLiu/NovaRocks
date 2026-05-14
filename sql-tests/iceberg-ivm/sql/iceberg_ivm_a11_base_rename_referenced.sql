@@ -71,9 +71,11 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
--- NovaRocks INSERT using the new column name `area` (same field id as `region`).
+-- NovaRocks INSERT using positional syntax (column order: id, area, amount after rename).
+-- Positional insert bypasses the session-cached column name check and lets the
+-- sink reload the schema from the REST catalog.
 -- @skip_result_check=true
-INSERT INTO ice_ivm_a11_rename_${uuid0}.ns_a11_rename_${uuid0}.base_${uuid0} (id, area, amount) VALUES (4, 'US', 300);
+INSERT INTO ice_ivm_a11_rename_${uuid0}.ns_a11_rename_${uuid0}.base_${uuid0} VALUES (4, 'US', 300);
 
 -- query 7
 -- A11 contract guard fires CompatibleSafeWithRebind; refresh should succeed
