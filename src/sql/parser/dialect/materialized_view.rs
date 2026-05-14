@@ -610,7 +610,10 @@ mod tests {
         match stmt {
             Statement::RefreshMaterializedView(r) => {
                 assert_eq!(r.name.parts, vec!["mv1"]);
-                assert!(!r.full, "expected full=false for plain REFRESH WITH SYNC MODE");
+                assert!(
+                    !r.full,
+                    "expected full=false for plain REFRESH WITH SYNC MODE"
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }

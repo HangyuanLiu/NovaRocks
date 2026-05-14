@@ -8,7 +8,7 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use crate::meta::repository::mv_contract::{MvSchemaContract, HIDDEN_APPLY_KEY_COLUMN_NAME};
+use crate::meta::repository::mv_contract::{HIDDEN_APPLY_KEY_COLUMN_NAME, MvSchemaContract};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {
@@ -22,41 +22,111 @@ pub(crate) enum ContractDecision {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SchemaEvolutionError {
-    BaseTableIdentityChanged { expected: String, actual: String },
-    BaseRowLineageContractBroken { reason: String },
-    BaseFieldDropped { field_id: i32, name_at_create: String },
-    BaseFieldTypeChanged { field_id: i32, name_at_create: String, from: String, to: String },
-    TargetTableIdentityChanged { expected: String, actual: String },
-    TargetRowLineageContractBroken { reason: String },
-    TargetVisibleFieldDropped { output_name: String, target_field_id: i32 },
-    TargetVisibleFieldRenamed { target_field_id: i32, expected: String, actual: String },
-    TargetVisibleFieldTypeChanged { target_field_id: i32, from: String, to: String },
-    HiddenApplyKeyContractBroken { reason: String },
+    BaseTableIdentityChanged {
+        expected: String,
+        actual: String,
+    },
+    BaseRowLineageContractBroken {
+        reason: String,
+    },
+    BaseFieldDropped {
+        field_id: i32,
+        name_at_create: String,
+    },
+    BaseFieldTypeChanged {
+        field_id: i32,
+        name_at_create: String,
+        from: String,
+        to: String,
+    },
+    TargetTableIdentityChanged {
+        expected: String,
+        actual: String,
+    },
+    TargetRowLineageContractBroken {
+        reason: String,
+    },
+    TargetVisibleFieldDropped {
+        output_name: String,
+        target_field_id: i32,
+    },
+    TargetVisibleFieldRenamed {
+        target_field_id: i32,
+        expected: String,
+        actual: String,
+    },
+    TargetVisibleFieldTypeChanged {
+        target_field_id: i32,
+        from: String,
+        to: String,
+    },
+    HiddenApplyKeyContractBroken {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SchemaEvolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BaseTableIdentityChanged { expected, actual } => write!(f,
-                "iceberg MV refresh blocked: base table identity changed (uuid expected={expected}, actual={actual}); run REFRESH FULL or recreate the MV"),
-            Self::BaseRowLineageContractBroken { reason } => write!(f,
-                "iceberg MV refresh blocked: base table row-lineage contract broken ({reason}); run REFRESH FULL or recreate the MV"),
-            Self::BaseFieldDropped { field_id, name_at_create } => write!(f,
-                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) was dropped from base table; run REFRESH FULL or recreate the MV"),
-            Self::BaseFieldTypeChanged { field_id, name_at_create, from, to } => write!(f,
-                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed type from {from} to {to}; run REFRESH FULL or recreate the MV"),
-            Self::TargetTableIdentityChanged { expected, actual } => write!(f,
-                "iceberg MV refresh blocked: target table identity changed (uuid expected={expected}, actual={actual}); recreate the MV"),
-            Self::TargetRowLineageContractBroken { reason } => write!(f,
-                "iceberg MV refresh blocked: target table row-lineage contract broken ({reason}); recreate the MV"),
-            Self::TargetVisibleFieldDropped { output_name, target_field_id } => write!(f,
-                "iceberg MV refresh blocked: target visible column \"{output_name}\" (field id {target_field_id}) was dropped; recreate the MV"),
-            Self::TargetVisibleFieldRenamed { target_field_id, expected, actual } => write!(f,
-                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) renamed externally: expected \"{expected}\", actual \"{actual}\"; recreate the MV"),
-            Self::TargetVisibleFieldTypeChanged { target_field_id, from, to } => write!(f,
-                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) changed type from {from} to {to}; recreate the MV"),
-            Self::HiddenApplyKeyContractBroken { reason } => write!(f,
-                "iceberg MV refresh blocked: target hidden apply-key column contract broken ({reason}); recreate the MV"),
+            Self::BaseTableIdentityChanged { expected, actual } => write!(
+                f,
+                "iceberg MV refresh blocked: base table identity changed (uuid expected={expected}, actual={actual}); run REFRESH FULL or recreate the MV"
+            ),
+            Self::BaseRowLineageContractBroken { reason } => write!(
+                f,
+                "iceberg MV refresh blocked: base table row-lineage contract broken ({reason}); run REFRESH FULL or recreate the MV"
+            ),
+            Self::BaseFieldDropped {
+                field_id,
+                name_at_create,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) was dropped from base table; run REFRESH FULL or recreate the MV"
+            ),
+            Self::BaseFieldTypeChanged {
+                field_id,
+                name_at_create,
+                from,
+                to,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed type from {from} to {to}; run REFRESH FULL or recreate the MV"
+            ),
+            Self::TargetTableIdentityChanged { expected, actual } => write!(
+                f,
+                "iceberg MV refresh blocked: target table identity changed (uuid expected={expected}, actual={actual}); recreate the MV"
+            ),
+            Self::TargetRowLineageContractBroken { reason } => write!(
+                f,
+                "iceberg MV refresh blocked: target table row-lineage contract broken ({reason}); recreate the MV"
+            ),
+            Self::TargetVisibleFieldDropped {
+                output_name,
+                target_field_id,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: target visible column \"{output_name}\" (field id {target_field_id}) was dropped; recreate the MV"
+            ),
+            Self::TargetVisibleFieldRenamed {
+                target_field_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) renamed externally: expected \"{expected}\", actual \"{actual}\"; recreate the MV"
+            ),
+            Self::TargetVisibleFieldTypeChanged {
+                target_field_id,
+                from,
+                to,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) changed type from {from} to {to}; recreate the MV"
+            ),
+            Self::HiddenApplyKeyContractBroken { reason } => write!(
+                f,
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken ({reason}); recreate the MV"
+            ),
         }
     }
 }
@@ -71,12 +141,14 @@ pub(crate) fn validate_schema_contract(
     current_target_table: &iceberg::table::Table,
 ) -> ContractDecision {
     // Stage 1: identity guard.
-    if let Some(err) = validate_identity_guards(contract, current_base_table, current_target_table) {
+    if let Some(err) = validate_identity_guards(contract, current_base_table, current_target_table)
+    {
         return ContractDecision::Incompatible(err);
     }
     // Stage 2 fast path.
     if current_base_table.metadata().current_schema_id() == contract.base.schema_id_at_create
-        && current_target_table.metadata().current_schema_id() == contract.target.schema_id_at_create
+        && current_target_table.metadata().current_schema_id()
+            == contract.target.schema_id_at_create
     {
         return ContractDecision::CompatibleSafe;
     }
@@ -92,7 +164,9 @@ pub(crate) fn validate_schema_contract(
     if rebound.is_empty() {
         ContractDecision::CompatibleSafe
     } else {
-        ContractDecision::CompatibleSafeWithRebind { rebound_columns: rebound }
+        ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns: rebound,
+        }
     }
 }
 
@@ -168,7 +242,11 @@ fn check_base_referenced_fields(
             });
         }
         if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-            rebound.push((record.field_id, record.name_at_create.clone(), field.name.clone()));
+            rebound.push((
+                record.field_id,
+                record.name_at_create.clone(),
+                field.name.clone(),
+            ));
         }
     }
     Ok(rebound)
@@ -204,12 +282,22 @@ fn check_target_schema(
     }
 
     let expected = &contract.target.hidden_apply_key;
-    let Some(field) = current.fields().iter().find(|f| f.id == expected.target_field_id) else {
+    let Some(field) = current
+        .fields()
+        .iter()
+        .find(|f| f.id == expected.target_field_id)
+    else {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
-            reason: format!("hidden apply-key field id {} not found", expected.target_field_id),
+            reason: format!(
+                "hidden apply-key field id {} not found",
+                expected.target_field_id
+            ),
         });
     };
-    if !field.name.eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME) {
+    if !field
+        .name
+        .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
+    {
         return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
             reason: format!("hidden apply-key column renamed to {}", field.name),
         });

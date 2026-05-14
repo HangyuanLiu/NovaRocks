@@ -7,7 +7,9 @@
 use crate::meta::repository::mv_contract::{
     BaseFieldRecord, ExpressionKind, ExpressionLineage, FilterLineage, OutputColumnLineage,
 };
-use crate::sql::analysis::{ExprKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, TypedExpr};
+use crate::sql::analysis::{
+    ExprKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, TypedExpr,
+};
 
 pub(crate) struct LineageResult {
     pub base_fields: Vec<BaseFieldRecord>,
@@ -42,12 +44,14 @@ pub(crate) fn build_projection_filter_lineage(
         for (_qualifier, name) in &col_refs {
             let field = resolve_field(base_iceberg_schema, name)?;
             field_ids.push(field.id);
-            referenced.entry(field.id).or_insert_with(|| BaseFieldRecord {
-                field_id: field.id,
-                name_at_create: field.name.clone(),
-                type_signature: format!("{}", field.field_type),
-                required: field.required,
-            });
+            referenced
+                .entry(field.id)
+                .or_insert_with(|| BaseFieldRecord {
+                    field_id: field.id,
+                    name_at_create: field.name.clone(),
+                    type_signature: format!("{}", field.field_type),
+                    required: field.required,
+                });
         }
         field_ids.sort_unstable();
         field_ids.dedup();
@@ -69,12 +73,14 @@ pub(crate) fn build_projection_filter_lineage(
         for (_qualifier, name) in &col_refs {
             let field = resolve_field(base_iceberg_schema, name)?;
             field_ids.push(field.id);
-            referenced.entry(field.id).or_insert_with(|| BaseFieldRecord {
-                field_id: field.id,
-                name_at_create: field.name.clone(),
-                type_signature: format!("{}", field.field_type),
-                required: field.required,
-            });
+            referenced
+                .entry(field.id)
+                .or_insert_with(|| BaseFieldRecord {
+                    field_id: field.id,
+                    name_at_create: field.name.clone(),
+                    type_signature: format!("{}", field.field_type),
+                    required: field.required,
+                });
         }
         field_ids.sort_unstable();
         field_ids.dedup();
@@ -168,7 +174,9 @@ fn collect_column_refs(
                 collect_column_refs(e, out, kind);
             }
         }
-        ExprKind::Between { expr, low, high, .. } => {
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
             kind.saw_func();
             collect_column_refs(expr, out, kind);
             collect_column_refs(low, out, kind);
@@ -234,7 +242,12 @@ impl ExpressionKindHint {
         self.saw_cast = true;
     }
     fn into_kind(self) -> ExpressionKind {
-        match (self.saw_column, self.saw_literal, self.saw_func, self.saw_cast) {
+        match (
+            self.saw_column,
+            self.saw_literal,
+            self.saw_func,
+            self.saw_cast,
+        ) {
             (true, false, false, false) => ExpressionKind::Column,
             (false, true, false, false) => ExpressionKind::Literal,
             (false, false, true, false) => ExpressionKind::Func,

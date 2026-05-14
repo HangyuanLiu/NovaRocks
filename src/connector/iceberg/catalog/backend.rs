@@ -232,37 +232,39 @@ fn build_iceberg_table_def_with_data_files(
         register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
     };
 
-    let iceberg_row_lineage_metadata_columns =
-        if has_data_files && is_v3_row_lineage(loaded.table.metadata()) && all_files_have_first_row_id {
-            vec![
-                ColumnDef {
-                    name: "_file".to_string(),
-                    data_type: arrow::datatypes::DataType::Utf8,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_pos".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_row_id".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-                ColumnDef {
-                    name: "_last_updated_sequence_number".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                },
-            ]
-        } else {
-            vec![]
-        };
+    let iceberg_row_lineage_metadata_columns = if has_data_files
+        && is_v3_row_lineage(loaded.table.metadata())
+        && all_files_have_first_row_id
+    {
+        vec![
+            ColumnDef {
+                name: "_file".to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_pos".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_row_id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+            ColumnDef {
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+            },
+        ]
+    } else {
+        vec![]
+    };
 
     Ok(TableDef {
         name: table_name.to_string(),

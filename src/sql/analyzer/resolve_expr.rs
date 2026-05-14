@@ -3598,10 +3598,8 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                         if matches!(name.as_str(), "greatest" | "least")
                             && matches!(result, DataType::Date32)
                         {
-                            result = DataType::Timestamp(
-                                arrow::datatypes::TimeUnit::Microsecond,
-                                None,
-                            );
+                            result =
+                                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
                         }
                         result
                     } else {
@@ -3691,9 +3689,7 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
         DataType::Float32 => "float".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
-        DataType::FixedSizeBinary(w)
-            if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
-        {
+        DataType::FixedSizeBinary(w) if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH => {
             "largeint".to_string()
         }
         DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
@@ -3717,7 +3713,13 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
         DataType::Struct(fields) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{} {}", f.name(), arrow_type_to_starrocks_name(f.data_type())))
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        f.name(),
+                        arrow_type_to_starrocks_name(f.data_type())
+                    )
+                })
                 .collect();
             format!("struct<{}>", parts.join(", "))
         }
@@ -3750,9 +3752,7 @@ fn sql_expr_logical_type_name(expr: &sqlast::Expr) -> Option<String> {
                 n if n.starts_with("hll_") || n == "hll_empty" || n == "hll_hash" => {
                     Some("hll".to_string())
                 }
-                "parse_json" | "json_object" | "json_array" | "to_json" => {
-                    Some("json".to_string())
-                }
+                "parse_json" | "json_object" | "json_array" | "to_json" => Some("json".to_string()),
                 _ => None,
             }
         }

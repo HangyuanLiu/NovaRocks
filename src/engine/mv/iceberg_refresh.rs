@@ -37,17 +37,16 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
     ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    extract_apply_key_values_from_chunks, find_apply_key_field_id,
-    iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
-    locate_target_rows_by_apply_key,
+    extract_apply_key_values_from_chunks, find_apply_key_field_id, iceberg_mv_physical_select_sql,
+    load_target_apply_locator_inputs, locate_target_rows_by_apply_key,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
 use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
-    MvRefreshState, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvDefinition, StoredMvRefresh,
+    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    StoredMvDefinition, StoredMvRefresh,
 };
 use crate::runtime::global_async_runtime::data_block_on;
 #[cfg(test)]
@@ -179,7 +178,7 @@ pub(crate) fn create_iceberg_mv(
     // 3. Build A11 lineage from the resolved query and the base Iceberg schema.
     let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
         &analysis.resolved_query,
-        &**loaded_base.table.metadata().current_schema(),
+        loaded_base.table.metadata().current_schema(),
     )?;
 
     // 4. Persist MV metadata in the repository.
@@ -584,42 +583,38 @@ pub(crate) fn refresh_iceberg_mv(
     // contract before any incremental work. validate_schema_contract
     // subsumes the earlier ensure_base_row_lineage_contract check
     // (it already enforces v3 + row-lineage).
-    let schema_contract = mv_definition
-        .schema_contract
-        .as_ref()
-        .ok_or_else(|| {
-            format!(
-                "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
-    let effective_definition =
-        match crate::engine::mv::schema_contract::validate_schema_contract(
-            schema_contract,
-            &loaded.table,
-            &target_loaded.table,
-        ) {
-            crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-                return Err(format!("{err}"));
-            }
-            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-                rebound_columns,
-            } => {
-                tracing::info!(
-                    target = ?target,
-                    rebound = ?rebound_columns,
-                    "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
-                );
-                let rewritten_sql =
-                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-                let mut def = mv_definition.clone();
-                def.select_sql = rewritten_sql;
-                def
-            }
-            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-                mv_definition.clone()
-            }
-        };
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(format!("{err}"));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            rebound_columns,
+        } => {
+            tracing::info!(
+                target = ?target,
+                rebound = ?rebound_columns,
+                "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+            );
+            let rewritten_sql =
+                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+            let mut def = mv_definition.clone();
+            def.select_sql = rewritten_sql;
+            def
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+            mv_definition.clone()
+        }
+    };
     let mv_definition = &effective_definition;
     let expected_main_snapshot_id = target_loaded
         .table
@@ -683,7 +678,7 @@ pub(crate) fn refresh_iceberg_mv(
                 &staging_branch,
                 refresh_id,
                 current_database,
-                &mv_definition,
+                mv_definition,
                 base_ref,
                 cur,
                 &current_table_uuid,
@@ -700,7 +695,7 @@ pub(crate) fn refresh_iceberg_mv(
             );
             let snapshots = single_snapshot_map(base_ref, cur);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
-            let target_snapshot_id = recorded_target_snapshot_id(&target, &mv_definition)?;
+            let target_snapshot_id = recorded_target_snapshot_id(&target, mv_definition)?;
             let refresh_id =
                 begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
             finalize_iceberg_mv_refresh(
@@ -722,7 +717,7 @@ pub(crate) fn refresh_iceberg_mv(
             &iceberg_catalog,
             expected_main_snapshot_id,
             current_database,
-            &mv_definition,
+            mv_definition,
             base_ref,
             prev,
             cur,
@@ -1422,6 +1417,7 @@ fn ensure_iceberg_mv_staging_branch(
     .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
@@ -1788,6 +1784,7 @@ async fn commit_iceberg_mv_target_files(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_target_files_with_ref(
     table: &iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
@@ -1891,6 +1888,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_apply_with_ref(
     table: &iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
@@ -2149,8 +2147,7 @@ fn incremental_refresh_iceberg_mv(
             base_ref,
             added_files,
         )
-        .and_then(query_result_to_chunks)
-        .map_err(|err| err)?;
+        .and_then(query_result_to_chunks)?;
         (chunks, Vec::new())
     };
     let added_rows = chunks
@@ -4707,9 +4704,7 @@ pub(crate) fn rewrite_select_sql_for_rebind(
 
     let rename_map: std::collections::HashMap<String, String> = rebound_columns
         .iter()
-        .map(|(_field_id, old_name, new_name)| {
-            (old_name.to_ascii_lowercase(), new_name.clone())
-        })
+        .map(|(_field_id, old_name, new_name)| (old_name.to_ascii_lowercase(), new_name.clone()))
         .collect();
 
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
@@ -4764,10 +4759,10 @@ fn rewrite_expr_idents(
         Expr::CompoundIdentifier(parts) => {
             // Only rewrite the last part (the column name), not table/schema
             // qualifiers.
-            if let Some(last) = parts.last_mut() {
-                if let Some(new_name) = rename_map.get(&last.value.to_ascii_lowercase()) {
-                    last.value = new_name.clone();
-                }
+            if let Some(last) = parts.last_mut()
+                && let Some(new_name) = rename_map.get(&last.value.to_ascii_lowercase())
+            {
+                last.value = new_name.clone();
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -4826,7 +4821,9 @@ fn rewrite_expr_idents(
                 rewrite_expr_idents(e, rename_map);
             }
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             rewrite_expr_idents(expr, rename_map);
             rewrite_expr_idents(low, rename_map);
             rewrite_expr_idents(high, rename_map);
