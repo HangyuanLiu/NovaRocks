@@ -593,25 +593,34 @@ pub(crate) fn refresh_iceberg_mv(
                 target.catalog, target.namespace, target.table
             )
         })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}"));
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
-            tracing::info!(
-                target = ?target,
-                rebound = ?rebound_columns,
-                "iceberg MV refresh: base columns rebound by field id; continuing",
-            );
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
-    }
+    let effective_definition =
+        match crate::engine::mv::schema_contract::validate_schema_contract(
+            schema_contract,
+            &loaded.table,
+            &target_loaded.table,
+        ) {
+            crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+                return Err(format!("{err}"));
+            }
+            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+                rebound_columns,
+            } => {
+                tracing::info!(
+                    target = ?target,
+                    rebound = ?rebound_columns,
+                    "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+                );
+                let rewritten_sql =
+                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+                let mut def = mv_definition.clone();
+                def.select_sql = rewritten_sql;
+                def
+            }
+            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+                mv_definition.clone()
+            }
+        };
+    let mv_definition = &effective_definition;
     let expected_main_snapshot_id = target_loaded
         .table
         .metadata()
@@ -4664,5 +4673,242 @@ mod tests {
             .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQL rewrite helper for CompatibleSafeWithRebind
+// ---------------------------------------------------------------------------
+
+/// Rewrite the stored MV SELECT SQL so that base column references use
+/// the column's current name (per `rebound_columns`) rather than the name
+/// captured at CREATE time. Only identifiers that appear at
+/// "column-reference" positions in the AST are rewritten; string literals
+/// and table identifiers are left alone.
+///
+/// `rebound_columns` is `[(field_id, name_at_create, current_name)]`.
+/// `field_id` is informational here — the rewrite is purely by
+/// case-insensitive name matching.
+///
+/// Limitation: this rewrite operates on the serialized SQL text, not on
+/// a bound semantic graph. If the stored MV SELECT contains subqueries,
+/// CTEs, or expressions where the same identifier appears in multiple
+/// roles (e.g. a base column shadowing a CTE alias), identifiers in all
+/// those positions will be rewritten. For A11 phase 1 (single-base
+/// projection/filter MVs, no CTEs, no subqueries), this is safe: A9's
+/// classification rejects unsupported shapes before reaching this code.
+pub(crate) fn rewrite_select_sql_for_rebind(
+    stored_sql: &str,
+    rebound_columns: &[(i32, String, String)],
+) -> Result<String, String> {
+    if rebound_columns.is_empty() {
+        return Ok(stored_sql.to_string());
+    }
+
+    let rename_map: std::collections::HashMap<String, String> = rebound_columns
+        .iter()
+        .map(|(_field_id, old_name, new_name)| {
+            (old_name.to_ascii_lowercase(), new_name.clone())
+        })
+        .collect();
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
+        .map_err(|e| format!("rebind rewrite: normalize_for_raw_parse: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("rebind rewrite: parse: {e}"))?;
+
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("rebind rewrite: expected SELECT query".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("rebind rewrite: expected SELECT body".to_string());
+    };
+
+    // Rewrite projection.
+    for item in &mut select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                rewrite_expr_idents(e, &rename_map);
+            }
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
+                // Wildcards don't carry column names; left alone.
+            }
+        }
+    }
+
+    // Rewrite WHERE.
+    if let Some(filter) = &mut select.selection {
+        rewrite_expr_idents(filter, &rename_map);
+    }
+
+    // Note: GROUP BY / HAVING / ORDER BY are not rewritten because A11 phase 1
+    // MV shape is projection/filter only. A9's classification rejects MVs with
+    // aggregates / window / order-by before reaching this code path.
+
+    Ok(stmt.to_string())
+}
+
+fn rewrite_expr_idents(
+    expr: &mut sqlparser::ast::Expr,
+    rename_map: &std::collections::HashMap<String, String>,
+) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => {
+            if let Some(new_name) = rename_map.get(&ident.value.to_ascii_lowercase()) {
+                ident.value = new_name.clone();
+            }
+        }
+        Expr::CompoundIdentifier(parts) => {
+            // Only rewrite the last part (the column name), not table/schema
+            // qualifiers.
+            if let Some(last) = parts.last_mut() {
+                if let Some(new_name) = rename_map.get(&last.value.to_ascii_lowercase()) {
+                    last.value = new_name.clone();
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_idents(left, rename_map);
+            rewrite_expr_idents(right, rename_map);
+        }
+        Expr::UnaryOp { expr, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+        }
+        Expr::Cast { expr, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+        }
+        Expr::Nested(inner) => {
+            rewrite_expr_idents(inner, rename_map);
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) = arg
+                    {
+                        rewrite_expr_idents(inner, rename_map);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                rewrite_expr_idents(op, rename_map);
+            }
+            for c in conditions {
+                rewrite_expr_idents(&mut c.condition, rename_map);
+                rewrite_expr_idents(&mut c.result, rename_map);
+            }
+            if let Some(e) = else_result {
+                rewrite_expr_idents(e, rename_map);
+            }
+        }
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => {
+            rewrite_expr_idents(inner, rename_map);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+            for e in list {
+                rewrite_expr_idents(e, rename_map);
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+            rewrite_expr_idents(low, rename_map);
+            rewrite_expr_idents(high, rename_map);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            rewrite_expr_idents(expr, rename_map);
+            rewrite_expr_idents(pattern, rename_map);
+        }
+        // Other variants (Subquery, Tuple, Array, etc.) are not expected in
+        // A11 phase 1 projection/filter MVs. Leave them alone — if they
+        // contain unrewritten column refs, the analyzer will surface a clear
+        // error.
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_no_rebind_returns_input_unchanged() {
+        let sql = "SELECT id, region FROM base WHERE region = 'US'";
+        let rewritten = rewrite_select_sql_for_rebind(sql, &[]).unwrap();
+        assert_eq!(rewritten, sql);
+    }
+
+    #[test]
+    fn rewrite_renames_column_in_projection_and_where() {
+        let sql = "SELECT id, region, amount FROM base WHERE region = 'US'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        // After rewrite, 'region' is replaced with 'area' in both
+        // projection and WHERE clause. The literal 'US' is unchanged.
+        assert!(
+            rewritten.contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_lowercase().contains("region"),
+            "expected no 'region' in: {rewritten}"
+        );
+        assert!(rewritten.contains("'US'"));
+    }
+
+    #[test]
+    fn rewrite_preserves_string_literals_matching_old_name() {
+        let sql = "SELECT id FROM base WHERE region = 'region'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        // The literal 'region' (string value) must be preserved.
+        assert!(
+            rewritten.contains("'region'"),
+            "string literal should not be rewritten: {rewritten}"
+        );
+        // But the column ref `region` in WHERE LHS gets rewritten to `area`.
+        assert!(rewritten.contains("area"));
+    }
+
+    #[test]
+    fn rewrite_is_case_insensitive_on_old_name() {
+        let sql = "SELECT id, REGION FROM base";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        assert!(
+            rewritten.to_ascii_lowercase().contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_handles_compound_identifier() {
+        let sql = "SELECT base.id, base.region FROM base WHERE base.region = 'US'";
+        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        assert!(
+            rewritten.contains("area"),
+            "expected 'area' in: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_lowercase().contains(".region"),
+            "expected no '.region' in: {rewritten}"
+        );
     }
 }
