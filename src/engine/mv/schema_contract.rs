@@ -108,11 +108,17 @@ fn validate_identity_guards(
             actual: actual_base_uuid,
         });
     }
-    if base.metadata().format_version() != iceberg::spec::FormatVersion::V3
-        || !row_lineage_enabled(base.metadata().properties())
-    {
+    if base.metadata().format_version() != iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
-            reason: "base table must be Iceberg v3 with write.row-lineage=true".to_string(),
+            reason: format!(
+                "base table must be Iceberg format v3, found {:?}",
+                base.metadata().format_version()
+            ),
+        });
+    }
+    if !row_lineage_enabled(base.metadata().properties()) {
+        return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
+            reason: "base table property write.row-lineage must be true".to_string(),
         });
     }
 
@@ -123,11 +129,17 @@ fn validate_identity_guards(
             actual: actual_target_uuid,
         });
     }
-    if target.metadata().format_version() != iceberg::spec::FormatVersion::V3
-        || !row_lineage_enabled(target.metadata().properties())
-    {
+    if target.metadata().format_version() != iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
-            reason: "target table must be Iceberg v3 with write.row-lineage=true".to_string(),
+            reason: format!(
+                "target table must be Iceberg format v3, found {:?}",
+                target.metadata().format_version()
+            ),
+        });
+    }
+    if !row_lineage_enabled(target.metadata().properties()) {
+        return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
+            reason: "target table property write.row-lineage must be true".to_string(),
         });
     }
     None
@@ -211,7 +223,7 @@ fn check_target_schema(
         iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long) => {}
         other => {
             return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
-                reason: format!("hidden apply-key column must be long, got {other:?}"),
+                reason: format!("hidden apply-key column must be long, got {other}"),
             });
         }
     }
