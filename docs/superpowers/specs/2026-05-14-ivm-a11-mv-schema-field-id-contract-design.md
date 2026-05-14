@@ -85,14 +85,13 @@ BaseFieldRecord {
 }
 
 OutputContract {
-  columns: Vec<OutputColumnLineage>,
+  columns: Vec<OutputColumnLineage>,     // 与 target.visible_columns 按下标对齐
   filter: Option<FilterLineage>,         // WHERE 的 lineage；None 表示无 filter
 }
 
 OutputColumnLineage {
-  output_name: String,
-  output_type: String,                   // type_signature
-  output_nullable: bool,
+  // 不重复 output_name / output_type / output_nullable；
+  // 这些都在同下标的 target.visible_columns 上有真理。
   expression: ExpressionLineage,
 }
 
@@ -198,13 +197,15 @@ fn build_projection_filter_lineage(
 
 `ensure_contract_self_consistent` 在持久化前必须通过：
 
-1. `output.columns.len() == target.visible_columns.len()` 且 `output_name` 顺序一致。
+1. `output.columns.len() == target.visible_columns.len()`（按下标对齐）。
 2. `target.hidden_apply_key.column_name == "__nova_base_row_id"`，对应列在 target schema
    中存在，type=BIGINT，required=true。
 3. `output.columns[i].expression.referenced_base_field_ids` 中每个 id 都能在
    `base.schema_at_create.fields` 中找到。
 4. `base.table_uuid` 非空，`base.schema_id_at_create >= 0`。
 5. 同一 referenced field id 在 base snapshot 中类型签名稳定。
+6. `target.visible_columns[i].output_name` 与 analyzer 给出的输出列名一致；
+   `target.visible_columns[i].type_signature` 与 target Iceberg schema 中该 field 的类型一致。
 
 自检失败要 rollback 已创建的 target table；走 A9 已有的 create rollback 路径。
 
