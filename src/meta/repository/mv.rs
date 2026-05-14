@@ -31,7 +31,8 @@ pub struct StoredMvDefinition {
     pub target_catalog: Option<String>,
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
-    pub schema_contract: crate::meta::repository::mv_contract::MvSchemaContract,
+    #[serde(default)]
+    pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: BTreeMap<String, i64>,
@@ -59,7 +60,7 @@ pub struct CreateMvDefinitionRequest {
     pub target_catalog: Option<String>,
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
-    pub schema_contract: crate::meta::repository::mv_contract::MvSchemaContract,
+    pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
     pub created_at_ms: i64,
 }
 

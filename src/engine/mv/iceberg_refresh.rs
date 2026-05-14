@@ -37,8 +37,8 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
     ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    ensure_target_apply_key_contract, extract_apply_key_values_from_chunks,
-    find_apply_key_field_id, iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
+    extract_apply_key_values_from_chunks, find_apply_key_field_id,
+    iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
     locate_target_rows_by_apply_key,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
@@ -46,7 +46,7 @@ use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
-    MvRefreshState, MvTargetApplyKey, MvTargetApplyKeySource, RecordPublishCommitRequest,
+    MvRefreshState, RecordPublishCommitRequest,
     RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvDefinition, StoredMvRefresh,
 };
 use crate::runtime::global_async_runtime::data_block_on;
@@ -199,10 +199,60 @@ pub(crate) fn create_iceberg_mv(
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
-                    target_apply_key: Some(MvTargetApplyKey {
-                        column_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-                        field_id: actual_apply_key_field_id,
-                        source: MvTargetApplyKeySource::BaseRowId,
+                    schema_contract: Some(crate::meta::repository::mv_contract::MvSchemaContract {
+                        contract_version: 1,
+                        base: crate::meta::repository::mv_contract::BaseContract {
+                            table_fqn: base_ref.fqn(),
+                            table_uuid: loaded_base.table.metadata().uuid().to_string(),
+                            schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
+                            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
+                                fields: Vec::new(), // populated in Task 8
+                            },
+                        },
+                        output: crate::meta::repository::mv_contract::OutputContract {
+                            columns: analysis
+                                .output_columns
+                                .iter()
+                                .map(|_| crate::meta::repository::mv_contract::OutputColumnLineage {
+                                    expression: crate::meta::repository::mv_contract::ExpressionLineage {
+                                        kind: crate::meta::repository::mv_contract::ExpressionKind::Column,
+                                        referenced_base_field_ids: Vec::new(), // populated in Task 8
+                                    },
+                                })
+                                .collect(),
+                            filter: None, // populated in Task 8
+                        },
+                        target: crate::meta::repository::mv_contract::TargetContract {
+                            table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                            table_uuid: target_loaded.table.metadata().uuid().to_string(),
+                            schema_id_at_create: target_loaded.table.metadata().current_schema_id(),
+                            visible_columns: analysis
+                                .output_columns
+                                .iter()
+                                .map(|col| {
+                                    let field = target_loaded
+                                        .table
+                                        .metadata()
+                                        .current_schema()
+                                        .as_struct()
+                                        .fields()
+                                        .iter()
+                                        .find(|f| f.name.eq_ignore_ascii_case(&col.name))
+                                        .expect("Task 8 self-check verifies output ↔ target alignment");
+                                    crate::meta::repository::mv_contract::TargetVisibleColumn {
+                                        output_name: col.name.clone(),
+                                        target_field_id: field.id,
+                                        type_signature: format!("{}", field.field_type),
+                                        nullable: !field.required,
+                                    }
+                                })
+                                .collect(),
+                            hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
+                                column_name: crate::meta::repository::mv_contract::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                                target_field_id: actual_apply_key_field_id,
+                                source: crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId,
+                            },
+                        },
                     }),
                     created_at_ms,
                 },
@@ -500,13 +550,7 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    let target_apply_key = mv_definition.target_apply_key.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing target apply-key metadata; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    ensure_target_apply_key_contract(&target_loaded.table, target_apply_key)?;
+    // TODO(A11-Task-10): call validate_schema_contract here.
     let expected_main_snapshot_id = target_loaded
         .table
         .metadata()
@@ -2864,9 +2908,11 @@ mod tests {
         assert_eq!(
             find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
                 .expect("mv definition")
-                .target_apply_key
-                .expect("target apply key")
-                .field_id,
+                .schema_contract
+                .expect("schema contract")
+                .target
+                .hidden_apply_key
+                .target_field_id,
             3
         );
     }
