@@ -57,30 +57,36 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
 
 -- query 5
--- Spark: rename base column `region` -> `area` (same field id) and insert new row.
+-- Spark: rename base column `region` -> `area` (same field id).
+-- The INSERT is done by NovaRocks in query 6 so that first_row_id is set
+-- correctly for row-lineage tracking (Spark 1.8.x does not write first_row_id).
 -- @result_contains=SPARK_SQL_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-a11-rename-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
 ALTER TABLE ice_rest.ns_a11_rename_${uuid0}.base_${uuid0} RENAME COLUMN region TO area;
-INSERT INTO ice_rest.ns_a11_rename_${uuid0}.base_${uuid0} VALUES (4, 'US', 300);
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'
 
 -- query 6
+-- NovaRocks INSERT using the new column name `area` (same field id as `region`).
+-- @skip_result_check=true
+INSERT INTO ice_ivm_a11_rename_${uuid0}.ns_a11_rename_${uuid0}.base_${uuid0} (id, area, amount) VALUES (4, 'US', 300);
+
+-- query 7
 -- A11 contract guard fires CompatibleSafeWithRebind; refresh should succeed
 -- and the new US row (id=4) should appear in the MV.
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
--- query 7
+-- query 8
 -- After rename + refresh: MV output column name is `region` (frozen at CREATE time).
 -- New row id=4 should appear.
 SELECT id, region, amount FROM mv_${uuid0} ORDER BY id;
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_rename_${uuid0}.ns_a11_rename_${uuid0}.base_${uuid0} FORCE;
