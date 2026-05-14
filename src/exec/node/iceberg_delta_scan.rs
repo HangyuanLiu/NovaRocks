@@ -31,11 +31,9 @@ use crate::fs::object_store::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
 pub struct IcebergDeltaScanNode {
-    pub base_table_ident: TableIdent,
+    pub base_table_ident: BaseTableIdent,
     pub from_snapshot_id: i64,
     pub to_snapshot_id: i64,
-    pub previous_snapshot_id: i64,
-    pub current_snapshot_id: i64,
     pub output_chunk_schema: ChunkSchema,
     pub apply_key_source: ApplyKeySource,
     pub change_files: Vec<DeltaSourceFile>,
@@ -44,8 +42,12 @@ pub struct IcebergDeltaScanNode {
     pub node_id: i32,
 }
 
+/// Three-part identifier of the base Iceberg table that an `IcebergDeltaScan`
+/// reads from. Distinct from `iceberg::TableIdent` (which carries a richer
+/// `NamespaceIdent`); this struct holds raw normalized strings for matching
+/// against NovaRocks-internal MV refresh state.
 #[derive(Clone, Debug)]
-pub struct TableIdent {
+pub struct BaseTableIdent {
     pub catalog: String,
     pub namespace: String,
     pub table: String,

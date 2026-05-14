@@ -35,8 +35,9 @@ pub mod union_all;
 pub mod values;
 
 pub use iceberg_delta_scan::{
-    ApplyKeySource, DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode, IcebergRuntimeHandles,
-    TableIdent,
+    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaSourceFile, DeltaSourceRole,
+    EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
+    PositionDeleteTargetData,
 };
 
 use crate::common::ids::SlotId;
