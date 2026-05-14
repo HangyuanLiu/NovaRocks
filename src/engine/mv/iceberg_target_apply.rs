@@ -96,7 +96,8 @@ pub(crate) fn ensure_base_row_lineage_contract(
         || !row_lineage_property_enabled(metadata.properties())
     {
         return Err(format!(
-            "iceberg MV incremental refresh requires base table {base_fqn} to be Iceberg v3 with write.row-lineage=true"
+            "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3 with write.row-lineage=true; \
+             upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
         ));
     }
     Ok(())

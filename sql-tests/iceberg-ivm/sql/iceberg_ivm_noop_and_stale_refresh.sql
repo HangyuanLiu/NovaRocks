@@ -24,6 +24,9 @@ CREATE TABLE ice_ivm_noop_${uuid0}.ns_${uuid0}.orders (
   order_id INT,
   amount BIGINT,
   region STRING
+) TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true"
 );
 INSERT INTO ice_ivm_noop_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10, 'east'),
