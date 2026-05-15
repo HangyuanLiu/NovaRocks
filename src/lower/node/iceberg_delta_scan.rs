@@ -34,7 +34,7 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::iceberg_delta_scan::{
     ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
     EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
-    PositionDeleteTargetData,
+    PositionDeleteFileFormat, PositionDeleteTargetData,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
@@ -134,7 +134,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         )
     })?;
 
-    let change_files = build_delta_source_files_from_batch(&batch);
+    let change_files = build_delta_source_files_from_batch(&batch)?;
 
     let object_store_factory =
         Arc::new(crate::connector::iceberg::changes::build_factory_for_table(
@@ -151,6 +151,20 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let delete_side = if has_delete {
         let base_data_file_lineage =
             crate::connector::iceberg::changes::base_data_file_lineage_index(&loaded.table)?;
+        // For OVERWRITE-deleted files we need the original `first_row_id`
+        // from the previous-snapshot view (the file is no longer alive in
+        // current, so `base_data_file_lineage` doesn't index it). Only
+        // build this when the change batch actually contains
+        // `deleted_data_files`, since the lookup walks every manifest in
+        // the previous snapshot.
+        let previous_data_file_lineage = if !batch.deleted_data_files.is_empty() {
+            crate::connector::iceberg::changes::previous_snapshot_data_file_lineage_index(
+                &loaded.table,
+                batch.previous_snapshot_id,
+            )?
+        } else {
+            std::collections::HashMap::new()
+        };
         let previous_delete_visibility =
             crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
                 &loaded.table,
@@ -160,6 +174,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         Some(DeltaScanDeleteSide {
             base_data_file_lineage,
             previous_delete_visibility,
+            previous_data_file_lineage,
         })
     } else {
         None
@@ -221,7 +236,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
 ///      `open_equality_delete_scanner`, `open_deleted_data_file_scanner`.
 fn build_delta_source_files_from_batch(
     batch: &crate::connector::iceberg::changes::IcebergChangeBatch,
-) -> Vec<DeltaSourceFile> {
+) -> Result<Vec<DeltaSourceFile>, String> {
     let mut out = Vec::with_capacity(
         batch.inserts.len()
             + batch.deletes.len()
@@ -253,10 +268,26 @@ fn build_delta_source_files_from_batch(
                 }]
             })
             .unwrap_or_default();
+        let file_format = match del.file_format {
+            iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
+            iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
+            other => {
+                return Err(format!(
+                    "ivm-a1 lower delta-scan: position-delete file {} has unsupported \
+                     file_format {:?}; only Parquet and Puffin are supported",
+                    del.delete_file_path, other
+                ));
+            }
+        };
         out.push(DeltaSourceFile {
             path: del.delete_file_path.clone(),
             size: del.delete_file_size,
-            role: DeltaSourceRole::PositionDelete { targets },
+            role: DeltaSourceRole::PositionDelete {
+                targets,
+                file_format,
+                content_offset: del.content_offset,
+                content_size_in_bytes: del.content_size_in_bytes,
+            },
             partition_spec_id: None,
             partition_key: None,
             first_row_id: None,
@@ -294,5 +325,5 @@ fn build_delta_source_files_from_batch(
             data_sequence_number: d.data_sequence_number,
         });
     }
-    out
+    Ok(out)
 }

@@ -28,6 +28,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int8Array};
+use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -38,6 +39,23 @@ use crate::exec::node::iceberg_delta_scan::{
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
+
+/// Number of trailing virtual columns the scan-tuple advertises after the
+/// data columns, in fixed order: `_file`, `_pos`, `_row_id`,
+/// `_last_updated_sequence_number`, `__change_op`. The first four are
+/// synthesized per-batch by the role scanners (`DataFileScanner` appends
+/// them directly; the three delete-side scanners receive them prepended by
+/// the underlying `scan_*` helpers in `connector::iceberg`). `__change_op`
+/// is appended at the operator level by `inject_change_op_column`. Together
+/// they define the trailing layout of the operator's chunk contract; the
+/// projection logic below depends on this constant to split each scanner's
+/// returned batch into "data columns" (which need iceberg-schema-evolution
+/// projection) and "lineage columns" (which are already aligned).
+///
+/// The constant is shared with `build_iceberg_table_def_for_delta_scan`
+/// (`src/connector/iceberg/catalog/backend.rs`) — keep in lockstep.
+const ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT: usize = 5;
+const ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT: usize = 4;
 
 pub struct IcebergDeltaScanFactory {
     name: String,
@@ -72,6 +90,7 @@ impl OperatorFactory for IcebergDeltaScanFactory {
             pending,
             current_scanner: None,
             finished: false,
+            data_projection: None,
         })
     }
 
@@ -86,6 +105,12 @@ struct IcebergDeltaScanOperator {
     pending: VecDeque<DeltaSourceFile>,
     current_scanner: Option<Box<dyn DeltaFileScanner>>,
     finished: bool,
+    /// Cached projection plan that maps each scanner's raw "data columns"
+    /// (the parquet file's snapshot-time layout) onto the current iceberg
+    /// schema's data columns as advertised by codegen (in `output_chunk_schema`).
+    /// Built lazily on the first batch because constructing it requires
+    /// reading the base table's current schema and converting it to arrow.
+    data_projection: Option<Arc<IcebergDataColumnProjection>>,
 }
 
 pub(crate) trait DeltaFileScanner: Send {
@@ -140,7 +165,9 @@ impl ProcessorOperator for IcebergDeltaScanOperator {
             match self.current_scanner.as_mut().unwrap().next_batch()? {
                 Some(batch) => {
                     let op = self.current_scanner.as_ref().unwrap().change_op_value();
-                    let tagged = inject_change_op_column(batch, op)?;
+                    let projection = self.ensure_data_projection()?;
+                    let realigned = project_scanner_batch_to_contract(&batch, &projection)?;
+                    let tagged = inject_change_op_column(realigned, op)?;
                     let chunk = Chunk::try_new_with_chunk_schema(
                         tagged,
                         self.node.output_chunk_schema.clone(),
@@ -157,6 +184,198 @@ impl ProcessorOperator for IcebergDeltaScanOperator {
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         Ok(())
     }
+}
+
+impl IcebergDeltaScanOperator {
+    /// Lazily build (and cache) the per-operator projection plan that maps
+    /// each scanner's raw data columns to the current iceberg schema columns
+    /// as advertised by codegen. The plan is invariant for the lifetime of
+    /// this operator (a single delta-scan node only ever references one base
+    /// table at one current schema), so we compute it once on the first
+    /// batch.
+    fn ensure_data_projection(&mut self) -> Result<Arc<IcebergDataColumnProjection>, String> {
+        if let Some(existing) = self.data_projection.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let plan = build_data_column_projection_plan(&self.node)?;
+        let plan = Arc::new(plan);
+        self.data_projection = Some(Arc::clone(&plan));
+        Ok(plan)
+    }
+}
+
+/// Per-output-column projection target derived from the codegen scan-tuple.
+///
+/// `name` is the iceberg-current-schema column name (== codegen slot name).
+/// `field_id` is the iceberg field-id, used to find the matching column in
+/// the parquet file by `parquet.field.id` metadata. `expected_data_type`
+/// is the data type the current iceberg schema declares for this column
+/// (which equals the codegen slot's arrow data type for IVM-A1; type
+/// evolution is not yet supported and we surface a clear error if mismatched).
+struct IcebergDataColumnTarget {
+    name: String,
+    field_id: i32,
+    expected_data_type: arrow::datatypes::DataType,
+    nullable: bool,
+}
+
+/// Plan for projecting each scanner's raw "data columns" prefix (everything
+/// before the four virtual lineage columns) onto the codegen-advertised
+/// current-iceberg-schema column list.
+pub(crate) struct IcebergDataColumnProjection {
+    targets: Vec<IcebergDataColumnTarget>,
+}
+
+fn build_data_column_projection_plan(
+    node: &IcebergDeltaScanNode,
+) -> Result<IcebergDataColumnProjection, String> {
+    // The chunk-schema is laid out as:
+    //   [data_columns ... (N) ][_file, _pos, _row_id, _last_updated_sequence_number, __change_op]
+    // The trailing virtual-column count is fixed (see
+    // `ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT` and
+    // `build_iceberg_table_def_for_delta_scan`).
+    let slots = node.output_chunk_schema.slots();
+    if slots.len() < ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT {
+        return Err(format!(
+            "iceberg delta-scan chunk schema is too short to contain the {} \
+             trailing virtual columns: {} slots",
+            ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT,
+            slots.len(),
+        ));
+    }
+    let data_slot_count = slots.len() - ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT;
+    let current_schema = node.iceberg_runtime.base_table.metadata().current_schema();
+    let mut targets = Vec::with_capacity(data_slot_count);
+    for slot in &slots[..data_slot_count] {
+        let name = slot.name().to_string();
+        let nested = current_schema
+            .field_by_name(slot.name())
+            .or_else(|| current_schema.field_by_name_case_insensitive(slot.name()))
+            .ok_or_else(|| {
+                format!(
+                    "iceberg delta-scan codegen tuple references column `{}` that is not in \
+                     the current iceberg schema (schema_id={})",
+                    slot.name(),
+                    current_schema.schema_id(),
+                )
+            })?;
+        targets.push(IcebergDataColumnTarget {
+            name,
+            field_id: nested.id,
+            expected_data_type: slot.data_type().clone(),
+            nullable: slot.nullable(),
+        });
+    }
+    Ok(IcebergDataColumnProjection { targets })
+}
+
+/// Realign a scanner's returned batch so its data-column prefix matches the
+/// codegen scan-tuple's current-iceberg-schema view.
+///
+/// Each scanner returns a batch with the layout:
+///   `[<raw parquet data columns>, _file, _pos, _row_id, _last_updated_sequence_number]`
+/// The data-column prefix preserves the parquet file's **snapshot-time**
+/// schema (Iceberg metadata-only DDL — DROP / RENAME / REORDER — leaves on-disk
+/// files untouched). The lineage suffix is operator-synthesized and already
+/// aligned. This function rebuilds the data-column prefix in
+/// `projection.targets` order by matching parquet columns to iceberg
+/// field-ids (via `parquet.field.id` metadata), then concatenates the
+/// untouched lineage columns. `__change_op` is appended downstream by
+/// `inject_change_op_column`.
+fn project_scanner_batch_to_contract(
+    batch: &RecordBatch,
+    projection: &IcebergDataColumnProjection,
+) -> Result<RecordBatch, String> {
+    let batch_schema = batch.schema();
+    let batch_cols = batch.num_columns();
+    if batch_cols < ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT {
+        return Err(format!(
+            "iceberg delta-scan: scanner returned batch with {} columns; expected at least {} \
+             trailing lineage columns",
+            batch_cols, ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT,
+        ));
+    }
+    let lineage_start = batch_cols - ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT;
+    let data_fields = &batch_schema.fields()[..lineage_start];
+    let parquet_has_any_field_id = data_fields.iter().any(|f| {
+        f.metadata()
+            .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            .is_some()
+    });
+
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(
+        projection.targets.len() + ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT,
+    );
+    let mut new_fields: Vec<Field> = Vec::with_capacity(
+        projection.targets.len() + ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT,
+    );
+
+    for target in &projection.targets {
+        // Prefer parquet field-id match for evolution-correct projection.
+        let by_field_id = data_fields.iter().position(|f| {
+            f.metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .and_then(|raw| raw.parse::<i32>().ok())
+                == Some(target.field_id)
+        });
+        let source_idx = if let Some(idx) = by_field_id {
+            idx
+        } else if parquet_has_any_field_id {
+            return Err(format!(
+                "iceberg delta-scan: parquet data file does not contain field_id={} for \
+                 column `{}` (the column may have been dropped from the file at write time, \
+                 or the writer did not stamp field-ids on this column)",
+                target.field_id, target.name,
+            ));
+        } else {
+            // Tolerate parquet writers that did not stamp field-ids by
+            // falling back to a case-insensitive name match. v3 row-lineage
+            // tables are expected to have field-ids; this branch is purely
+            // defensive.
+            data_fields
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(&target.name))
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg delta-scan: parquet data file (no field-ids) has no column \
+                         named `{}` (case-insensitive)",
+                        target.name,
+                    )
+                })?
+        };
+        let source_field = batch_schema.field(source_idx);
+        if source_field.data_type() != &target.expected_data_type {
+            return Err(format!(
+                "iceberg delta-scan: column `{}` (field_id={}) has parquet type {:?} but \
+                 codegen tuple expects {:?}; type evolution is not yet supported in IVM-A1",
+                target.name,
+                target.field_id,
+                source_field.data_type(),
+                target.expected_data_type,
+            ));
+        }
+        new_columns.push(batch.column(source_idx).clone());
+        new_fields.push(Field::new(
+            target.name.clone(),
+            target.expected_data_type.clone(),
+            target.nullable,
+        ));
+    }
+
+    // Lineage tail: pass through untouched. We re-emit the field metadata
+    // exactly as the scanner wrote it.
+    for idx in lineage_start..batch_cols {
+        new_columns.push(batch.column(idx).clone());
+        new_fields.push(batch_schema.field(idx).clone());
+    }
+
+    let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+    RecordBatch::try_new_with_options(
+        new_schema,
+        new_columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| format!("project iceberg delta-scan batch to codegen contract: {e}"))
 }
 
 fn inject_change_op_column(batch: RecordBatch, value: i8) -> Result<RecordBatch, String> {
@@ -181,9 +400,19 @@ fn open_scanner_for_role(
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     match &file.role {
         DeltaSourceRole::DataFile => open_data_file_scanner(node, &file),
-        DeltaSourceRole::PositionDelete { targets } => {
-            open_position_delete_scanner(node, &file, targets)
-        }
+        DeltaSourceRole::PositionDelete {
+            targets,
+            file_format,
+            content_offset,
+            content_size_in_bytes,
+        } => open_position_delete_scanner(
+            node,
+            &file,
+            targets,
+            *file_format,
+            *content_offset,
+            *content_size_in_bytes,
+        ),
         DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets: _,
@@ -350,24 +579,31 @@ fn open_position_delete_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
     targets: &[crate::exec::node::iceberg_delta_scan::PositionDeleteTargetData],
+    file_format: crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat,
+    content_offset: Option<i64>,
+    content_size_in_bytes: Option<i64>,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
-    // A1 Phase 2 limits position-delete sources to Parquet v2 deletes; the
-    // operator does not yet plumb Puffin/DV-blob metadata through
-    // `DeltaSourceFile`. Extending the data type is tracked as Phase 2
-    // follow-up.
     let referenced = if targets.len() == 1 {
         Some(targets[0].data_file_path.clone())
     } else {
         None
+    };
+    let iceberg_format = match file_format {
+        crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Parquet => {
+            iceberg::spec::DataFileFormat::Parquet
+        }
+        crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Puffin => {
+            iceberg::spec::DataFileFormat::Puffin
+        }
     };
     let delete = crate::connector::iceberg::changes::PositionDeleteRef {
         delete_file_path: file.path.clone(),
         delete_file_size: file.size,
         record_count: None,
         referenced_data_file: referenced,
-        file_format: iceberg::spec::DataFileFormat::Parquet,
-        content_offset: None,
-        content_size_in_bytes: None,
+        file_format: iceberg_format,
+        content_offset,
+        content_size_in_bytes,
     };
     let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
         format!(
@@ -447,15 +683,6 @@ fn open_deleted_data_file_scanner(
     file: &DeltaSourceFile,
     _visibility: &Option<crate::exec::node::iceberg_delta_scan::DeletedFileVisibility>,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
-    let deleted_file = crate::connector::iceberg::changes::DeletedDataFileRef {
-        path: file.path.clone(),
-        size: file.size,
-        record_count: None,
-        partition_spec_id: file.partition_spec_id,
-        partition_key: file.partition_key.clone(),
-        first_row_id: file.first_row_id,
-        data_sequence_number: file.data_sequence_number,
-    };
     // Use the preloaded full-table visibility from runtime.delete_side; the
     // operator no longer rebuilds per-file visibility from
     // `DeletedFileVisibility::already_deleted_positions`.
@@ -466,6 +693,53 @@ fn open_deleted_data_file_scanner(
             file.path
         )
     })?;
+    // Resolve the file's `first_row_id` / `data_sequence_number`. The
+    // OVERWRITE manifest may only carry the per-DataFile fields when the
+    // original APPEND explicitly stamped them. iceberg-rust's writer often
+    // sets only the manifest-level `first_row_id`, so the per-DataFile
+    // fields can be `None` here. In that case, fall back to the
+    // previous-snapshot data-file lineage index (where the file is still
+    // alive and its row-lineage attributes are unambiguous).
+    let resolved_first_row_id = match file.first_row_id {
+        Some(v) => v,
+        None => delete_side
+            .previous_data_file_lineage
+            .get(&file.path)
+            .map(|lineage| lineage.first_row_id)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg MV deleted-data-file reverse projection requires first_row_id for {} \
+                     and the previous-snapshot data-file lineage index does not contain this file; \
+                     this typically means the file was added and overwrite-deleted within the same \
+                     delta range, which IVM-A1 does not support",
+                    file.path,
+                )
+            })?,
+    };
+    let resolved_data_sequence_number = match file.data_sequence_number {
+        Some(v) => v,
+        None => delete_side
+            .previous_data_file_lineage
+            .get(&file.path)
+            .map(|lineage| lineage.data_sequence_number)
+            .ok_or_else(|| {
+                format!(
+                    "iceberg MV deleted-data-file reverse projection requires data_sequence_number \
+                     for {} and the previous-snapshot data-file lineage index does not contain \
+                     this file; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                    file.path,
+                )
+            })?,
+    };
+    let deleted_file = crate::connector::iceberg::changes::DeletedDataFileRef {
+        path: file.path.clone(),
+        size: file.size,
+        record_count: None,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key.clone(),
+        first_row_id: Some(resolved_first_row_id),
+        data_sequence_number: Some(resolved_data_sequence_number),
+    };
     let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file(
         &node.iceberg_runtime.base_table,
         &deleted_file,

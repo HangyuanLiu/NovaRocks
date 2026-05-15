@@ -76,6 +76,19 @@ pub enum DeltaSourceRole {
     DataFile,
     PositionDelete {
         targets: Vec<PositionDeleteTargetData>,
+        /// Position-delete encoding: Parquet for the v2 (positional rows)
+        /// format, Puffin for the v3 (deletion vector blob) format. The
+        /// operator dispatches `scan_position_delete_rows_for_targets`
+        /// accordingly. Other variants are rejected at plan time.
+        file_format: PositionDeleteFileFormat,
+        /// Required when `file_format == Puffin`: byte offset of the
+        /// `deletion-vector-v1` blob inside the Puffin file. `None` for
+        /// the Parquet position-delete format.
+        content_offset: Option<i64>,
+        /// Required when `file_format == Puffin`: byte length of the
+        /// `deletion-vector-v1` blob inside the Puffin file. `None` for
+        /// the Parquet position-delete format.
+        content_size_in_bytes: Option<i64>,
     },
     EqualityDelete {
         equality_field_ids: Vec<i32>,
@@ -84,6 +97,21 @@ pub enum DeltaSourceRole {
     DeletedDataFile {
         previous_data_file_visibility: Option<DeletedFileVisibility>,
     },
+}
+
+/// Encoding of a position-delete file. Mirrors the subset of
+/// `iceberg::spec::DataFileFormat` that IVM-A1 supports for the position
+/// delete role; the lowering pass rejects any other format. We carry it
+/// here (rather than re-using `iceberg::spec::DataFileFormat`) so the
+/// `IcebergDeltaScanNode` does not need to leak the wider iceberg enum
+/// through its public type surface — and so adding new formats in the
+/// future is a single localized change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionDeleteFileFormat {
+    /// v2 position-delete file (one row per (file, pos) pair, parquet-encoded).
+    Parquet,
+    /// v3 deletion-vector file (Puffin blob with `deletion-vector-v1` body).
+    Puffin,
 }
 
 #[derive(Clone, Debug)]
@@ -135,4 +163,13 @@ pub struct DeltaScanDeleteSide {
     pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
     pub(crate) previous_delete_visibility:
         crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    /// `first_row_id` / `data_sequence_number` index keyed by data-file
+    /// path, built from the **previous** MV-refresh snapshot (i.e. the
+    /// `from_snapshot_id` of the delta range). Used as a fallback by the
+    /// `IcebergDeltaScanOperator`'s `DeletedDataFile` scanner when an
+    /// OVERWRITE manifest's deleted entry does not carry an explicit
+    /// per-file `first_row_id` (the iceberg writer may have only stamped
+    /// the manifest-level `first_row_id` on the original APPEND, leaving
+    /// the per-DataFile field `None`).
+    pub previous_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
 }

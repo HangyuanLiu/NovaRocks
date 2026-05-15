@@ -340,19 +340,23 @@ pub(crate) fn append_base_row_id_column(
 
 /// Append all four Iceberg v3 row-lineage virtual columns
 /// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) to a batch
-/// of reverse-projected delete-side rows so its column count matches what
-/// `build_iceberg_table_def_for_delta_scan` advertises to codegen. The
-/// caller knows which target data file the rows came from (so `_file` is a
-/// constant string column and `_last_updated_sequence_number` is a constant
-/// int64 column), the per-row positions (`_pos`), and the file's
-/// `first_row_id` (so `_row_id = first_row_id + pos`).
+/// of reverse-projected delete-side rows so its column count and trailing
+/// order match what `build_iceberg_table_def_for_delta_scan` advertises to
+/// codegen and what `DataFileScanner::append_data_file_lineage_columns`
+/// emits on the insert side. The caller knows which target data file the
+/// rows came from (so `_file` is a constant string column and
+/// `_last_updated_sequence_number` is a constant int64 column), the per-row
+/// positions (`_pos`), and the file's `first_row_id` (so
+/// `_row_id = first_row_id + pos`).
 ///
-/// `_row_id` reuses `append_base_row_id_column` so any existing `_row_id`
-/// in the input is verified to match the computed values rather than
-/// silently overwritten. The other three columns are always appended on top
-/// of the result; the chunk layout maps by slot_id / column name, not by
-/// position, so trailing order does not have to mirror the codegen
-/// advertised order in `build_iceberg_table_def_for_delta_scan`.
+/// The chunk-schema contract check (`align_chunk_schema_to_batch`) is
+/// strictly positional and name-matching, so all callers in the delta-scan
+/// pipeline must agree on the trailing lineage column order:
+/// `_file, _pos, _row_id, _last_updated_sequence_number`. This function
+/// verifies any pre-existing `_row_id` column in the input against the
+/// computed value (via `append_base_row_id_column`) before reshaping, so
+/// caller batches that already carry `_row_id` (e.g. base data files that
+/// physically store the column) are accepted as long as their values match.
 pub(crate) fn append_iceberg_v3_row_lineage_columns(
     batch: &RecordBatch,
     data_file_path: &str,
@@ -362,6 +366,12 @@ pub(crate) fn append_iceberg_v3_row_lineage_columns(
 ) -> Result<RecordBatch, ChangeError> {
     use arrow::array::StringArray;
 
+    // `append_base_row_id_column` returns either:
+    //   - the original batch unchanged (when `_row_id` already exists and
+    //     matches the computed row-ids), or
+    //   - the batch with `_row_id` appended at the tail.
+    // In either case we then strip `_row_id` out of the column list and
+    // append the four lineage columns in the canonical contract order.
     let with_row_id = append_base_row_id_column(batch, first_row_id, positions)?;
     let row_count = with_row_id.num_rows();
     let mut pos_values = Vec::with_capacity(row_count);
@@ -374,12 +384,37 @@ pub(crate) fn append_iceberg_v3_row_lineage_columns(
         pos_values.push(position);
     }
 
-    let mut fields = with_row_id
+    // Locate (and remove) any `_row_id` column from the in-progress batch
+    // so we can re-append it in the canonical position (3rd of the four
+    // trailing lineage columns). `append_base_row_id_column` has already
+    // validated that any pre-existing `_row_id` matches the computed value,
+    // so peeling it off here is purely a positional fix-up.
+    let row_id_idx = with_row_id
         .schema()
         .fields()
         .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+        .position(|f| f.name() == ROW_ID_COLUMN);
+    let (data_fields, data_columns, row_id_col): (
+        Vec<arrow::datatypes::FieldRef>,
+        Vec<ArrayRef>,
+        ArrayRef,
+    ) = if let Some(idx) = row_id_idx {
+        let mut fields: Vec<arrow::datatypes::FieldRef> =
+            with_row_id.schema().fields().iter().cloned().collect();
+        let mut cols: Vec<ArrayRef> = with_row_id.columns().to_vec();
+        let row_id_col = cols.remove(idx);
+        fields.remove(idx);
+        (fields, cols, row_id_col)
+    } else {
+        // Defensive: `append_base_row_id_column` always either keeps an
+        // existing _row_id or appends one. Reaching this arm would be a bug.
+        return Err(ChangeError::InternalInconsistency(format!(
+            "iceberg v3 row-lineage materializer: batch missing {ROW_ID_COLUMN} after \
+             append_base_row_id_column for data file {data_file_path}"
+        )));
+    };
+
+    let mut fields = data_fields;
     fields.push(Arc::new(Field::new(
         "_file",
         arrow::datatypes::DataType::Utf8,
@@ -391,17 +426,23 @@ pub(crate) fn append_iceberg_v3_row_lineage_columns(
         false,
     )));
     fields.push(Arc::new(Field::new(
+        ROW_ID_COLUMN,
+        arrow::datatypes::DataType::Int64,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
         "_last_updated_sequence_number",
         arrow::datatypes::DataType::Int64,
         false,
     )));
     let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-    let mut columns = with_row_id.columns().to_vec();
+    let mut columns = data_columns;
     columns.push(Arc::new(StringArray::from(vec![
         data_file_path.to_string();
         row_count
     ])) as ArrayRef);
     columns.push(Arc::new(Int64Array::from(pos_values)) as ArrayRef);
+    columns.push(row_id_col);
     columns.push(Arc::new(Int64Array::from(vec![data_sequence_number; row_count])) as ArrayRef);
     RecordBatch::try_new(schema, columns).map_err(|e| {
         ChangeError::InternalInconsistency(format!(

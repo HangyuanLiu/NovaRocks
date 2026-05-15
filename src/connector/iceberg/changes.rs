@@ -944,8 +944,37 @@ pub(crate) fn base_data_file_lineage_index(
     String,
 > {
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    build_data_file_lineage_index_from_snapshot(&read_snapshot)
+}
+
+/// Build a (file_path -> first_row_id / data_sequence_number) index from the
+/// data files alive in a specific snapshot. Distinct from
+/// `base_data_file_lineage_index` (which reads the current snapshot) — this
+/// is used to look up the original `first_row_id` of a file that was
+/// OVERWRITE-deleted between the MV's previous-refresh snapshot and the
+/// current snapshot. The deleted file is no longer alive in current, but
+/// it WAS alive at `previous_snapshot_id`, where its first_row_id is
+/// faithfully readable via the iceberg-rust per-manifest inheritance.
+pub(crate) fn previous_snapshot_data_file_lineage_index(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<
+    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    String,
+> {
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    build_data_file_lineage_index_from_snapshot(&read_snapshot)
+}
+
+fn build_data_file_lineage_index_from_snapshot(
+    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+) -> Result<
+    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    String,
+> {
     let mut out = std::collections::HashMap::new();
-    for file in read_snapshot.files {
+    for file in &read_snapshot.files {
         let first_row_id = file.first_row_id.ok_or_else(|| {
             format!(
                 "iceberg MV delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
@@ -959,7 +988,7 @@ pub(crate) fn base_data_file_lineage_index(
             )
         })?;
         out.insert(
-            file.path,
+            file.path.clone(),
             crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
                 first_row_id,
                 data_sequence_number,
@@ -1599,6 +1628,12 @@ async fn collect_deleted_data_files_for_manifest_list(
                 continue;
             }
             let record_count = i64::try_from(df.record_count()).unwrap_or(i64::MAX);
+            // For deleted entries `df.first_row_id()` is the value carried
+            // forward from the original `Added` entry — when the file was
+            // first appended. The IcebergDeltaScanOperator's deleted-file
+            // scanner falls back to a previous-snapshot lineage lookup if
+            // this is `None` (e.g. the original APPEND only set the
+            // manifest-level first_row_id and relied on inheritance).
             deleted_data_files.push(DeletedDataFileRef {
                 path: df.file_path().to_string(),
                 size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
