@@ -42,7 +42,69 @@ pub(crate) fn build_scan_node(
     if resolved.physical_layout.is_some() {
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
+    if matches!(
+        resolved.table.storage,
+        TableStorage::IcebergDeltaTable { .. }
+    ) {
+        return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
+    }
     build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
+}
+
+/// Emit `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` for an IVM-A1 delta scan.
+/// Only the lightweight identity + snapshot range is carried in the Thrift
+/// payload; the actual change-file enumeration happens at `lower_plan`
+/// time via `connector::iceberg::changes::plan_changes`.
+///
+/// `conjuncts` is the predicate-pushdown output for this scan. We forward
+/// them on `node.conjuncts` so the shared `LowerNode::evaluate_conjuncts`
+/// path applies them post-scan, just like `HDFS_SCAN_NODE`. Without this,
+/// `WHERE` clauses on an `__nr_ivm_delta(...)` table reference are silently
+/// dropped because there is no Filter node above the scan after pushdown.
+fn build_iceberg_delta_scan_node(
+    node_id: i32,
+    scan_tuple_id: i32,
+    resolved: &ResolvedTable,
+    conjuncts: Vec<exprs::TExpr>,
+) -> plan_nodes::TPlanNode {
+    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
+        match &resolved.table.storage {
+            TableStorage::IcebergDeltaTable {
+                catalog,
+                namespace,
+                table,
+                from_snapshot_id,
+                to_snapshot_id,
+            } => (
+                catalog.clone(),
+                namespace.clone(),
+                table.clone(),
+                *from_snapshot_id,
+                *to_snapshot_id,
+            ),
+            _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
+        };
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = vec![scan_tuple_id];
+    node.nullable_tuples = vec![];
+    node.conjuncts = if conjuncts.is_empty() {
+        None
+    } else {
+        Some(conjuncts)
+    };
+    node.compact_data = true;
+    node.iceberg_delta_scan_node = Some(Box::new(plan_nodes::TIcebergDeltaScanNode {
+        catalog,
+        namespace,
+        table,
+        from_snapshot_id,
+        to_snapshot_id,
+    }));
+    node
 }
 
 fn build_hdfs_scan_node(
@@ -562,6 +624,13 @@ pub(crate) fn build_exec_params_multi(
                     // call keyed off `serialized_table`. We still need at
                     // least one scan range so the runtime allocates a morsel
                     // and dispatches to `IcebergMetadataScanOp`.
+                    vec![build_iceberg_metadata_scan_range_params()]
+                }
+                TableStorage::IcebergDeltaTable { .. } => {
+                    // IVM delta-scan is a single-instance operator: the
+                    // change-file enumeration happens inside lower_plan
+                    // from `plan_changes`, so we emit one placeholder
+                    // morsel for the runtime to dispatch on.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
             }
@@ -1494,5 +1563,6 @@ pub(crate) fn default_plan_node() -> plan_nodes::TPlanNode {
         look_up_node: None,
         benchmark_scan_node: None,
         cache_stats_scan_node: None,
+        iceberg_delta_scan_node: None,
     }
 }

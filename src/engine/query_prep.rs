@@ -553,6 +553,30 @@ pub(crate) fn drop_registered_external_table(
     }
 }
 
+/// IVM-A1 helper: build an `InMemoryCatalog`-compatible `TableDef` for the
+/// base table of an MV refresh without registering any data files.
+/// Advertises Iceberg v3 row-lineage virtual columns (`_row_id`, etc.) so
+/// the analyzer can resolve apply-key references; the actual per-snapshot
+/// files come from the `IcebergDeltaScan` operator at runtime.
+pub(crate) fn build_iceberg_table_def_for_delta_scan(
+    state: &Arc<StandaloneState>,
+    catalog_name: &str,
+    namespace: &str,
+    table_name: &str,
+) -> Result<TableDef, String> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg registry read lock");
+        registry.get(catalog_name)?
+    };
+    let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table_name)?;
+    crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
+        namespace, table_name, loaded,
+    )
+}
+
 pub(crate) fn build_iceberg_table_def_with_files(
     state: &Arc<StandaloneState>,
     catalog_name: &str,

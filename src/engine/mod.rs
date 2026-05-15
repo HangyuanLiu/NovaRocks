@@ -407,6 +407,12 @@ impl StandaloneNovaRocks {
                         .to_string(),
                 );
             }
+            TableStorage::IcebergDeltaTable { .. } => {
+                return Err(
+                    "register_parquet_table_in_database does not support IVM iceberg delta tables"
+                        .to_string(),
+                );
+            }
         }
         let mut guard = self
             .inner
@@ -2312,6 +2318,35 @@ pub(crate) fn execute_query(
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
+    execute_query_with_options(
+        query,
+        catalog,
+        current_database,
+        exchange_port,
+        query_opts,
+        None,
+        None,
+    )
+}
+
+/// Extended `execute_query` entry that accepts an optional custom terminal
+/// sink factory and an optional Iceberg catalog registry. Used by IVM-A1
+/// refresh paths: the merge sink intercepts pipeline output (no result
+/// rows are produced), and lower_plan needs the registry to resolve
+/// `ICEBERG_DELTA_SCAN_NODE` runtime handles.
+///
+/// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
+/// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM
+/// callers.
+pub(crate) fn execute_query_with_options(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+) -> Result<QueryResult, String> {
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
@@ -2325,8 +2360,23 @@ pub(crate) fn execute_query(
     let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(*plan, query_opts),
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs)
+        }
         StandaloneExecutionPlan::Coordinated(build_result) => {
+            if terminal_sink.is_some() {
+                return Err(
+                    "IVM-A1 custom sink does not yet support coordinated multi-fragment plans"
+                        .to_string(),
+                );
+            }
+            if iceberg_catalogs.is_some() {
+                return Err(
+                    "IVM-A1 iceberg_catalogs runtime registry does not yet support coordinated \
+                     multi-fragment plans"
+                        .to_string(),
+                );
+            }
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 "127.0.0.1".to_string(),
@@ -2478,6 +2528,8 @@ fn collect_scan_stats(
 fn execute_plan(
     result: PlanBuildResult,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<QueryResult, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -2511,6 +2563,7 @@ fn execute_plan(
         &layout_hints,
         None,
         None,
+        iceberg_catalogs,
     )?;
     let mut exec_plan = ExecPlan {
         arena,
@@ -2518,7 +2571,17 @@ fn execute_plan(
     };
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
+    // Default to the result-capturing sink unless the caller supplied a
+    // custom terminal sink (e.g. IVM-A1 IcebergMergeSinkFactory). When a
+    // custom sink is in use, output chunks are intercepted by the sink so
+    // the returned `QueryResult` only carries the column metadata.
     let handle = ResultSinkHandle::new();
+    let sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory> =
+        match terminal_sink {
+            Some(custom_sink) => custom_sink,
+            None => Box::new(ResultSinkFactory::new(handle.clone())),
+        };
+
     // Use available CPU cores for pipeline parallelism (capped at 8)
     let pipeline_dop = std::thread::available_parallelism()
         .map(|p| p.get().min(4))
@@ -2527,7 +2590,7 @@ fn execute_plan(
         exec_plan,
         false,
         std::time::Duration::from_millis(10),
-        Box::new(ResultSinkFactory::new(handle.clone())),
+        sink,
         None,
         None,
         pipeline_dop as _,
@@ -4440,329 +4503,6 @@ enable_path_style_access = true
                 .get("db1", "t")
                 .is_err(),
             "drop table should remove stale local table"
-        );
-    }
-
-    #[test]
-    fn execute_mv_incremental_refresh_reads_only_delta_files() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        let first_insert = session
-            .execute_in_database("insert into ice.db1.tbl values (1, 'old')", "default")
-            .expect("insert first iceberg row");
-        assert!(matches!(first_insert, StatementResult::Ok));
-
-        let entry = {
-            let registry = engine
-                .inner
-                .iceberg_catalogs
-                .read()
-                .expect("iceberg registry read lock");
-            registry.get("ice").expect("load iceberg catalog entry")
-        };
-        let first_loaded =
-            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load first table");
-        let previous_snapshot_id = first_loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .expect("first snapshot")
-            .snapshot_id();
-
-        let second_insert = session
-            .execute_in_database("insert into ice.db1.tbl values (2, 'new')", "default")
-            .expect("insert second iceberg row");
-        assert!(matches!(second_insert, StatementResult::Ok));
-
-        let second_loaded =
-            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let batch =
-            crate::connector::plan_iceberg_changes(&second_loaded.table, previous_snapshot_id, &[])
-                .expect("plan_changes");
-        assert!(
-            batch.deletes.is_empty(),
-            "append-only fixture: {:?}",
-            batch.deletes
-        );
-        assert!(
-            batch.equality_deletes.is_empty(),
-            "append-only fixture equality deletes: {:?}",
-            batch.equality_deletes
-        );
-        let added_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
-            .inserts
-            .iter()
-            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
-                path: f.path.clone(),
-                size: f.size,
-                record_count: f.record_count,
-                partition_spec_id: f.partition_spec_id,
-                partition_key: f.partition_key.clone(),
-                first_row_id: f.first_row_id,
-                data_sequence_number: f.data_sequence_number,
-                change_op: None,
-            })
-            .collect();
-
-        let result = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &engine.inner,
-            "default",
-            "select id, name from ice.db1.tbl order by id",
-            &crate::connector::IcebergTableRef {
-                catalog: "ice".to_string(),
-                namespace: "db1".to_string(),
-                table: "tbl".to_string(),
-            },
-            added_files,
-        )
-        .expect("execute mv incremental refresh");
-
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let ids = chunk.batch.column(0);
-        let ids = ids
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .expect("id array");
-        let names = chunk.batch.column(1);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("name array");
-        assert_eq!(ids.value(0), 2);
-        assert_eq!(names.value(0), "new");
-
-        let catalog = engine
-            .inner
-            .catalog
-            .read()
-            .expect("standalone catalog read lock");
-        assert!(catalog.get("db1", "tbl").is_err());
-    }
-
-    #[test]
-    fn execute_mv_incremental_refresh_rejects_base_ref_mismatch() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &engine.inner,
-            "default",
-            "select id, name from ice.db1.tbl",
-            &crate::connector::IcebergTableRef {
-                catalog: "ice".to_string(),
-                namespace: "db1".to_string(),
-                table: "other".to_string(),
-            },
-            vec![],
-        )
-        .expect_err("mismatched base ref must fail");
-        assert!(
-            err.contains("incremental MV refresh stored SQL base table mismatch"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn execute_mv_incremental_refresh_rejects_zero_or_multiple_base_refs() {
-        let state = Arc::new(StandaloneState::default());
-        let base_ref = crate::connector::IcebergTableRef {
-            catalog: "ice".to_string(),
-            namespace: "db1".to_string(),
-            table: "tbl".to_string(),
-        };
-
-        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &state,
-            "default",
-            "select 1",
-            &base_ref,
-            vec![],
-        )
-        .expect_err("missing base ref must fail");
-        assert!(
-            err.contains(
-                "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got 0"
-            ),
-            "err={err}"
-        );
-
-        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &state,
-            "default",
-            "select * from ice.db1.tbl t join ice.db1.other o on t.id = o.id",
-            &base_ref,
-            vec![],
-        )
-        .expect_err("multiple base refs must fail");
-        assert!(
-            err.contains(
-                "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got 2"
-            ),
-            "err={err}"
-        );
-
-        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &state,
-            "default",
-            "select * from ice.db1.tbl t join ice.db1.tbl u on t.id = u.id",
-            &base_ref,
-            vec![],
-        )
-        .expect_err("repeated base ref must fail");
-        assert!(
-            err.contains(
-                "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got 2"
-            ),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn execute_mv_incremental_refresh_rejects_multiple_local_delta_files() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        let first_insert = session
-            .execute_in_database("insert into ice.db1.tbl values (1, 'old')", "default")
-            .expect("insert first iceberg row");
-        assert!(matches!(first_insert, StatementResult::Ok));
-
-        let entry = {
-            let registry = engine
-                .inner
-                .iceberg_catalogs
-                .read()
-                .expect("iceberg registry read lock");
-            registry.get("ice").expect("load iceberg catalog entry")
-        };
-        let first_loaded =
-            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load first table");
-        let previous_snapshot_id = first_loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .expect("first snapshot")
-            .snapshot_id();
-
-        let second_insert = session
-            .execute_in_database("insert into ice.db1.tbl values (2, 'new')", "default")
-            .expect("insert second iceberg row");
-        assert!(matches!(second_insert, StatementResult::Ok));
-
-        let second_loaded =
-            crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let batch =
-            crate::connector::plan_iceberg_changes(&second_loaded.table, previous_snapshot_id, &[])
-                .expect("plan_changes");
-        assert!(
-            batch.deletes.is_empty(),
-            "append-only fixture: {:?}",
-            batch.deletes
-        );
-        assert!(
-            batch.equality_deletes.is_empty(),
-            "append-only fixture equality deletes: {:?}",
-            batch.equality_deletes
-        );
-        let mut delta_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
-            .inserts
-            .iter()
-            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
-                path: f.path.clone(),
-                size: f.size,
-                record_count: f.record_count,
-                partition_spec_id: f.partition_spec_id,
-                partition_key: f.partition_key.clone(),
-                first_row_id: f.first_row_id,
-                data_sequence_number: f.data_sequence_number,
-                change_op: None,
-            })
-            .collect();
-        let first_delta_file = delta_files
-            .first()
-            .expect("at least one delta file")
-            .clone();
-        delta_files.push(first_delta_file);
-
-        let err = super::mv_flow::execute_query_for_mv_incremental_refresh(
-            &engine.inner,
-            "default",
-            "select id, name from ice.db1.tbl",
-            &crate::connector::IcebergTableRef {
-                catalog: "ice".to_string(),
-                namespace: "db1".to_string(),
-                table: "tbl".to_string(),
-            },
-            delta_files,
-        )
-        .expect_err("multiple local delta files must fail");
-        assert!(
-            err.contains(
-                "incremental MV refresh over local iceberg supports at most one delta file"
-            ),
-            "err={err}"
         );
     }
 

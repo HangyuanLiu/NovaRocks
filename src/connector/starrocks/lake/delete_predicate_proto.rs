@@ -17,10 +17,7 @@ use crate::service::grpc_client::proto::starrocks::{
     BinaryPredicatePb, DeletePredicatePb, InPredicatePb, IsNullPredicatePb,
 };
 
-pub fn build_delete_predicate_pb(
-    terms: &DeletePredicateTerms,
-    version: i32,
-) -> DeletePredicatePb {
+pub fn build_delete_predicate_pb(terms: &DeletePredicateTerms, version: i32) -> DeletePredicatePb {
     DeletePredicatePb {
         version,
         sub_predicates: Vec::new(),

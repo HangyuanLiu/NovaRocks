@@ -1,0 +1,19 @@
+-- query 4
+region	cnt	total
+APAC	1666	1250334
+EMEA	834	625916
+
+-- query 5
+region	cnt	total
+APAC	1666	1250334
+EMEA	834	625916
+
+-- query 8
+region	cnt	total
+APAC	2147	1538842
+EMEA	824	619921
+
+-- query 9
+region	cnt	total
+APAC	2147	1538842
+EMEA	824	619921

@@ -20,6 +20,7 @@ pub mod assert;
 pub mod exchange_source;
 pub mod fetch;
 pub mod filter;
+pub mod iceberg_delta_scan;
 pub mod join;
 pub mod limit;
 pub mod lookup;
@@ -32,6 +33,12 @@ pub mod sort;
 pub mod table_function;
 pub mod union_all;
 pub mod values;
+
+pub use iceberg_delta_scan::{
+    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaSourceFile, DeltaSourceRole,
+    EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
+    PositionDeleteTargetData,
+};
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
@@ -77,6 +84,7 @@ pub enum ExecNodeKind {
     Limit(LimitNode),
     ExchangeSource(ExchangeSourceNode),
     Scan(ScanNode),
+    IcebergDeltaScan(IcebergDeltaScanNode),
     Fetch(FetchNode),
     LookUp(LookUpNode),
     Aggregate(AggregateNode),
@@ -234,6 +242,13 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
         ),
         ExecNodeKind::Scan(scan) => Some(
             scan.output_chunk_schema()
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::IcebergDeltaScan(scan) => Some(
+            scan.output_chunk_schema
                 .slot_ids()
                 .iter()
                 .copied()
@@ -412,6 +427,9 @@ fn push_down_local_runtime_filters_inner(
                 })
                 .collect();
             scan.add_runtime_filter_specs(&specs);
+        }
+        ExecNodeKind::IcebergDeltaScan(_) => {
+            // delta source is a leaf; runtime filters do not apply for A1
         }
         ExecNodeKind::Fetch(FetchNode { input, .. }) => {
             let filtered = filter_specs_for_child(arena, inherited, input);

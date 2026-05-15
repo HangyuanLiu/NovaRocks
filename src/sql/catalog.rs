@@ -182,6 +182,21 @@ pub enum TableStorage {
         /// does not need them today.
         cloud_properties: BTreeMap<String, String>,
     },
+    /// IVM-A1 plan-time Iceberg delta-scan placeholder. Produced by the
+    /// analyzer/planner when it recognizes the
+    /// `__nr_ivm_delta('cat.ns.tbl', from, to)` table function. Codegen
+    /// emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` whose lowering
+    /// re-discovers the actual change files via
+    /// `connector::iceberg::changes::plan_changes`. The descriptor here
+    /// carries only the lightweight identity and snapshot range so the
+    /// Thrift plan stays small.
+    IcebergDeltaTable {
+        catalog: String,
+        namespace: String,
+        table: String,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    },
 }
 
 #[derive(Clone, Debug)]

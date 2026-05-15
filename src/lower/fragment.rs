@@ -133,6 +133,7 @@ fn collect_glm_metadata(
             }
         }
         ExecNodeKind::Values(_) => {}
+        ExecNodeKind::IcebergDeltaScan(_) => {}
     }
     Ok(())
 }
@@ -260,6 +261,7 @@ pub(crate) fn execute_fragment(
                 &layout_hints,
                 last_query_id,
                 fe_addr,
+                None,
             )?
         };
 

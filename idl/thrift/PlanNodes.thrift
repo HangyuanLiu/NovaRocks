@@ -89,7 +89,13 @@ enum TPlanNodeType {
   FETCH_NODE,
   LOOKUP_NODE,
   BENCHMARK_SCAN_NODE,
-  LAKE_CACHE_STATS_SCAN_NODE
+  LAKE_CACHE_STATS_SCAN_NODE,
+
+  // NovaRocks-only node types start at 1000 to avoid colliding with
+  // upstream starrocks additions (which occupy 0..999 by sequential
+  // ordering). FE never emits these — they are produced only by
+  // NovaRocks-internal compile paths (e.g. IVM incremental refresh).
+  ICEBERG_DELTA_SCAN_NODE = 1000
 }
 
 // phases of an execution node
@@ -1551,6 +1557,24 @@ struct TPlanNode {
   84: optional TBenchmarkScanNode benchmark_scan_node;
 
   85: optional TCacheStatsScanNode cache_stats_scan_node;
+
+  // NovaRocks-only payloads start at field 1000 to mirror the
+  // TPlanNodeType id offset (see enum above).
+  1000: optional TIcebergDeltaScanNode iceberg_delta_scan_node;
+}
+
+// NovaRocks-only: IVM-A1 Iceberg incremental delta scan source. Carries only
+// lightweight descriptors (catalog/namespace/table strings + from/to
+// snapshot ids). The list of change files and runtime state (delete
+// visibility, first_row_id index, opendal factory) are computed at
+// lower_plan time by `plan_changes` so they never traverse the Thrift
+// wire format.
+struct TIcebergDeltaScanNode {
+  1: required string catalog
+  2: required string namespace
+  3: required string table
+  4: required i64 from_snapshot_id
+  5: required i64 to_snapshot_id
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

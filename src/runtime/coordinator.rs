@@ -518,6 +518,7 @@ impl ExecutionCoordinator {
             &layout_hints,
             None, // last_query_id
             None, // fe_addr
+            None, // iceberg_catalogs (IVM-only)
         )?;
 
         let mut exec_plan = ExecPlan {

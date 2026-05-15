@@ -99,6 +99,12 @@ pub(crate) enum Relation {
     /// An Iceberg metadata table scan: `t$snapshots`, `t$history`, etc.
     /// Produced by `resolve_from` after `__nr_meta_<type>__` suffix detection.
     IcebergMetadataScan(IcebergMetadataScanRelation),
+    /// IVM-A1 plan-time delta scan: `__nr_ivm_delta('cat.ns.tbl', from, to)`.
+    /// Produced by the analyzer when it recognizes the `__nr_ivm_delta`
+    /// table function. Lowered by the planner into a regular `Scan` over a
+    /// synthetic `TableDef` whose storage is `TableStorage::IcebergDeltaTable`,
+    /// and emitted by codegen as `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
+    IcebergDeltaScan(IcebergDeltaScanRelation),
     /// A subquery in FROM: `(SELECT ...) AS alias`.
     Subquery {
         query: Box<ResolvedQuery>,
@@ -150,6 +156,28 @@ pub(crate) struct IcebergMetadataScanRelation {
     pub table: TableDef,
     pub metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     /// FROM-clause alias (e.g., `t$snapshots AS s` → `Some("s")`).
+    pub alias: Option<String>,
+}
+
+/// IVM-A1 plan-time delta-scan reference: the analyzer's output for a
+/// `__nr_ivm_delta('cat.ns.tbl', from_snap, to_snap)` table function call.
+/// Carries the base table's `TableDef` (with v3 row-lineage metadata
+/// columns already populated by the catalog) so the planner can emit a
+/// synthetic `LogicalPlan::Scan` whose storage tag dispatches codegen to
+/// `ICEBERG_DELTA_SCAN_NODE`.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergDeltaScanRelation {
+    /// Three-part identifier of the base Iceberg table.
+    pub catalog: String,
+    pub namespace: String,
+    pub table_name: String,
+    /// The base table definition resolved through the catalog. Includes the
+    /// `iceberg_row_lineage_metadata_columns` that delta-scan exposes as
+    /// resolvable virtual columns (`_row_id`, etc).
+    pub table: TableDef,
+    pub from_snapshot_id: i64,
+    pub to_snapshot_id: i64,
+    /// Optional FROM-clause alias (`__nr_ivm_delta(...) AS t` → `Some("t")`).
     pub alias: Option<String>,
 }
 

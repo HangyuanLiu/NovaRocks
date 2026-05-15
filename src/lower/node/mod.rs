@@ -25,6 +25,7 @@ mod fetch;
 mod file_scan;
 mod hash_join;
 pub(crate) mod hdfs_scan;
+mod iceberg_delta_scan;
 mod jdbc_scan;
 mod lake_meta_scan;
 mod lake_scan;
@@ -65,6 +66,7 @@ pub(crate) use fetch::lower_fetch_node;
 pub(crate) use file_scan::lower_file_scan_node;
 pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
+pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
 pub(crate) use jdbc_scan::lower_jdbc_scan_node;
 pub(crate) use lake_meta_scan::lower_lake_meta_scan_node;
 pub(crate) use lake_scan::lower_lake_scan_node;
@@ -145,6 +147,7 @@ pub(crate) fn test_plan_node(
         look_up_node: None,
         benchmark_scan_node: None,
         cache_stats_scan_node: None,
+        iceberg_delta_scan_node: None,
     }
 }
 
@@ -208,6 +211,7 @@ pub(crate) fn lower_plan(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<Lowered, String> {
     let mut idx = 0usize;
     let global_common_slot_map = collect_global_common_slot_map(&plan.nodes);
@@ -234,6 +238,7 @@ pub(crate) fn lower_plan(
         &global_common_slot_map,
         last_query_id,
         fe_addr,
+        iceberg_catalogs,
     )?;
     if idx != plan.nodes.len() {
         // best-effort: ignore trailing nodes
@@ -285,6 +290,7 @@ fn lower_node(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<Lowered, String> {
     let root_index = *idx;
     let root_node = nodes
@@ -328,6 +334,7 @@ fn lower_node(
             global_common_slot_map,
             last_query_id,
             fe_addr,
+            iceberg_catalogs,
         )?;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(lowered);
@@ -354,6 +361,7 @@ fn lower_node_with_children(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<Lowered, String> {
     let mut out_layout = layout_for_row_tuples(&node.row_tuples, tuple_slots);
     // Some plan nodes carry multiple tuples in `row_tuples` (e.g. aggregate intermediate vs output).
@@ -517,6 +525,15 @@ fn lower_node_with_children(
             connectors,
             out_layout,
         )?,
+        t if t == plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
+            if !children.is_empty() {
+                return Err(format!(
+                    "ICEBERG_DELTA_SCAN_NODE expected 0 children, got {}",
+                    children.len()
+                ));
+            }
+            lower_iceberg_delta_scan_node(node, desc_tbl, out_layout, iceberg_catalogs)?
+        }
         t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => lower_lake_scan_node(
             node,
             desc_tbl,

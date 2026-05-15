@@ -1220,6 +1220,19 @@ fn build_pipeline_for_node(
                 |shared, id| Box::new(ExceptSourceFactory::new(shared, id)),
             ),
         },
+        ExecNodeKind::IcebergDeltaScan(node) => {
+            let source: Box<dyn OperatorFactory> = Box::new(
+                crate::exec::operators::IcebergDeltaScanFactory::new(node.clone()),
+            );
+            // A1 single-driver: morsel-level parallelism deferred to a later
+            // phase (see plan §"Phase 2 — IcebergDeltaScan Operator").
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(1),
+            })
+        }
         ExecNodeKind::Values(ValuesNode { chunk, node_id }) => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk.clone(), *node_id));
