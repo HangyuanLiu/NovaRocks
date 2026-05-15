@@ -150,9 +150,11 @@ impl<'a> super::AnalyzerContext<'a> {
                                     .and_then(|(q, _, _, _)| q.clone());
                                 match (left_q, right_q) {
                                     (Some(l), Some(r)) => out.push((name, l, r)),
-                                    _ => return Err(format!(
-                                        "USING column `{name}` must exist on both sides"
-                                    )),
+                                    _ => {
+                                        return Err(format!(
+                                            "USING column `{name}` must exist on both sides"
+                                        ));
+                                    }
                                 }
                             }
                             Some(out)
@@ -195,8 +197,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             // require equality, so the chained value is
                             // still correct.
                             for c in using_cols_ast {
-                                current_scope
-                                    .clear_computed_column(&c.to_string());
+                                current_scope.clear_computed_column(&c.to_string());
                             }
                         }
                     }
@@ -781,11 +782,9 @@ impl<'a> super::AnalyzerContext<'a> {
         alias: Option<&sqlast::TableAlias>,
     ) -> Result<(Relation, AnalyzerScope), String> {
         let sqlast::FunctionArguments::List(arg_list) = &function.args else {
-            return Err(
-                "__nr_ivm_delta requires three positional arguments: \
+            return Err("__nr_ivm_delta requires three positional arguments: \
                  (catalog.namespace.table, from_snapshot_id, to_snapshot_id)"
-                    .into(),
-            );
+                .into());
         };
         if arg_list.args.len() != 3 {
             return Err(format!(
@@ -833,8 +832,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let to_expr = positional_expr(&arg_list.args[2], "__nr_ivm_delta argument 2")?;
         let from_snapshot_id = eval_const_i64(from_expr)
             .map_err(|e| format!("__nr_ivm_delta from_snapshot_id: {e}"))?;
-        let to_snapshot_id = eval_const_i64(to_expr)
-            .map_err(|e| format!("__nr_ivm_delta to_snapshot_id: {e}"))?;
+        let to_snapshot_id =
+            eval_const_i64(to_expr).map_err(|e| format!("__nr_ivm_delta to_snapshot_id: {e}"))?;
         if from_snapshot_id < 0 || to_snapshot_id < 0 {
             return Err(format!(
                 "__nr_ivm_delta requires non-negative snapshot ids; \
@@ -890,7 +889,9 @@ fn positional_expr<'a>(
         sqlast::FunctionArg::Named { .. } => Err(format!(
             "{context} must be a positional argument, got a named argument"
         )),
-        other => Err(format!("{context} must be a positional expression, got {other}")),
+        other => Err(format!(
+            "{context} must be a positional expression, got {other}"
+        )),
     }
 }
 

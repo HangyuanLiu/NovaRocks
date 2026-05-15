@@ -1491,7 +1491,10 @@ fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan,
     let synthetic_table = TableDef {
         name: rel.table.name.clone(),
         columns: rel.table.columns.clone(),
-        iceberg_row_lineage_metadata_columns: rel.table.iceberg_row_lineage_metadata_columns.clone(),
+        iceberg_row_lineage_metadata_columns: rel
+            .table
+            .iceberg_row_lineage_metadata_columns
+            .clone(),
         iceberg_table: rel.table.iceberg_table.clone(),
         storage: TableStorage::IcebergDeltaTable {
             catalog: rel.catalog,

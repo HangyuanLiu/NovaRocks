@@ -66,11 +66,8 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     })?;
 
     let entry = iceberg_catalogs.get(&payload.catalog)?;
-    let loaded = crate::connector::iceberg::catalog::load_table(
-        &entry,
-        &payload.namespace,
-        &payload.table,
-    )?;
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &payload.namespace, &payload.table)?;
 
     // Compute the change batch from the lineage. The snapshot interval is
     // (from_snapshot_id, to_snapshot_id] semantically; `plan_changes`
@@ -95,12 +92,11 @@ pub(crate) fn lower_iceberg_delta_scan_node(
 
     let change_files = build_delta_source_files_from_batch(&batch);
 
-    let object_store_factory = Arc::new(
-        crate::connector::iceberg::changes::build_factory_for_table(
+    let object_store_factory =
+        Arc::new(crate::connector::iceberg::changes::build_factory_for_table(
             &loaded.table,
             entry.object_store_config(),
-        )?,
-    );
+        )?);
 
     // Only preload the delete-side full-table indices when the change
     // batch actually contains delete-side roles. Empty preloads waste I/O

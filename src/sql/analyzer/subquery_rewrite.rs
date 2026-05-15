@@ -87,7 +87,10 @@ impl<'a> AnalyzerContext<'a> {
                 .as_ref()
                 .map(|f| expr_contains_placeholder(f, sq_info.id))
                 .unwrap_or(false);
-            if !in_filter && !in_having && let Some(from) = select.from.as_mut() {
+            if !in_filter
+                && !in_having
+                && let Some(from) = select.from.as_mut()
+            {
                 let id = sq_info.id;
                 if self.rewrite_subquery_in_relation(from, scope, &sq_info)? {
                     // Placeholder dispatched to JOIN-ON rewrite.
@@ -207,14 +210,9 @@ impl<'a> AnalyzerContext<'a> {
                 sq_alias,
                 *negated,
             ),
-            SubqueryKind::Exists { negated } => self.rewrite_join_on_exists(
-                join,
-                scope,
-                sq_info,
-                resolved_sub,
-                sq_alias,
-                *negated,
-            ),
+            SubqueryKind::Exists { negated } => {
+                self.rewrite_join_on_exists(join, scope, sq_info, resolved_sub, sq_alias, *negated)
+            }
             SubqueryKind::Scalar => {
                 self.rewrite_join_on_scalar(join, scope, sq_info, resolved_sub, sq_alias)
             }
@@ -250,8 +248,8 @@ impl<'a> AnalyzerContext<'a> {
             .first()
             .ok_or("IN subquery must produce at least one column")?
             .clone();
-        let sub_rel = sub_from
-            .ok_or("correlated IN subquery must have a FROM clause".to_string())?;
+        let sub_rel =
+            sub_from.ok_or("correlated IN subquery must have a FROM clause".to_string())?;
 
         // Build the equality condition plus the lifted WHERE.
         let eq_cond = TypedExpr {
@@ -344,8 +342,8 @@ impl<'a> AnalyzerContext<'a> {
             .first()
             .ok_or("EXISTS subquery must produce at least one column")?
             .clone();
-        let sub_rel = sub_from
-            .ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
+        let sub_rel =
+            sub_from.ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
 
         let side = match sub_filter.as_ref() {
             Some(f) => choose_aux_join_side(join, std::slice::from_ref(f)),
@@ -407,7 +405,8 @@ impl<'a> AnalyzerContext<'a> {
             QueryBody::Select(_) => {
                 // Re-derive the inner scope from the subquery's analyzed FROM.
                 // For simplicity, recompute via `analyze_query_in_scope_with_inner`.
-                let (_, scope) = self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+                let (_, scope) =
+                    self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
                 scope
             }
             _ => return Err("correlated scalar subquery must be a SELECT".into()),
@@ -420,13 +419,12 @@ impl<'a> AnalyzerContext<'a> {
         };
         let outer_corr_exprs: Vec<TypedExpr> =
             corr_preds.iter().map(|p| p.outer_col.clone()).collect();
-        let (modified_sub, corr_join_conds) = self
-            .build_correlated_scalar_subquery_from_resolved(
-                resolved_sub,
-                scope,
-                &sq_alias,
-                &corr_preds,
-            )?;
+        let (modified_sub, corr_join_conds) = self.build_correlated_scalar_subquery_from_resolved(
+            resolved_sub,
+            scope,
+            &sq_alias,
+            &corr_preds,
+        )?;
         let scalar_output = modified_sub.output_columns[0].clone();
         let output_columns = modified_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
@@ -516,12 +514,7 @@ impl<'a> AnalyzerContext<'a> {
             sub_col.data_type.clone(),
             true,
         );
-        scope.add_column(
-            Some(&sq_alias),
-            &match_col,
-            sub_col.data_type.clone(),
-            true,
-        );
+        scope.add_column(Some(&sq_alias), &match_col, sub_col.data_type.clone(), true);
 
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
@@ -949,9 +942,7 @@ impl<'a> AnalyzerContext<'a> {
         let sq_alias = format!("__sq_{}", sq_info.id);
 
         if inside_or && lhs_typed_list.len() > 1 {
-            return Err(
-                "multi-column IN subquery inside OR is not yet supported".to_string(),
-            );
+            return Err("multi-column IN subquery inside OR is not yet supported".to_string());
         }
 
         // Build per-column equality conjuncts. For a single-column IN this
@@ -1969,29 +1960,36 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
             expr_contains_placeholder(left, placeholder_id)
                 || expr_contains_placeholder(right, placeholder_id)
         }
-        ExprKind::UnaryOp { expr: inner, .. } => {
-            expr_contains_placeholder(inner, placeholder_id)
-        }
-        ExprKind::IsNull { expr: inner, .. } => {
-            expr_contains_placeholder(inner, placeholder_id)
-        }
-        ExprKind::Cast { expr: inner, .. } => {
-            expr_contains_placeholder(inner, placeholder_id)
-        }
+        ExprKind::UnaryOp { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
+        ExprKind::IsNull { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
+        ExprKind::Cast { expr: inner, .. } => expr_contains_placeholder(inner, placeholder_id),
         ExprKind::Nested(inner) => expr_contains_placeholder(inner, placeholder_id),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            args.iter().any(|a| expr_contains_placeholder(a, placeholder_id))
-        }
-        ExprKind::InList { expr: inner, list, .. } => {
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => args
+            .iter()
+            .any(|a| expr_contains_placeholder(a, placeholder_id)),
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
             expr_contains_placeholder(inner, placeholder_id)
-                || list.iter().any(|i| expr_contains_placeholder(i, placeholder_id))
+                || list
+                    .iter()
+                    .any(|i| expr_contains_placeholder(i, placeholder_id))
         }
-        ExprKind::Between { expr: inner, low, high, .. } => {
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
             expr_contains_placeholder(inner, placeholder_id)
                 || expr_contains_placeholder(low, placeholder_id)
                 || expr_contains_placeholder(high, placeholder_id)
         }
-        ExprKind::Like { expr: inner, pattern, .. } => {
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
             expr_contains_placeholder(inner, placeholder_id)
                 || expr_contains_placeholder(pattern, placeholder_id)
         }
@@ -2072,23 +2070,20 @@ fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
             .columns
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
-        Relation::IcebergDeltaScan(s) => s
-            .table
-            .columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(col_lower))
-            || s.table
-                .iceberg_row_lineage_metadata_columns
+        Relation::IcebergDeltaScan(s) => {
+            s.table
+                .columns
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
-        Relation::Subquery {
-            output_columns, ..
-        } => output_columns
+                .any(|c| c.name.eq_ignore_ascii_case(col_lower))
+                || s.table
+                    .iceberg_row_lineage_metadata_columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(col_lower))
+        }
+        Relation::Subquery { output_columns, .. } => output_columns
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
-        Relation::CTEConsume {
-            output_columns, ..
-        } => output_columns
+        Relation::CTEConsume { output_columns, .. } => output_columns
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
         Relation::GenerateSeries(g) => g.column_name.eq_ignore_ascii_case(col_lower),

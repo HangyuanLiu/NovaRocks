@@ -3805,26 +3805,20 @@ mod tests {
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_with_negative_snapshot() {
-        let err = parse_raw_and_analyze(
-            "SELECT * FROM __nr_ivm_delta('cat.ns.iv_orders', -1, 200) AS t",
-        )
-        .expect_err("must fail");
-        assert!(
-            err.contains("non-negative"),
-            "unexpected error: {err}"
-        );
+        let err =
+            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.iv_orders', -1, 200) AS t")
+                .expect_err("must fail");
+        assert!(err.contains("non-negative"), "unexpected error: {err}");
     }
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
         // `orders` is registered without row-lineage metadata columns.
-        let err = parse_raw_and_analyze(
-            "SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t",
-        )
-        .expect_err("must fail");
+        let err =
+            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t")
+                .expect_err("must fail");
         assert!(
-            err.contains("write.row-lineage")
-                || err.contains("row-lineage metadata"),
+            err.contains("write.row-lineage") || err.contains("row-lineage metadata"),
             "expected row-lineage rebuild diagnostic, got: {err}"
         );
     }
