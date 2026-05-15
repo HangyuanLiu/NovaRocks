@@ -65,15 +65,59 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         )
     })?;
 
+    // Defense in depth: revalidate snapshot ids are non-negative even though
+    // the standalone analyzer already rejects negative values. A Thrift node
+    // from a non-analyzer producer (e.g. direct Thrift, future IVM planner
+    // path) would bypass that guard and silently misinterpret the ids.
+    let node_id = node.node_id;
+    if payload.from_snapshot_id < 0 {
+        return Err(format!(
+            "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): from_snapshot_id must be non-negative, got {}",
+            payload.catalog, payload.namespace, payload.table, payload.from_snapshot_id,
+        ));
+    }
+    if payload.to_snapshot_id < 0 {
+        return Err(format!(
+            "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): to_snapshot_id must be non-negative, got {}",
+            payload.catalog, payload.namespace, payload.table, payload.to_snapshot_id,
+        ));
+    }
+
     let entry = iceberg_catalogs.get(&payload.catalog)?;
     let loaded =
         crate::connector::iceberg::catalog::load_table(&entry, &payload.namespace, &payload.table)?;
 
+    // A1 contract: to_snapshot_id must match the base table's current snapshot.
+    // plan_changes walks lineage backward from current; if to_snapshot_id differs,
+    // the result would silently diverge from caller intent.
+    // A2 follow-up: relax this guard to support historical to_snapshot_id pins.
+    let current_snapshot_id = loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id())
+        .ok_or_else(|| {
+            format!(
+                "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): base table has no current snapshot",
+                payload.catalog, payload.namespace, payload.table,
+            )
+        })?;
+    if payload.to_snapshot_id != current_snapshot_id {
+        return Err(format!(
+            "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): to_snapshot_id={} does not match base table current snapshot {}; \
+             A1 only supports current-snapshot reads. Pinning to a historical to_snapshot_id is reserved for A2.",
+            payload.catalog,
+            payload.namespace,
+            payload.table,
+            payload.to_snapshot_id,
+            current_snapshot_id,
+        ));
+    }
+
     // Compute the change batch from the lineage. The snapshot interval is
     // (from_snapshot_id, to_snapshot_id] semantically; `plan_changes`
-    // walks the lineage backward from the current snapshot, so we rely on
-    // `to_snapshot_id` matching the table's current snapshot. Future work:
-    // pin to a specific `to_snapshot_id` if it differs from current.
+    // walks the lineage backward from the current snapshot (validated above
+    // to equal to_snapshot_id).
     let batch = crate::connector::iceberg::changes::plan_changes(
         &loaded.table,
         payload.from_snapshot_id,
@@ -165,6 +209,16 @@ pub(crate) fn lower_iceberg_delta_scan_node(
 /// Each delta source file is annotated with its semantic role
 /// (DataFile / PositionDelete / EqualityDelete / DeletedDataFile) so the
 /// downstream `IcebergDeltaScanOperator` can dispatch on it.
+///
+/// **Why `targets` / `previous_data_file_visibility` are empty here:**
+/// `PositionDelete::targets` and `EqualityDelete::targets` are populated with
+/// `Vec::new()`, and `DeletedDataFile::previous_data_file_visibility` is `None`.
+/// This is intentional — operator scanners read from `runtime.delete_side`
+/// (the preloaded base-table row-id index and previous delete-visibility map)
+/// rather than these per-role fields. Populating per-role fields would duplicate
+/// what the runtime already holds and create a second source of truth.
+/// See: `src/exec/operators/iceberg_delta_scan.rs::open_position_delete_scanner`,
+///      `open_equality_delete_scanner`, `open_deleted_data_file_scanner`.
 fn build_delta_source_files_from_batch(
     batch: &crate::connector::iceberg::changes::IcebergChangeBatch,
 ) -> Vec<DeltaSourceFile> {
