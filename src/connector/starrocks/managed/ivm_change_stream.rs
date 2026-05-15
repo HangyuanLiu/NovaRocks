@@ -19,7 +19,7 @@ pub(crate) fn plan_iceberg_change_batch_for_ivm(
     expected_current_snapshot_id: i64,
     pk_columns: &[String],
 ) -> Result<IcebergChangeBatch, ChangeError> {
-    let batch = plan_changes(base_table, previous_snapshot_id, pk_columns)?;
+    let batch = plan_changes(base_table, previous_snapshot_id, None, pk_columns)?;
     validate_change_batch_current_snapshot(&batch, expected_current_snapshot_id)
         .map_err(ChangeError::InternalInconsistency)?;
     Ok(batch)

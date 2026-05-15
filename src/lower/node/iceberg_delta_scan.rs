@@ -121,6 +121,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let batch = crate::connector::iceberg::changes::plan_changes(
         &loaded.table,
         payload.from_snapshot_id,
+        None,
         &[],
     )
     .map_err(|e| {

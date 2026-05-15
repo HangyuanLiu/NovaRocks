@@ -5981,6 +5981,7 @@ enable_path_style_access = true
         let change_batch = crate::connector::iceberg::changes::plan_changes(
             &loaded.table,
             previous_snapshot_id,
+            None,
             &[],
         )
         .expect("plan COW update from standard manifest diff");

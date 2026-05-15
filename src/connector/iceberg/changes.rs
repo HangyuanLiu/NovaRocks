@@ -262,6 +262,11 @@ impl PositionDeleteRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergChangeBatch {
     pub previous_snapshot_id: i64,
+    /// The resolved upper endpoint of the planned lineage. When `plan_changes`
+    /// was called with `to_snapshot_id = None`, this equals `table.metadata().current_snapshot()`
+    /// at the time of the call. When called with `to_snapshot_id = Some(id)`, this
+    /// equals `id`. Do not assume this matches the table's current snapshot
+    /// at any later moment; callers that need that invariant must check explicitly.
     pub current_snapshot_id: i64,
     pub inserts: Vec<DataFileRef>,
     pub deletes: Vec<PositionDeleteRef>,
@@ -486,26 +491,35 @@ pub(crate) fn classify_lineage(
 }
 
 /// Public entrypoint for snapshot-lineage change planning. Walks the
-/// lineage from `previous_snapshot_id` (exclusive) to the table's
-/// current snapshot (inclusive), classifies each snapshot operation,
-/// and assembles `IcebergChangeBatch { inserts, deletes }`.
+/// lineage from `previous_snapshot_id` (exclusive) to `to_snapshot_id`
+/// (inclusive). When `to_snapshot_id` is `None`, defaults to the table's
+/// current snapshot (preserves legacy behavior).
+///
+/// The returned `IcebergChangeBatch.current_snapshot_id` field reflects
+/// the *resolved* to_snapshot_id (i.e. the actual right endpoint of the
+/// walked lineage), which may differ from `table.metadata().current_snapshot()`
+/// when the caller pins to a historical snapshot.
 ///
 /// The `_pk_columns` parameter is reserved for future delete-side row-id
 /// computation; snapshot lineage planning itself does not need it yet.
 pub(crate) fn plan_changes(
     table: &iceberg::table::Table,
     previous_snapshot_id: i64,
+    to_snapshot_id: Option<i64>,
     _pk_columns: &[String],
 ) -> Result<IcebergChangeBatch, ChangeError> {
     let metadata = table.metadata();
-    let current_snapshot_id = metadata
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| {
-            ChangeError::InternalInconsistency(
-                "plan_changes: table has no current snapshot".to_string(),
-            )
-        })?;
+    let current_snapshot_id = match to_snapshot_id {
+        Some(id) => id,
+        None => metadata
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(
+                    "plan_changes: table has no current snapshot".to_string(),
+                )
+            })?,
+    };
 
     let plan = classify_lineage(metadata, previous_snapshot_id, current_snapshot_id)?;
     if plan.actions.is_empty() {
@@ -2396,7 +2410,7 @@ mod tests {
 
         insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
         let loaded = load_table(&entry, "ns", "orders").expect("load second");
-        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan");
+        let batch = plan_changes(&loaded.table, previous, None, &[]).expect("plan");
         assert_eq!(batch.previous_snapshot_id, previous);
         assert_eq!(
             batch.current_snapshot_id,
@@ -2516,7 +2530,7 @@ mod tests {
 
         entry.invalidate_table_cache("ns", "orders");
         let loaded = load_table(&entry, "ns", "orders").expect("load overwrite");
-        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan overwrite");
+        let batch = plan_changes(&loaded.table, previous, None, &[]).expect("plan overwrite");
 
         assert_eq!(batch.inserts.len(), 1);
         assert_eq!(batch.deleted_data_files.len(), 1);
@@ -2678,7 +2692,7 @@ mod tests {
             .build()
             .expect("pruned table");
 
-        let err = plan_changes(&pruned_table, previous, &[]).expect_err("should fail");
+        let err = plan_changes(&pruned_table, previous, None, &[]).expect_err("should fail");
         assert!(
             matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == previous)
         );

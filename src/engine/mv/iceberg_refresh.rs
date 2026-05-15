@@ -2563,7 +2563,7 @@ fn incremental_refresh_iceberg_mv(
 ) -> Result<StatementResult, String> {
     // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
     // safely, rebuild instead of risking an incorrect incremental result.
-    let batch = match plan_changes(base_table, previous_snapshot_id, &[]) {
+    let batch = match plan_changes(base_table, previous_snapshot_id, None, &[]) {
         Ok(batch) => batch,
         Err(err) => match policy_signal_from_change_error(&err) {
             IcebergChangePolicySignal::FullRefresh { reason } => {
