@@ -407,6 +407,12 @@ impl StandaloneNovaRocks {
                         .to_string(),
                 );
             }
+            TableStorage::IcebergDeltaTable { .. } => {
+                return Err(
+                    "register_parquet_table_in_database does not support IVM iceberg delta tables"
+                        .to_string(),
+                );
+            }
         }
         let mut guard = self
             .inner

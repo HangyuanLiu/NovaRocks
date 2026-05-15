@@ -1369,6 +1369,7 @@ fn plan_relation_scoped(
             output_columns,
         })),
         Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel),
+        Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel),
     }
 }
 
@@ -1448,6 +1449,60 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
     };
     Ok(LogicalPlan::Scan(ScanNode {
         database: rel.database,
+        table: synthetic_table,
+        alias: rel.alias,
+        columns: output_columns,
+        predicates: vec![],
+        required_columns: None,
+    }))
+}
+
+/// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
+/// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
+/// `TableStorage::IcebergDeltaTable` storage. Codegen recognizes this
+/// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
+/// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
+/// actual change file list via `connector::iceberg::changes::plan_changes`.
+fn plan_iceberg_delta_scan(rel: IcebergDeltaScanRelation) -> Result<LogicalPlan, String> {
+    use crate::sql::catalog::{TableDef, TableStorage};
+
+    // Output schema: base columns + iceberg v3 row-lineage metadata columns.
+    // The delta scan emits both: scanner-side projection re-uses the same
+    // column ordering as the base scan, plus the row-lineage virtual columns
+    // for downstream row-identity matching.
+    let mut output_columns: Vec<OutputColumn> = rel
+        .table
+        .columns
+        .iter()
+        .map(|c| OutputColumn {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+        })
+        .collect();
+    for col in &rel.table.iceberg_row_lineage_metadata_columns {
+        output_columns.push(OutputColumn {
+            name: col.name.clone(),
+            data_type: col.data_type.clone(),
+            nullable: col.nullable,
+        });
+    }
+
+    let synthetic_table = TableDef {
+        name: rel.table.name.clone(),
+        columns: rel.table.columns.clone(),
+        iceberg_row_lineage_metadata_columns: rel.table.iceberg_row_lineage_metadata_columns.clone(),
+        iceberg_table: rel.table.iceberg_table.clone(),
+        storage: TableStorage::IcebergDeltaTable {
+            catalog: rel.catalog,
+            namespace: rel.namespace.clone(),
+            table: rel.table_name.clone(),
+            from_snapshot_id: rel.from_snapshot_id,
+            to_snapshot_id: rel.to_snapshot_id,
+        },
+    };
+    Ok(LogicalPlan::Scan(ScanNode {
+        database: rel.namespace,
         table: synthetic_table,
         alias: rel.alias,
         columns: output_columns,

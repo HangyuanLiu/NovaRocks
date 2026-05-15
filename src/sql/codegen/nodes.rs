@@ -564,6 +564,13 @@ pub(crate) fn build_exec_params_multi(
                     // and dispatches to `IcebergMetadataScanOp`.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
+                TableStorage::IcebergDeltaTable { .. } => {
+                    // IVM delta-scan is a single-instance operator: the
+                    // change-file enumeration happens inside lower_plan
+                    // from `plan_changes`, so we emit one placeholder
+                    // morsel for the runtime to dispatch on.
+                    vec![build_iceberg_metadata_scan_range_params()]
+                }
             }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);

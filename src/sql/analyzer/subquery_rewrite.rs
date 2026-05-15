@@ -2034,6 +2034,10 @@ fn relation_exposes_qualifier(rel: &Relation, qual_lower: &str) -> bool {
             let name = s.alias.as_deref().unwrap_or(&s.table.name);
             name.eq_ignore_ascii_case(qual_lower)
         }
+        Relation::IcebergDeltaScan(s) => {
+            let name = s.alias.as_deref().unwrap_or(&s.table.name);
+            name.eq_ignore_ascii_case(qual_lower)
+        }
         Relation::Subquery { alias, .. } => alias.eq_ignore_ascii_case(qual_lower),
         Relation::CTEConsume { alias, .. } => alias.eq_ignore_ascii_case(qual_lower),
         Relation::GenerateSeries(g) => g
@@ -2068,6 +2072,15 @@ fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
             .columns
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
+        Relation::IcebergDeltaScan(s) => s
+            .table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_lower))
+            || s.table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col_lower)),
         Relation::Subquery {
             output_columns, ..
         } => output_columns

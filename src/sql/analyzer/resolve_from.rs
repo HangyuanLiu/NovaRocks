@@ -580,6 +580,9 @@ impl<'a> super::AnalyzerContext<'a> {
             .last()
             .map(|p| p.to_string().to_ascii_lowercase())
             .unwrap_or_default();
+        if func_name == "__nr_ivm_delta" {
+            return self.analyze_iceberg_delta_table_function(function, alias);
+        }
         if func_name != "generate_series" {
             return Err(format!("unsupported table function: {func_name}"));
         }
@@ -736,6 +739,129 @@ impl<'a> super::AnalyzerContext<'a> {
             alias: alias_name,
         });
         Ok((relation, scope))
+    }
+
+    /// Analyze the IVM-A1 internal table function
+    /// `__nr_ivm_delta('cat.ns.tbl', from_snapshot_id, to_snapshot_id)`.
+    /// This function is produced by the IVM refresh driver (and exercised
+    /// directly in tests) to scan the snapshot-range delta of an Iceberg
+    /// base table.
+    fn analyze_iceberg_delta_table_function(
+        &self,
+        function: &sqlast::Function,
+        alias: Option<&sqlast::TableAlias>,
+    ) -> Result<(Relation, AnalyzerScope), String> {
+        let sqlast::FunctionArguments::List(arg_list) = &function.args else {
+            return Err(
+                "__nr_ivm_delta requires three positional arguments: \
+                 (catalog.namespace.table, from_snapshot_id, to_snapshot_id)"
+                    .into(),
+            );
+        };
+        if arg_list.args.len() != 3 {
+            return Err(format!(
+                "__nr_ivm_delta requires 3 positional arguments \
+                 (catalog.namespace.table, from_snapshot_id, to_snapshot_id), got {}",
+                arg_list.args.len()
+            ));
+        }
+
+        // Argument 0: three-part identifier as a string literal.
+        let three_part = positional_expr(&arg_list.args[0], "__nr_ivm_delta argument 0")?;
+        let three_part = match three_part {
+            sqlast::Expr::Value(v) => match &v.value {
+                sqlast::Value::SingleQuotedString(s)
+                | sqlast::Value::DoubleQuotedString(s)
+                | sqlast::Value::TripleSingleQuotedString(s)
+                | sqlast::Value::TripleDoubleQuotedString(s) => s.clone(),
+                _ => {
+                    return Err(format!(
+                        "__nr_ivm_delta argument 0 must be a string literal \
+                         (catalog.namespace.table), got {v}"
+                    ));
+                }
+            },
+            other => {
+                return Err(format!(
+                    "__nr_ivm_delta argument 0 must be a string literal \
+                     (catalog.namespace.table), got {other}"
+                ));
+            }
+        };
+        let parts: Vec<&str> = three_part.split('.').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            return Err(format!(
+                "__nr_ivm_delta argument 0 must be a three-part identifier \
+                 'catalog.namespace.table', got '{three_part}'"
+            ));
+        }
+        let catalog = parts[0].to_string();
+        let namespace = parts[1].to_string();
+        let table_name = parts[2].to_string();
+
+        // Argument 1 / 2: from_snapshot_id, to_snapshot_id (non-negative i64).
+        let from_expr = positional_expr(&arg_list.args[1], "__nr_ivm_delta argument 1")?;
+        let to_expr = positional_expr(&arg_list.args[2], "__nr_ivm_delta argument 2")?;
+        let from_snapshot_id = eval_const_i64(from_expr)
+            .map_err(|e| format!("__nr_ivm_delta from_snapshot_id: {e}"))?;
+        let to_snapshot_id = eval_const_i64(to_expr)
+            .map_err(|e| format!("__nr_ivm_delta to_snapshot_id: {e}"))?;
+        if from_snapshot_id < 0 || to_snapshot_id < 0 {
+            return Err(format!(
+                "__nr_ivm_delta requires non-negative snapshot ids; \
+                 got from={from_snapshot_id}, to={to_snapshot_id}"
+            ));
+        }
+
+        // Look up the base table. `__nr_ivm_delta` requires that the table
+        // exposes Iceberg v3 row-lineage metadata columns — without them
+        // we cannot recover row identity across snapshots.
+        let table_def = self.catalog.get_table(&namespace, &table_name)?;
+        if table_def.iceberg_row_lineage_metadata_columns.is_empty() {
+            return Err(format!(
+                "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
+                 row-lineage metadata columns; rebuild the table with \
+                 `write.row-lineage = true` (Iceberg v3)"
+            ));
+        }
+
+        // Output schema = base table columns + row-lineage metadata columns.
+        // Both are exposed as resolvable columns under the alias / table name.
+        let alias_name = alias.map(|a| a.name.value.clone());
+        let mut scope = AnalyzerScope::new();
+        let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
+        scope.add_table(Some(qualifier), &table_def.columns);
+        scope.add_iceberg_metadata_columns(
+            qualifier,
+            &table_def.iceberg_row_lineage_metadata_columns,
+        );
+
+        let relation = Relation::IcebergDeltaScan(IcebergDeltaScanRelation {
+            catalog,
+            namespace,
+            table_name,
+            table: table_def,
+            from_snapshot_id,
+            to_snapshot_id,
+            alias: alias_name,
+        });
+        Ok((relation, scope))
+    }
+}
+
+/// Extract the underlying expression from a positional `FunctionArg`,
+/// returning a clear error when the caller passed a named argument or
+/// any other unsupported form.
+fn positional_expr<'a>(
+    arg: &'a sqlast::FunctionArg,
+    context: &str,
+) -> Result<&'a sqlast::Expr, String> {
+    match arg {
+        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => Ok(e),
+        sqlast::FunctionArg::Named { .. } => Err(format!(
+            "{context} must be a positional argument, got a named argument"
+        )),
+        other => Err(format!("{context} must be a positional expression, got {other}")),
     }
 }
 

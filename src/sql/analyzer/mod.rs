@@ -1575,6 +1575,17 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 Ok(())
             }
+            Relation::IcebergDeltaScan(rel) => {
+                // Mirror Scan: expose base columns + row-lineage metadata
+                // columns under the alias (or table name).
+                let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
+                scope.add_table(Some(qualifier), &rel.table.columns);
+                scope.add_iceberg_metadata_columns(
+                    qualifier,
+                    &rel.table.iceberg_row_lineage_metadata_columns,
+                );
+                Ok(())
+            }
         }
     }
 

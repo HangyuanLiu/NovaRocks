@@ -104,6 +104,11 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // A small constant keeps them at the bottom of any join
                 // reorder ordering without forcing a separate stats path.
                 TableStorage::IcebergMetadataTable { .. } => 1,
+                // IVM delta-scan placeholders carry no static rows. The
+                // change file list is resolved at lower_plan time. Treat
+                // them as small for join-reorder purposes; IVM refresh
+                // plans usually do not involve multi-table joins anyway.
+                TableStorage::IcebergDeltaTable { .. } => 1,
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();

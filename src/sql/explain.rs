@@ -637,6 +637,8 @@ fn scan_supports_decode_hint(
         // Iceberg metadata-table scans are JVM-bridged; the parquet decode
         // hint path does not apply.
         TableStorage::IcebergMetadataTable { .. } => false,
+        // IVM delta-scan does not produce stable column-dictionary stats.
+        TableStorage::IcebergDeltaTable { .. } => false,
     }
 }
 
@@ -648,6 +650,8 @@ fn scan_supports_min_max_stats(
         TableStorage::LocalParquetFile { .. } | TableStorage::S3ParquetFiles { .. } => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         TableStorage::IcebergMetadataTable { .. } => return false,
+        // IVM delta-scan is a synthetic placeholder; no parquet stats.
+        TableStorage::IcebergDeltaTable { .. } => return false,
     }
     required_columns.iter().all(|required| {
         table
