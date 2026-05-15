@@ -271,6 +271,12 @@ fn resolve_table_factor(
 pub(crate) type AfterCaptureHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+struct AfterCaptureHookRegistration {
+    owner: std::thread::ThreadId,
+    hook: AfterCaptureHook,
+}
+
+#[cfg(test)]
 pub(crate) fn lock_after_capture_hook_for_test() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -279,18 +285,22 @@ pub(crate) fn lock_after_capture_hook_for_test() -> std::sync::MutexGuard<'stati
 }
 
 #[cfg(test)]
-fn after_capture_hook_slot() -> &'static std::sync::Mutex<Option<AfterCaptureHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCaptureHook>>> =
+fn after_capture_hook_slot() -> &'static std::sync::Mutex<Option<AfterCaptureHookRegistration>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCaptureHookRegistration>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
 fn invoke_after_capture_hook() {
+    let current_thread = std::thread::current().id();
     let hook = after_capture_hook_slot()
         .lock()
         .expect("after_capture_hook lock")
-        .clone();
+        .as_ref()
+        .and_then(|registration| {
+            (registration.owner == current_thread).then(|| Arc::clone(&registration.hook))
+        });
     if let Some(hook) = hook {
         hook();
     }
@@ -300,7 +310,10 @@ fn invoke_after_capture_hook() {
 pub(crate) fn set_after_capture_hook(f: AfterCaptureHook) {
     *after_capture_hook_slot()
         .lock()
-        .expect("after_capture_hook lock") = Some(f);
+        .expect("after_capture_hook lock") = Some(AfterCaptureHookRegistration {
+        owner: std::thread::current().id(),
+        hook: f,
+    });
 }
 
 #[cfg(test)]
@@ -372,6 +385,10 @@ mod tests {
         set_after_capture_hook(Arc::new(move || {
             flag_for_hook.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
+        std::thread::spawn(invoke_after_capture_hook)
+            .join()
+            .expect("invoke hook from non-owner thread");
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         invoke_after_capture_hook();
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
         clear_after_capture_hook();
