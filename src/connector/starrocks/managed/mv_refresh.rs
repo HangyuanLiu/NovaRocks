@@ -113,13 +113,23 @@ pub(crate) fn refresh_mv(
     };
     validate_incremental_mv_base_ref(mv_shape.base_table(), base_ref)?;
 
+    // Freeze the snapshot pin for the duration of this refresh. From now on
+    // pin is the only source of snapshot ids for base table reads, delta
+    // computation, intent recording, and bookkeeping.
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )?;
+    let current_snapshot_id = pin.get(base_ref);
+    let current_table_uuid = pin
+        .uuid(base_ref)
+        .ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?
+        .to_string();
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let current_snapshot_id = loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    let current_table_uuid = loaded.table.metadata().uuid().to_string();
     let previous_snapshot_id = mv_definition
         .last_refresh_snapshots
         .get(&base_ref.fqn())
@@ -149,10 +159,7 @@ pub(crate) fn refresh_mv(
         policy,
         MvRefreshPolicy::FullRefresh { .. } | MvRefreshPolicy::Incremental { .. }
     ) {
-        let target_snapshots = current_snapshot_id
-            .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
-            .unwrap_or_default();
-        begin_mv_refresh_intent(state, runtime.table.table_id, target_snapshots)?;
+        begin_mv_refresh_intent(state, runtime.table.table_id, pin.to_snapshot_map())?;
     }
 
     let projection_apply_shape = mv_shape.clone();
@@ -166,9 +173,9 @@ pub(crate) fn refresh_mv(
             })
         },
         |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
-        |current_snapshot_id| {
-            let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+        |_current_snapshot_id| {
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
             update_managed_mv_refresh_summary(
                 state,
                 runtime.table.table_id,
@@ -309,8 +316,8 @@ pub(crate) fn refresh_mv(
                 load_physical_insert_plan(state, &resolved_mv, PartitionTarget::Active)
             }?;
             let previous_rows = mv_definition.last_refresh_rows.unwrap_or(0);
-            let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
             write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
                 state,
                 plan,
