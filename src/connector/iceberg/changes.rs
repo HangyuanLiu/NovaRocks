@@ -728,6 +728,23 @@ pub(crate) fn scan_equality_delete_rows_for_one(
     )
 }
 
+/// Helper for `IcebergDeltaScanOperator`: scan one freshly-added data file
+/// (snapshot diff INSERT side). Returns raw rows with the base-table physical
+/// projection. `__change_op` is injected by the operator.
+#[allow(dead_code)]
+pub(crate) fn scan_one_added_data_file(
+    path: &str,
+    size: i64,
+    base_table: &iceberg::table::Table,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+    let normalized = normalize_delete_projection_path(path, object_store_config)
+        .map_err(|e| format!("normalize added data file `{path}`: {e}"))?;
+    let len = u64::try_from(size).ok();
+    read_full_data_file(&normalized, len, &factory)
+}
+
 /// Helper for `IcebergDeltaScanOperator`: scan one deleted data file
 /// (i.e., a file that was present at previous_snapshot and removed in
 /// current snapshot). Returns the live rows from that file at the previous

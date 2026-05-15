@@ -30,6 +30,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int8Array};
 use arrow::record_batch::RecordBatch;
 
+use crate::exec::change_op::CHANGE_OP_INSERT;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::iceberg_delta_scan::{
     DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode,
@@ -176,11 +177,11 @@ fn inject_change_op_column(batch: RecordBatch, value: i8) -> Result<RecordBatch,
 }
 
 fn open_scanner_for_role(
-    _node: &IcebergDeltaScanNode,
+    node: &IcebergDeltaScanNode,
     file: DeltaSourceFile,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
-    match file.role {
-        DeltaSourceRole::DataFile => Err("data-file scanner: TODO Task 5".to_string()),
+    match &file.role {
+        DeltaSourceRole::DataFile => open_data_file_scanner(node, &file),
         DeltaSourceRole::PositionDelete { .. } => {
             Err("position-delete scanner: TODO Task 6".to_string())
         }
@@ -191,6 +192,35 @@ fn open_scanner_for_role(
             Err("deleted-data-file scanner: TODO Task 8".to_string())
         }
     }
+}
+
+struct DataFileScanner {
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl DeltaFileScanner for DataFileScanner {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, String> {
+        Ok(self.batches.next())
+    }
+
+    fn change_op_value(&self) -> i8 {
+        CHANGE_OP_INSERT
+    }
+}
+
+fn open_data_file_scanner(
+    node: &IcebergDeltaScanNode,
+    file: &DeltaSourceFile,
+) -> Result<Box<dyn DeltaFileScanner>, String> {
+    let batches = crate::connector::iceberg::changes::scan_one_added_data_file(
+        &file.path,
+        file.size,
+        &node.iceberg_runtime.base_table,
+        node.object_store_config.as_ref(),
+    )?;
+    Ok(Box::new(DataFileScanner {
+        batches: batches.into_iter(),
+    }))
 }
 
 #[cfg(test)]
