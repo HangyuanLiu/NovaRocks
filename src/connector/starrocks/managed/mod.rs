@@ -22,6 +22,7 @@ pub(crate) mod mv_ddl;
 pub(crate) mod mv_refresh;
 pub(crate) mod mv_refresh_strategy;
 pub(crate) mod mv_shape;
+pub(crate) mod refresh_pin;
 pub(crate) mod txn;
 
 pub(crate) use backend::{
