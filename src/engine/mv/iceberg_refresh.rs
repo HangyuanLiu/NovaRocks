@@ -1931,6 +1931,127 @@ async fn commit_iceberg_mv_target_files_with_ref(
     Ok(outcome)
 }
 
+/// IVM-A1 commit entrypoint: run the iceberg commit against a collector that
+/// the merge sink already populated with `WrittenFile`s and
+/// `PositionDeleteGroup`s. Mirrors the post-injection portion of
+/// [`commit_iceberg_mv_apply_with_ref`] but skips collector construction so
+/// the caller can share the collector with the sink.
+///
+/// The collector's `op_kind` must be set by the caller before any inject
+/// calls — typically `CommitOpKind::RowDeltaDv` when the change batch has
+/// any DELETE-side rows, `CommitOpKind::FastAppend` otherwise.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) async fn commit_iceberg_mv_with_populated_collector(
+    table: &iceberg::table::Table,
+    catalog: &Arc<dyn Catalog>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    ident: &TableIdent,
+    collector: Arc<IcebergCommitCollector>,
+    target_ref: &str,
+    snapshot_properties: BTreeMap<String, String>,
+) -> Result<CommitOutcome, String> {
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)?;
+    let mut outcome = match run_iceberg_commit(RunInput {
+        collector: collector.clone(),
+        catalog: catalog.clone(),
+        table: table.clone(),
+        fs: abort_cleanup.fs,
+        file_io: table.file_io().clone(),
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties,
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err)
+            if target_ref != "main" && err.contains("committed but new snapshot not visible") =>
+        {
+            let reloaded = catalog.load_table(ident).await.map_err(|e| {
+                format!(
+                    "load iceberg table after branch commit recovery failed: {e}; original error: {err}"
+                )
+            })?;
+            let new_snapshot_id = reloaded
+                .metadata()
+                .refs()
+                .get(target_ref)
+                .map(|r| r.snapshot_id)
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg branch commit recovery failed because target ref {target_ref} is missing; original error: {err}"
+                    )
+                })?;
+            collector.mark_committed();
+            CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths: Vec::new(),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    if target_ref != "main" {
+        let reloaded = catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| format!("load iceberg table after branch commit failed: {e}"))?;
+        outcome.new_snapshot_id = reloaded
+            .metadata()
+            .refs()
+            .get(target_ref)
+            .map(|r| r.snapshot_id)
+            .ok_or_else(|| {
+                format!("iceberg branch commit completed but target ref {target_ref} is missing")
+            })?;
+    }
+    Ok(outcome)
+}
+
+/// IVM-A1 helper: construct an empty `IcebergCommitCollector` configured for
+/// the supplied target table and branch. The caller (refresh driver) hands
+/// the resulting `Arc` to `IcebergMergeSinkPlan` so the sink can inject
+/// written files / position-delete groups during pipeline execution, then
+/// later passes the same `Arc` to
+/// [`commit_iceberg_mv_with_populated_collector`].
+#[allow(dead_code)]
+pub(crate) fn new_iceberg_mv_commit_collector(
+    table: &iceberg::table::Table,
+    ident: &TableIdent,
+    target_ref: &str,
+    op_kind: CommitOpKind,
+) -> Arc<IcebergCommitCollector> {
+    let metadata = table.metadata();
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let base_snapshot_id = metadata
+        .refs()
+        .get(target_ref)
+        .map(|r| r.snapshot_id)
+        .or_else(|| {
+            if target_ref == "main" {
+                metadata.current_snapshot().map(|s| s.snapshot_id())
+            } else {
+                None
+            }
+        });
+    Arc::new(IcebergCommitCollector::new(
+        op_kind,
+        ident.clone(),
+        base_snapshot_id,
+        metadata.last_sequence_number(),
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().clone(),
+        staging_dir,
+        crate::common::types::UniqueId { hi: 0, lo: 0 },
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_apply_with_ref(
     table: &iceberg::table::Table,
