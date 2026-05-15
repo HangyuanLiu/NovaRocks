@@ -66,7 +66,7 @@ impl ManagedMvRefreshMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IcebergTableRef {
     pub catalog: String,
     pub namespace: String,

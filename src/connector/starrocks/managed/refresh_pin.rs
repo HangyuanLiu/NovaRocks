@@ -16,7 +16,7 @@
 //! consistency: every base table is read at the snapshot it had at refresh
 //! start, regardless of intervening external commits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::connector::starrocks::managed::model::IcebergTableRef;
@@ -97,6 +97,164 @@ impl RefreshSnapshotPin {
     }
 }
 
+/// Walk `query` in place. For each `TableFactor::Table` whose 3-part name
+/// resolves into the pin and is not in `delta_bearing`, set
+/// `version = Some(VersionAsOf(Number(pin[base])))`. Returns the number
+/// of mutations performed.
+///
+/// Rules:
+/// - `TableFactor::Table` with `version = Some(_)` already -> Err. The
+///   refresh SELECT is not allowed to combine user-written FOR VERSION AS OF
+///   with refresh pinning.
+/// - Table not in pin -> unchanged (likely a CTE, a different catalog, or
+///   an alias not addressed by base_refs).
+/// - Table in pin and in delta_bearing -> unchanged (handled by
+///   mutate_query_for_ivm_delta_scan in iceberg_refresh.rs).
+/// - Table in pin and not in delta_bearing -> inject version.
+///
+/// In scope-B single-base MVs, the unique base is delta-bearing, so this
+/// function is a no-op in production. It exists for the multi-base future.
+#[allow(dead_code)]
+pub(crate) fn inject_pin_as_for_version_as_of(
+    query: &mut sqlparser::ast::Query,
+    pin: &RefreshSnapshotPin,
+    delta_bearing: &HashSet<IcebergTableRef>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<usize, String> {
+    let mut state = InjectState {
+        pin,
+        delta_bearing,
+        current_catalog,
+        current_database,
+        count: 0,
+        first_error: None,
+    };
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            walk_set_expr(cte.query.body.as_mut(), &mut state);
+        }
+    }
+    walk_set_expr(query.body.as_mut(), &mut state);
+    if let Some(err) = state.first_error {
+        return Err(err);
+    }
+    Ok(state.count)
+}
+
+struct InjectState<'a> {
+    pin: &'a RefreshSnapshotPin,
+    delta_bearing: &'a HashSet<IcebergTableRef>,
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    count: usize,
+    first_error: Option<String>,
+}
+
+fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>) {
+    use sqlparser::ast::SetExpr;
+    if state.first_error.is_some() {
+        return;
+    }
+    match expr {
+        SetExpr::Select(select) => {
+            for tw in &mut select.from {
+                walk_factor(&mut tw.relation, state);
+                for join in &mut tw.joins {
+                    walk_factor(&mut join.relation, state);
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            walk_set_expr(left.as_mut(), state);
+            walk_set_expr(right.as_mut(), state);
+        }
+        SetExpr::Query(q) => walk_set_expr(q.body.as_mut(), state),
+        _ => {}
+    }
+}
+
+fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState<'_>) {
+    use sqlparser::ast::{Expr, ObjectNamePart, TableFactor, TableVersion, Value};
+    if state.first_error.is_some() {
+        return;
+    }
+    match factor {
+        TableFactor::Table {
+            name,
+            version,
+            args,
+            ..
+        } => {
+            // Skip table-valued functions (e.g. __nr_ivm_delta).
+            if args.is_some() {
+                return;
+            }
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|p| match p {
+                    ObjectNamePart::Identifier(i) => Some(i.value.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            let Some(base_ref) =
+                resolve_table_factor(&parts, state.current_catalog, state.current_database)
+            else {
+                return;
+            };
+            let Some(pinned) = state.pin.get(&base_ref) else {
+                return;
+            };
+            if state.delta_bearing.contains(&base_ref) {
+                return;
+            }
+            if version.is_some() {
+                state.first_error = Some(format!(
+                    "refresh SELECT must not write explicit FOR VERSION AS OF for base table {}; refresh pin would conflict",
+                    base_ref.fqn()
+                ));
+                return;
+            }
+            *version = Some(TableVersion::VersionAsOf(Expr::Value(
+                Value::Number(pinned.to_string(), false).into(),
+            )));
+            state.count += 1;
+        }
+        TableFactor::Derived { subquery, .. } => {
+            walk_set_expr(subquery.body.as_mut(), state);
+        }
+        _ => {}
+    }
+}
+
+fn resolve_table_factor(
+    parts: &[String],
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Option<IcebergTableRef> {
+    let current_database = current_database.to_ascii_lowercase();
+    let current_catalog = current_catalog.map(|s| s.to_ascii_lowercase());
+    match parts {
+        [tbl] => current_catalog.map(|cat| IcebergTableRef {
+            catalog: cat,
+            namespace: current_database,
+            table: tbl.clone(),
+        }),
+        [db, tbl] => current_catalog.map(|cat| IcebergTableRef {
+            catalog: cat,
+            namespace: db.clone(),
+            table: tbl.clone(),
+        }),
+        [cat, db, tbl] => Some(IcebergTableRef {
+            catalog: cat.clone(),
+            namespace: db.clone(),
+            table: tbl.clone(),
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) type AfterCaptureHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -136,6 +294,32 @@ pub(crate) fn clear_after_capture_hook() {
 mod tests {
     use super::*;
 
+    fn parse_select_for_test(sql: &str) -> sqlparser::ast::Query {
+        let statement = crate::sql::parser::parse_sql_raw(sql).expect("test SQL must parse");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("test SQL must be a query");
+        };
+        *query
+    }
+
+    fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
+        let mut pin = RefreshSnapshotPin::default();
+        for (fqn, snapshot_id, uuid) in entries {
+            pin.snapshots.insert((*fqn).to_string(), *snapshot_id);
+            pin.table_uuids
+                .insert((*fqn).to_string(), (*uuid).to_string());
+        }
+        pin
+    }
+
+    fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
+        IcebergTableRef {
+            catalog: c.to_string(),
+            namespace: n.to_string(),
+            table: t.to_string(),
+        }
+    }
+
     #[test]
     fn pin_get_and_iter_use_fqn_keys() {
         let mut pin = RefreshSnapshotPin::default();
@@ -173,5 +357,92 @@ mod tests {
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
         invoke_after_capture_hook();
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn inject_pin_skips_delta_bearing_base() {
+        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders");
+        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
+
+        let count =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect("inject must succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(query.to_string(), "SELECT * FROM ice.db.orders");
+    }
+
+    #[test]
+    fn inject_pin_injects_non_delta_bearing_base() {
+        let mut query =
+            parse_select_for_test("SELECT * FROM db.orders JOIN ice.db.customers ON true");
+        let pin = make_pin(&[
+            ("ice.db.orders", 42, "uuid-orders"),
+            ("ice.db.customers", 99, "uuid-customers"),
+        ]);
+        let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
+
+        let count =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect("inject must succeed");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            query.to_string(),
+            "SELECT * FROM db.orders JOIN ice.db.customers VERSION AS OF 99 ON true"
+        );
+    }
+
+    #[test]
+    fn inject_pin_skips_tables_not_in_pin() {
+        let mut query = parse_select_for_test(
+            "WITH recent AS (SELECT * FROM local_db.orders) SELECT * FROM recent JOIN other.db.dim ON true",
+        );
+        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let delta_bearing = std::collections::HashSet::new();
+
+        let count =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect("inject must succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            query.to_string(),
+            "WITH recent AS (SELECT * FROM local_db.orders) SELECT * FROM recent JOIN other.db.dim ON true"
+        );
+    }
+
+    #[test]
+    fn inject_pin_rejects_existing_for_version_as_of() {
+        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
+        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let delta_bearing = std::collections::HashSet::new();
+
+        let err =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect_err("explicit version must be rejected");
+
+        assert_eq!(
+            err,
+            "refresh SELECT must not write explicit FOR VERSION AS OF for base table ice.db.orders; refresh pin would conflict"
+        );
+    }
+
+    #[test]
+    fn inject_pin_skips_table_valued_functions() {
+        let mut query = parse_select_for_test("SELECT * FROM __nr_ivm_delta('ice.db.orders')");
+        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let delta_bearing = std::collections::HashSet::new();
+
+        let count =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect("inject must succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            query.to_string(),
+            "SELECT * FROM __nr_ivm_delta('ice.db.orders')"
+        );
     }
 }
