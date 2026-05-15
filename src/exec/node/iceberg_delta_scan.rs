@@ -122,6 +122,6 @@ pub struct IcebergRuntimeHandles {
 #[derive(Debug)]
 pub struct DeltaScanDeleteSide {
     pub base_first_row_ids: std::collections::HashMap<String, i64>,
-    pub previous_delete_visibility:
+    pub(crate) previous_delete_visibility:
         crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 }

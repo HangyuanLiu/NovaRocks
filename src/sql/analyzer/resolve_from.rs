@@ -231,6 +231,32 @@ impl<'a> super::AnalyzerContext<'a> {
                     })
                     .collect();
 
+                // IVM-A1 internal table function dispatch:
+                // `FROM __nr_ivm_delta(...)` parses as `TableFactor::Table`
+                // with `args: Some(FunctionArgumentList { ... })`. Route to
+                // the dedicated analyzer before the regular base-table
+                // resolution path runs.
+                if parts.len() == 1
+                    && parts[0].eq_ignore_ascii_case("__nr_ivm_delta")
+                    && let Some(table_function_args) = args
+                {
+                    let function = sqlast::Function {
+                        name: name.clone(),
+                        uses_odbc_syntax: false,
+                        parameters: sqlast::FunctionArguments::None,
+                        args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                            duplicate_treatment: None,
+                            args: table_function_args.args.clone(),
+                            clauses: Vec::new(),
+                        }),
+                        filter: None,
+                        null_treatment: None,
+                        over: None,
+                        within_group: Vec::new(),
+                    };
+                    return self.analyze_iceberg_delta_table_function(&function, alias.as_ref());
+                }
+
                 // StarRocks dialect allows `FROM t, unnest(arr_expr) [AS u(cols)]`
                 // as an implicit lateral table function. The standard sqlparser
                 // dialect we use does not recognize UNNEST as a keyword, so the
@@ -581,6 +607,9 @@ impl<'a> super::AnalyzerContext<'a> {
             .map(|p| p.to_string().to_ascii_lowercase())
             .unwrap_or_default();
         if func_name == "__nr_ivm_delta" {
+            // `TABLE(__nr_ivm_delta(...))` (explicit TABLE wrapper) also
+            // routes here in addition to the bare `FROM __nr_ivm_delta(...)`
+            // path handled in TableFactor::Table.
             return self.analyze_iceberg_delta_table_function(function, alias);
         }
         if func_name != "generate_series" {

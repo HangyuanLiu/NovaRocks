@@ -2502,6 +2502,46 @@ mod tests {
                         path: std::path::PathBuf::from("/tmp/nation.parquet"),
                     },
                 }),
+                // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
+                // table exposing the row-lineage metadata pseudo-columns
+                // (_row_id, _last_updated_sequence_number) that
+                // `__nr_ivm_delta` requires.
+                "iv_orders" => Ok(TableDef {
+                    name: "iv_orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![
+                        ColumnDef {
+                            name: "_row_id".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                        },
+                        ColumnDef {
+                            name: "_last_updated_sequence_number".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                        },
+                    ],
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![],
+                        cloud_properties: Default::default(),
+                    },
+                }),
                 _ => Err(format!("table not found: {table}")),
             }
         }
@@ -3718,6 +3758,74 @@ mod tests {
         assert!(
             err.contains("cannot be combined with branch/tag suffix"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analyzer_recognizes_nr_ivm_delta_table_function() {
+        // The TestCatalog's `iv_orders` table carries the v3 row-lineage
+        // metadata columns required by __nr_ivm_delta. Note: the TestCatalog
+        // returns the same table for any database name, so we can pass any
+        // catalog/namespace strings in the three-part identifier.
+        let resolved = parse_raw_and_analyze(
+            "SELECT _row_id FROM __nr_ivm_delta('cat.ns.iv_orders', 100, 200) AS t",
+        )
+        .expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let from = sel.from.as_ref().expect("FROM should be present");
+        match from {
+            Relation::IcebergDeltaScan(rel) => {
+                assert_eq!(rel.catalog, "cat");
+                assert_eq!(rel.namespace, "ns");
+                assert_eq!(rel.table_name, "iv_orders");
+                assert_eq!(rel.from_snapshot_id, 100);
+                assert_eq!(rel.to_snapshot_id, 200);
+                assert_eq!(rel.alias.as_deref(), Some("t"));
+                assert!(
+                    rel.table
+                        .iceberg_row_lineage_metadata_columns
+                        .iter()
+                        .any(|c| c.name == "_row_id"),
+                    "expected _row_id in row-lineage metadata columns"
+                );
+            }
+            other => panic!("expected IcebergDeltaScan, got {other:?}"),
+        }
+        // Output column `_row_id` should resolve through the row-lineage
+        // metadata columns the analyzer registered into the scope.
+        assert_eq!(resolved.output_columns.len(), 1);
+        assert_eq!(resolved.output_columns[0].name, "_row_id");
+        assert_eq!(
+            resolved.output_columns[0].data_type,
+            arrow::datatypes::DataType::Int64
+        );
+    }
+
+    #[test]
+    fn analyzer_rejects_nr_ivm_delta_with_negative_snapshot() {
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM __nr_ivm_delta('cat.ns.iv_orders', -1, 200) AS t",
+        )
+        .expect_err("must fail");
+        assert!(
+            err.contains("non-negative"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
+        // `orders` is registered without row-lineage metadata columns.
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t",
+        )
+        .expect_err("must fail");
+        assert!(
+            err.contains("write.row-lineage")
+                || err.contains("row-lineage metadata"),
+            "expected row-lineage rebuild diagnostic, got: {err}"
         );
     }
 }
