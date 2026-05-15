@@ -1,5 +1,4 @@
 pub(crate) mod iceberg_backend;
-pub(crate) mod iceberg_delta_plan;
 pub(crate) mod iceberg_merge_sink;
 pub(crate) mod iceberg_refresh;
 pub(crate) mod iceberg_target_apply;
