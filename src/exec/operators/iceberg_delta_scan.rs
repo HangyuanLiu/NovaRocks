@@ -261,22 +261,18 @@ fn open_position_delete_scanner(
         content_offset: None,
         content_size_in_bytes: None,
     };
-    let base_first_row_ids = targets
-        .iter()
-        .filter_map(|t| {
-            t.data_file_first_row_id
-                .map(|id| (t.data_file_path.clone(), id))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let factory = crate::connector::iceberg::changes::build_factory_for_table(
-        &node.iceberg_runtime.base_table,
-        node.object_store_config.as_ref(),
-    )?;
+    let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
+        format!(
+            "ivm-a1 position-delete scanner: runtime.delete_side missing for {} (lower_plan \
+             should have preloaded it when the change batch has DELETE-side roles)",
+            file.path
+        )
+    })?;
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
         &node.iceberg_runtime.base_table,
         &delete,
-        &base_first_row_ids,
-        &factory,
+        &delete_side.base_first_row_ids,
+        node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
     Ok(Box::new(PositionDeleteScanner {
@@ -312,14 +308,10 @@ fn open_equality_delete_scanner(
         partition_spec_id: file.partition_spec_id,
         partition_key: file.partition_key.clone(),
     };
-    let factory = crate::connector::iceberg::changes::build_factory_for_table(
-        &node.iceberg_runtime.base_table,
-        node.object_store_config.as_ref(),
-    )?;
     let rows = crate::connector::iceberg::changes::scan_equality_delete_rows_for_one(
         &node.iceberg_runtime.base_table,
         &delete,
-        &factory,
+        node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
     Ok(Box::new(EqualityDeleteScanner {
@@ -344,7 +336,7 @@ impl DeltaFileScanner for DeletedDataFileScanner {
 fn open_deleted_data_file_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
-    visibility: &Option<crate::exec::node::iceberg_delta_scan::DeletedFileVisibility>,
+    _visibility: &Option<crate::exec::node::iceberg_delta_scan::DeletedFileVisibility>,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     let deleted_file = crate::connector::iceberg::changes::DeletedDataFileRef {
         path: file.path.clone(),
@@ -355,29 +347,21 @@ fn open_deleted_data_file_scanner(
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
     };
-    let mut previous_delete_visibility: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile =
-        std::collections::HashMap::new();
-    if let Some(vis) = visibility.as_ref()
-        && !vis.already_deleted_positions.is_empty()
-    {
-        let mut entry = crate::engine::delete_flow::ExistingDeleteVisibility::default();
-        for &pos in &vis.already_deleted_positions {
-            let unsigned = u64::try_from(pos).map_err(|_| {
-                format!(
-                    "DeletedFileVisibility::already_deleted_positions for {} contains negative \
-                     row position {pos}",
-                    file.path
-                )
-            })?;
-            entry.deleted_positions.insert(unsigned);
-        }
-        previous_delete_visibility.insert(file.path.clone(), entry);
-    }
+    // Use the preloaded full-table visibility from runtime.delete_side; the
+    // operator no longer rebuilds per-file visibility from
+    // `DeletedFileVisibility::already_deleted_positions`.
+    let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
+        format!(
+            "ivm-a1 deleted-data-file scanner: runtime.delete_side missing for {} (lower_plan \
+             should have preloaded it when the change batch has DELETE-side roles)",
+            file.path
+        )
+    })?;
     let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file(
         &node.iceberg_runtime.base_table,
         &deleted_file,
         node.object_store_config.as_ref(),
-        &previous_delete_visibility,
+        &delete_side.previous_delete_visibility,
     )?;
     Ok(Box::new(DeletedDataFileScanner {
         batches: rows.into_iter(),

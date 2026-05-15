@@ -1728,6 +1728,7 @@ mod tests {
             None::<plan_nodes::TLookUpNode>,
             None::<plan_nodes::TBenchmarkScanNode>,
             None::<plan_nodes::TCacheStatsScanNode>,
+            None::<Box<plan_nodes::TIcebergDeltaScanNode>>,
         )
     }
 

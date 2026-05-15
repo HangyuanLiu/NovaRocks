@@ -20,14 +20,15 @@
 //! Single source leaf that internally consumes Iceberg snapshot diff
 //! products (data files / position-delete / equality-delete / deleted-data-file)
 //! and emits a unified chunk stream tagged with the A4 transparent
-//! `__change_op` column (+1 for INSERT, -1 for DELETE). Used by MV
-//! incremental refresh via the leaf-swap plan rewrite in
-//! `engine/mv/iceberg_delta_plan.rs`.
+//! `__change_op` column (+1 for INSERT, -1 for DELETE). Populated by
+//! `lower_iceberg_delta_scan` (in `src/lower/thrift/iceberg_delta_scan.rs`)
+//! when the Thrift plan carries `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
 
 use std::sync::Arc;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::fs::object_store::ObjectStoreConfig;
+use crate::fs::opendal::OpendalRangeReaderFactory;
 
 #[derive(Clone, Debug)]
 pub struct IcebergDeltaScanNode {
@@ -103,9 +104,24 @@ pub struct DeletedFileVisibility {
 }
 
 /// Iceberg per-table runtime handles required by `IcebergDeltaScanOperator`
-/// to open delete files and re-read target data files. Populated by the
-/// refresh driver before constructing the ExecPlan.
+/// to open delete files and re-read target data files. Constructed by
+/// `lower_iceberg_delta_scan` when lowering `ICEBERG_DELTA_SCAN_NODE`:
+/// - `base_table` comes from `iceberg::Catalog::load_table`
+/// - `object_store_factory` is built once via `build_factory_for_table` and
+///   shared across role scanners
+/// - `delete_side` is populated via `base_data_file_first_row_id_index` +
+///   `load_existing_delete_visibility_by_data_file_at` only when the change
+///   batch contains DELETE-side roles (position / equality / deleted-data-file).
 #[derive(Debug)]
 pub struct IcebergRuntimeHandles {
     pub base_table: iceberg::table::Table,
+    pub object_store_factory: Arc<OpendalRangeReaderFactory>,
+    pub delete_side: Option<DeltaScanDeleteSide>,
+}
+
+#[derive(Debug)]
+pub struct DeltaScanDeleteSide {
+    pub base_first_row_ids: std::collections::HashMap<String, i64>,
+    pub previous_delete_visibility:
+        crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 }
