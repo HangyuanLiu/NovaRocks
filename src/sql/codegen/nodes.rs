@@ -46,7 +46,7 @@ pub(crate) fn build_scan_node(
         resolved.table.storage,
         TableStorage::IcebergDeltaTable { .. }
     ) {
-        return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved);
+        return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
     build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
 }
@@ -55,10 +55,17 @@ pub(crate) fn build_scan_node(
 /// Only the lightweight identity + snapshot range is carried in the Thrift
 /// payload; the actual change-file enumeration happens at `lower_plan`
 /// time via `connector::iceberg::changes::plan_changes`.
+///
+/// `conjuncts` is the predicate-pushdown output for this scan. We forward
+/// them on `node.conjuncts` so the shared `LowerNode::evaluate_conjuncts`
+/// path applies them post-scan, just like `HDFS_SCAN_NODE`. Without this,
+/// `WHERE` clauses on an `__nr_ivm_delta(...)` table reference are silently
+/// dropped because there is no Filter node above the scan after pushdown.
 fn build_iceberg_delta_scan_node(
     node_id: i32,
     scan_tuple_id: i32,
     resolved: &ResolvedTable,
+    conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
     let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
         match &resolved.table.storage {
@@ -84,7 +91,11 @@ fn build_iceberg_delta_scan_node(
     node.limit = -1;
     node.row_tuples = vec![scan_tuple_id];
     node.nullable_tuples = vec![];
-    node.conjuncts = None;
+    node.conjuncts = if conjuncts.is_empty() {
+        None
+    } else {
+        Some(conjuncts)
+    };
     node.compact_data = true;
     node.iceberg_delta_scan_node = Some(Box::new(plan_nodes::TIcebergDeltaScanNode {
         catalog,

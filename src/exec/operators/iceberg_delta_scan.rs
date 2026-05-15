@@ -196,11 +196,43 @@ fn open_scanner_for_role(
 
 struct DataFileScanner {
     batches: std::vec::IntoIter<RecordBatch>,
+    /// File path used to populate the `_file` lineage column on every row.
+    file_path: String,
+    /// Base row id stamped on the manifest entry; the per-row `_row_id` for
+    /// row `r` within this scanner is `first_row_id + (rows_emitted_so_far + r)`.
+    first_row_id: i64,
+    /// Manifest entry's `data_sequence_number`; replicated across all rows
+    /// as `_last_updated_sequence_number`.
+    data_sequence_number: i64,
+    /// Rows emitted so far across all batches in this scanner. Used to make
+    /// `_pos` and `_row_id` strictly monotonic over the file.
+    rows_emitted: i64,
 }
 
 impl DeltaFileScanner for DataFileScanner {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, String> {
-        Ok(self.batches.next())
+        let Some(batch) = self.batches.next() else {
+            return Ok(None);
+        };
+        let row_count = batch.num_rows();
+        let pos_start = self.rows_emitted;
+        let enriched = append_data_file_lineage_columns(
+            &batch,
+            &self.file_path,
+            pos_start,
+            self.first_row_id,
+            self.data_sequence_number,
+        )?;
+        self.rows_emitted = self
+            .rows_emitted
+            .checked_add(row_count as i64)
+            .ok_or_else(|| {
+                format!(
+                    "ivm-a1 data-file scanner row count overflow: file={} rows_so_far={} batch_rows={}",
+                    self.file_path, self.rows_emitted, row_count
+                )
+            })?;
+        Ok(Some(enriched))
     }
 
     fn change_op_value(&self) -> i8 {
@@ -218,9 +250,86 @@ fn open_data_file_scanner(
         &node.iceberg_runtime.base_table,
         node.object_store_config.as_ref(),
     )?;
+    // Iceberg v3 row-lineage data files always carry `first_row_id` on the
+    // manifest entry; the IVM-A1 contract is to fail loudly if either lineage
+    // input is missing rather than silently fall back to defaults.
+    let first_row_id = file.first_row_id.ok_or_else(|| {
+        format!(
+            "ivm-a1 data-file scanner: manifest entry for {} is missing first_row_id (Iceberg v3 \
+             row-lineage required)",
+            file.path
+        )
+    })?;
+    let data_sequence_number = file.data_sequence_number.ok_or_else(|| {
+        format!(
+            "ivm-a1 data-file scanner: manifest entry for {} is missing data_sequence_number \
+             (Iceberg v3 row-lineage required)",
+            file.path
+        )
+    })?;
     Ok(Box::new(DataFileScanner {
         batches: batches.into_iter(),
+        file_path: file.path.clone(),
+        first_row_id,
+        data_sequence_number,
+        rows_emitted: 0,
     }))
+}
+
+/// Append the four Iceberg v3 row-lineage virtual columns to a raw data-file
+/// batch (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+/// Mirrors the order codegen registers in the scan-tuple descriptor through
+/// `build_iceberg_table_def_for_delta_scan::iceberg_row_lineage_metadata_columns`,
+/// so the chunk schema contract length matches.
+fn append_data_file_lineage_columns(
+    batch: &RecordBatch,
+    file_path: &str,
+    pos_start: i64,
+    first_row_id: i64,
+    data_sequence_number: i64,
+) -> Result<RecordBatch, String> {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let row_count = batch.num_rows();
+    let file_col: ArrayRef = Arc::new(StringArray::from(vec![file_path.to_string(); row_count]));
+    let pos_values: Vec<i64> = (0..row_count as i64).map(|i| pos_start + i).collect();
+    let pos_col: ArrayRef = Arc::new(Int64Array::from(pos_values.clone()));
+    let row_id_values = pos_values
+        .iter()
+        .map(|pos| {
+            first_row_id.checked_add(*pos).ok_or_else(|| {
+                format!(
+                    "ivm-a1 data-file scanner _row_id overflow: first_row_id={first_row_id} pos={pos} file={file_path}"
+                )
+            })
+        })
+        .collect::<Result<Vec<i64>, String>>()?;
+    let row_id_col: ArrayRef = Arc::new(Int64Array::from(row_id_values));
+    let seq_col: ArrayRef = Arc::new(Int64Array::from(vec![data_sequence_number; row_count]));
+
+    let mut fields: Vec<arrow::datatypes::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new("_file", DataType::Utf8, false));
+    fields.push(Field::new("_pos", DataType::Int64, false));
+    fields.push(Field::new("_row_id", DataType::Int64, false));
+    fields.push(Field::new(
+        "_last_updated_sequence_number",
+        DataType::Int64,
+        false,
+    ));
+    let new_schema = Arc::new(Schema::new(fields));
+    let mut columns = batch.columns().to_vec();
+    columns.push(file_col);
+    columns.push(pos_col);
+    columns.push(row_id_col);
+    columns.push(seq_col);
+    RecordBatch::try_new(new_schema, columns)
+        .map_err(|e| format!("append data-file lineage columns failed: {e}"))
 }
 
 struct PositionDeleteScanner {

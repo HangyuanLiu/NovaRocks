@@ -2214,6 +2214,34 @@ fn mutate_query_for_ivm_delta_scan(
     Ok(state.matches)
 }
 
+/// Append the IVM `__change_op` pseudo-column reference to the top-level
+/// `SELECT` projection so the merge sink can read it from the chunk.
+///
+/// Only the top-level projection is mutated — subqueries / CTEs are not
+/// touched because the top-level chunk is the one that reaches the merge
+/// sink, and `__change_op` is only resolvable against
+/// `__nr_ivm_delta(...)` source factors that contribute to the top-level
+/// scan tuple. Set operations (UNION / EXCEPT / INTERSECT) are rejected
+/// because each branch would need its own augmentation; the IVM-A1 contract
+/// allows a single `__nr_ivm_delta` reference, so this is a defensive guard
+/// rather than a supported shape.
+fn append_change_op_to_projection(query: &mut sqlparser::ast::Query) -> Result<(), String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(
+            "IVM-A1 __change_op projection: top-level SELECT body required (set operations are not supported)"
+                .to_string(),
+        );
+    };
+    select
+        .projection
+        .push(sqlparser::ast::SelectItem::UnnamedExpr(
+            sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new(
+                crate::exec::change_op::CHANGE_OP_COLUMN,
+            )),
+        ));
+    Ok(())
+}
+
 struct MutateState<'a> {
     normalized_base: &'a (String, String, String),
     base_ref: &'a IcebergTableRef,
@@ -2781,6 +2809,27 @@ fn incremental_refresh_iceberg_mv(
     // `InMemoryCatalog` view exposes <db>.<table>, not <cat>.<db>.<table>).
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
 
+    // Append the IVM `__change_op` transparent pseudo-column to the top-level
+    // projection. The `IcebergDeltaScan` operator synthesizes per-row values
+    // (`+1` for DataFile / `-1` for delete roles); the merge sink reads the
+    // column by name to partition each chunk into INSERT and DELETE batches.
+    // We append it only on the incremental refresh path because the
+    // `build_iceberg_table_def_for_delta_scan` `TableDef` exposes
+    // `__change_op` as a row-lineage virtual column; full-rebuild / first
+    // refresh use a regular base scan whose `TableDef` does not advertise it,
+    // so the same augmentation in `iceberg_mv_physical_select_sql` would
+    // fail to resolve `__change_op` there.
+    if let Err(err) = append_change_op_to_projection(&mut query) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        ));
+    }
+
     // 6. Pre-load the A9 target locator inputs only when the change batch
     // carries DELETE-side rows. The merge sink consumes these when it sees
     // a DELETE chunk; for insert-only batches we leave them None so the
@@ -2862,6 +2911,51 @@ fn incremental_refresh_iceberg_mv(
 
     let added_rows = collector.injected_data_record_count();
     let deleted_rows = collector.injected_delete_record_count();
+
+    // 8b. Post-execution empty-delta short-circuit.
+    //
+    // The file-level `is_empty_delta` check earlier in this function only
+    // catches snapshot ranges that produced no inserts and no deletes at all.
+    // A snapshot range that inserted rows the MV's WHERE / PROJECT removes
+    // (e.g. WHERE id > 10 with an inserted row of id=1) still appears
+    // non-empty at the file level, so we enter the staging-branch path. Once
+    // execution finishes the merge sink reports zero contributed rows; in
+    // that case there is no Iceberg data to commit, and committing an empty
+    // snapshot on the staging branch is both wasteful and confuses
+    // downstream consumers that diff main vs the staging branch.
+    //
+    // Recovery: drop the staging branch (so the next refresh starts clean),
+    // abort the staging-branch refresh intent, open a fresh metadata-only
+    // refresh intent (no target / staging-branch fields), and finalize it
+    // with the new base snapshot id. This mirrors the file-level empty-delta
+    // short-circuit semantics: lineage advances without producing a new
+    // Iceberg snapshot.
+    if added_rows == 0 && deleted_rows == 0 {
+        tracing::info!(
+            "iceberg mv {}.{}.{}: incremental refresh produced 0 effective rows after SELECT \
+             evaluation; advancing lineage to base snapshot {current_snapshot_id} without new \
+             iceberg snapshot",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+        abort_iceberg_mv_refresh(state, refresh_id)?;
+        let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
+        let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
+        let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+        let metadata_refresh_id =
+            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+        finalize_iceberg_mv_refresh(
+            state,
+            metadata_refresh_id,
+            mv_definition.last_refresh_rows.unwrap_or(0),
+            snapshots,
+            table_uuids,
+            target_snapshot_id,
+        )?;
+        return Ok(StatementResult::Ok);
+    }
 
     // 9. Drive the commit from the populated collector.
     let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
