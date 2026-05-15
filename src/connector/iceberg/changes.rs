@@ -2555,6 +2555,245 @@ mod tests {
     }
 
     #[test]
+    fn plan_changes_to_none_equivalent_to_to_some_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+        let current = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        let batch_none = plan_changes(&loaded.table, previous, None, &[]).expect("none");
+        let batch_some = plan_changes(&loaded.table, previous, Some(current), &[]).expect("some");
+
+        assert_eq!(
+            batch_none.previous_snapshot_id,
+            batch_some.previous_snapshot_id
+        );
+        assert_eq!(
+            batch_none.current_snapshot_id,
+            batch_some.current_snapshot_id
+        );
+        assert_eq!(batch_none.inserts.len(), batch_some.inserts.len());
+        assert_eq!(batch_none.deletes.len(), batch_some.deletes.len());
+    }
+
+    #[test]
+    fn plan_changes_to_is_strict_ancestor_of_from_returns_lineage_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+        let s1 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        let err =
+            plan_changes(&loaded.table, s1, Some(s0), &[]).expect_err("ancestor not descendant");
+        assert!(
+            matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == s1),
+            "expected LineageBroken with previous_snapshot={s1}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_changes_truncates_to_middle_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1 append A");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+        let s1 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(3)]]).expect("snap s2 append B");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s2");
+        let s2 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(4)]]).expect("snap s3 append C");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s3");
+        let s3 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        assert_ne!(s0, s1);
+        assert_ne!(s1, s2);
+        assert_ne!(s2, s3);
+
+        let batch_mid = plan_changes(&loaded.table, s0, Some(s2), &[]).expect("truncate");
+        assert_eq!(batch_mid.previous_snapshot_id, s0);
+        assert_eq!(batch_mid.current_snapshot_id, s2);
+        let mid_files: i64 = batch_mid
+            .inserts
+            .iter()
+            .map(|f| f.record_count.unwrap_or_default())
+            .sum();
+
+        let batch_full = plan_changes(&loaded.table, s0, Some(s3), &[]).expect("full");
+        let full_files: i64 = batch_full
+            .inserts
+            .iter()
+            .map(|f| f.record_count.unwrap_or_default())
+            .sum();
+
+        assert!(
+            mid_files < full_files,
+            "mid-ancestor truncation should yield fewer rows: mid={mid_files} full={full_files}"
+        );
+    }
+
+    #[test]
+    fn plan_changes_to_snapshot_id_expired_returns_lineage_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+
+        let pruned_metadata = loaded
+            .table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .remove_snapshots(&[s0])
+            .build()
+            .expect("pruned metadata")
+            .metadata;
+        let pruned_table = iceberg::table::Table::builder()
+            .file_io(loaded.table.file_io().clone())
+            .metadata(std::sync::Arc::new(pruned_metadata))
+            .identifier(loaded.table.identifier().clone())
+            .build()
+            .expect("pruned table");
+
+        let from = s0 + 1;
+        let err = plan_changes(&pruned_table, from, Some(s0), &[]).expect_err("expired to");
+        assert!(
+            matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == from),
+            "expected LineageBroken, got {err:?}"
+        );
+    }
+
+    #[test]
     fn position_delete_ref_validates_parquet_with_no_content_offset() {
         let r = super::PositionDeleteRef {
             delete_file_path: "/tmp/x.parquet".to_string(),
