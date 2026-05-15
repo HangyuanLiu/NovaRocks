@@ -568,6 +568,23 @@ fn rewrite_full_refresh_select_with_pin(
     Ok(stmt.to_string())
 }
 
+fn ensure_loaded_base_contains_pinned_snapshot(
+    base_ref: &IcebergTableRef,
+    table: &iceberg::table::Table,
+    pinned_snapshot_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(snapshot_id) = pinned_snapshot_id else {
+        return Ok(());
+    };
+    if table.metadata().snapshot_by_id(snapshot_id).is_none() {
+        return Err(format!(
+            "refresh pin snapshot {snapshot_id} for base {} is missing from post-pin loaded table metadata",
+            base_ref.fqn()
+        ));
+    }
+    Ok(())
+}
+
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -610,8 +627,6 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    // Single base-table load shared by the A11 contract guard and the
-    // refresh flow below (Task 11: collapses the double load from Task 10).
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let [base_ref] = base_refs.as_slice() else {
         return Err(
@@ -625,8 +640,8 @@ pub(crate) fn refresh_iceberg_mv(
             target.catalog, target.namespace, target.table
         )
     })?;
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let current_snapshot_id_before_pin = loaded
+    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
         .table
         .metadata()
         .current_snapshot()
@@ -638,10 +653,37 @@ pub(crate) fn refresh_iceberg_mv(
     let is_empty_base_noop =
         previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
 
+    if is_empty_base_noop {
+        tracing::info!(
+            "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        return Ok(StatementResult::Ok);
+    }
+
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )?;
+    let current_snapshot_id = pin.get(base_ref);
+    let current_table_uuid = pin
+        .uuid(base_ref)
+        .ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?
+        .to_string();
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    ensure_loaded_base_contains_pinned_snapshot(base_ref, &loaded.table, current_snapshot_id)?;
+
     // A11 contract guard. Validate the full base ↔ output ↔ target
-    // contract before any incremental work. validate_schema_contract
-    // subsumes the earlier ensure_base_row_lineage_contract check
-    // (it already enforces v3 + row-lineage).
+    // contract after the refresh pin is captured and the base table is
+    // reloaded. validate_schema_contract subsumes the earlier
+    // ensure_base_row_lineage_contract check (it already enforces v3 +
+    // row-lineage).
     let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
         &loaded.table,
@@ -669,29 +711,6 @@ pub(crate) fn refresh_iceberg_mv(
         }
     };
     let mv_definition = &effective_definition;
-    if is_empty_base_noop {
-        tracing::info!(
-            "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        return Ok(StatementResult::Ok);
-    }
-
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )?;
-    let current_snapshot_id = pin.get(base_ref);
-    let current_table_uuid = pin
-        .uuid(base_ref)
-        .ok_or_else(|| {
-            format!(
-                "refresh pin missing uuid for base {} (this should not happen)",
-                base_ref.fqn()
-            )
-        })?
-        .to_string();
     let pinned_full_select_sql =
         rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
     let expected_main_snapshot_id = target_loaded
@@ -859,8 +878,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         ))
     })?;
-    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-    let current_snapshot_id_before_pin = loaded
+    let pre_pin_loaded =
+        load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
         .table
         .metadata()
         .current_snapshot()
@@ -871,19 +891,6 @@ pub(crate) fn plan_iceberg_mv_refresh(
         .copied();
     let is_empty_base_noop =
         previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(RefreshError::user(format!("{err}")));
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        }
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
-    }
     if is_empty_base_noop {
         let mut snapshot_pins = BTreeMap::new();
         snapshot_pins.insert(base_ref.fqn(), None);
@@ -911,6 +918,22 @@ pub(crate) fn plan_iceberg_mv_refresh(
     )
     .map_err(RefreshError::user)?;
     let current_snapshot_id = pin.get(base_ref);
+    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    ensure_loaded_base_contains_pinned_snapshot(base_ref, &loaded.table, current_snapshot_id)
+        .map_err(RefreshError::user)?;
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        schema_contract,
+        &loaded.table,
+        &target_loaded.table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            return Err(RefreshError::user(format!("{err}")));
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            ..
+        }
+        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
+    }
 
     let mode = match (previous_snapshot_id, current_snapshot_id) {
         (None, None) => RefreshMode::Noop,
