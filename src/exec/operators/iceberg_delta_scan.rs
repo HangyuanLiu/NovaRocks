@@ -653,9 +653,10 @@ fn open_equality_delete_scanner(
         partition_key: file.partition_key.clone(),
     };
     let rows =
-        crate::connector::iceberg::changes::scan_equality_delete_rows_for_one_with_v3_lineage(
+        crate::connector::iceberg::changes::scan_equality_delete_rows_for_one_with_v3_lineage_at(
             &node.iceberg_runtime.base_table,
             &delete,
+            node.to_snapshot_id,
             node.iceberg_runtime.object_store_factory.as_ref(),
             node.object_store_config.as_ref(),
         )?;

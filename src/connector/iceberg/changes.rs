@@ -601,6 +601,25 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
     )
 }
 
+/// Snapshot-pinned variant of
+/// `scan_equality_delete_rows_for_one_with_v3_lineage`.
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
+    base_table: &iceberg::table::Table,
+    delete: &EqualityDeleteRef,
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    scan_equality_delete_rows_for_table_with_v3_lineage_at(
+        base_table,
+        std::slice::from_ref(delete),
+        snapshot_id,
+        factory,
+        object_store_config,
+    )
+}
+
 /// Helper for `IcebergDeltaScanOperator`: scan one freshly-added data file
 /// (snapshot diff INSERT side). Returns raw rows with the base-table physical
 /// projection. `__change_op` is injected by the operator.
@@ -695,6 +714,43 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+/// Snapshot-pinned variant of
+/// `scan_equality_delete_rows_for_table_with_v3_lineage`.
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
@@ -945,11 +1001,8 @@ where
 }
 
 /// Build a path -> v3 row-lineage index over the base table's current
-/// snapshot. Used by the `IcebergDeltaScanOperator` delete-side scanners
-/// to look up `first_row_id` and `data_sequence_number` for each target
-/// data file referenced by a position/equality/deleted-data-file role,
-/// so the operator can synthesize the four v3 row-lineage virtual columns
-/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+/// snapshot. Current-snapshot callers keep legacy behavior; historical
+/// delta-scan callers should use `base_data_file_lineage_index_at`.
 pub(crate) fn base_data_file_lineage_index(
     table: &iceberg::table::Table,
 ) -> Result<
@@ -960,15 +1013,13 @@ pub(crate) fn base_data_file_lineage_index(
     build_data_file_lineage_index_from_snapshot(&read_snapshot)
 }
 
-/// Build a (file_path -> first_row_id / data_sequence_number) index from the
-/// data files alive in a specific snapshot. Distinct from
-/// `base_data_file_lineage_index` (which reads the current snapshot) — this
-/// is used to look up the original `first_row_id` of a file that was
-/// OVERWRITE-deleted between the MV's previous-refresh snapshot and the
-/// current snapshot. The deleted file is no longer alive in current, but
-/// it WAS alive at `previous_snapshot_id`, where its first_row_id is
-/// faithfully readable via the iceberg-rust per-manifest inheritance.
-pub(crate) fn previous_snapshot_data_file_lineage_index(
+/// Build a path -> v3 row-lineage index over a specific base table snapshot.
+/// Used by the `IcebergDeltaScanOperator` delete-side scanners to look up
+/// `first_row_id` and `data_sequence_number` for each target data file
+/// referenced by a position/equality/deleted-data-file role,
+/// so the operator can synthesize the four v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+pub(crate) fn base_data_file_lineage_index_at(
     table: &iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
@@ -978,6 +1029,25 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
     let read_snapshot =
         crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
     build_data_file_lineage_index_from_snapshot(&read_snapshot)
+}
+
+/// Build a (file_path -> first_row_id / data_sequence_number) index from the
+/// data files alive in a specific snapshot. Distinct from
+/// `base_data_file_lineage_index_at` at the delta-scan upper endpoint: this
+/// is used to look up the original `first_row_id` of a file that was
+/// OVERWRITE-deleted between the MV's previous-refresh snapshot and the
+/// planned upper snapshot. The deleted file is no longer alive at that upper
+/// endpoint, but it WAS alive at `previous_snapshot_id`, where its
+/// first_row_id is faithfully readable via iceberg-rust per-manifest
+/// inheritance.
+pub(crate) fn previous_snapshot_data_file_lineage_index(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<
+    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    String,
+> {
+    base_data_file_lineage_index_at(table, snapshot_id)
 }
 
 fn build_data_file_lineage_index_from_snapshot(

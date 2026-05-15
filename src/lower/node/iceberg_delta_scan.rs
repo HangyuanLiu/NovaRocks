@@ -123,11 +123,14 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         || !batch.deleted_data_files.is_empty();
     let delete_side = if has_delete {
         let base_data_file_lineage =
-            crate::connector::iceberg::changes::base_data_file_lineage_index(&loaded.table)?;
+            crate::connector::iceberg::changes::base_data_file_lineage_index_at(
+                &loaded.table,
+                batch.current_snapshot_id,
+            )?;
         // For OVERWRITE-deleted files we need the original `first_row_id`
         // from the previous-snapshot view (the file is no longer alive in
-        // current, so `base_data_file_lineage` doesn't index it). Only
-        // build this when the change batch actually contains
+        // the delta-scan upper snapshot, so `base_data_file_lineage` doesn't
+        // index it). Only build this when the change batch actually contains
         // `deleted_data_files`, since the lookup walks every manifest in
         // the previous snapshot.
         let previous_data_file_lineage = if !batch.deleted_data_files.is_empty() {
