@@ -1010,9 +1010,11 @@ fn equality_change_to_delete_spec(
 }
 
 /// Read every data file removed by an overwrite snapshot and return its row
-/// content as `RecordBatch`es. The MV refresh path feeds these to
-/// `execute_query_for_mv_incremental_deletes`, so the MV SELECT projects the
-/// pre-overwrite rows using only standard Iceberg manifest diff information.
+/// content as `RecordBatch`es. Managed-lake IVM (`ivm_delta_source.rs`)
+/// feeds these into a temp parquet table the MV SELECT then reads from.
+/// Iceberg-MV IVM (Task 13 onward) uses the lineage-bearing
+/// `scan_deleted_data_file_rows_with_visibility_and_v3_lineage` variant
+/// instead.
 pub(crate) fn scan_deleted_data_file_rows(
     base_table: &iceberg::table::Table,
     deleted_data_files: &[DeletedDataFileRef],
