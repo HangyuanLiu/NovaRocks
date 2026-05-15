@@ -22,7 +22,7 @@
 //! batch (insert data files, position-delete, equality-delete, deleted
 //! data files) is computed here at lower_plan time via
 //! `connector::iceberg::changes::plan_changes`. The delete-side
-//! preloads (`base_first_row_ids`, `previous_delete_visibility`) are
+//! preloads (`base_data_file_lineage`, `previous_delete_visibility`) are
 //! captured into `IcebergRuntimeHandles` so per-file operator code can
 //! borrow them instead of rebuilding them per file.
 
@@ -149,8 +149,8 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         || !batch.equality_deletes.is_empty()
         || !batch.deleted_data_files.is_empty();
     let delete_side = if has_delete {
-        let base_first_row_ids =
-            crate::connector::iceberg::changes::base_data_file_first_row_id_index(&loaded.table)?;
+        let base_data_file_lineage =
+            crate::connector::iceberg::changes::base_data_file_lineage_index(&loaded.table)?;
         let previous_delete_visibility =
             crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
                 &loaded.table,
@@ -158,7 +158,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
                 entry.object_store_config(),
             )?;
         Some(DeltaScanDeleteSide {
-            base_first_row_ids,
+            base_data_file_lineage,
             previous_delete_visibility,
         })
     } else {
@@ -242,7 +242,7 @@ fn build_delta_source_files_from_batch(
     for del in &batch.deletes {
         // `referenced_data_file` is the only target identity present on the
         // PositionDeleteRef. The operator scanner re-derives `data_file_first_row_id`
-        // through `runtime.delete_side.base_first_row_ids` (preloaded above).
+        // through `runtime.delete_side.base_data_file_lineage` (preloaded above).
         let targets = del
             .referenced_data_file
             .as_ref()
@@ -266,7 +266,7 @@ fn build_delta_source_files_from_batch(
     for eq in &batch.equality_deletes {
         // Equality deletes don't carry per-target row-ids; the operator
         // scans older data files in the same partition through the iceberg
-        // reader, again leveraging the preloaded `base_first_row_ids`.
+        // reader, again leveraging the preloaded `base_data_file_lineage`.
         let targets: Vec<EqualityDeleteTargetData> = Vec::new();
         out.push(DeltaSourceFile {
             path: eq.delete_file_path.clone(),

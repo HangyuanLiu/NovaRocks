@@ -619,7 +619,10 @@ pub(crate) fn materialize_changes(
         let base_first_row_ids = if batch.deletes.is_empty() {
             std::collections::HashMap::new()
         } else {
-            base_data_file_first_row_id_index(base_table)?
+            base_data_file_lineage_index(base_table)?
+                .into_iter()
+                .map(|(path, lineage)| (path, lineage.first_row_id))
+                .collect()
         };
         let size_lookup = |path: &str| -> Option<u64> {
             // We do not currently carry the per-data-file size index across
@@ -689,30 +692,59 @@ pub(crate) fn materialize_changes(
 /// and reverse-project deleted rows from its target data file(s).
 ///
 /// Returns rows with the same projection as a regular base-table scan
-/// (including `_row_id` for A9 apply key). Each row has not yet had
-/// `__change_op` injected — the operator will add it.
+/// plus all four Iceberg v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) so the
+/// downstream codegen tuple descriptor's slot count matches. Each row has
+/// not yet had `__change_op` injected — the operator will add it.
 #[allow(dead_code)]
 pub(crate) fn scan_position_delete_rows_for_targets(
     base_table: &iceberg::table::Table,
     delete: &PositionDeleteRef,
-    base_first_row_ids: &std::collections::HashMap<String, i64>,
+    base_data_file_lineage: &std::collections::HashMap<
+        String,
+        crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
+    >,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let size_lookup = |_path: &str| -> Option<u64> { None };
-    crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
+    crate::connector::iceberg::scan_deletes::scan_deletes_with_lineage_lookup_and_path_normalizer(
         std::slice::from_ref(delete),
         factory,
         base_table.file_io(),
         size_lookup,
-        |path| base_first_row_ids.get(path).copied(),
+        |path| base_data_file_lineage.get(path).copied(),
         |path| normalize_delete_projection_path(path, object_store_config),
     )
     .map_err(|e| e.to_string())
 }
 
 /// Helper for `IcebergDeltaScanOperator`: scan one equality-delete file
-/// and reverse-project the matching rows from its target data file(s).
+/// and reverse-project the matching rows from its target data file(s),
+/// emitting all four Iceberg v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) so the
+/// downstream codegen tuple descriptor's slot count matches.
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
+    base_table: &iceberg::table::Table,
+    delete: &EqualityDeleteRef,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    scan_equality_delete_rows_for_table_with_v3_lineage(
+        base_table,
+        std::slice::from_ref(delete),
+        factory,
+        object_store_config,
+    )
+}
+
+/// Pre-A1 helper used by the `materialize_changes` reverse-projection path
+/// and the managed-lake IVM delta source. Emits only `_row_id` on top of
+/// the base-table physical projection — callers register the result as a
+/// SQL temp table and re-run the MV SELECT, which has no use for `_file`,
+/// `_pos`, or `_last_updated_sequence_number`. New IVM-A1 / v3 callers
+/// should use the `*_with_v3_lineage` variants.
 #[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_one(
     base_table: &iceberg::table::Table,
@@ -748,7 +780,9 @@ pub(crate) fn scan_one_added_data_file(
 /// Helper for `IcebergDeltaScanOperator`: scan one deleted data file
 /// (i.e., a file that was present at previous_snapshot and removed in
 /// current snapshot). Returns the live rows from that file at the previous
-/// snapshot, applying the previous-visibility delete mask.
+/// snapshot, applying the previous-visibility delete mask. Emits all four
+/// Iceberg v3 row-lineage virtual columns so the downstream codegen tuple
+/// descriptor's slot count matches.
 #[allow(dead_code)]
 pub(crate) fn scan_one_deleted_data_file(
     base_table: &iceberg::table::Table,
@@ -756,7 +790,7 @@ pub(crate) fn scan_one_deleted_data_file(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    scan_deleted_data_file_rows_with_visibility(
+    scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
         base_table,
         std::slice::from_ref(deleted_file),
         object_store_config,
@@ -804,6 +838,165 @@ pub(crate) fn scan_equality_delete_rows_for_table(
                 },
             )?);
         }
+    }
+    Ok(out)
+}
+
+/// IVM-A1 variant of `scan_equality_delete_rows_for_table` that emits the
+/// full Iceberg v3 row-lineage virtual column set on each batch.
+pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let mut out = Vec::new();
+    for delete in equality_deletes {
+        let delete_file = equality_change_to_read_delete(delete);
+        let delete_specs = vec![equality_change_to_delete_spec(delete, object_store_config)?];
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &delete_specs,
+            factory,
+        )?;
+        for data_file in crate::connector::iceberg::read::data_files_matching_delete(
+            &read_snapshot,
+            &delete_file,
+        ) {
+            let first_row_id = data_file.first_row_id.ok_or_else(|| {
+                format!(
+                    "iceberg MV equality-delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                    data_file.path
+                )
+            })?;
+            let data_sequence_number = data_file.data_sequence_number.ok_or_else(|| {
+                format!(
+                    "iceberg MV equality-delete reverse projection requires data_sequence_number for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                    data_file.path
+                )
+            })?;
+            out.extend(read_data_file_matching_equality_deletes_with_v3_lineage(
+                &data_file.path,
+                u64::try_from(data_file.size).ok(),
+                &sets,
+                first_row_id,
+                data_sequence_number,
+                factory,
+                |path| {
+                    normalize_delete_projection_path(path, object_store_config)
+                        .map_err(|e| e.to_string())
+                },
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_data_file_matching_equality_deletes_with_v3_lineage<N>(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
+    first_row_id: i64,
+    data_sequence_number: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: N,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String>
+where
+    N: Fn(&str) -> Result<String, String>,
+{
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+    use arrow::array::BooleanArray;
+    use arrow::compute::filter_record_batch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    if sets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let normalized_path = normalize_path(data_file_path)?;
+    let reader = factory
+        .open_with_len(&normalized_path, data_file_size)
+        .map_err(|e| {
+            format!(
+                "open iceberg data file {data_file_path} for equality-delete v3-lineage reverse projection failed: {e}"
+            )
+        })?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::try_new(reader)
+        .map_err(|e| {
+            format!(
+                "read iceberg data file {data_file_path} metadata for equality-delete v3-lineage reverse projection failed: {e}"
+            )
+        })?
+        .build()
+        .map_err(|e| {
+            format!(
+                "build iceberg data reader for equality-delete v3-lineage reverse projection {data_file_path} failed: {e}"
+            )
+        })?;
+
+    let mut out = Vec::new();
+    let mut next_position = 0_u64;
+    for batch in reader {
+        let batch = batch.map_err(|e| {
+            format!(
+                "read iceberg data file {data_file_path} batch for equality-delete v3-lineage reverse projection failed: {e}"
+            )
+        })?;
+        let row_count = batch.num_rows();
+        let Some(keep_mask) =
+            crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
+        else {
+            next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
+                format!(
+                    "row position overflow while scanning equality deletes for {data_file_path}"
+                )
+            })?;
+            continue;
+        };
+
+        let mut matched_positions = Vec::new();
+        let match_mask = BooleanArray::from(
+            keep_mask
+                .iter()
+                .enumerate()
+                .map(|(idx, keep)| {
+                    let matched = !*keep;
+                    if matched {
+                        matched_positions.push(next_position + idx as u64);
+                    }
+                    matched
+                })
+                .collect::<Vec<_>>(),
+        );
+        let filtered = filter_record_batch(&batch, &match_mask).map_err(|e| {
+            format!(
+                "filter iceberg data file {data_file_path} for equality-delete v3-lineage reverse projection failed: {e}"
+            )
+        })?;
+        if filtered.num_rows() > 0 {
+            out.push(
+                crate::connector::iceberg::scan_deletes::append_iceberg_v3_row_lineage_columns(
+                    &filtered,
+                    data_file_path,
+                    &matched_positions,
+                    first_row_id,
+                    data_sequence_number,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
+            format!("row position overflow while scanning equality deletes for {data_file_path}")
+        })?;
     }
     Ok(out)
 }
@@ -910,9 +1103,18 @@ where
     Ok(out)
 }
 
-pub(crate) fn base_data_file_first_row_id_index(
+/// Build a path -> v3 row-lineage index over the base table's current
+/// snapshot. Used by the `IcebergDeltaScanOperator` delete-side scanners
+/// to look up `first_row_id` and `data_sequence_number` for each target
+/// data file referenced by a position/equality/deleted-data-file role,
+/// so the operator can synthesize the four v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+pub(crate) fn base_data_file_lineage_index(
     table: &iceberg::table::Table,
-) -> Result<std::collections::HashMap<String, i64>, String> {
+) -> Result<
+    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    String,
+> {
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
     let mut out = std::collections::HashMap::new();
     for file in read_snapshot.files {
@@ -922,7 +1124,19 @@ pub(crate) fn base_data_file_first_row_id_index(
                 file.path
             )
         })?;
-        out.insert(file.path, first_row_id);
+        let data_sequence_number = file.data_sequence_number.ok_or_else(|| {
+            format!(
+                "iceberg MV delete reverse projection requires data_sequence_number for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                file.path
+            )
+        })?;
+        out.insert(
+            file.path,
+            crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+                first_row_id,
+                data_sequence_number,
+            },
+        );
     }
     Ok(out)
 }
@@ -1046,6 +1260,131 @@ fn scan_deleted_data_file_rows_with_visibility(
         Some(existing_deletes_by_file),
     )
     .map_err(|e| e.to_string())
+}
+
+/// IVM-A1 variant of `scan_deleted_data_file_rows_with_visibility` that
+/// emits the full Iceberg v3 row-lineage virtual column set on each batch.
+fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
+    base_table: &iceberg::table::Table,
+    deleted_data_files: &[DeletedDataFileRef],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if deleted_data_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+    let mut out = Vec::new();
+    // Group by logical path (in iceberg manifests the same path could occur
+    // in multiple `DeletedDataFileRef`s if a follow-up snapshot also touched
+    // the file; defensive de-dup keeps lineage synthesis deterministic).
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in deleted_data_files {
+        if !seen.insert(file.path.clone()) {
+            continue;
+        }
+        let first_row_id = file.first_row_id.ok_or_else(|| {
+            format!(
+                "iceberg MV deleted-data-file reverse projection requires first_row_id for {}; \
+                 rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                file.path
+            )
+        })?;
+        let data_sequence_number = file.data_sequence_number.ok_or_else(|| {
+            format!(
+                "iceberg MV deleted-data-file reverse projection requires data_sequence_number for {}; \
+                 rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                file.path
+            )
+        })?;
+        let normalized = normalize_delete_projection_path(&file.path, object_store_config)
+            .map_err(|e| format!("normalize deleted data file `{}`: {e}", file.path))?;
+        let size = u64::try_from(file.size).ok();
+        let batches = read_full_data_file_with_v3_lineage_and_visibility(
+            &file.path,
+            &normalized,
+            size,
+            first_row_id,
+            data_sequence_number,
+            &factory,
+            Some(existing_deletes_by_file),
+        )?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
+fn read_full_data_file_with_v3_lineage_and_visibility(
+    logical_path: &str,
+    path: &str,
+    size: Option<u64>,
+    first_row_id: i64,
+    data_sequence_number: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    existing_deletes_by_file: Option<
+        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    >,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use arrow::array::BooleanArray;
+    use arrow::compute::filter_record_batch;
+
+    let batches = read_full_data_file(path, size, factory)?;
+    let mut out = Vec::with_capacity(batches.len());
+    let mut next_position = 0_u64;
+    for batch in batches {
+        let end = next_position
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| format!("row position overflow while scanning deleted file {path}"))?;
+        let mut positions = Vec::with_capacity(batch.num_rows());
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let position = next_position.checked_add(row as u64).ok_or_else(|| {
+                format!("row position overflow while scanning deleted file {path}")
+            })?;
+            let visible = match existing_deletes_by_file {
+                Some(deletes) => {
+                    let row_position = i64::try_from(position).map_err(|_| {
+                        format!("row position {position} is too large for deleted file {path}")
+                    })?;
+                    crate::engine::delete_flow::data_file_row_is_visible(
+                        &batch,
+                        row,
+                        logical_path,
+                        row_position,
+                        deletes,
+                    )?
+                }
+                None => true,
+            };
+            keep.push(visible);
+            if visible {
+                positions.push(position);
+            }
+        }
+        if positions.is_empty() {
+            next_position = end;
+            continue;
+        }
+        let filtered = if positions.len() == batch.num_rows() {
+            batch
+        } else {
+            filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|e| {
+                format!("filter deleted data file {logical_path} by previous delete visibility failed: {e}")
+            })?
+        };
+        let enriched =
+            crate::connector::iceberg::scan_deletes::append_iceberg_v3_row_lineage_columns(
+                &filtered,
+                logical_path,
+                &positions,
+                first_row_id,
+                data_sequence_number,
+            )
+            .map_err(|e| e.to_string())?;
+        out.push(enriched);
+        next_position = end;
+    }
+    Ok(out)
 }
 
 pub(crate) fn scan_deleted_data_file_rows_with_factory<N>(

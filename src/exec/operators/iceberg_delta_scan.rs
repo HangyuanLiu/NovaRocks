@@ -379,7 +379,7 @@ fn open_position_delete_scanner(
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
         &node.iceberg_runtime.base_table,
         &delete,
-        &delete_side.base_first_row_ids,
+        &delete_side.base_data_file_lineage,
         node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
@@ -416,12 +416,13 @@ fn open_equality_delete_scanner(
         partition_spec_id: file.partition_spec_id,
         partition_key: file.partition_key.clone(),
     };
-    let rows = crate::connector::iceberg::changes::scan_equality_delete_rows_for_one(
-        &node.iceberg_runtime.base_table,
-        &delete,
-        node.iceberg_runtime.object_store_factory.as_ref(),
-        node.object_store_config.as_ref(),
-    )?;
+    let rows =
+        crate::connector::iceberg::changes::scan_equality_delete_rows_for_one_with_v3_lineage(
+            &node.iceberg_runtime.base_table,
+            &delete,
+            node.iceberg_runtime.object_store_factory.as_ref(),
+            node.object_store_config.as_ref(),
+        )?;
     Ok(Box::new(EqualityDeleteScanner {
         batches: rows.into_iter(),
     }))

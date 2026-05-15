@@ -338,6 +338,78 @@ pub(crate) fn append_base_row_id_column(
     })
 }
 
+/// Append all four Iceberg v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) to a batch
+/// of reverse-projected delete-side rows so its column count matches what
+/// `build_iceberg_table_def_for_delta_scan` advertises to codegen. The
+/// caller knows which target data file the rows came from (so `_file` is a
+/// constant string column and `_last_updated_sequence_number` is a constant
+/// int64 column), the per-row positions (`_pos`), and the file's
+/// `first_row_id` (so `_row_id = first_row_id + pos`).
+///
+/// `_row_id` reuses `append_base_row_id_column` so any existing `_row_id`
+/// in the input is verified to match the computed values rather than
+/// silently overwritten. The other three columns are always appended on top
+/// of the result; the chunk layout maps by slot_id / column name, not by
+/// position, so trailing order does not have to mirror the codegen
+/// advertised order in `build_iceberg_table_def_for_delta_scan`.
+pub(crate) fn append_iceberg_v3_row_lineage_columns(
+    batch: &RecordBatch,
+    data_file_path: &str,
+    positions: &[u64],
+    first_row_id: i64,
+    data_sequence_number: i64,
+) -> Result<RecordBatch, ChangeError> {
+    use arrow::array::StringArray;
+
+    let with_row_id = append_base_row_id_column(batch, first_row_id, positions)?;
+    let row_count = with_row_id.num_rows();
+    let mut pos_values = Vec::with_capacity(row_count);
+    for position in positions {
+        let position = i64::try_from(*position).map_err(|_| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg row position {position} exceeds i64 while materializing v3 row lineage"
+            ))
+        })?;
+        pos_values.push(position);
+    }
+
+    let mut fields = with_row_id
+        .schema()
+        .fields()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(
+        "_file",
+        arrow::datatypes::DataType::Utf8,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
+        "_pos",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )));
+    fields.push(Arc::new(Field::new(
+        "_last_updated_sequence_number",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )));
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let mut columns = with_row_id.columns().to_vec();
+    columns.push(Arc::new(StringArray::from(vec![
+        data_file_path.to_string();
+        row_count
+    ])) as ArrayRef);
+    columns.push(Arc::new(Int64Array::from(pos_values)) as ArrayRef);
+    columns.push(Arc::new(Int64Array::from(vec![data_sequence_number; row_count])) as ArrayRef);
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "append iceberg v3 row-lineage columns to delete reverse projection batch: {e}"
+        ))
+    })
+}
+
 /// Open a single data file and project the rows at the positions
 /// listed in `positions`. Returns one `RecordBatch` per parquet
 /// `RecordBatch` boundary that contained at least one matching row.
@@ -746,6 +818,168 @@ where
         )?;
         out.extend(batches);
     }
+    Ok(out)
+}
+
+/// Variant of `scan_deletes_with_base_row_id_lookup_and_path_normalizer` that
+/// emits the full Iceberg v3 row-lineage virtual column set
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) on every
+/// returned batch — the row-lineage contract that
+/// `IcebergDeltaScanOperator`'s delete-side scanners need to match the
+/// codegen tuple descriptor. `first_row_id` and `data_sequence_number` are
+/// looked up per target data file via the supplied closure (typically
+/// backed by `base_data_file_lineage_index`).
+pub(crate) fn scan_deletes_with_lineage_lookup_and_path_normalizer<F, R, N>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
+    data_file_size_lookup: F,
+    lineage_lookup: R,
+    normalize_path: N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    F: Fn(&str) -> Option<u64>,
+    R: Fn(&str) -> Option<crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    use iceberg::spec::DataFileFormat;
+
+    if delete_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (parquet_dels, puffin_dels): (Vec<_>, Vec<_>) = delete_files
+        .iter()
+        .cloned()
+        .partition(|r| r.file_format == DataFileFormat::Parquet);
+
+    let mut positions_per_file = read_delete_positions_per_data_file_with_path_normalizer(
+        &parquet_dels,
+        factory,
+        &normalize_path,
+    )?;
+    if !puffin_dels.is_empty() {
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "scan_deletes: block_on_dv_read for Puffin DV: {e}"
+                ))
+            })??;
+        for (path, treemap) in dv_positions {
+            *positions_per_file.entry(path).or_default() |= treemap;
+        }
+    }
+
+    let mut out: Vec<RecordBatch> = Vec::new();
+    let mut data_file_paths: Vec<&String> = positions_per_file.keys().collect();
+    data_file_paths.sort();
+    for data_file_path in data_file_paths {
+        let positions = &positions_per_file[data_file_path];
+        let size = data_file_size_lookup(data_file_path);
+        let lineage = lineage_lookup(data_file_path).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg delete reverse projection missing v3 row-lineage metadata for data file {data_file_path}"
+            ))
+        })?;
+        let batches = read_data_file_at_positions_with_v3_lineage_and_path_normalizer(
+            data_file_path,
+            size,
+            positions,
+            lineage,
+            factory,
+            &normalize_path,
+        )?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
+fn read_data_file_at_positions_with_v3_lineage_and_path_normalizer<N>(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    positions: &RoaringTreemap,
+    lineage: crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: &N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+
+    if positions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let normalized_data_file_path = normalize_path(data_file_path)?;
+    let reader = factory
+        .open_with_len(&normalized_data_file_path, data_file_size)
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
+            ))
+        })?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
+        ))
+    })?;
+    let row_selection = positions_to_row_selection(positions)?;
+    let reader = builder
+        .with_row_selection(row_selection)
+        .build()
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "build parquet reader for {data_file_path}: {e}"
+            ))
+        })?;
+
+    let ordered_positions: Vec<u64> = positions.iter().collect();
+    let mut position_offset = 0_usize;
+    let mut out: Vec<RecordBatch> = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
+            ))
+        })?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let end = position_offset
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "delete reverse projection row count overflow for {data_file_path}"
+                ))
+            })?;
+        let batch_positions = ordered_positions.get(position_offset..end).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "delete reverse projection for {data_file_path} returned more rows than selected positions"
+            ))
+        })?;
+        out.push(append_iceberg_v3_row_lineage_columns(
+            &batch,
+            data_file_path,
+            batch_positions,
+            lineage.first_row_id,
+            lineage.data_sequence_number,
+        )?);
+        position_offset = end;
+    }
+    if position_offset != ordered_positions.len() {
+        return Err(ChangeError::InternalInconsistency(format!(
+            "delete reverse projection for {data_file_path} returned {} rows for {} selected positions",
+            position_offset,
+            ordered_positions.len()
+        )));
+    }
+
     Ok(out)
 }
 

@@ -2791,7 +2791,19 @@ fn incremental_refresh_iceberg_mv(
                 target_entry,
                 &staging_branch,
                 refresh_id,
-                format!("IVM-A1 AST mutate expected exactly 1 base-table reference, found {n}"),
+                format!(
+                    "IVM-A1 AST mutate for MV {}.{}.{} (mv_id={}): expected exactly 1 reference \
+                     to base table {}.{}.{} in physical SELECT, found {} (incremental refresh \
+                     only supports single-base MVs)",
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    mv_definition.mv_id,
+                    base_ref.catalog,
+                    base_ref.namespace,
+                    base_ref.table,
+                    n,
+                ),
             ));
         }
         Err(err) => {

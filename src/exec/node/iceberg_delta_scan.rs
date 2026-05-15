@@ -109,7 +109,7 @@ pub struct DeletedFileVisibility {
 /// - `base_table` comes from `iceberg::Catalog::load_table`
 /// - `object_store_factory` is built once via `build_factory_for_table` and
 ///   shared across role scanners
-/// - `delete_side` is populated via `base_data_file_first_row_id_index` +
+/// - `delete_side` is populated via `base_data_file_lineage_index` +
 ///   `load_existing_delete_visibility_by_data_file_at` only when the change
 ///   batch contains DELETE-side roles (position / equality / deleted-data-file).
 #[derive(Debug)]
@@ -119,9 +119,20 @@ pub struct IcebergRuntimeHandles {
     pub delete_side: Option<DeltaScanDeleteSide>,
 }
 
+/// Per-target-data-file v3 row-lineage metadata required by the delete-side
+/// scanners in `IcebergDeltaScanOperator` to synthesize the
+/// `_file` / `_pos` / `_row_id` / `_last_updated_sequence_number` virtual
+/// columns when reverse-projecting deleted rows. Filled in by
+/// `base_data_file_lineage_index` from the previous-snapshot read view.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseDataFileLineage {
+    pub first_row_id: i64,
+    pub data_sequence_number: i64,
+}
+
 #[derive(Debug)]
 pub struct DeltaScanDeleteSide {
-    pub base_first_row_ids: std::collections::HashMap<String, i64>,
+    pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
     pub(crate) previous_delete_visibility:
         crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 }

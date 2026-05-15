@@ -191,15 +191,17 @@ pub(crate) fn build_iceberg_table_def_with_files(
 
 /// IVM-A1 helper: build a `TableDef` for the base table without registering
 /// any data files. Always advertises Iceberg v3 row-lineage virtual columns
-/// (`_row_id`, `_pos`, `_file`, `_last_updated_sequence_number`) plus the
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) plus the
 /// transparent IVM `__change_op` pseudo-column when the metadata declares
 /// row-lineage, so the analyzer can resolve `_row_id` references that the
 /// IVM apply-key flow depends on and the merge sink can locate the
-/// per-row insert / delete tag. The `IcebergDeltaScan` operator (not the
-/// standard scan) supplies these columns per-file at runtime by synthesizing
-/// them from `DeltaSourceFile.{path, first_row_id, data_sequence_number}`
-/// and the per-row position; `__change_op` is set to `+1` for `DataFile`
-/// and `-1` for the three delete roles.
+/// per-row insert / delete tag. The four lineage columns are listed in the
+/// exact order the codegen scan-tuple builder consumes them; the
+/// `IcebergDeltaScan` operator (not the standard scan) supplies these
+/// columns per-file at runtime by synthesizing them from
+/// `DeltaSourceFile.{path, first_row_id, data_sequence_number}` and the
+/// per-row position. `__change_op` is set to `+1` for `DataFile` and `-1`
+/// for the three delete roles.
 ///
 /// `__change_op` is grouped with the lineage columns rather than living on
 /// its own field because the codegen scan-tuple builder is the only consumer
@@ -207,8 +209,14 @@ pub(crate) fn build_iceberg_table_def_with_files(
 /// the change-op column into the same carrier keeps slot allocation in a
 /// single loop. The downstream IcebergDeltaScan codegen path does not
 /// consume `iceberg_metadata_pseudo_column_slots` for extended_columns
-/// emission (that is HDFS_SCAN-only), so the only effect of adding
-/// `__change_op` here is to extend the scan tuple by one extra slot.
+/// emission (that is HDFS_SCAN-only). The reason `__change_op` survives
+/// column pruning all the way down to the operator is not that it is
+/// listed here — column pruning would still drop a slot that no expression
+/// references — but that the refresh driver explicitly appends
+/// `__change_op` to the top-level projection via
+/// `crate::engine::mv::iceberg_refresh::append_change_op_to_projection`
+/// before analysis runs. That append is what makes the slot load-bearing;
+/// declaring the column on the `TableDef` only ensures it resolves.
 ///
 /// Returns Err if the table metadata does not declare v3 row-lineage; A1
 /// requires v3 row-lineage to compute the apply key.
