@@ -7,7 +7,7 @@ use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
 use crate::connector::iceberg::changes::{
     DeletedDataFileRef, IcebergChangeBatch, build_factory_for_table,
     normalize_delete_projection_path, previous_snapshot_data_file_lineage_index,
-    scan_deleted_data_file_rows, scan_equality_delete_rows_for_table,
+    scan_deleted_data_file_rows, scan_equality_delete_rows_for_table_at,
 };
 use crate::connector::starrocks::managed::model::IcebergTableRef;
 use crate::engine::catalog::InMemoryCatalog;
@@ -70,9 +70,10 @@ pub(crate) fn build_delta_source_files(
                 |path| normalize_delete_projection_path(path, object_store_config),
             )
             .map_err(|e| e.to_string())?;
-        deleted_rows.extend(scan_equality_delete_rows_for_table(
+        deleted_rows.extend(scan_equality_delete_rows_for_table_at(
             &input.loaded.table,
             &batch.equality_deletes,
+            batch.current_snapshot_id,
             &factory,
             object_store_config,
         )?);

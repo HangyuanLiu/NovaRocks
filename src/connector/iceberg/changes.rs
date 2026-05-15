@@ -658,6 +658,7 @@ pub(crate) fn scan_one_deleted_data_file(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_table(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
@@ -668,6 +669,40 @@ pub(crate) fn scan_equality_delete_rows_for_table(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    scan_equality_delete_rows_for_snapshot(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+pub(crate) fn scan_equality_delete_rows_for_table_at(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    scan_equality_delete_rows_for_snapshot(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+fn scan_equality_delete_rows_for_snapshot(
+    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);

@@ -113,6 +113,26 @@ pub(crate) fn refresh_mv(
     };
     validate_incremental_mv_base_ref(mv_shape.base_table(), base_ref)?;
 
+    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    let previous_snapshot_id = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
+    if previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none() {
+        tracing::info!(
+            "managed lake mv {}.{}: base table {} has no snapshot; skipping refresh",
+            db_name,
+            mv_name,
+            base_ref.fqn()
+        );
+        return Ok(StatementResult::Ok);
+    }
+
     // Freeze the snapshot pin for the duration of this refresh. From now on
     // pin is the only source of snapshot ids for base table reads, delta
     // computation, intent recording, and bookkeeping.
@@ -130,10 +150,6 @@ pub(crate) fn refresh_mv(
         })?
         .to_string();
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let previous_snapshot_id = mv_definition
-        .last_refresh_snapshots
-        .get(&base_ref.fqn())
-        .copied();
     let mut policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
     if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
         && previous_uuid != &current_table_uuid
@@ -2528,6 +2544,240 @@ mod tests {
             Some(s2),
             "follow-up refresh should record the current base snapshot"
         );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn equality_delete_reverse_projection_uses_refresh_pin() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine =
+            match crate::engine::StandaloneNovaRocks::open(crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            }) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    if is_unavailable_object_store_error(&err) {
+                        eprintln!(
+                            "skipping equality-delete pin test: object store unavailable: {err}"
+                        );
+                        return;
+                    }
+                    panic!("open standalone engine: {err}");
+                }
+            };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 10), (2, 20), (3, 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+
+        session
+            .execute_in_database(
+                "alter table ice.ns.orders add equality delete (amount) values (10)",
+                "default",
+            )
+            .expect("add equality delete for base amount=10");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot after equality delete");
+
+        let hook_engine = engine.clone();
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let _hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("alter table ice.ns.orders optimize", "default")
+                .expect("hook create optimize job");
+            hook_engine
+                .run_pending_optimize_jobs_for_test()
+                .expect("hook run optimize job");
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (4, 40)", "default")
+                .expect("hook insert producing post-pin snapshot");
+            let post_pin_snapshot =
+                current_orders_main_snapshot(&hook_session).expect("post-pin snapshot");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(post_pin_snapshot);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, equality-delete pinned) refresh materialized view: {err}");
+        }
+
+        let post_pin_snapshot = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(
+            s1, post_pin_snapshot,
+            "hook OPTIMIZE + INSERT should advance the base snapshot"
+        );
+
+        let rows_after_refresh =
+            collect_projection_mv_rows(&session).expect("select equality-delete pinned MV rows");
+        assert_eq!(
+            rows_after_refresh,
+            vec![(2, 21), (3, 31)],
+            "refresh pinned at s1 must retract id=1 and must not include post-pin id=4"
+        );
+
+        let mv_after_refresh = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded = mv_after_refresh
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded,
+            Some(s1),
+            "incremental refresh bookkeeping must record the equality-delete pin snapshot"
+        );
+        assert_ne!(
+            recorded,
+            Some(post_pin_snapshot),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn refresh_empty_iceberg_base_is_noop_before_pin_capture() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine =
+            match crate::engine::StandaloneNovaRocks::open(crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            }) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    if is_unavailable_object_store_error(&err) {
+                        eprintln!(
+                            "skipping empty-base MV refresh test: object store unavailable: {err}"
+                        );
+                        return;
+                    }
+                    panic!("open standalone engine: {err}");
+                }
+            };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create empty iceberg orders table");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping empty-base MV refresh test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping empty-base MV refresh test: object store unavailable on refresh: {err}"
+                );
+                return;
+            }
+            panic!("refresh materialized view over empty base should be a no-op: {err}");
+        }
 
         drop(engine);
     }
