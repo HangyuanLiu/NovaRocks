@@ -172,8 +172,7 @@ fn inject_change_op_column(batch: RecordBatch, value: i8) -> Result<RecordBatch,
     let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
     let mut columns = batch.columns().to_vec();
     columns.push(arr);
-    RecordBatch::try_new(new_schema, columns)
-        .map_err(|e| format!("inject __change_op column: {e}"))
+    RecordBatch::try_new(new_schema, columns).map_err(|e| format!("inject __change_op column: {e}"))
 }
 
 fn open_scanner_for_role(

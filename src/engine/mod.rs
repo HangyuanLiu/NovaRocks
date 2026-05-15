@@ -2318,6 +2318,35 @@ pub(crate) fn execute_query(
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
+    execute_query_with_options(
+        query,
+        catalog,
+        current_database,
+        exchange_port,
+        query_opts,
+        None,
+        None,
+    )
+}
+
+/// Extended `execute_query` entry that accepts an optional custom terminal
+/// sink factory and an optional Iceberg catalog registry. Used by IVM-A1
+/// refresh paths: the merge sink intercepts pipeline output (no result
+/// rows are produced), and lower_plan needs the registry to resolve
+/// `ICEBERG_DELTA_SCAN_NODE` runtime handles.
+///
+/// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
+/// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM
+/// callers.
+pub(crate) fn execute_query_with_options(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+) -> Result<QueryResult, String> {
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
@@ -2331,8 +2360,23 @@ pub(crate) fn execute_query(
     let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(*plan, query_opts),
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs)
+        }
         StandaloneExecutionPlan::Coordinated(build_result) => {
+            if terminal_sink.is_some() {
+                return Err(
+                    "IVM-A1 custom sink does not yet support coordinated multi-fragment plans"
+                        .to_string(),
+                );
+            }
+            if iceberg_catalogs.is_some() {
+                return Err(
+                    "IVM-A1 iceberg_catalogs runtime registry does not yet support coordinated \
+                     multi-fragment plans"
+                        .to_string(),
+                );
+            }
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 "127.0.0.1".to_string(),
@@ -2484,6 +2528,8 @@ fn collect_scan_stats(
 fn execute_plan(
     result: PlanBuildResult,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
 ) -> Result<QueryResult, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -2517,7 +2563,7 @@ fn execute_plan(
         &layout_hints,
         None,
         None,
-        None,
+        iceberg_catalogs,
     )?;
     let mut exec_plan = ExecPlan {
         arena,
@@ -2525,7 +2571,17 @@ fn execute_plan(
     };
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
+    // Default to the result-capturing sink unless the caller supplied a
+    // custom terminal sink (e.g. IVM-A1 IcebergMergeSinkFactory). When a
+    // custom sink is in use, output chunks are intercepted by the sink so
+    // the returned `QueryResult` only carries the column metadata.
     let handle = ResultSinkHandle::new();
+    let sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory> =
+        match terminal_sink {
+            Some(custom_sink) => custom_sink,
+            None => Box::new(ResultSinkFactory::new(handle.clone())),
+        };
+
     // Use available CPU cores for pipeline parallelism (capped at 8)
     let pipeline_dop = std::thread::available_parallelism()
         .map(|p| p.get().min(4))
@@ -2534,7 +2590,7 @@ fn execute_plan(
         exec_plan,
         false,
         std::time::Duration::from_millis(10),
-        Box::new(ResultSinkFactory::new(handle.clone())),
+        sink,
         None,
         None,
         pipeline_dop as _,

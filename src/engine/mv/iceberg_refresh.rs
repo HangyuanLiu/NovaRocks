@@ -12,7 +12,7 @@ use iceberg::spec::DataFile;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use crate::connector::iceberg::changes::{
-    IcebergChangePolicySignal, materialize_changes, plan_changes, policy_signal_from_change_error,
+    IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, IcebergCommitCollector, MvRefreshPublishPlan,
@@ -28,7 +28,7 @@ use crate::connector::starrocks::managed::mv_ddl::{
 };
 use crate::connector::starrocks::managed::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
-    query_result_to_chunks, run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
+    run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
 use crate::connector::starrocks::managed::mv_shape::{
     IncrementalMvShape, classify_incremental_mv_query,
@@ -37,15 +37,12 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_PROP_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID,
     ICEBERG_MV_PROP_APPLY_KEY_SOURCE, apply_key_table_column, ensure_base_row_lineage_contract,
-    extract_apply_key_values_from_chunks, find_apply_key_field_id, iceberg_mv_physical_select_sql,
-    load_target_apply_locator_inputs, locate_target_rows_by_apply_key,
+    find_apply_key_field_id, iceberg_mv_physical_select_sql, load_target_apply_locator_inputs,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
     MvTarget, RefreshError, RefreshMode, RefreshPlan,
 };
-use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
-use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -2173,15 +2170,351 @@ async fn commit_iceberg_mv_apply_with_ref(
     Ok(outcome)
 }
 
+/// IVM-A1 AST helper: mutate a parsed MV SELECT in place so the unique
+/// reference to `base_ref` becomes a `__nr_ivm_delta(...)` table function
+/// call. Returns the number of matches replaced (must be exactly 1 for the
+/// caller to proceed).
+///
+/// Matching rules (case-insensitive, via `normalize_identifier`):
+/// - `tbl` matches when `base_ref.table` equals `tbl`. (Bare 1-part name.)
+/// - `db.tbl` matches when `(db, tbl)` equals `(base_ref.namespace, base_ref.table)`.
+/// - `cat.db.tbl` matches when the full triple equals `base_ref`.
+///
+/// Aliases are preserved. If the original factor had no alias, the rewritten
+/// `__nr_ivm_delta(...)` carries an explicit alias equal to the original base
+/// table name so downstream references like `<table>.<col>` keep resolving.
+fn mutate_query_for_ivm_delta_scan(
+    query: &mut sqlparser::ast::Query,
+    base_ref: &IcebergTableRef,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> Result<usize, String> {
+    let normalized_base = (
+        crate::engine::catalog::normalize_identifier(&base_ref.catalog)?,
+        crate::engine::catalog::normalize_identifier(&base_ref.namespace)?,
+        crate::engine::catalog::normalize_identifier(&base_ref.table)?,
+    );
+    let mut state = MutateState {
+        normalized_base: &normalized_base,
+        base_ref,
+        from_snapshot_id,
+        to_snapshot_id,
+        matches: 0,
+        errors: Vec::new(),
+    };
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            mutate_set_expr_for_ivm(cte.query.body.as_mut(), &mut state);
+        }
+    }
+    mutate_set_expr_for_ivm(query.body.as_mut(), &mut state);
+    if let Some(err) = state.errors.into_iter().next() {
+        return Err(err);
+    }
+    Ok(state.matches)
+}
+
+struct MutateState<'a> {
+    normalized_base: &'a (String, String, String),
+    base_ref: &'a IcebergTableRef,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    matches: usize,
+    errors: Vec<String>,
+}
+
+fn mutate_set_expr_for_ivm(expr: &mut sqlparser::ast::SetExpr, state: &mut MutateState<'_>) {
+    use sqlparser::ast::SetExpr;
+    match expr {
+        SetExpr::Select(select) => {
+            for from in &mut select.from {
+                mutate_factor_for_ivm(&mut from.relation, state);
+                for join in &mut from.joins {
+                    mutate_factor_for_ivm(&mut join.relation, state);
+                }
+            }
+            if let Some(selection) = &mut select.selection {
+                mutate_expr_for_ivm(selection, state);
+            }
+            if let Some(having) = &mut select.having {
+                mutate_expr_for_ivm(having, state);
+            }
+            for projection in &mut select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        mutate_expr_for_ivm(e, state);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            mutate_set_expr_for_ivm(left.as_mut(), state);
+            mutate_set_expr_for_ivm(right.as_mut(), state);
+        }
+        SetExpr::Query(q) => {
+            mutate_set_expr_for_ivm(q.body.as_mut(), state);
+        }
+        _ => {}
+    }
+}
+
+fn mutate_expr_for_ivm(expr: &mut sqlparser::ast::Expr, state: &mut MutateState<'_>) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            mutate_set_expr_for_ivm(q.body.as_mut(), state);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            mutate_set_expr_for_ivm(subquery.body.as_mut(), state);
+            mutate_expr_for_ivm(expr, state);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            mutate_expr_for_ivm(left, state);
+            mutate_expr_for_ivm(right, state);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            mutate_expr_for_ivm(expr, state);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            mutate_expr_for_ivm(expr, state);
+            mutate_expr_for_ivm(low, state);
+            mutate_expr_for_ivm(high, state);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                mutate_expr_for_ivm(op, state);
+            }
+            for case_when in conditions {
+                mutate_expr_for_ivm(&mut case_when.condition, state);
+                mutate_expr_for_ivm(&mut case_when.result, state);
+            }
+            if let Some(else_expr) = else_result {
+                mutate_expr_for_ivm(else_expr, state);
+            }
+        }
+        Expr::Cast { expr, .. } => mutate_expr_for_ivm(expr, state),
+        _ => {}
+    }
+}
+
+fn mutate_factor_for_ivm(factor: &mut sqlparser::ast::TableFactor, state: &mut MutateState<'_>) {
+    use sqlparser::ast::TableFactor;
+    match factor {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
+            // Skip table-valued function factors (e.g. existing __nr_ivm_delta).
+            if args.is_some() {
+                return;
+            }
+            let raw_parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+                    _ => None,
+                })
+                .collect();
+            // Synthetic iceberg-metadata factors (`__nr_meta_*__`) are not
+            // base-table references — leave them alone.
+            let normalized_lc: Vec<String> =
+                raw_parts.iter().map(|s| s.to_ascii_lowercase()).collect();
+            let (base_parts, metadata_suffix) =
+                crate::sql::analyzer::iceberg_metadata::split_metadata_suffix(&normalized_lc);
+            if metadata_suffix.is_some() {
+                return;
+            }
+            let normalized = match base_parts.len() {
+                1 => match crate::engine::catalog::normalize_identifier(&base_parts[0]) {
+                    Ok(t) => (None, None, t),
+                    Err(e) => {
+                        state.errors.push(format!(
+                            "IVM-A1 base table candidate '{}' normalize: {e}",
+                            base_parts[0]
+                        ));
+                        return;
+                    }
+                },
+                2 => {
+                    let db = match crate::engine::catalog::normalize_identifier(&base_parts[0]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.errors.push(format!(
+                                "IVM-A1 base table candidate db '{}' normalize: {e}",
+                                base_parts[0]
+                            ));
+                            return;
+                        }
+                    };
+                    let tbl = match crate::engine::catalog::normalize_identifier(&base_parts[1]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.errors.push(format!(
+                                "IVM-A1 base table candidate table '{}' normalize: {e}",
+                                base_parts[1]
+                            ));
+                            return;
+                        }
+                    };
+                    (None, Some(db), tbl)
+                }
+                3 => {
+                    let cat = match crate::engine::catalog::normalize_identifier(&base_parts[0]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.errors.push(format!(
+                                "IVM-A1 base table candidate catalog '{}' normalize: {e}",
+                                base_parts[0]
+                            ));
+                            return;
+                        }
+                    };
+                    let db = match crate::engine::catalog::normalize_identifier(&base_parts[1]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.errors.push(format!(
+                                "IVM-A1 base table candidate db '{}' normalize: {e}",
+                                base_parts[1]
+                            ));
+                            return;
+                        }
+                    };
+                    let tbl = match crate::engine::catalog::normalize_identifier(&base_parts[2]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.errors.push(format!(
+                                "IVM-A1 base table candidate table '{}' normalize: {e}",
+                                base_parts[2]
+                            ));
+                            return;
+                        }
+                    };
+                    (Some(cat), Some(db), tbl)
+                }
+                _ => return,
+            };
+
+            let matches_base = match &normalized {
+                (Some(cat), Some(db), tbl) => {
+                    *cat == state.normalized_base.0
+                        && *db == state.normalized_base.1
+                        && *tbl == state.normalized_base.2
+                }
+                (None, Some(db), tbl) => {
+                    *db == state.normalized_base.1 && *tbl == state.normalized_base.2
+                }
+                (None, None, tbl) => *tbl == state.normalized_base.2,
+                (Some(_), None, _) => false,
+            };
+            if !matches_base {
+                return;
+            }
+
+            state.matches += 1;
+            let fqn = format!(
+                "{}.{}.{}",
+                state.base_ref.catalog, state.base_ref.namespace, state.base_ref.table
+            );
+            let new_factor = build_nr_ivm_delta_table_factor(
+                &fqn,
+                state.from_snapshot_id,
+                state.to_snapshot_id,
+                alias.clone(),
+                &state.base_ref.table,
+            );
+            *factor = new_factor;
+        }
+        TableFactor::Derived { subquery, .. } => {
+            mutate_set_expr_for_ivm(subquery.body.as_mut(), state);
+        }
+        _ => {}
+    }
+}
+
+fn build_nr_ivm_delta_table_factor(
+    fqn: &str,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    original_alias: Option<sqlparser::ast::TableAlias>,
+    original_table_name: &str,
+) -> sqlparser::ast::TableFactor {
+    use sqlparser::ast as sqlast;
+    let make_string_arg = |s: String| -> sqlast::FunctionArg {
+        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(
+            sqlast::Value::SingleQuotedString(s).into(),
+        )))
+    };
+    let make_number_arg = |n: i64| -> sqlast::FunctionArg {
+        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(
+            sqlast::Value::Number(n.to_string(), false).into(),
+        )))
+    };
+    let args = sqlast::TableFunctionArgs {
+        args: vec![
+            make_string_arg(fqn.to_string()),
+            make_number_arg(from_snapshot_id),
+            make_number_arg(to_snapshot_id),
+        ],
+        settings: None,
+    };
+    // Preserve the original alias when present, otherwise fall back to the
+    // original base table name so projection references that wrote
+    // `<table>.<col>` keep resolving. This mirrors the standalone analyzer
+    // behaviour for `__nr_ivm_delta(...)` (it uses the alias name or, when
+    // absent, the table_def name as the scope qualifier).
+    let alias = original_alias.or_else(|| {
+        Some(sqlast::TableAlias {
+            explicit: false,
+            name: sqlast::Ident::new(original_table_name),
+            columns: Vec::new(),
+        })
+    });
+    sqlast::TableFactor::Table {
+        name: sqlast::ObjectName(vec![sqlast::ObjectNamePart::Identifier(
+            sqlast::Ident::new("__nr_ivm_delta"),
+        )]),
+        alias,
+        args: Some(args),
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    }
+}
+
 /// Execute the incremental refresh of an iceberg-backed MV.
 ///
+/// IVM-A1 path: rewrite the MV SELECT AST so its single base-table reference
+/// becomes `__nr_ivm_delta('cat.ns.tbl', from, to)`, register the base table
+/// in a one-shot `InMemoryCatalog` via `build_iceberg_table_def_for_delta_scan`,
+/// and execute the resulting `Query` through `execute_query_with_options`
+/// with a custom `IcebergMergeSinkFactory`. The sink fans inserts to a
+/// streaming data-file writer and routes DELETE rows through the A9 target
+/// locator, accumulating into a shared `IcebergCommitCollector`. After the
+/// pipeline completes, the refresh driver hands the populated collector to
+/// `commit_iceberg_mv_with_populated_collector` for the staging-branch commit,
+/// then publishes and finalizes.
+///
 /// Steps:
-/// 1. Plan the change batch from `previous_snapshot_id` to `current_snapshot_id`.
-/// 2. Run the MV SELECT scoped to the inserts only.
-/// 3. If the delta yields 0 rows, advance lineage without committing an empty snapshot.
-/// 4. Otherwise: verify MV iceberg table is in the expected state (inconsistent-state guard),
-///    write data files, commit fast-append to the staging branch, publish main,
-///    and finalize repository metadata.
+/// 1. Plan the change batch from `previous_snapshot_id` to `current_snapshot_id`
+///    (also used to short-circuit empty-delta finalize).
+/// 2. If the delta yields no inserts and no deletes, advance lineage without
+///    committing an empty Iceberg snapshot.
+/// 3. Otherwise: begin staging branch, build the AST-mutated query, build the
+///    collector + merge sink, run `execute_query_with_options`, commit, publish,
+///    and finalize.
 ///
 /// Metadata-only empty deltas keep the old finalize path because no Iceberg
 /// snapshot is created.
@@ -2260,69 +2593,14 @@ fn incremental_refresh_iceberg_mv(
         ));
     }
 
-    let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
     let has_delete_changes = !batch.deletes.is_empty()
         || !batch.equality_deletes.is_empty()
         || !batch.deleted_data_files.is_empty();
-    let (chunks, delete_base_row_ids) = if has_delete_changes {
-        let base_object_store_config = {
-            let catalogs = state
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            catalogs
-                .get(&base_ref.catalog)?
-                .object_store_config()
-                .cloned()
-        };
-        let materialized = materialize_changes(
-            state,
-            current_database,
-            &physical_sql,
-            base_ref,
-            base_table,
-            batch,
-            base_object_store_config.as_ref(),
-            &[],
-        )?;
-        let insert_chunks = query_result_to_chunks(materialized.inserts)?;
-        let delete_chunks = query_result_to_chunks(materialized.deletes)?;
-        let delete_base_row_ids = extract_apply_key_values_from_chunks(&delete_chunks)?;
-        (insert_chunks, delete_base_row_ids)
-    } else {
-        let added_files: Vec<IcebergFileForQuery> = batch
-            .inserts
-            .iter()
-            .map(|f| IcebergFileForQuery {
-                path: f.path.clone(),
-                size: f.size,
-                record_count: f.record_count,
-                partition_spec_id: f.partition_spec_id,
-                partition_key: f.partition_key.clone(),
-                first_row_id: f.first_row_id,
-                data_sequence_number: f.data_sequence_number,
-                change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
-            })
-            .collect();
-        let chunks = execute_query_for_mv_incremental_refresh(
-            state,
-            current_database,
-            &physical_sql,
-            base_ref,
-            added_files,
-        )
-        .and_then(query_result_to_chunks)?;
-        (chunks, Vec::new())
-    };
-    let added_rows = chunks
-        .iter()
-        .map(|c| c.batch.num_rows() as i64)
-        .sum::<i64>();
-    let deleted_rows = i64::try_from(delete_base_row_ids.len())
-        .map_err(|_| "too many iceberg MV delete rows".to_string())?;
+    let is_empty_delta = batch.inserts.is_empty() && !has_delete_changes;
 
-    // 3. Empty delta: no new rows → advance lineage without committing an empty snapshot.
-    if added_rows == 0 && delete_base_row_ids.is_empty() {
+    // 2. Empty delta: advance lineage without committing an empty Iceberg
+    // snapshot. This must run before any staging-branch work.
+    if is_empty_delta {
         tracing::info!(
             "iceberg mv {}.{}.{}: incremental refresh delta has 0 rows; \
              advancing lineage to base snapshot {current_snapshot_id} without new iceberg snapshot",
@@ -2346,7 +2624,7 @@ fn incremental_refresh_iceberg_mv(
         return Ok(StatementResult::Ok);
     }
 
-    // 4. Write and commit.
+    // 3. Begin the staging branch and pre-load the target Iceberg table.
     let staging_branch = format!(
         "__nova_mv_refresh_{}_{}",
         mv_definition.mv_id,
@@ -2385,50 +2663,217 @@ fn incremental_refresh_iceberg_mv(
             ));
         }
     };
-    let target_locator_inputs = if delete_base_row_ids.is_empty() {
-        None
-    } else {
-        Some(
-            load_target_apply_locator_inputs(target_entry, &target_table).map_err(|err| {
-                handle_iceberg_mv_commit_error(
+
+    // 4. Build the one-shot InMemoryCatalog with the base table registered
+    // via the IVM-A1 delta-scan TableDef factory (empty storage + v3
+    // row-lineage virtual cols). The analyzer / planner / codegen chain
+    // produces an `ICEBERG_DELTA_SCAN_NODE`, which lower_plan turns into
+    // `IcebergDeltaScan` using the runtime registry passed below.
+    let base_table_def = match crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
+        state,
+        &base_ref.catalog,
+        &base_ref.namespace,
+        &base_ref.table,
+    ) {
+        Ok(def) => def,
+        Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+    if let Err(err) = catalog.create_database(&base_ref.namespace) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            err,
+        ));
+    }
+    if let Err(err) = catalog.register(&base_ref.namespace, base_table_def) {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            format!("register base table for IVM-A1 SELECT: {err}"),
+        ));
+    }
+
+    // 5. Parse the MV physical SELECT to AST and mutate the unique base-table
+    // reference into `__nr_ivm_delta(...)`.
+    let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
+    let normalized = match crate::sql::parser::dialect::normalize_for_raw_parse(&physical_sql) {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    };
+    let statement = match crate::sql::parser::parse_normalized_sql_raw(&normalized) {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                format!("sql parser error: {err}"),
+            ));
+        }
+    };
+    let sqlparser::ast::Statement::Query(query_box) = statement else {
+        return Err(handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            refresh_id,
+            "REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string(),
+        ));
+    };
+    let mut query = *query_box;
+    match mutate_query_for_ivm_delta_scan(
+        &mut query,
+        base_ref,
+        previous_snapshot_id,
+        current_snapshot_id,
+    ) {
+        Ok(1) => {}
+        Ok(n) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                format!("IVM-A1 AST mutate expected exactly 1 base-table reference, found {n}"),
+            ));
+        }
+        Err(err) => {
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+    }
+    // Drop any leftover catalog-qualified 3-part names (the analyzer's
+    // `InMemoryCatalog` view exposes <db>.<table>, not <cat>.<db>.<table>).
+    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+
+    // 6. Pre-load the A9 target locator inputs only when the change batch
+    // carries DELETE-side rows. The merge sink consumes these when it sees
+    // a DELETE chunk; for insert-only batches we leave them None so the
+    // sink rejects an unexpected DELETE arrival rather than silently
+    // failing.
+    let locator_state = if has_delete_changes {
+        let inputs = match load_target_apply_locator_inputs(target_entry, &target_table) {
+            Ok(v) => v,
+            Err(err) => {
+                return Err(handle_iceberg_mv_commit_error(
                     state,
                     target,
                     target_entry,
                     &staging_branch,
                     refresh_id,
                     err,
-                )
-            })?,
-        )
-    };
-    let new_snapshot_id = match data_block_on(async {
-        let written = write_chunks_as_iceberg_data_files(&target_table, &chunks).await?;
-        let delete_groups = match target_locator_inputs.as_ref() {
-            Some((existing_deletes_by_file, referenced_data_file_partitions)) => {
-                locate_target_rows_by_apply_key(
-                    &target_table,
-                    &delete_base_row_ids,
-                    existing_deletes_by_file,
-                    referenced_data_file_partitions,
-                )
-                .await?
+                ));
             }
-            None => Vec::new(),
         };
-        commit_iceberg_mv_apply_with_ref(
-            &target_table,
-            iceberg_catalog,
-            target_entry,
-            &ident,
-            written,
-            delete_groups,
-            &staging_branch,
-            marker,
-        )
-        .await
-        .map(|outcome| outcome.new_snapshot_id)
-    }) {
-        Ok(Ok(snapshot_id)) => snapshot_id,
+        let (existing_deletes_by_file, referenced_data_file_partitions) = inputs;
+        Some(crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
+            existing_deletes_by_file,
+            referenced_data_file_partitions,
+        })
+    } else {
+        None
+    };
+
+    // 7. Build the shared commit collector + merge sink factory. The sink
+    // injects WrittenFile / PositionDeleteGroup descriptors into the
+    // collector during pipeline execution; the commit driver below
+    // consumes the populated collector.
+    let op_kind = if has_delete_changes {
+        CommitOpKind::RowDeltaDv
+    } else {
+        CommitOpKind::FastAppend
+    };
+    let collector =
+        new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
+    let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
+        target_table: target_table.clone(),
+        collector: Arc::clone(&collector),
+        locator_state,
+        apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+    };
+    let merge_sink =
+        crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
+
+    // 8. Execute the mutated query with the merge sink as the terminal
+    // operator. lower_plan is given the iceberg catalog registry so it
+    // can resolve the IcebergRuntimeHandles for the IcebergDeltaScan
+    // operator.
+    {
+        let catalogs_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if let Err(err) = crate::engine::execute_query_with_options(
+            &query,
+            &catalog,
+            current_database,
+            state.exchange_port,
+            None,
+            Some(Box::new(merge_sink)),
+            Some(&*catalogs_guard),
+        ) {
+            drop(catalogs_guard);
+            return Err(handle_iceberg_mv_commit_error(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                refresh_id,
+                err,
+            ));
+        }
+        drop(catalogs_guard);
+    }
+
+    let added_rows = collector.injected_data_record_count();
+    let deleted_rows = collector.injected_delete_record_count();
+
+    // 9. Drive the commit from the populated collector.
+    let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        Arc::clone(&collector),
+        &staging_branch,
+        marker,
+    )) {
+        Ok(Ok(outcome)) => outcome.new_snapshot_id,
         Ok(Err(err)) | Err(err) => {
             return Err(handle_iceberg_mv_commit_error(
                 state,
@@ -2688,6 +3133,123 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
+
+    fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let sqlparser::ast::Statement::Query(q) = stmt else {
+            panic!("expected SELECT");
+        };
+        *q
+    }
+
+    fn test_base_ref() -> IcebergTableRef {
+        IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+        }
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_replaces_three_part_ref() {
+        let mut query = parse_select_query("SELECT * FROM ice.db.orders");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 100, 200)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 1);
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("__nr_ivm_delta('ice.db.orders', 100, 200)"),
+            "unexpected rendered query: {rendered}"
+        );
+        // Default alias falls back to the base-table name so projection scopes resolve.
+        assert!(
+            rendered.contains("AS orders") || rendered.contains("orders"),
+            "expected alias preserved in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_replaces_two_part_ref() {
+        let mut query = parse_select_query("SELECT * FROM db.orders");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 100, 200)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 1);
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("__nr_ivm_delta('ice.db.orders', 100, 200)"),
+            "unexpected rendered query: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_replaces_bare_table_name() {
+        let mut query = parse_select_query("SELECT * FROM orders");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 100, 200)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 1);
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("__nr_ivm_delta('ice.db.orders', 100, 200)"),
+            "unexpected rendered query: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_preserves_existing_alias() {
+        let mut query = parse_select_query("SELECT * FROM ice.db.orders AS o");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 7, 8)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 1);
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("__nr_ivm_delta('ice.db.orders', 7, 8) AS o"),
+            "expected explicit alias to round-trip: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_returns_zero_when_no_match() {
+        let mut query = parse_select_query("SELECT * FROM other_table");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 100, 200)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 0);
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_returns_multi_when_two_refs() {
+        // The mutator itself reports the cardinality; the caller decides what
+        // to do with a multi-match result (the IVM refresh driver rejects).
+        let mut query =
+            parse_select_query("SELECT * FROM ice.db.orders a JOIN ice.db.orders b ON a.id = b.id");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 100, 200)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 2);
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_recurses_into_subquery() {
+        let mut query = parse_select_query("SELECT * FROM (SELECT * FROM ice.db.orders) AS sub");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 5, 6)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 1);
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("__nr_ivm_delta('ice.db.orders', 5, 6)"),
+            "expected nested derived to be rewritten: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mutate_query_for_ivm_delta_scan_skips_existing_table_function() {
+        // A pre-existing __nr_ivm_delta call is itself a TableFactor::Table
+        // with `args: Some(...)`. The mutator must not double-wrap.
+        let mut query = parse_select_query("SELECT * FROM __nr_ivm_delta('ice.db.orders', 1, 2)");
+        let matches = mutate_query_for_ivm_delta_scan(&mut query, &test_base_ref(), 9, 10)
+            .expect("mutate must succeed");
+        assert_eq!(matches, 0);
+    }
 
     fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {

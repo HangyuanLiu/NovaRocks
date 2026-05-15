@@ -43,10 +43,8 @@ pub struct IcebergMergeSinkPlan {
 }
 
 pub struct TargetLocatorState {
-    pub existing_deletes_by_file:
-        crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    pub referenced_data_file_partitions:
-        crate::engine::delete_flow::ReferencedDataFilePartitions,
+    pub existing_deletes_by_file: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    pub referenced_data_file_partitions: crate::engine::delete_flow::ReferencedDataFilePartitions,
 }
 
 pub struct IcebergMergeSinkFactory {
@@ -280,9 +278,8 @@ fn partition_chunk_by_change_op(
         if indices.is_empty() {
             return Ok(None);
         }
-        let index_arr = arrow::array::UInt32Array::from_iter_values(
-            indices.iter().map(|&i| i as u32),
-        );
+        let index_arr =
+            arrow::array::UInt32Array::from_iter_values(indices.iter().map(|&i| i as u32));
         let mut taken_columns = Vec::with_capacity(batch.num_columns());
         for col in batch.columns() {
             let taken = arrow::compute::take(col.as_ref(), &index_arr, None)
@@ -306,11 +303,8 @@ fn strip_change_op(batch: RecordBatch) -> Result<RecordBatch, String> {
     else {
         return Ok(batch);
     };
-    let mut fields: Vec<arrow::datatypes::Field> = schema
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
+    let mut fields: Vec<arrow::datatypes::Field> =
+        schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     fields.remove(idx);
     let mut columns: Vec<arrow::array::ArrayRef> = batch.columns().to_vec();
     columns.remove(idx);
@@ -330,9 +324,7 @@ fn extract_apply_key_values_from_record_batch(
         .column(idx)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
-        .ok_or_else(|| {
-            format!("merge sink: apply-key column {apply_key_column} must be Int64")
-        })?;
+        .ok_or_else(|| format!("merge sink: apply-key column {apply_key_column} must be Int64"))?;
     arr.iter()
         .map(|v| {
             v.ok_or_else(|| {
@@ -345,7 +337,7 @@ fn extract_apply_key_values_from_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array, Int8Array};
+    use arrow::array::{ArrayRef, Int8Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -435,8 +427,8 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
         )
         .unwrap();
-        let err = extract_apply_key_values_from_record_batch(&batch, "__nova_base_row_id")
-            .unwrap_err();
+        let err =
+            extract_apply_key_values_from_record_batch(&batch, "__nova_base_row_id").unwrap_err();
         assert!(err.contains("missing apply-key column"));
     }
 }

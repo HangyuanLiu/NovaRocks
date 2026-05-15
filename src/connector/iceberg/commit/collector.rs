@@ -136,6 +136,33 @@ impl IcebergCommitCollector {
         std::mem::take(&mut *guard)
     }
 
+    /// Sum of `record_count` across all currently-injected
+    /// [`WrittenFile`]s with `content == Data`. Non-destructive; used by
+    /// IVM-A1 refresh accounting (added-row count for the MV row total).
+    pub fn injected_data_record_count(&self) -> i64 {
+        use iceberg::spec::DataContentType;
+        let guard = self
+            .injected
+            .lock()
+            .expect("collector injected lock poisoned");
+        guard
+            .iter()
+            .filter(|wf| matches!(wf.content, DataContentType::Data))
+            .map(|wf| wf.record_count as i64)
+            .sum()
+    }
+
+    /// Sum of `positions.len()` across all currently-injected
+    /// [`PositionDeleteGroup`]s. Non-destructive; used by IVM-A1 refresh
+    /// accounting (deleted-row count for the MV row total).
+    pub fn injected_delete_record_count(&self) -> i64 {
+        let guard = self
+            .delete_groups
+            .lock()
+            .expect("collector delete_groups lock poisoned");
+        guard.iter().map(|g| g.positions.len() as i64).sum()
+    }
+
     /// Pre-load a written file into the collector. Used by the standalone
     /// engine when it writes data files via iceberg-rust `DataFileWriter`
     /// directly (no IcebergSink in the loop). Each path is recorded in the
