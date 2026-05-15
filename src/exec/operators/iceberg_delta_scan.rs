@@ -30,7 +30,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int8Array};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::change_op::CHANGE_OP_INSERT;
+use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
 use crate::exec::node::iceberg_delta_scan::{
     DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode,
@@ -182,15 +182,16 @@ fn open_scanner_for_role(
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     match &file.role {
         DeltaSourceRole::DataFile => open_data_file_scanner(node, &file),
-        DeltaSourceRole::PositionDelete { .. } => {
-            Err("position-delete scanner: TODO Task 6".to_string())
+        DeltaSourceRole::PositionDelete { targets } => {
+            open_position_delete_scanner(node, &file, targets)
         }
-        DeltaSourceRole::EqualityDelete { .. } => {
-            Err("equality-delete scanner: TODO Task 7".to_string())
-        }
-        DeltaSourceRole::DeletedDataFile { .. } => {
-            Err("deleted-data-file scanner: TODO Task 8".to_string())
-        }
+        DeltaSourceRole::EqualityDelete {
+            equality_field_ids,
+            targets: _,
+        } => open_equality_delete_scanner(node, &file, equality_field_ids),
+        DeltaSourceRole::DeletedDataFile {
+            previous_data_file_visibility,
+        } => open_deleted_data_file_scanner(node, &file, previous_data_file_visibility),
     }
 }
 
@@ -220,6 +221,166 @@ fn open_data_file_scanner(
     )?;
     Ok(Box::new(DataFileScanner {
         batches: batches.into_iter(),
+    }))
+}
+
+struct PositionDeleteScanner {
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl DeltaFileScanner for PositionDeleteScanner {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, String> {
+        Ok(self.batches.next())
+    }
+
+    fn change_op_value(&self) -> i8 {
+        CHANGE_OP_DELETE
+    }
+}
+
+fn open_position_delete_scanner(
+    node: &IcebergDeltaScanNode,
+    file: &DeltaSourceFile,
+    targets: &[crate::exec::node::iceberg_delta_scan::PositionDeleteTargetData],
+) -> Result<Box<dyn DeltaFileScanner>, String> {
+    // A1 Phase 2 limits position-delete sources to Parquet v2 deletes; the
+    // operator does not yet plumb Puffin/DV-blob metadata through
+    // `DeltaSourceFile`. Extending the data type is tracked as Phase 2
+    // follow-up.
+    let referenced = if targets.len() == 1 {
+        Some(targets[0].data_file_path.clone())
+    } else {
+        None
+    };
+    let delete = crate::connector::iceberg::changes::PositionDeleteRef {
+        delete_file_path: file.path.clone(),
+        delete_file_size: file.size,
+        record_count: None,
+        referenced_data_file: referenced,
+        file_format: iceberg::spec::DataFileFormat::Parquet,
+        content_offset: None,
+        content_size_in_bytes: None,
+    };
+    let base_first_row_ids = targets
+        .iter()
+        .filter_map(|t| {
+            t.data_file_first_row_id
+                .map(|id| (t.data_file_path.clone(), id))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let factory = crate::connector::iceberg::changes::build_factory_for_table(
+        &node.iceberg_runtime.base_table,
+        node.object_store_config.as_ref(),
+    )?;
+    let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
+        &node.iceberg_runtime.base_table,
+        &delete,
+        &base_first_row_ids,
+        &factory,
+        node.object_store_config.as_ref(),
+    )?;
+    Ok(Box::new(PositionDeleteScanner {
+        batches: rows.into_iter(),
+    }))
+}
+
+struct EqualityDeleteScanner {
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl DeltaFileScanner for EqualityDeleteScanner {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, String> {
+        Ok(self.batches.next())
+    }
+
+    fn change_op_value(&self) -> i8 {
+        CHANGE_OP_DELETE
+    }
+}
+
+fn open_equality_delete_scanner(
+    node: &IcebergDeltaScanNode,
+    file: &DeltaSourceFile,
+    equality_field_ids: &[i32],
+) -> Result<Box<dyn DeltaFileScanner>, String> {
+    let delete = crate::connector::iceberg::changes::EqualityDeleteRef {
+        delete_file_path: file.path.clone(),
+        delete_file_size: file.size,
+        record_count: None,
+        equality_ids: equality_field_ids.to_vec(),
+        sequence_number: file.data_sequence_number,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key.clone(),
+    };
+    let factory = crate::connector::iceberg::changes::build_factory_for_table(
+        &node.iceberg_runtime.base_table,
+        node.object_store_config.as_ref(),
+    )?;
+    let rows = crate::connector::iceberg::changes::scan_equality_delete_rows_for_one(
+        &node.iceberg_runtime.base_table,
+        &delete,
+        &factory,
+        node.object_store_config.as_ref(),
+    )?;
+    Ok(Box::new(EqualityDeleteScanner {
+        batches: rows.into_iter(),
+    }))
+}
+
+struct DeletedDataFileScanner {
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl DeltaFileScanner for DeletedDataFileScanner {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, String> {
+        Ok(self.batches.next())
+    }
+
+    fn change_op_value(&self) -> i8 {
+        CHANGE_OP_DELETE
+    }
+}
+
+fn open_deleted_data_file_scanner(
+    node: &IcebergDeltaScanNode,
+    file: &DeltaSourceFile,
+    visibility: &Option<crate::exec::node::iceberg_delta_scan::DeletedFileVisibility>,
+) -> Result<Box<dyn DeltaFileScanner>, String> {
+    let deleted_file = crate::connector::iceberg::changes::DeletedDataFileRef {
+        path: file.path.clone(),
+        size: file.size,
+        record_count: None,
+        partition_spec_id: file.partition_spec_id,
+        partition_key: file.partition_key.clone(),
+        first_row_id: file.first_row_id,
+        data_sequence_number: file.data_sequence_number,
+    };
+    let mut previous_delete_visibility: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile =
+        std::collections::HashMap::new();
+    if let Some(vis) = visibility.as_ref()
+        && !vis.already_deleted_positions.is_empty()
+    {
+        let mut entry = crate::engine::delete_flow::ExistingDeleteVisibility::default();
+        for &pos in &vis.already_deleted_positions {
+            let unsigned = u64::try_from(pos).map_err(|_| {
+                format!(
+                    "DeletedFileVisibility::already_deleted_positions for {} contains negative \
+                     row position {pos}",
+                    file.path
+                )
+            })?;
+            entry.deleted_positions.insert(unsigned);
+        }
+        previous_delete_visibility.insert(file.path.clone(), entry);
+    }
+    let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file(
+        &node.iceberg_runtime.base_table,
+        &deleted_file,
+        node.object_store_config.as_ref(),
+        &previous_delete_visibility,
+    )?;
+    Ok(Box::new(DeletedDataFileScanner {
+        batches: rows.into_iter(),
     }))
 }
 
