@@ -37,6 +37,41 @@ pub(crate) struct RowLineageWriteBatch {
     pub lineage: RowLineageColumns,
 }
 
+/// Streaming-shape facade over [`write_record_batches_as_data_files`] for
+/// the IVM-A1 MV merge sink. The current implementation buffers all batches
+/// in-memory and delegates to the batch helper on `finish()`. This preserves
+/// the per-batch backpressure surface the sink operator wants while keeping
+/// per-partition writer lifecycle identical to the existing call sites; a
+/// later optimization can replace the buffering with a partition-aware
+/// rolling writer without changing the sink interface.
+pub(crate) struct IcebergStreamingDataFileWriter {
+    table: iceberg::table::Table,
+    buffered: Vec<RecordBatch>,
+}
+
+impl IcebergStreamingDataFileWriter {
+    pub(crate) fn new(table: iceberg::table::Table) -> Result<Self, String> {
+        Ok(Self {
+            table,
+            buffered: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+        if batch.num_rows() > 0 {
+            self.buffered.push(batch);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(self) -> Result<Vec<DataFile>, String> {
+        if self.buffered.is_empty() {
+            return Ok(Vec::new());
+        }
+        write_record_batches_as_data_files(&self.table, self.buffered).await
+    }
+}
+
 pub(crate) async fn write_record_batches_as_data_files(
     table: &iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
