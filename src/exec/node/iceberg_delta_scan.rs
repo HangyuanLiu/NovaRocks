@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use crate::exec::chunk::ChunkSchema;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::fs::object_store::ObjectStoreConfig;
 
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ pub struct IcebergDeltaScanNode {
     pub base_table_ident: BaseTableIdent,
     pub from_snapshot_id: i64,
     pub to_snapshot_id: i64,
-    pub output_chunk_schema: ChunkSchema,
+    pub output_chunk_schema: ChunkSchemaRef,
     pub apply_key_source: ApplyKeySource,
     pub change_files: Vec<DeltaSourceFile>,
     pub object_store_config: Option<ObjectStoreConfig>,
