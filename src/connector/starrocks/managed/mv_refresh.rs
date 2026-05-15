@@ -1750,6 +1750,9 @@ mod tests {
         StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
+    use crate::connector::starrocks::managed::refresh_pin::{
+        AfterCaptureHook, lock_after_capture_hook_for_test,
+    };
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
@@ -3078,15 +3081,18 @@ mod tests {
         ))
     }
 
-    struct AfterCaptureHookGuard;
+    struct AfterCaptureHookGuard {
+        _hook_lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl AfterCaptureHookGuard {
-        fn install(
-            hook: crate::connector::starrocks::managed::refresh_pin::AfterCaptureHook,
-        ) -> Self {
+        fn install(hook: AfterCaptureHook) -> Self {
+            let hook_lock = lock_after_capture_hook_for_test();
             crate::connector::starrocks::managed::refresh_pin::clear_after_capture_hook();
             crate::connector::starrocks::managed::refresh_pin::set_after_capture_hook(hook);
-            Self
+            Self {
+                _hook_lock: hook_lock,
+            }
         }
     }
 

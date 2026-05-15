@@ -271,6 +271,14 @@ fn resolve_table_factor(
 pub(crate) type AfterCaptureHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+pub(crate) fn lock_after_capture_hook_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("after_capture_hook test lock")
+}
+
+#[cfg(test)]
 fn after_capture_hook_slot() -> &'static std::sync::Mutex<Option<AfterCaptureHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCaptureHook>>> =
         std::sync::OnceLock::new();
@@ -358,6 +366,7 @@ mod tests {
 
     #[test]
     fn after_capture_hook_round_trip() {
+        let _hook_lock = lock_after_capture_hook_for_test();
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag_for_hook = Arc::clone(&flag);
         set_after_capture_hook(Arc::new(move || {
