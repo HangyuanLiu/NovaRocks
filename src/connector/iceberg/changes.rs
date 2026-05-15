@@ -411,26 +411,26 @@ fn validate_replace_snapshot(
     Ok(())
 }
 
-/// Walk the parent chain from `current_snapshot` back to
-/// `previous_snapshot_id`, dispatching each node through
+/// Walk the explicit lineage range from `previous_snapshot_id` (exclusive) to
+/// `current_snapshot_id` (inclusive), dispatching each node through
 /// `classify_snapshot`. Performs no I/O.
 ///
 /// Errors:
-/// - `LineageBroken` when `previous_snapshot_id` is not an ancestor of
-///   the current snapshot (its metadata entry has been pruned, or the
-///   chain runs off its root).
+/// - `LineageBroken` when `current_snapshot_id` is missing, or when
+///   `previous_snapshot_id` is not an ancestor of `current_snapshot_id`
+///   (its metadata entry has been pruned, or the chain runs off its root).
 /// - `UnsupportedOperation` / `ReplaceValidationFailed` propagated from
 ///   `classify_snapshot`.
 pub(crate) fn classify_lineage(
     metadata: &iceberg::spec::TableMetadata,
     previous_snapshot_id: i64,
+    current_snapshot_id: i64,
 ) -> Result<LineagePlan, ChangeError> {
-    let current_snapshot = metadata.current_snapshot().ok_or_else(|| {
-        ChangeError::InternalInconsistency(
-            "classify_lineage: table has no current snapshot".to_string(),
-        )
-    })?;
-    let current_snapshot_id = current_snapshot.snapshot_id();
+    let current_snapshot = metadata
+        .snapshot_by_id(current_snapshot_id)
+        .ok_or(ChangeError::LineageBroken {
+            previous_snapshot: previous_snapshot_id,
+        })?;
 
     if current_snapshot_id == previous_snapshot_id {
         return Ok(LineagePlan {
@@ -447,17 +447,9 @@ pub(crate) fn classify_lineage(
     }
 
     let mut actions_reversed: Vec<LineageAction> = Vec::new();
-    let mut cursor = current_snapshot_id;
+    let mut current = current_snapshot;
     loop {
-        if cursor == previous_snapshot_id {
-            break;
-        }
-        let snapshot_ref = metadata
-            .snapshot_by_id(cursor)
-            .ok_or(ChangeError::LineageBroken {
-                previous_snapshot: previous_snapshot_id,
-            })?;
-        let snapshot = snapshot_ref.as_ref();
+        let snapshot = current.as_ref();
         let parent_id = snapshot.parent_snapshot_id();
         let parent = parent_id
             .and_then(|id| metadata.snapshot_by_id(id))
@@ -468,7 +460,14 @@ pub(crate) fn classify_lineage(
         }
 
         match parent_id {
-            Some(id) => cursor = id,
+            Some(id) if id == previous_snapshot_id => break,
+            Some(id) => {
+                current = metadata
+                    .snapshot_by_id(id)
+                    .ok_or(ChangeError::LineageBroken {
+                        previous_snapshot: previous_snapshot_id,
+                    })?;
+            }
             None => {
                 // Walked off the root without finding previous_snapshot_id.
                 return Err(ChangeError::LineageBroken {
@@ -508,7 +507,7 @@ pub(crate) fn plan_changes(
             )
         })?;
 
-    let plan = classify_lineage(metadata, previous_snapshot_id)?;
+    let plan = classify_lineage(metadata, previous_snapshot_id, current_snapshot_id)?;
     if plan.actions.is_empty() {
         return Ok(IcebergChangeBatch {
             previous_snapshot_id,
