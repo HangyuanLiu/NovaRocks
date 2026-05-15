@@ -1,12 +1,14 @@
 # IVM-A1 Delta Pipeline Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Plan version:** v2（2026-05-15 改方案，原 leaf-swap 路线已废弃；参见 spec § 11 改动历史 / Task 12 替换说明）
 
-**Goal:** 把 iceberg-backed MV 增量刷新从"两次独立 `execute_query` + temp parquet + 异步写后 commit"重构为"一次 `execute_plan` + 新算子 `IcebergDeltaScan` 流式反向重建 + 新算子 `IcebergMergeSinkFactory` 按 `__change_op` 路由写入；A7 staging 与 A10 commit 仍由 refresh driver 调度"。
+**Goal:** 把 iceberg-backed MV 增量刷新从"两次独立 `execute_query` + temp parquet + 异步写后 commit"重构为"一次 `execute_query` + 新算子 `IcebergDeltaScan` 流式反向重建 + 新算子 `IcebergMergeSinkFactory` 按 `__change_op` 路由写入；A7 staging 与 A10 commit 仍由 refresh driver 调度"。
 
-**Architecture:** 新增两个算子（`IcebergDeltaScan` source，`IcebergMergeSinkFactory` sink），ExecPlan leaf-swap 把 SQL 走 analyzer/codegen 产出的 base scan leaf 替换为 `IcebergDeltaScan`、顶部包 `IcebergMergeSink`，refresh driver 在构建 ExecPlan 前预加载 A9 locator state、构 plan 后单次 execute、pipeline 结束后调用现有 A10 commit。删除 `materialize_changes`/`write_mv_delete_temp_parquet`/`execute_query_for_mv_incremental_refresh`/`execute_query_for_mv_incremental_deletes` 四个旧路径。
+**Architecture (v2):** 把 `IcebergDeltaScan` 做成编译时一等节点：在 `idl/thrift/PlanNodes.thrift` 新增 `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE = 1000` + `TIcebergDeltaScanNode` payload；refresh driver 在 sqlparser AST 层把 base 表的 `TableFactor::Table` 替换为内置 table function `__nr_ivm_delta('cat.ns.tbl', from_snap, to_snap)`；analyzer/planner/optimizer/codegen 整条链路原生识别此节点；lower_plan 现场调 `plan_changes` 计算 `change_files` 并加载 `IcebergRuntimeHandles`（含 base_first_row_ids + previous_delete_visibility）；pipeline 顶部由 refresh driver 通过 `execute_query` 的 sink 参数挂上 `IcebergMergeSinkFactory`；pipeline 跑完 refresh driver 调 `commit_iceberg_mv_with_populated_collector`。删除 `materialize_changes` / `write_mv_delete_temp_parquet` / `execute_query_for_mv_incremental_refresh` / `execute_query_for_mv_incremental_deletes` 四个旧路径。
 
-**Tech Stack:** Rust 2024 / Arrow `RecordBatch` / Iceberg 0.9 (vendored) / opendal / NovaRocks `Operator`/`OperatorFactory`/`ProcessorOperator`/`ExecNodeKind` 体系；测试用 `cargo test` + `tests/sql-test-runner` 跑 `iceberg-ivm` suite。
+**Tech Stack:** Rust 2024 / Arrow `RecordBatch` / Iceberg 0.9 (vendored) / opendal / NovaRocks `Operator`/`OperatorFactory`/`ProcessorOperator`/`ExecNodeKind` 体系 + Thrift IDL 扩展；测试用 `cargo test` + `tests/sql-test-runner` 跑 `iceberg-ivm` suite。
 
 **Spec reference:** [`docs/superpowers/specs/2026-05-14-ivm-a1-delta-pipeline-design.md`](../specs/2026-05-14-ivm-a1-delta-pipeline-design.md)
 
@@ -18,10 +20,10 @@
 
 | Path | Purpose |
 |---|---|
-| `src/exec/node/iceberg_delta_scan.rs` | `IcebergDeltaScanNode` + supporting structs (`DeltaSourceRole`, `DeltaSourceFile`, `ApplyKeySource`) |
+| `src/exec/node/iceberg_delta_scan.rs` | `IcebergDeltaScanNode` + supporting structs (`DeltaSourceRole`, `DeltaSourceFile`, `ApplyKeySource`, `IcebergRuntimeHandles`, `DeltaScanDeleteSide`) |
 | `src/exec/operators/iceberg_delta_scan.rs` | `IcebergDeltaScanFactory` + `IcebergDeltaScanOperator` (streaming pull operator) |
-| `src/engine/mv/iceberg_merge_sink.rs` | `IcebergMergeSinkFactory` + `IcebergMergeSinkOperator` + `TargetLocatorState` |
-| `src/engine/mv/iceberg_delta_plan.rs` | Leaf-swap ExecPlan rewrite pass: `swap_base_scan_with_delta_scan` + `wrap_root_with_merge_sink` |
+| `src/engine/mv/iceberg_merge_sink.rs` | `IcebergMergeSinkFactory` + `IcebergMergeSinkOperator` |
+| `src/lower/thrift/iceberg_delta_scan.rs` | Thrift → ExecNode 转换：`lower_iceberg_delta_scan` (调 `plan_changes` + 加载 runtime) |
 | `sql-tests/iceberg-ivm/sql/iceberg_ivm_a1_large_delta_mixed.sql` | New SQL test: 100MB+ delta + INSERT/DELETE 混合 |
 | `sql-tests/iceberg-ivm/sql/iceberg_ivm_a1_update_only.sql` | New SQL test: UPDATE-only refresh |
 | `sql-tests/iceberg-ivm/result/iceberg_ivm_a1_large_delta_mixed.result` | Recorded baseline |
@@ -31,23 +33,37 @@
 
 | Path | What |
 |---|---|
+| `idl/thrift/PlanNodes.thrift` | 新增 `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE = 1000` + `TIcebergDeltaScanNode` struct + `TPlanNode.iceberg_delta_scan_node` optional 字段 |
 | `src/exec/node/mod.rs` | Add `IcebergDeltaScan(IcebergDeltaScanNode)` variant + extend `output_slots_for_node` / `push_down_local_runtime_filters_inner` / 其他 match dispatch sites |
 | `src/exec/operators/mod.rs` | Export `IcebergDeltaScanFactory` |
 | `src/exec/pipeline/builder.rs` | Add `ExecNodeKind::IcebergDeltaScan(...)` arm 构造 `IcebergDeltaScanFactory` |
-| `src/lower/fragment.rs` | Add `ExecNodeKind::IcebergDeltaScan(_) => {}` 在 layout/preserve dispatch |
-| `src/connector/iceberg/changes.rs` | 抽出 `materialize_changes` 内部的反向重建逻辑为 streaming-friendly helpers；保留 `materialize_changes` 函数本身在 Task 13 才删除 |
-| `src/engine/mv/iceberg_refresh.rs` | `refresh_iceberg_mv` 的增量分支重写为 leaf-swap + execute_plan + A10 commit；删旧 `write_chunks_as_iceberg_data_files` 显式调用 |
-| `src/engine/mv/mod.rs` | `pub mod iceberg_merge_sink;` + `pub mod iceberg_delta_plan;` |
+| `src/lower/fragment.rs` / `src/lower/thrift/lower_plan.rs` | Dispatch `ICEBERG_DELTA_SCAN_NODE` → `lower_iceberg_delta_scan` |
+| `src/sql/analyzer/resolve_from.rs` | `TableFactor::TableFunction` 分支新增 `__nr_ivm_delta` 识别 → `Relation::IcebergDeltaScan` |
+| `src/sql/analyzer/mod.rs` | `Relation` 加 `IcebergDeltaScan(IcebergDeltaScanRelation)` 变体 |
+| `src/sql/planner/...` | `LogicalPlan` 加 `IcebergDeltaScan(LogicalIcebergDeltaScan)` 变体，passthrough |
+| `src/sql/optimizer/...` | `PhysicalPlan` 加 `IcebergDeltaScan(PhysicalIcebergDeltaScan)` 变体，passthrough |
+| `src/sql/codegen/fragment_builder.rs` | `PhysicalIcebergDeltaScan` → emit `TPlanNode { node_type: ICEBERG_DELTA_SCAN_NODE, iceberg_delta_scan_node: Some(...) }` |
+| `src/engine/mod.rs` | `execute_query` / `execute_plan` 增加可选 `terminal_sink: Option<Box<dyn OperatorFactory>>` 参数；其他 caller 传 None 用默认 ResultSink |
+| `src/connector/iceberg/changes.rs` | 抽出 `materialize_changes` 内部反向重建为 per-file streaming-friendly helpers；`materialize_changes` 在 Task 14 才删 |
+| `src/engine/mv/iceberg_refresh.rs` | `refresh_iceberg_mv` 增量分支重写：AST mutate + 自定义 sink 调 `execute_query` + `commit_iceberg_mv_with_populated_collector` |
+| `src/engine/mv/mod.rs` | `pub mod iceberg_merge_sink;` |
 
 ### Delete
 
 | Path | Why |
 |---|---|
-| `src/engine/mv_flow.rs` lines for `execute_query_for_mv_incremental_refresh` (230-280) | Replaced by ExecPlan + execute_plan |
+| `src/engine/mv_flow.rs` lines for `execute_query_for_mv_incremental_refresh` (230-280) | Replaced by single `execute_query` with custom sink |
 | `src/engine/mv_flow.rs` lines for `write_mv_delete_temp_parquet` (282-329) | 不再走 temp parquet |
 | `src/engine/mv_flow.rs` lines for `delete_temp_table_def_from_batch_schema` (331-378) | 一次性 catalog 魔术不需要 |
-| `src/engine/mv_flow.rs` lines for `execute_query_for_mv_incremental_deletes` (387-431) | Replaced by ExecPlan + execute_plan |
+| `src/engine/mv_flow.rs` lines for `execute_query_for_mv_incremental_deletes` (387-431) | Replaced by single `execute_query` with custom sink |
 | `src/connector/iceberg/changes.rs` `materialize_changes` (569-679) | 被新算子吞掉 |
+
+### Reverted from v1 (废弃)
+
+| Path | 状态 |
+|---|---|
+| `src/engine/mv/iceberg_delta_plan.rs` | v1 创建的 leaf-swap rewrite 文件，v2 不需要，**整体删除** |
+| `src/engine/mod.rs` `compile_query_to_exec_plan` / `lower_single_fragment_to_exec_plan` 三函数抽取 | v1 的 Seam 1，v2 不需要 ExecPlan 切片，**回退**（只保留 `execute_query` 的 sink 参数化） |
 
 ### 不动（明示）
 
@@ -55,7 +71,7 @@
 - `src/connector/iceberg/sink.rs`（FE-thrift-driven 现有 sink 不动；新 MV sink 独立模块）
 - `src/connector/iceberg/commit/*`（A10 commit 框架不动）
 - `src/connector/starrocks/managed/ivm_delta_source.rs`（managed-lake MV 仍走 temp parquet，A1 不动）
-- `src/engine/mv/iceberg_target_apply.rs` 内部实现（A9 helper `load_target_apply_locator_inputs`/`locate_target_rows_by_apply_key` 函数签名不动，只是调用点搬家）
+- `src/engine/mv/iceberg_target_apply.rs` 内部实现（A9 helper `load_target_apply_locator_inputs` / `locate_target_rows_by_apply_key` 函数签名不动，只是调用点搬家）
 
 ---
 
@@ -66,7 +82,7 @@
 | Phase | 验证命令 |
 |---|---|
 | Phase 0-3 (单元代码) | `cargo build --lib` + `cargo test --lib -- iceberg_delta_scan iceberg_merge_sink` |
-| Phase 4 (leaf-swap) | `cargo build --lib` + `cargo test --lib -- iceberg_delta_plan` |
+| Phase 4 (IDL + analyzer + codegen + lower) | `cargo build --lib` + 编译期保证 Thrift 解码 + 单元测试 `__nr_ivm_delta` AST mutate 与 analyzer 分发 |
 | Phase 5 (integration) | `cargo build` + 启动 standalone-server，手动 mysql client refresh 一次小 MV 烟测 |
 | Phase 6 (deletion) | `cargo build` (确保删完没有死引用) + `cargo clippy --lib -- -D warnings` |
 | Phase 7-8 (SQL tests) | `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config $NOVAROCKS_SQL_TEST_CONFIG --suite iceberg-ivm --mode verify` |
@@ -101,9 +117,9 @@ Create `src/exec/node/iceberg_delta_scan.rs`:
 //! Single source leaf that internally consumes Iceberg snapshot diff
 //! products (data files / position-delete / equality-delete / deleted-data-file)
 //! and emits a unified chunk stream tagged with the A4 transparent
-//! `__change_op` column (+1 for INSERT, -1 for DELETE). Used by MV
-//! incremental refresh via the leaf-swap plan rewrite in
-//! `engine/mv/iceberg_delta_plan.rs`.
+//! `__change_op` column (+1 for INSERT, -1 for DELETE). Populated by
+//! `lower_iceberg_delta_scan` (in `src/lower/thrift/iceberg_delta_scan.rs`)
+//! when the Thrift plan carries `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
 
 use std::sync::Arc;
 
@@ -111,17 +127,16 @@ use crate::connector::iceberg::changes::ChangedDataFile;
 use crate::connector::iceberg::changes::DeletedDataFileRef;
 use crate::connector::iceberg::changes::EqualityDeleteRef;
 use crate::connector::iceberg::changes::PositionDeleteRef;
-use crate::exec::chunk::ChunkSchema;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::fs::object_store::ObjectStoreConfig;
+use crate::fs::opendal::OpendalRangeReaderFactory;
 
 #[derive(Clone, Debug)]
 pub struct IcebergDeltaScanNode {
-    pub base_table_ident: TableIdent,
+    pub base_table_ident: BaseTableIdent,
     pub from_snapshot_id: i64,
     pub to_snapshot_id: i64,
-    pub previous_snapshot_id: i64,
-    pub current_snapshot_id: i64,
-    pub output_chunk_schema: ChunkSchema,
+    pub output_chunk_schema: ChunkSchemaRef,
     pub apply_key_source: ApplyKeySource,
     pub change_files: Vec<DeltaSourceFile>,
     pub object_store_config: Option<ObjectStoreConfig>,
@@ -130,7 +145,7 @@ pub struct IcebergDeltaScanNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct TableIdent {
+pub struct BaseTableIdent {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -186,11 +201,24 @@ pub struct DeletedFileVisibility {
 }
 
 /// Iceberg per-table runtime handles required by `IcebergDeltaScanOperator`
-/// to open delete files and re-read target data files. Populated by the
-/// refresh driver before constructing the ExecPlan.
+/// to open delete files and re-read target data files. Constructed by
+/// `lower_iceberg_delta_scan` when lowering `ICEBERG_DELTA_SCAN_NODE` —
+/// `base_table` comes from `iceberg::Catalog::load_table`, `delete_side`
+/// is populated via `base_data_file_first_row_id_index` +
+/// `load_existing_delete_visibility_by_data_file_at` only when the change
+/// batch has any DELETE-side roles.
 #[derive(Debug)]
 pub struct IcebergRuntimeHandles {
     pub base_table: iceberg::table::Table,
+    pub object_store_factory: Arc<OpendalRangeReaderFactory>,
+    pub delete_side: Option<DeltaScanDeleteSide>,
+}
+
+#[derive(Debug)]
+pub struct DeltaScanDeleteSide {
+    pub base_first_row_ids: std::collections::HashMap<String, i64>,
+    pub previous_delete_visibility:
+        crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
 }
 ```
 
@@ -202,8 +230,9 @@ Modify `src/exec/node/mod.rs:50-89`:
 // At top of file, add import (find existing use block for ValuesNode):
 pub mod iceberg_delta_scan;
 pub use iceberg_delta_scan::{
-    ApplyKeySource, DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode,
-    IcebergRuntimeHandles, TableIdent,
+    ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
+    DeletedFileVisibility, EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
+    PositionDeleteTargetData,
 };
 
 // In `ExecNodeKind` enum (currently lines 70-89):
@@ -605,38 +634,26 @@ fn open_scanner_for_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::iceberg_delta_scan::{ApplyKeySource, TableIdent};
+    use crate::exec::node::iceberg_delta_scan::{ApplyKeySource, BaseTableIdent};
 
-    fn dummy_node_with_no_files() -> IcebergDeltaScanNode {
-        IcebergDeltaScanNode {
-            base_table_ident: TableIdent {
-                catalog: "c".into(),
-                namespace: "n".into(),
-                table: "t".into(),
-            },
-            from_snapshot_id: 1,
-            to_snapshot_id: 2,
-            previous_snapshot_id: 1,
-            current_snapshot_id: 2,
-            output_chunk_schema: ChunkSchema::empty(),
-            apply_key_source: ApplyKeySource::BaseRowId,
-            change_files: Vec::new(),
-            object_store_config: None,
-            iceberg_runtime: Arc::new(
-                IcebergRuntimeHandles {
-                    base_table: panic!("test uses no_files variant; runtime not required"),
-                },
-            ),
-            node_id: 99,
+    // Note: full IcebergDeltaScanNode fixtures require `iceberg::table::Table`
+    // and `OpendalRangeReaderFactory` instances which are non-trivial to mock.
+    // Operator semantic verification happens at the SQL test level (Phase 7).
+    // The unit test below is compile-only — it asserts the factory type
+    // implements the `OperatorFactory` trait.
+    #[allow(dead_code)]
+    fn _example_ident() -> BaseTableIdent {
+        BaseTableIdent {
+            catalog: "c".into(),
+            namespace: "n".into(),
+            table: "t".into(),
         }
     }
 
     #[test]
-    fn empty_change_files_returns_none_immediately() {
-        // Cannot construct base_table without iceberg fixtures, so this test
-        // is reserved for SQL-level verification in Phase 7. Compile-only smoke:
-        let _ = std::any::TypeId::of::<IcebergDeltaScanFactory>();
+    fn iceberg_delta_scan_factory_compiles_as_operator_factory() {
+        fn assert_is_factory<T: OperatorFactory + ?Sized>() {}
+        assert_is_factory::<IcebergDeltaScanFactory>();
     }
 }
 ```
@@ -1483,424 +1500,515 @@ cargo test --lib iceberg_merge_sink && \
 
 ---
 
-# Phase 4 — Leaf-Swap ExecPlan Rewrite
+# Phase 4 — Plan-Time `IcebergDeltaScan` Dispatch（IDL + Analyzer + Codegen + Lower）
 
-### Task 12: 实现 `swap_base_scan_with_delta_scan` + `wrap_root_with_merge_sink`
+Task 12 是把 `IcebergDeltaScan` 做成编译时一等节点 —— 在 SQL → AST → 各阶段 plan → Thrift → ExecPlan 整条链路上原生出现，不依赖 ExecPlan 后置 mutation。**v1 的 leaf-swap 路线已废弃**，原 `src/engine/mv/iceberg_delta_plan.rs` 整体不创建。
+
+### Task 12: Plan-time `IcebergDeltaScan` 全链路接入
 
 **Files:**
-- Create: `src/engine/mv/iceberg_delta_plan.rs`
-- Modify: `src/engine/mv/mod.rs`
 
-- [ ] **Step 1: 写新文件**
+- Modify: `idl/thrift/PlanNodes.thrift`（加 enum 变体 + struct + TPlanNode 字段）
+- Modify: `src/sql/analyzer/resolve_from.rs`（识别 `__nr_ivm_delta` table function）
+- Modify: `src/sql/analyzer/mod.rs`（`Relation` 加变体 `IcebergDeltaScan`）
+- Modify: `src/sql/planner/...`（`LogicalPlan` 加变体）
+- Modify: `src/sql/optimizer/...`（`PhysicalPlan` 加变体 + passthrough）
+- Modify: `src/sql/codegen/fragment_builder.rs`（emit `ICEBERG_DELTA_SCAN_NODE`）
+- Create: `src/lower/thrift/iceberg_delta_scan.rs`（`lower_iceberg_delta_scan`）
+- Modify: `src/lower/thrift/lower_plan.rs`（dispatch ICEBERG_DELTA_SCAN_NODE）
+- Modify: `src/exec/node/iceberg_delta_scan.rs`（`IcebergRuntimeHandles` 加 `object_store_factory` + `delete_side`）
 
-Create `src/engine/mv/iceberg_delta_plan.rs`:
+- [ ] **Step 1: 扩展 Thrift IDL**
+
+Edit `idl/thrift/PlanNodes.thrift`，在 `TPlanNodeType` 末尾、`}` 之前加：
+
+```thrift
+enum TPlanNodeType {
+    OLAP_SCAN_NODE,
+    ...
+    LAKE_CACHE_STATS_SCAN_NODE,
+
+    // NovaRocks-only nodes start from 1000 to avoid colliding with upstream
+    // starrocks additions (which occupy 0..999 by sequential ordering).
+    ICEBERG_DELTA_SCAN_NODE = 1000,
+}
+```
+
+在文件合适位置（与其他 `T*ScanNode` 一起）加 `TIcebergDeltaScanNode`：
+
+```thrift
+// IVM-A1 Iceberg incremental delta scan source.
+//
+// Only carries lightweight descriptors (catalog/namespace/table strings +
+// from/to snapshot ids); the actual `Vec<DeltaSourceFile>` and runtime
+// state (visibility / first_row_id index) are computed at lower_plan time
+// by `plan_changes` so they never traverse the wire format.
+struct TIcebergDeltaScanNode {
+    1: required string catalog,
+    2: required string namespace,
+    3: required string table,
+    4: required i64 from_snapshot_id,
+    5: required i64 to_snapshot_id,
+}
+```
+
+在 `TPlanNode` 结构体加 optional 字段挂这个 payload。
+
+`cargo build --lib` 编译以触发 Thrift 代码再生成。
+
+- [ ] **Step 2: 扩展 `IcebergRuntimeHandles`（加 `object_store_factory` + `delete_side`）**
+
+Edit `src/exec/node/iceberg_delta_scan.rs`：
 
 ```rust
-//! Plan-rewrite pass: swap the unique base-table Scan leaf in a codegen'd
-//! ExecPlan with `IcebergDeltaScan`, and wrap the root with `IcebergMergeSink`.
-//!
-//! This is the minimal "leaf-swap" sketch of POC route-one plan rewrite,
-//! limited to the single-base-table projection/filter MV shape that A1
-//! supports. Aggregate / join MVs are deferred to A2/A3.
+pub struct IcebergRuntimeHandles {
+    pub base_table: iceberg::table::Table,
+    pub object_store_factory: Arc<crate::fs::opendal::OpendalRangeReaderFactory>,
+    pub delete_side: Option<DeltaScanDeleteSide>,
+}
 
-use std::sync::Arc;
+pub struct DeltaScanDeleteSide {
+    pub base_first_row_ids: std::collections::HashMap<String, i64>,
+    pub previous_delete_visibility:
+        crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+}
+```
 
-use crate::exec::node::iceberg_delta_scan::IcebergDeltaScanNode;
-use crate::exec::node::{ExecNode, ExecNodeKind, ScanNode};
+Tasks 6/7/8 的 operator scanner 跟着改 —— 从 `delete_side` 借用而不是每次自己 build。
 
-/// Walk the ExecPlan top-down and find the (unique) base-table Scan leaf.
-/// Returns Err if zero or more than one Scan leaf matches; this is the
-/// fail-fast we want for A1 (single-base MV contract enforced by A11).
-pub(crate) fn find_unique_base_scan_leaf(
-    root: &ExecNode,
-    base_namespace: &str,
-    base_table: &str,
-) -> Result<ScanLeafLocator, String> {
-    let mut found = Vec::new();
-    collect_scan_leaves(root, &[], &mut found);
-    let matching: Vec<_> = found
-        .into_iter()
-        .filter(|(_, scan)| {
-            scan.scan_table_namespace().eq_ignore_ascii_case(base_namespace)
-                && scan.scan_table_name().eq_ignore_ascii_case(base_table)
+- [ ] **Step 3: analyzer 识别 `__nr_ivm_delta` table function**
+
+Edit `src/sql/analyzer/resolve_from.rs`，在 [`TableFactor::TableFunction`](../../../src/sql/analyzer/resolve_from.rs:424) 分支起首加：
+
+```rust
+sqlast::TableFactor::TableFunction { expr, alias } => {
+    let func_name = expr.name.0.last()
+        .and_then(|p| match p {
+            sqlast::ObjectNamePart::Identifier(i) => Some(i.value.to_ascii_lowercase()),
+            _ => None,
         })
-        .collect();
-    match matching.len() {
-        0 => Err(format!(
-            "ivm-a1 leaf-swap: no base scan leaf for {base_namespace}.{base_table} found in ExecPlan"
-        )),
-        1 => Ok(matching.into_iter().next().unwrap().0),
-        n => Err(format!(
-            "ivm-a1 leaf-swap: expected exactly one base scan leaf for {base_namespace}.{base_table}, found {n}"
-        )),
+        .unwrap_or_default();
+    if func_name == "__nr_ivm_delta" {
+        return self.analyze_iceberg_delta_table_function(expr, alias.as_ref());
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct ScanLeafLocator {
-    pub path: Vec<usize>,
-}
-
-fn collect_scan_leaves<'a>(
-    node: &'a ExecNode,
-    path: &[usize],
-    out: &mut Vec<(ScanLeafLocator, &'a ScanNode)>,
-) {
-    match &node.kind {
-        ExecNodeKind::Scan(scan) => {
-            out.push((ScanLeafLocator { path: path.to_vec() }, scan));
-        }
-        _ => {
-            for (i, child) in children_of(node).iter().enumerate() {
-                let mut sub = path.to_vec();
-                sub.push(i);
-                collect_scan_leaves(child, &sub, out);
-            }
-        }
-    }
-}
-
-fn children_of(node: &ExecNode) -> Vec<&ExecNode> {
-    // mirror existing patterns in src/exec/node/mod.rs::output_slots_for_node
-    // for each ExecNodeKind that wraps an input.
-    match &node.kind {
-        ExecNodeKind::Project(p) => vec![&p.input],
-        ExecNodeKind::Filter(f) => vec![&f.input],
-        ExecNodeKind::Limit(l) => vec![&l.input],
-        ExecNodeKind::Repeat(r) => vec![&r.input],
-        ExecNodeKind::AssertNumRows(a) => vec![&a.input],
-        ExecNodeKind::Sort(s) => vec![&s.input],
-        ExecNodeKind::TableFunction(t) => vec![&t.input],
-        ExecNodeKind::Fetch(f) => vec![&f.input],
-        ExecNodeKind::UnionAll(u) => u.inputs.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-pub(crate) fn swap_base_scan_with_delta_scan(
-    root: &mut ExecNode,
-    locator: &ScanLeafLocator,
-    delta_node: IcebergDeltaScanNode,
-) -> Result<(), String> {
-    let target = locate_mut(root, &locator.path)?;
-    let scan_meta = match &target.kind {
-        ExecNodeKind::Scan(scan) => scan.clone(),
-        _ => return Err("ivm-a1 leaf-swap: locator no longer points at a Scan node".to_string()),
-    };
-    // Sanity: the IcebergDeltaScanNode's output schema must match what the
-    // upstream Project/Filter expect. We compare slot ids.
-    let scan_slots: Vec<_> = scan_meta.output_chunk_schema().slot_ids().to_vec();
-    let delta_slots: Vec<_> = delta_node.output_chunk_schema.slot_ids().to_vec();
-    if scan_slots != delta_slots {
-        return Err(format!(
-            "ivm-a1 leaf-swap: schema slot mismatch (scan={:?}, delta={:?})",
-            scan_slots, delta_slots
-        ));
-    }
-    target.kind = ExecNodeKind::IcebergDeltaScan(delta_node);
-    Ok(())
-}
-
-fn locate_mut<'a>(root: &'a mut ExecNode, path: &[usize]) -> Result<&'a mut ExecNode, String> {
-    let mut cur = root;
-    for &i in path {
-        cur = children_of_mut(cur)
-            .into_iter()
-            .nth(i)
-            .ok_or_else(|| "ivm-a1 leaf-swap: stale locator path".to_string())?;
-    }
-    Ok(cur)
-}
-
-fn children_of_mut(node: &mut ExecNode) -> Vec<&mut ExecNode> {
-    match &mut node.kind {
-        ExecNodeKind::Project(p) => vec![&mut p.input],
-        ExecNodeKind::Filter(f) => vec![&mut f.input],
-        ExecNodeKind::Limit(l) => vec![&mut l.input],
-        ExecNodeKind::Repeat(r) => vec![&mut r.input],
-        ExecNodeKind::AssertNumRows(a) => vec![&mut a.input],
-        ExecNodeKind::Sort(s) => vec![&mut s.input],
-        ExecNodeKind::TableFunction(t) => vec![&mut t.input],
-        ExecNodeKind::Fetch(f) => vec![&mut f.input],
-        ExecNodeKind::UnionAll(u) => u.inputs.iter_mut().collect(),
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fail_when_no_base_scan_leaf() {
-        // ExecPlan with only a Values leaf (no Scan) → expect Err
-        let node = crate::exec::node::ExecNode {
-            kind: ExecNodeKind::Values(crate::exec::node::values::ValuesNode {
-                chunk: crate::exec::chunk::Chunk::empty(),
-                node_id: 0,
-            }),
-        };
-        let err = find_unique_base_scan_leaf(&node, "ns", "t").unwrap_err();
-        assert!(err.contains("no base scan leaf"));
-    }
+    // ... 原有 user-defined table function 逻辑
 }
 ```
 
-- [ ] **Step 2: 注册 module**
-
-Modify `src/engine/mv/mod.rs`:
+新增方法 `analyze_iceberg_delta_table_function`：
 
 ```rust
-pub(crate) mod iceberg_delta_plan;
+fn analyze_iceberg_delta_table_function(
+    &self,
+    expr: &sqlast::Function,
+    alias: Option<&sqlast::TableAlias>,
+) -> Result<(Relation, AnalyzerScope), String> {
+    let args = expr.args.as_ref()
+        .ok_or_else(|| "__nr_ivm_delta requires args".to_string())?;
+    if args.args.len() != 3 {
+        return Err(format!("__nr_ivm_delta expects 3 args (catalog.namespace.table, from_snap, to_snap), got {}", args.args.len()));
+    }
+    let fqn = parse_string_arg(&args.args[0], "table fqn")?;
+    let from_snap = parse_i64_arg(&args.args[1], "from_snapshot_id")?;
+    let to_snap = parse_i64_arg(&args.args[2], "to_snapshot_id")?;
+    if from_snap < 0 || to_snap < 0 {
+        return Err(format!("__nr_ivm_delta snapshot id must be non-negative, got from={from_snap} to={to_snap}"));
+    }
+    let (catalog, namespace, table) = split_catalog_namespace_table(&fqn)?;
+
+    // 查 base 表的 TableDef，拿 schema + 强制 advertise row-lineage 虚拟列
+    let table_def = self.catalog.get_table(&namespace, &table)?;
+    require_iceberg_row_lineage_advertised(&table_def)?;
+
+    let qualifier = alias
+        .map(|a| a.name.value.clone())
+        .unwrap_or_else(|| table_def.name.clone());
+
+    let mut scope = AnalyzerScope::new();
+    for col in &table_def.columns {
+        scope.add_column(Some(&qualifier), &col.name, col.data_type.clone(), col.nullable);
+    }
+    for col in &table_def.iceberg_row_lineage_metadata_columns {
+        scope.add_column(Some(&qualifier), &col.name, col.data_type.clone(), col.nullable);
+    }
+
+    let relation = Relation::IcebergDeltaScan(IcebergDeltaScanRelation {
+        catalog, namespace, table,
+        from_snapshot_id: from_snap,
+        to_snapshot_id: to_snap,
+        qualifier,
+        columns: table_def.columns.clone(),
+        row_lineage_columns: table_def.iceberg_row_lineage_metadata_columns.clone(),
+    });
+    Ok((relation, scope))
+}
 ```
 
-- [ ] **Step 3: 编译 + 跑单元测试**
+`Relation` enum 加变体 `IcebergDeltaScan(IcebergDeltaScanRelation)`；其他 match 站点同步加 arm。
 
-Run: `cargo test --lib --package novarocks iceberg_delta_plan 2>&1 | tail -10`
-Expected:
-```
-test fail_when_no_base_scan_leaf ... ok
+`parse_string_arg` / `parse_i64_arg` / `split_catalog_namespace_table` / `require_iceberg_row_lineage_advertised` 都是 helper，写在 `resolve_from.rs` 底下或 `mod.rs`。
+
+- [ ] **Step 4: planner / optimizer passthrough**
+
+LogicalPlan 加变体 `IcebergDeltaScan(LogicalIcebergDeltaScan)`；planner 把 `Relation::IcebergDeltaScan` 1:1 转过去。
+
+PhysicalPlan 加变体 `IcebergDeltaScan(PhysicalIcebergDeltaScan)`；optimizer 现阶段不做专用规则，passthrough。
+
+- [ ] **Step 5: fragment_builder emit `ICEBERG_DELTA_SCAN_NODE`**
+
+Edit `src/sql/codegen/fragment_builder.rs`，在物理节点 emit 的 match 加分支：
+
+```rust
+PhysicalPlan::IcebergDeltaScan(ds) => {
+    let tnode = TPlanNode {
+        node_id: ...,
+        node_type: TPlanNodeType::ICEBERG_DELTA_SCAN_NODE,
+        iceberg_delta_scan_node: Some(TIcebergDeltaScanNode {
+            catalog: ds.catalog.clone(),
+            namespace: ds.namespace.clone(),
+            table: ds.table.clone(),
+            from_snapshot_id: ds.from_snapshot_id,
+            to_snapshot_id: ds.to_snapshot_id,
+        }),
+        ...
+    };
+    // 输出 schema 走标准 desc_tbl 流程
+    ...
+}
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: lower_plan 现场构造 `IcebergDeltaScanNode`**
+
+Create `src/lower/thrift/iceberg_delta_scan.rs`：
+
+```rust
+pub(crate) fn lower_iceberg_delta_scan(
+    thrift_node: &TIcebergDeltaScanNode,
+    node_id: i32,
+    output_chunk_schema: ChunkSchemaRef,
+    iceberg_catalogs: &crate::connector::iceberg::catalog::IcebergCatalogRegistry,
+) -> Result<ExecNode, String> {
+    let entry = iceberg_catalogs.get(&thrift_node.catalog)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(
+        &entry, &thrift_node.namespace, &thrift_node.table,
+    )?;
+
+    let batch = crate::connector::iceberg::changes::plan_changes(
+        &loaded.table,
+        thrift_node.from_snapshot_id,
+        &[],
+    ).map_err(|e| format!("ivm-a1 lower delta-scan: plan_changes failed: {e}"))?;
+
+    let change_files = build_delta_source_files_from_batch(&batch);
+
+    let object_store_factory = Arc::new(
+        crate::connector::iceberg::changes::build_factory_for_table(
+            &loaded.table, entry.object_store_config(),
+        )?
+    );
+
+    let delete_side = if !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.deleted_data_files.is_empty()
+    {
+        Some(DeltaScanDeleteSide {
+            base_first_row_ids: crate::connector::iceberg::changes::base_data_file_first_row_id_index(&loaded.table)?,
+            previous_delete_visibility: crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
+                &loaded.table,
+                Some(batch.previous_snapshot_id),
+                entry.object_store_config(),
+            )?,
+        })
+    } else {
+        None
+    };
+
+    Ok(ExecNode { kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
+        base_table_ident: BaseTableIdent {
+            catalog: thrift_node.catalog.clone(),
+            namespace: thrift_node.namespace.clone(),
+            table: thrift_node.table.clone(),
+        },
+        from_snapshot_id: thrift_node.from_snapshot_id,
+        to_snapshot_id: thrift_node.to_snapshot_id,
+        output_chunk_schema,
+        apply_key_source: ApplyKeySource::BaseRowId,
+        change_files,
+        object_store_config: entry.object_store_config().cloned(),
+        iceberg_runtime: Arc::new(IcebergRuntimeHandles {
+            base_table: loaded.table,
+            object_store_factory,
+            delete_side,
+        }),
+        node_id,
+    })})
+}
+```
+
+Edit `src/lower/thrift/lower_plan.rs` 的 main dispatch match：
+
+```rust
+match plan_node.node_type {
+    TPlanNodeType::OLAP_SCAN_NODE => ...,
+    ...
+    TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
+        let payload = plan_node.iceberg_delta_scan_node.as_ref()
+            .ok_or_else(|| "ICEBERG_DELTA_SCAN_NODE missing iceberg_delta_scan_node payload".to_string())?;
+        lower_iceberg_delta_scan(payload, plan_node.node_id, output_chunk_schema, iceberg_catalogs)?
+    }
+}
+```
+
+`iceberg_catalogs` 是 lower_plan 新加的参数（见下一 Step）。
+
+- [ ] **Step 7: lower_plan 接 IcebergCatalogRegistry 引用**
+
+Edit `src/lower/thrift/lower_plan.rs` 的 `lower_plan` 函数签名，加一个 `iceberg_catalogs: Option<&IcebergCatalogRegistry>` 参数；所有现有 caller 默认传 None；MV refresh 路径传 `Some(...)`。
+
+`execute_plan` / `execute_query` 调 `lower_plan` 时从 `state.iceberg_catalogs` 拿出来传进。
+
+- [ ] **Step 8: 编译通过**
+
+Run: `cargo build --lib 2>&1 | grep -E "^error" | head`
+Expected: 无错误。
+
+- [ ] **Step 9: 加单测 —— `__nr_ivm_delta` analyzer 分发**
+
+Create test in `src/sql/analyzer/resolve_from.rs` (in existing `#[cfg(test)] mod tests`)：
+
+```rust
+#[test]
+fn analyzer_recognizes_nr_ivm_delta_table_function() {
+    // 构造 InMemoryCatalog 注册一个 v3 row-lineage iceberg 表，
+    // 解析 `SELECT * FROM __nr_ivm_delta('cat.ns.t', 100, 200) AS t`，
+    // 断言 ResolvedQuery 顶层 Relation 是 IcebergDeltaScan 变体。
+}
+
+#[test]
+fn analyzer_rejects_nr_ivm_delta_with_negative_snapshot() {
+    // `__nr_ivm_delta('cat.ns.t', -1, 200)` → 报错含 "non-negative"
+}
+
+#[test]
+fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
+    // 注册一个 v2 表，预期报错含 "row-lineage" 提示
+}
+```
+
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/engine/mv/iceberg_delta_plan.rs src/engine/mv/mod.rs
-git commit -m "feat(ivm-a1): ExecPlan leaf-swap rewrite (find + swap base scan)"
+git add idl/thrift/PlanNodes.thrift \
+        src/sql/analyzer/resolve_from.rs src/sql/analyzer/mod.rs \
+        src/sql/planner/ src/sql/optimizer/ src/sql/codegen/fragment_builder.rs \
+        src/lower/thrift/iceberg_delta_scan.rs src/lower/thrift/lower_plan.rs \
+        src/exec/node/iceberg_delta_scan.rs
+git commit -m "feat(ivm-a1): plan-time IcebergDeltaScan dispatch via __nr_ivm_delta table function + ICEBERG_DELTA_SCAN_NODE Thrift type"
 ```
 
 ---
 
 # Phase 5 — Refresh Driver Integration
 
-### Task 13: 把 `refresh_iceberg_mv` 的增量分支重写为 leaf-swap + execute_plan
+### Task 13: 把 `refresh_iceberg_mv` 增量分支重写为 AST mutate + custom-sink execute_query
+
+新方案下 refresh driver 不再 mutate ExecPlan，而是在 sqlparser AST 层把 base 表的 `TableFactor::Table` 替换为 `__nr_ivm_delta` table function，然后调 `execute_query` 时传入自定义 sink（`IcebergMergeSinkFactory`）。Plan-time TPlanNode 由 Phase 4 提供，本 Task 不重复。
 
 **Files:**
-- Modify: `src/engine/mv/iceberg_refresh.rs`（在 line 2009-2253 那段——`IcebergChangePolicySignal::Incremental` 实际处理路径）
 
-- [ ] **Step 1: 在 refresh 函数上方加新 helper**
+- Modify: `src/engine/mv/iceberg_refresh.rs`（line 2009-2253 那段 —— `IcebergChangePolicySignal::Incremental` 实际处理路径）
+- Use: `build_iceberg_table_def_for_delta_scan`（Seam 2 commit `4e0b6d4a` 已落地）
+- Use: `new_iceberg_mv_commit_collector` + `commit_iceberg_mv_with_populated_collector`（Seam 3 commit `c9b07f01` 已落地）
+- Use: `execute_query` 的 sink 参数（Seam 1 v2 形态，待新 commit 落地）
 
-Add inside `iceberg_refresh.rs`, near the existing locator helpers:
+- [ ] **Step 1: 在 `refresh_iceberg_mv` 模块上方加 helper：AST mutate**
+
+Add to `iceberg_refresh.rs`：
 
 ```rust
-/// Convert an iceberg snapshot diff `IcebergChangeBatch` into the
-/// `change_files: Vec<DeltaSourceFile>` that `IcebergDeltaScanNode` consumes.
-fn build_delta_source_files(
-    batch: &IcebergChangeBatch,
-) -> Vec<crate::exec::node::iceberg_delta_scan::DeltaSourceFile> {
-    use crate::exec::node::iceberg_delta_scan::{
-        DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData,
-        PositionDeleteTargetData,
-    };
-    let mut out = Vec::new();
-    for ins in &batch.inserts {
-        out.push(DeltaSourceFile {
-            path: ins.path.clone(),
-            size: ins.size,
-            role: DeltaSourceRole::DataFile,
-            partition_spec_id: ins.partition_spec_id,
-            partition_key: ins.partition_key.clone(),
-            first_row_id: ins.first_row_id,
-            data_sequence_number: ins.data_sequence_number,
-        });
+/// Mutate a parsed MV SELECT query in-place: find the unique TableFactor::Table
+/// referencing `base_ref`, replace it with a TableFunction call to
+/// `__nr_ivm_delta('cat.ns.tbl', from_snap, to_snap) AS <original_alias_or_table>`.
+fn mutate_query_for_ivm_delta_scan(
+    query: &mut sqlparser::ast::Query,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+) -> Result<(), String> {
+    use sqlparser::ast::{Function, FunctionArg, FunctionArgExpr, ObjectName,
+                          ObjectNamePart, TableFactor, Value};
+
+    // walk Query.body.from[*] and joins, replace matching TableFactor::Table.
+    // For A1 single-base-table contract there must be exactly one match; fail fast
+    // when none or multiple.
+    let mut matches: usize = 0;
+    visit_table_factors_mut(query, &mut |tf| {
+        if let TableFactor::Table { name, alias, .. } = tf {
+            if matches_base_ref(name, base_ref) {
+                matches += 1;
+                let alias_for_replacement = alias.clone().or_else(|| {
+                    // 默认 alias 用 base 表名，保持外面 SELECT column refs 能 resolve
+                    Some(make_table_alias(&base_ref.table))
+                });
+                *tf = TableFactor::TableFunction {
+                    expr: Function {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(
+                            sqlparser::ast::Ident::new("__nr_ivm_delta"),
+                        )]),
+                        args: Some(sqlparser::ast::FunctionArguments::List(
+                            sqlparser::ast::FunctionArgumentList {
+                                duplicate_treatment: None,
+                                args: vec![
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                        sqlparser::ast::Expr::Value(
+                                            Value::SingleQuotedString(base_ref.fqn()).into()
+                                        )
+                                    )),
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                        sqlparser::ast::Expr::Value(
+                                            Value::Number(from_snapshot_id.to_string(), false).into()
+                                        )
+                                    )),
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                        sqlparser::ast::Expr::Value(
+                                            Value::Number(to_snapshot_id.to_string(), false).into()
+                                        )
+                                    )),
+                                ],
+                                clauses: vec![],
+                            }
+                        )),
+                        ...  // 其他 Function 字段照填 default
+                    },
+                    alias: alias_for_replacement,
+                };
+            }
+        }
+    });
+    match matches {
+        0 => Err(format!(
+            "ivm-a1 ast mutate: no FROM {} found in MV SELECT",
+            base_ref.fqn()
+        )),
+        1 => Ok(()),
+        n => Err(format!(
+            "ivm-a1 ast mutate: expected exactly one FROM {} in MV SELECT, found {n}",
+            base_ref.fqn()
+        )),
     }
-    for d in &batch.deletes {
-        let targets = d
-            .targets
-            .iter()
-            .map(|t| PositionDeleteTargetData {
-                data_file_path: t.data_file_path.clone(),
-                data_file_first_row_id: None, // looked up by operator using base_first_row_ids
-            })
-            .collect();
-        out.push(DeltaSourceFile {
-            path: d.path.clone(),
-            size: d.size,
-            role: DeltaSourceRole::PositionDelete { targets },
-            partition_spec_id: d.partition_spec_id,
-            partition_key: d.partition_key.clone(),
-            first_row_id: None,
-            data_sequence_number: d.data_sequence_number,
-        });
-    }
-    for ed in &batch.equality_deletes {
-        let targets = ed
-            .targets
-            .iter()
-            .map(|t| EqualityDeleteTargetData {
-                data_file_path: t.data_file_path.clone(),
-                data_file_first_row_id: t.data_file_first_row_id,
-            })
-            .collect();
-        out.push(DeltaSourceFile {
-            path: ed.path.clone(),
-            size: ed.size,
-            role: DeltaSourceRole::EqualityDelete {
-                equality_field_ids: ed.equality_field_ids.clone(),
-                targets,
-            },
-            partition_spec_id: ed.partition_spec_id,
-            partition_key: ed.partition_key.clone(),
-            first_row_id: None,
-            data_sequence_number: ed.data_sequence_number,
-        });
-    }
-    for ddf in &batch.deleted_data_files {
-        out.push(DeltaSourceFile {
-            path: ddf.path.clone(),
-            size: ddf.size,
-            role: DeltaSourceRole::DeletedDataFile {
-                previous_data_file_visibility: None, // filled by refresh driver below
-            },
-            partition_spec_id: ddf.partition_spec_id,
-            partition_key: ddf.partition_key.clone(),
-            first_row_id: ddf.first_row_id,
-            data_sequence_number: ddf.data_sequence_number,
-        });
-    }
-    out
 }
 ```
 
-- [ ] **Step 2: 把 `IcebergChangePolicySignal::Incremental` 的处理段（2009-2253）重写**
+`visit_table_factors_mut` / `matches_base_ref` / `make_table_alias` 都是新加的小 helper。
 
-Replace the entire `let (chunks, delete_base_row_ids) = if has_delete_changes { ... } else { ... };` block + downstream commit code with:
+- [ ] **Step 2: 重写 `IcebergChangePolicySignal::Incremental` 的处理段**
+
+替换原 line 2009-2253 那段 `let (chunks, delete_base_row_ids) = if has_delete_changes { ... } else { ... };` + 下游 commit。新流程：
 
 ```rust
-        let object_store_config = {
-            let catalogs = state
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            catalogs
-                .get(&base_ref.catalog)?
-                .object_store_config()
-                .cloned()
-        };
+        // 1. 提前 plan_changes 做空 delta 早返回判断（lower_plan 之后还会再调一次，可接受）
+        let batch = plan_changes(base_table, previous_snapshot_id, &[])?;
+        let has_delete_changes = !batch.deletes.is_empty()
+            || !batch.equality_deletes.is_empty()
+            || !batch.deleted_data_files.is_empty();
+        let is_empty_delta = batch.inserts.is_empty() && !has_delete_changes;
+        if is_empty_delta {
+            // existing lineage-advance code 不变，提前 return
+            ...
+            return Ok(StatementResult::Ok);
+        }
 
-        let locator_state = if has_delete_changes {
-            Some(
-                load_target_apply_locator_inputs(target_entry, &target_table).map_err(|err| {
-                    handle_iceberg_mv_commit_error(
-                        state,
-                        target,
-                        target_entry,
-                        &staging_branch,
-                        refresh_id,
-                        err,
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
+        // 2. begin A7 staged refresh intent → staging branch（不变）
+        let staging_branch = format!("__nova_mv_refresh_{}_{}", ...);
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(...)?;
+        ensure_iceberg_mv_staging_branch(...)?;
+        let target_table = reload_iceberg_mv_target_table(...)?;
 
-        // Build the IcebergDeltaScan node parameters
-        let change_files = build_delta_source_files(&batch);
-        let iceberg_runtime = Arc::new(
-            crate::exec::node::iceberg_delta_scan::IcebergRuntimeHandles {
-                base_table: base_table.clone(),
-            },
-        );
-
-        // Run the SELECT through analyzer+codegen to get Project/Filter/Scan tree
-        let mut exec_plan = compile_physical_select_to_exec_plan(
-            state,
-            current_database,
-            &physical_sql,
+        // 3. 构建 catalog：注册 base 表（empty storage + row-lineage 虚拟列）
+        let base_table_def = crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
+            state, &base_ref.catalog, &base_ref.namespace, &base_ref.table,
         )?;
+        let mut catalog = crate::sql::analyzer::InMemoryCatalog::default();
+        catalog.create_database(&base_ref.namespace)?;
+        catalog.register(&base_ref.namespace, base_table_def)
+            .map_err(|e| format!("register base table: {e}"))?;
+        // target MV 表的 TableDef（如果 MV SELECT 引用 —— A1 简单 MV 不会，但保险注册）
+        // 略
 
-        // Find the base scan leaf and swap with IcebergDeltaScan
-        let locator = crate::engine::mv::iceberg_delta_plan::find_unique_base_scan_leaf(
-            &exec_plan.root,
-            &base_ref.namespace,
-            &base_ref.table,
-        )?;
-        let delta_node = crate::exec::node::iceberg_delta_scan::IcebergDeltaScanNode {
-            base_table_ident: crate::exec::node::iceberg_delta_scan::TableIdent {
-                catalog: base_ref.catalog.clone(),
-                namespace: base_ref.namespace.clone(),
-                table: base_ref.table.clone(),
-            },
-            from_snapshot_id: batch.previous_snapshot_id,
-            to_snapshot_id: current_snapshot_id,
-            previous_snapshot_id: batch.previous_snapshot_id,
+        // 4. 解析 MV physical_select_sql → sqlparser AST，mutate base table → __nr_ivm_delta
+        let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(&physical_sql)?;
+        let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+            .map_err(|e| format!("sql parser error: {e}"))?;
+        let mut query = match statement {
+            sqlparser::ast::Statement::Query(q) => *q,
+            _ => return Err("MV SELECT must parse to a Query".to_string()),
+        };
+        mutate_query_for_ivm_delta_scan(
+            &mut query,
+            base_ref,
+            previous_snapshot_id,
             current_snapshot_id,
-            output_chunk_schema: extract_scan_output_schema(&exec_plan.root, &locator)?,
-            apply_key_source: crate::exec::node::iceberg_delta_scan::ApplyKeySource::BaseRowId,
-            change_files,
-            object_store_config,
-            iceberg_runtime,
-            node_id: -1,
-        };
-        crate::engine::mv::iceberg_delta_plan::swap_base_scan_with_delta_scan(
-            &mut exec_plan.root,
-            &locator,
-            delta_node,
         )?;
+        // 三部分名转两部分（与 execute_query_for_mv_incremental_refresh 现有处理一致）
+        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
 
-        // Wrap root with IcebergMergeSink
+        // 5. 构造 commit collector 与 merge sink
+        let ident = iceberg_mv_table_ident(target)?;
+        let op_kind = if has_delete_changes {
+            CommitOpKind::RowDeltaDv
+        } else {
+            CommitOpKind::FastAppend
+        };
+        let collector = new_iceberg_mv_commit_collector(
+            &target_table, &ident, &staging_branch, op_kind,
+        );
         let merge_sink_plan = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkPlan {
             target_table: target_table.clone(),
             collector: Arc::clone(&collector),
-            locator_state: locator_state.map(|ls| {
-                crate::engine::mv::iceberg_merge_sink::TargetLocatorState {
-                    existing_deletes_by_file: ls.existing_deletes_by_file,
-                    referenced_data_file_partitions: ls.referenced_data_file_partitions,
-                }
-            }),
-            apply_key_column: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN
-                .to_string(),
-            apply_key_field_id: find_apply_key_field_id(&target_table)?,
+            apply_key_column:
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
         };
-        let merge_sink_factory =
-            crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::try_new(
-                merge_sink_plan,
-            )?;
-        attach_sink_to_exec_plan(&mut exec_plan, merge_sink_factory)?;
+        let merge_sink = crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(
+            merge_sink_plan,
+        );
 
-        // Execute the unified plan
-        execute_plan_for_mv_refresh(state, exec_plan)?;
+        // 6. 单次 execute_query：编译链路全程 plan-time IcebergDeltaScan，pipeline 跑 sink
+        crate::engine::execute_query_with_sink(
+            &query,
+            &catalog,
+            current_database,
+            state.exchange_port,
+            None,                                // query_opts
+            Some(Box::new(merge_sink)),          // 自定义 sink 参数
+        )?;
 
-        // Collector now has WrittenFile + PositionDeleteGroup; drive commit
+        // 7. driver 端 commit
         let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
             .to_summary_properties();
-        let new_snapshot_id = match data_block_on(commit_iceberg_mv_apply_with_ref(
-            &target_table,
-            iceberg_catalog,
-            target_entry,
-            &ident,
-            Vec::new(), // written files are already in collector
-            Vec::new(), // delete groups too
-            &staging_branch,
-            marker,
-        )) {
-            Ok(outcome) => outcome.new_snapshot_id,
-            Err(err) => {
+        let new_snapshot_id = match data_block_on(
+            commit_iceberg_mv_with_populated_collector(
+                &target_table, iceberg_catalog, target_entry, &ident,
+                collector, &staging_branch, marker,
+            ),
+        ) {
+            Ok(Ok(outcome)) => outcome.new_snapshot_id,
+            Ok(Err(err)) | Err(err) => {
                 return Err(handle_iceberg_mv_commit_error(
                     state, target, target_entry, &staging_branch, refresh_id, err,
                 ));
             }
         };
+
+        // 8. publish + record + finalize（不变）
+        ...
 ```
 
-(Note: `compile_physical_select_to_exec_plan`, `extract_scan_output_schema`, `attach_sink_to_exec_plan`, `execute_plan_for_mv_refresh` are helpers that consolidate the SQL → ExecPlan path the implementer must factor out from the existing `execute_query_for_mv_incremental_refresh` body. Read that function lines 230-279 to see the parser → strip_catalog → analyzer → codegen → pipeline path; the new helpers expose stable seams without going through `QueryResult`. Each helper is small (10-30 lines).)
+注意：`execute_query_with_sink` 是 Seam 1 v2 新增的入口（接受 `terminal_sink: Option<Box<dyn OperatorFactory>>` 参数）。`execute_query` 也可以直接改签名加可选参数，调用方根据需要传 None / Some。
 
-`commit_iceberg_mv_apply_with_ref` already accepts pre-populated collector — modify its signature if necessary to skip taking `written` / `delete_groups` as arguments (they should come from the collector). If the existing signature can't be changed cleanly, leave the empty Vec form and let collector pre-population dominate.
+- [ ] **Step 3: 早返回 + 提前 plan_changes 的位置调整**
 
-- [ ] **Step 3: 把 `let (chunks, delete_base_row_ids) = ...` 之后的 `write_chunks_as_iceberg_data_files + locate_target_rows_by_apply_key + commit` 块完全删掉**
-
-The block at lines 2110-2244 (`if added_rows == 0 ... commit_iceberg_mv_apply_with_ref ...`) needs to be replaced by the new flow above, but the `add_rows == 0` early return + lineage advance logic must be preserved (move it up to before the ExecPlan construction):
-
-```rust
-// Early return: empty delta → advance lineage without commit
-let is_empty_delta = batch.inserts.is_empty() && !has_delete_changes;
-if is_empty_delta {
-    // existing lineage-advance code (lines ~2086-2107) preserved here
-    ...
-    return Ok(StatementResult::Ok);
-}
-```
+`is_empty_delta` 检查从原 line 2086-2107 上移到本 Task Step 2 的开头（在 staging branch 创建之前），避免空 delta 时白创 staging。如果担心重复，把 plan_changes 结果作为参数传给后续 lower_plan —— 但这又把 change_files 拉回上层，违背 plan-time TPlanNode 设计；保留"lower_plan 重新调一次"的轻微 redundancy。
 
 - [ ] **Step 4: 编译通过**
 
@@ -1933,7 +2041,7 @@ USE iceberg.test_db;
 -- assert REFRESH MATERIALIZED VIEW succeeds
 ```
 
-Expected: no error from `REFRESH MATERIALIZED VIEW`. If `IcebergDeltaScan` or `IcebergMergeSink` panics, the error surfaces here.
+Expected: no error from `REFRESH MATERIALIZED VIEW`. If analyzer / lower / `IcebergDeltaScan` / `IcebergMergeSink` panics, the error surfaces here.
 
 ```bash
 kill -9 "$SRV_PID"
@@ -1943,7 +2051,7 @@ kill -9 "$SRV_PID"
 
 ```bash
 git add src/engine/mv/iceberg_refresh.rs
-git commit -m "feat(ivm-a1): rewrite incremental refresh as single execute_plan via leaf-swap"
+git commit -m "feat(ivm-a1): rewrite incremental refresh as AST mutate + execute_query with custom sink"
 ```
 
 ---
