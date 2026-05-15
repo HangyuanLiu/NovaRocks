@@ -3926,7 +3926,7 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
-        crate::connector::starrocks::managed::mv_ddl::create_mv(
+        crate::engine::mv_flow::create_mv(
             &env.state,
             Some("ice"),
             &env.current_db,
@@ -4087,7 +4087,7 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
-        let err = crate::connector::starrocks::managed::mv_ddl::create_mv(
+        let err = crate::engine::mv_flow::create_mv(
             &env.state,
             Some("ice"),
             &env.current_db,
