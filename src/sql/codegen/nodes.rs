@@ -42,7 +42,58 @@ pub(crate) fn build_scan_node(
     if resolved.physical_layout.is_some() {
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
+    if matches!(
+        resolved.table.storage,
+        TableStorage::IcebergDeltaTable { .. }
+    ) {
+        return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved);
+    }
     build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
+}
+
+/// Emit `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` for an IVM-A1 delta scan.
+/// Only the lightweight identity + snapshot range is carried in the Thrift
+/// payload; the actual change-file enumeration happens at `lower_plan`
+/// time via `connector::iceberg::changes::plan_changes`.
+fn build_iceberg_delta_scan_node(
+    node_id: i32,
+    scan_tuple_id: i32,
+    resolved: &ResolvedTable,
+) -> plan_nodes::TPlanNode {
+    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
+        match &resolved.table.storage {
+            TableStorage::IcebergDeltaTable {
+                catalog,
+                namespace,
+                table,
+                from_snapshot_id,
+                to_snapshot_id,
+            } => (
+                catalog.clone(),
+                namespace.clone(),
+                table.clone(),
+                *from_snapshot_id,
+                *to_snapshot_id,
+            ),
+            _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
+        };
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = vec![scan_tuple_id];
+    node.nullable_tuples = vec![];
+    node.conjuncts = None;
+    node.compact_data = true;
+    node.iceberg_delta_scan_node = Some(Box::new(plan_nodes::TIcebergDeltaScanNode {
+        catalog,
+        namespace,
+        table,
+        from_snapshot_id,
+        to_snapshot_id,
+    }));
+    node
 }
 
 fn build_hdfs_scan_node(
