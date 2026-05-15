@@ -2517,6 +2517,7 @@ fn execute_plan(
         &layout_hints,
         None,
         None,
+        None,
     )?;
     let mut exec_plan = ExecPlan {
         arena,

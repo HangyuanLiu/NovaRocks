@@ -261,6 +261,7 @@ pub(crate) fn execute_fragment(
                 &layout_hints,
                 last_query_id,
                 fe_addr,
+                None,
             )?
         };
 

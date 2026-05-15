@@ -910,7 +910,7 @@ where
     Ok(out)
 }
 
-fn base_data_file_first_row_id_index(
+pub(crate) fn base_data_file_first_row_id_index(
     table: &iceberg::table::Table,
 ) -> Result<std::collections::HashMap<String, i64>, String> {
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
