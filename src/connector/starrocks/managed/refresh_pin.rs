@@ -159,10 +159,7 @@ fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>
     match expr {
         SetExpr::Select(select) => {
             for tw in &mut select.from {
-                walk_factor(&mut tw.relation, state);
-                for join in &mut tw.joins {
-                    walk_factor(&mut join.relation, state);
-                }
+                walk_table_with_joins(tw, state);
             }
         }
         SetExpr::SetOperation { left, right, .. } => {
@@ -171,6 +168,16 @@ fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>
         }
         SetExpr::Query(q) => walk_set_expr(q.body.as_mut(), state),
         _ => {}
+    }
+}
+
+fn walk_table_with_joins(
+    table_with_joins: &mut sqlparser::ast::TableWithJoins,
+    state: &mut InjectState<'_>,
+) {
+    walk_factor(&mut table_with_joins.relation, state);
+    for join in &mut table_with_joins.joins {
+        walk_factor(&mut join.relation, state);
     }
 }
 
@@ -206,14 +213,14 @@ fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState
             let Some(pinned) = state.pin.get(&base_ref) else {
                 return;
             };
-            if state.delta_bearing.contains(&base_ref) {
-                return;
-            }
             if version.is_some() {
                 state.first_error = Some(format!(
                     "refresh SELECT must not write explicit FOR VERSION AS OF for base table {}; refresh pin would conflict",
                     base_ref.fqn()
                 ));
+                return;
+            }
+            if state.delta_bearing.contains(&base_ref) {
                 return;
             }
             *version = Some(TableVersion::VersionAsOf(Expr::Value(
@@ -223,6 +230,11 @@ fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState
         }
         TableFactor::Derived { subquery, .. } => {
             walk_set_expr(subquery.body.as_mut(), state);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            walk_table_with_joins(table_with_joins.as_mut(), state);
         }
         _ => {}
     }
@@ -426,6 +438,43 @@ mod tests {
         assert_eq!(
             err,
             "refresh SELECT must not write explicit FOR VERSION AS OF for base table ice.db.orders; refresh pin would conflict"
+        );
+    }
+
+    #[test]
+    fn inject_pin_rejects_delta_bearing_base_with_existing_for_version_as_of() {
+        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
+        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
+
+        let err =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect_err("explicit version on delta-bearing base must be rejected");
+
+        assert_eq!(
+            err,
+            "refresh SELECT must not write explicit FOR VERSION AS OF for base table ice.db.orders; refresh pin would conflict"
+        );
+    }
+
+    #[test]
+    fn inject_pin_walks_nested_join() {
+        let mut query =
+            parse_select_for_test("SELECT * FROM (ice.db.orders JOIN ice.db.customers ON true)");
+        let pin = make_pin(&[
+            ("ice.db.orders", 42, "uuid-orders"),
+            ("ice.db.customers", 99, "uuid-customers"),
+        ]);
+        let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
+
+        let count =
+            inject_pin_as_for_version_as_of(&mut query, &pin, &delta_bearing, Some("ice"), "db")
+                .expect("inject must succeed");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            query.to_string(),
+            "SELECT * FROM (ice.db.orders JOIN ice.db.customers VERSION AS OF 99 ON true)"
         );
     }
 
