@@ -272,34 +272,6 @@ pub(crate) struct IcebergChangeBatch {
 /// Per-row Change action: this row got inserted or deleted relative to
 /// the previous MV refresh state. Carried alongside the row contents
 /// through the materialize-changes pipeline so the aggregate path can
-/// route inserts and deletes differently (insert → positive delta;
-/// delete → negative delta after sign-flip).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum ChangeAction {
-    Insert,
-    Delete,
-}
-
-/// Output of `materialize_changes`: separate `QueryResult` streams for
-/// the insert side and the delete side. Both are produced by running
-/// the MV's SELECT statement against a one-shot in-memory catalog
-/// whose base table has been replaced by the relevant subset of rows
-/// (insert files, or deleted-rows-as-temp-parquet). Aggregate semantics
-/// (WHERE, GROUP BY, projection) are honored uniformly because the SQL
-/// is the same on both branches.
-///
-/// Either branch may be the empty `QueryResult` (no rows / no chunks)
-/// if the corresponding file list was empty.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct MaterializedChanges {
-    pub previous_snapshot_id: i64,
-    pub current_snapshot_id: i64,
-    pub inserts: crate::engine::QueryResult,
-    pub deletes: crate::engine::QueryResult,
-}
-
 /// One unit of work the file-collection phase needs to perform for a
 /// single snapshot in the lineage. `Replace` snapshots are validated by
 /// `classify_snapshot` itself and never produce a `LineageAction` —
@@ -565,129 +537,6 @@ pub(crate) fn plan_changes(
     })
 }
 
-/// Top-level entry: take an `IcebergChangeBatch`, produce a
-/// `MaterializedChanges` whose `inserts` and `deletes` branches each
-/// hold the result of running the MV's SELECT statement against the
-/// relevant subset of base-table rows.
-///
-/// The `_pk_columns` parameter is reserved for future delete-side row-id
-/// computation when aggregate apply-changes needs stable row identity.
-#[allow(dead_code)]
-pub(crate) fn materialize_changes(
-    state: &std::sync::Arc<crate::engine::StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
-    base_table: &iceberg::table::Table,
-    batch: IcebergChangeBatch,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-    _pk_columns: &[String],
-) -> Result<MaterializedChanges, String> {
-    let inserts = if batch.inserts.is_empty() {
-        crate::engine::QueryResult::empty()
-    } else {
-        let added_files: Vec<crate::engine::query_prep::IcebergFileForQuery> = batch
-            .inserts
-            .iter()
-            .map(|f| crate::engine::query_prep::IcebergFileForQuery {
-                path: f.path.clone(),
-                size: f.size,
-                record_count: f.record_count,
-                partition_spec_id: f.partition_spec_id,
-                partition_key: f.partition_key.clone(),
-                first_row_id: f.first_row_id,
-                data_sequence_number: f.data_sequence_number,
-                change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
-            })
-            .collect();
-        crate::engine::mv_flow::execute_query_for_mv_incremental_refresh(
-            state,
-            current_database,
-            sql,
-            base_ref,
-            added_files,
-        )?
-    };
-
-    let needs_deletes_scan = !batch.deletes.is_empty()
-        || !batch.equality_deletes.is_empty()
-        || !batch.deleted_data_files.is_empty();
-    let deletes = if !needs_deletes_scan {
-        crate::engine::QueryResult::empty()
-    } else {
-        let factory = build_factory_for_table(base_table, object_store_config)?;
-        let base_first_row_ids = if batch.deletes.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            base_data_file_lineage_index(base_table)?
-                .into_iter()
-                .map(|(path, lineage)| (path, lineage.first_row_id))
-                .collect()
-        };
-        let size_lookup = |path: &str| -> Option<u64> {
-            // We do not currently carry the per-data-file size index across
-            // this boundary; the parquet reader reads metadata by HEAD when
-            // we pass `None`. This is only an optimization opportunity.
-            let _ = path;
-            None
-        };
-        let mut deleted_rows = if batch.deletes.is_empty() {
-            Vec::new()
-        } else {
-            crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
-                &batch.deletes,
-                &factory,
-                base_table.file_io(),
-                size_lookup,
-                |path| base_first_row_ids.get(path).copied(),
-                |path| normalize_delete_projection_path(path, object_store_config),
-            )
-            .map_err(|e| e.to_string())?
-        };
-        if !batch.deleted_data_files.is_empty() {
-            let deleted_data_files = deleted_data_files_with_first_row_ids_for_reverse_projection(
-                base_table,
-                batch.previous_snapshot_id,
-                &batch.deleted_data_files,
-            )?;
-            let previous_delete_visibility =
-                crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
-                    base_table,
-                    Some(batch.previous_snapshot_id),
-                    object_store_config,
-                )?;
-            deleted_rows.extend(scan_deleted_data_file_rows_with_visibility(
-                base_table,
-                &deleted_data_files,
-                object_store_config,
-                &previous_delete_visibility,
-            )?);
-        }
-        if !batch.equality_deletes.is_empty() {
-            deleted_rows.extend(scan_equality_delete_rows_for_table(
-                base_table,
-                &batch.equality_deletes,
-                &factory,
-                object_store_config,
-            )?);
-        }
-        crate::engine::mv_flow::execute_query_for_mv_incremental_deletes(
-            state,
-            current_database,
-            sql,
-            base_ref,
-            deleted_rows,
-        )?
-    };
-
-    Ok(MaterializedChanges {
-        previous_snapshot_id: batch.previous_snapshot_id,
-        current_snapshot_id: batch.current_snapshot_id,
-        inserts,
-        deletes,
-    })
-}
-
 /// Helper for `IcebergDeltaScanOperator`: scan one position-delete file
 /// and reverse-project deleted rows from its target data file(s).
 ///
@@ -732,27 +581,6 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_equality_delete_rows_for_table_with_v3_lineage(
-        base_table,
-        std::slice::from_ref(delete),
-        factory,
-        object_store_config,
-    )
-}
-
-/// Pre-A1 helper used by the `materialize_changes` reverse-projection path
-/// and the managed-lake IVM delta source. Emits only `_row_id` on top of
-/// the base-table physical projection — callers register the result as a
-/// SQL temp table and re-run the MV SELECT, which has no use for `_file`,
-/// `_pos`, or `_last_updated_sequence_number`. New IVM-A1 / v3 callers
-/// should use the `*_with_v3_lineage` variants.
-#[allow(dead_code)]
-pub(crate) fn scan_equality_delete_rows_for_one(
-    base_table: &iceberg::table::Table,
-    delete: &EqualityDeleteRef,
-    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    scan_equality_delete_rows_for_table(
         base_table,
         std::slice::from_ref(delete),
         factory,
@@ -1141,48 +969,6 @@ pub(crate) fn base_data_file_lineage_index(
     Ok(out)
 }
 
-fn deleted_data_files_with_first_row_ids_for_reverse_projection(
-    table: &iceberg::table::Table,
-    previous_snapshot_id: i64,
-    deleted_data_files: &[DeletedDataFileRef],
-) -> Result<Vec<DeletedDataFileRef>, String> {
-    let mut out = deleted_data_files.to_vec();
-    if out.iter().all(|file| file.first_row_id.is_some()) {
-        return Ok(out);
-    }
-
-    let previous_files =
-        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
-            table,
-            previous_snapshot_id,
-        )?;
-    let first_row_ids = previous_files
-        .into_iter()
-        .map(|file| (file.path, file.first_row_id))
-        .collect::<std::collections::HashMap<_, _>>();
-    for file in &mut out {
-        if file.first_row_id.is_some() {
-            continue;
-        }
-        match first_row_ids.get(&file.path) {
-            Some(Some(first_row_id)) => file.first_row_id = Some(*first_row_id),
-            Some(None) => {
-                return Err(format!(
-                    "iceberg MV deleted-data-file reverse projection requires first_row_id for {}; previous snapshot {} does not expose Iceberg v3 row-lineage metadata",
-                    file.path, previous_snapshot_id
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "iceberg MV deleted-data-file reverse projection could not find {} in previous snapshot {}",
-                    file.path, previous_snapshot_id
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn equality_change_to_read_delete(
     delete: &EqualityDeleteRef,
 ) -> crate::connector::iceberg::read::IcebergReadDeleteFile {
@@ -1240,25 +1026,6 @@ pub(crate) fn scan_deleted_data_file_rows(
     scan_deleted_data_file_rows_with_factory(deleted_data_files, &factory, |path| {
         normalize_delete_projection_path(path, object_store_config)
     })
-    .map_err(|e| e.to_string())
-}
-
-fn scan_deleted_data_file_rows_with_visibility(
-    base_table: &iceberg::table::Table,
-    deleted_data_files: &[DeletedDataFileRef],
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
-    if deleted_data_files.is_empty() {
-        return Ok(Vec::new());
-    }
-    let factory = build_factory_for_table(base_table, object_store_config)?;
-    scan_deleted_data_file_rows_with_factory_and_visibility(
-        deleted_data_files,
-        &factory,
-        |path| normalize_delete_projection_path(path, object_store_config),
-        Some(existing_deletes_by_file),
-    )
     .map_err(|e| e.to_string())
 }
 

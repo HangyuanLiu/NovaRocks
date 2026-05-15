@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use crate::engine::catalog::{InMemoryCatalog, normalize_identifier};
+use crate::engine::catalog::normalize_identifier;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
     RefreshError, RefreshRequest,
 };
-use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult, execute_query};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
@@ -496,8 +495,8 @@ pub(crate) fn analyze_visible_output_types(
     // already present the registration failure is harmless and we proceed.
     //
     // Safety contract for this swallow path: it is safe ONLY because the production
-    // refresh path (execute_query_for_mv_refresh / execute_query_for_mv_incremental_refresh)
-    // separately calls refresh_external_tables_for_query (force=true) before execution,
+    // refresh path (execute_query_for_mv_refresh) separately calls
+    // refresh_external_tables_for_query (force=true) before execution,
     // ensuring catalog freshness. This analyzer-only path tolerates registration failure
     // when tables are already cached locally to keep test fixtures simple (tests pre-populate
     // the catalog without a live iceberg backend). If a non-refresh caller ever invokes this
@@ -630,58 +629,6 @@ pub(crate) fn validate_incremental_mv_base_ref(
     Ok(expected)
 }
 
-pub(crate) fn execute_query_for_mv_incremental_refresh(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
-    delta_files: Vec<IcebergFileForQuery>,
-) -> Result<QueryResult, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
-    };
-
-    let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
-    let is_s3 = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(&catalog_name)?.is_s3()
-    };
-    if !is_s3 && delta_files.len() > 1 {
-        return Err(
-            "incremental MV refresh over local iceberg supports at most one delta file".to_string(),
-        );
-    }
-
-    let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
-        state,
-        &catalog_name,
-        &namespace,
-        &table_name,
-        delta_files,
-    )?;
-    let mut incremental_catalog = InMemoryCatalog::default();
-    incremental_catalog.create_database(&namespace)?;
-    incremental_catalog
-        .register(&namespace, table_def)
-        .map_err(|e| format!("register incremental iceberg table: {e}"))?;
-
-    let mut executable = query.as_ref().clone();
-    strip_catalog_from_three_part_names(&mut executable);
-    execute_query(
-        &executable,
-        &incremental_catalog,
-        current_database,
-        state.exchange_port,
-        None,
-    )
-}
-
 pub(crate) fn write_mv_delete_temp_parquet(
     namespace: &str,
     table_name: &str,
@@ -731,114 +678,12 @@ pub(crate) fn write_mv_delete_temp_parquet(
     Ok((format!("file://{}", path.display()), total_size, total_rows))
 }
 
-pub(crate) fn delete_temp_table_def_from_batch_schema(
-    table_name: &str,
-    schema: arrow::datatypes::SchemaRef,
-    path: String,
-    total_size: i64,
-    total_rows: Option<i64>,
-) -> Result<crate::sql::catalog::TableDef, String> {
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| crate::sql::catalog::ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-        })
-        .collect::<Vec<_>>();
-    if !columns.iter().any(|col| col.name == "_row_id") {
-        return Err(
-            "delete-side MV temp table requires a real _row_id column in the deleted-row batch"
-                .to_string(),
-        );
-    }
-
-    Ok(crate::sql::catalog::TableDef {
-        name: table_name.to_string(),
-        columns,
-        iceberg_row_lineage_metadata_columns: vec![],
-        iceberg_table: None,
-        storage: crate::sql::catalog::TableStorage::S3ParquetFiles {
-            files: vec![crate::sql::catalog::S3FileInfo {
-                path,
-                size: total_size,
-                row_count: total_rows,
-                column_stats: None,
-                partition_spec_id: None,
-                partition_key: None,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                delete_files: vec![],
-                manifest_path: None,
-                partition_values: vec![],
-            }],
-            cloud_properties: Default::default(),
-        },
-    })
-}
-
-/// Run the MV's SELECT statement against a one-shot in-memory catalog
-/// where the base table's storage is a single temp parquet file
-/// containing the supplied deleted rows. Mirrors the insert-side
-/// `execute_query_for_mv_incremental_refresh` but without iceberg-file
-/// list construction — the caller has already projected the rows.
-///
-/// Returns the empty `QueryResult` when `deleted_rows` is empty.
-pub(crate) fn execute_query_for_mv_incremental_deletes(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
-    deleted_rows: Vec<arrow::record_batch::RecordBatch>,
-) -> Result<QueryResult, String> {
-    if deleted_rows.is_empty() {
-        return Ok(QueryResult::empty());
-    }
-
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
-    };
-    let (_catalog_name, namespace, table_name) =
-        validate_incremental_mv_base_ref(&query, base_ref)?;
-
-    let (path, total_size, total_rows) =
-        write_mv_delete_temp_parquet(&namespace, &table_name, &deleted_rows)?;
-    let table_def = delete_temp_table_def_from_batch_schema(
-        &table_name,
-        deleted_rows[0].schema(),
-        path,
-        total_size,
-        total_rows,
-    )?;
-    let mut incremental_catalog = InMemoryCatalog::default();
-    incremental_catalog.create_database(&namespace)?;
-    incremental_catalog
-        .register(&namespace, table_def)
-        .map_err(|e| format!("register delete-side iceberg table: {e}"))?;
-
-    let mut executable = query.as_ref().clone();
-    strip_catalog_from_three_part_names(&mut executable);
-    execute_query(
-        &executable,
-        &incremental_catalog,
-        current_database,
-        state.exchange_port,
-        None,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array, Int64Array};
+    use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -942,36 +787,6 @@ mod tests {
                 .map(String::as_str),
             Some("7")
         );
-    }
-
-    #[test]
-    fn mv_delete_temp_table_exposes_row_id_as_internal_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("_row_id", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![100, 101])) as ArrayRef,
-            ],
-        )
-        .expect("batch");
-
-        let table_def = super::delete_temp_table_def_from_batch_schema(
-            "t",
-            batch.schema(),
-            "file:///tmp/delete.parquet".to_string(),
-            128,
-            Some(2),
-        )
-        .expect("table def");
-
-        assert!(table_def.columns.iter().any(|col| {
-            col.name == "_row_id" && col.data_type == DataType::Int64 && !col.nullable
-        }));
-        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
     }
 
     /// Regression: the returned `total_size` must equal the on-disk parquet
