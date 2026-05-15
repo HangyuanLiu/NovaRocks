@@ -2479,17 +2479,53 @@ fn execute_plan(
     result: PlanBuildResult,
     query_opts: Option<crate::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
+    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+
+    let compiled = lower_single_fragment_to_exec_plan(result, query_opts)?;
+    let handle = ResultSinkHandle::new();
+    let output_columns = compiled.output_columns.clone();
+    run_exec_plan_with_sink_factory(compiled, Box::new(ResultSinkFactory::new(handle.clone())))?;
+
+    Ok(QueryResult {
+        columns: output_columns
+            .iter()
+            .map(|c| QueryResultColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                logical_type: None,
+            })
+            .collect(),
+        chunks: handle.take_chunks(),
+    })
+}
+
+/// SQL → ExecPlan bundle used by callers that need to mutate the plan before
+/// execution (e.g. IVM-A1 MV refresh swaps the base-scan leaf for an
+/// `IcebergDeltaScan` and replaces the result sink with a merge sink).
+pub(crate) struct CompiledExecPlan {
+    pub exec_plan: crate::exec::node::ExecPlan,
+    pub output_columns: Vec<crate::sql::codegen::OutputColumn>,
+    pub query_opts: Option<crate::internal_service::TQueryOptions>,
+}
+
+/// Lower a single-fragment Thrift `PlanBuildResult` to an in-memory `ExecPlan`
+/// plus the runtime context required to execute it. Public seam for the
+/// IVM-A1 leaf-swap path (`engine/mv/iceberg_refresh.rs`) — callers that just
+/// want results should keep using [`execute_plan`].
+pub(crate) fn lower_single_fragment_to_exec_plan(
+    result: PlanBuildResult,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<CompiledExecPlan, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
     use crate::lower::thrift::lower_plan;
-    use crate::runtime::runtime_state::RuntimeState;
 
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;
     let exec_params = result.exec_params;
+    let output_columns = result.output_columns;
 
     let mut tuple_slots = build_tuple_slot_order(Some(&desc_tbl));
     reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
@@ -2518,8 +2554,30 @@ fn execute_plan(
     };
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
-    let handle = ResultSinkHandle::new();
-    // Use available CPU cores for pipeline parallelism (capped at 8)
+    Ok(CompiledExecPlan {
+        exec_plan,
+        output_columns,
+        query_opts,
+    })
+}
+
+/// Run a previously compiled `ExecPlan` through the pipeline executor with
+/// the supplied terminal sink factory. Used by [`execute_plan`] with a
+/// `ResultSinkFactory`, and by IVM-A1 with an `IcebergMergeSinkFactory`.
+pub(crate) fn run_exec_plan_with_sink_factory(
+    compiled: CompiledExecPlan,
+    sink: Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>,
+) -> Result<(), String> {
+    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    let CompiledExecPlan {
+        exec_plan,
+        output_columns: _,
+        query_opts,
+    } = compiled;
+
+    // Use available CPU cores for pipeline parallelism (capped at 4)
     let pipeline_dop = std::thread::available_parallelism()
         .map(|p| p.get().min(4))
         .unwrap_or(4);
@@ -2527,7 +2585,7 @@ fn execute_plan(
         exec_plan,
         false,
         std::time::Duration::from_millis(10),
-        Box::new(ResultSinkFactory::new(handle.clone())),
+        sink,
         None,
         None,
         pipeline_dop as _,
@@ -2537,21 +2595,39 @@ fn execute_plan(
         None,
         None,
         None,
+    )
+}
+
+/// Compile a `sqlparser` SELECT query through analyzer → planner → optimizer
+/// → fragment-builder → thrift lowering, producing a single-fragment
+/// `CompiledExecPlan`. Errors if the optimizer produces a multi-fragment
+/// (coordinated) plan, which the leaf-swap caller cannot consume yet.
+pub(crate) fn compile_query_to_exec_plan(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<CompiledExecPlan, String> {
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        &physical,
+        catalog,
+        current_database,
     )?;
 
-    Ok(QueryResult {
-        columns: result
-            .output_columns
-            .iter()
-            .map(|c| QueryResultColumn {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-                logical_type: None,
-            })
-            .collect(),
-        chunks: handle.take_chunks(),
-    })
+    match choose_standalone_execution(build_result) {
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            lower_single_fragment_to_exec_plan(*plan, query_opts)
+        }
+        StandaloneExecutionPlan::Coordinated(_) => Err(
+            "compile_query_to_exec_plan: SELECT produces a coordinated multi-fragment plan, \
+             which is unsupported for callers that mutate ExecPlan in place"
+                .to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
