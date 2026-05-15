@@ -685,6 +685,68 @@ pub(crate) fn materialize_changes(
     })
 }
 
+/// Helper for `IcebergDeltaScanOperator`: scan one position-delete file
+/// and reverse-project deleted rows from its target data file(s).
+///
+/// Returns rows with the same projection as a regular base-table scan
+/// (including `_row_id` for A9 apply key). Each row has not yet had
+/// `__change_op` injected — the operator will add it.
+#[allow(dead_code)]
+pub(crate) fn scan_position_delete_rows_for_targets(
+    base_table: &iceberg::table::Table,
+    delete: &PositionDeleteRef,
+    base_first_row_ids: &std::collections::HashMap<String, i64>,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    let size_lookup = |_path: &str| -> Option<u64> { None };
+    crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
+        std::slice::from_ref(delete),
+        factory,
+        base_table.file_io(),
+        size_lookup,
+        |path| base_first_row_ids.get(path).copied(),
+        |path| normalize_delete_projection_path(path, object_store_config),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Helper for `IcebergDeltaScanOperator`: scan one equality-delete file
+/// and reverse-project the matching rows from its target data file(s).
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_one(
+    base_table: &iceberg::table::Table,
+    delete: &EqualityDeleteRef,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    scan_equality_delete_rows_for_table(
+        base_table,
+        std::slice::from_ref(delete),
+        factory,
+        object_store_config,
+    )
+}
+
+/// Helper for `IcebergDeltaScanOperator`: scan one deleted data file
+/// (i.e., a file that was present at previous_snapshot and removed in
+/// current snapshot). Returns the live rows from that file at the previous
+/// snapshot, applying the previous-visibility delete mask.
+#[allow(dead_code)]
+pub(crate) fn scan_one_deleted_data_file(
+    base_table: &iceberg::table::Table,
+    deleted_file: &DeletedDataFileRef,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    scan_deleted_data_file_rows_with_visibility(
+        base_table,
+        std::slice::from_ref(deleted_file),
+        object_store_config,
+        previous_delete_visibility,
+    )
+}
+
 pub(crate) fn scan_equality_delete_rows_for_table(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
