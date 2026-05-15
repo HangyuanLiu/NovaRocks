@@ -189,6 +189,67 @@ pub(crate) fn build_iceberg_table_def_with_files(
     build_iceberg_table_def_with_data_files(entry, namespace, table_name, loaded, data_files)
 }
 
+/// IVM-A1 helper: build a `TableDef` for the base table without registering
+/// any data files. Always advertises Iceberg v3 row-lineage virtual columns
+/// (`_row_id`, `_pos`, `_file`, `_last_updated_sequence_number`) when the
+/// metadata declares row-lineage, so the analyzer can resolve `_row_id`
+/// references that the IVM apply-key flow depends on, even though the
+/// `IcebergDeltaScan` operator (not the standard scan) supplies the
+/// per-snapshot files at runtime.
+///
+/// Returns Err if the table metadata does not declare v3 row-lineage; A1
+/// requires v3 row-lineage to compute the apply key.
+pub(crate) fn build_iceberg_table_def_for_delta_scan(
+    namespace: &str,
+    table_name: &str,
+    loaded: IcebergLoadedTable,
+) -> Result<TableDef, String> {
+    if !is_v3_row_lineage(loaded.table.metadata()) {
+        return Err(format!(
+            "iceberg table {namespace}.{table_name} cannot back an IVM-A1 delta scan because its \
+             metadata does not declare Iceberg v3 row-lineage; rebuild the base table with \
+             write.row-lineage=true before creating the MV"
+        ));
+    }
+    let iceberg_table = Some(build_iceberg_table_info(&loaded));
+    let columns =
+        hide_novarocks_mv_apply_key_columns(loaded.table.metadata(), loaded.columns.clone())?;
+    let storage = register_empty_iceberg_table(namespace, table_name, &loaded.columns)?;
+    let iceberg_row_lineage_metadata_columns = vec![
+        ColumnDef {
+            name: "_file".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+        },
+        ColumnDef {
+            name: "_pos".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+        },
+        ColumnDef {
+            name: "_row_id".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+        },
+        ColumnDef {
+            name: "_last_updated_sequence_number".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+        },
+    ];
+    Ok(TableDef {
+        name: table_name.to_string(),
+        columns,
+        iceberg_row_lineage_metadata_columns,
+        iceberg_table,
+        storage,
+    })
+}
+
 fn build_iceberg_table_def_with_data_files(
     entry: &IcebergCatalogEntry,
     namespace: &str,
