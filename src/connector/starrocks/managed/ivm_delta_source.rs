@@ -1,9 +1,12 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
 
 use crate::connector::iceberg::changes::{
-    IcebergChangeBatch, build_factory_for_table, normalize_delete_projection_path,
+    DeletedDataFileRef, IcebergChangeBatch, build_factory_for_table,
+    normalize_delete_projection_path, previous_snapshot_data_file_lineage_index,
     scan_deleted_data_file_rows, scan_equality_delete_rows_for_table,
 };
 use crate::connector::starrocks::managed::model::IcebergTableRef;
@@ -11,6 +14,7 @@ use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{QueryResult, StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
 
 pub(crate) struct IvmDeltaSourceFiles {
     pub previous_snapshot_id: i64,
@@ -72,9 +76,14 @@ pub(crate) fn build_delta_source_files(
             &factory,
             object_store_config,
         )?);
-        deleted_rows.extend(scan_deleted_data_file_rows(
+        let deleted_data_files = deleted_data_files_with_previous_lineage(
             &input.loaded.table,
             &batch.deleted_data_files,
+            batch.previous_snapshot_id,
+        )?;
+        deleted_rows.extend(scan_deleted_data_file_rows(
+            &input.loaded.table,
+            deleted_data_files.as_ref(),
             object_store_config,
         )?);
         if !deleted_rows.is_empty() {
@@ -185,9 +194,81 @@ fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(identifier))
 }
 
+fn deleted_data_files_with_previous_lineage<'a>(
+    table: &iceberg::table::Table,
+    deleted_data_files: &'a [DeletedDataFileRef],
+    previous_snapshot_id: i64,
+) -> Result<Cow<'a, [DeletedDataFileRef]>, String> {
+    if !deleted_data_files_need_previous_lineage(deleted_data_files) {
+        return Ok(Cow::Borrowed(deleted_data_files));
+    }
+
+    let previous_lineage = previous_snapshot_data_file_lineage_index(table, previous_snapshot_id)?;
+    let mut enriched = deleted_data_files.to_vec();
+    enrich_deleted_data_files_with_previous_lineage(&mut enriched, &previous_lineage)?;
+    Ok(Cow::Owned(enriched))
+}
+
+fn deleted_data_files_need_previous_lineage(deleted_data_files: &[DeletedDataFileRef]) -> bool {
+    deleted_data_files
+        .iter()
+        .any(|file| file.first_row_id.is_none() || file.data_sequence_number.is_none())
+}
+
+fn enrich_deleted_data_files_with_previous_lineage(
+    deleted_data_files: &mut [DeletedDataFileRef],
+    previous_lineage: &HashMap<String, BaseDataFileLineage>,
+) -> Result<(), String> {
+    for file in deleted_data_files {
+        if file.first_row_id.is_some() && file.data_sequence_number.is_some() {
+            continue;
+        }
+
+        let lineage = previous_lineage.get(&file.path).ok_or_else(|| {
+            format!(
+                "iceberg MV deleted-data-file reverse projection requires previous-snapshot \
+                 data-file lineage for {}; the previous-snapshot data-file lineage index does \
+                 not contain the file",
+                file.path
+            )
+        })?;
+        if file.first_row_id.is_none() {
+            file.first_row_id = Some(lineage.first_row_id);
+        }
+        if file.data_sequence_number.is_none() {
+            file.data_sequence_number = Some(lineage.data_sequence_number);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::projection_select_with_change_op;
+    use std::collections::HashMap;
+
+    use crate::connector::iceberg::changes::DeletedDataFileRef;
+    use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
+
+    use super::{
+        deleted_data_files_need_previous_lineage, enrich_deleted_data_files_with_previous_lineage,
+        projection_select_with_change_op,
+    };
+
+    fn deleted_ref(
+        path: &str,
+        first_row_id: Option<i64>,
+        data_sequence_number: Option<i64>,
+    ) -> DeletedDataFileRef {
+        DeletedDataFileRef {
+            path: path.to_string(),
+            size: 128,
+            record_count: Some(1),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            first_row_id,
+            data_sequence_number,
+        }
+    }
 
     #[test]
     fn projection_select_with_change_op_preserves_where_for_projection_filter() {
@@ -226,5 +307,72 @@ mod tests {
             .expect_err("non-query must fail");
 
         assert!(err.contains("expected SELECT query"));
+    }
+
+    #[test]
+    fn deleted_data_files_need_previous_lineage_only_when_metadata_is_missing() {
+        assert!(!deleted_data_files_need_previous_lineage(&[]));
+        assert!(!deleted_data_files_need_previous_lineage(&[deleted_ref(
+            "s3://bucket/full.parquet",
+            Some(10),
+            Some(20),
+        )]));
+        assert!(deleted_data_files_need_previous_lineage(&[deleted_ref(
+            "s3://bucket/missing-first.parquet",
+            None,
+            Some(20),
+        )]));
+        assert!(deleted_data_files_need_previous_lineage(&[deleted_ref(
+            "s3://bucket/missing-seq.parquet",
+            Some(10),
+            None,
+        )]));
+    }
+
+    #[test]
+    fn enrich_deleted_data_files_with_previous_lineage_fills_only_missing_metadata() {
+        let mut files = vec![
+            deleted_ref("s3://bucket/missing-first.parquet", None, Some(44)),
+            deleted_ref("s3://bucket/missing-seq.parquet", Some(55), None),
+            deleted_ref("s3://bucket/full.parquet", Some(77), Some(88)),
+        ];
+        let previous_lineage = HashMap::from([
+            (
+                "s3://bucket/missing-first.parquet".to_string(),
+                BaseDataFileLineage {
+                    first_row_id: 11,
+                    data_sequence_number: 22,
+                },
+            ),
+            (
+                "s3://bucket/missing-seq.parquet".to_string(),
+                BaseDataFileLineage {
+                    first_row_id: 33,
+                    data_sequence_number: 66,
+                },
+            ),
+        ]);
+
+        enrich_deleted_data_files_with_previous_lineage(&mut files, &previous_lineage)
+            .expect("lineage should enrich deleted files");
+
+        assert_eq!(files[0].first_row_id, Some(11));
+        assert_eq!(files[0].data_sequence_number, Some(44));
+        assert_eq!(files[1].first_row_id, Some(55));
+        assert_eq!(files[1].data_sequence_number, Some(66));
+        assert_eq!(files[2].first_row_id, Some(77));
+        assert_eq!(files[2].data_sequence_number, Some(88));
+    }
+
+    #[test]
+    fn enrich_deleted_data_files_with_previous_lineage_fails_when_lookup_is_missing() {
+        let mut files = vec![deleted_ref("s3://bucket/missing.parquet", None, Some(44))];
+        let err = enrich_deleted_data_files_with_previous_lineage(&mut files, &HashMap::new())
+            .expect_err("missing lookup must fail fast");
+
+        assert!(err.contains("s3://bucket/missing.parquet"));
+        assert!(
+            err.contains("previous-snapshot data-file lineage index does not contain the file")
+        );
     }
 }
