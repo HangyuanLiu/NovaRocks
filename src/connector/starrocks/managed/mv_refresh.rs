@@ -2191,6 +2191,155 @@ mod tests {
     }
 
     #[test]
+    fn last_refresh_snapshots_equals_pin_not_post_refresh_current() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping MV refresh pin bookkeeping test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database("insert into ice.ns.orders values (1, 'A', 10)", "default")
+            .expect("seed iceberg base row");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, customer, amount from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+        let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
+        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
+            Some(s0),
+            "initial full refresh should record the base snapshot it refreshed"
+        );
+
+        session
+            .execute_in_database("insert into ice.ns.orders values (2, 'B', 20)", "default")
+            .expect("insert base row producing s1");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot s1");
+        assert_ne!(s0, s1, "second INSERT should advance the base snapshot");
+
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let _hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (3, 'C', 30)", "default")
+                .expect("hook insert producing s2");
+            let s2 = current_orders_main_snapshot(&hook_session).expect("snapshot s2");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, hook-advanced) refresh materialized view: {err}");
+        }
+
+        let s2 = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(s1, s2, "hook INSERT should advance the base snapshot");
+        assert_eq!(
+            current_orders_main_snapshot(&session).expect("snapshot after hook refresh"),
+            s2,
+            "base table current snapshot should now be the hook-created snapshot"
+        );
+
+        let mv_after_incremental =
+            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded = mv_after_incremental
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded,
+            Some(s1),
+            "incremental refresh bookkeeping must record the refresh pin snapshot"
+        );
+        assert_ne!(
+            recorded,
+            Some(s2),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
     fn aggregate_mv_incremental_refresh_treats_deleted_data_files_as_delete_bearing() {
         let batch = crate::connector::iceberg::changes::IcebergChangeBatch {
             previous_snapshot_id: 1,
@@ -2927,6 +3076,69 @@ mod tests {
         Err(format!(
             "SHOW MATERIALIZED VIEWS did not return `{mv_name}`"
         ))
+    }
+
+    struct AfterCaptureHookGuard;
+
+    impl AfterCaptureHookGuard {
+        fn install(
+            hook: crate::connector::starrocks::managed::refresh_pin::AfterCaptureHook,
+        ) -> Self {
+            crate::connector::starrocks::managed::refresh_pin::clear_after_capture_hook();
+            crate::connector::starrocks::managed::refresh_pin::set_after_capture_hook(hook);
+            Self
+        }
+    }
+
+    impl Drop for AfterCaptureHookGuard {
+        fn drop(&mut self) {
+            crate::connector::starrocks::managed::refresh_pin::clear_after_capture_hook();
+        }
+    }
+
+    fn current_orders_main_snapshot(
+        session: &crate::engine::StandaloneSession,
+    ) -> Result<i64, String> {
+        let result = session.execute_in_database(
+            "select name, snapshot_id from ice.ns.orders$refs",
+            "default",
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("iceberg refs query must return rows".to_string());
+        };
+        for chunk in &query_result.chunks {
+            let names = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "refs name column not Utf8".to_string())?;
+            let snapshot_ids = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "refs snapshot_id column not Int64".to_string())?;
+            for row in 0..chunk.batch.num_rows() {
+                if names.value(row).eq_ignore_ascii_case("main") {
+                    return Ok(snapshot_ids.value(row));
+                }
+            }
+        }
+        Err("iceberg main ref not found".to_string())
+    }
+
+    fn load_mv_definition_from_metadata(
+        metadata_path: &std::path::Path,
+        mv_id: i64,
+    ) -> StoredMvDefinition {
+        let provider = crate::meta::SqliteMetaStoreProvider::open(metadata_path)
+            .expect("open sqlite metadata provider");
+        let read = provider.begin_read().expect("begin metadata read");
+        crate::meta::repository::mv::MvMetaRepository::default()
+            .load_by_id(read.as_ref(), mv_id)
+            .expect("load mv definition")
+            .expect("mv definition exists")
     }
 
     /// Build a TOML config file that points the standalone server at
