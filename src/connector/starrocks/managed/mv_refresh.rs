@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array};
@@ -164,15 +164,34 @@ pub(crate) fn refresh_mv(
 
     let projection_apply_shape = mv_shape.clone();
     let projection_full_primary_key_columns = mv_definition.primary_key_columns.clone();
+    let pinned_full_select_sql =
+        rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
+    let pinned_base_metadata = current_base_metadata_from_pin(&pin);
     dispatch_mv_refresh_strategy(
         &mv_shape,
         policy,
         || {
-            refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
-                run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
-            })
+            refresh_mv_full_with_pinned_executor(
+                state,
+                &db_name,
+                &mv_name,
+                pinned_full_select_sql.clone(),
+                pinned_base_metadata.clone(),
+                move |ctx| {
+                    run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
+                },
+            )
         },
-        |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
+        |shape| {
+            refresh_aggregate_mv_full_with_pinned_metadata(
+                state,
+                &db_name,
+                &mv_name,
+                shape,
+                pinned_full_select_sql.clone(),
+                pinned_base_metadata.clone(),
+            )
+        },
         |_current_snapshot_id| {
             let snapshots = pin.to_snapshot_map();
             let table_uuids = pin.to_table_uuid_map();
@@ -206,10 +225,12 @@ pub(crate) fn refresh_mv(
                             "mv_refresh fall-back to Full from projection incremental planner"
                         );
                         let primary_key_columns = mv_definition.primary_key_columns.clone();
-                        return refresh_mv_full_with_executor(
+                        return refresh_mv_full_with_pinned_executor(
                             state,
                             &db_name,
                             &mv_name,
+                            pinned_full_select_sql.clone(),
+                            pinned_base_metadata.clone(),
                             move |ctx| {
                                 run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
                             },
@@ -248,9 +269,14 @@ pub(crate) fn refresh_mv(
                         "mv_refresh fall-back to Full from projection apply policy"
                     );
                     let primary_key_columns = mv_definition.primary_key_columns.clone();
-                    return refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
-                        run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
-                    });
+                    return refresh_mv_full_with_pinned_executor(
+                        state,
+                        &db_name,
+                        &mv_name,
+                        pinned_full_select_sql.clone(),
+                        pinned_base_metadata.clone(),
+                        move |ctx| run_projection_mv_select_and_chunks(ctx, &primary_key_columns),
+                    );
                 }
             }
 
@@ -278,9 +304,8 @@ pub(crate) fn refresh_mv(
                 advance_mv_refresh_metadata_without_writes(
                     state,
                     runtime.table.table_id,
-                    base_ref,
-                    current_snapshot_id,
-                    &current_table_uuid,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
                     mv_definition.last_refresh_rows.unwrap_or(0),
                 )?;
                 refresh_managed_catalog(state)?;
@@ -352,7 +377,14 @@ pub(crate) fn refresh_mv(
                             reason = %reason,
                             "mv_refresh fall-back to Full from aggregate incremental planner"
                         );
-                        return refresh_aggregate_mv_full(state, &db_name, &mv_name, shape);
+                        return refresh_aggregate_mv_full_with_pinned_metadata(
+                            state,
+                            &db_name,
+                            &mv_name,
+                            shape,
+                            pinned_full_select_sql.clone(),
+                            pinned_base_metadata.clone(),
+                        );
                     }
                     MvRefreshPolicy::Unsupported { reason } => {
                         return Err(format!(
@@ -378,7 +410,10 @@ pub(crate) fn refresh_mv(
                 previous_refresh_rows: mv_definition.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
-                current_table_uuid: current_table_uuid.clone(),
+                refresh_snapshots: pin.to_snapshot_map(),
+                refresh_table_uuids: pin.to_table_uuid_map(),
+                pinned_full_select_sql: pinned_full_select_sql.clone(),
+                pinned_base_metadata: pinned_base_metadata.clone(),
                 loaded: &loaded,
             })
         },
@@ -443,6 +478,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn refresh_aggregate_mv_full(
     state: &Arc<StandaloneState>,
     database: &str,
@@ -451,25 +487,81 @@ fn refresh_aggregate_mv_full(
 ) -> Result<StatementResult, String> {
     let shape = shape.clone();
     refresh_mv_full_with_executor(state, database, mv_name, move |ctx| {
-        // Step 1: obtain visible-shaped output types by analyzing the ORIGINAL select_sql
-        // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
-        // (one column per visible_output), not state-shaped types (which expand AVG into
-        // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
-        let visible_output_columns =
-            analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
-
-        // Step 2: build the layout from visible types.
-        let layout =
-            super::mv_agg_state::build_aggregate_mv_layout(&shape, &visible_output_columns)?;
-
-        // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
-        // it to obtain the actual state-shaped data.
-        let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, &shape)?;
-        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
-
-        // Step 4: materialize state-shaped executor result using the visible-type layout.
-        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, &shape)
+        execute_aggregate_mv_full_refresh(ctx, &shape)
     })
+}
+
+fn refresh_aggregate_mv_full_with_pinned_metadata(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    shape: &super::mv_shape::AggregateMvShape,
+    pinned_select_sql: String,
+    base_metadata: CurrentBaseMetadata,
+) -> Result<StatementResult, String> {
+    let shape = shape.clone();
+    refresh_mv_full_with_pinned_executor(
+        state,
+        database,
+        mv_name,
+        pinned_select_sql,
+        base_metadata,
+        move |ctx| execute_aggregate_mv_full_refresh(ctx, &shape),
+    )
+}
+
+fn execute_aggregate_mv_full_refresh(
+    ctx: MvRefreshContext,
+    shape: &super::mv_shape::AggregateMvShape,
+) -> Result<Vec<Chunk>, String> {
+    // Step 1: obtain visible-shaped output types by analyzing the refresh SELECT
+    // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
+    // (one column per visible_output), not state-shaped types (which expand AVG into
+    // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
+    let visible_output_columns =
+        analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
+
+    // Step 2: build the layout from visible types.
+    let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &visible_output_columns)?;
+
+    // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
+    // it to obtain the actual state-shaped data.
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, shape)?;
+    let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
+
+    // Step 4: materialize state-shaped executor result using the visible-type layout.
+    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, shape)
+}
+
+fn rewrite_full_refresh_select_with_pin(
+    select_sql: &str,
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    base_ref: &IcebergTableRef,
+) -> Result<String, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("full refresh pin SELECT normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("full refresh pin SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("full refresh pin SELECT expects a SELECT query".to_string());
+    };
+    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+        query,
+        pin,
+        &HashSet::new(),
+        Some(&base_ref.catalog),
+        &base_ref.namespace,
+    )?;
+    Ok(stmt.to_string())
+}
+
+fn current_base_metadata_from_pin(
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+) -> CurrentBaseMetadata {
+    CurrentBaseMetadata {
+        snapshots: pin.to_snapshot_map(),
+        table_uuids: pin.to_table_uuid_map(),
+    }
 }
 
 fn change_batch_has_deletes(
@@ -492,7 +584,10 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
-    current_table_uuid: String,
+    refresh_snapshots: BTreeMap<String, i64>,
+    refresh_table_uuids: BTreeMap<String, String>,
+    pinned_full_select_sql: String,
+    pinned_base_metadata: CurrentBaseMetadata,
     loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 
@@ -520,7 +615,14 @@ fn refresh_aggregate_mv_incremental(
                 reason = %reason,
                 "mv_refresh fall-back to Full from apply policy"
             );
-            return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+            return refresh_aggregate_mv_full_with_pinned_metadata(
+                ctx.state,
+                ctx.database,
+                ctx.mv_name,
+                ctx.shape,
+                ctx.pinned_full_select_sql.clone(),
+                ctx.pinned_base_metadata.clone(),
+            );
         }
     }
 
@@ -551,9 +653,8 @@ fn refresh_aggregate_mv_incremental(
         advance_mv_refresh_metadata_without_writes(
             ctx.state,
             ctx.table_id,
-            ctx.base_ref,
-            ctx.current_snapshot_id,
-            &ctx.current_table_uuid,
+            ctx.refresh_snapshots.clone(),
+            ctx.refresh_table_uuids.clone(),
             ctx.previous_refresh_rows,
         )?;
         refresh_managed_catalog(ctx.state)?;
@@ -586,7 +687,14 @@ fn refresh_aggregate_mv_incremental(
                     error = %err,
                     "mv_refresh fall-back to Full from signed delta aggregate rewrite"
                 );
-                return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+                return refresh_aggregate_mv_full_with_pinned_metadata(
+                    ctx.state,
+                    ctx.database,
+                    ctx.mv_name,
+                    ctx.shape,
+                    ctx.pinned_full_select_sql.clone(),
+                    ctx.pinned_base_metadata.clone(),
+                );
             }
             Err(err) => return Err(err),
         };
@@ -611,8 +719,6 @@ fn refresh_aggregate_mv_incremental(
         },
         PartitionTarget::Active,
     )?;
-    let snapshots = single_snapshot_map(ctx.base_ref, ctx.current_snapshot_id);
-    let table_uuids = single_table_uuid_map(ctx.base_ref, &ctx.current_table_uuid);
     write_chunks_into_managed_partition_for_aggregate_mv_upsert(
         ctx.state,
         plan,
@@ -621,8 +727,8 @@ fn refresh_aggregate_mv_incremental(
         MvRefreshWriteMetadata {
             table_id: ctx.table_id,
             previous_refresh_rows: ctx.previous_refresh_rows,
-            snapshots,
-            table_uuids,
+            snapshots: ctx.refresh_snapshots,
+            table_uuids: ctx.refresh_table_uuids,
         },
     )?;
     refresh_managed_catalog(ctx.state)?;
@@ -632,24 +738,59 @@ fn refresh_aggregate_mv_incremental(
 fn advance_mv_refresh_metadata_without_writes(
     state: &Arc<StandaloneState>,
     table_id: i64,
-    base_ref: &IcebergTableRef,
-    current_snapshot_id: i64,
-    current_table_uuid: &str,
+    refresh_snapshots: BTreeMap<String, i64>,
+    refresh_table_uuids: BTreeMap<String, String>,
     last_refresh_rows: i64,
 ) -> Result<(), String> {
     update_managed_mv_refresh_summary(
         state,
         table_id,
         last_refresh_rows,
-        single_snapshot_map(base_ref, current_snapshot_id),
-        single_table_uuid_map(base_ref, current_table_uuid),
+        refresh_snapshots,
+        refresh_table_uuids,
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn refresh_mv_full_with_executor<F>(
     state: &Arc<StandaloneState>,
     database: &str,
     mv_name: &str,
+    executor: F,
+) -> Result<StatementResult, String>
+where
+    F: FnOnce(MvRefreshContext) -> Result<Vec<Chunk>, String>,
+{
+    refresh_mv_full_with_executor_inner(state, database, mv_name, None, None, executor)
+}
+
+fn refresh_mv_full_with_pinned_executor<F>(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    pinned_select_sql: String,
+    base_metadata: CurrentBaseMetadata,
+    executor: F,
+) -> Result<StatementResult, String>
+where
+    F: FnOnce(MvRefreshContext) -> Result<Vec<Chunk>, String>,
+{
+    refresh_mv_full_with_executor_inner(
+        state,
+        database,
+        mv_name,
+        Some(pinned_select_sql),
+        Some(base_metadata),
+        executor,
+    )
+}
+
+fn refresh_mv_full_with_executor_inner<F>(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    select_sql_override: Option<String>,
+    base_metadata_override: Option<CurrentBaseMetadata>,
     executor: F,
 ) -> Result<StatementResult, String>
 where
@@ -710,7 +851,7 @@ where
     let chunks = match executor(MvRefreshContext {
         state: Arc::clone(state),
         database: database.to_string(),
-        select_sql: mv_definition.select_sql.clone(),
+        select_sql: select_sql_override.unwrap_or_else(|| mv_definition.select_sql.clone()),
     }) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -746,13 +887,18 @@ where
         }
     };
 
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let base_metadata = collect_current_base_metadata_or_cleanup_staged_partition(
-        state,
-        runtime.table.table_id,
-        &staged,
-        &base_refs,
-    )?;
+    let base_metadata = match base_metadata_override {
+        Some(metadata) => metadata,
+        None => {
+            let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+            collect_current_base_metadata_or_cleanup_staged_partition(
+                state,
+                runtime.table.table_id,
+                &staged,
+                &base_refs,
+            )?
+        }
+    };
     if let Err(err) = activate_managed_mv_refresh_partition(
         state,
         runtime.table.table_id,
@@ -1688,10 +1834,17 @@ mod tests {
             table: "orders".to_string(),
         };
         let snapshots = single_snapshot_map(&base_ref, 42);
+        let table_uuids = single_table_uuid_map(&base_ref, "uuid-1");
         begin_mv_refresh_intent(&state, table_id, snapshots.clone()).expect("begin refresh");
 
-        advance_mv_refresh_metadata_without_writes(&state, table_id, &base_ref, 42, "uuid-1", 17)
-            .expect("advance metadata");
+        advance_mv_refresh_metadata_without_writes(
+            &state,
+            table_id,
+            snapshots.clone(),
+            table_uuids,
+            17,
+        )
+        .expect("advance metadata");
 
         let provider = state.metadata_provider.as_ref().expect("metadata provider");
         let read = provider.begin_read().expect("read");
