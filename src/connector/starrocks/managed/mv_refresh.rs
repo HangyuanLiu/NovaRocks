@@ -2343,6 +2343,196 @@ mod tests {
     }
 
     #[test]
+    fn pin_freeze_against_concurrent_commit() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping MV refresh pin freeze acceptance test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 10), (2, 20)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+        let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
+        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
+            Some(s0),
+            "initial full refresh should record the seeded base snapshot"
+        );
+
+        session
+            .execute_in_database("insert into ice.ns.orders values (3, 30)", "default")
+            .expect("insert base row producing s1");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot s1");
+        assert_ne!(s0, s1, "external INSERT should advance the base snapshot");
+
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (4, 40)", "default")
+                .expect("hook insert producing s2");
+            let s2 = current_orders_main_snapshot(&hook_session).expect("snapshot s2");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on pinned incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, hook-advanced) refresh materialized view: {err}");
+        }
+
+        let s2 = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(s1, s2, "hook INSERT should advance the base snapshot");
+        let rows_after_pinned_refresh =
+            collect_projection_mv_rows(&session).expect("select pinned refresh MV rows");
+        assert_eq!(
+            rows_after_pinned_refresh,
+            vec![(1, 11), (2, 21), (3, 31)],
+            "refresh pinned at s1 must not include the concurrent s2 row"
+        );
+
+        let mv_after_pinned_refresh =
+            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded_after_pinned_refresh = mv_after_pinned_refresh
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded_after_pinned_refresh,
+            Some(s1),
+            "incremental refresh bookkeeping must record the refresh pin snapshot"
+        );
+        assert_ne!(
+            recorded_after_pinned_refresh,
+            Some(s2),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+        drop(hook_guard);
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on follow-up refresh: {err}"
+                );
+                return;
+            }
+            panic!("third (follow-up) refresh materialized view: {err}");
+        }
+
+        let rows_after_follow_up =
+            collect_projection_mv_rows(&session).expect("select follow-up refresh MV rows");
+        assert_eq!(
+            rows_after_follow_up,
+            vec![(1, 11), (2, 21), (3, 31), (4, 41)],
+            "follow-up refresh should pick up the post-pin base row"
+        );
+        let current_snapshot =
+            current_orders_main_snapshot(&session).expect("snapshot after follow-up refresh");
+        assert_eq!(
+            current_snapshot, s2,
+            "no additional base commit should happen after the hook insert"
+        );
+        let mv_after_follow_up = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_follow_up
+                .last_refresh_snapshots
+                .get(&base_key)
+                .copied(),
+            Some(s2),
+            "follow-up refresh should record the current base snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
     fn aggregate_mv_incremental_refresh_treats_deleted_data_files_as_delete_bearing() {
         let batch = crate::connector::iceberg::changes::IcebergChangeBatch {
             previous_snapshot_id: 1,
@@ -3029,6 +3219,39 @@ mod tests {
                     counts.value(i),
                     sums.value(i),
                 ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn collect_projection_mv_rows(
+        session: &crate::engine::StandaloneSession,
+    ) -> Result<Vec<(i64, i64)>, String> {
+        let result = session.execute_in_context(
+            "select id, amount_plus_one from orders_mv order by id",
+            None,
+            "analytics",
+            None,
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("select from orders_mv must return rows".to_string());
+        };
+        let mut out = Vec::new();
+        for chunk in &query_result.chunks {
+            let ids = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "orders_mv id column not Int64".to_string())?;
+            let amount_plus_one = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "orders_mv amount_plus_one column not Int64".to_string())?;
+            for row in 0..chunk.batch.num_rows() {
+                out.push((ids.value(row), amount_plus_one.value(row)));
             }
         }
         Ok(out)
