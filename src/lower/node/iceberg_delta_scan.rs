@@ -87,41 +87,13 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let loaded =
         crate::connector::iceberg::catalog::load_table(&entry, &payload.namespace, &payload.table)?;
 
-    // A1 contract: to_snapshot_id must match the base table's current snapshot.
-    // plan_changes walks lineage backward from current; if to_snapshot_id differs,
-    // the result would silently diverge from caller intent.
-    // A2 follow-up: relax this guard to support historical to_snapshot_id pins.
-    let current_snapshot_id = loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| {
-            format!(
-                "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): base table has no current snapshot",
-                payload.catalog, payload.namespace, payload.table,
-            )
-        })?;
-    if payload.to_snapshot_id != current_snapshot_id {
-        return Err(format!(
-            "ivm-a1 lower delta-scan (node_id={node_id}, {}.{}.{}): to_snapshot_id={} does not match base table current snapshot {}; \
-             A1 only supports current-snapshot reads. Pinning to a historical to_snapshot_id is reserved for A2.",
-            payload.catalog,
-            payload.namespace,
-            payload.table,
-            payload.to_snapshot_id,
-            current_snapshot_id,
-        ));
-    }
-
-    // Compute the change batch from the lineage. The snapshot interval is
-    // (from_snapshot_id, to_snapshot_id] semantically; `plan_changes`
-    // walks the lineage backward from the current snapshot (validated above
-    // to equal to_snapshot_id).
+    // The snapshot interval is (from_snapshot_id, to_snapshot_id] semantically.
+    // Lineage validation (to in metadata, from is a descendant ancestor of to)
+    // is enforced by plan_changes / classify_lineage.
     let batch = crate::connector::iceberg::changes::plan_changes(
         &loaded.table,
         payload.from_snapshot_id,
-        None,
+        Some(payload.to_snapshot_id),
         &[],
     )
     .map_err(|e| {
