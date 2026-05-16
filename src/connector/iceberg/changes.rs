@@ -262,6 +262,11 @@ impl PositionDeleteRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergChangeBatch {
     pub previous_snapshot_id: i64,
+    /// The resolved upper endpoint of the planned lineage. When `plan_changes`
+    /// was called with `to_snapshot_id = None`, this equals `table.metadata().current_snapshot()`
+    /// at the time of the call. When called with `to_snapshot_id = Some(id)`, this
+    /// equals `id`. Do not assume this matches the table's current snapshot
+    /// at any later moment; callers that need that invariant must check explicitly.
     pub current_snapshot_id: i64,
     pub inserts: Vec<DataFileRef>,
     pub deletes: Vec<PositionDeleteRef>,
@@ -411,26 +416,26 @@ fn validate_replace_snapshot(
     Ok(())
 }
 
-/// Walk the parent chain from `current_snapshot` back to
-/// `previous_snapshot_id`, dispatching each node through
+/// Walk the explicit lineage range from `previous_snapshot_id` (exclusive) to
+/// `current_snapshot_id` (inclusive), dispatching each node through
 /// `classify_snapshot`. Performs no I/O.
 ///
 /// Errors:
-/// - `LineageBroken` when `previous_snapshot_id` is not an ancestor of
-///   the current snapshot (its metadata entry has been pruned, or the
-///   chain runs off its root).
+/// - `LineageBroken` when `current_snapshot_id` is missing, or when
+///   `previous_snapshot_id` is not an ancestor of `current_snapshot_id`
+///   (its metadata entry has been pruned, or the chain runs off its root).
 /// - `UnsupportedOperation` / `ReplaceValidationFailed` propagated from
 ///   `classify_snapshot`.
 pub(crate) fn classify_lineage(
     metadata: &iceberg::spec::TableMetadata,
     previous_snapshot_id: i64,
+    current_snapshot_id: i64,
 ) -> Result<LineagePlan, ChangeError> {
-    let current_snapshot = metadata.current_snapshot().ok_or_else(|| {
-        ChangeError::InternalInconsistency(
-            "classify_lineage: table has no current snapshot".to_string(),
-        )
-    })?;
-    let current_snapshot_id = current_snapshot.snapshot_id();
+    let current_snapshot = metadata
+        .snapshot_by_id(current_snapshot_id)
+        .ok_or(ChangeError::LineageBroken {
+            previous_snapshot: previous_snapshot_id,
+        })?;
 
     if current_snapshot_id == previous_snapshot_id {
         return Ok(LineagePlan {
@@ -447,17 +452,9 @@ pub(crate) fn classify_lineage(
     }
 
     let mut actions_reversed: Vec<LineageAction> = Vec::new();
-    let mut cursor = current_snapshot_id;
+    let mut current = current_snapshot;
     loop {
-        if cursor == previous_snapshot_id {
-            break;
-        }
-        let snapshot_ref = metadata
-            .snapshot_by_id(cursor)
-            .ok_or(ChangeError::LineageBroken {
-                previous_snapshot: previous_snapshot_id,
-            })?;
-        let snapshot = snapshot_ref.as_ref();
+        let snapshot = current.as_ref();
         let parent_id = snapshot.parent_snapshot_id();
         let parent = parent_id
             .and_then(|id| metadata.snapshot_by_id(id))
@@ -468,7 +465,14 @@ pub(crate) fn classify_lineage(
         }
 
         match parent_id {
-            Some(id) => cursor = id,
+            Some(id) if id == previous_snapshot_id => break,
+            Some(id) => {
+                current = metadata
+                    .snapshot_by_id(id)
+                    .ok_or(ChangeError::LineageBroken {
+                        previous_snapshot: previous_snapshot_id,
+                    })?;
+            }
             None => {
                 // Walked off the root without finding previous_snapshot_id.
                 return Err(ChangeError::LineageBroken {
@@ -487,28 +491,37 @@ pub(crate) fn classify_lineage(
 }
 
 /// Public entrypoint for snapshot-lineage change planning. Walks the
-/// lineage from `previous_snapshot_id` (exclusive) to the table's
-/// current snapshot (inclusive), classifies each snapshot operation,
-/// and assembles `IcebergChangeBatch { inserts, deletes }`.
+/// lineage from `previous_snapshot_id` (exclusive) to `to_snapshot_id`
+/// (inclusive). When `to_snapshot_id` is `None`, defaults to the table's
+/// current snapshot (preserves legacy behavior).
+///
+/// The returned `IcebergChangeBatch.current_snapshot_id` field reflects
+/// the *resolved* to_snapshot_id (i.e. the actual right endpoint of the
+/// walked lineage), which may differ from `table.metadata().current_snapshot()`
+/// when the caller pins to a historical snapshot.
 ///
 /// The `_pk_columns` parameter is reserved for future delete-side row-id
 /// computation; snapshot lineage planning itself does not need it yet.
 pub(crate) fn plan_changes(
     table: &iceberg::table::Table,
     previous_snapshot_id: i64,
+    to_snapshot_id: Option<i64>,
     _pk_columns: &[String],
 ) -> Result<IcebergChangeBatch, ChangeError> {
     let metadata = table.metadata();
-    let current_snapshot_id = metadata
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| {
-            ChangeError::InternalInconsistency(
-                "plan_changes: table has no current snapshot".to_string(),
-            )
-        })?;
+    let current_snapshot_id = match to_snapshot_id {
+        Some(id) => id,
+        None => metadata
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(
+                    "plan_changes: table has no current snapshot".to_string(),
+                )
+            })?,
+    };
 
-    let plan = classify_lineage(metadata, previous_snapshot_id)?;
+    let plan = classify_lineage(metadata, previous_snapshot_id, current_snapshot_id)?;
     if plan.actions.is_empty() {
         return Ok(IcebergChangeBatch {
             previous_snapshot_id,
@@ -588,6 +601,25 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
     )
 }
 
+/// Snapshot-pinned variant of
+/// `scan_equality_delete_rows_for_one_with_v3_lineage`.
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
+    base_table: &iceberg::table::Table,
+    delete: &EqualityDeleteRef,
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    scan_equality_delete_rows_for_table_with_v3_lineage_at(
+        base_table,
+        std::slice::from_ref(delete),
+        snapshot_id,
+        factory,
+        object_store_config,
+    )
+}
+
 /// Helper for `IcebergDeltaScanOperator`: scan one freshly-added data file
 /// (snapshot diff INSERT side). Returns raw rows with the base-table physical
 /// projection. `__change_op` is injected by the operator.
@@ -626,6 +658,7 @@ pub(crate) fn scan_one_deleted_data_file(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_table(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
@@ -636,6 +669,40 @@ pub(crate) fn scan_equality_delete_rows_for_table(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    scan_equality_delete_rows_for_snapshot(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+pub(crate) fn scan_equality_delete_rows_for_table_at(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    scan_equality_delete_rows_for_snapshot(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+fn scan_equality_delete_rows_for_snapshot(
+    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
@@ -682,6 +749,43 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
         return Ok(Vec::new());
     }
     let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+/// Snapshot-pinned variant of
+/// `scan_equality_delete_rows_for_table_with_v3_lineage`.
+#[allow(dead_code)]
+pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
+    table: &iceberg::table::Table,
+    equality_deletes: &[EqualityDeleteRef],
+    snapshot_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if equality_deletes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read_snapshot =
+        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
+    scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+        &read_snapshot,
+        equality_deletes,
+        factory,
+        object_store_config,
+    )
+}
+
+fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
+    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    equality_deletes: &[EqualityDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let mut out = Vec::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
@@ -932,11 +1036,8 @@ where
 }
 
 /// Build a path -> v3 row-lineage index over the base table's current
-/// snapshot. Used by the `IcebergDeltaScanOperator` delete-side scanners
-/// to look up `first_row_id` and `data_sequence_number` for each target
-/// data file referenced by a position/equality/deleted-data-file role,
-/// so the operator can synthesize the four v3 row-lineage virtual columns
-/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+/// snapshot. Current-snapshot callers keep legacy behavior; historical
+/// delta-scan callers should use `base_data_file_lineage_index_at`.
 pub(crate) fn base_data_file_lineage_index(
     table: &iceberg::table::Table,
 ) -> Result<
@@ -947,15 +1048,13 @@ pub(crate) fn base_data_file_lineage_index(
     build_data_file_lineage_index_from_snapshot(&read_snapshot)
 }
 
-/// Build a (file_path -> first_row_id / data_sequence_number) index from the
-/// data files alive in a specific snapshot. Distinct from
-/// `base_data_file_lineage_index` (which reads the current snapshot) — this
-/// is used to look up the original `first_row_id` of a file that was
-/// OVERWRITE-deleted between the MV's previous-refresh snapshot and the
-/// current snapshot. The deleted file is no longer alive in current, but
-/// it WAS alive at `previous_snapshot_id`, where its first_row_id is
-/// faithfully readable via the iceberg-rust per-manifest inheritance.
-pub(crate) fn previous_snapshot_data_file_lineage_index(
+/// Build a path -> v3 row-lineage index over a specific base table snapshot.
+/// Used by the `IcebergDeltaScanOperator` delete-side scanners to look up
+/// `first_row_id` and `data_sequence_number` for each target data file
+/// referenced by a position/equality/deleted-data-file role,
+/// so the operator can synthesize the four v3 row-lineage virtual columns
+/// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
+pub(crate) fn base_data_file_lineage_index_at(
     table: &iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
@@ -965,6 +1064,25 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
     let read_snapshot =
         crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
     build_data_file_lineage_index_from_snapshot(&read_snapshot)
+}
+
+/// Build a (file_path -> first_row_id / data_sequence_number) index from the
+/// data files alive in a specific snapshot. Distinct from
+/// `base_data_file_lineage_index_at` at the delta-scan upper endpoint: this
+/// is used to look up the original `first_row_id` of a file that was
+/// OVERWRITE-deleted between the MV's previous-refresh snapshot and the
+/// planned upper snapshot. The deleted file is no longer alive at that upper
+/// endpoint, but it WAS alive at `previous_snapshot_id`, where its
+/// first_row_id is faithfully readable via iceberg-rust per-manifest
+/// inheritance.
+pub(crate) fn previous_snapshot_data_file_lineage_index(
+    table: &iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<
+    std::collections::HashMap<String, crate::exec::node::iceberg_delta_scan::BaseDataFileLineage>,
+    String,
+> {
+    base_data_file_lineage_index_at(table, snapshot_id)
 }
 
 fn build_data_file_lineage_index_from_snapshot(
@@ -2397,7 +2515,7 @@ mod tests {
 
         insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
         let loaded = load_table(&entry, "ns", "orders").expect("load second");
-        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan");
+        let batch = plan_changes(&loaded.table, previous, None, &[]).expect("plan");
         assert_eq!(batch.previous_snapshot_id, previous);
         assert_eq!(
             batch.current_snapshot_id,
@@ -2517,7 +2635,7 @@ mod tests {
 
         entry.invalidate_table_cache("ns", "orders");
         let loaded = load_table(&entry, "ns", "orders").expect("load overwrite");
-        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan overwrite");
+        let batch = plan_changes(&loaded.table, previous, None, &[]).expect("plan overwrite");
 
         assert_eq!(batch.inserts.len(), 1);
         assert_eq!(batch.deleted_data_files.len(), 1);
@@ -2538,6 +2656,245 @@ mod tests {
                 .map(|f| f.record_count.unwrap_or_default())
                 .sum::<i64>(),
             2
+        );
+    }
+
+    #[test]
+    fn plan_changes_to_none_equivalent_to_to_some_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+        let current = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        let batch_none = plan_changes(&loaded.table, previous, None, &[]).expect("none");
+        let batch_some = plan_changes(&loaded.table, previous, Some(current), &[]).expect("some");
+
+        assert_eq!(
+            batch_none.previous_snapshot_id,
+            batch_some.previous_snapshot_id
+        );
+        assert_eq!(
+            batch_none.current_snapshot_id,
+            batch_some.current_snapshot_id
+        );
+        assert_eq!(batch_none.inserts.len(), batch_some.inserts.len());
+        assert_eq!(batch_none.deletes.len(), batch_some.deletes.len());
+    }
+
+    #[test]
+    fn plan_changes_to_is_strict_ancestor_of_from_returns_lineage_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+        let s1 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        let err =
+            plan_changes(&loaded.table, s1, Some(s0), &[]).expect_err("ancestor not descendant");
+        assert!(
+            matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == s1),
+            "expected LineageBroken with previous_snapshot={s1}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_changes_truncates_to_middle_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1 append A");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+        let s1 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(3)]]).expect("snap s2 append B");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s2");
+        let s2 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(4)]]).expect("snap s3 append C");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s3");
+        let s3 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        assert_ne!(s0, s1);
+        assert_ne!(s1, s2);
+        assert_ne!(s2, s3);
+
+        let batch_mid = plan_changes(&loaded.table, s0, Some(s2), &[]).expect("truncate");
+        assert_eq!(batch_mid.previous_snapshot_id, s0);
+        assert_eq!(batch_mid.current_snapshot_id, s2);
+        let mid_files: i64 = batch_mid
+            .inserts
+            .iter()
+            .map(|f| f.record_count.unwrap_or_default())
+            .sum();
+
+        let batch_full = plan_changes(&loaded.table, s0, Some(s3), &[]).expect("full");
+        let full_files: i64 = batch_full
+            .inserts
+            .iter()
+            .map(|f| f.record_count.unwrap_or_default())
+            .sum();
+
+        assert!(
+            mid_files < full_files,
+            "mid-ancestor truncation should yield fewer rows: mid={mid_files} full={full_files}"
+        );
+    }
+
+    #[test]
+    fn plan_changes_to_snapshot_id_expired_returns_lineage_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("snap s0");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s0");
+        let s0 = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("snap s1");
+        let loaded = load_table(&entry, "ns", "orders").expect("load s1");
+
+        let pruned_metadata = loaded
+            .table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .remove_snapshots(&[s0])
+            .build()
+            .expect("pruned metadata")
+            .metadata;
+        let pruned_table = iceberg::table::Table::builder()
+            .file_io(loaded.table.file_io().clone())
+            .metadata(std::sync::Arc::new(pruned_metadata))
+            .identifier(loaded.table.identifier().clone())
+            .build()
+            .expect("pruned table");
+
+        let from = s0 + 1;
+        let err = plan_changes(&pruned_table, from, Some(s0), &[]).expect_err("expired to");
+        assert!(
+            matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == from),
+            "expected LineageBroken, got {err:?}"
         );
     }
 
@@ -2679,7 +3036,7 @@ mod tests {
             .build()
             .expect("pruned table");
 
-        let err = plan_changes(&pruned_table, previous, &[]).expect_err("should fail");
+        let err = plan_changes(&pruned_table, previous, None, &[]).expect_err("should fail");
         assert!(
             matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == previous)
         );

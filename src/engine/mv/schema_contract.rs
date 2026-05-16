@@ -140,25 +140,50 @@ pub(crate) fn validate_schema_contract(
     current_base_table: &iceberg::table::Table,
     current_target_table: &iceberg::table::Table,
 ) -> ContractDecision {
+    validate_schema_contract_with_base_schema(
+        contract,
+        current_base_table,
+        current_base_table.metadata().current_schema(),
+        current_target_table,
+    )
+}
+
+pub(crate) fn validate_schema_contract_with_base_schema(
+    contract: &MvSchemaContract,
+    current_base_table: &iceberg::table::Table,
+    base_schema: &iceberg::spec::Schema,
+    current_target_table: &iceberg::table::Table,
+) -> ContractDecision {
     // Stage 1: identity guard.
     if let Some(err) = validate_identity_guards(contract, current_base_table, current_target_table)
     {
         return ContractDecision::Incompatible(err);
     }
+    validate_schema_contract_after_identity(
+        contract,
+        base_schema,
+        current_target_table.metadata().current_schema(),
+    )
+}
+
+fn validate_schema_contract_after_identity(
+    contract: &MvSchemaContract,
+    base_schema: &iceberg::spec::Schema,
+    target_schema: &iceberg::spec::Schema,
+) -> ContractDecision {
     // Stage 2 fast path.
-    if current_base_table.metadata().current_schema_id() == contract.base.schema_id_at_create
-        && current_target_table.metadata().current_schema_id()
-            == contract.target.schema_id_at_create
+    if base_schema.schema_id() == contract.base.schema_id_at_create
+        && target_schema.schema_id() == contract.target.schema_id_at_create
     {
         return ContractDecision::CompatibleSafe;
     }
     // Stage 2 precise base check.
-    let rebound = match check_base_referenced_fields(contract, current_base_table) {
+    let rebound = match check_base_referenced_fields(contract, base_schema) {
         Err(err) => return ContractDecision::Incompatible(err),
         Ok(r) => r,
     };
     // Stage 3 target check.
-    if let Some(err) = check_target_schema(contract, current_target_table) {
+    if let Some(err) = check_target_schema(contract, target_schema) {
         return ContractDecision::Incompatible(err);
     }
     if rebound.is_empty() {
@@ -221,9 +246,9 @@ fn validate_identity_guards(
 
 fn check_base_referenced_fields(
     contract: &MvSchemaContract,
-    base: &iceberg::table::Table,
+    base_schema: &iceberg::spec::Schema,
 ) -> Result<Vec<(i32, String, String)>, SchemaEvolutionError> {
-    let current = base.metadata().current_schema().as_struct();
+    let current = base_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &contract.base.schema_at_create.fields {
         let Some(field) = current.fields().iter().find(|f| f.id == record.field_id) else {
@@ -254,9 +279,9 @@ fn check_base_referenced_fields(
 
 fn check_target_schema(
     contract: &MvSchemaContract,
-    target: &iceberg::table::Table,
+    target_schema: &iceberg::spec::Schema,
 ) -> Option<SchemaEvolutionError> {
-    let current = target.metadata().current_schema().as_struct();
+    let current = target_schema.as_struct();
     for tv in &contract.target.visible_columns {
         let Some(field) = current.fields().iter().find(|f| f.id == tv.target_field_id) else {
             return Some(SchemaEvolutionError::TargetVisibleFieldDropped {
@@ -328,6 +353,12 @@ fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::repository::mv_contract::{
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, OutputColumnLineage, OutputContract,
+        TargetContract, TargetVisibleColumn,
+    };
+    use std::sync::Arc;
 
     // NOTE: building real `iceberg::table::Table` instances is heavy.
     // These tests cover the SchemaEvolutionError Display + the
@@ -374,5 +405,87 @@ mod tests {
             name_at_create: "amount".into(),
         });
         let _ = err; // just ensure it compiles
+    }
+
+    #[test]
+    fn supplied_base_schema_drives_base_rebind_decision() {
+        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "renamed_id",
+                base_type.clone(),
+            ))])
+            .build()
+            .expect("base schema");
+        let target_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    target_type.clone(),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("target schema");
+        let contract = MvSchemaContract {
+            contract_version: 1,
+            base: BaseContract {
+                table_fqn: "ice.db.orders".to_string(),
+                table_uuid: "base-uuid".to_string(),
+                schema_id_at_create: 1,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![BaseFieldRecord {
+                        field_id: 1,
+                        name_at_create: "id".to_string(),
+                        type_signature: format!("{base_type}"),
+                        required: true,
+                    }],
+                },
+            },
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![1],
+                    },
+                }],
+                filter: None,
+            },
+            target: TargetContract {
+                table_fqn: "ice.db.mv_orders".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 11,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: format!("{target_type}"),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::BaseRowId,
+                },
+            },
+        };
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        assert_eq!(
+            decision,
+            ContractDecision::CompatibleSafeWithRebind {
+                rebound_columns: vec![(1, "id".to_string(), "renamed_id".to_string())],
+            }
+        );
     }
 }

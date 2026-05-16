@@ -2,7 +2,7 @@
 //! tables in the current Iceberg catalog. Aggregate shapes (phase4b) and any
 //! unsupported MV definitions are rejected here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -546,6 +546,53 @@ fn recorded_target_snapshot_id(
         })
 }
 
+fn rewrite_full_refresh_select_with_pin(
+    select_sql: &str,
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    base_ref: &IcebergTableRef,
+) -> Result<String, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("iceberg MV full refresh pin SELECT normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("iceberg MV full refresh pin SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("iceberg MV full refresh pin SELECT expects a SELECT query".to_string());
+    };
+    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+        query,
+        pin,
+        &HashSet::new(),
+        Some(&base_ref.catalog),
+        &base_ref.namespace,
+    )?;
+    Ok(stmt.to_string())
+}
+
+fn resolve_pinned_base_schema(
+    base_ref: &IcebergTableRef,
+    table: &iceberg::table::Table,
+    pinned_snapshot_id: Option<i64>,
+) -> Result<Arc<iceberg::spec::Schema>, String> {
+    let snapshot_id = pinned_snapshot_id.ok_or_else(|| {
+        format!(
+            "refresh pin missing snapshot for base {} after non-empty base probe",
+            base_ref.fqn()
+        )
+    })?;
+    let snapshot = table.metadata().snapshot_by_id(snapshot_id).ok_or_else(|| {
+        format!(
+            "refresh pin snapshot {snapshot_id} for base {} is missing from post-pin loaded table metadata",
+            base_ref.fqn()
+        )
+    })?;
+    snapshot.schema(table.metadata()).map_err(|e| {
+        format!(
+            "refresh pin snapshot {snapshot_id} for base {} has unresolvable schema: {e}",
+            base_ref.fqn()
+        )
+    })
+}
+
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -588,8 +635,6 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    // Single base-table load shared by the A11 contract guard and the
-    // refresh flow below (Task 11: collapses the double load from Task 10).
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let [base_ref] = base_refs.as_slice() else {
         return Err(
@@ -597,45 +642,88 @@ pub(crate) fn refresh_iceberg_mv(
                 .to_string(),
         );
     };
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
-
-    // A11 contract guard. Validate the full base ↔ output ↔ target
-    // contract before any incremental work. validate_schema_contract
-    // subsumes the earlier ensure_base_row_lineage_contract check
-    // (it already enforces v3 + row-lineage).
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
             target.catalog, target.namespace, target.table
         )
     })?;
-    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}"));
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
-            tracing::info!(
-                target = ?target,
-                rebound = ?rebound_columns,
-                "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
-            );
-            let rewritten_sql =
-                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-            let mut def = mv_definition.clone();
-            def.select_sql = rewritten_sql;
-            def
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-            mv_definition.clone()
-        }
-    };
+    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    let previous_snapshot_id = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
+    let is_empty_base_noop =
+        previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
+
+    if is_empty_base_noop {
+        tracing::info!(
+            "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        return Ok(StatementResult::Ok);
+    }
+
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )?;
+    let current_snapshot_id = pin.get(base_ref);
+    let current_table_uuid = pin
+        .uuid(base_ref)
+        .ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?
+        .to_string();
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let pinned_base_schema =
+        resolve_pinned_base_schema(base_ref, &loaded.table, current_snapshot_id)?;
+
+    // A11 contract guard. Validate the full base ↔ output ↔ target
+    // contract after the refresh pin is captured and the base table is
+    // reloaded. validate_schema_contract subsumes the earlier
+    // ensure_base_row_lineage_contract check (it already enforces v3 +
+    // row-lineage).
+    let effective_definition =
+        match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
+            schema_contract,
+            &loaded.table,
+            pinned_base_schema.as_ref(),
+            &target_loaded.table,
+        ) {
+            crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+                return Err(format!("{err}"));
+            }
+            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+                rebound_columns,
+            } => {
+                tracing::info!(
+                    target = ?target,
+                    rebound = ?rebound_columns,
+                    "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+                );
+                let rewritten_sql =
+                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+                let mut def = mv_definition.clone();
+                def.select_sql = rewritten_sql;
+                def
+            }
+            crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
+                mv_definition.clone()
+            }
+        };
     let mv_definition = &effective_definition;
+    let pinned_full_select_sql =
+        rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
     let expected_main_snapshot_id = target_loaded
         .table
         .metadata()
@@ -646,17 +734,6 @@ pub(crate) fn refresh_iceberg_mv(
         mv_definition.mv_id,
         uuid::Uuid::new_v4().simple()
     );
-
-    let current_snapshot_id = loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
-    let current_table_uuid = loaded.table.metadata().uuid().to_string();
-    let previous_snapshot_id = mv_definition
-        .last_refresh_snapshots
-        .get(&base_ref.fqn())
-        .copied();
 
     if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
         && previous_uuid != &current_table_uuid
@@ -686,7 +763,7 @@ pub(crate) fn refresh_iceberg_mv(
                 &target,
                 mv_definition.mv_id,
                 expected_main_snapshot_id,
-                single_snapshot_map(base_ref, cur),
+                pin.to_snapshot_map(),
                 &staging_branch,
             )?;
             first_refresh_iceberg_mv(
@@ -699,6 +776,7 @@ pub(crate) fn refresh_iceberg_mv(
                 refresh_id,
                 current_database,
                 mv_definition,
+                &pinned_full_select_sql,
                 base_ref,
                 cur,
                 &current_table_uuid,
@@ -713,8 +791,8 @@ pub(crate) fn refresh_iceberg_mv(
                 target.namespace,
                 target.table
             );
-            let snapshots = single_snapshot_map(base_ref, cur);
-            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
             let target_snapshot_id = recorded_target_snapshot_id(&target, mv_definition)?;
             let refresh_id =
                 begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
@@ -743,6 +821,7 @@ pub(crate) fn refresh_iceberg_mv(
             cur,
             &loaded.table,
             &current_table_uuid,
+            &pinned_full_select_sql,
         ),
 
         // Previous snapshot no longer reachable.
@@ -804,16 +883,60 @@ pub(crate) fn plan_iceberg_mv_refresh(
             "iceberg materialized view refresh requires exactly one base table reference",
         ));
     };
-    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         RefreshError::user(format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         ))
     })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
+    let pre_pin_loaded =
+        load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id());
+    let previous_snapshot_id = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
+    let is_empty_base_noop =
+        previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none();
+    if is_empty_base_noop {
+        let mut snapshot_pins = BTreeMap::new();
+        snapshot_pins.insert(base_ref.fqn(), None);
+        return Ok(RefreshPlan {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            mode: RefreshMode::Noop,
+            base_refs: vec![MvBaseRef {
+                catalog: base_ref.catalog.clone(),
+                namespace: base_ref.namespace.clone(),
+                table: base_ref.table.clone(),
+            }],
+            snapshot_pins,
+            backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
+                stmt: stmt.clone(),
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+            }),
+        });
+    }
+
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )
+    .map_err(RefreshError::user)?;
+    let current_snapshot_id = pin.get(base_ref);
+    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    let pinned_base_schema =
+        resolve_pinned_base_schema(base_ref, &loaded.table, current_snapshot_id)
+            .map_err(RefreshError::user)?;
+    match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
         schema_contract,
         &loaded.table,
+        pinned_base_schema.as_ref(),
         &target_loaded.table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
@@ -825,15 +948,6 @@ pub(crate) fn plan_iceberg_mv_refresh(
         | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
     }
 
-    let current_snapshot_id = loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
-    let previous_snapshot_id = mv_definition
-        .last_refresh_snapshots
-        .get(&base_ref.fqn())
-        .copied();
     let mode = match (previous_snapshot_id, current_snapshot_id) {
         (None, None) => RefreshMode::Noop,
         (None, Some(_)) => RefreshMode::Full,
@@ -1538,12 +1652,13 @@ fn first_refresh_iceberg_mv(
     refresh_id: i64,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
+    pinned_full_select_sql: &str,
     base_ref: &IcebergTableRef,
     base_snapshot_id: i64,
     current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
     // 1. Run SELECT and collect chunks.
-    let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
+    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -1676,11 +1791,12 @@ fn rebuild_iceberg_mv(
     refresh_id: i64,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
+    pinned_full_select_sql: &str,
     base_ref: &IcebergTableRef,
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
-    let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
+    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -2560,10 +2676,16 @@ fn incremental_refresh_iceberg_mv(
     current_snapshot_id: i64,
     base_table: &iceberg::table::Table,
     current_table_uuid: &str,
+    pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
     // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
     // safely, rebuild instead of risking an incorrect incremental result.
-    let batch = match plan_changes(base_table, previous_snapshot_id, &[]) {
+    let batch = match plan_changes(
+        base_table,
+        previous_snapshot_id,
+        Some(current_snapshot_id),
+        &[],
+    ) {
         Ok(batch) => batch,
         Err(err) => match policy_signal_from_change_error(&err) {
             IcebergChangePolicySignal::FullRefresh { reason } => {
@@ -2596,6 +2718,7 @@ fn incremental_refresh_iceberg_mv(
                     refresh_id,
                     current_database,
                     mv_definition,
+                    pinned_full_select_sql,
                     base_ref,
                     Some(current_snapshot_id),
                     current_table_uuid,
@@ -3926,13 +4049,8 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
-        crate::engine::mv_flow::create_mv(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &stmt,
-        )
-        .expect("create iceberg mv through ddl");
+        crate::engine::mv_flow::create_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv through ddl");
 
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv relationship");
@@ -3951,6 +4069,61 @@ mod tests {
         catalog
             .get("analytics", "mv_orders")
             .expect("registered target");
+    }
+
+    #[test]
+    fn refresh_iceberg_mv_empty_base_remains_noop_before_pin_capture() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("empty base refresh should be no-op");
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        assert!(mv.last_refresh_snapshots.is_empty());
+        assert!(mv.last_refresh_table_uuids.is_empty());
+
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_orders".to_string(),
+        };
+        let plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("empty base plan should be no-op");
+        assert_eq!(plan.mode, RefreshMode::Noop);
+        assert_eq!(
+            plan.snapshot_pins.get("ice.sales.orders").copied(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn rewrite_full_refresh_select_with_pin_injects_version_as_of() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let base_refs =
+            parse_iceberg_table_refs(&mv.base_table_refs).expect("parse base table refs");
+        let [base_ref] = base_refs.as_slice() else {
+            panic!("expected single base ref");
+        };
+        let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+            &env.state, &base_refs,
+        )
+        .expect("capture pin");
+        let snapshot_id = pin.get(base_ref).expect("pinned snapshot");
+
+        let rewritten = rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
+            .expect("rewrite select with pin");
+
+        assert!(rewritten.contains("VERSION AS OF"));
+        assert!(rewritten.contains(&snapshot_id.to_string()));
     }
 
     #[test]
@@ -4087,13 +4260,9 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
-        let err = crate::engine::mv_flow::create_mv(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &stmt,
-        )
-        .expect_err("existing target should fail even with IF NOT EXISTS");
+        let err =
+            crate::engine::mv_flow::create_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+                .expect_err("existing target should fail even with IF NOT EXISTS");
         assert_eq!(
             err,
             "Iceberg MV target table ice.analytics.mv_orders already exists"

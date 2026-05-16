@@ -322,6 +322,11 @@ impl StandaloneNovaRocks {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn run_pending_optimize_jobs_for_test(&self) -> Result<(), String> {
+        crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
+    }
+
     pub fn managed_table_info(
         &self,
         database_name: &str,
@@ -5981,6 +5986,7 @@ enable_path_style_access = true
         let change_batch = crate::connector::iceberg::changes::plan_changes(
             &loaded.table,
             previous_snapshot_id,
+            None,
             &[],
         )
         .expect("plan COW update from standard manifest diff");

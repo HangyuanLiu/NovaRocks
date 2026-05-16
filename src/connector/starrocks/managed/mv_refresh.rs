@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array};
@@ -113,17 +113,43 @@ pub(crate) fn refresh_mv(
     };
     validate_incremental_mv_base_ref(mv_shape.base_table(), base_ref)?;
 
-    let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let current_snapshot_id = loaded
+    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let current_snapshot_id_before_pin = pre_pin_loaded
         .table
         .metadata()
         .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    let current_table_uuid = loaded.table.metadata().uuid().to_string();
+        .map(|s| s.snapshot_id());
     let previous_snapshot_id = mv_definition
         .last_refresh_snapshots
         .get(&base_ref.fqn())
         .copied();
+    if previous_snapshot_id.is_none() && current_snapshot_id_before_pin.is_none() {
+        tracing::info!(
+            "managed lake mv {}.{}: base table {} has no snapshot; skipping refresh",
+            db_name,
+            mv_name,
+            base_ref.fqn()
+        );
+        return Ok(StatementResult::Ok);
+    }
+
+    // Freeze the snapshot pin for the duration of this refresh. From now on
+    // pin is the only source of snapshot ids for base table reads, delta
+    // computation, intent recording, and bookkeeping.
+    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        state, &base_refs,
+    )?;
+    let current_snapshot_id = pin.get(base_ref);
+    let current_table_uuid = pin
+        .uuid(base_ref)
+        .ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?
+        .to_string();
+    let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let mut policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
     if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
         && previous_uuid != &current_table_uuid
@@ -149,26 +175,42 @@ pub(crate) fn refresh_mv(
         policy,
         MvRefreshPolicy::FullRefresh { .. } | MvRefreshPolicy::Incremental { .. }
     ) {
-        let target_snapshots = current_snapshot_id
-            .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
-            .unwrap_or_default();
-        begin_mv_refresh_intent(state, runtime.table.table_id, target_snapshots)?;
+        begin_mv_refresh_intent(state, runtime.table.table_id, pin.to_snapshot_map())?;
     }
 
     let projection_apply_shape = mv_shape.clone();
     let projection_full_primary_key_columns = mv_definition.primary_key_columns.clone();
+    let pinned_full_select_sql =
+        rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
+    let pinned_base_metadata = current_base_metadata_from_pin(&pin);
     dispatch_mv_refresh_strategy(
         &mv_shape,
         policy,
         || {
-            refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
-                run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
-            })
+            refresh_mv_full_with_pinned_executor(
+                state,
+                &db_name,
+                &mv_name,
+                pinned_full_select_sql.clone(),
+                pinned_base_metadata.clone(),
+                move |ctx| {
+                    run_projection_mv_select_and_chunks(ctx, &projection_full_primary_key_columns)
+                },
+            )
         },
-        |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
-        |current_snapshot_id| {
-            let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+        |shape| {
+            refresh_aggregate_mv_full_with_pinned_metadata(
+                state,
+                &db_name,
+                &mv_name,
+                shape,
+                pinned_full_select_sql.clone(),
+                pinned_base_metadata.clone(),
+            )
+        },
+        |_current_snapshot_id| {
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
             update_managed_mv_refresh_summary(
                 state,
                 runtime.table.table_id,
@@ -199,10 +241,12 @@ pub(crate) fn refresh_mv(
                             "mv_refresh fall-back to Full from projection incremental planner"
                         );
                         let primary_key_columns = mv_definition.primary_key_columns.clone();
-                        return refresh_mv_full_with_executor(
+                        return refresh_mv_full_with_pinned_executor(
                             state,
                             &db_name,
                             &mv_name,
+                            pinned_full_select_sql.clone(),
+                            pinned_base_metadata.clone(),
                             move |ctx| {
                                 run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
                             },
@@ -241,9 +285,14 @@ pub(crate) fn refresh_mv(
                         "mv_refresh fall-back to Full from projection apply policy"
                     );
                     let primary_key_columns = mv_definition.primary_key_columns.clone();
-                    return refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
-                        run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
-                    });
+                    return refresh_mv_full_with_pinned_executor(
+                        state,
+                        &db_name,
+                        &mv_name,
+                        pinned_full_select_sql.clone(),
+                        pinned_base_metadata.clone(),
+                        move |ctx| run_projection_mv_select_and_chunks(ctx, &primary_key_columns),
+                    );
                 }
             }
 
@@ -271,9 +320,8 @@ pub(crate) fn refresh_mv(
                 advance_mv_refresh_metadata_without_writes(
                     state,
                     runtime.table.table_id,
-                    base_ref,
-                    current_snapshot_id,
-                    &current_table_uuid,
+                    pin.to_snapshot_map(),
+                    pin.to_table_uuid_map(),
                     mv_definition.last_refresh_rows.unwrap_or(0),
                 )?;
                 refresh_managed_catalog(state)?;
@@ -309,8 +357,8 @@ pub(crate) fn refresh_mv(
                 load_physical_insert_plan(state, &resolved_mv, PartitionTarget::Active)
             }?;
             let previous_rows = mv_definition.last_refresh_rows.unwrap_or(0);
-            let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
+            let snapshots = pin.to_snapshot_map();
+            let table_uuids = pin.to_table_uuid_map();
             write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
                 state,
                 plan,
@@ -345,7 +393,14 @@ pub(crate) fn refresh_mv(
                             reason = %reason,
                             "mv_refresh fall-back to Full from aggregate incremental planner"
                         );
-                        return refresh_aggregate_mv_full(state, &db_name, &mv_name, shape);
+                        return refresh_aggregate_mv_full_with_pinned_metadata(
+                            state,
+                            &db_name,
+                            &mv_name,
+                            shape,
+                            pinned_full_select_sql.clone(),
+                            pinned_base_metadata.clone(),
+                        );
                     }
                     MvRefreshPolicy::Unsupported { reason } => {
                         return Err(format!(
@@ -371,7 +426,10 @@ pub(crate) fn refresh_mv(
                 previous_refresh_rows: mv_definition.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
-                current_table_uuid: current_table_uuid.clone(),
+                refresh_snapshots: pin.to_snapshot_map(),
+                refresh_table_uuids: pin.to_table_uuid_map(),
+                pinned_full_select_sql: pinned_full_select_sql.clone(),
+                pinned_base_metadata: pinned_base_metadata.clone(),
                 loaded: &loaded,
             })
         },
@@ -436,6 +494,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn refresh_aggregate_mv_full(
     state: &Arc<StandaloneState>,
     database: &str,
@@ -444,25 +503,81 @@ fn refresh_aggregate_mv_full(
 ) -> Result<StatementResult, String> {
     let shape = shape.clone();
     refresh_mv_full_with_executor(state, database, mv_name, move |ctx| {
-        // Step 1: obtain visible-shaped output types by analyzing the ORIGINAL select_sql
-        // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
-        // (one column per visible_output), not state-shaped types (which expand AVG into
-        // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
-        let visible_output_columns =
-            analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
-
-        // Step 2: build the layout from visible types.
-        let layout =
-            super::mv_agg_state::build_aggregate_mv_layout(&shape, &visible_output_columns)?;
-
-        // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
-        // it to obtain the actual state-shaped data.
-        let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, &shape)?;
-        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
-
-        // Step 4: materialize state-shaped executor result using the visible-type layout.
-        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, &shape)
+        execute_aggregate_mv_full_refresh(ctx, &shape)
     })
+}
+
+fn refresh_aggregate_mv_full_with_pinned_metadata(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    shape: &super::mv_shape::AggregateMvShape,
+    pinned_select_sql: String,
+    base_metadata: CurrentBaseMetadata,
+) -> Result<StatementResult, String> {
+    let shape = shape.clone();
+    refresh_mv_full_with_pinned_executor(
+        state,
+        database,
+        mv_name,
+        pinned_select_sql,
+        base_metadata,
+        move |ctx| execute_aggregate_mv_full_refresh(ctx, &shape),
+    )
+}
+
+fn execute_aggregate_mv_full_refresh(
+    ctx: MvRefreshContext,
+    shape: &super::mv_shape::AggregateMvShape,
+) -> Result<Vec<Chunk>, String> {
+    // Step 1: obtain visible-shaped output types by analyzing the refresh SELECT
+    // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
+    // (one column per visible_output), not state-shaped types (which expand AVG into
+    // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
+    let visible_output_columns =
+        analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
+
+    // Step 2: build the layout from visible types.
+    let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &visible_output_columns)?;
+
+    // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
+    // it to obtain the actual state-shaped data.
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, shape)?;
+    let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
+
+    // Step 4: materialize state-shaped executor result using the visible-type layout.
+    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, shape)
+}
+
+fn rewrite_full_refresh_select_with_pin(
+    select_sql: &str,
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    base_ref: &IcebergTableRef,
+) -> Result<String, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("full refresh pin SELECT normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("full refresh pin SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("full refresh pin SELECT expects a SELECT query".to_string());
+    };
+    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+        query,
+        pin,
+        &HashSet::new(),
+        Some(&base_ref.catalog),
+        &base_ref.namespace,
+    )?;
+    Ok(stmt.to_string())
+}
+
+fn current_base_metadata_from_pin(
+    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+) -> CurrentBaseMetadata {
+    CurrentBaseMetadata {
+        snapshots: pin.to_snapshot_map(),
+        table_uuids: pin.to_table_uuid_map(),
+    }
 }
 
 fn change_batch_has_deletes(
@@ -485,7 +600,10 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
-    current_table_uuid: String,
+    refresh_snapshots: BTreeMap<String, i64>,
+    refresh_table_uuids: BTreeMap<String, String>,
+    pinned_full_select_sql: String,
+    pinned_base_metadata: CurrentBaseMetadata,
     loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 
@@ -513,7 +631,14 @@ fn refresh_aggregate_mv_incremental(
                 reason = %reason,
                 "mv_refresh fall-back to Full from apply policy"
             );
-            return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+            return refresh_aggregate_mv_full_with_pinned_metadata(
+                ctx.state,
+                ctx.database,
+                ctx.mv_name,
+                ctx.shape,
+                ctx.pinned_full_select_sql.clone(),
+                ctx.pinned_base_metadata.clone(),
+            );
         }
     }
 
@@ -544,9 +669,8 @@ fn refresh_aggregate_mv_incremental(
         advance_mv_refresh_metadata_without_writes(
             ctx.state,
             ctx.table_id,
-            ctx.base_ref,
-            ctx.current_snapshot_id,
-            &ctx.current_table_uuid,
+            ctx.refresh_snapshots.clone(),
+            ctx.refresh_table_uuids.clone(),
             ctx.previous_refresh_rows,
         )?;
         refresh_managed_catalog(ctx.state)?;
@@ -579,7 +703,14 @@ fn refresh_aggregate_mv_incremental(
                     error = %err,
                     "mv_refresh fall-back to Full from signed delta aggregate rewrite"
                 );
-                return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+                return refresh_aggregate_mv_full_with_pinned_metadata(
+                    ctx.state,
+                    ctx.database,
+                    ctx.mv_name,
+                    ctx.shape,
+                    ctx.pinned_full_select_sql.clone(),
+                    ctx.pinned_base_metadata.clone(),
+                );
             }
             Err(err) => return Err(err),
         };
@@ -604,8 +735,6 @@ fn refresh_aggregate_mv_incremental(
         },
         PartitionTarget::Active,
     )?;
-    let snapshots = single_snapshot_map(ctx.base_ref, ctx.current_snapshot_id);
-    let table_uuids = single_table_uuid_map(ctx.base_ref, &ctx.current_table_uuid);
     write_chunks_into_managed_partition_for_aggregate_mv_upsert(
         ctx.state,
         plan,
@@ -614,8 +743,8 @@ fn refresh_aggregate_mv_incremental(
         MvRefreshWriteMetadata {
             table_id: ctx.table_id,
             previous_refresh_rows: ctx.previous_refresh_rows,
-            snapshots,
-            table_uuids,
+            snapshots: ctx.refresh_snapshots,
+            table_uuids: ctx.refresh_table_uuids,
         },
     )?;
     refresh_managed_catalog(ctx.state)?;
@@ -625,24 +754,59 @@ fn refresh_aggregate_mv_incremental(
 fn advance_mv_refresh_metadata_without_writes(
     state: &Arc<StandaloneState>,
     table_id: i64,
-    base_ref: &IcebergTableRef,
-    current_snapshot_id: i64,
-    current_table_uuid: &str,
+    refresh_snapshots: BTreeMap<String, i64>,
+    refresh_table_uuids: BTreeMap<String, String>,
     last_refresh_rows: i64,
 ) -> Result<(), String> {
     update_managed_mv_refresh_summary(
         state,
         table_id,
         last_refresh_rows,
-        single_snapshot_map(base_ref, current_snapshot_id),
-        single_table_uuid_map(base_ref, current_table_uuid),
+        refresh_snapshots,
+        refresh_table_uuids,
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn refresh_mv_full_with_executor<F>(
     state: &Arc<StandaloneState>,
     database: &str,
     mv_name: &str,
+    executor: F,
+) -> Result<StatementResult, String>
+where
+    F: FnOnce(MvRefreshContext) -> Result<Vec<Chunk>, String>,
+{
+    refresh_mv_full_with_executor_inner(state, database, mv_name, None, None, executor)
+}
+
+fn refresh_mv_full_with_pinned_executor<F>(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    pinned_select_sql: String,
+    base_metadata: CurrentBaseMetadata,
+    executor: F,
+) -> Result<StatementResult, String>
+where
+    F: FnOnce(MvRefreshContext) -> Result<Vec<Chunk>, String>,
+{
+    refresh_mv_full_with_executor_inner(
+        state,
+        database,
+        mv_name,
+        Some(pinned_select_sql),
+        Some(base_metadata),
+        executor,
+    )
+}
+
+fn refresh_mv_full_with_executor_inner<F>(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    select_sql_override: Option<String>,
+    base_metadata_override: Option<CurrentBaseMetadata>,
     executor: F,
 ) -> Result<StatementResult, String>
 where
@@ -703,7 +867,7 @@ where
     let chunks = match executor(MvRefreshContext {
         state: Arc::clone(state),
         database: database.to_string(),
-        select_sql: mv_definition.select_sql.clone(),
+        select_sql: select_sql_override.unwrap_or_else(|| mv_definition.select_sql.clone()),
     }) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -739,13 +903,18 @@ where
         }
     };
 
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let base_metadata = collect_current_base_metadata_or_cleanup_staged_partition(
-        state,
-        runtime.table.table_id,
-        &staged,
-        &base_refs,
-    )?;
+    let base_metadata = match base_metadata_override {
+        Some(metadata) => metadata,
+        None => {
+            let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+            collect_current_base_metadata_or_cleanup_staged_partition(
+                state,
+                runtime.table.table_id,
+                &staged,
+                &base_refs,
+            )?
+        }
+    };
     if let Err(err) = activate_managed_mv_refresh_partition(
         state,
         runtime.table.table_id,
@@ -1597,6 +1766,9 @@ mod tests {
         StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
+    use crate::connector::starrocks::managed::refresh_pin::{
+        AfterCaptureHook, lock_after_capture_hook_for_test,
+    };
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
@@ -1681,10 +1853,17 @@ mod tests {
             table: "orders".to_string(),
         };
         let snapshots = single_snapshot_map(&base_ref, 42);
+        let table_uuids = single_table_uuid_map(&base_ref, "uuid-1");
         begin_mv_refresh_intent(&state, table_id, snapshots.clone()).expect("begin refresh");
 
-        advance_mv_refresh_metadata_without_writes(&state, table_id, &base_ref, 42, "uuid-1", 17)
-            .expect("advance metadata");
+        advance_mv_refresh_metadata_without_writes(
+            &state,
+            table_id,
+            snapshots.clone(),
+            table_uuids,
+            17,
+        )
+        .expect("advance metadata");
 
         let provider = state.metadata_provider.as_ref().expect("metadata provider");
         let read = provider.begin_read().expect("read");
@@ -2026,6 +2205,579 @@ mod tests {
             Some(2),
             "incremental refresh metadata row count tracks active MV rows, not the row delta"
         );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn last_refresh_snapshots_equals_pin_not_post_refresh_current() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping MV refresh pin bookkeeping test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database("insert into ice.ns.orders values (1, 'A', 10)", "default")
+            .expect("seed iceberg base row");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, customer, amount from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+        let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
+        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
+            Some(s0),
+            "initial full refresh should record the base snapshot it refreshed"
+        );
+
+        session
+            .execute_in_database("insert into ice.ns.orders values (2, 'B', 20)", "default")
+            .expect("insert base row producing s1");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot s1");
+        assert_ne!(s0, s1, "second INSERT should advance the base snapshot");
+
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let _hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (3, 'C', 30)", "default")
+                .expect("hook insert producing s2");
+            let s2 = current_orders_main_snapshot(&hook_session).expect("snapshot s2");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin bookkeeping test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, hook-advanced) refresh materialized view: {err}");
+        }
+
+        let s2 = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(s1, s2, "hook INSERT should advance the base snapshot");
+        assert_eq!(
+            current_orders_main_snapshot(&session).expect("snapshot after hook refresh"),
+            s2,
+            "base table current snapshot should now be the hook-created snapshot"
+        );
+
+        let mv_after_incremental =
+            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded = mv_after_incremental
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded,
+            Some(s1),
+            "incremental refresh bookkeeping must record the refresh pin snapshot"
+        );
+        assert_ne!(
+            recorded,
+            Some(s2),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn pin_freeze_against_concurrent_commit() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping MV refresh pin freeze acceptance test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 10), (2, 20)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+        let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
+        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
+            Some(s0),
+            "initial full refresh should record the seeded base snapshot"
+        );
+
+        session
+            .execute_in_database("insert into ice.ns.orders values (3, 30)", "default")
+            .expect("insert base row producing s1");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot s1");
+        assert_ne!(s0, s1, "external INSERT should advance the base snapshot");
+
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (4, 40)", "default")
+                .expect("hook insert producing s2");
+            let s2 = current_orders_main_snapshot(&hook_session).expect("snapshot s2");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on pinned incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, hook-advanced) refresh materialized view: {err}");
+        }
+
+        let s2 = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(s1, s2, "hook INSERT should advance the base snapshot");
+        let rows_after_pinned_refresh =
+            collect_projection_mv_rows(&session).expect("select pinned refresh MV rows");
+        assert_eq!(
+            rows_after_pinned_refresh,
+            vec![(1, 11), (2, 21), (3, 31)],
+            "refresh pinned at s1 must not include the concurrent s2 row"
+        );
+
+        let mv_after_pinned_refresh =
+            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded_after_pinned_refresh = mv_after_pinned_refresh
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded_after_pinned_refresh,
+            Some(s1),
+            "incremental refresh bookkeeping must record the refresh pin snapshot"
+        );
+        assert_ne!(
+            recorded_after_pinned_refresh,
+            Some(s2),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+        drop(hook_guard);
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping MV refresh pin freeze acceptance test: object store unavailable on follow-up refresh: {err}"
+                );
+                return;
+            }
+            panic!("third (follow-up) refresh materialized view: {err}");
+        }
+
+        let rows_after_follow_up =
+            collect_projection_mv_rows(&session).expect("select follow-up refresh MV rows");
+        assert_eq!(
+            rows_after_follow_up,
+            vec![(1, 11), (2, 21), (3, 31), (4, 41)],
+            "follow-up refresh should pick up the post-pin base row"
+        );
+        let current_snapshot =
+            current_orders_main_snapshot(&session).expect("snapshot after follow-up refresh");
+        assert_eq!(
+            current_snapshot, s2,
+            "no additional base commit should happen after the hook insert"
+        );
+        let mv_after_follow_up = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        assert_eq!(
+            mv_after_follow_up
+                .last_refresh_snapshots
+                .get(&base_key)
+                .copied(),
+            Some(s2),
+            "follow-up refresh should record the current base snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn equality_delete_reverse_projection_uses_refresh_pin() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine =
+            match crate::engine::StandaloneNovaRocks::open(crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            }) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    if is_unavailable_object_store_error(&err) {
+                        eprintln!(
+                            "skipping equality-delete pin test: object store unavailable: {err}"
+                        );
+                        return;
+                    }
+                    panic!("open standalone engine: {err}");
+                }
+            };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 10), (2, 20), (3, 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let mv_info = engine
+            .managed_table_info("analytics", "orders_mv")
+            .expect("managed table info for MV");
+        let base_key = "ice.ns.orders".to_string();
+
+        session
+            .execute_in_database(
+                "alter table ice.ns.orders add equality delete (amount) values (10)",
+                "default",
+            )
+            .expect("add equality delete for base amount=10");
+        let s1 = current_orders_main_snapshot(&session).expect("snapshot after equality delete");
+
+        let hook_engine = engine.clone();
+        let hook_session = session.clone();
+        let hook_snapshot = Arc::new(Mutex::new(None));
+        let hook_snapshot_for_hook = Arc::clone(&hook_snapshot);
+        let _hook_guard = AfterCaptureHookGuard::install(Arc::new(move || {
+            hook_session
+                .execute_in_database("alter table ice.ns.orders optimize", "default")
+                .expect("hook create optimize job");
+            hook_engine
+                .run_pending_optimize_jobs_for_test()
+                .expect("hook run optimize job");
+            hook_session
+                .execute_in_database("insert into ice.ns.orders values (4, 40)", "default")
+                .expect("hook insert producing post-pin snapshot");
+            let post_pin_snapshot =
+                current_orders_main_snapshot(&hook_session).expect("post-pin snapshot");
+            *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(post_pin_snapshot);
+        }));
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping equality-delete pin test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, equality-delete pinned) refresh materialized view: {err}");
+        }
+
+        let post_pin_snapshot = hook_snapshot
+            .lock()
+            .expect("hook snapshot lock")
+            .expect("after-capture hook should run during refresh pin capture");
+        assert_ne!(
+            s1, post_pin_snapshot,
+            "hook OPTIMIZE + INSERT should advance the base snapshot"
+        );
+
+        let rows_after_refresh =
+            collect_projection_mv_rows(&session).expect("select equality-delete pinned MV rows");
+        assert_eq!(
+            rows_after_refresh,
+            vec![(2, 21), (3, 31)],
+            "refresh pinned at s1 must retract id=1 and must not include post-pin id=4"
+        );
+
+        let mv_after_refresh = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let recorded = mv_after_refresh
+            .last_refresh_snapshots
+            .get(&base_key)
+            .copied();
+        assert_eq!(
+            recorded,
+            Some(s1),
+            "incremental refresh bookkeeping must record the equality-delete pin snapshot"
+        );
+        assert_ne!(
+            recorded,
+            Some(post_pin_snapshot),
+            "incremental refresh bookkeeping must not record the post-capture current snapshot"
+        );
+
+        drop(engine);
+    }
+
+    #[test]
+    fn refresh_empty_iceberg_base_is_noop_before_pin_capture() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine =
+            match crate::engine::StandaloneNovaRocks::open(crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+            }) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    if is_unavailable_object_store_error(&err) {
+                        eprintln!(
+                            "skipping empty-base MV refresh test: object store unavailable: {err}"
+                        );
+                        return;
+                    }
+                    panic!("open standalone engine: {err}");
+                }
+            };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create empty iceberg orders table");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view orders_mv \
+             distributed by hash(id) buckets 2 \
+             primary key (id) \
+             as select id, amount + 1 as amount_plus_one from ice.ns.orders",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping empty-base MV refresh test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view orders_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping empty-base MV refresh test: object store unavailable on refresh: {err}"
+                );
+                return;
+            }
+            panic!("refresh materialized view over empty base should be a no-op: {err}");
+        }
 
         drop(engine);
     }
@@ -2722,6 +3474,39 @@ mod tests {
         Ok(out)
     }
 
+    fn collect_projection_mv_rows(
+        session: &crate::engine::StandaloneSession,
+    ) -> Result<Vec<(i64, i64)>, String> {
+        let result = session.execute_in_context(
+            "select id, amount_plus_one from orders_mv order by id",
+            None,
+            "analytics",
+            None,
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("select from orders_mv must return rows".to_string());
+        };
+        let mut out = Vec::new();
+        for chunk in &query_result.chunks {
+            let ids = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "orders_mv id column not Int64".to_string())?;
+            let amount_plus_one = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "orders_mv amount_plus_one column not Int64".to_string())?;
+            for row in 0..chunk.batch.num_rows() {
+                out.push((ids.value(row), amount_plus_one.value(row)));
+            }
+        }
+        Ok(out)
+    }
+
     fn show_mv_last_refresh_rows(
         session: &crate::engine::StandaloneSession,
         mv_name: &str,
@@ -2767,6 +3552,72 @@ mod tests {
         Err(format!(
             "SHOW MATERIALIZED VIEWS did not return `{mv_name}`"
         ))
+    }
+
+    struct AfterCaptureHookGuard {
+        _hook_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AfterCaptureHookGuard {
+        fn install(hook: AfterCaptureHook) -> Self {
+            let hook_lock = lock_after_capture_hook_for_test();
+            crate::connector::starrocks::managed::refresh_pin::clear_after_capture_hook();
+            crate::connector::starrocks::managed::refresh_pin::set_after_capture_hook(hook);
+            Self {
+                _hook_lock: hook_lock,
+            }
+        }
+    }
+
+    impl Drop for AfterCaptureHookGuard {
+        fn drop(&mut self) {
+            crate::connector::starrocks::managed::refresh_pin::clear_after_capture_hook();
+        }
+    }
+
+    fn current_orders_main_snapshot(
+        session: &crate::engine::StandaloneSession,
+    ) -> Result<i64, String> {
+        let result = session.execute_in_database(
+            "select name, snapshot_id from ice.ns.orders$refs",
+            "default",
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("iceberg refs query must return rows".to_string());
+        };
+        for chunk in &query_result.chunks {
+            let names = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "refs name column not Utf8".to_string())?;
+            let snapshot_ids = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "refs snapshot_id column not Int64".to_string())?;
+            for row in 0..chunk.batch.num_rows() {
+                if names.value(row).eq_ignore_ascii_case("main") {
+                    return Ok(snapshot_ids.value(row));
+                }
+            }
+        }
+        Err("iceberg main ref not found".to_string())
+    }
+
+    fn load_mv_definition_from_metadata(
+        metadata_path: &std::path::Path,
+        mv_id: i64,
+    ) -> StoredMvDefinition {
+        let provider = crate::meta::SqliteMetaStoreProvider::open(metadata_path)
+            .expect("open sqlite metadata provider");
+        let read = provider.begin_read().expect("begin metadata read");
+        crate::meta::repository::mv::MvMetaRepository::default()
+            .load_by_id(read.as_ref(), mv_id)
+            .expect("load mv definition")
+            .expect("mv definition exists")
     }
 
     /// Build a TOML config file that points the standalone server at
