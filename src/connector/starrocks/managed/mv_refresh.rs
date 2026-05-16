@@ -294,6 +294,11 @@ pub(crate) fn refresh_mv(
                         move |ctx| run_projection_mv_select_and_chunks(ctx, &primary_key_columns),
                     );
                 }
+                MvApplyPolicy::Unsupported { reason } => {
+                    return Err(format!(
+                        "iceberg materialized view refresh unsupported: {reason}"
+                    ));
+                }
             }
 
             let source_files = build_delta_source_files(
@@ -460,6 +465,10 @@ where
         FnOnce(&super::mv_shape::AggregateMvShape, i64, i64) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
+        (super::mv_shape::IncrementalMvShape::JoinProjectionFilter(_), _) => Err(
+            "join projection/filter IMV refresh is not supported by legacy managed MV refresh"
+                .to_string(),
+        ),
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::FullRefresh { .. },
@@ -639,6 +648,11 @@ fn refresh_aggregate_mv_incremental(
                 ctx.pinned_full_select_sql.clone(),
                 ctx.pinned_base_metadata.clone(),
             );
+        }
+        MvApplyPolicy::Unsupported { reason } => {
+            return Err(format!(
+                "iceberg materialized view refresh unsupported: {reason}"
+            ));
         }
     }
 

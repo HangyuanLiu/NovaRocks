@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 pub struct MvSchemaContract {
     pub contract_version: u16,
     pub base: BaseContract,
+    #[serde(default)]
+    pub bases: Vec<BaseContract>,
     pub output: OutputContract,
+    #[serde(default)]
+    pub join: Option<JoinContract>,
     pub target: TargetContract,
 }
 
@@ -18,6 +22,8 @@ pub struct MvSchemaContract {
 pub struct BaseContract {
     pub table_fqn: String,
     pub table_uuid: String,
+    #[serde(default)]
+    pub alias_at_create: Option<String>,
     pub schema_id_at_create: i32,
     pub schema_at_create: BaseSchemaSnapshot,
 }
@@ -47,9 +53,36 @@ pub struct OutputColumnLineage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualifiedFieldLineage {
+    pub table_fqn: String,
+    pub qualifier_at_create: String,
+    pub field_id: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinContract {
+    pub kind: JoinContractKind,
+    pub predicates: Vec<JoinPredicateLineage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JoinContractKind {
+    InnerEquiJoin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinPredicateLineage {
+    pub left: QualifiedFieldLineage,
+    pub right: QualifiedFieldLineage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpressionLineage {
     pub kind: ExpressionKind,
     pub referenced_base_field_ids: Vec<i32>,
+    #[serde(default)]
+    pub referenced_base_fields: Vec<QualifiedFieldLineage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +98,8 @@ pub enum ExpressionKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterLineage {
     pub referenced_base_field_ids: Vec<i32>,
+    #[serde(default)]
+    pub referenced_base_fields: Vec<QualifiedFieldLineage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +130,7 @@ pub struct HiddenApplyKeyContract {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApplyKeySource {
     BaseRowId,
+    JoinRowKey,
 }
 
 /// Errors returned by `MvSchemaContract::ensure_self_consistent`.
@@ -114,9 +150,25 @@ pub enum ContractSelfCheckError {
         output_index: usize,
         field_id: i32,
     },
+    OutputReferencesUnknownQualifiedBaseField {
+        output_index: usize,
+        table_fqn: String,
+        field_id: i32,
+    },
     FilterReferencesUnknownBaseFieldId {
         field_id: i32,
     },
+    FilterReferencesUnknownQualifiedBaseField {
+        table_fqn: String,
+        field_id: i32,
+    },
+    JoinReferencesUnknownQualifiedBaseField {
+        table_fqn: String,
+        field_id: i32,
+    },
+    JoinRowKeyRequiresJoinContract,
+    BaseRowIdRejectsJoinContract,
+    EmptyJoinPredicates,
     EmptyBaseTableUuid,
     NegativeBaseSchemaId(i32),
     DuplicateBaseFieldIdWithDifferentType {
@@ -153,11 +205,54 @@ impl std::fmt::Display for ContractSelfCheckError {
                     "MV contract output column #{output_index} references base field id {field_id} that is not in base.schema_at_create"
                 )
             }
+            Self::OutputReferencesUnknownQualifiedBaseField {
+                output_index,
+                table_fqn,
+                field_id,
+            } => {
+                write!(
+                    f,
+                    "MV contract output column #{output_index} references unknown base field {table_fqn}#{field_id}"
+                )
+            }
             Self::FilterReferencesUnknownBaseFieldId { field_id } => {
                 write!(
                     f,
                     "MV contract WHERE filter references base field id {field_id} that is not in base.schema_at_create"
                 )
+            }
+            Self::FilterReferencesUnknownQualifiedBaseField {
+                table_fqn,
+                field_id,
+            } => {
+                write!(
+                    f,
+                    "MV contract WHERE filter references unknown base field {table_fqn}#{field_id}"
+                )
+            }
+            Self::JoinReferencesUnknownQualifiedBaseField {
+                table_fqn,
+                field_id,
+            } => {
+                write!(
+                    f,
+                    "MV contract JOIN predicate references unknown base field {table_fqn}#{field_id}"
+                )
+            }
+            Self::JoinRowKeyRequiresJoinContract => {
+                write!(
+                    f,
+                    "MV contract JoinRowKey apply-key source requires a non-empty join contract"
+                )
+            }
+            Self::BaseRowIdRejectsJoinContract => {
+                write!(
+                    f,
+                    "MV contract BaseRowId apply-key source cannot be used with a join contract"
+                )
+            }
+            Self::EmptyJoinPredicates => {
+                write!(f, "MV contract join predicates must not be empty")
             }
             Self::EmptyBaseTableUuid => write!(f, "MV contract base.table_uuid is empty"),
             Self::NegativeBaseSchemaId(id) => {
@@ -180,8 +275,17 @@ impl std::fmt::Display for ContractSelfCheckError {
 impl std::error::Error for ContractSelfCheckError {}
 
 pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
+pub const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
 
 impl MvSchemaContract {
+    fn effective_bases(&self) -> Vec<&BaseContract> {
+        if self.bases.is_empty() {
+            vec![&self.base]
+        } else {
+            self.bases.iter().collect()
+        }
+    }
+
     /// Cheap structural self-check run at CREATE time. Does NOT consult
     /// the live Iceberg tables — that part lives in
     /// `validate_schema_contract` and runs at REFRESH time.
@@ -192,26 +296,42 @@ impl MvSchemaContract {
                 target_len: self.target.visible_columns.len(),
             });
         }
-        if self.target.hidden_apply_key.column_name != HIDDEN_APPLY_KEY_COLUMN_NAME {
+        let expected_hidden_apply_key_column = match self.target.hidden_apply_key.source {
+            ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+            ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+        };
+        if self.target.hidden_apply_key.column_name != expected_hidden_apply_key_column {
             return Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong {
-                expected: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                expected: expected_hidden_apply_key_column.to_string(),
                 actual: self.target.hidden_apply_key.column_name.clone(),
             });
         }
-        if self.base.table_uuid.is_empty() {
-            return Err(ContractSelfCheckError::EmptyBaseTableUuid);
+        match self.target.hidden_apply_key.source {
+            ApplyKeySource::JoinRowKey => match &self.join {
+                Some(join) if join.predicates.is_empty() => {
+                    return Err(ContractSelfCheckError::EmptyJoinPredicates);
+                }
+                Some(_) => {}
+                None => return Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract),
+            },
+            ApplyKeySource::BaseRowId => {
+                if self.join.is_some() {
+                    return Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract);
+                }
+            }
         }
-        if self.base.schema_id_at_create < 0 {
-            return Err(ContractSelfCheckError::NegativeBaseSchemaId(
-                self.base.schema_id_at_create,
-            ));
+        let bases = self.effective_bases();
+        for base in &bases {
+            validate_base_contract(base)?;
         }
-        let known_field_ids: std::collections::BTreeSet<i32> = self
-            .base
-            .schema_at_create
-            .fields
+        let known_field_ids: std::collections::BTreeSet<i32> = bases
             .iter()
-            .map(|f| f.field_id)
+            .flat_map(|base| {
+                base.schema_at_create
+                    .fields
+                    .iter()
+                    .map(|field| field.field_id)
+            })
             .collect();
         for (i, col) in self.output.columns.iter().enumerate() {
             for fid in &col.expression.referenced_base_field_ids {
@@ -232,24 +352,90 @@ impl MvSchemaContract {
                 }
             }
         }
-        let mut seen: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
-        for f in &self.base.schema_at_create.fields {
-            if let Some(prev) = seen.get(&f.field_id) {
-                if *prev != f.type_signature.as_str() {
+        for (i, col) in self.output.columns.iter().enumerate() {
+            for field in &col.expression.referenced_base_fields {
+                if !qualified_field_known(&bases, field) {
                     return Err(
-                        ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
-                            field_id: f.field_id,
-                            first: prev.to_string(),
-                            second: f.type_signature.clone(),
+                        ContractSelfCheckError::OutputReferencesUnknownQualifiedBaseField {
+                            output_index: i,
+                            table_fqn: field.table_fqn.clone(),
+                            field_id: field.field_id,
                         },
                     );
                 }
-            } else {
-                seen.insert(f.field_id, &f.type_signature);
+            }
+        }
+        if let Some(filter) = &self.output.filter {
+            for field in &filter.referenced_base_fields {
+                if !qualified_field_known(&bases, field) {
+                    return Err(
+                        ContractSelfCheckError::FilterReferencesUnknownQualifiedBaseField {
+                            table_fqn: field.table_fqn.clone(),
+                            field_id: field.field_id,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(join) = &self.join {
+            for pred in &join.predicates {
+                for field in [&pred.left, &pred.right] {
+                    if !qualified_field_known(&bases, field) {
+                        return Err(
+                            ContractSelfCheckError::JoinReferencesUnknownQualifiedBaseField {
+                                table_fqn: field.table_fqn.clone(),
+                                field_id: field.field_id,
+                            },
+                        );
+                    }
+                }
             }
         }
         Ok(())
     }
+}
+
+fn validate_base_contract(base: &BaseContract) -> Result<(), ContractSelfCheckError> {
+    if base.table_uuid.is_empty() {
+        return Err(ContractSelfCheckError::EmptyBaseTableUuid);
+    }
+    if base.schema_id_at_create < 0 {
+        return Err(ContractSelfCheckError::NegativeBaseSchemaId(
+            base.schema_id_at_create,
+        ));
+    }
+    let mut seen: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
+    for field in &base.schema_at_create.fields {
+        if let Some(prev) = seen.get(&field.field_id) {
+            if *prev != field.type_signature.as_str() {
+                return Err(
+                    ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType {
+                        field_id: field.field_id,
+                        first: prev.to_string(),
+                        second: field.type_signature.clone(),
+                    },
+                );
+            }
+        } else {
+            seen.insert(field.field_id, &field.type_signature);
+        }
+    }
+    Ok(())
+}
+
+fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage) -> bool {
+    bases.iter().any(|base| {
+        base.table_fqn == field.table_fqn
+            && matches!(
+                base.alias_at_create.as_deref(),
+                Some(alias) if alias.eq_ignore_ascii_case(&field.qualifier_at_create)
+            )
+            && base
+                .schema_at_create
+                .fields
+                .iter()
+                .any(|record| record.field_id == field.field_id)
+    })
 }
 
 #[cfg(test)]
@@ -262,6 +448,7 @@ mod tests {
             base: BaseContract {
                 table_fqn: "ice.ns.orders".to_string(),
                 table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
                     fields: vec![BaseFieldRecord {
@@ -272,15 +459,18 @@ mod tests {
                     }],
                 },
             },
+            bases: vec![],
             output: OutputContract {
                 columns: vec![OutputColumnLineage {
                     expression: ExpressionLineage {
                         kind: ExpressionKind::Column,
                         referenced_base_field_ids: vec![1],
+                        referenced_base_fields: vec![],
                     },
                 }],
                 filter: None,
             },
+            join: None,
             target: TargetContract {
                 table_fqn: "ice.mv.orders_mv".to_string(),
                 table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -306,6 +496,68 @@ mod tests {
         let json = serde_json::to_string(&c).expect("serialize");
         let decoded: MvSchemaContract = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, c);
+    }
+
+    #[test]
+    fn contract_v1_json_defaults_multi_base_fields() {
+        let json = r#"{
+            "contract_version": 1,
+            "base": {
+                "table_fqn": "ice.ns.orders",
+                "table_uuid": "11111111-1111-1111-1111-111111111111",
+                "schema_id_at_create": 0,
+                "schema_at_create": {
+                    "fields": [
+                        {
+                            "field_id": 1,
+                            "name_at_create": "id",
+                            "type_signature": "long",
+                            "required": true
+                        }
+                    ]
+                }
+            },
+            "output": {
+                "columns": [
+                    {
+                        "expression": {
+                            "kind": "COLUMN",
+                            "referenced_base_field_ids": [1]
+                        }
+                    }
+                ],
+                "filter": null
+            },
+            "target": {
+                "table_fqn": "ice.mv.orders_mv",
+                "table_uuid": "22222222-2222-2222-2222-222222222222",
+                "schema_id_at_create": 0,
+                "visible_columns": [
+                    {
+                        "output_name": "id",
+                        "target_field_id": 1,
+                        "type_signature": "long",
+                        "nullable": false
+                    }
+                ],
+                "hidden_apply_key": {
+                    "column_name": "__nova_base_row_id",
+                    "target_field_id": 2,
+                    "source": "BASE_ROW_ID"
+                }
+            }
+        }"#;
+        let decoded: MvSchemaContract = serde_json::from_str(json).expect("deserialize v1");
+        assert!(decoded.bases.is_empty());
+        assert!(decoded.join.is_none());
+        assert_eq!(decoded.base.alias_at_create, None);
+        assert!(
+            decoded.output.columns[0]
+                .expression
+                .referenced_base_fields
+                .is_empty()
+        );
+        decoded.ensure_self_consistent().expect("self check");
     }
 
     #[test]
@@ -366,10 +618,238 @@ mod tests {
         let mut c = sample_contract();
         c.output.filter = Some(FilterLineage {
             referenced_base_field_ids: vec![999],
+            referenced_base_fields: vec![],
         });
         assert!(matches!(
             c.ensure_self_consistent(),
             Err(ContractSelfCheckError::FilterReferencesUnknownBaseFieldId { field_id: 999 })
         ));
+    }
+
+    #[test]
+    fn contract_v2_accepts_two_base_join_contract() {
+        let contract = sample_join_contract();
+        contract.ensure_self_consistent().expect("self check");
+        assert_eq!(contract.contract_version, 2);
+        assert_eq!(contract.bases.len(), 2);
+        assert_eq!(
+            contract.target.hidden_apply_key.source,
+            ApplyKeySource::JoinRowKey
+        );
+    }
+
+    #[test]
+    fn contract_v2_accepts_legacy_field_id_from_secondary_base() {
+        let mut contract = sample_join_contract();
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = vec![2];
+        contract.ensure_self_consistent().expect("self check");
+    }
+
+    #[test]
+    fn contract_v2_rejects_output_reference_to_unknown_base() {
+        let mut contract = sample_join_contract();
+        contract.output.columns[0]
+            .expression
+            .referenced_base_fields
+            .push(QualifiedFieldLineage {
+                table_fqn: "ice.ns.missing".to_string(),
+                qualifier_at_create: "m".to_string(),
+                field_id: 99,
+            });
+        let err = contract.ensure_self_consistent().expect_err("unknown base");
+        assert!(err.to_string().contains("unknown base field"), "err={err}");
+    }
+
+    #[test]
+    fn contract_v2_rejects_output_reference_with_wrong_alias() {
+        let mut contract = sample_join_contract();
+        contract.output.columns[0].expression.referenced_base_fields[0].qualifier_at_create =
+            "wrong".to_string();
+        let err = contract.ensure_self_consistent().expect_err("wrong alias");
+        assert!(err.to_string().contains("unknown base field"), "err={err}");
+    }
+
+    #[test]
+    fn contract_v2_rejects_filter_reference_to_unknown_base() {
+        let mut contract = sample_join_contract();
+        contract.output.filter = Some(FilterLineage {
+            referenced_base_field_ids: vec![],
+            referenced_base_fields: vec![QualifiedFieldLineage {
+                table_fqn: "ice.ns.missing".to_string(),
+                qualifier_at_create: "m".to_string(),
+                field_id: 99,
+            }],
+        });
+        let err = contract.ensure_self_consistent().expect_err("unknown base");
+        assert!(err.to_string().contains("unknown base field"), "err={err}");
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_reference_to_unknown_base() {
+        let mut contract = sample_join_contract();
+        contract.join.as_mut().expect("join").predicates[0]
+            .right
+            .table_fqn = "ice.ns.missing".to_string();
+        let err = contract.ensure_self_consistent().expect_err("unknown base");
+        assert!(err.to_string().contains("unknown base field"), "err={err}");
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_row_key_with_base_hidden_column() {
+        let mut contract = sample_join_contract();
+        contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::HiddenApplyKeyColumnNameWrong { .. })
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_secondary_base_with_empty_uuid() {
+        let mut contract = sample_join_contract();
+        contract.bases[1].table_uuid = String::new();
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::EmptyBaseTableUuid)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_secondary_base_duplicate_field_id_with_different_type() {
+        let mut contract = sample_join_contract();
+        contract.bases[1]
+            .schema_at_create
+            .fields
+            .push(BaseFieldRecord {
+                field_id: 2,
+                name_at_create: "id_again".to_string(),
+                type_signature: "string".to_string(),
+                required: true,
+            });
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::DuplicateBaseFieldIdWithDifferentType { field_id: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_row_key_without_join_contract() {
+        let mut contract = sample_join_contract();
+        contract.join = None;
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_join_contract_with_empty_predicates() {
+        let mut contract = sample_join_contract();
+        contract.join.as_mut().expect("join").predicates.clear();
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::EmptyJoinPredicates)
+        ));
+    }
+
+    #[test]
+    fn contract_v2_rejects_base_row_id_with_join_contract() {
+        let mut contract = sample_join_contract();
+        contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
+        contract.target.hidden_apply_key.source = ApplyKeySource::BaseRowId;
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract)
+        ));
+    }
+
+    fn sample_join_contract() -> MvSchemaContract {
+        MvSchemaContract {
+            contract_version: 2,
+            base: BaseContract {
+                table_fqn: "ice.ns.left".to_string(),
+                table_uuid: "left-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot { fields: vec![] },
+            },
+            bases: vec![
+                BaseContract {
+                    table_fqn: "ice.ns.left".to_string(),
+                    table_uuid: "left-uuid".to_string(),
+                    alias_at_create: Some("l".to_string()),
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot {
+                        fields: vec![BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "id".to_string(),
+                            type_signature: "long".to_string(),
+                            required: true,
+                        }],
+                    },
+                },
+                BaseContract {
+                    table_fqn: "ice.ns.right".to_string(),
+                    table_uuid: "right-uuid".to_string(),
+                    alias_at_create: Some("r".to_string()),
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot {
+                        fields: vec![BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "id".to_string(),
+                            type_signature: "long".to_string(),
+                            required: true,
+                        }],
+                    },
+                },
+            ],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: vec![],
+                        referenced_base_fields: vec![QualifiedFieldLineage {
+                            table_fqn: "ice.ns.left".to_string(),
+                            qualifier_at_create: "l".to_string(),
+                            field_id: 1,
+                        }],
+                    },
+                }],
+                filter: None,
+            },
+            join: Some(JoinContract {
+                kind: JoinContractKind::InnerEquiJoin,
+                predicates: vec![JoinPredicateLineage {
+                    left: QualifiedFieldLineage {
+                        table_fqn: "ice.ns.left".to_string(),
+                        qualifier_at_create: "l".to_string(),
+                        field_id: 1,
+                    },
+                    right: QualifiedFieldLineage {
+                        table_fqn: "ice.ns.right".to_string(),
+                        qualifier_at_create: "r".to_string(),
+                        field_id: 2,
+                    },
+                }],
+            }),
+            target: TargetContract {
+                table_fqn: "ice.ns.mv".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 0,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "id".to_string(),
+                    target_field_id: 1,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::JoinRowKey,
+                },
+            },
+        }
     }
 }
