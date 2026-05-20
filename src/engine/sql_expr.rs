@@ -349,6 +349,55 @@ pub(crate) fn sqlparser_function_to_literal(
                 )),
             }
         }
+        "bitmap_empty" => {
+            if !args.is_empty() {
+                return Err("bitmap_empty expects 0 arguments".to_string());
+            }
+            // SeriV2 empty bitmap encoding: a single BITMAP_TYPE_EMPTY (=0) byte,
+            // matching `eval_bitmap_empty` runtime output.
+            Ok(Literal::String(bytes_to_latin1_string(&[
+                crate::exec::expr::function::object::bitmap_common::BITMAP_TYPE_EMPTY,
+            ])))
+        }
+        "hll_hash" => {
+            if args.len() != 1 {
+                return Err("hll_hash expects 1 argument".to_string());
+            }
+            use crate::exec::expr::function::object::hll_hash::{
+                encode_hll_empty, encode_hll_single, murmur_hash64a, MURMUR_SEED,
+            };
+            let arg = sqlparser_expr_to_literal(args[0])?;
+            // Mirror the runtime `eval_hll_hash` byte conversion exactly:
+            //   - NULL  → encode_hll_empty()
+            //   - Int   → Int64 little-endian (analyzer types integer literals as Int64)
+            //   - Float → Float64 little-endian
+            //   - String → raw UTF-8 bytes
+            //   - Bool  → single byte 0/1
+            let bytes = match arg {
+                Literal::Null => encode_hll_empty(),
+                Literal::Int(v) => {
+                    let buf = v.to_le_bytes();
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::Float(v) => {
+                    let buf = v.to_le_bytes();
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::String(s) => {
+                    let hash = murmur_hash64a(s.as_bytes(), MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::Bool(b) => {
+                    let buf = [if b { 1u8 } else { 0u8 }];
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                other => return Err(format!("hll_hash unsupported literal: {other:?}")),
+            };
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err("to_binary expects 1 or 2 arguments".to_string());
@@ -384,6 +433,37 @@ pub(crate) fn sqlparser_function_to_literal(
             Ok(Literal::String(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
+        }
+        "to_bitmap" => {
+            if args.len() != 1 {
+                return Err("to_bitmap expects 1 argument".to_string());
+            }
+            use crate::exec::expr::function::object::to_bitmap::encode_bitmap_single;
+            let arg = sqlparser_expr_to_literal(args[0])?;
+            // Mirror `eval_to_bitmap` runtime semantics for scalar literals:
+            //   - NULL or negative integer → NULL
+            //   - Int  → encode as u64 (Int64 runtime arm uses i128::from then casts)
+            //   - Bool → 1 or 0
+            //   - String → parse as unsigned decimal; non-numeric → NULL
+            let value: u64 = match arg {
+                Literal::Null => return Ok(Literal::Null),
+                Literal::Int(v) if v >= 0 => v as u64,
+                Literal::Int(_) => return Ok(Literal::Null),
+                Literal::Bool(b) => {
+                    if b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Literal::String(s) => match s.trim().parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Literal::Null),
+                },
+                other => return Err(format!("to_bitmap unsupported literal: {other:?}")),
+            };
+            let bytes = encode_bitmap_single(value);
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "md5sum" => {
             use md5::Digest;

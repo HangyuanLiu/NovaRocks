@@ -25,10 +25,10 @@ mod bitmap_to_string;
 mod dispatch;
 mod ds_hll_functions;
 mod hll_codec;
-mod hll_hash;
+pub(crate) mod hll_hash;
 mod json_object;
 pub mod percentile_functions;
-mod to_bitmap;
+pub(crate) mod to_bitmap;
 mod utility_functions;
 
 pub use dispatch::{eval_object_function, metadata, register};

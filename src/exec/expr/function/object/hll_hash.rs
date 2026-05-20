@@ -28,7 +28,7 @@ const HLL_DATA_EMPTY: u8 = 0;
 const HLL_DATA_EXPLICIT: u8 = 1;
 
 const MURMUR_PRIME: u64 = 0xc6a4_a793_5bd1_e995;
-const MURMUR_SEED: u32 = 0xadc8_3b19;
+pub(crate) const MURMUR_SEED: u32 = 0xadc8_3b19;
 
 pub fn eval_hll_hash(
     arena: &ExprArena,
@@ -128,11 +128,11 @@ pub fn eval_hll_hash(
     ))
 }
 
-fn encode_hll_empty() -> Vec<u8> {
+pub(crate) fn encode_hll_empty() -> Vec<u8> {
     vec![HLL_DATA_EMPTY]
 }
 
-fn encode_hll_single(hash: u64) -> Vec<u8> {
+pub(crate) fn encode_hll_single(hash: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + std::mem::size_of::<u64>());
     out.push(HLL_DATA_EXPLICIT);
     out.push(1);
@@ -140,7 +140,7 @@ fn encode_hll_single(hash: u64) -> Vec<u8> {
     out
 }
 
-fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
+pub(crate) fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
     let r: u32 = 47;
     let mut h = (seed as u64) ^ (data.len() as u64).wrapping_mul(MURMUR_PRIME);
 
