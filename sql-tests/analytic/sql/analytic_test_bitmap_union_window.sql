@@ -20,12 +20,10 @@ INSERT INTO ${case_db}.t1 VALUES (1, to_bitmap(11)), (2, to_bitmap(22)), (3, nul
 SELECT c1, bitmap_to_string(bitmap_union(c2) over()) FROM ${case_db}.t1 ORDER BY c1;
 
 -- query 3
--- Expected per StarRocks: row c1=3 returns NULL because the partition's only
--- bitmap input is NULL. NovaRocks currently returns an empty string instead
--- (bitmap_union over a NULL-only group yields an empty bitmap rather than
--- NULL). Skip result comparison until that aggregate-NULL behavior is fixed.
+-- Row c1=3 returns NULL because the partition's only bitmap input is NULL
+-- (SQL/StarRocks semantics: aggregate over an all-NULL group yields NULL,
+-- not the per-element identity).
 -- @order_sensitive=true
--- @skip_result_check=true
 SELECT c1, bitmap_to_string(bitmap_union(c2) over(partition by c1)) FROM ${case_db}.t1 ORDER BY c1;
 
 -- query 4

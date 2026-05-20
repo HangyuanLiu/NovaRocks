@@ -36,6 +36,12 @@ type BitmapValues = BTreeSet<u64>;
 
 struct BitmapState {
     values: BitmapValues,
+    /// Whether this state has observed at least one non-null input row.
+    /// SQL aggregate semantics: a group whose inputs are all NULL must
+    /// finalize to NULL, not to the per-element identity (empty bitmap / 0).
+    /// Tracked separately from `values` because a non-null empty BITMAP input
+    /// (e.g. `bitmap_empty()`) still marks the group as non-NULL.
+    has_value: bool,
 }
 
 const BITMAP_TYPE_EMPTY: u8 = 0;
@@ -60,12 +66,21 @@ fn state_slot(ptr: *mut u8) -> *mut *mut BitmapState {
     ptr as *mut *mut BitmapState
 }
 
+/// Get or initialize the BitmapState for this aggregate slot, marking that
+/// the group has observed at least one non-null input.
+///
+/// Every caller already gates on `arr.is_null(row)`, so reaching this function
+/// implies a non-null input row was successfully consumed. Centralizing the
+/// `has_value = true` write here keeps the dozen-plus type-specific update
+/// arms consistent and ensures finalize emits NULL only when no non-null
+/// input was seen.
 unsafe fn get_or_init_state<'a>(ptr: *mut u8) -> &'a mut BitmapState {
     let slot = state_slot(ptr);
     let raw = unsafe { *slot };
-    if raw.is_null() {
+    let state = if raw.is_null() {
         let boxed = Box::new(BitmapState {
             values: BitmapValues::default(),
+            has_value: false,
         });
         let raw = Box::into_raw(boxed);
         unsafe {
@@ -74,7 +89,9 @@ unsafe fn get_or_init_state<'a>(ptr: *mut u8) -> &'a mut BitmapState {
         }
     } else {
         unsafe { &mut *raw }
-    }
+    };
+    state.has_value = true;
+    state
 }
 
 unsafe fn get_state<'a>(ptr: *mut u8) -> Option<&'a BitmapState> {
@@ -683,13 +700,18 @@ impl AggregateFunction for BitmapUnionIntAgg {
         output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
         if output_intermediate {
+            // For both BitmapAgg and BitmapUnionInt the intermediate stage must
+            // emit NULL when no non-null input was observed, so the final
+            // merge stage propagates the all-null group as NULL instead of
+            // treating an empty BITMAP payload as a real (empty) input.
             let mut builder = BinaryBuilder::new();
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 match unsafe { get_state(ptr) } {
-                    Some(state) => builder.append_value(encode_bitmap(&state.values)?),
-                    None if matches!(spec.kind, AggKind::BitmapAgg) => builder.append_null(),
-                    None => builder.append_value(vec![BITMAP_TYPE_EMPTY]),
+                    Some(state) if state.has_value => {
+                        builder.append_value(encode_bitmap(&state.values)?)
+                    }
+                    _ => builder.append_null(),
                 }
             }
             return Ok(Arc::new(builder.finish()));
@@ -700,16 +722,20 @@ impl AggregateFunction for BitmapUnionIntAgg {
                 let mut builder = Int64Builder::new();
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let value = match unsafe { get_state(ptr) } {
-                        Some(state) => i64::try_from(state.values.len()).map_err(|_| {
-                            format!(
-                                "bitmap_union_int cardinality overflow: {}",
-                                state.values.len()
-                            )
-                        })?,
-                        None => 0_i64,
-                    };
-                    builder.append_value(value);
+                    match unsafe { get_state(ptr) } {
+                        Some(state) if state.has_value => {
+                            let value = i64::try_from(state.values.len()).map_err(|_| {
+                                format!(
+                                    "bitmap_union_int cardinality overflow: {}",
+                                    state.values.len()
+                                )
+                            })?;
+                            builder.append_value(value);
+                        }
+                        // All-null group: SQL semantics say bitmap_union_count
+                        // and bitmap_union_int return NULL, not 0.
+                        _ => builder.append_null(),
+                    }
                 }
                 Ok(Arc::new(builder.finish()))
             }
@@ -718,8 +744,10 @@ impl AggregateFunction for BitmapUnionIntAgg {
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     match unsafe { get_state(ptr) } {
-                        Some(state) => builder.append_value(encode_bitmap(&state.values)?),
-                        None => builder.append_null(),
+                        Some(state) if state.has_value => {
+                            builder.append_value(encode_bitmap(&state.values)?)
+                        }
+                        _ => builder.append_null(),
                     }
                 }
                 Ok(Arc::new(builder.finish()))
@@ -732,8 +760,15 @@ impl AggregateFunction for BitmapUnionIntAgg {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
-    use super::{decode_bitmap, encode_bitmap};
+    use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+
+    use super::{
+        AggregateFunction, BITMAP_TYPE_EMPTY, BitmapUnionIntAgg, decode_bitmap, encode_bitmap,
+    };
+    use crate::exec::expr::agg::functions::{AggInputView, AggKind, AggSpec, AggStatePtr};
 
     #[test]
     fn bitmap_union_int_encodes_single32() {
@@ -750,5 +785,185 @@ mod tests {
         let encoded = encode_bitmap(&values).expect("encode");
         let decoded = decode_bitmap(&encoded).expect("decode");
         assert_eq!(decoded, values);
+    }
+
+    /// Allocates a state slot on the heap, initializes it, runs `f`, then
+    /// drops the state. Returns the output Array produced inside `f`.
+    fn with_state<F>(spec: &AggSpec, f: F) -> ArrayRef
+    where
+        F: FnOnce(&BitmapUnionIntAgg, *mut u8, &AggSpec) -> ArrayRef,
+    {
+        let agg = BitmapUnionIntAgg;
+        // Allocate enough memory for a pointer-sized state slot.
+        let mut backing = Box::new(0_usize);
+        let ptr = (&mut *backing) as *mut usize as *mut u8;
+        agg.init_state(spec, ptr);
+        let out = f(&agg, ptr, spec);
+        agg.drop_state(spec, ptr);
+        out
+    }
+
+    fn spec_bitmap_agg() -> AggSpec {
+        AggSpec {
+            kind: AggKind::BitmapAgg,
+            output_type: DataType::Binary,
+            intermediate_type: DataType::Binary,
+            input_arg_type: None,
+            count_all: false,
+        }
+    }
+
+    fn spec_bitmap_union_int() -> AggSpec {
+        AggSpec {
+            kind: AggKind::BitmapUnionInt,
+            output_type: DataType::Int64,
+            intermediate_type: DataType::Binary,
+            input_arg_type: None,
+            count_all: false,
+        }
+    }
+
+    #[test]
+    fn bitmap_agg_finalize_returns_null_for_empty_group() {
+        let spec = spec_bitmap_agg();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr.is_null(0), "expected NULL for empty group");
+    }
+
+    #[test]
+    fn bitmap_agg_finalize_returns_null_for_all_null_input() {
+        let spec = spec_bitmap_agg();
+        // Input array of length 1, all-null Int32 column.
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Option::<i32>::None]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(spec, 0, &[ptr as AggStatePtr], &view)
+                .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr.is_null(0), "all-null group should finalize to NULL");
+    }
+
+    #[test]
+    fn bitmap_agg_finalize_returns_empty_for_non_null_bitmap_empty_input() {
+        // A non-null but logically empty BITMAP input still counts as a
+        // non-null observation; result must be empty bitmap, NOT NULL.
+        let spec = spec_bitmap_agg();
+        // Use the merge path with a BITMAP_TYPE_EMPTY intermediate value.
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[BITMAP_TYPE_EMPTY][..])]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Binary(input.as_any().downcast_ref::<BinaryArray>().unwrap());
+            agg.merge_batch(spec, 0, &[ptr as AggStatePtr], &view)
+                .expect("merge_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(
+            !arr.is_null(0),
+            "non-null empty BITMAP input must yield non-null result"
+        );
+        assert_eq!(arr.value(0), &[BITMAP_TYPE_EMPTY][..]);
+    }
+
+    #[test]
+    fn bitmap_agg_finalize_returns_bitmap_for_mixed_input() {
+        let spec = spec_bitmap_agg();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(11), None, Some(22)]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(
+                spec,
+                0,
+                &[ptr as AggStatePtr, ptr as AggStatePtr, ptr as AggStatePtr],
+                &view,
+            )
+            .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(!arr.is_null(0));
+        let decoded = decode_bitmap(arr.value(0)).expect("decode");
+        assert_eq!(decoded, BTreeSet::from([11_u64, 22_u64]));
+    }
+
+    #[test]
+    fn bitmap_union_int_finalize_returns_null_for_empty_group() {
+        let spec = spec_bitmap_union_int();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(
+            arr.is_null(0),
+            "bitmap_union_int/bitmap_union_count over empty group must be NULL, not 0"
+        );
+    }
+
+    #[test]
+    fn bitmap_union_int_finalize_returns_null_for_all_null_input() {
+        let spec = spec_bitmap_union_int();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Option::<i32>::None, None]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(spec, 0, &[ptr as AggStatePtr, ptr as AggStatePtr], &view)
+                .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_union_int_finalize_returns_count_for_mixed_input() {
+        let spec = spec_bitmap_union_int();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(11), None, Some(22), Some(11)]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(
+                spec,
+                0,
+                &[
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                ],
+                &view,
+            )
+            .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), 2_i64);
+    }
+
+    #[test]
+    fn bitmap_agg_intermediate_emits_null_for_empty_group() {
+        // Round-trip through intermediate: empty state should serialize to
+        // NULL in the partial stage, so the merge stage sees NULL and skips
+        // it instead of folding an empty bitmap into the final state.
+        let spec = spec_bitmap_agg();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], true)
+                .expect("build_array intermediate")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
     }
 }
