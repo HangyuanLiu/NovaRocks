@@ -4,6 +4,7 @@
 //! design rationale. Reference: StarRocks `materialization/` rules.
 
 pub(crate) mod column_id;
+pub(crate) mod predicate_split;
 pub(crate) mod registry;
 pub(crate) mod rules;
 pub(crate) mod trace;
