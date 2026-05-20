@@ -7,6 +7,7 @@ pub(crate) mod sort_limit_to_top_n;
 pub(crate) mod split_distinct_agg;
 pub(crate) mod split_top_n;
 
+use super::mv_rewrite::MvRewriteCtx;
 use super::rule::Rule;
 
 /// Returns all implementation rules (logical -> physical).
@@ -38,11 +39,13 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
 }
 
 /// Returns all transformation rules (logical -> logical).
-pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
-    vec![
+pub(crate) fn all_transformation_rules(_mv_ctx: &MvRewriteCtx) -> Vec<Box<dyn Rule>> {
+    let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(join_commutativity::JoinCommutativity),
         Box::new(join_associativity::JoinAssociativity),
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
         Box::new(split_top_n::SplitTopN),
-    ]
+    ];
+    // MV rules will be added here in later tasks.
+    rules
 }

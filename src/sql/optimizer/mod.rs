@@ -5,6 +5,7 @@ pub(crate) mod cost;
 pub(crate) mod cte_rewrite;
 pub(crate) mod extract;
 pub(crate) mod memo;
+pub(crate) mod mv_rewrite;
 pub(crate) mod operator;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
@@ -63,6 +64,7 @@ pub(crate) fn optimize(
     //    dropping join-key or select-list columns from scan required_columns.
     let options =
         options::OptimizerOptions::from_session(&options::current_session_optimizer_settings());
+    let mv_ctx = mv_rewrite::MvRewriteCtx::from_options(&options);
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
         &rbo::rules::predicate_pushdown_rbo_rules(),
@@ -107,7 +109,7 @@ pub(crate) fn optimize(
     check_deadline(deadline)?;
 
     // 7. Explore: apply transformation rules (logical -> logical).
-    let transform_rules = rules::all_transformation_rules();
+    let transform_rules = rules::all_transformation_rules(&mv_ctx);
     explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
@@ -140,7 +142,9 @@ pub(crate) fn optimize(
 /// detect typos in rule names so they can be surfaced via `warn!`
 /// without rejecting the SET statement.
 pub(crate) fn is_known_rule_name(name: &str) -> bool {
-    rules::all_transformation_rules()
+    let dummy_opts = options::OptimizerOptions::default_settings();
+    let dummy_ctx = mv_rewrite::MvRewriteCtx::from_options(&dummy_opts);
+    rules::all_transformation_rules(&dummy_ctx)
         .iter()
         .any(|r| r.name() == name)
         || rules::all_implementation_rules()

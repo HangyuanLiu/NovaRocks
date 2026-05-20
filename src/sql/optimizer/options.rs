@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
     pub enable_rbo_table_prune: bool,
@@ -12,6 +12,35 @@ pub(crate) struct SessionOptimizerSettings {
     pub enable_table_prune_on_update: bool,
     pub enable_eliminate_agg: bool,
     pub disabled_rules: Vec<String>,
+    /// Master kill switch for MV query rewrite. Default true.
+    pub enable_mv_rewrite: bool,
+    /// When false, only fully-fresh MVs are eligible; partial-freshness
+    /// rewrites (UNION ALL with stale-partition base scan) are disabled.
+    /// Default true.
+    pub enable_mv_union_rewrite: bool,
+    /// Skip MV rewrite when fresh partitions cover less than this fraction.
+    /// Default 0.2.
+    pub mv_rewrite_min_fresh_ratio: f64,
+    /// Hard cap on number of MV alternatives inserted per memo group.
+    /// Default 3.
+    pub mv_rewrite_max_candidates_per_group: usize,
+}
+
+impl Default for SessionOptimizerSettings {
+    fn default() -> Self {
+        Self {
+            enable_ukfk_opt: false,
+            enable_rbo_table_prune: false,
+            enable_cbo_table_prune: false,
+            enable_table_prune_on_update: false,
+            enable_eliminate_agg: false,
+            disabled_rules: Vec::new(),
+            enable_mv_rewrite: true,
+            enable_mv_union_rewrite: true,
+            mv_rewrite_min_fresh_ratio: 0.2,
+            mv_rewrite_max_candidates_per_group: 3,
+        }
+    }
 }
 
 thread_local! {
@@ -50,6 +79,14 @@ pub(crate) struct OptimizerOptions {
     pub cbo_max_groups: usize,
     /// Wall-clock budget for the entire `optimize()` call (existing constant; documented here).
     pub optimize_timeout: Duration,
+    /// Master kill switch for MV query rewrite.
+    pub enable_mv_rewrite: bool,
+    /// Enables partial-freshness UNION ALL compensation rewrites.
+    pub enable_mv_union_rewrite: bool,
+    /// Skip MV rewrite when fresh partitions cover less than this fraction.
+    pub mv_rewrite_min_fresh_ratio: f64,
+    /// Hard cap on number of MV alternatives inserted per memo group.
+    pub mv_rewrite_max_candidates_per_group: usize,
 }
 
 impl OptimizerOptions {
@@ -59,6 +96,10 @@ impl OptimizerOptions {
             rbo_max_iterations: 32,
             cbo_max_groups: 5000,
             optimize_timeout: Duration::from_secs(10),
+            enable_mv_rewrite: true,
+            enable_mv_union_rewrite: true,
+            mv_rewrite_min_fresh_ratio: 0.2,
+            mv_rewrite_max_candidates_per_group: 3,
         }
     }
 
@@ -75,6 +116,10 @@ impl OptimizerOptions {
         for rule_name in &settings.disabled_rules {
             opts.disable(rule_name);
         }
+        opts.enable_mv_rewrite = settings.enable_mv_rewrite;
+        opts.enable_mv_union_rewrite = settings.enable_mv_union_rewrite;
+        opts.mv_rewrite_min_fresh_ratio = settings.mv_rewrite_min_fresh_ratio;
+        opts.mv_rewrite_max_candidates_per_group = settings.mv_rewrite_max_candidates_per_group;
         opts
     }
 }
@@ -124,5 +169,14 @@ mod tests {
         let opts = OptimizerOptions::from_session(&settings);
         assert!(opts.is_enabled("JoinCommutativity"));
         assert!(opts.is_enabled("AnyRuleAtAll"));
+    }
+
+    #[test]
+    fn default_enables_mv_rewrite() {
+        let s = SessionOptimizerSettings::default();
+        assert!(s.enable_mv_rewrite);
+        assert!(s.enable_mv_union_rewrite);
+        assert!((s.mv_rewrite_min_fresh_ratio - 0.2).abs() < 1e-9);
+        assert_eq!(s.mv_rewrite_max_candidates_per_group, 3);
     }
 }

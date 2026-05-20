@@ -523,6 +523,36 @@ fn parse_set_non_negative_integer(query: &str, keyword: &str) -> Option<u64> {
     value_str.parse::<u64>().ok()
 }
 
+/// Parse `SET <keyword> = <float>`. Returns `Some((keyword, value))` when
+/// the statement matches the keyword exactly (case-insensitive). The value
+/// must be a valid `f64` literal.
+fn parse_set_float(query: &str, keyword: &str) -> Option<f64> {
+    let normalized = query.replace('=', " = ");
+    let mut parts = normalized.split_whitespace();
+    let head = parts.next()?;
+    if !head.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let actual_keyword = parts.next()?;
+    if !actual_keyword.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let next = parts.next()?;
+    let value_str = if next == "=" { parts.next()? } else { next };
+    if parts.next().is_some() {
+        return None;
+    }
+    value_str.parse::<f64>().ok()
+}
+
+/// Parse `SET <keyword> = <usize>`. Returns `Some(value)` when the statement
+/// matches the keyword exactly (case-insensitive). The value must be a valid
+/// non-negative integer that fits in `usize`.
+fn parse_set_non_negative_usize(query: &str, keyword: &str) -> Option<usize> {
+    let value = parse_set_non_negative_integer(query, keyword)?;
+    usize::try_from(value).ok()
+}
+
 /// Parse `SET query_timeout = N` and `SET query_timeout=N`. Returns the
 /// integer seconds value if the statement matches that shape. The optional
 /// `=` separator may have spaces around it or be glued to the keyword/value.
@@ -745,8 +775,28 @@ async fn execute_statement_text(
                 shim.optimizer_settings.enable_table_prune_on_update = enabled
             }
             "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
+            "enable_materialized_view_rewrite" => {
+                shim.optimizer_settings.enable_mv_rewrite = enabled
+            }
+            "enable_materialized_view_union_rewrite" => {
+                shim.optimizer_settings.enable_mv_union_rewrite = enabled
+            }
             _ => return Ok(StatementResult::Ok),
         }
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(ratio) =
+        parse_set_float(trimmed, "mv_rewrite_min_fresh_ratio")
+    {
+        shim.optimizer_settings.mv_rewrite_min_fresh_ratio = ratio;
+        return Ok(StatementResult::Ok);
+    }
+
+    if let Some(max_cands) =
+        parse_set_non_negative_usize(trimmed, "mv_rewrite_max_candidates_per_group")
+    {
+        shim.optimizer_settings.mv_rewrite_max_candidates_per_group = max_cands;
         return Ok(StatementResult::Ok);
     }
 
