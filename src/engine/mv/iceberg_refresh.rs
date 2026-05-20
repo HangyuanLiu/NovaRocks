@@ -1597,6 +1597,7 @@ fn refresh_single_aggregate_iceberg_mv(
         .get(base_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let mut rebind_happened = false;
     let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
         &loaded.table,
@@ -1617,6 +1618,7 @@ fn refresh_single_aggregate_iceberg_mv(
                 rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
             let mut def = mv_definition.clone();
             def.select_sql = rewritten_sql;
+            rebind_happened = true;
             def
         }
         crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
@@ -1624,6 +1626,28 @@ fn refresh_single_aggregate_iceberg_mv(
         }
     };
     let mv_definition = &effective_definition;
+    // When rebind rewrote stored SELECT, the original `aggregate_shape`
+    // captured by `plan_iceberg_aggregate_mv_refresh` still references the
+    // pre-rebind base column names. Reclassify against the rewritten SQL so
+    // downstream signed-delta/full-state rewrites consistently use the
+    // current base column names.
+    let reclassified_aggregate_shape = if rebind_happened {
+        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
+        let canonical_new = canonicalize_iceberg_mv_select_query(
+            &new_query,
+            current_catalog,
+            current_database,
+        );
+        let new_shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            &canonical_new,
+        )?;
+        aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
+            "iceberg aggregate MV rebind broke aggregate classification".to_string()
+        })?
+    } else {
+        aggregate_shape.clone()
+    };
+    let aggregate_shape = &reclassified_aggregate_shape;
 
     match previous {
         None => {

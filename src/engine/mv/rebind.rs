@@ -131,6 +131,14 @@ impl RebindRewriteContext {
     }
 }
 
+fn top_level_column_output_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        sqlparser::ast::Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+        _ => None,
+    }
+}
+
 fn collect_select_qualifiers(
     select: &sqlparser::ast::Select,
 ) -> std::collections::HashMap<String, String> {
@@ -167,8 +175,30 @@ fn rewrite_select(
 ) -> Result<(), String> {
     for item in &mut select.projection {
         match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(e)
-            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+            sqlparser::ast::SelectItem::UnnamedExpr(e) => {
+                // Preserve the original output column name when a top-level
+                // unaliased column reference is rewritten by rebind. SQL
+                // implicitly uses the last identifier as the output column
+                // name; rewriting `region` -> `area` would silently change
+                // the MV's output column name, breaking the contract with
+                // the frozen target table schema.
+                let original_output_name = top_level_column_output_name(e);
+                rewrite_expr_idents(e, ctx)?;
+                if let Some(original) = original_output_name {
+                    let current = top_level_column_output_name(e);
+                    if current.as_deref() != Some(original.as_str()) {
+                        let new_expr = std::mem::replace(
+                            e,
+                            sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("")),
+                        );
+                        *item = sqlparser::ast::SelectItem::ExprWithAlias {
+                            expr: new_expr,
+                            alias: sqlparser::ast::Ident::new(original),
+                        };
+                    }
+                }
+            }
+            sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
                 rewrite_expr_idents(e, ctx)?;
             }
             sqlparser::ast::SelectItem::Wildcard(_)
@@ -370,9 +400,24 @@ mod tests {
     fn rewrites_group_by_and_having_for_single_aggregate() {
         let sql = "SELECT region, COUNT(*) AS c FROM ice.db.orders GROUP BY region HAVING region IS NOT NULL ORDER BY region";
         let rewritten = rewrite_select_sql_for_rebind(sql, &single("region", "area")).unwrap();
-        assert!(rewritten.contains("area"), "rewritten={rewritten}");
+        // SELECT projection preserves the original output column name as an
+        // alias so the MV target schema contract remains stable.
         assert!(
-            !rewritten.to_ascii_lowercase().contains("region"),
+            rewritten.contains("area AS region"),
+            "rewritten={rewritten}"
+        );
+        // GROUP BY / HAVING / ORDER BY reference the base column directly and
+        // do not need an alias.
+        assert!(
+            rewritten.contains("GROUP BY area"),
+            "rewritten={rewritten}"
+        );
+        assert!(
+            rewritten.contains("HAVING area IS NOT NULL"),
+            "rewritten={rewritten}"
+        );
+        assert!(
+            rewritten.contains("ORDER BY area"),
             "rewritten={rewritten}"
         );
     }
@@ -398,9 +443,37 @@ mod tests {
         let rewritten = rewrite_select_sql_for_rebind(sql, &join_rebinds()).unwrap();
         assert!(rewritten.contains("f.new_dim_id"), "rewritten={rewritten}");
         assert!(rewritten.contains("d.new_id"), "rewritten={rewritten}");
-        assert!(rewritten.contains("d.area"), "rewritten={rewritten}");
+        // SELECT projection: rewritten reference + original output name alias.
+        assert!(
+            rewritten.contains("d.area AS region"),
+            "rewritten={rewritten}"
+        );
+        // GROUP BY / ORDER BY: no alias needed; rewrites cleanly.
+        assert!(
+            rewritten.contains("GROUP BY d.area"),
+            "rewritten={rewritten}"
+        );
+        assert!(
+            rewritten.contains("ORDER BY d.area"),
+            "rewritten={rewritten}"
+        );
         assert!(!rewritten.contains("f.dim_id"), "rewritten={rewritten}");
-        assert!(!rewritten.contains("d.region"), "rewritten={rewritten}");
+    }
+
+    #[test]
+    fn join_projection_qualified_rename_keeps_output_alias() {
+        let sql = "SELECT d.region FROM ice.db.fact AS f JOIN ice.db.dim AS d ON f.dim_id = d.id";
+        let rebound = vec![RebindColumn {
+            base_table_fqn: "ice.db.dim".to_string(),
+            field_id: 3,
+            name_at_create: "region".to_string(),
+            current_name: "area".to_string(),
+        }];
+        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
+        assert!(
+            rewritten.contains("d.area AS region"),
+            "rewritten={rewritten}"
+        );
     }
 
     #[test]
