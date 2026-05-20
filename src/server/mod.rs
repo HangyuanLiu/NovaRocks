@@ -523,26 +523,68 @@ fn parse_set_non_negative_integer(query: &str, keyword: &str) -> Option<u64> {
     value_str.parse::<u64>().ok()
 }
 
-/// Parse `SET <keyword> = <float>`. Returns `Some((keyword, value))` when
-/// the statement matches the keyword exactly (case-insensitive). The value
-/// must be a valid `f64` literal.
-fn parse_set_float(query: &str, keyword: &str) -> Option<f64> {
+/// Parse `SET <keyword> = <float>` for ratio variables whose valid range is
+/// `[0.0, 1.0]` (finite, non-negative, at most 1.0).
+///
+/// Return values:
+/// - `Ok(None)`      — statement does not match `keyword` at all; caller should
+///                     continue to the next SET handler.
+/// - `Ok(Some(v))`   — keyword matched and value is a valid finite `[0.0, 1.0]`
+///                     ratio; `v` is ready to assign.
+/// - `Err(msg)`      — keyword matched but value is out of range, non-finite,
+///                     or not parseable; caller should surface `msg` as an error.
+fn parse_set_float(query: &str, keyword: &str) -> Result<Option<f64>, String> {
     let normalized = query.replace('=', " = ");
     let mut parts = normalized.split_whitespace();
-    let head = parts.next()?;
+    let head = match parts.next() {
+        Some(h) => h,
+        None => return Ok(None),
+    };
     if !head.eq_ignore_ascii_case("set") {
-        return None;
+        return Ok(None);
     }
-    let actual_keyword = parts.next()?;
+    let actual_keyword = match parts.next() {
+        Some(k) => k,
+        None => return Ok(None),
+    };
     if !actual_keyword.eq_ignore_ascii_case(keyword) {
-        return None;
+        return Ok(None);
     }
-    let next = parts.next()?;
-    let value_str = if next == "=" { parts.next()? } else { next };
+    // Keyword matched — any further parse failure is a user error, not a miss.
+    let next = match parts.next() {
+        Some(t) => t,
+        None => {
+            return Err(format!(
+                "invalid value for {keyword}: expected a number in [0.0, 1.0]"
+            ))
+        }
+    };
+    let value_str = if next == "=" {
+        match parts.next() {
+            Some(v) => v,
+            None => {
+                return Err(format!(
+                    "invalid value for {keyword}: expected a number in [0.0, 1.0]"
+                ))
+            }
+        }
+    } else {
+        next
+    };
     if parts.next().is_some() {
-        return None;
+        return Err(format!(
+            "invalid value for {keyword}: unexpected tokens after value"
+        ));
     }
-    value_str.parse::<f64>().ok()
+    let v = value_str.parse::<f64>().map_err(|_| {
+        format!("invalid value for {keyword}: '{value_str}' is not a valid number")
+    })?;
+    if !v.is_finite() || v < 0.0 || v > 1.0 {
+        return Err(format!(
+            "invalid value for {keyword}: '{value_str}' is out of range [0.0, 1.0] or non-finite"
+        ));
+    }
+    Ok(Some(v))
 }
 
 /// Parse `SET <keyword> = <usize>`. Returns `Some(value)` when the statement
@@ -788,6 +830,7 @@ async fn execute_statement_text(
 
     if let Some(ratio) =
         parse_set_float(trimmed, "mv_rewrite_min_fresh_ratio")
+            .map_err(|e| (ErrorKind::ER_WRONG_VALUE_FOR_VAR, e))?
     {
         shim.optimizer_settings.mv_rewrite_min_fresh_ratio = ratio;
         return Ok(StatementResult::Ok);
@@ -1306,5 +1349,36 @@ mod tests {
         assert!(!crate::sql::optimizer::is_known_rule_name(
             "TotallyNotARealRule"
         ));
+    }
+
+    #[test]
+    fn parse_set_float_rejects_nan_inf_negative_and_above_one() {
+        let kw = "mv_rewrite_min_fresh_ratio";
+        // Valid in-range values are accepted.
+        assert_eq!(
+            parse_set_float(&format!("SET {kw} = 0.0"), kw),
+            Ok(Some(0.0))
+        );
+        assert_eq!(
+            parse_set_float(&format!("SET {kw} = 1.0"), kw),
+            Ok(Some(1.0))
+        );
+        assert_eq!(
+            parse_set_float(&format!("SET {kw} = 0.5"), kw),
+            Ok(Some(0.5))
+        );
+        // Statements that don't mention the keyword fall through (Ok(None)).
+        assert_eq!(
+            parse_set_float("SET query_timeout = 60", kw),
+            Ok(None)
+        );
+        assert_eq!(parse_set_float("SELECT 1", kw), Ok(None));
+        // Keyword matched but value is invalid — must be Err.
+        assert!(parse_set_float(&format!("SET {kw} = NaN"), kw).is_err());
+        assert!(parse_set_float(&format!("SET {kw} = inf"), kw).is_err());
+        assert!(parse_set_float(&format!("SET {kw} = -inf"), kw).is_err());
+        assert!(parse_set_float(&format!("SET {kw} = -0.5"), kw).is_err());
+        assert!(parse_set_float(&format!("SET {kw} = 1.5"), kw).is_err());
+        assert!(parse_set_float(&format!("SET {kw} = abc"), kw).is_err());
     }
 }

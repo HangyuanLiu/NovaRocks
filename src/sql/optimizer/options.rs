@@ -179,4 +179,20 @@ mod tests {
         assert!((s.mv_rewrite_min_fresh_ratio - 0.2).abs() < 1e-9);
         assert_eq!(s.mv_rewrite_max_candidates_per_group, 3);
     }
+
+    #[test]
+    fn from_session_propagates_mv_settings() {
+        let settings = SessionOptimizerSettings {
+            enable_mv_rewrite: false,
+            enable_mv_union_rewrite: false,
+            mv_rewrite_min_fresh_ratio: 0.75,
+            mv_rewrite_max_candidates_per_group: 7,
+            ..Default::default()
+        };
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(!opts.enable_mv_rewrite);
+        assert!(!opts.enable_mv_union_rewrite);
+        assert!((opts.mv_rewrite_min_fresh_ratio - 0.75).abs() < 1e-9);
+        assert_eq!(opts.mv_rewrite_max_candidates_per_group, 7);
+    }
 }
