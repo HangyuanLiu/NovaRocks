@@ -311,6 +311,23 @@ impl MvMetaRepository {
             .collect()
     }
 
+    /// Return the IDs of all MVs that reference `base_table_fqn` as one of
+    /// their base tables. Linear scan over `list_definitions`; v1 callers
+    /// are responsible for caching the result for the duration of a query.
+    pub fn list_mvs_by_base_table(
+        &self,
+        txn: &mut dyn MetaReadTxn,
+        base_table_fqn: &str,
+    ) -> RepositoryResult<Vec<i64>> {
+        let all = self.list_definitions(txn)?;
+        let needle = base_table_fqn.to_string();
+        Ok(all
+            .into_iter()
+            .filter(|d| d.base_table_refs.iter().any(|b| b == &needle))
+            .map(|d| d.mv_id)
+            .collect())
+    }
+
     pub fn find_by_target(
         &self,
         txn: &dyn MetaReadTxn,
@@ -999,4 +1016,74 @@ fn key_refresh(refresh_id: i64) -> RepositoryResult<MetaKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+
+    fn open_test_provider() -> (tempfile::TempDir, SqliteMetaStoreProvider) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider =
+            SqliteMetaStoreProvider::open(dir.path().join("metadata.sqlite")).expect("open");
+        (dir, provider)
+    }
+
+    #[test]
+    fn list_mvs_by_base_table_filters_by_base_fqn() {
+        let (_dir, provider) = open_test_provider();
+        let repo = MvMetaRepository::default();
+
+        let mut txn = provider.begin_write("seed").expect("write");
+
+        // mv1 references base_a only
+        let mv1_id = repo
+            .create_definition(
+                txn.as_mut(),
+                CreateMvDefinitionRequest {
+                    select_sql: "SELECT 1".into(),
+                    base_table_refs: vec!["base_a".into()],
+                    primary_key_columns: vec![],
+                    storage_engine: "iceberg".into(),
+                    target_catalog: None,
+                    target_namespace: None,
+                    target_table: None,
+                    schema_contract: None,
+                    partition_spec: None,
+                    created_at_ms: 0,
+                },
+            )
+            .unwrap()
+            .mv_id;
+
+        // mv2 references base_a + base_b
+        let mv2_id = repo
+            .create_definition(
+                txn.as_mut(),
+                CreateMvDefinitionRequest {
+                    select_sql: "SELECT 1".into(),
+                    base_table_refs: vec!["base_a".into(), "base_b".into()],
+                    primary_key_columns: vec![],
+                    storage_engine: "iceberg".into(),
+                    target_catalog: None,
+                    target_namespace: None,
+                    target_table: None,
+                    schema_contract: None,
+                    partition_spec: None,
+                    created_at_ms: 0,
+                },
+            )
+            .unwrap()
+            .mv_id;
+
+        txn.commit().expect("commit");
+
+        let mut txn = provider.begin_write("read").expect("write");
+
+        let mut a = repo.list_mvs_by_base_table(txn.as_mut(), "base_a").unwrap();
+        a.sort();
+        assert_eq!(a, vec![mv1_id, mv2_id]);
+
+        let b = repo.list_mvs_by_base_table(txn.as_mut(), "base_b").unwrap();
+        assert_eq!(b, vec![mv2_id]);
+
+        let none = repo.list_mvs_by_base_table(txn.as_mut(), "missing").unwrap();
+        assert!(none.is_empty());
+    }
 }

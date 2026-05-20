@@ -4,6 +4,7 @@
 //! design rationale. Reference: StarRocks `materialization/` rules.
 
 pub(crate) mod column_id;
+pub(crate) mod registry;
 pub(crate) mod rules;
 pub(crate) mod trace;
 
@@ -22,7 +23,7 @@ struct MvRewriteCtxInner {
     pub enable_mv_union_rewrite: bool,
     pub mv_rewrite_min_fresh_ratio: f64,
     pub mv_rewrite_max_candidates_per_group: usize,
-    // Catalog handle + MvCandidateRegistry will be added in later tasks.
+    pub registry: registry::MvCandidateRegistry,
 }
 
 impl MvRewriteCtx {
@@ -33,6 +34,7 @@ impl MvRewriteCtx {
                 enable_mv_union_rewrite: opts.enable_mv_union_rewrite,
                 mv_rewrite_min_fresh_ratio: opts.mv_rewrite_min_fresh_ratio,
                 mv_rewrite_max_candidates_per_group: opts.mv_rewrite_max_candidates_per_group,
+                registry: registry::MvCandidateRegistry::new(),
             }),
         }
     }
@@ -54,5 +56,10 @@ impl MvRewriteCtx {
     #[allow(dead_code)]
     pub(crate) fn max_candidates_per_group(&self) -> usize {
         self.inner.mv_rewrite_max_candidates_per_group
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn registry(&self) -> &registry::MvCandidateRegistry {
+        &self.inner.registry
     }
 }
