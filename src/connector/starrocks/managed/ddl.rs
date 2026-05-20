@@ -907,15 +907,36 @@ pub(crate) fn bootstrap_empty_partition_for_tablets(
 pub(crate) fn request_schema_from_runtime(
     runtime: &ManagedTableRuntime,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
+    // Build a name -> aggregation-string lookup from the tablet schema PB so
+    // we can restore the ColumnAggregation modifier (BITMAP_UNION, HLL_UNION,
+    // SUM, …) that StoredManagedColumn does not carry.
+    let pb_agg_by_name: std::collections::HashMap<String, Option<String>> = runtime
+        .tablet_schema
+        .column
+        .iter()
+        .filter_map(|col| {
+            let name = col.name.as_deref()?;
+            let key = normalize_identifier(name).ok()?;
+            Some((key, col.aggregation.clone()))
+        })
+        .collect();
+
     let columns = runtime
         .columns
         .iter()
         .map(|column| {
+            let normalized = normalize_identifier(&column.column_name)?;
+            let aggregation = match pb_agg_by_name.get(&normalized) {
+                Some(agg_opt) => aggregation_string_to_column_aggregation(
+                    agg_opt.as_deref().unwrap_or("NONE"),
+                )?,
+                None => None,
+            };
             Ok(TableColumnDef {
                 name: column.column_name.clone(),
                 data_type: parse_managed_logical_type(&column.logical_type)?,
                 nullable: column.nullable,
-                aggregation: None,
+                aggregation,
                 default: None,
             })
         })
@@ -934,6 +955,28 @@ pub(crate) fn request_schema_from_runtime(
         },
         runtime.table.current_schema_id,
     )
+}
+
+/// Maps the string aggregation representation stored in `ColumnPb.aggregation`
+/// back to the parser-level `ColumnAggregation` enum.
+///
+/// Returns `None` for `"NONE"` (no aggregation modifier).  Returns an error
+/// for values that are unrecognised or unsupported in this context.
+fn aggregation_string_to_column_aggregation(
+    agg: &str,
+) -> Result<Option<ColumnAggregation>, String> {
+    match agg.trim().to_ascii_uppercase().as_str() {
+        "NONE" => Ok(None),
+        "SUM" => Ok(Some(ColumnAggregation::Sum)),
+        "MIN" => Ok(Some(ColumnAggregation::Min)),
+        "MAX" => Ok(Some(ColumnAggregation::Max)),
+        "REPLACE" | "REPLACE_IF_NOT_NULL" => Ok(Some(ColumnAggregation::Replace)),
+        "BITMAP_UNION" => Ok(Some(ColumnAggregation::BitmapUnion)),
+        "HLL_UNION" => Ok(Some(ColumnAggregation::HllUnion)),
+        other => Err(format!(
+            "unrecognised column aggregation string in tablet schema PB: `{other}`"
+        )),
+    }
 }
 
 pub(crate) fn build_create_tablet_request(
@@ -2081,6 +2124,124 @@ mod tests {
         assert_eq!(request_schema.columns[1].column_name, "__hidden");
         assert_eq!(request_schema.columns[1].is_key, Some(false));
         assert_eq!(request_schema.short_key_column_count, 1);
+    }
+
+    #[test]
+    fn request_schema_from_runtime_preserves_aggregation() {
+        // Build a synthetic tablet schema PB with:
+        //   k1 INT  (key, no aggregation)
+        //   v_bm BITMAP  (BITMAP_UNION value column)
+        //   v_hll HLL    (HLL_UNION value column)
+        //   v_sum INT    (SUM value column)
+        let make_col_pb = |name: &str, ty: &str, agg: Option<&str>| {
+            crate::service::grpc_client::proto::starrocks::ColumnPb {
+                unique_id: 0,
+                name: Some(name.to_string()),
+                r#type: ty.to_string(),
+                is_key: Some(false),
+                aggregation: agg.map(|s| s.to_string()),
+                is_nullable: Some(true),
+                visible: Some(true),
+                ..Default::default()
+            }
+        };
+
+        let tablet_schema = crate::service::grpc_client::proto::starrocks::TabletSchemaPb {
+            keys_type: None,
+            column: vec![
+                make_col_pb("k1", "INT", Some("NONE")),
+                make_col_pb("v_bm", "OBJECT", Some("BITMAP_UNION")),
+                make_col_pb("v_hll", "HLL", Some("HLL_UNION")),
+                make_col_pb("v_sum", "INT", Some("SUM")),
+            ],
+            ..Default::default()
+        };
+
+        let runtime = ManagedTableRuntime {
+            database_name: "db".to_string(),
+            table: StoredManagedTable {
+                table_id: 1,
+                db_id: 1,
+                name: "agg_tbl".to_string(),
+                keys_type: "AGG_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 1,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
+            },
+            tablet_schema,
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 1,
+                    column_name: "v_bm".to_string(),
+                    logical_type: "BITMAP".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 2,
+                    column_name: "v_hll".to_string(),
+                    logical_type: "HLL".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 3,
+                    column_name: "v_sum".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+            ],
+            partitions: Vec::new(),
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+        };
+
+        let schema = request_schema_from_runtime(&runtime)
+            .expect("request_schema_from_runtime with BITMAP_UNION/HLL_UNION columns");
+
+        assert_eq!(schema.columns.len(), 4);
+
+        // k1: key column — no aggregation
+        assert_eq!(schema.columns[0].column_name, "k1");
+        assert_eq!(schema.columns[0].aggregation_type, None);
+
+        // v_bm: BITMAP_UNION value column
+        assert_eq!(schema.columns[1].column_name, "v_bm");
+        assert_eq!(
+            schema.columns[1].aggregation_type,
+            Some(crate::types::TAggregationType::BITMAP_UNION)
+        );
+
+        // v_hll: HLL_UNION value column
+        assert_eq!(schema.columns[2].column_name, "v_hll");
+        assert_eq!(
+            schema.columns[2].aggregation_type,
+            Some(crate::types::TAggregationType::HLL_UNION)
+        );
+
+        // v_sum: SUM value column
+        assert_eq!(schema.columns[3].column_name, "v_sum");
+        assert_eq!(
+            schema.columns[3].aggregation_type,
+            Some(crate::types::TAggregationType::SUM)
+        );
     }
 
     #[test]
