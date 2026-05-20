@@ -6,4 +6,5 @@ pub(crate) mod iceberg_merge_sink;
 pub(crate) mod iceberg_refresh;
 pub(crate) mod iceberg_target_apply;
 pub(crate) mod lifecycle;
+pub(crate) mod rebind;
 pub(crate) mod schema_contract;
