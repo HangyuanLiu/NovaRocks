@@ -2174,16 +2174,52 @@ fn refresh_join_aggregate_iceberg_mv(
 
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    let effective_definition = validate_join_schema_contract(
+    let decision = validate_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ],
         target_table,
-    )?
-    .into_definition(mv_definition)?;
+    )?;
+    let rebind_happened = matches!(
+        decision,
+        JoinSchemaContractDecision::CompatibleSafeWithRebind { .. }
+    );
+    let effective_definition = decision.into_definition(mv_definition)?;
     let mv_definition = &effective_definition;
+    // Reclassify the join aggregate shape against the rewritten SELECT so
+    // downstream signed-delta / branch rewrites use the current base column
+    // names (join key and group key).
+    let reclassified_join_aggregate_shape = if rebind_happened {
+        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
+        let canonical_new = canonicalize_iceberg_mv_select_query(
+            &new_query,
+            current_catalog,
+            current_database,
+        );
+        let new_shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            &canonical_new,
+        )?;
+        match new_shape {
+            IncrementalMvShape::JoinAggregate(shape) => shape,
+            _ => {
+                return Err(
+                    "iceberg join aggregate MV rebind broke join aggregate classification"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        join_aggregate_shape.clone()
+    };
+    let join_aggregate_shape = &reclassified_join_aggregate_shape;
+    let reclassified_aggregate_shape = if rebind_happened {
+        join_aggregate_shape.as_aggregate_shape_for_layout()
+    } else {
+        aggregate_shape.clone()
+    };
+    let aggregate_shape = &reclassified_aggregate_shape;
 
     let left_current = pin
         .get(left_ref)
