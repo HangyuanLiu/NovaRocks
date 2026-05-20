@@ -47,6 +47,7 @@ use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
     MvTarget, RefreshError, RefreshMode, RefreshPlan,
 };
+use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -1596,6 +1597,7 @@ fn refresh_single_aggregate_iceberg_mv(
         .get(base_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
+    let mut rebind_happened = false;
     let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
         &loaded.table,
@@ -1616,6 +1618,7 @@ fn refresh_single_aggregate_iceberg_mv(
                 rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
             let mut def = mv_definition.clone();
             def.select_sql = rewritten_sql;
+            rebind_happened = true;
             def
         }
         crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
@@ -1623,6 +1626,26 @@ fn refresh_single_aggregate_iceberg_mv(
         }
     };
     let mv_definition = &effective_definition;
+    // When rebind rewrote stored SELECT, the original `aggregate_shape`
+    // captured by `plan_iceberg_aggregate_mv_refresh` still references the
+    // pre-rebind base column names. Reclassify against the rewritten SQL so
+    // downstream signed-delta/full-state rewrites consistently use the
+    // current base column names.
+    let reclassified_aggregate_shape = if rebind_happened {
+        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
+        let canonical_new =
+            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
+        let new_shape =
+            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+                &canonical_new,
+            )?;
+        aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
+            "iceberg aggregate MV rebind broke aggregate classification".to_string()
+        })?
+    } else {
+        aggregate_shape.clone()
+    };
+    let aggregate_shape = &reclassified_aggregate_shape;
 
     match previous {
         None => {
@@ -2149,7 +2172,7 @@ fn refresh_join_aggregate_iceberg_mv(
 
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    validate_join_schema_contract(
+    let decision = validate_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
@@ -2157,6 +2180,42 @@ fn refresh_join_aggregate_iceberg_mv(
         ],
         target_table,
     )?;
+    let rebind_happened = matches!(
+        decision,
+        JoinSchemaContractDecision::CompatibleSafeWithRebind { .. }
+    );
+    let effective_definition = decision.into_definition(mv_definition)?;
+    let mv_definition = &effective_definition;
+    // Reclassify the join aggregate shape against the rewritten SELECT so
+    // downstream signed-delta / branch rewrites use the current base column
+    // names (join key and group key).
+    let reclassified_join_aggregate_shape = if rebind_happened {
+        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
+        let canonical_new =
+            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
+        let new_shape =
+            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+                &canonical_new,
+            )?;
+        match new_shape {
+            IncrementalMvShape::JoinAggregate(shape) => shape,
+            _ => {
+                return Err(
+                    "iceberg join aggregate MV rebind broke join aggregate classification"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        join_aggregate_shape.clone()
+    };
+    let join_aggregate_shape = &reclassified_join_aggregate_shape;
+    let reclassified_aggregate_shape = if rebind_happened {
+        join_aggregate_shape.as_aggregate_shape_for_layout()
+    } else {
+        aggregate_shape.clone()
+    };
+    let aggregate_shape = &reclassified_aggregate_shape;
 
     let left_current = pin
         .get(left_ref)
@@ -2546,8 +2605,12 @@ pub(crate) fn plan_iceberg_mv_refresh(
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ];
-        validate_join_schema_contract(schema_contract, &join_bases, &target_loaded.table)
-            .map_err(RefreshError::user)?;
+        match validate_join_schema_contract(schema_contract, &join_bases, &target_loaded.table)
+            .map_err(RefreshError::user)?
+        {
+            JoinSchemaContractDecision::CompatibleSafe
+            | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+        }
         let left_current = left_loaded
             .table
             .metadata()
@@ -2881,7 +2944,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                 load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
             let right_loaded =
                 load_current_iceberg_base_table(state, right_ref).map_err(RefreshError::user)?;
-            validate_join_schema_contract(
+            match validate_join_schema_contract(
                 schema_contract,
                 &[
                     (left_ref, &left_loaded.table),
@@ -2889,7 +2952,11 @@ fn plan_iceberg_aggregate_mv_refresh(
                 ],
                 target_table,
             )
-            .map_err(RefreshError::user)?;
+            .map_err(RefreshError::user)?
+            {
+                JoinSchemaContractDecision::CompatibleSafe
+                | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+            }
 
             let mut snapshot_pins = BTreeMap::new();
             let mut current_snapshots = BTreeMap::new();
@@ -4994,7 +5061,7 @@ fn refresh_iceberg_join_mv(
         (left_ref, &left_loaded_before_pin.table),
         (right_ref, &right_loaded_before_pin.table),
     ];
-    validate_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)?;
+    let _ = validate_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)?;
 
     match (
         left_previous,
@@ -5048,14 +5115,16 @@ fn refresh_iceberg_join_mv(
 
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    validate_join_schema_contract(
+    let effective_definition = validate_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ],
         target_table,
-    )?;
+    )?
+    .into_definition(mv_definition)?;
+    let mv_definition = &effective_definition;
 
     let left_current = pin
         .get(left_ref)
@@ -5174,11 +5243,79 @@ fn validate_refresh_pin_table_uuids(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum JoinSchemaContractDecision {
+    CompatibleSafe,
+    CompatibleSafeWithRebind {
+        rebound_columns: Vec<crate::engine::mv::schema_contract::RebindColumn>,
+    },
+}
+
+impl JoinSchemaContractDecision {
+    fn into_definition(
+        self,
+        mv_definition: &StoredMvDefinition,
+    ) -> Result<StoredMvDefinition, String> {
+        match self {
+            Self::CompatibleSafe => Ok(mv_definition.clone()),
+            Self::CompatibleSafeWithRebind { rebound_columns } => {
+                let rewritten_sql =
+                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+                let mut def = mv_definition.clone();
+                def.select_sql = rewritten_sql;
+                Ok(def)
+            }
+        }
+    }
+}
+
+fn validate_join_base_schema_contract_for_rebind(
+    base_fqn: &str,
+    base_contract: &crate::meta::repository::mv_contract::BaseContract,
+    current_schema: &iceberg::spec::Schema,
+) -> Result<Vec<crate::engine::mv::schema_contract::RebindColumn>, String> {
+    let current_schema = current_schema.as_struct();
+    let mut rebound = Vec::new();
+    for record in &base_contract.schema_at_create.fields {
+        let Some(field) = current_schema
+            .fields()
+            .iter()
+            .find(|field| field.id == record.field_id)
+        else {
+            return Err(format!(
+                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) was dropped from {}; recreate the MV",
+                record.name_at_create, record.field_id, base_fqn
+            ));
+        };
+        if format!("{}", field.field_type) != record.type_signature {
+            return Err(format!(
+                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed type from {} to {}; recreate the MV",
+                record.name_at_create, record.field_id, record.type_signature, field.field_type
+            ));
+        }
+        if field.required != record.required {
+            return Err(format!(
+                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed nullability; recreate the MV",
+                record.name_at_create, record.field_id
+            ));
+        }
+        if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
+            rebound.push(crate::engine::mv::schema_contract::RebindColumn {
+                base_table_fqn: base_fqn.to_string(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                current_name: field.name.clone(),
+            });
+        }
+    }
+    Ok(rebound)
+}
+
 fn validate_join_schema_contract(
     contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     bases: &[(&IcebergTableRef, &iceberg::table::Table); 2],
     target_table: &iceberg::table::Table,
-) -> Result<(), String> {
+) -> Result<JoinSchemaContractDecision, String> {
     contract
         .ensure_self_consistent()
         .map_err(|e| format!("Iceberg join MV schema contract is self-inconsistent: {e}"))?;
@@ -5194,6 +5331,7 @@ fn validate_join_schema_contract(
                 .to_string(),
         );
     }
+    let mut rebound_columns = Vec::new();
     for (base_ref, table) in bases {
         ensure_base_row_lineage_contract(table, &base_ref.fqn())?;
         let base_contract = contract
@@ -5212,39 +5350,11 @@ fn validate_join_schema_contract(
                 base_ref.fqn()
             ));
         }
-        let current_schema = table.metadata().current_schema().as_struct();
-        for record in &base_contract.schema_at_create.fields {
-            let Some(field) = current_schema
-                .fields()
-                .iter()
-                .find(|field| field.id == record.field_id)
-            else {
-                return Err(format!(
-                    "iceberg join MV refresh blocked: base column \"{}\" (field id {}) was dropped from {}; recreate the MV",
-                    record.name_at_create,
-                    record.field_id,
-                    base_ref.fqn()
-                ));
-            };
-            if format!("{}", field.field_type) != record.type_signature {
-                return Err(format!(
-                    "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed type from {} to {}; recreate the MV",
-                    record.name_at_create, record.field_id, record.type_signature, field.field_type
-                ));
-            }
-            if field.required != record.required {
-                return Err(format!(
-                    "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed nullability; recreate the MV",
-                    record.name_at_create, record.field_id
-                ));
-            }
-            if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-                return Err(format!(
-                    "iceberg join MV refresh blocked: base column \"{}\" (field id {}) was renamed to \"{}\"; recreate the MV",
-                    record.name_at_create, record.field_id, field.name
-                ));
-            }
-        }
+        rebound_columns.extend(validate_join_base_schema_contract_for_rebind(
+            &base_ref.fqn(),
+            base_contract,
+            table.metadata().current_schema(),
+        )?);
     }
     let left_schema = bases[0].1.metadata().current_schema();
     match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
@@ -5254,12 +5364,17 @@ fn validate_join_schema_contract(
         target_table,
     ) {
         crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
+            return Err(format!("{err}"));
         }
         crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
         | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
             ..
-        } => Ok(()),
+        } => {}
+    }
+    if rebound_columns.is_empty() {
+        Ok(JoinSchemaContractDecision::CompatibleSafe)
+    } else {
+        Ok(JoinSchemaContractDecision::CompatibleSafeWithRebind { rebound_columns })
     }
 }
 
@@ -6951,6 +7066,44 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
+
+    #[test]
+    fn join_base_schema_contract_returns_rebind_for_rename() {
+        let ty = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let base_contract = crate::meta::repository::mv_contract::BaseContract {
+            table_fqn: "ice.db.fact".to_string(),
+            table_uuid: "uuid".to_string(),
+            alias_at_create: Some("f".to_string()),
+            schema_id_at_create: 1,
+            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
+                fields: vec![crate::meta::repository::mv_contract::BaseFieldRecord {
+                    field_id: 2,
+                    name_at_create: "dim_id".to_string(),
+                    type_signature: format!("{ty}"),
+                    required: false,
+                }],
+            },
+        };
+        let current_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![std::sync::Arc::new(
+                iceberg::spec::NestedField::optional(2, "new_dim_id", ty),
+            )])
+            .build()
+            .expect("schema");
+
+        let rebound = validate_join_base_schema_contract_for_rebind(
+            "ice.db.fact",
+            &base_contract,
+            &current_schema,
+        )
+        .expect("compatible");
+
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(rebound[0].base_table_fqn, "ice.db.fact");
+        assert_eq!(rebound[0].name_at_create, "dim_id");
+        assert_eq!(rebound[0].current_name, "new_dim_id");
+    }
 
     fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
@@ -10413,242 +10566,5 @@ mod tests {
             .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SQL rewrite helper for CompatibleSafeWithRebind
-// ---------------------------------------------------------------------------
-
-/// Rewrite the stored MV SELECT SQL so that base column references use
-/// the column's current name (per `rebound_columns`) rather than the name
-/// captured at CREATE time. Only identifiers that appear at
-/// "column-reference" positions in the AST are rewritten; string literals
-/// and table identifiers are left alone.
-///
-/// `rebound_columns` is `[(field_id, name_at_create, current_name)]`.
-/// `field_id` is informational here — the rewrite is purely by
-/// case-insensitive name matching.
-///
-/// Limitation: this rewrite operates on the serialized SQL text, not on
-/// a bound semantic graph. If the stored MV SELECT contains subqueries,
-/// CTEs, or expressions where the same identifier appears in multiple
-/// roles (e.g. a base column shadowing a CTE alias), identifiers in all
-/// those positions will be rewritten. For A11 phase 1 (single-base
-/// projection/filter MVs, no CTEs, no subqueries), this is safe: A9's
-/// classification rejects unsupported shapes before reaching this code.
-pub(crate) fn rewrite_select_sql_for_rebind(
-    stored_sql: &str,
-    rebound_columns: &[(i32, String, String)],
-) -> Result<String, String> {
-    if rebound_columns.is_empty() {
-        return Ok(stored_sql.to_string());
-    }
-
-    let rename_map: std::collections::HashMap<String, String> = rebound_columns
-        .iter()
-        .map(|(_field_id, old_name, new_name)| (old_name.to_ascii_lowercase(), new_name.clone()))
-        .collect();
-
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
-        .map_err(|e| format!("rebind rewrite: normalize_for_raw_parse: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("rebind rewrite: parse: {e}"))?;
-
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("rebind rewrite: expected SELECT query".to_string());
-    };
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("rebind rewrite: expected SELECT body".to_string());
-    };
-
-    // Rewrite projection.
-    for item in &mut select.projection {
-        match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(e)
-            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
-                rewrite_expr_idents(e, &rename_map);
-            }
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
-                // Wildcards don't carry column names; left alone.
-            }
-        }
-    }
-
-    // Rewrite WHERE.
-    if let Some(filter) = &mut select.selection {
-        rewrite_expr_idents(filter, &rename_map);
-    }
-
-    // Note: GROUP BY / HAVING / ORDER BY are not rewritten because A11 phase 1
-    // MV shape is projection/filter only. A9's classification rejects MVs with
-    // aggregates / window / order-by before reaching this code path.
-
-    Ok(stmt.to_string())
-}
-
-fn rewrite_expr_idents(
-    expr: &mut sqlparser::ast::Expr,
-    rename_map: &std::collections::HashMap<String, String>,
-) {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Identifier(ident) => {
-            if let Some(new_name) = rename_map.get(&ident.value.to_ascii_lowercase()) {
-                ident.value = new_name.clone();
-            }
-        }
-        Expr::CompoundIdentifier(parts) => {
-            // Only rewrite the last part (the column name), not table/schema
-            // qualifiers.
-            if let Some(last) = parts.last_mut()
-                && let Some(new_name) = rename_map.get(&last.value.to_ascii_lowercase())
-            {
-                last.value = new_name.clone();
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_expr_idents(left, rename_map);
-            rewrite_expr_idents(right, rename_map);
-        }
-        Expr::UnaryOp { expr, .. } => {
-            rewrite_expr_idents(expr, rename_map);
-        }
-        Expr::Cast { expr, .. } => {
-            rewrite_expr_idents(expr, rename_map);
-        }
-        Expr::Nested(inner) => {
-            rewrite_expr_idents(inner, rename_map);
-        }
-        Expr::Function(func) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
-                for arg in &mut list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(inner),
-                    ) = arg
-                    {
-                        rewrite_expr_idents(inner, rename_map);
-                    }
-                }
-            }
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                rewrite_expr_idents(op, rename_map);
-            }
-            for c in conditions {
-                rewrite_expr_idents(&mut c.condition, rename_map);
-                rewrite_expr_idents(&mut c.result, rename_map);
-            }
-            if let Some(e) = else_result {
-                rewrite_expr_idents(e, rename_map);
-            }
-        }
-        Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsFalse(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsNotFalse(inner) => {
-            rewrite_expr_idents(inner, rename_map);
-        }
-        Expr::InList { expr, list, .. } => {
-            rewrite_expr_idents(expr, rename_map);
-            for e in list {
-                rewrite_expr_idents(e, rename_map);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            rewrite_expr_idents(expr, rename_map);
-            rewrite_expr_idents(low, rename_map);
-            rewrite_expr_idents(high, rename_map);
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            rewrite_expr_idents(expr, rename_map);
-            rewrite_expr_idents(pattern, rename_map);
-        }
-        // Other variants (Subquery, Tuple, Array, etc.) are not expected in
-        // A11 phase 1 projection/filter MVs. Leave them alone — if they
-        // contain unrewritten column refs, the analyzer will surface a clear
-        // error.
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod rebind_tests {
-    use super::*;
-
-    #[test]
-    fn rewrite_no_rebind_returns_input_unchanged() {
-        let sql = "SELECT id, region FROM base WHERE region = 'US'";
-        let rewritten = rewrite_select_sql_for_rebind(sql, &[]).unwrap();
-        assert_eq!(rewritten, sql);
-    }
-
-    #[test]
-    fn rewrite_renames_column_in_projection_and_where() {
-        let sql = "SELECT id, region, amount FROM base WHERE region = 'US'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
-        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
-        // After rewrite, 'region' is replaced with 'area' in both
-        // projection and WHERE clause. The literal 'US' is unchanged.
-        assert!(
-            rewritten.contains("area"),
-            "expected 'area' in: {rewritten}"
-        );
-        assert!(
-            !rewritten.to_lowercase().contains("region"),
-            "expected no 'region' in: {rewritten}"
-        );
-        assert!(rewritten.contains("'US'"));
-    }
-
-    #[test]
-    fn rewrite_preserves_string_literals_matching_old_name() {
-        let sql = "SELECT id FROM base WHERE region = 'region'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
-        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
-        // The literal 'region' (string value) must be preserved.
-        assert!(
-            rewritten.contains("'region'"),
-            "string literal should not be rewritten: {rewritten}"
-        );
-        // But the column ref `region` in WHERE LHS gets rewritten to `area`.
-        assert!(rewritten.contains("area"));
-    }
-
-    #[test]
-    fn rewrite_is_case_insensitive_on_old_name() {
-        let sql = "SELECT id, REGION FROM base";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
-        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
-        assert!(
-            rewritten.to_ascii_lowercase().contains("area"),
-            "expected 'area' in: {rewritten}"
-        );
-    }
-
-    #[test]
-    fn rewrite_handles_compound_identifier() {
-        let sql = "SELECT base.id, base.region FROM base WHERE base.region = 'US'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
-        let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
-        assert!(
-            rewritten.contains("area"),
-            "expected 'area' in: {rewritten}"
-        );
-        assert!(
-            !rewritten.to_lowercase().contains(".region"),
-            "expected no '.region' in: {rewritten}"
-        );
     }
 }
