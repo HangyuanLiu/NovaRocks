@@ -1,3 +1,5 @@
+use crate::engine::mv::partition::TargetPartitionFilter;
+
 pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
 pub(crate) const ICEBERG_MV_JOIN_APPLY_KEY_COLUMN: &str = "__nova_join_row_key";
 pub(crate) const ICEBERG_MV_GROUP_APPLY_KEY_COLUMN: &str = "__row_id__";
@@ -206,6 +208,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
     base_row_ids: &[i64],
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
@@ -213,6 +216,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
         ApplyKeyRequest::Int64(base_row_ids),
         existing_deletes_by_file,
         referenced_data_file_partitions,
+        partition_filter,
     )
     .await
 }
@@ -223,6 +227,7 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
     requested_keys: &[String],
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
@@ -230,6 +235,7 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
         ApplyKeyRequest::Utf8(requested_keys),
         existing_deletes_by_file,
         referenced_data_file_partitions,
+        partition_filter,
     )
     .await
 }
@@ -450,6 +456,7 @@ async fn locate_target_rows_by_apply_key_impl(
     requested_keys: ApplyKeyRequest<'_>,
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     use futures::StreamExt;
     use iceberg::arrow::ArrowReaderBuilder;
@@ -473,12 +480,87 @@ async fn locate_target_rows_by_apply_key_impl(
         .plan_files()
         .await
         .map_err(|e| format!("plan iceberg MV target locator files failed: {e}"))?;
-    let cleaned_tasks = task_stream.map(|task_result| {
-        task_result.map(|mut task| {
-            task.deletes.clear();
-            task.predicate = None;
-            task
-        })
+    let target_metadata = target_table.metadata_ref();
+    let filter_owned = partition_filter.clone();
+    let cleaned_tasks = task_stream.map(move |task_result| {
+        let mut task = task_result?;
+        task.deletes.clear();
+        task.predicate = None;
+        if filter_owned.is_allow_list() {
+            let Some(partition_struct) = task.partition.as_ref() else {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!(
+                        "iceberg MV target locator: file scan task for data file `{}` is missing partition metadata",
+                        task.data_file_path
+                    ),
+                ));
+            };
+            // iceberg-rust 0.9 always sets partition_spec = None in FileScanTask
+            // (library TODO in scan/context.rs:139).  Fall back to the table's
+            // default partition spec id so the call never errors unconditionally.
+            let spec_id = task
+                .partition_spec
+                .as_ref()
+                .map(|spec| spec.spec_id())
+                .unwrap_or_else(|| target_metadata.default_partition_spec().spec_id());
+            let values = crate::connector::iceberg::changes::change_partition_field_values(
+                &target_metadata,
+                spec_id,
+                partition_struct,
+            )
+            .map_err(|e| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!(
+                        "iceberg MV target locator: cannot derive partition values for `{}`: {e}",
+                        task.data_file_path
+                    ),
+                )
+            })?;
+            let mut fields = Vec::with_capacity(values.len());
+            for value in &values {
+                let mv_value =
+                    crate::engine::mv::partition::mapping::change_partition_value_to_mv_value(
+                        &task.data_file_path,
+                        &value.value,
+                    )
+                    .map_err(|e| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e)
+                    })?;
+                fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+                    value.field_name.clone(),
+                    mv_value,
+                ));
+            }
+            // Use the allow-list's own spec_id as the canonical key spec_id.
+            // The AllowList is built from the schema contract's target_spec_id,
+            // which may differ from the table's raw default spec_id when the
+            // contract was persisted before a partition spec evolution.
+            // All keys in a single allow-list share the same spec_id (they come
+            // from one contract refresh pass), so picking any key's spec_id is
+            // safe.  For an empty allow-list, fall back to spec_id derived above;
+            // filter_owned.matches will then return false (empty set has no
+            // members), so the task is correctly dropped.
+            let key_spec_id = match &filter_owned {
+                TargetPartitionFilter::AllowList(set) => {
+                    set.iter().next().map(|k| k.spec_id).unwrap_or(spec_id)
+                }
+                TargetPartitionFilter::None => spec_id,
+            };
+            let key = crate::engine::mv::partition::MvPartitionKey::new(key_spec_id, fields);
+            if !filter_owned.matches(&key) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(task))
+    });
+    let cleaned_tasks = cleaned_tasks.filter_map(|task_or_skip| async move {
+        match task_or_skip {
+            Ok(Some(task)) => Some(Ok(task)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        }
     });
     let arrow_reader = ArrowReaderBuilder::new(target_table.file_io().clone())
         .with_row_group_filtering_enabled(false)
@@ -511,6 +593,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
     join_row_keys: &[String],
     existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     locate_target_rows_by_string_apply_key(
         target_table,
@@ -518,6 +601,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
         join_row_keys,
         existing_deletes_by_file,
         referenced_data_file_partitions,
+        partition_filter,
     )
     .await
 }
@@ -525,11 +609,74 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mv::partition::TargetPartitionFilter;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use iceberg::spec::Struct;
     use std::sync::Arc;
+
+    /// Build a minimal `MemoryCatalog`-backed iceberg table that can serve as
+    /// the target for `locate_target_rows_by_apply_key` tests.  The table has
+    /// a single `i64` column named `ICEBERG_MV_APPLY_KEY_COLUMN` and no data
+    /// files.  The `_row_ids` slice is accepted for future extension but
+    /// currently unused (no data is written; tests that exercise the no-request
+    /// path need an empty target table).
+    fn build_memory_iceberg_apply_key_target(_row_ids: &[i64]) -> iceberg::table::Table {
+        use iceberg::Catalog;
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
+        };
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+            let catalog = MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                )
+                .await
+                .expect("MemoryCatalog::load");
+
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create_namespace");
+
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        ICEBERG_MV_APPLY_KEY_COLUMN,
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .expect("build schema");
+
+            let table_ident = TableIdent::new(namespace.clone(), "mv_target".to_string());
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("mv_target".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V3)
+                        .build(),
+                )
+                .await
+                .expect("create_table");
+
+            catalog.load_table(&table_ident).await.expect("load_table")
+        })
+    }
 
     #[test]
     fn apply_key_table_column_is_required_bigint() {
@@ -759,5 +906,270 @@ mod tests {
             );
         }
         partitions
+    }
+
+    #[test]
+    fn empty_request_with_filter_none_returns_empty_groups() {
+        // No request → no scan → empty groups, regardless of filter shape.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let target_table = build_memory_iceberg_apply_key_target(&[]);
+        let existing = std::collections::HashMap::new();
+        let referenced = std::collections::HashMap::new();
+        let groups = rt
+            .block_on(super::locate_target_rows_by_apply_key(
+                &target_table,
+                &[],
+                &existing,
+                &referenced,
+                &TargetPartitionFilter::None,
+            ))
+            .expect("locator");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn empty_request_with_empty_allow_list_returns_empty_groups() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let target_table = build_memory_iceberg_apply_key_target(&[]);
+        let existing = std::collections::HashMap::new();
+        let referenced = std::collections::HashMap::new();
+        let filter = TargetPartitionFilter::AllowList(std::collections::BTreeSet::new());
+        let groups = rt
+            .block_on(super::locate_target_rows_by_apply_key(
+                &target_table,
+                &[],
+                &existing,
+                &referenced,
+                &filter,
+            ))
+            .expect("locator");
+        assert!(groups.is_empty());
+    }
+
+    /// Build a partitioned apply-key target table with two data files:
+    ///   region=a → apply_key = "key-a" at position 0
+    ///   region=b → apply_key = "key-b" at position 0
+    ///
+    /// Schema: `ICEBERG_MV_JOIN_APPLY_KEY_COLUMN` (Utf8 required, field_id=1),
+    ///         `region` (Utf8 optional, field_id=2).
+    /// Partition spec: identity(region), bound spec_id=0.
+    ///
+    /// Returns `(Table, data_file_paths, Arc<Catalog>)`. The catalog arc must
+    /// be kept alive for the duration of the test; `data_file_paths[0]` holds
+    /// the region=a file path and `data_file_paths[1]` the region=b path.
+    fn build_partitioned_apply_key_target_with_rows() -> (
+        iceberg::table::Table,
+        Vec<String>,
+        std::sync::Arc<dyn iceberg::Catalog>,
+    ) {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
+            UnboundPartitionSpec,
+        };
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let warehouse = format!("memory://test-warehouse-{}", Uuid::new_v4());
+            let catalog: std::sync::Arc<dyn iceberg::Catalog> = std::sync::Arc::new(
+                MemoryCatalogBuilder::default()
+                    .load(
+                        "memory",
+                        HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                    )
+                    .await
+                    .expect("MemoryCatalog::load"),
+            );
+
+            let namespace = NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create_namespace");
+
+            // Schema: apply_key (String, required), region (String, optional).
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::optional(2, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("build schema");
+
+            // Partition spec: identity(region) using source field_id=2.
+            let partition_spec = UnboundPartitionSpec::builder()
+                .add_partition_field(2, "region", Transform::Identity)
+                .expect("add partition field")
+                .build();
+
+            let table_ident = TableIdent::new(namespace.clone(), "mv_apply_target".to_string());
+            let table = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("mv_apply_target".to_string())
+                        .schema(schema)
+                        .partition_spec(partition_spec)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create_table");
+
+            // Two batches: region=a and region=b, each with one apply_key row.
+            let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, true),
+            ]));
+            let batch_a = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["key-a"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                ],
+            )
+            .expect("batch_a");
+            let batch_b = RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["key-b"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["b"])) as ArrayRef,
+                ],
+            )
+            .expect("batch_b");
+
+            // Write region=a first, then region=b.  The writer produces one data
+            // file per partition, so data_files[0] = region=a and
+            // data_files[1] = region=b.
+            let data_files =
+                crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                    &table,
+                    vec![batch_a, batch_b],
+                )
+                .await
+                .expect("write data files");
+            assert_eq!(data_files.len(), 2, "expected one data file per partition");
+
+            let file_paths: Vec<String> = data_files
+                .iter()
+                .map(|f| f.file_path().to_string())
+                .collect();
+
+            // Commit both data files via fast_append.
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .add_data_files(data_files)
+                .set_commit_uuid(Uuid::new_v4());
+            let tx = action.apply(tx).expect("fast_append apply");
+            let _table_after: iceberg::table::Table = tx
+                .commit(catalog.as_ref())
+                .await
+                .expect("fast_append commit");
+
+            let refreshed = catalog
+                .load_table(&table_ident)
+                .await
+                .expect("reload table");
+            (refreshed, file_paths, catalog)
+        })
+    }
+
+    /// Verify that the AllowList pruning path:
+    ///   (a) does not error when `task.partition_spec` is None (iceberg-rust 0.9
+    ///       always sets it to None — library TODO in scan/context.rs:139),
+    ///   (b) correctly uses the contract's `target_spec_id` (here: 7) rather
+    ///       than the table's raw default spec_id (here: 0) when constructing
+    ///       the comparison key, so that the allow-list lookup succeeds.
+    ///
+    /// The test builds a two-partition table (region=a, region=b) and calls the
+    /// locator with an AllowList whose single key carries `spec_id=7` (the
+    /// contract spec_id) and `region=a`.  Only the region=a file passes the
+    /// filter; exactly one PositionDeleteGroup is produced.
+    #[test]
+    fn allow_list_with_contract_spec_id_keeps_matching_partition() {
+        use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (target_table, file_paths, _catalog) = build_partitioned_apply_key_target_with_rows();
+
+        // The contract's target_spec_id is 7 — intentionally different from the
+        // table's raw default spec_id (0) to reproduce the production mismatch.
+        // All keys in one AllowList share the same spec_id (single contract pass).
+        const CONTRACT_SPEC_ID: i32 = 7;
+
+        let allow_key = MvPartitionKey::new(
+            CONTRACT_SPEC_ID,
+            vec![MvPartitionKeyField::new(
+                "region".to_string(),
+                MvPartitionValue::String("a".to_string()),
+            )],
+        );
+        let filter = TargetPartitionFilter::AllowList(
+            std::iter::once(allow_key).collect::<std::collections::BTreeSet<_>>(),
+        );
+
+        // Populate referenced_data_file_partitions for both files so the locator
+        // can build PositionDeleteGroups after finding the match.  The table was
+        // just created so its only partition spec has id=0.
+        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+            std::collections::HashMap::new();
+        for path in &file_paths {
+            referenced.insert(
+                path.clone(),
+                crate::engine::delete_flow::ReferencedDataFilePartition {
+                    partition_spec_id: 0,
+                    partition_values: iceberg::spec::Struct::empty(),
+                },
+            );
+        }
+
+        let existing = std::collections::HashMap::new();
+        let join_keys = vec!["key-a".to_string()];
+
+        let groups = rt
+            .block_on(super::locate_target_rows_by_string_apply_key(
+                &target_table,
+                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                &join_keys,
+                &existing,
+                &referenced,
+                &filter,
+            ))
+            .expect("locator must not error (old bug triggered: 'missing partition spec')");
+
+        // The AllowList kept region=a and pruned region=b, so exactly one
+        // PositionDeleteGroup must be returned.  The referenced file must be
+        // one of the two data files (it will be the region=a one), and it must
+        // contain exactly one row at position 0.
+        assert_eq!(
+            groups.len(),
+            1,
+            "expected exactly one delete group (region=b must be pruned by AllowList)"
+        );
+        assert!(
+            file_paths.contains(&groups[0].referenced_data_file),
+            "delete group references an unknown file: {}",
+            groups[0].referenced_data_file
+        );
+        assert_eq!(
+            groups[0].positions,
+            vec![0i64],
+            "one row at position 0 in the matched data file"
+        );
     }
 }
