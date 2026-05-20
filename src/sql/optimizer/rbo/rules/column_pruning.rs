@@ -508,6 +508,7 @@ mod tests {
                     nullable: true,
                 },
             ],
+            already_pushed: false,
         });
 
         let rule = PruneColumns;
