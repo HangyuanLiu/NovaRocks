@@ -333,6 +333,8 @@ pub enum SqlType {
     String,
     Json,
     Binary,
+    Bitmap,
+    Hll,
     Boolean,
     Date,
     DateTime,

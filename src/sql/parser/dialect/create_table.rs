@@ -1528,4 +1528,14 @@ mod tests {
         let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
         assert_eq!(columns.len(), 1);
     }
+
+    #[test]
+    fn parse_create_table_with_bitmap_and_hll_columns() {
+        let sql = "CREATE TABLE foo (k INT, bm BITMAP, hv HLL) \
+                   DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1";
+        let stmt = parse_create_table_one(sql).expect("parse must succeed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert_eq!(columns[1].data_type, SqlType::Bitmap);
+        assert_eq!(columns[2].data_type, SqlType::Hll);
+    }
 }
