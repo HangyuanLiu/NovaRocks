@@ -464,12 +464,14 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "name".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
                 write_default: None,
+                logical_type: None,
             },
         ]
     }
@@ -663,6 +665,7 @@ mod tests {
             data_type: arrow::datatypes::DataType::Float64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         }];
         let w = parse_where("v = 1.0");
         let err = translate_to_delete_predicate(&w, &schema, &["v".to_string()], KeysType::Dup)
@@ -703,6 +706,7 @@ mod tests {
             data_type: ty,
             nullable: true,
             write_default: None,
+            logical_type: None,
         }]
     }
 

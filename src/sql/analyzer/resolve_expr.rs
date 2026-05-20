@@ -938,6 +938,29 @@ impl<'a> super::AnalyzerContext<'a> {
                     | sqlast::BinaryOperator::Spaceship
             );
             if coerce_for_compare {
+                // BITMAP / HLL columns have no scalar identity and cannot be
+                // compared with `=`, `<`, etc. Reject before the operand type
+                // is dropped to `Boolean` so the user sees a clear error.
+                let op_sym = match op {
+                    sqlast::BinaryOperator::Eq => "=",
+                    sqlast::BinaryOperator::NotEq => "!=",
+                    sqlast::BinaryOperator::Lt => "<",
+                    sqlast::BinaryOperator::LtEq => "<=",
+                    sqlast::BinaryOperator::Gt => ">",
+                    sqlast::BinaryOperator::GtEq => ">=",
+                    sqlast::BinaryOperator::Spaceship => "<=>",
+                    _ => unreachable!(),
+                };
+                if let Some(logical) = scope.logical_type_of_expr(&left_typed) {
+                    return Err(format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                    ));
+                }
+                if let Some(logical) = scope.logical_type_of_expr(&right_typed) {
+                    return Err(format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                    ));
+                }
                 let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
                 let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
                 (left_coerced, right_coerced)

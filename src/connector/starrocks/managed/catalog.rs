@@ -611,6 +611,7 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
             data_type: arrow_type_from_tablet_column(schema_column)?,
             nullable: column.nullable,
             write_default: None,
+            logical_type: logical_type_from_tablet_column(schema_column),
         });
     }
     Ok(TableDef {
@@ -706,7 +707,10 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
         }
         "TIME" => Ok(DataType::Time64(TimeUnit::Microsecond)),
         "CHAR" | "VARCHAR" | "STRING" | "JSON" => Ok(DataType::Utf8),
-        "BINARY" | "VARBINARY" => Ok(DataType::Binary),
+        // BITMAP / HLL share `DataType::Binary` with plain BINARY at the
+        // Arrow layer. Logical-type tagging via `ColumnDef.logical_type`
+        // lets the analyzer distinguish them downstream.
+        "BINARY" | "VARBINARY" | "OBJECT" | "BITMAP" | "HLL" => Ok(DataType::Binary),
         "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
             let precision = column
                 .precision
@@ -778,6 +782,25 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
             Ok(DataType::Struct(Fields::from(fields)))
         }
         other => Err(format!("unsupported managed tablet column type `{other}`")),
+    }
+}
+
+/// Return the StarRocks logical type tag for tablet columns whose Arrow
+/// `data_type` does not uniquely identify the logical type (`BITMAP` and
+/// `HLL` both collapse onto `DataType::Binary`). Returns `None` for columns
+/// whose Arrow type is authoritative.
+fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::sql::SqlType> {
+    let raw_type = column.r#type.trim().to_ascii_uppercase();
+    let base_type = raw_type
+        .split('(')
+        .next()
+        .unwrap_or(raw_type.as_str())
+        .trim();
+    match base_type {
+        // BE schema persists BITMAP as `OBJECT` (the historical wire name).
+        "OBJECT" | "BITMAP" => Some(crate::sql::SqlType::Bitmap),
+        "HLL" => Some(crate::sql::SqlType::Hll),
+        _ => None,
     }
 }
 
@@ -933,12 +956,14 @@ mod tests {
                     data_type: DataType::Int32,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
                 ColumnDef {
                     name: "items".to_string(),
                     data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                     nullable: true,
                     write_default: None,
+                    logical_type: None,
                 },
             ]
         );

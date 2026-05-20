@@ -369,6 +369,31 @@ fn resolve_managed_create_defaults(
             columns: choose_default_dup_key_columns(columns)?,
         },
     };
+    // BITMAP / HLL columns cannot appear in any user-declared key
+    // (DUPLICATE / AGGREGATE / UNIQUE / PRIMARY). `key_eligible_type` already
+    // returns false for them; surface a BITMAP/HLL-aware error message.
+    for key_col_name in &key_desc.columns {
+        let normalized = normalize_identifier(key_col_name)?;
+        let Some(column) = columns
+            .iter()
+            .find(|c| normalize_identifier(&c.name).ok().as_deref() == Some(normalized.as_str()))
+        else {
+            // Missing column will be caught downstream in `build_tablet_schema`.
+            continue;
+        };
+        if matches!(column.data_type, SqlType::Bitmap | SqlType::Hll) {
+            let key_kind = match key_desc.kind {
+                TableKeyKind::Primary => "PRIMARY KEY",
+                TableKeyKind::Unique => "UNIQUE KEY",
+                TableKeyKind::Aggregate => "AGGREGATE KEY",
+                TableKeyKind::Duplicate => "DUPLICATE KEY",
+            };
+            return Err(format!(
+                "BITMAP/HLL columns cannot be part of {key_kind} (column `{}` has type {:?})",
+                column.name, column.data_type
+            ));
+        }
+    }
     let bucket_num = i64::from(bucket_count.unwrap_or(DEFAULT_MANAGED_BUCKET_COUNT));
     if bucket_num <= 0 {
         return Err("managed standalone CREATE TABLE requires BUCKETS > 0".to_string());

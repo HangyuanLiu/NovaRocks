@@ -2080,6 +2080,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 data_type: ArrowDataType::Int64,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
@@ -3401,12 +3402,14 @@ mod tests {
                     data_type: DataType::Int32,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
                 ColumnDef {
                     name: "category".to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
                     write_default: None,
+                    logical_type: None,
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
@@ -3543,6 +3546,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -3570,6 +3574,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -3600,6 +3605,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3643,6 +3649,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3689,6 +3696,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3737,6 +3745,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {
@@ -3784,6 +3793,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: Some(IcebergTableInfo {

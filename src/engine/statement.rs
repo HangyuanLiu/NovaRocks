@@ -877,6 +877,7 @@ pub(crate) fn execute_create_table_statement(
             columns,
             key_desc,
             bucket_count,
+            distribution_columns,
             partition_fields,
             properties,
         } => {
@@ -888,6 +889,29 @@ pub(crate) fn execute_create_table_statement(
                     "managed lake is not configured; set `warehouse_uri` to run CREATE TABLE"
                         .to_string(),
                 );
+            }
+
+            // BITMAP / HLL columns cannot be used as distribution keys —
+            // they are opaque blobs with no hash semantics that match a
+            // scalar column. Reject the CREATE TABLE before any catalog
+            // mutation. Column names are case-insensitive in StarRocks.
+            for dist_col in &distribution_columns {
+                let dist_lower = dist_col.to_ascii_lowercase();
+                if let Some(column) = columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
+                {
+                    if matches!(
+                        column.data_type,
+                        crate::sql::parser::ast::SqlType::Bitmap
+                            | crate::sql::parser::ast::SqlType::Hll
+                    ) {
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
+                            column.name, column.data_type
+                        ));
+                    }
+                }
             }
 
             let target = crate::engine::backend_resolver::resolve_table_target(

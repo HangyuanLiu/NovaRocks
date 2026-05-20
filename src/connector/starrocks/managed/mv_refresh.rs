@@ -4539,12 +4539,14 @@ enable_path_style_access = true
                                 data_type: DataType::Int64,
                                 nullable: false,
                                 write_default: None,
+                                logical_type: None,
                             },
                             ColumnDef {
                                 name: "v".to_string(),
                                 data_type: DataType::Int64,
                                 nullable: false,
                                 write_default: None,
+                                logical_type: None,
                             },
                         ],
                         storage: TableStorage::LocalParquetFile {

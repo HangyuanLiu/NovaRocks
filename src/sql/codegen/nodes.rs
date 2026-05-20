@@ -1322,6 +1322,7 @@ mod tests {
                         data_type: DataType::Int8,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
@@ -1378,6 +1379,7 @@ mod tests {
                         data_type: DataType::Int8,
                         nullable: false,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_table: None,
                     storage: TableStorage::S3ParquetFiles {

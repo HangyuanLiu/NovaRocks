@@ -452,6 +452,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             })
             .collect();
         LogicalPlan::Scan(ScanNode {

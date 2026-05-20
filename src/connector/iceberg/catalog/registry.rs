@@ -713,6 +713,7 @@ pub(crate) fn load_table(
                 data_type,
                 nullable: field.is_nullable(),
                 write_default: nested.write_default.clone(),
+                logical_type: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

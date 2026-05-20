@@ -50,6 +50,11 @@ pub(crate) enum CreateTableKind {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,
         bucket_count: Option<u32>,
+        /// Columns named in `DISTRIBUTED BY HASH(...)`. Empty when no such
+        /// clause was written (StarRocks then derives the distribution from
+        /// the leading key columns). Used by managed-lake DDL to reject
+        /// BITMAP / HLL columns up front.
+        distribution_columns: Vec<String>,
         partition_fields: Vec<IcebergPartitionFieldExpr>,
         properties: Vec<(String, String)>,
     },

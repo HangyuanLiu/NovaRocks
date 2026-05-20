@@ -243,30 +243,35 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
             write_default: None,
+            logical_type: None,
         },
         ColumnDef {
             name: "_pos".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         },
         ColumnDef {
             name: "_row_id".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         },
         ColumnDef {
             name: "_last_updated_sequence_number".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         },
         ColumnDef {
             name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
             data_type: arrow::datatypes::DataType::Int8,
             nullable: false,
             write_default: None,
+            logical_type: None,
         },
     ];
     Ok(TableDef {
@@ -331,24 +336,28 @@ fn build_iceberg_table_def_with_data_files(
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "_pos".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "_row_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "_last_updated_sequence_number".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             },
         ]
     } else {
@@ -700,6 +709,7 @@ mod tests {
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
                 write_default: None,
+                logical_type: None,
             }],
             logical_types: HashMap::new(),
             key_desc: None,
@@ -731,6 +741,7 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
+            logical_type: None,
         }
     }
 
