@@ -654,7 +654,7 @@ pub(crate) fn cast_literal(
                 Err("cannot cast complex literal to string".to_string())
             }
         },
-        SqlType::Binary => match &value {
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => match &value {
             Literal::Null => Ok(Literal::Null),
             Literal::Bool(v) => Ok(Literal::String(if *v {
                 "1".to_string()
@@ -945,7 +945,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
         SqlType::String | SqlType::Json => Ok(DataType::Utf8),
-        SqlType::Binary => Ok(DataType::Binary),
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => Ok(DataType::Binary),
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::Date => Ok(DataType::Date32),
         SqlType::DateTime => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
