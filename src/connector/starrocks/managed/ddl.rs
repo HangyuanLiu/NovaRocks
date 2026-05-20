@@ -927,9 +927,9 @@ pub(crate) fn request_schema_from_runtime(
         .map(|column| {
             let normalized = normalize_identifier(&column.column_name)?;
             let aggregation = match pb_agg_by_name.get(&normalized) {
-                Some(agg_opt) => aggregation_string_to_column_aggregation(
-                    agg_opt.as_deref().unwrap_or("NONE"),
-                )?,
+                Some(agg_opt) => {
+                    aggregation_string_to_column_aggregation(agg_opt.as_deref().unwrap_or("NONE"))?
+                }
                 None => None,
             };
             Ok(TableColumnDef {

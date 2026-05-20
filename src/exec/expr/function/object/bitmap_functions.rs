@@ -411,8 +411,7 @@ pub fn eval_bitmap_and(
     for row in 0..chunk.len() {
         let lhs_idx = row_index(row, lhs_len, "bitmap_and", 0, chunk.len())?;
         let rhs_idx = row_index(row, rhs_len, "bitmap_and", 1, chunk.len())?;
-        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
-            || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx)) || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
         {
             builder.append_null();
             continue;
@@ -458,8 +457,7 @@ pub fn eval_bitmap_has_any(
     for row in 0..chunk.len() {
         let lhs_idx = row_index(row, lhs_len, "bitmap_has_any", 0, chunk.len())?;
         let rhs_idx = row_index(row, rhs_len, "bitmap_has_any", 1, chunk.len())?;
-        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
-            || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx)) || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
         {
             builder.append_null();
             continue;
@@ -517,13 +515,14 @@ pub fn eval_sub_bitmap(
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-            Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                builder.append_null();
-                continue;
-            }
-        };
+        let values =
+            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+                Ok(values) => values.into_iter().collect::<Vec<_>>(),
+                Err(_) => {
+                    builder.append_null();
+                    continue;
+                }
+            };
         let cardinality = i64::try_from(values.len())
             .map_err(|_| format!("sub_bitmap cardinality overflow: len={}", values.len()))?;
         let offset = offset.expect("checked");
@@ -590,13 +589,14 @@ pub fn eval_bitmap_subset_limit(
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-            Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                builder.append_null();
-                continue;
-            }
-        };
+        let values =
+            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+                Ok(values) => values.into_iter().collect::<Vec<_>>(),
+                Err(_) => {
+                    builder.append_null();
+                    continue;
+                }
+            };
         if values.is_empty() {
             builder.append_null();
             continue;
@@ -654,8 +654,7 @@ pub fn eval_bitmap_subset_in_range(
     let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let bitmap_idx =
-            row_index(row, bitmap_len, "bitmap_subset_in_range", 0, chunk.len())?;
+        let bitmap_idx = row_index(row, bitmap_len, "bitmap_subset_in_range", 0, chunk.len())?;
         let start_idx = row_index(
             row,
             range_start.len(),
@@ -679,13 +678,14 @@ pub fn eval_bitmap_subset_in_range(
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-            Ok(values) => values.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                builder.append_null();
-                continue;
-            }
-        };
+        let values =
+            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+                Ok(values) => values.into_iter().collect::<Vec<_>>(),
+                Err(_) => {
+                    builder.append_null();
+                    continue;
+                }
+            };
         if values.is_empty() {
             builder.append_null();
             continue;
@@ -1143,16 +1143,9 @@ mod bitmap_binary_op_tests {
             }
             let left = decode_bitmap(lhs_opt.unwrap().value(lhs_idx)).unwrap();
             let right = decode_bitmap(rhs_opt.unwrap().value(rhs_idx)).unwrap();
-            let values: Vec<u64> = left
-                .iter()
-                .filter(|v| right.contains(v))
-                .copied()
-                .collect();
+            let values: Vec<u64> = left.iter().filter(|v| right.contains(v)).copied().collect();
             builder.append_value(
-                encode_internal_bitmap(
-                    &values.iter().copied().collect::<BTreeSet<_>>(),
-                )
-                .unwrap(),
+                encode_internal_bitmap(&values.iter().copied().collect::<BTreeSet<_>>()).unwrap(),
             );
         }
         Ok(Arc::new(builder.finish()) as ArrayRef)
