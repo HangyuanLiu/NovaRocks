@@ -299,6 +299,8 @@ pub(crate) enum ColumnAggregation {
     Min,
     Max,
     Replace,
+    BitmapUnion,
+    HllUnion,
 }
 
 /// Literal that may appear in `DEFAULT <literal>` clauses for Iceberg v3

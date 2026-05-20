@@ -662,6 +662,10 @@ fn parse_column_aggregation(parser: &mut Parser<'_>) -> Option<ColumnAggregation
         Some(ColumnAggregation::Max)
     } else if peek_word_eq(parser, 0, "REPLACE") {
         Some(ColumnAggregation::Replace)
+    } else if peek_word_eq(parser, 0, "BITMAP_UNION") {
+        Some(ColumnAggregation::BitmapUnion)
+    } else if peek_word_eq(parser, 0, "HLL_UNION") {
+        Some(ColumnAggregation::HllUnion)
     } else {
         None
     }?;
@@ -1005,7 +1009,7 @@ mod tests {
 
     use super::parse_create_table_statement;
     use crate::sql::parser::ast::{
-        CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
+        ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
     };
     use crate::sql::parser::dialect::StarRocksDialect;
 
@@ -1537,5 +1541,23 @@ mod tests {
         let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
         assert_eq!(columns[1].data_type, SqlType::Bitmap);
         assert_eq!(columns[2].data_type, SqlType::Hll);
+    }
+
+    #[test]
+    fn parse_aggregate_key_with_bitmap_hll_state_columns() {
+        let sql = "CREATE TABLE foo (
+        k INT,
+        bm BITMAP BITMAP_UNION,
+        hv HLL HLL_UNION
+    ) AGGREGATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1";
+        let stmt = parse_create_table_one(sql).expect("parse must succeed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected Iceberg kind");
+        };
+        assert_eq!(
+            columns[1].aggregation,
+            Some(ColumnAggregation::BitmapUnion)
+        );
+        assert_eq!(columns[2].aggregation, Some(ColumnAggregation::HllUnion));
     }
 }

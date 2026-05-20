@@ -153,5 +153,11 @@ fn merge_aggregate_table_value(
             *existing = incoming.clone();
             Ok(())
         }
+        ColumnAggregation::BitmapUnion | ColumnAggregation::HllUnion => {
+            Err(format!(
+                "{:?} column aggregation is applied at storage read time, not at INSERT merge",
+                aggregation
+            ))
+        }
     }
 }
