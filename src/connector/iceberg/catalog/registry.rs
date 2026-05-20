@@ -703,17 +703,26 @@ pub(crate) fn load_table(
                 nested.field_type.as_ref(),
                 iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant)
             );
+            let logical_type_override = logical_types.get(&field_name);
             let data_type = if is_variant {
                 DataType::LargeBinary
             } else {
-                apply_logical_type_override(field.data_type(), logical_types.get(&field_name))
+                apply_logical_type_override(field.data_type(), logical_type_override)
             };
+            // Only BITMAP/HLL need to surface as ColumnDef.logical_type: the
+            // Arrow data_type collapses both onto Binary, but the analyzer
+            // needs to reject ORDER BY / GROUP BY / comparison / key /
+            // distribution misuse. Other logical-type overrides (DATE) are
+            // already disambiguated by the Arrow data_type itself.
+            let logical_type = logical_type_override
+                .filter(|t| matches!(t, SqlType::Bitmap | SqlType::Hll))
+                .cloned();
             Ok(ColumnDef {
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
                 write_default: nested.write_default.clone(),
-                logical_type: None,
+                logical_type,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

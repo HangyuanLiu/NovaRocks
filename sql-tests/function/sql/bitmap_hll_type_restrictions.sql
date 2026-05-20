@@ -73,3 +73,15 @@ ENGINE=OLAP
 AGGREGATE KEY(k)
 DISTRIBUTED BY HASH(hv) BUCKETS 1
 PROPERTIES("replication_num"="1");
+
+-- query 12: IN list against a BITMAP column must be rejected
+-- @expect_error=BITMAP/HLL columns cannot appear in IN
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm IN (bm);
+
+-- query 13: BETWEEN against a BITMAP column must be rejected
+-- @expect_error=BITMAP/HLL columns cannot appear in BETWEEN
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm BETWEEN bm AND bm;
+
+-- query 14: NOT IN against a BITMAP column must be rejected
+-- @expect_error=BITMAP/HLL columns cannot appear in NOT IN
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm NOT IN (bm);

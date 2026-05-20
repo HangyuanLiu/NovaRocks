@@ -63,13 +63,12 @@ impl AnalyzerScope {
         name: &str,
     ) -> Option<crate::sql::SqlType> {
         let name_lower = name.to_lowercase();
-        if let Some(q) = qualifier {
-            if let Some(t) = self
+        if let Some(q) = qualifier
+            && let Some(t) = self
                 .qualified_logical_types
                 .get(&(q.to_lowercase(), name_lower.clone()))
-            {
-                return Some(t.clone());
-            }
+        {
+            return Some(t.clone());
         }
         self.unqualified_logical_types.get(&name_lower).cloned()
     }

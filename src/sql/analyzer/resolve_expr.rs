@@ -210,6 +210,24 @@ impl<'a> super::AnalyzerContext<'a> {
                     let item_typed = self.analyze_expr(item, scope)?;
                     list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
                 }
+                // BITMAP / HLL operands cannot participate in IN / NOT IN
+                // because they have no scalar identity. Reject upfront so the
+                // user sees a clear error before lowering / codegen.
+                let kw = if *negated { "NOT IN" } else { "IN" };
+                if let Some(logical) = scope.logical_type_of_expr(&expr_typed) {
+                    let col = column_name_of_expr(&expr_typed);
+                    return Err(format!(
+                        "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                    ));
+                }
+                for item in &list_typed {
+                    if let Some(logical) = scope.logical_type_of_expr(item) {
+                        let col = column_name_of_expr(item);
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
+                }
                 Ok(TypedExpr {
                     kind: ExprKind::InList {
                         expr: Box::new(expr_typed),
@@ -240,6 +258,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 // expression is left unchanged.
                 let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
                 let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
+                // BITMAP / HLL operands cannot participate in BETWEEN because
+                // they have no ordering. Reject upfront so the user sees a
+                // clear error before lowering / codegen.
+                for operand in [&expr_typed, &low_typed, &high_typed] {
+                    if let Some(logical) = scope.logical_type_of_expr(operand) {
+                        let col = column_name_of_expr(operand);
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
+                }
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -410,6 +439,19 @@ impl<'a> super::AnalyzerContext<'a> {
                 subquery,
                 negated,
             } => {
+                // BITMAP / HLL operands cannot participate in IN subquery
+                // because they have no scalar identity. Reject upfront by
+                // resolving the LHS to detect a logical-type tag; the LHS
+                // is dropped before the subquery is planned so we cannot
+                // wait until later.
+                let in_expr_typed = self.analyze_expr(in_expr, scope)?;
+                if let Some(logical) = scope.logical_type_of_expr(&in_expr_typed) {
+                    let col = column_name_of_expr(&in_expr_typed);
+                    let kw = if *negated { "NOT IN" } else { "IN" };
+                    return Err(format!(
+                        "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                    ));
+                }
                 let id = self.alloc_subquery_id();
                 let kind = SubqueryKind::InSubquery { negated: *negated };
                 self.collected_subqueries.borrow_mut().push(SubqueryInfo {
@@ -3865,6 +3907,21 @@ fn sql_type_starrocks_name(sql_type: &sqlast::DataType) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// Render a short, user-facing display name for an expression operand. Used by
+/// the BITMAP/HLL fail-fast checks (IN list, BETWEEN, IN subquery, comparison)
+/// so the rejection message can say *which* operand had the offending type. We
+/// only care about column refs here — the same convention `logical_type_of_expr`
+/// uses — but fall back to a placeholder so the format string never panics.
+fn column_name_of_expr(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        ExprKind::ColumnRef { qualifier, column } => match qualifier {
+            Some(q) => format!("{q}.{column}"),
+            None => column.clone(),
+        },
+        _ => "<expr>".to_string(),
+    }
 }
 
 /// Best-effort defaults for MySQL-style `@@var` session variables. We do not

@@ -900,17 +900,16 @@ pub(crate) fn execute_create_table_statement(
                 if let Some(column) = columns
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
-                {
-                    if matches!(
+                    && matches!(
                         column.data_type,
                         crate::sql::parser::ast::SqlType::Bitmap
                             | crate::sql::parser::ast::SqlType::Hll
-                    ) {
-                        return Err(format!(
-                            "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
-                            column.name, column.data_type
-                        ));
-                    }
+                    )
+                {
+                    return Err(format!(
+                        "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
+                        column.name, column.data_type
+                    ));
                 }
             }
 
