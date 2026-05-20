@@ -2102,7 +2102,29 @@ fn infer_scalar_function_return_type(
         "sleep" => Ok(DataType::Boolean),
         "uuid" | "typeof" => Ok(DataType::Utf8),
         "murmur_hash3_32" => Ok(DataType::Int32),
-        "hll_hash" | "ds_hll_count_distinct_state" | "to_bitmap" => Ok(DataType::Binary),
+        "hll_hash"
+        | "ds_hll_count_distinct_state"
+        | "to_bitmap"
+        | "bitmap_or"
+        | "bitmap_xor"
+        | "bitmap_andnot"
+        | "bitmap_intersect"
+        | "bitmap_from_string"
+        | "bitmap_empty"
+        | "bitmap_and"
+        | "sub_bitmap"
+        | "bitmap_subset_limit"
+        | "bitmap_subset_in_range"
+        | "bitmap_to_binary"
+        | "bitmap_from_binary"
+        | "bitmap_to_base64" => Ok(DataType::Binary),
+        "bitmap_contains" | "bitmap_has_any" => Ok(DataType::Boolean),
+        "bitmap_min" | "bitmap_max" | "bitmap_count" => Ok(DataType::Int64),
+        "bitmap_to_array" => Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )))),
         "xx_hash3_64" => Ok(DataType::Int64),
         "xx_hash3_128" => Ok(DataType::FixedSizeBinary(
             crate::common::largeint::LARGEINT_BYTE_WIDTH,

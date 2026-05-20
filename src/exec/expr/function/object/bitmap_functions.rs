@@ -789,3 +789,309 @@ pub fn eval_bitmap_to_base64(
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Binary bitmap set-operation helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Return a `BinaryArray` view of `arr`, or `None` if it is an all-null `NullArray`.
+/// Any other array type that is not BinaryArray returns an `Err`.
+fn as_binary_or_null_array<'a>(
+    arr: &'a ArrayRef,
+    fn_name: &str,
+) -> Result<Option<&'a BinaryArray>, String> {
+    use arrow::datatypes::DataType as DT;
+    match arr.data_type() {
+        DT::Null => Ok(None),
+        DT::Binary => Ok(Some(arr.as_any().downcast_ref::<BinaryArray>().unwrap())),
+        other => Err(format!(
+            "{fn_name} expects BITMAP/BINARY input, got {other:?}"
+        )),
+    }
+}
+
+fn bitmap_binary_op(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: impl Fn(&BTreeSet<u64>, &BTreeSet<u64>) -> BTreeSet<u64>,
+) -> Result<ArrayRef, String> {
+    let lhs_bin = as_binary_or_null_array(lhs, "bitmap op")?;
+    let rhs_bin = as_binary_or_null_array(rhs, "bitmap op")?;
+
+    // Determine result length from whichever side is not a bare NullArray.
+    let len = match (lhs_bin, rhs_bin) {
+        (Some(l), Some(r)) => {
+            if l.len() != r.len() {
+                return Err(format!(
+                    "bitmap op length mismatch: lhs={} rhs={}",
+                    l.len(),
+                    r.len()
+                ));
+            }
+            l.len()
+        }
+        (Some(l), None) => l.len(),
+        (None, Some(r)) => r.len(),
+        (None, None) => lhs.len(),
+    };
+
+    let mut out = BinaryBuilder::new();
+    for i in 0..len {
+        let lhs_null = lhs_bin.map_or(true, |a| a.is_null(i));
+        let rhs_null = rhs_bin.map_or(true, |a| a.is_null(i));
+        if lhs_null || rhs_null {
+            out.append_null();
+            continue;
+        }
+        let a = super::bitmap_common::decode_bitmap(lhs_bin.unwrap().value(i))?;
+        let b = super::bitmap_common::decode_bitmap(rhs_bin.unwrap().value(i))?;
+        let merged = op(&a, &b);
+        out.append_value(super::bitmap_common::encode_internal_bitmap(&merged)?);
+    }
+    Ok(Arc::new(out.finish()) as ArrayRef)
+}
+
+pub(crate) fn eval_bitmap_or_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+    bitmap_binary_op(lhs, rhs, |a, b| a.union(b).copied().collect())
+}
+
+pub(crate) fn eval_bitmap_xor_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+    bitmap_binary_op(lhs, rhs, |a, b| {
+        a.symmetric_difference(b).copied().collect()
+    })
+}
+
+pub(crate) fn eval_bitmap_andnot_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, String> {
+    bitmap_binary_op(lhs, rhs, |a, b| a.difference(b).copied().collect())
+}
+
+pub(crate) fn eval_bitmap_intersect_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, String> {
+    bitmap_binary_op(lhs, rhs, |a, b| a.intersection(b).copied().collect())
+}
+
+pub(crate) fn eval_bitmap_contains_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, String> {
+    use arrow::datatypes::DataType as DT;
+    // Handle all-null literal for the bitmap argument.
+    if lhs.data_type() == &DT::Null || rhs.data_type() == &DT::Null {
+        let len = if lhs.data_type() != &DT::Null {
+            lhs.len()
+        } else if rhs.data_type() != &DT::Null {
+            rhs.len()
+        } else {
+            lhs.len()
+        };
+        let mut out = BooleanBuilder::new();
+        for _ in 0..len {
+            out.append_null();
+        }
+        return Ok(Arc::new(out.finish()) as ArrayRef);
+    }
+    let lhs = lhs
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| "bitmap_contains expects BITMAP/BINARY input for arg 1".to_string())?;
+    let rhs = rhs
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| "bitmap_contains expects BIGINT input for arg 2".to_string())?;
+    if lhs.len() != rhs.len() {
+        return Err(format!(
+            "bitmap_contains length mismatch: lhs={} rhs={}",
+            lhs.len(),
+            rhs.len()
+        ));
+    }
+    let mut out = BooleanBuilder::new();
+    for i in 0..lhs.len() {
+        if lhs.is_null(i) || rhs.is_null(i) {
+            out.append_null();
+            continue;
+        }
+        let a = super::bitmap_common::decode_bitmap(lhs.value(i))?;
+        let v = rhs.value(i);
+        out.append_value(v >= 0 && a.contains(&(v as u64)));
+    }
+    Ok(Arc::new(out.finish()) as ArrayRef)
+}
+
+pub fn eval_bitmap_or(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 2 {
+        return Err(format!("bitmap_or expects 2 arguments, got {}", args.len()));
+    }
+    let lhs = arena.eval(args[0], chunk)?;
+    let rhs = arena.eval(args[1], chunk)?;
+    eval_bitmap_or_arrays(&lhs, &rhs)
+}
+
+pub fn eval_bitmap_xor(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "bitmap_xor expects 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let lhs = arena.eval(args[0], chunk)?;
+    let rhs = arena.eval(args[1], chunk)?;
+    eval_bitmap_xor_arrays(&lhs, &rhs)
+}
+
+pub fn eval_bitmap_andnot(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "bitmap_andnot expects 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let lhs = arena.eval(args[0], chunk)?;
+    let rhs = arena.eval(args[1], chunk)?;
+    eval_bitmap_andnot_arrays(&lhs, &rhs)
+}
+
+pub fn eval_bitmap_intersect(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "bitmap_intersect expects 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let lhs = arena.eval(args[0], chunk)?;
+    let rhs = arena.eval(args[1], chunk)?;
+    eval_bitmap_intersect_arrays(&lhs, &rhs)
+}
+
+pub fn eval_bitmap_contains(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "bitmap_contains expects 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let lhs = arena.eval(args[0], chunk)?;
+    let rhs = arena.eval(args[1], chunk)?;
+    eval_bitmap_contains_arrays(&lhs, &rhs)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests for binary bitmap operations
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod bitmap_binary_op_tests {
+    use super::*;
+    use crate::exec::expr::function::object::bitmap_common::{
+        decode_bitmap, encode_internal_bitmap,
+    };
+    use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int64Array};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn encode(values: &[u64]) -> Vec<u8> {
+        let set: BTreeSet<u64> = values.iter().copied().collect();
+        encode_internal_bitmap(&set).expect("encode")
+    }
+
+    fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
+        let mut b = BinaryBuilder::new();
+        for v in values {
+            match v {
+                Some(bs) => b.append_value(bs),
+                None => b.append_null(),
+            }
+        }
+        Arc::new(b.finish()) as ArrayRef
+    }
+
+    fn decode_row(arr: &BinaryArray, row: usize) -> Vec<u64> {
+        decode_bitmap(arr.value(row)).expect("decode").into_iter().collect()
+    }
+
+    #[test]
+    fn bitmap_or_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 2])), Some(encode(&[]))]);
+        let rhs = binary_array(&[Some(encode(&[3])), Some(encode(&[42]))]);
+        let out = eval_bitmap_or_arrays(&lhs, &rhs).expect("or");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(decode_row(arr, 0), vec![1, 2, 3]);
+        assert_eq!(decode_row(arr, 1), vec![42]);
+    }
+
+    #[test]
+    fn bitmap_xor_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 2, 3]))]);
+        let rhs = binary_array(&[Some(encode(&[2, 3, 4]))]);
+        let out = eval_bitmap_xor_arrays(&lhs, &rhs).expect("xor");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(decode_row(arr, 0), vec![1, 4]);
+    }
+
+    #[test]
+    fn bitmap_andnot_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 2, 3]))]);
+        let rhs = binary_array(&[Some(encode(&[2]))]);
+        let out = eval_bitmap_andnot_arrays(&lhs, &rhs).expect("andnot");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(decode_row(arr, 0), vec![1, 3]);
+    }
+
+    #[test]
+    fn bitmap_intersect_scalar_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 2, 3]))]);
+        let rhs = binary_array(&[Some(encode(&[2, 3, 4]))]);
+        let out = eval_bitmap_intersect_arrays(&lhs, &rhs).expect("intersect");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(decode_row(arr, 0), vec![2, 3]);
+    }
+
+    #[test]
+    fn bitmap_contains_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 5, 9])), Some(encode(&[1, 5, 9]))]);
+        let rhs = Arc::new(Int64Array::from(vec![5, 2])) as ArrayRef;
+        let out = eval_bitmap_contains_arrays(&lhs, &rhs).expect("contains");
+        let arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+    }
+
+    #[test]
+    fn bitmap_or_propagates_nulls() {
+        let lhs = binary_array(&[None]);
+        let rhs = binary_array(&[Some(encode(&[1]))]);
+        let out = eval_bitmap_or_arrays(&lhs, &rhs).expect("or");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
+    }
+}

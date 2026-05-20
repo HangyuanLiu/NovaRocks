@@ -1,0 +1,23 @@
+-- query 1
+bitmap_to_string(bitmap_or(to_bitmap(1), to_bitmap(2)))
+1,2
+
+-- query 2
+bitmap_to_string(bitmap_xor(bitmap_from_string('1,2,3'), bitmap_from_string('2,3,4')))
+1,4
+
+-- query 3
+bitmap_to_string(bitmap_andnot(bitmap_from_string('1,2,3'), bitmap_from_string('2')))
+1,3
+
+-- query 4
+bitmap_to_string(bitmap_intersect(bitmap_from_string('1,2,3'), bitmap_from_string('2,3,4')))
+2,3
+
+-- query 5
+bitmap_contains(to_bitmap(1), 1)	bitmap_contains(to_bitmap(1), 2)
+1	0
+
+-- query 6
+(bitmap_or(NULL, to_bitmap(1))) IS NULL
+1
