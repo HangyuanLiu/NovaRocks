@@ -423,6 +423,8 @@ fn key_eligible_type(data_type: &SqlType) -> bool {
             | SqlType::Double
             | SqlType::Json
             | SqlType::Binary
+            | SqlType::Bitmap
+            | SqlType::Hll
             | SqlType::Array(_)
             | SqlType::Map(_, _)
             | SqlType::Struct(_)
@@ -439,6 +441,7 @@ fn short_key_index_size(data_type: &SqlType) -> usize {
         SqlType::LargeInt | SqlType::Decimal { .. } => 16,
         SqlType::String | SqlType::Binary => 20,
         SqlType::Json => 16,
+        SqlType::Bitmap | SqlType::Hll => SHORT_KEY_MAX_SIZE_BYTES + 1,
         SqlType::Float => 4,
         SqlType::Double => 8,
         SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) | SqlType::Variant => {
@@ -1105,6 +1108,8 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
             None,
         ),
         SqlType::Json => (crate::types::TPrimitiveType::JSON, Some(16), None, None),
+        SqlType::Bitmap => (crate::types::TPrimitiveType::OBJECT, None, None, None),
+        SqlType::Hll => (crate::types::TPrimitiveType::HLL, None, None, None),
         SqlType::Boolean => (crate::types::TPrimitiveType::BOOLEAN, Some(1), None, None),
         SqlType::Date => (crate::types::TPrimitiveType::DATE, Some(4), None, None),
         SqlType::DateTime => (crate::types::TPrimitiveType::DATETIME, Some(8), None, None),
@@ -1231,6 +1236,8 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
         SqlType::Decimal { .. }
         | SqlType::Array(_)
         | SqlType::Binary
+        | SqlType::Bitmap
+        | SqlType::Hll
         | SqlType::Map(_, _)
         | SqlType::Struct(_)
         | SqlType::Variant => None,
@@ -1255,6 +1262,8 @@ pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
         SqlType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
         SqlType::Array(inner) => format!("ARRAY<{}>", logical_type_name(inner)),
         SqlType::Binary => "BINARY".to_string(),
+        SqlType::Bitmap => "BITMAP".to_string(),
+        SqlType::Hll => "HLL".to_string(),
         SqlType::Map(k, v) => format!("MAP<{},{}>", logical_type_name(k), logical_type_name(v)),
         SqlType::Struct(fields) => {
             let mut parts = Vec::with_capacity(fields.len());
@@ -1311,6 +1320,8 @@ fn parse_managed_logical_type(raw: &str) -> Result<SqlType, String> {
         "DOUBLE" => Ok(SqlType::Double),
         "STRING" => Ok(SqlType::String),
         "JSON" => Ok(SqlType::Json),
+        "BITMAP" => Ok(SqlType::Bitmap),
+        "HLL" => Ok(SqlType::Hll),
         "BOOLEAN" => Ok(SqlType::Boolean),
         "DATE" => Ok(SqlType::Date),
         "DATETIME" => Ok(SqlType::DateTime),
@@ -1373,11 +1384,12 @@ mod tests {
     };
 
     use super::{
-        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table, logical_type_name,
-        managed_physical_column, parse_managed_logical_type, patch_tablet_schema_column_flags,
-        request_schema_from_runtime, resolve_managed_create_defaults, sql_type_to_tcolumn_type,
-        sql_type_to_ttype_desc, stored_columns_from_physical_columns,
-        table_columns_from_physical_columns, truncate_managed_table_with_hooks,
+        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table, key_eligible_type,
+        logical_type_name, managed_physical_column, parse_managed_logical_type,
+        patch_tablet_schema_column_flags, request_schema_from_runtime,
+        resolve_managed_create_defaults, sql_type_to_tcolumn_type, sql_type_to_ttype_desc,
+        stored_columns_from_physical_columns, table_columns_from_physical_columns,
+        truncate_managed_table_with_hooks,
     };
 
     fn test_managed_config() -> ManagedLakeConfig {
@@ -2267,5 +2279,30 @@ mod tests {
         .expect_err("double first column should fail");
 
         assert!(err.contains("first column `d` cannot be a key column"));
+    }
+
+    #[test]
+    fn bitmap_hll_thrift_mapping() {
+        let bm = sql_type_to_tcolumn_type(&SqlType::Bitmap).expect("bitmap thrift");
+        assert_eq!(bm.type_, crate::types::TPrimitiveType::OBJECT);
+
+        let hv = sql_type_to_tcolumn_type(&SqlType::Hll).expect("hll thrift");
+        assert_eq!(hv.type_, crate::types::TPrimitiveType::HLL);
+
+        assert_eq!(logical_type_name(&SqlType::Bitmap), "BITMAP");
+        assert_eq!(logical_type_name(&SqlType::Hll), "HLL");
+
+        assert_eq!(
+            parse_managed_logical_type("BITMAP").expect("bitmap parse"),
+            SqlType::Bitmap
+        );
+        assert_eq!(
+            parse_managed_logical_type("HLL").expect("hll parse"),
+            SqlType::Hll
+        );
+
+        // BITMAP/HLL are not eligible as key columns.
+        assert!(!key_eligible_type(&SqlType::Bitmap));
+        assert!(!key_eligible_type(&SqlType::Hll));
     }
 }
