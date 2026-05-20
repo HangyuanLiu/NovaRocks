@@ -49,21 +49,6 @@ fn row_index(
     ))
 }
 
-fn downcast_binary<'a>(
-    array: &'a ArrayRef,
-    fn_name: &str,
-    arg_idx: usize,
-) -> Result<&'a BinaryArray, String> {
-    array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
-        format!(
-            "{} expects BITMAP/BINARY input for arg {}, got {:?}",
-            fn_name,
-            arg_idx,
-            array.data_type()
-        )
-    })
-}
-
 fn i64_arg_at(
     array: &ArrayRef,
     row: usize,
@@ -223,15 +208,17 @@ fn bitmap_minmax_impl(
     pick_max: bool,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = downcast_binary(&input, fn_name, 0)?;
+    let arr_opt = as_binary_or_null_array(&input, fn_name)?;
 
+    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut values_i128: Vec<Option<i128>> = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
-        let idx = row_index(row, arr.len(), fn_name, 0, chunk.len())?;
-        if arr.is_null(idx) {
+        let idx = row_index(row, len, fn_name, 0, chunk.len())?;
+        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
             values_i128.push(None);
             continue;
         }
+        let arr = arr_opt.unwrap();
         let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
@@ -345,6 +332,13 @@ pub fn eval_bitmap_from_string(
     if let Some(arr) = input.as_any().downcast_ref::<LargeBinaryArray>() {
         parse_binary_array!(arr);
     }
+    // NullArray (literal NULL) → all-null output
+    if input.data_type() == &DataType::Null {
+        for _ in 0..chunk.len() {
+            builder.append_null();
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
 
     Err(format!(
         "bitmap_from_string expects VARCHAR/BINARY input, got {:?}",
@@ -359,14 +353,17 @@ pub fn eval_bitmap_count(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = downcast_binary(&input, "bitmap_count", 0)?;
+    let arr_opt = as_binary_or_null_array(&input, "bitmap_count")?;
+    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = Int64Builder::new();
     for row in 0..chunk.len() {
-        let idx = row_index(row, arr.len(), "bitmap_count", 0, chunk.len())?;
-        if arr.is_null(idx) {
-            builder.append_value(0);
+        let idx = row_index(row, len, "bitmap_count", 0, chunk.len())?;
+        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
+            // NULL bitmap input → NULL output (consistent with StarRocks NULL semantics)
+            builder.append_null();
             continue;
         }
+        let arr = arr_opt.unwrap();
         match super::bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => {
                 let count = i64::try_from(values.len())
@@ -405,25 +402,29 @@ pub fn eval_bitmap_and(
 ) -> Result<ArrayRef, String> {
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    let lhs = downcast_binary(&lhs, "bitmap_and", 0)?;
-    let rhs = downcast_binary(&rhs, "bitmap_and", 1)?;
+    let lhs_opt = as_binary_or_null_array(&lhs, "bitmap_and")?;
+    let rhs_opt = as_binary_or_null_array(&rhs, "bitmap_and")?;
 
+    let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
+    let rhs_len = rhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let lhs_idx = row_index(row, lhs.len(), "bitmap_and", 0, chunk.len())?;
-        let rhs_idx = row_index(row, rhs.len(), "bitmap_and", 1, chunk.len())?;
-        if lhs.is_null(lhs_idx) || rhs.is_null(rhs_idx) {
+        let lhs_idx = row_index(row, lhs_len, "bitmap_and", 0, chunk.len())?;
+        let rhs_idx = row_index(row, rhs_len, "bitmap_and", 1, chunk.len())?;
+        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
+            || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+        {
             builder.append_null();
             continue;
         }
-        let left = match super::bitmap_common::decode_bitmap(lhs.value(lhs_idx)) {
+        let left = match super::bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        let right = match super::bitmap_common::decode_bitmap(rhs.value(rhs_idx)) {
+        let right = match super::bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
@@ -448,25 +449,29 @@ pub fn eval_bitmap_has_any(
 ) -> Result<ArrayRef, String> {
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    let lhs = downcast_binary(&lhs, "bitmap_has_any", 0)?;
-    let rhs = downcast_binary(&rhs, "bitmap_has_any", 1)?;
+    let lhs_opt = as_binary_or_null_array(&lhs, "bitmap_has_any")?;
+    let rhs_opt = as_binary_or_null_array(&rhs, "bitmap_has_any")?;
 
+    let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
+    let rhs_len = rhs_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BooleanBuilder::new();
     for row in 0..chunk.len() {
-        let lhs_idx = row_index(row, lhs.len(), "bitmap_has_any", 0, chunk.len())?;
-        let rhs_idx = row_index(row, rhs.len(), "bitmap_has_any", 1, chunk.len())?;
-        if lhs.is_null(lhs_idx) || rhs.is_null(rhs_idx) {
+        let lhs_idx = row_index(row, lhs_len, "bitmap_has_any", 0, chunk.len())?;
+        let rhs_idx = row_index(row, rhs_len, "bitmap_has_any", 1, chunk.len())?;
+        if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
+            || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+        {
             builder.append_null();
             continue;
         }
-        let left = match super::bitmap_common::decode_bitmap(lhs.value(lhs_idx)) {
+        let left = match super::bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        let right = match super::bitmap_common::decode_bitmap(rhs.value(rhs_idx)) {
+        let right = match super::bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
@@ -493,16 +498,17 @@ pub fn eval_sub_bitmap(
     let offset = arena.eval(args[1], chunk)?;
     let len = arena.eval(args[2], chunk)?;
 
-    let bitmap = downcast_binary(&bitmap, "sub_bitmap", 0)?;
+    let bitmap_opt = as_binary_or_null_array(&bitmap, "sub_bitmap")?;
+    let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
 
     for row in 0..chunk.len() {
-        let bitmap_idx = row_index(row, bitmap.len(), "sub_bitmap", 0, chunk.len())?;
+        let bitmap_idx = row_index(row, bitmap_len, "sub_bitmap", 0, chunk.len())?;
         let offset_idx = row_index(row, offset.len(), "sub_bitmap", 1, chunk.len())?;
         let len_idx = row_index(row, len.len(), "sub_bitmap", 2, chunk.len())?;
         let offset = i64_arg_at(&offset, offset_idx, "sub_bitmap", 1)?;
         let len = i64_arg_at(&len, len_idx, "sub_bitmap", 2)?;
-        if bitmap.is_null(bitmap_idx) || offset.is_none() || len.is_none() {
+        if bitmap_opt.is_none_or(|a| a.is_null(bitmap_idx)) || offset.is_none() || len.is_none() {
             builder.append_null();
             continue;
         }
@@ -511,7 +517,7 @@ pub fn eval_sub_bitmap(
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap.value(bitmap_idx)) {
+        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
             Err(_) => {
                 builder.append_null();
@@ -562,10 +568,11 @@ pub fn eval_bitmap_subset_limit(
     let range_start = arena.eval(args[1], chunk)?;
     let limit = arena.eval(args[2], chunk)?;
 
-    let bitmap = downcast_binary(&bitmap, "bitmap_subset_limit", 0)?;
+    let bitmap_opt = as_binary_or_null_array(&bitmap, "bitmap_subset_limit")?;
+    let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let bitmap_idx = row_index(row, bitmap.len(), "bitmap_subset_limit", 0, chunk.len())?;
+        let bitmap_idx = row_index(row, bitmap_len, "bitmap_subset_limit", 0, chunk.len())?;
         let start_idx = row_index(
             row,
             range_start.len(),
@@ -576,11 +583,14 @@ pub fn eval_bitmap_subset_limit(
         let limit_idx = row_index(row, limit.len(), "bitmap_subset_limit", 2, chunk.len())?;
         let range_start = i64_arg_at(&range_start, start_idx, "bitmap_subset_limit", 1)?;
         let limit = i64_arg_at(&limit, limit_idx, "bitmap_subset_limit", 2)?;
-        if bitmap.is_null(bitmap_idx) || range_start.is_none() || limit.is_none() {
+        if bitmap_opt.is_none_or(|a| a.is_null(bitmap_idx))
+            || range_start.is_none()
+            || limit.is_none()
+        {
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap.value(bitmap_idx)) {
+        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
             Err(_) => {
                 builder.append_null();
@@ -640,10 +650,12 @@ pub fn eval_bitmap_subset_in_range(
     let range_start = arena.eval(args[1], chunk)?;
     let range_end = arena.eval(args[2], chunk)?;
 
-    let bitmap = downcast_binary(&bitmap, "bitmap_subset_in_range", 0)?;
+    let bitmap_opt = as_binary_or_null_array(&bitmap, "bitmap_subset_in_range")?;
+    let bitmap_len = bitmap_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let bitmap_idx = row_index(row, bitmap.len(), "bitmap_subset_in_range", 0, chunk.len())?;
+        let bitmap_idx =
+            row_index(row, bitmap_len, "bitmap_subset_in_range", 0, chunk.len())?;
         let start_idx = row_index(
             row,
             range_start.len(),
@@ -660,11 +672,14 @@ pub fn eval_bitmap_subset_in_range(
         )?;
         let range_start = i64_arg_at(&range_start, start_idx, "bitmap_subset_in_range", 1)?;
         let range_end = i64_arg_at(&range_end, end_idx, "bitmap_subset_in_range", 2)?;
-        if bitmap.is_null(bitmap_idx) || range_start.is_none() || range_end.is_none() {
+        if bitmap_opt.is_none_or(|a| a.is_null(bitmap_idx))
+            || range_start.is_none()
+            || range_end.is_none()
+        {
             builder.append_null();
             continue;
         }
-        let values = match super::bitmap_common::decode_bitmap(bitmap.value(bitmap_idx)) {
+        let values = match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
             Ok(values) => values.into_iter().collect::<Vec<_>>(),
             Err(_) => {
                 builder.append_null();
@@ -710,14 +725,16 @@ pub fn eval_bitmap_to_binary(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = downcast_binary(&input, "bitmap_to_binary", 0)?;
+    let arr_opt = as_binary_or_null_array(&input, "bitmap_to_binary")?;
+    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let idx = row_index(row, arr.len(), "bitmap_to_binary", 0, chunk.len())?;
-        if arr.is_null(idx) {
+        let idx = row_index(row, len, "bitmap_to_binary", 0, chunk.len())?;
+        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
             builder.append_null();
             continue;
         }
+        let arr = arr_opt.unwrap();
         let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
@@ -737,14 +754,16 @@ pub fn eval_bitmap_from_binary(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = downcast_binary(&input, "bitmap_from_binary", 0)?;
+    let arr_opt = as_binary_or_null_array(&input, "bitmap_from_binary")?;
+    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = BinaryBuilder::new();
     for row in 0..chunk.len() {
-        let idx = row_index(row, arr.len(), "bitmap_from_binary", 0, chunk.len())?;
-        if arr.is_null(idx) {
+        let idx = row_index(row, len, "bitmap_from_binary", 0, chunk.len())?;
+        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
             builder.append_null();
             continue;
         }
+        let arr = arr_opt.unwrap();
         let payload = arr.value(idx);
         if payload.is_empty() {
             builder.append_null();
@@ -769,14 +788,16 @@ pub fn eval_bitmap_to_base64(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
-    let arr = downcast_binary(&input, "bitmap_to_base64", 0)?;
+    let arr_opt = as_binary_or_null_array(&input, "bitmap_to_base64")?;
+    let len = arr_opt.map(|a| a.len()).unwrap_or(chunk.len());
     let mut builder = StringBuilder::new();
     for row in 0..chunk.len() {
-        let idx = row_index(row, arr.len(), "bitmap_to_base64", 0, chunk.len())?;
-        if arr.is_null(idx) {
+        let idx = row_index(row, len, "bitmap_to_base64", 0, chunk.len())?;
+        if arr_opt.is_none_or(|arr| arr.is_null(idx)) {
             builder.append_null();
             continue;
         }
+        let arr = arr_opt.unwrap();
         let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
@@ -1096,5 +1117,179 @@ mod bitmap_binary_op_tests {
         let out = eval_bitmap_or_arrays(&lhs, &rhs).expect("or");
         let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert!(arr.is_null(0));
+    }
+
+    // ── helpers for refactored functions ──────────────────────────────────────
+
+    fn null_array(len: usize) -> ArrayRef {
+        Arc::new(arrow::array::NullArray::new(len)) as ArrayRef
+    }
+
+    fn eval_bitmap_and_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+        let lhs_opt = as_binary_or_null_array(lhs, "bitmap_and")?;
+        let rhs_opt = as_binary_or_null_array(rhs, "bitmap_and")?;
+        let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(lhs.len());
+        let rhs_len = rhs_opt.map(|a| a.len()).unwrap_or(rhs.len());
+        let chunk_len = lhs_len.max(rhs_len);
+        let mut builder = BinaryBuilder::new();
+        for row in 0..chunk_len {
+            let lhs_idx = if lhs_len == 1 { 0 } else { row };
+            let rhs_idx = if rhs_len == 1 { 0 } else { row };
+            if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
+                || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+            {
+                builder.append_null();
+                continue;
+            }
+            let left = decode_bitmap(lhs_opt.unwrap().value(lhs_idx)).unwrap();
+            let right = decode_bitmap(rhs_opt.unwrap().value(rhs_idx)).unwrap();
+            let values: Vec<u64> = left
+                .iter()
+                .filter(|v| right.contains(v))
+                .copied()
+                .collect();
+            builder.append_value(
+                encode_internal_bitmap(
+                    &values.iter().copied().collect::<BTreeSet<_>>(),
+                )
+                .unwrap(),
+            );
+        }
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn eval_bitmap_has_any_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+        use arrow::array::BooleanBuilder;
+        let lhs_opt = as_binary_or_null_array(lhs, "bitmap_has_any")?;
+        let rhs_opt = as_binary_or_null_array(rhs, "bitmap_has_any")?;
+        let lhs_len = lhs_opt.map(|a| a.len()).unwrap_or(lhs.len());
+        let rhs_len = rhs_opt.map(|a| a.len()).unwrap_or(rhs.len());
+        let chunk_len = lhs_len.max(rhs_len);
+        let mut builder = BooleanBuilder::new();
+        for row in 0..chunk_len {
+            let lhs_idx = if lhs_len == 1 { 0 } else { row };
+            let rhs_idx = if rhs_len == 1 { 0 } else { row };
+            if lhs_opt.is_none_or(|a| a.is_null(lhs_idx))
+                || rhs_opt.is_none_or(|a| a.is_null(rhs_idx))
+            {
+                builder.append_null();
+                continue;
+            }
+            let left = decode_bitmap(lhs_opt.unwrap().value(lhs_idx)).unwrap();
+            let right = decode_bitmap(rhs_opt.unwrap().value(rhs_idx)).unwrap();
+            let has_any = left.iter().any(|v| right.contains(v));
+            builder.append_value(has_any);
+        }
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    fn eval_bitmap_count_arrays(input: &ArrayRef) -> Result<ArrayRef, String> {
+        use arrow::array::Int64Builder;
+        let arr_opt = as_binary_or_null_array(input, "bitmap_count")?;
+        let len = arr_opt.map(|a| a.len()).unwrap_or(input.len());
+        let mut builder = Int64Builder::new();
+        for i in 0..len {
+            if arr_opt.is_none_or(|a| a.is_null(i)) {
+                builder.append_null();
+                continue;
+            }
+            match decode_bitmap(arr_opt.unwrap().value(i)) {
+                Ok(values) => builder.append_value(values.len() as i64),
+                Err(_) => builder.append_null(),
+            }
+        }
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    }
+
+    // ── NULL propagation tests for refactored functions ───────────────────────
+
+    #[test]
+    fn as_binary_or_null_array_handles_null_array() {
+        let arr = null_array(3);
+        let result = as_binary_or_null_array(&arr, "test").expect("should not error");
+        assert!(result.is_none(), "NullArray should map to None");
+    }
+
+    #[test]
+    fn as_binary_or_null_array_rejects_wrong_type() {
+        let arr = Arc::new(Int64Array::from(vec![1i64])) as ArrayRef;
+        assert!(as_binary_or_null_array(&arr, "test").is_err());
+    }
+
+    #[test]
+    fn bitmap_and_propagates_null_literal_lhs() {
+        let lhs = null_array(1);
+        let rhs = binary_array(&[Some(encode(&[1]))]);
+        let out = eval_bitmap_and_arrays(&lhs, &rhs).expect("and");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_and_propagates_null_literal_rhs() {
+        let lhs = binary_array(&[Some(encode(&[1]))]);
+        let rhs = null_array(1);
+        let out = eval_bitmap_and_arrays(&lhs, &rhs).expect("and");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_and_propagates_null_value() {
+        let lhs = binary_array(&[None]);
+        let rhs = binary_array(&[Some(encode(&[1]))]);
+        let out = eval_bitmap_and_arrays(&lhs, &rhs).expect("and");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_and_basic() {
+        let lhs = binary_array(&[Some(encode(&[1, 2, 3]))]);
+        let rhs = binary_array(&[Some(encode(&[2, 3, 4]))]);
+        let out = eval_bitmap_and_arrays(&lhs, &rhs).expect("and");
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(decode_row(arr, 0), vec![2, 3]);
+    }
+
+    #[test]
+    fn bitmap_has_any_propagates_null_literal() {
+        let lhs = null_array(1);
+        let rhs = binary_array(&[Some(encode(&[1]))]);
+        let out = eval_bitmap_has_any_arrays(&lhs, &rhs).expect("has_any");
+        assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_has_any_propagates_null_value() {
+        let lhs = binary_array(&[None]);
+        let rhs = binary_array(&[Some(encode(&[1]))]);
+        let out = eval_bitmap_has_any_arrays(&lhs, &rhs).expect("has_any");
+        assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_count_propagates_null_literal() {
+        let input = null_array(1);
+        let out = eval_bitmap_count_arrays(&input).expect("count");
+        assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_count_propagates_null_value() {
+        let input = binary_array(&[None]);
+        let out = eval_bitmap_count_arrays(&input).expect("count");
+        assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn bitmap_count_basic() {
+        let input = binary_array(&[Some(encode(&[1, 2, 3]))]);
+        let out = eval_bitmap_count_arrays(&input).expect("count");
+        let arr = out
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 3);
     }
 }

@@ -21,3 +21,55 @@ bitmap_contains(to_bitmap(1), 1)	bitmap_contains(to_bitmap(1), 2)
 -- query 6
 (bitmap_or(NULL, to_bitmap(1))) IS NULL
 1
+
+-- query 7
+(bitmap_and(NULL, to_bitmap(1))) IS NULL
+1
+
+-- query 8
+(bitmap_has_any(NULL, to_bitmap(1))) IS NULL
+1
+
+-- query 9
+(bitmap_count(NULL)) IS NULL
+1
+
+-- query 10
+(bitmap_to_string(NULL)) IS NULL
+1
+
+-- query 11
+(bitmap_to_binary(NULL)) IS NULL
+1
+
+-- query 12
+(bitmap_from_binary(NULL)) IS NULL
+1
+
+-- query 13
+(bitmap_to_base64(NULL)) IS NULL
+1
+
+-- query 14
+(bitmap_from_string(NULL)) IS NULL
+1
+
+-- query 15
+(sub_bitmap(NULL, 0, 1)) IS NULL
+1
+
+-- query 16
+(bitmap_subset_limit(NULL, 0, 1)) IS NULL
+1
+
+-- query 17
+(bitmap_subset_in_range(NULL, 0, 10)) IS NULL
+1
+
+-- query 18
+(bitmap_min(NULL)) IS NULL
+1
+
+-- query 19
+(bitmap_max(NULL)) IS NULL
+1

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BinaryArray, StringBuilder};
+use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -32,6 +33,16 @@ pub fn eval_bitmap_to_string(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let input = arena.eval(args[0], chunk)?;
+
+    // NullArray (literal NULL) → all-null output
+    if input.data_type() == &DataType::Null {
+        let mut builder = StringBuilder::new();
+        for _ in 0..chunk.len() {
+            builder.append_null();
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
     let arr = input
         .as_any()
         .downcast_ref::<BinaryArray>()
@@ -45,7 +56,7 @@ pub fn eval_bitmap_to_string(
     for row in 0..chunk.len() {
         let idx = row_index(row, arr.len());
         if arr.is_null(idx) {
-            builder.append_value("");
+            builder.append_null();
             continue;
         }
         let values = super::bitmap_common::decode_bitmap(arr.value(idx))?;
