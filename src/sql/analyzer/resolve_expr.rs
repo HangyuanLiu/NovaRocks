@@ -2309,6 +2309,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 start,
                 end,
             })
+        } else if !order_by.is_empty() {
+            // SQL standard: when ORDER BY is present but no explicit window
+            // frame is given, the implicit frame is
+            //   RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // (i.e. running aggregate over peers). Without this default,
+            // aggregate window functions like SUM/AVG/BITMAP_UNION over
+            // ORDER BY would return the whole-partition value on every row.
+            // Ranking/offset functions (row_number, rank, lead, lag, ...)
+            // ignore the frame at execution time, so synthesizing a default
+            // here has no effect on them.
+            Some(WindowFrame {
+                frame_type: WindowFrameType::Range,
+                start: WindowBound::UnboundedPreceding,
+                end: WindowBound::CurrentRow,
+            })
         } else {
             None
         };
