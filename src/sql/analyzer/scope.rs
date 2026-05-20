@@ -31,6 +31,13 @@ pub(super) struct AnalyzerScope {
     /// `COALESCE(left.id, right.id)` so that null-padding on either side
     /// still produces the correct merged value.
     computed_columns: HashMap<String, crate::sql::analysis::TypedExpr>,
+    /// Logical type tags for columns whose Arrow `DataType` is ambiguous —
+    /// today only BITMAP and HLL, both stored as `DataType::Binary`. The
+    /// analyzer consults this side-table to reject misuse (ORDER BY /
+    /// GROUP BY / comparison / key / distribution). Keyed by lower-cased
+    /// (qualifier, column) and the unqualified column name.
+    qualified_logical_types: HashMap<(String, String), crate::sql::SqlType>,
+    unqualified_logical_types: HashMap<String, crate::sql::SqlType>,
 }
 
 impl AnalyzerScope {
@@ -42,6 +49,44 @@ impl AnalyzerScope {
             lambda_params: HashMap::new(),
             canonical_qualifier: HashMap::new(),
             computed_columns: HashMap::new(),
+            qualified_logical_types: HashMap::new(),
+            unqualified_logical_types: HashMap::new(),
+        }
+    }
+
+    /// Look up the logical type tag for a column reference. Returns the
+    /// StarRocks `SqlType` for BITMAP/HLL columns; `None` for all other
+    /// columns (including those whose Arrow type fully describes them).
+    pub(super) fn logical_type_for(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::SqlType> {
+        let name_lower = name.to_lowercase();
+        if let Some(q) = qualifier
+            && let Some(t) = self
+                .qualified_logical_types
+                .get(&(q.to_lowercase(), name_lower.clone()))
+        {
+            return Some(t.clone());
+        }
+        self.unqualified_logical_types.get(&name_lower).cloned()
+    }
+
+    /// Convenience: if `expr` is a `ColumnRef`, return the column's logical
+    /// type tag. Returns `None` for expressions that are not direct column
+    /// references — the BITMAP/HLL fail-fast checks only need to recognise
+    /// the column-ref case because comparison / sort / group of *derived*
+    /// BITMAP/HLL values would already have been rejected when the producer
+    /// function was resolved.
+    pub(super) fn logical_type_of_expr(
+        &self,
+        expr: &crate::sql::analysis::TypedExpr,
+    ) -> Option<crate::sql::SqlType> {
+        if let crate::sql::analysis::ExprKind::ColumnRef { qualifier, column } = &expr.kind {
+            self.logical_type_for(qualifier.as_deref(), column)
+        } else {
+            None
         }
     }
 
@@ -73,9 +118,16 @@ impl AnalyzerScope {
                     (q.to_lowercase(), name_lower.clone()),
                     (col.data_type.clone(), col.nullable),
                 );
+                if let Some(logical) = col.logical_type.clone() {
+                    self.qualified_logical_types
+                        .insert((q.to_lowercase(), name_lower.clone()), logical);
+                }
             }
             self.unqualified
-                .insert(name_lower, (col.data_type.clone(), col.nullable));
+                .insert(name_lower.clone(), (col.data_type.clone(), col.nullable));
+            if let Some(logical) = col.logical_type.clone() {
+                self.unqualified_logical_types.insert(name_lower, logical);
+            }
             // Store original-case name in ordered for SELECT * display.
             self.ordered.push((
                 qualifier.map(|s| s.to_lowercase()),
@@ -440,6 +492,7 @@ mod tests {
             data_type: ty,
             nullable,
             write_default: None,
+            logical_type: None,
         }
     }
 

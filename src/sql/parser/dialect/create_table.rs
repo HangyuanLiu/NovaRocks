@@ -57,6 +57,7 @@ pub(crate) fn parse_create_table_statement(
     let mut _engine = None;
     let mut key_desc = None;
     let mut bucket_count = None;
+    let mut distribution_columns: Vec<String> = Vec::new();
     let mut partition_fields = Vec::new();
     let mut legacy_range_partitions = Vec::new();
     let mut parsed_iceberg_partition_clause = false;
@@ -104,11 +105,14 @@ pub(crate) fn parse_create_table_statement(
                 ensure_partition_clause_boundary(parser)?;
             }
         } else if peek_word_eq(parser, 0, "DISTRIBUTED") {
-            bucket_count = if parsed_iceberg_partition_clause {
-                parse_bucket_count_strict(parser)?
-            } else {
-                parse_bucket_count(parser)?
-            };
+            let (parsed_bucket_count, parsed_distribution_columns) =
+                if parsed_iceberg_partition_clause {
+                    parse_bucket_count_strict(parser)?
+                } else {
+                    parse_bucket_count(parser)?
+                };
+            bucket_count = parsed_bucket_count;
+            distribution_columns = parsed_distribution_columns;
         } else if parser.parse_keyword(Keyword::ORDER) {
             // ORDER BY (...)
             let _ = parser.parse_keyword(Keyword::BY);
@@ -171,6 +175,7 @@ pub(crate) fn parse_create_table_statement(
         columns,
         key_desc,
         bucket_count,
+        distribution_columns,
         partition_fields,
         properties,
     };
@@ -510,8 +515,9 @@ fn parse_positive_u32(parser: &mut Parser<'_>, label: &str) -> Result<u32, Strin
     }
 }
 
-fn parse_bucket_count(parser: &mut Parser<'_>) -> Result<Option<u32>, String> {
+fn parse_bucket_count(parser: &mut Parser<'_>) -> Result<(Option<u32>, Vec<String>), String> {
     parser.next_token(); // DISTRIBUTED
+    let mut distribution_columns = Vec::new();
     loop {
         if parser.peek_token_ref().token == Token::EOF
             || parser.peek_token_ref().token == Token::SemiColon
@@ -519,35 +525,46 @@ fn parse_bucket_count(parser: &mut Parser<'_>) -> Result<Option<u32>, String> {
             || peek_word_eq(parser, 0, "PROPERTIES")
             || peek_word_eq(parser, 0, "TBLPROPERTIES")
         {
-            return Ok(None);
+            return Ok((None, distribution_columns));
         }
         if peek_word_eq(parser, 0, "BUCKETS") {
             parser.next_token(); // BUCKETS
             let token = parser.next_token();
             return match token.token {
-                Token::Number(value, _) => {
-                    Ok(Some(value.parse::<u32>().map_err(|e| {
-                        format!("invalid BUCKETS value `{value}`: {e}")
-                    })?))
-                }
+                Token::Number(value, _) => Ok((
+                    Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|e| format!("invalid BUCKETS value `{value}`: {e}"))?,
+                    ),
+                    distribution_columns,
+                )),
                 other => Err(format!("expected numeric BUCKETS value, got {other}")),
             };
         }
         if parser.peek_token_ref().token == Token::LParen {
-            skip_parenthesized(parser);
+            // Capture column names inside `HASH(...)` once. Subsequent parens
+            // (none expected today) fall through to the original skip path.
+            if distribution_columns.is_empty() {
+                distribution_columns = capture_parenthesized_identifiers(parser);
+            } else {
+                skip_parenthesized(parser);
+            }
         } else {
             parser.next_token();
         }
     }
 }
 
-fn parse_bucket_count_strict(parser: &mut Parser<'_>) -> Result<Option<u32>, String> {
+fn parse_bucket_count_strict(
+    parser: &mut Parser<'_>,
+) -> Result<(Option<u32>, Vec<String>), String> {
     parser.next_token(); // DISTRIBUTED
     parser
         .expect_keyword(Keyword::BY)
         .map_err(|e| format!("expected BY after DISTRIBUTED: {e}"))?;
     expect_word(parser, "HASH")?;
-    skip_parenthesized(parser);
+    let distribution_columns = capture_parenthesized_identifiers(parser);
 
     let bucket_count = if peek_word_eq(parser, 0, "BUCKETS") {
         parser.next_token(); // BUCKETS
@@ -570,12 +587,43 @@ fn parse_bucket_count_strict(parser: &mut Parser<'_>) -> Result<Option<u32>, Str
         || peek_word_eq(parser, 0, "PROPERTIES")
         || peek_word_eq(parser, 0, "TBLPROPERTIES")
     {
-        return Ok(bucket_count);
+        return Ok((bucket_count, distribution_columns));
     }
     Err(format!(
         "unexpected token after DISTRIBUTED clause: {}",
         parser.peek_token_ref().token
     ))
+}
+
+/// Consume a `(...)` group and return identifier tokens inside it (with quote
+/// characters stripped). Used for `DISTRIBUTED BY HASH(col1, col2, ...)` so
+/// the engine can reject BITMAP/HLL distribution columns.  Any non-identifier
+/// tokens (commas, whitespace) are silently skipped — the engine validates
+/// the resulting names against the declared schema.
+fn capture_parenthesized_identifiers(parser: &mut Parser<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    if !parser.consume_token(&Token::LParen) {
+        return names;
+    }
+    let mut depth = 1;
+    loop {
+        let tok = parser.next_token();
+        match tok.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Token::Word(w) if depth == 1 => {
+                names.push(w.value);
+            }
+            Token::EOF => break,
+            _ => {}
+        }
+    }
+    names
 }
 
 fn expect_word(parser: &mut Parser<'_>, word: &str) -> Result<(), String> {
@@ -662,6 +710,10 @@ fn parse_column_aggregation(parser: &mut Parser<'_>) -> Option<ColumnAggregation
         Some(ColumnAggregation::Max)
     } else if peek_word_eq(parser, 0, "REPLACE") {
         Some(ColumnAggregation::Replace)
+    } else if peek_word_eq(parser, 0, "BITMAP_UNION") {
+        Some(ColumnAggregation::BitmapUnion)
+    } else if peek_word_eq(parser, 0, "HLL_UNION") {
+        Some(ColumnAggregation::HllUnion)
     } else {
         None
     }?;
@@ -1005,7 +1057,7 @@ mod tests {
 
     use super::parse_create_table_statement;
     use crate::sql::parser::ast::{
-        CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
+        ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
     };
     use crate::sql::parser::dialect::StarRocksDialect;
 
@@ -1527,5 +1579,30 @@ mod tests {
         assert!(stmt.as_select.is_none());
         let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
         assert_eq!(columns.len(), 1);
+    }
+
+    #[test]
+    fn parse_create_table_with_bitmap_and_hll_columns() {
+        let sql = "CREATE TABLE foo (k INT, bm BITMAP, hv HLL) \
+                   DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1";
+        let stmt = parse_create_table_one(sql).expect("parse must succeed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert_eq!(columns[1].data_type, SqlType::Bitmap);
+        assert_eq!(columns[2].data_type, SqlType::Hll);
+    }
+
+    #[test]
+    fn parse_aggregate_key_with_bitmap_hll_state_columns() {
+        let sql = "CREATE TABLE foo (
+        k INT,
+        bm BITMAP BITMAP_UNION,
+        hv HLL HLL_UNION
+    ) AGGREGATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1";
+        let stmt = parse_create_table_one(sql).expect("parse must succeed");
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind else {
+            panic!("expected Iceberg kind");
+        };
+        assert_eq!(columns[1].aggregation, Some(ColumnAggregation::BitmapUnion));
+        assert_eq!(columns[2].aggregation, Some(ColumnAggregation::HllUnion));
     }
 }

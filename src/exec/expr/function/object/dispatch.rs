@@ -61,7 +61,16 @@ pub fn eval_object_function(
         "bitmap_min" => super::bitmap_functions::eval_bitmap_min(arena, expr, args, chunk),
         "bitmap_max" => super::bitmap_functions::eval_bitmap_max(arena, expr, args, chunk),
         "bitmap_and" => super::bitmap_functions::eval_bitmap_and(arena, expr, args, chunk),
+        "bitmap_andnot" => super::bitmap_functions::eval_bitmap_andnot(arena, expr, args, chunk),
+        "bitmap_contains" => {
+            super::bitmap_functions::eval_bitmap_contains(arena, expr, args, chunk)
+        }
         "bitmap_has_any" => super::bitmap_functions::eval_bitmap_has_any(arena, expr, args, chunk),
+        "bitmap_intersect" => {
+            super::bitmap_functions::eval_bitmap_intersect(arena, expr, args, chunk)
+        }
+        "bitmap_or" => super::bitmap_functions::eval_bitmap_or(arena, expr, args, chunk),
+        "bitmap_xor" => super::bitmap_functions::eval_bitmap_xor(arena, expr, args, chunk),
         "sub_bitmap" => super::bitmap_functions::eval_sub_bitmap(arena, expr, args, chunk),
         "bitmap_subset_limit" => {
             super::bitmap_functions::eval_bitmap_subset_limit(arena, expr, args, chunk)
@@ -114,7 +123,12 @@ static OBJECT_FUNCTIONS: &[(&str, &str)] = &[
     ("bitmap_min", "bitmap_min"),
     ("bitmap_max", "bitmap_max"),
     ("bitmap_and", "bitmap_and"),
+    ("bitmap_andnot", "bitmap_andnot"),
+    ("bitmap_contains", "bitmap_contains"),
     ("bitmap_has_any", "bitmap_has_any"),
+    ("bitmap_intersect", "bitmap_intersect"),
+    ("bitmap_or", "bitmap_or"),
+    ("bitmap_xor", "bitmap_xor"),
     ("sub_bitmap", "sub_bitmap"),
     ("bitmap_subset_limit", "bitmap_subset_limit"),
     ("bitmap_subset_in_range", "bitmap_subset_in_range"),
@@ -176,7 +190,32 @@ static OBJECT_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
     FunctionMeta {
+        name: "bitmap_andnot",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bitmap_contains",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
         name: "bitmap_has_any",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bitmap_intersect",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bitmap_or",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "bitmap_xor",
         min_args: 2,
         max_args: 2,
     },

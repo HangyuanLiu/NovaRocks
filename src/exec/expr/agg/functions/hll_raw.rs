@@ -52,10 +52,18 @@ fn state_slot(ptr: *mut u8) -> *mut *mut HllRawState {
     ptr as *mut *mut HllRawState
 }
 
+/// Get or initialize the HllRawState for this aggregate slot, marking that
+/// the group has observed at least one non-null input.
+///
+/// Every caller already gates on `arr.is_null(row)`, so reaching this function
+/// implies a non-null input row. Marking `has_value` here keeps the empty-vs
+/// -NULL distinction consistent with bitmap_union_int and ensures finalize
+/// emits NULL only when no non-null input was seen — independent of corner
+/// cases like a hashed value of 0 in `update_register_from_hash`.
 unsafe fn get_or_init_state<'a>(ptr: *mut u8) -> &'a mut HllRawState {
     let slot = state_slot(ptr);
     let raw = unsafe { *slot };
-    if raw.is_null() {
+    let state = if raw.is_null() {
         let boxed: Box<HllRawState> = Box::default();
         let raw = Box::into_raw(boxed);
         unsafe {
@@ -64,7 +72,9 @@ unsafe fn get_or_init_state<'a>(ptr: *mut u8) -> &'a mut HllRawState {
         }
     } else {
         unsafe { &mut *raw }
-    }
+    };
+    state.has_value = true;
+    state
 }
 
 unsafe fn get_state<'a>(ptr: *mut u8) -> Option<&'a HllRawState> {
@@ -219,7 +229,12 @@ fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
     if !state.has_value {
         return None;
     }
-    let registers = state.registers.as_ref()?;
+    // A non-null input that contributed no register updates (e.g. merging an
+    // HLL_DATA_EMPTY payload) is still a non-null observation, so emit a
+    // valid empty HLL payload rather than NULL.
+    let Some(registers) = state.registers.as_ref() else {
+        return Some(vec![HLL_DATA_EMPTY]);
+    };
     let non_zero = registers.iter().filter(|v| **v > 0).count();
     if non_zero == 0 {
         return Some(vec![HLL_DATA_EMPTY]);
@@ -663,14 +678,18 @@ impl AggregateFunction for HllRawAgg {
         };
         match output_type {
             DataType::Binary => {
+                // A group whose inputs were all NULL must finalize to NULL,
+                // not to an empty HLL payload. This applies to both the
+                // partial intermediate stage and the final stage, so the
+                // merge pipeline can short-circuit NULL inputs uniformly.
                 let mut builder = BinaryBuilder::new();
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
-                    let payload = state
-                        .and_then(serialize_hll_state)
-                        .unwrap_or_else(|| vec![HLL_DATA_EMPTY]);
-                    builder.append_value(payload);
+                    match state.and_then(serialize_hll_state) {
+                        Some(payload) => builder.append_value(payload),
+                        None => builder.append_null(),
+                    }
                 }
                 Ok(std::sync::Arc::new(builder.finish()) as ArrayRef)
             }
@@ -679,8 +698,16 @@ impl AggregateFunction for HllRawAgg {
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
-                    let value = state.map(estimate_cardinality).unwrap_or(0);
-                    builder.append_value(value);
+                    // hll_union_agg / ds_hll_count_distinct_merge over an
+                    // all-null group return NULL, mirroring StarRocks. Only
+                    // emit the estimated cardinality when at least one
+                    // non-null input was observed.
+                    match state {
+                        Some(s) if s.has_value => {
+                            builder.append_value(estimate_cardinality(s));
+                        }
+                        _ => builder.append_null(),
+                    }
                 }
                 Ok(std::sync::Arc::new(builder.finish()) as ArrayRef)
             }
@@ -689,5 +716,203 @@ impl AggregateFunction for HllRawAgg {
                 other
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+
+    use super::{HLL_DATA_EMPTY, HllRawAgg};
+    use crate::exec::expr::agg::functions::{
+        AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction,
+    };
+
+    fn spec_hll_union() -> AggSpec {
+        AggSpec {
+            kind: AggKind::HllRawMerge,
+            output_type: DataType::Binary,
+            intermediate_type: DataType::Binary,
+            input_arg_type: None,
+            count_all: false,
+        }
+    }
+
+    fn spec_hll_union_agg() -> AggSpec {
+        AggSpec {
+            kind: AggKind::HllUnionCount,
+            output_type: DataType::Int64,
+            intermediate_type: DataType::Binary,
+            input_arg_type: None,
+            count_all: false,
+        }
+    }
+
+    fn spec_hll_raw_hash() -> AggSpec {
+        AggSpec {
+            kind: AggKind::HllRawHash,
+            output_type: DataType::Int64,
+            intermediate_type: DataType::Binary,
+            input_arg_type: None,
+            count_all: false,
+        }
+    }
+
+    fn with_state<F>(spec: &AggSpec, f: F) -> ArrayRef
+    where
+        F: FnOnce(&HllRawAgg, *mut u8, &AggSpec) -> ArrayRef,
+    {
+        let agg = HllRawAgg;
+        let mut backing = Box::new(0_usize);
+        let ptr = (&mut *backing) as *mut usize as *mut u8;
+        agg.init_state(spec, ptr);
+        let out = f(&agg, ptr, spec);
+        agg.drop_state(spec, ptr);
+        out
+    }
+
+    #[test]
+    fn hll_union_finalize_returns_null_for_empty_group() {
+        // hll_union over an empty / never-updated group must yield NULL,
+        // not an HLL_DATA_EMPTY payload.
+        let spec = spec_hll_union();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn hll_union_finalize_returns_null_for_all_null_merge() {
+        let spec = spec_hll_union();
+        // Single all-null binary input row.
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![Option::<&[u8]>::None]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.merge_batch(spec, 0, &[ptr as AggStatePtr], &view)
+                .expect("merge_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn hll_union_finalize_non_null_for_empty_hll_input() {
+        // An HLL_DATA_EMPTY payload is a non-null observation: the aggregate
+        // result must not be NULL — it should be a valid (but-empty) HLL.
+        let spec = spec_hll_union();
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[HLL_DATA_EMPTY][..])]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.merge_batch(spec, 0, &[ptr as AggStatePtr], &view)
+                .expect("merge_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(!arr.is_null(0));
+    }
+
+    #[test]
+    fn hll_union_agg_finalize_returns_null_for_empty_group() {
+        let spec = spec_hll_union_agg();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(
+            arr.is_null(0),
+            "hll_union_agg over empty group must be NULL, not 0"
+        );
+    }
+
+    #[test]
+    fn hll_union_agg_finalize_returns_null_for_all_null_merge() {
+        let spec = spec_hll_union_agg();
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![Option::<&[u8]>::None, None]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(spec, 0, &[ptr as AggStatePtr, ptr as AggStatePtr], &view)
+                .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn ndv_finalize_returns_null_for_empty_group() {
+        // ndv / approx_count_distinct use HllRawHash with Int64 output.
+        // All-null group must yield NULL, not 0.
+        let spec = spec_hll_raw_hash();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn ndv_finalize_returns_null_for_all_null_input() {
+        let spec = spec_hll_raw_hash();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Option::<i32>::None, None]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(spec, 0, &[ptr as AggStatePtr, ptr as AggStatePtr], &view)
+                .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn ndv_finalize_returns_non_null_for_mixed_input() {
+        let spec = spec_hll_raw_hash();
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(1)]));
+        let out = with_state(&spec, |agg, ptr, spec| {
+            let view = AggInputView::Any(&input);
+            agg.update_batch(
+                spec,
+                0,
+                &[
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                    ptr as AggStatePtr,
+                ],
+                &view,
+            )
+            .expect("update_batch");
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
+                .expect("build_array")
+        });
+        let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(!arr.is_null(0));
+        // Approximate HLL cardinality for 2 distinct values is small but positive.
+        assert!(arr.value(0) >= 1);
+    }
+
+    #[test]
+    fn hll_union_intermediate_emits_null_for_empty_group() {
+        let spec = spec_hll_union();
+        let out = with_state(&spec, |agg, ptr, spec| {
+            agg.build_array(spec, 0, &[ptr as AggStatePtr], true)
+                .expect("build_array intermediate")
+        });
+        let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(arr.is_null(0));
     }
 }

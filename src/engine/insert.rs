@@ -606,6 +606,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: true,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "b".to_string(),
@@ -614,6 +615,7 @@ mod tests {
                 write_default: Some(iceberg::spec::Literal::Primitive(
                     iceberg::spec::PrimitiveLiteral::Int(5),
                 )),
+                logical_type: None,
             },
         ];
         let rows = vec![vec![Literal::Int(1)]];
@@ -707,12 +709,14 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: true,
                 write_default: None,
+                logical_type: None,
             },
             ColumnDef {
                 name: "b".to_string(),
                 data_type: DataType::Int32,
                 nullable: true,
                 write_default: None,
+                logical_type: None,
             },
         ];
         let rows = vec![vec![Literal::Int(1)]];

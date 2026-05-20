@@ -210,6 +210,24 @@ impl<'a> super::AnalyzerContext<'a> {
                     let item_typed = self.analyze_expr(item, scope)?;
                     list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
                 }
+                // BITMAP / HLL operands cannot participate in IN / NOT IN
+                // because they have no scalar identity. Reject upfront so the
+                // user sees a clear error before lowering / codegen.
+                let kw = if *negated { "NOT IN" } else { "IN" };
+                if let Some(logical) = scope.logical_type_of_expr(&expr_typed) {
+                    let col = column_name_of_expr(&expr_typed);
+                    return Err(format!(
+                        "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                    ));
+                }
+                for item in &list_typed {
+                    if let Some(logical) = scope.logical_type_of_expr(item) {
+                        let col = column_name_of_expr(item);
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
+                }
                 Ok(TypedExpr {
                     kind: ExprKind::InList {
                         expr: Box::new(expr_typed),
@@ -240,6 +258,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 // expression is left unchanged.
                 let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
                 let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
+                // BITMAP / HLL operands cannot participate in BETWEEN because
+                // they have no ordering. Reject upfront so the user sees a
+                // clear error before lowering / codegen.
+                for operand in [&expr_typed, &low_typed, &high_typed] {
+                    if let Some(logical) = scope.logical_type_of_expr(operand) {
+                        let col = column_name_of_expr(operand);
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
+                }
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -410,6 +439,19 @@ impl<'a> super::AnalyzerContext<'a> {
                 subquery,
                 negated,
             } => {
+                // BITMAP / HLL operands cannot participate in IN subquery
+                // because they have no scalar identity. Reject upfront by
+                // resolving the LHS to detect a logical-type tag; the LHS
+                // is dropped before the subquery is planned so we cannot
+                // wait until later.
+                let in_expr_typed = self.analyze_expr(in_expr, scope)?;
+                if let Some(logical) = scope.logical_type_of_expr(&in_expr_typed) {
+                    let col = column_name_of_expr(&in_expr_typed);
+                    let kw = if *negated { "NOT IN" } else { "IN" };
+                    return Err(format!(
+                        "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                    ));
+                }
                 let id = self.alloc_subquery_id();
                 let kind = SubqueryKind::InSubquery { negated: *negated };
                 self.collected_subqueries.borrow_mut().push(SubqueryInfo {
@@ -938,6 +980,29 @@ impl<'a> super::AnalyzerContext<'a> {
                     | sqlast::BinaryOperator::Spaceship
             );
             if coerce_for_compare {
+                // BITMAP / HLL columns have no scalar identity and cannot be
+                // compared with `=`, `<`, etc. Reject before the operand type
+                // is dropped to `Boolean` so the user sees a clear error.
+                let op_sym = match op {
+                    sqlast::BinaryOperator::Eq => "=",
+                    sqlast::BinaryOperator::NotEq => "!=",
+                    sqlast::BinaryOperator::Lt => "<",
+                    sqlast::BinaryOperator::LtEq => "<=",
+                    sqlast::BinaryOperator::Gt => ">",
+                    sqlast::BinaryOperator::GtEq => ">=",
+                    sqlast::BinaryOperator::Spaceship => "<=>",
+                    _ => unreachable!(),
+                };
+                if let Some(logical) = scope.logical_type_of_expr(&left_typed) {
+                    return Err(format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                    ));
+                }
+                if let Some(logical) = scope.logical_type_of_expr(&right_typed) {
+                    return Err(format!(
+                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                    ));
+                }
                 let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
                 let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
                 (left_coerced, right_coerced)
@@ -2243,6 +2308,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 frame_type,
                 start,
                 end,
+            })
+        } else if !order_by.is_empty() {
+            // SQL standard: when ORDER BY is present but no explicit window
+            // frame is given, the implicit frame is
+            //   RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            // (i.e. running aggregate over peers). Without this default,
+            // aggregate window functions like SUM/AVG/BITMAP_UNION over
+            // ORDER BY would return the whole-partition value on every row.
+            // Ranking/offset functions (row_number, rank, lead, lag, ...)
+            // ignore the frame at execution time, so synthesizing a default
+            // here has no effect on them.
+            Some(WindowFrame {
+                frame_type: WindowFrameType::Range,
+                start: WindowBound::UnboundedPreceding,
+                end: WindowBound::CurrentRow,
             })
         } else {
             None
@@ -3842,6 +3922,21 @@ fn sql_type_starrocks_name(sql_type: &sqlast::DataType) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// Render a short, user-facing display name for an expression operand. Used by
+/// the BITMAP/HLL fail-fast checks (IN list, BETWEEN, IN subquery, comparison)
+/// so the rejection message can say *which* operand had the offending type. We
+/// only care about column refs here — the same convention `logical_type_of_expr`
+/// uses — but fall back to a placeholder so the format string never panics.
+fn column_name_of_expr(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        ExprKind::ColumnRef { qualifier, column } => match qualifier {
+            Some(q) => format!("{q}.{column}"),
+            None => column.clone(),
+        },
+        _ => "<expr>".to_string(),
+    }
 }
 
 /// Best-effort defaults for MySQL-style `@@var` session variables. We do not

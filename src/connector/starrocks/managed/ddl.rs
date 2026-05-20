@@ -369,6 +369,31 @@ fn resolve_managed_create_defaults(
             columns: choose_default_dup_key_columns(columns)?,
         },
     };
+    // BITMAP / HLL columns cannot appear in any user-declared key
+    // (DUPLICATE / AGGREGATE / UNIQUE / PRIMARY). `key_eligible_type` already
+    // returns false for them; surface a BITMAP/HLL-aware error message.
+    for key_col_name in &key_desc.columns {
+        let normalized = normalize_identifier(key_col_name)?;
+        let Some(column) = columns
+            .iter()
+            .find(|c| normalize_identifier(&c.name).ok().as_deref() == Some(normalized.as_str()))
+        else {
+            // Missing column will be caught downstream in `build_tablet_schema`.
+            continue;
+        };
+        if matches!(column.data_type, SqlType::Bitmap | SqlType::Hll) {
+            let key_kind = match key_desc.kind {
+                TableKeyKind::Primary => "PRIMARY KEY",
+                TableKeyKind::Unique => "UNIQUE KEY",
+                TableKeyKind::Aggregate => "AGGREGATE KEY",
+                TableKeyKind::Duplicate => "DUPLICATE KEY",
+            };
+            return Err(format!(
+                "BITMAP/HLL columns cannot be part of {key_kind} (column `{}` has type {:?})",
+                column.name, column.data_type
+            ));
+        }
+    }
     let bucket_num = i64::from(bucket_count.unwrap_or(DEFAULT_MANAGED_BUCKET_COUNT));
     if bucket_num <= 0 {
         return Err("managed standalone CREATE TABLE requires BUCKETS > 0".to_string());
@@ -423,6 +448,8 @@ fn key_eligible_type(data_type: &SqlType) -> bool {
             | SqlType::Double
             | SqlType::Json
             | SqlType::Binary
+            | SqlType::Bitmap
+            | SqlType::Hll
             | SqlType::Array(_)
             | SqlType::Map(_, _)
             | SqlType::Struct(_)
@@ -439,6 +466,7 @@ fn short_key_index_size(data_type: &SqlType) -> usize {
         SqlType::LargeInt | SqlType::Decimal { .. } => 16,
         SqlType::String | SqlType::Binary => 20,
         SqlType::Json => 16,
+        SqlType::Bitmap | SqlType::Hll => SHORT_KEY_MAX_SIZE_BYTES + 1,
         SqlType::Float => 4,
         SqlType::Double => 8,
         SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) | SqlType::Variant => {
@@ -879,15 +907,36 @@ pub(crate) fn bootstrap_empty_partition_for_tablets(
 pub(crate) fn request_schema_from_runtime(
     runtime: &ManagedTableRuntime,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
+    // Build a name -> aggregation-string lookup from the tablet schema PB so
+    // we can restore the ColumnAggregation modifier (BITMAP_UNION, HLL_UNION,
+    // SUM, …) that StoredManagedColumn does not carry.
+    let pb_agg_by_name: std::collections::HashMap<String, Option<String>> = runtime
+        .tablet_schema
+        .column
+        .iter()
+        .filter_map(|col| {
+            let name = col.name.as_deref()?;
+            let key = normalize_identifier(name).ok()?;
+            Some((key, col.aggregation.clone()))
+        })
+        .collect();
+
     let columns = runtime
         .columns
         .iter()
         .map(|column| {
+            let normalized = normalize_identifier(&column.column_name)?;
+            let aggregation = match pb_agg_by_name.get(&normalized) {
+                Some(agg_opt) => {
+                    aggregation_string_to_column_aggregation(agg_opt.as_deref().unwrap_or("NONE"))?
+                }
+                None => None,
+            };
             Ok(TableColumnDef {
                 name: column.column_name.clone(),
                 data_type: parse_managed_logical_type(&column.logical_type)?,
                 nullable: column.nullable,
-                aggregation: None,
+                aggregation,
                 default: None,
             })
         })
@@ -906,6 +955,28 @@ pub(crate) fn request_schema_from_runtime(
         },
         runtime.table.current_schema_id,
     )
+}
+
+/// Maps the string aggregation representation stored in `ColumnPb.aggregation`
+/// back to the parser-level `ColumnAggregation` enum.
+///
+/// Returns `None` for `"NONE"` (no aggregation modifier).  Returns an error
+/// for values that are unrecognised or unsupported in this context.
+fn aggregation_string_to_column_aggregation(
+    agg: &str,
+) -> Result<Option<ColumnAggregation>, String> {
+    match agg.trim().to_ascii_uppercase().as_str() {
+        "NONE" => Ok(None),
+        "SUM" => Ok(Some(ColumnAggregation::Sum)),
+        "MIN" => Ok(Some(ColumnAggregation::Min)),
+        "MAX" => Ok(Some(ColumnAggregation::Max)),
+        "REPLACE" | "REPLACE_IF_NOT_NULL" => Ok(Some(ColumnAggregation::Replace)),
+        "BITMAP_UNION" => Ok(Some(ColumnAggregation::BitmapUnion)),
+        "HLL_UNION" => Ok(Some(ColumnAggregation::HllUnion)),
+        other => Err(format!(
+            "unrecognised column aggregation string in tablet schema PB: `{other}`"
+        )),
+    }
 }
 
 pub(crate) fn build_create_tablet_request(
@@ -1079,6 +1150,8 @@ fn column_aggregation_to_thrift(aggregation: ColumnAggregation) -> crate::types:
         ColumnAggregation::Min => crate::types::TAggregationType::MIN,
         ColumnAggregation::Max => crate::types::TAggregationType::MAX,
         ColumnAggregation::Replace => crate::types::TAggregationType::REPLACE,
+        ColumnAggregation::BitmapUnion => crate::types::TAggregationType::BITMAP_UNION,
+        ColumnAggregation::HllUnion => crate::types::TAggregationType::HLL_UNION,
     }
 }
 
@@ -1105,6 +1178,8 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
             None,
         ),
         SqlType::Json => (crate::types::TPrimitiveType::JSON, Some(16), None, None),
+        SqlType::Bitmap => (crate::types::TPrimitiveType::OBJECT, None, None, None),
+        SqlType::Hll => (crate::types::TPrimitiveType::HLL, None, None, None),
         SqlType::Boolean => (crate::types::TPrimitiveType::BOOLEAN, Some(1), None, None),
         SqlType::Date => (crate::types::TPrimitiveType::DATE, Some(4), None, None),
         SqlType::DateTime => (crate::types::TPrimitiveType::DATETIME, Some(8), None, None),
@@ -1231,6 +1306,8 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
         SqlType::Decimal { .. }
         | SqlType::Array(_)
         | SqlType::Binary
+        | SqlType::Bitmap
+        | SqlType::Hll
         | SqlType::Map(_, _)
         | SqlType::Struct(_)
         | SqlType::Variant => None,
@@ -1255,6 +1332,8 @@ pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
         SqlType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
         SqlType::Array(inner) => format!("ARRAY<{}>", logical_type_name(inner)),
         SqlType::Binary => "BINARY".to_string(),
+        SqlType::Bitmap => "BITMAP".to_string(),
+        SqlType::Hll => "HLL".to_string(),
         SqlType::Map(k, v) => format!("MAP<{},{}>", logical_type_name(k), logical_type_name(v)),
         SqlType::Struct(fields) => {
             let mut parts = Vec::with_capacity(fields.len());
@@ -1311,6 +1390,8 @@ fn parse_managed_logical_type(raw: &str) -> Result<SqlType, String> {
         "DOUBLE" => Ok(SqlType::Double),
         "STRING" => Ok(SqlType::String),
         "JSON" => Ok(SqlType::Json),
+        "BITMAP" => Ok(SqlType::Bitmap),
+        "HLL" => Ok(SqlType::Hll),
         "BOOLEAN" => Ok(SqlType::Boolean),
         "DATE" => Ok(SqlType::Date),
         "DATETIME" => Ok(SqlType::DateTime),
@@ -1373,11 +1454,12 @@ mod tests {
     };
 
     use super::{
-        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table, logical_type_name,
-        managed_physical_column, parse_managed_logical_type, patch_tablet_schema_column_flags,
-        request_schema_from_runtime, resolve_managed_create_defaults, sql_type_to_tcolumn_type,
-        sql_type_to_ttype_desc, stored_columns_from_physical_columns,
-        table_columns_from_physical_columns, truncate_managed_table_with_hooks,
+        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table, key_eligible_type,
+        logical_type_name, managed_physical_column, parse_managed_logical_type,
+        patch_tablet_schema_column_flags, request_schema_from_runtime,
+        resolve_managed_create_defaults, sql_type_to_tcolumn_type, sql_type_to_ttype_desc,
+        stored_columns_from_physical_columns, table_columns_from_physical_columns,
+        truncate_managed_table_with_hooks,
     };
 
     fn test_managed_config() -> ManagedLakeConfig {
@@ -2045,6 +2127,124 @@ mod tests {
     }
 
     #[test]
+    fn request_schema_from_runtime_preserves_aggregation() {
+        // Build a synthetic tablet schema PB with:
+        //   k1 INT  (key, no aggregation)
+        //   v_bm BITMAP  (BITMAP_UNION value column)
+        //   v_hll HLL    (HLL_UNION value column)
+        //   v_sum INT    (SUM value column)
+        let make_col_pb = |name: &str, ty: &str, agg: Option<&str>| {
+            crate::service::grpc_client::proto::starrocks::ColumnPb {
+                unique_id: 0,
+                name: Some(name.to_string()),
+                r#type: ty.to_string(),
+                is_key: Some(false),
+                aggregation: agg.map(|s| s.to_string()),
+                is_nullable: Some(true),
+                visible: Some(true),
+                ..Default::default()
+            }
+        };
+
+        let tablet_schema = crate::service::grpc_client::proto::starrocks::TabletSchemaPb {
+            keys_type: None,
+            column: vec![
+                make_col_pb("k1", "INT", Some("NONE")),
+                make_col_pb("v_bm", "OBJECT", Some("BITMAP_UNION")),
+                make_col_pb("v_hll", "HLL", Some("HLL_UNION")),
+                make_col_pb("v_sum", "INT", Some("SUM")),
+            ],
+            ..Default::default()
+        };
+
+        let runtime = ManagedTableRuntime {
+            database_name: "db".to_string(),
+            table: StoredManagedTable {
+                table_id: 1,
+                db_id: 1,
+                name: "agg_tbl".to_string(),
+                keys_type: "AGG_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 1,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
+            },
+            tablet_schema,
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 1,
+                    column_name: "v_bm".to_string(),
+                    logical_type: "BITMAP".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 2,
+                    column_name: "v_hll".to_string(),
+                    logical_type: "HLL".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 1,
+                    ordinal: 3,
+                    column_name: "v_sum".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+            ],
+            partitions: Vec::new(),
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+        };
+
+        let schema = request_schema_from_runtime(&runtime)
+            .expect("request_schema_from_runtime with BITMAP_UNION/HLL_UNION columns");
+
+        assert_eq!(schema.columns.len(), 4);
+
+        // k1: key column — no aggregation
+        assert_eq!(schema.columns[0].column_name, "k1");
+        assert_eq!(schema.columns[0].aggregation_type, None);
+
+        // v_bm: BITMAP_UNION value column
+        assert_eq!(schema.columns[1].column_name, "v_bm");
+        assert_eq!(
+            schema.columns[1].aggregation_type,
+            Some(crate::types::TAggregationType::BITMAP_UNION)
+        );
+
+        // v_hll: HLL_UNION value column
+        assert_eq!(schema.columns[2].column_name, "v_hll");
+        assert_eq!(
+            schema.columns[2].aggregation_type,
+            Some(crate::types::TAggregationType::HLL_UNION)
+        );
+
+        // v_sum: SUM value column
+        assert_eq!(schema.columns[3].column_name, "v_sum");
+        assert_eq!(
+            schema.columns[3].aggregation_type,
+            Some(crate::types::TAggregationType::SUM)
+        );
+    }
+
+    #[test]
     fn managed_json_type_uses_starrocks_json_primitive() {
         let column_type = sql_type_to_tcolumn_type(&SqlType::Json).expect("json column type");
         assert_eq!(column_type.type_, crate::types::TPrimitiveType::JSON);
@@ -2267,5 +2467,30 @@ mod tests {
         .expect_err("double first column should fail");
 
         assert!(err.contains("first column `d` cannot be a key column"));
+    }
+
+    #[test]
+    fn bitmap_hll_thrift_mapping() {
+        let bm = sql_type_to_tcolumn_type(&SqlType::Bitmap).expect("bitmap thrift");
+        assert_eq!(bm.type_, crate::types::TPrimitiveType::OBJECT);
+
+        let hv = sql_type_to_tcolumn_type(&SqlType::Hll).expect("hll thrift");
+        assert_eq!(hv.type_, crate::types::TPrimitiveType::HLL);
+
+        assert_eq!(logical_type_name(&SqlType::Bitmap), "BITMAP");
+        assert_eq!(logical_type_name(&SqlType::Hll), "HLL");
+
+        assert_eq!(
+            parse_managed_logical_type("BITMAP").expect("bitmap parse"),
+            SqlType::Bitmap
+        );
+        assert_eq!(
+            parse_managed_logical_type("HLL").expect("hll parse"),
+            SqlType::Hll
+        );
+
+        // BITMAP/HLL are not eligible as key columns.
+        assert!(!key_eligible_type(&SqlType::Bitmap));
+        assert!(!key_eligible_type(&SqlType::Hll));
     }
 }

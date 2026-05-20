@@ -150,6 +150,7 @@ mod tests {
                         data_type: DataType::Int64,
                         nullable: true,
                         write_default: None,
+                        logical_type: None,
                     })
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],

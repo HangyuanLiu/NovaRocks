@@ -439,6 +439,7 @@ fn resolve_managed_table_info(
             data_type: arrow_type_from_tablet_column(schema_column)?,
             nullable: column.nullable,
             write_default: None,
+            logical_type: None,
         });
     }
 

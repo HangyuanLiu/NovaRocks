@@ -444,6 +444,17 @@ impl<'a> AnalyzerContext<'a> {
             }
         }
 
+        // BITMAP / HLL columns cannot participate in GROUP BY because they
+        // have no comparable scalar identity. Reject upfront so the user
+        // sees a clear error before lowering / codegen.
+        for gb in &group_by {
+            if let Some(logical) = scope.logical_type_of_expr(gb) {
+                return Err(format!(
+                    "BITMAP/HLL columns cannot appear in GROUP BY (column has type {logical:?})"
+                ));
+            }
+        }
+
         // --- Detect aggregation ---
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
         let has_aggregation = !group_by.is_empty() || has_agg_in_select;
@@ -1775,6 +1786,31 @@ impl<'a> AnalyzerContext<'a> {
             });
         }
 
+        // BITMAP / HLL columns cannot participate in ORDER BY because they
+        // are opaque blobs with no ordering. Check the projection scope for
+        // alias references, then the FROM scope for direct column refs.
+        let from_scope_for_check: Option<AnalyzerScope> = if let QueryBody::Select(sel) = body {
+            sel.from
+                .as_ref()
+                .and_then(|rel| self.rebuild_from_scope(rel).ok().map(|(_, s)| s))
+        } else {
+            None
+        };
+        for item in &sort_items {
+            let logical = projection_scope
+                .logical_type_of_expr(&item.expr)
+                .or_else(|| {
+                    from_scope_for_check
+                        .as_ref()
+                        .and_then(|s| s.logical_type_of_expr(&item.expr))
+                });
+            if let Some(logical) = logical {
+                return Err(format!(
+                    "BITMAP/HLL columns cannot appear in ORDER BY (column has type {logical:?})"
+                ));
+            }
+        }
+
         Ok(sort_items)
     }
 }
@@ -2260,36 +2296,42 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_custkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_orderstatus".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_totalprice".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_orderdate".to_string(),
                             data_type: arrow::datatypes::DataType::Date32,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_orderpriority".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2306,54 +2348,63 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_partkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_suppkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_quantity".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_extendedprice".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_discount".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_commitdate".to_string(),
                             data_type: arrow::datatypes::DataType::Date32,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_receiptdate".to_string(),
                             data_type: arrow::datatypes::DataType::Date32,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "l_shipdate".to_string(),
                             data_type: arrow::datatypes::DataType::Date32,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2370,18 +2421,21 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "s_name".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "s_comment".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2398,18 +2452,21 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "p_name".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "p_brand".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2426,24 +2483,28 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "ps_suppkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "ps_supplycost".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "ps_availqty".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2460,18 +2521,21 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "c_acctbal".to_string(),
                             data_type: arrow::datatypes::DataType::Float64,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "c_phone".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2488,12 +2552,14 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "n_name".to_string(),
                             data_type: arrow::datatypes::DataType::Utf8,
                             nullable: true,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -2514,12 +2580,14 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_custkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![
@@ -2528,12 +2596,14 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "_last_updated_sequence_number".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_table: None,

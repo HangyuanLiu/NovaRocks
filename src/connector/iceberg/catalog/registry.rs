@@ -703,16 +703,26 @@ pub(crate) fn load_table(
                 nested.field_type.as_ref(),
                 iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant)
             );
+            let logical_type_override = logical_types.get(&field_name);
             let data_type = if is_variant {
                 DataType::LargeBinary
             } else {
-                apply_logical_type_override(field.data_type(), logical_types.get(&field_name))
+                apply_logical_type_override(field.data_type(), logical_type_override)
             };
+            // Only BITMAP/HLL need to surface as ColumnDef.logical_type: the
+            // Arrow data_type collapses both onto Binary, but the analyzer
+            // needs to reject ORDER BY / GROUP BY / comparison / key /
+            // distribution misuse. Other logical-type overrides (DATE) are
+            // already disambiguated by the Arrow data_type itself.
+            let logical_type = logical_type_override
+                .filter(|t| matches!(t, SqlType::Bitmap | SqlType::Hll))
+                .cloned();
             Ok(ColumnDef {
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
                 write_default: nested.write_default.clone(),
+                logical_type,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1682,7 +1692,7 @@ pub(crate) fn iceberg_type_for_sql_type(
             scale: 0,
         }),
         SqlType::String | SqlType::Json => Type::Primitive(PrimitiveType::String),
-        SqlType::Binary => Type::Primitive(PrimitiveType::Binary),
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => Type::Primitive(PrimitiveType::Binary),
         SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         SqlType::Date => Type::Primitive(PrimitiveType::Date),
         SqlType::DateTime => Type::Primitive(PrimitiveType::Timestamp),
@@ -2333,6 +2343,8 @@ fn format_column_aggregation(aggregation: ColumnAggregation) -> &'static str {
         ColumnAggregation::Min => "min",
         ColumnAggregation::Max => "max",
         ColumnAggregation::Replace => "replace",
+        ColumnAggregation::BitmapUnion => "bitmap_union",
+        ColumnAggregation::HllUnion => "hll_union",
     }
 }
 
@@ -2342,6 +2354,8 @@ fn parse_column_aggregation(value: &str) -> Option<ColumnAggregation> {
         "min" => Some(ColumnAggregation::Min),
         "max" => Some(ColumnAggregation::Max),
         "replace" => Some(ColumnAggregation::Replace),
+        "bitmap_union" => Some(ColumnAggregation::BitmapUnion),
+        "hll_union" => Some(ColumnAggregation::HllUnion),
         _ => None,
     }
 }

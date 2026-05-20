@@ -934,6 +934,7 @@ fn derive_column_defs_from_runtime(
                     )?,
                 nullable: column.nullable,
                 write_default: None,
+                logical_type: None,
             })
         })
         .collect()
@@ -1545,6 +1546,7 @@ mod tests {
             data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
             nullable: false,
             write_default: None,
+            logical_type: None,
         }];
 
         let aligned =

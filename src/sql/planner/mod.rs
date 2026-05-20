@@ -1408,6 +1408,7 @@ fn plan_iceberg_metadata_scan(rel: IcebergMetadataScanRelation) -> Result<Logica
             data_type: c.data_type.clone(),
             nullable: c.nullable,
             write_default: None,
+            logical_type: None,
         })
         .collect();
     let output_columns: Vec<OutputColumn> = cols
@@ -1689,12 +1690,14 @@ mod tests {
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                         ColumnDef {
                             name: "o_custkey".to_string(),
                             data_type: arrow::datatypes::DataType::Int64,
                             nullable: false,
                             write_default: None,
+                            logical_type: None,
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
@@ -1731,6 +1734,7 @@ mod tests {
                         ),
                         nullable: true,
                         write_default: None,
+                        logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,

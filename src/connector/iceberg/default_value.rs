@@ -65,7 +65,9 @@ pub(crate) fn default_literal_to_iceberg(
         }
         (DefaultLiteral::Date(d), SqlType::Date) => PrimitiveLiteral::Int(*d),
         (DefaultLiteral::DateTime(t), SqlType::DateTime) => PrimitiveLiteral::Long(*t),
-        (DefaultLiteral::Binary(b), SqlType::Binary) => PrimitiveLiteral::Binary(b.clone()),
+        (DefaultLiteral::Binary(b), SqlType::Binary | SqlType::Bitmap | SqlType::Hll) => {
+            PrimitiveLiteral::Binary(b.clone())
+        }
         (lit, ty) => {
             return Err(format!(
                 "DEFAULT value type does not match column type: literal={lit:?} column={ty:?}"
@@ -121,7 +123,10 @@ pub(crate) fn iceberg_literal_to_ast(
             Ok(AstLiteral::Date(date.format("%Y-%m-%d").to_string()))
         }
         (IcebergLiteral::Primitive(PrimitiveLiteral::Int128(_)), SqlType::Decimal { .. })
-        | (IcebergLiteral::Primitive(PrimitiveLiteral::Binary(_)), SqlType::Binary)
+        | (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(_)),
+            SqlType::Binary | SqlType::Bitmap | SqlType::Hll,
+        )
         | (IcebergLiteral::Primitive(PrimitiveLiteral::Long(_)), SqlType::DateTime) => {
             Err(format!(
                 "write-default for column type {column_type:?} is not yet supported by the INSERT path"

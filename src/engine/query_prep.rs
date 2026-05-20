@@ -738,6 +738,7 @@ fn stamp_delta_table_def_change_ops(
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
             write_default: None,
+            logical_type: None,
         });
 
     if change_ops.is_empty() && matches!(table_def.storage, TableStorage::LocalParquetFile { .. }) {
@@ -854,24 +855,28 @@ mod tests {
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
                 crate::sql::catalog::ColumnDef {
                     name: "_pos".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
                 crate::sql::catalog::ColumnDef {
                     name: "_row_id".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
                 crate::sql::catalog::ColumnDef {
                     name: "_last_updated_sequence_number".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
+                    logical_type: None,
                 },
             ],
             iceberg_table: None,

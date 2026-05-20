@@ -20,6 +20,9 @@ INSERT INTO ${case_db}.t1 VALUES (1, to_bitmap(11)), (2, to_bitmap(22)), (3, nul
 SELECT c1, bitmap_to_string(bitmap_union(c2) over()) FROM ${case_db}.t1 ORDER BY c1;
 
 -- query 3
+-- Row c1=3 returns NULL because the partition's only bitmap input is NULL
+-- (SQL/StarRocks semantics: aggregate over an all-NULL group yields NULL,
+-- not the per-element identity).
 -- @order_sensitive=true
 SELECT c1, bitmap_to_string(bitmap_union(c2) over(partition by c1)) FROM ${case_db}.t1 ORDER BY c1;
 
@@ -28,5 +31,8 @@ SELECT c1, bitmap_to_string(bitmap_union(c2) over(partition by c1)) FROM ${case_
 SELECT c1, bitmap_to_string(bitmap_union(c2) over(partition by c1%2)) FROM ${case_db}.t1 ORDER BY c1;
 
 -- query 5
+-- Default frame per SQL standard / StarRocks: when ORDER BY is given with no
+-- explicit window, the implicit frame is RANGE BETWEEN UNBOUNDED PRECEDING
+-- AND CURRENT ROW (running cumulative union over the ordered peers).
 -- @order_sensitive=true
 SELECT c1, bitmap_to_string(bitmap_union(c2) over(partition by c1%2 order by c1)) FROM ${case_db}.t1 ORDER BY c1;

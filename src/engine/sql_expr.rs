@@ -349,6 +349,91 @@ pub(crate) fn sqlparser_function_to_literal(
                 )),
             }
         }
+        "bitmap_empty" => {
+            if !args.is_empty() {
+                return Err("bitmap_empty expects 0 arguments".to_string());
+            }
+            // SeriV2 empty bitmap encoding: a single BITMAP_TYPE_EMPTY (=0) byte,
+            // matching `eval_bitmap_empty` runtime output.
+            Ok(Literal::String(bytes_to_latin1_string(&[
+                crate::exec::expr::function::object::bitmap_common::BITMAP_TYPE_EMPTY,
+            ])))
+        }
+        "hll_hash" => {
+            if args.len() != 1 {
+                return Err("hll_hash expects 1 argument".to_string());
+            }
+            // Reject explicit narrowing CAST since this const-fold path always
+            // hashes Int64 little-endian bytes, while the runtime path hashes
+            // the cast's native (narrower) width. Allowing the unwrap would
+            // produce values that disagree with `eval_hll_hash` at runtime.
+            if let sqlast::Expr::Cast { data_type, .. } = args[0] {
+                let narrowing = matches!(
+                    data_type,
+                    sqlast::DataType::TinyInt(_)
+                        | sqlast::DataType::TinyIntUnsigned(_)
+                        | sqlast::DataType::UTinyInt
+                        | sqlast::DataType::SmallInt(_)
+                        | sqlast::DataType::SmallIntUnsigned(_)
+                        | sqlast::DataType::USmallInt
+                        | sqlast::DataType::Int2(_)
+                        | sqlast::DataType::Int2Unsigned(_)
+                        | sqlast::DataType::MediumInt(_)
+                        | sqlast::DataType::MediumIntUnsigned(_)
+                        | sqlast::DataType::Int(_)
+                        | sqlast::DataType::Integer(_)
+                        | sqlast::DataType::IntUnsigned(_)
+                        | sqlast::DataType::IntegerUnsigned(_)
+                        | sqlast::DataType::Int4(_)
+                        | sqlast::DataType::Int4Unsigned(_)
+                        | sqlast::DataType::Int16
+                        | sqlast::DataType::Int32
+                        | sqlast::DataType::Float(_)
+                        | sqlast::DataType::FloatUnsigned(_)
+                );
+                if narrowing {
+                    return Err(
+                        "hll_hash with narrowing CAST argument is not supported in INSERT VALUES; \
+                         wrap the value directly without CAST"
+                            .to_string(),
+                    );
+                }
+            }
+            use crate::exec::expr::function::object::hll_hash::{
+                MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a,
+            };
+            let arg = sqlparser_expr_to_literal(args[0])?;
+            // Mirror the runtime `eval_hll_hash` byte conversion exactly:
+            //   - NULL  → encode_hll_empty()
+            //   - Int   → Int64 little-endian (analyzer types integer literals as Int64)
+            //   - Float → Float64 little-endian
+            //   - String → raw UTF-8 bytes
+            //   - Bool  → single byte 0/1
+            let bytes = match arg {
+                Literal::Null => encode_hll_empty(),
+                Literal::Int(v) => {
+                    let buf = v.to_le_bytes();
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::Float(v) => {
+                    let buf = v.to_le_bytes();
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::String(s) => {
+                    let hash = murmur_hash64a(s.as_bytes(), MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                Literal::Bool(b) => {
+                    let buf = [if b { 1u8 } else { 0u8 }];
+                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
+                    encode_hll_single(hash)
+                }
+                other => return Err(format!("hll_hash unsupported literal: {other:?}")),
+            };
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err("to_binary expects 1 or 2 arguments".to_string());
@@ -384,6 +469,37 @@ pub(crate) fn sqlparser_function_to_literal(
             Ok(Literal::String(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
+        }
+        "to_bitmap" => {
+            if args.len() != 1 {
+                return Err("to_bitmap expects 1 argument".to_string());
+            }
+            use crate::exec::expr::function::object::to_bitmap::encode_bitmap_single;
+            let arg = sqlparser_expr_to_literal(args[0])?;
+            // Mirror `eval_to_bitmap` runtime semantics for scalar literals:
+            //   - NULL or negative integer → NULL
+            //   - Int  → encode as u64 (Int64 runtime arm uses i128::from then casts)
+            //   - Bool → 1 or 0
+            //   - String → parse as unsigned decimal; non-numeric → NULL
+            let value: u64 = match arg {
+                Literal::Null => return Ok(Literal::Null),
+                Literal::Int(v) if v >= 0 => v as u64,
+                Literal::Int(_) => return Ok(Literal::Null),
+                Literal::Bool(b) => {
+                    if b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Literal::String(s) => match s.trim().parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => return Ok(Literal::Null),
+                },
+                other => return Err(format!("to_bitmap unsupported literal: {other:?}")),
+            };
+            let bytes = encode_bitmap_single(value);
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "md5sum" => {
             use md5::Digest;
@@ -654,7 +770,7 @@ pub(crate) fn cast_literal(
                 Err("cannot cast complex literal to string".to_string())
             }
         },
-        SqlType::Binary => match &value {
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => match &value {
             Literal::Null => Ok(Literal::Null),
             Literal::Bool(v) => Ok(Literal::String(if *v {
                 "1".to_string()
@@ -945,7 +1061,7 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
         SqlType::Float => Ok(DataType::Float32),
         SqlType::Double => Ok(DataType::Float64),
         SqlType::String | SqlType::Json => Ok(DataType::Utf8),
-        SqlType::Binary => Ok(DataType::Binary),
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => Ok(DataType::Binary),
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::Date => Ok(DataType::Date32),
         SqlType::DateTime => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
@@ -1446,5 +1562,38 @@ mod tests {
             err.contains("parse_json expects 1 argument"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn hll_hash_const_fold_rejects_narrowing_cast() {
+        // The const-fold path always hashes the literal as Int64 little-endian
+        // bytes; CAST(5 AS TINYINT) would silently produce the wrong bytes
+        // (8-byte vs 1-byte) compared to the runtime path. We must reject
+        // the explicit narrowing CAST rather than silently diverge.
+        for cast_type in ["TINYINT", "SMALLINT", "INT", "INTEGER", "FLOAT"] {
+            let sql = format!("hll_hash(CAST(5 AS {cast_type}))");
+            let raw = parse_expr(&sql);
+            let sqlparser::ast::Expr::Function(ref func) = raw else {
+                panic!("expected Function node for `{sql}`");
+            };
+            let err =
+                sqlparser_function_to_literal(func).expect_err(&format!("must reject `{sql}`"));
+            assert!(
+                err.contains("hll_hash with narrowing CAST"),
+                "unexpected error for `{sql}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hll_hash_const_fold_accepts_bigint_cast() {
+        // CAST to BIGINT is the runtime path's native width for integer
+        // literals, so it must continue to fold cleanly.
+        let raw = parse_expr("hll_hash(CAST(5 AS BIGINT))");
+        let sqlparser::ast::Expr::Function(ref func) = raw else {
+            panic!("expected Function node");
+        };
+        let lit = sqlparser_function_to_literal(func).expect("BIGINT cast must fold");
+        assert!(matches!(lit, Literal::String(_)));
     }
 }

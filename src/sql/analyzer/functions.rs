@@ -561,7 +561,6 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "hll_union"
             | "hll_union_agg"
             | "hll_raw_agg"
-            | "hll_cardinality"
             | "ndv"
             | "variance"
             | "variance_samp"
@@ -831,7 +830,27 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "ds_hll_count_distinct_state"
         | "to_bitmap"
         | "to_binary"
-        | "encode_row_id" => DataType::Binary,
+        | "encode_row_id"
+        | "bitmap_or"
+        | "bitmap_xor"
+        | "bitmap_andnot"
+        | "bitmap_intersect"
+        | "bitmap_from_string"
+        | "bitmap_empty"
+        | "bitmap_and"
+        | "sub_bitmap"
+        | "bitmap_subset_limit"
+        | "bitmap_subset_in_range"
+        | "bitmap_to_binary"
+        | "bitmap_from_binary"
+        | "bitmap_to_base64" => DataType::Binary,
+        "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
+        "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
+        "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))),
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "grouping" | "grouping_id" => DataType::Int64,
         "split" => DataType::List(Arc::new(arrow::datatypes::Field::new(

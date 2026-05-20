@@ -1184,6 +1184,7 @@ mod tests {
             data_type: DataType::FixedSizeBinary(16),
             nullable: false,
             write_default: None,
+            logical_type: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
@@ -1230,6 +1231,7 @@ mod tests {
             data_type: DataType::Utf8,
             nullable: true,
             write_default: None,
+            logical_type: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
@@ -1340,6 +1342,7 @@ mod tests {
             data_type: column_type,
             nullable: true,
             write_default: None,
+            logical_type: None,
         };
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
