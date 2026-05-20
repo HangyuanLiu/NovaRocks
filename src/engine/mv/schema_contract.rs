@@ -13,12 +13,19 @@ use crate::meta::repository::mv_contract::{
     JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RebindColumn {
+    pub(crate) base_table_fqn: String,
+    pub(crate) field_id: i32,
+    pub(crate) name_at_create: String,
+    pub(crate) current_name: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {
     CompatibleSafe,
     CompatibleSafeWithRebind {
-        /// (base field id, name_at_create, current_name)
-        rebound_columns: Vec<(i32, String, String)>,
+        rebound_columns: Vec<RebindColumn>,
     },
     Incompatible(SchemaEvolutionError),
 }
@@ -41,6 +48,12 @@ pub(crate) enum SchemaEvolutionError {
         name_at_create: String,
         from: String,
         to: String,
+    },
+    BaseFieldNullabilityChanged {
+        field_id: i32,
+        name_at_create: String,
+        from_required: bool,
+        to_required: bool,
     },
     TargetTableIdentityChanged {
         expected: String,
@@ -100,6 +113,15 @@ impl std::fmt::Display for SchemaEvolutionError {
             } => write!(
                 f,
                 "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed type from {from} to {to}; run REFRESH FULL or recreate the MV"
+            ),
+            Self::BaseFieldNullabilityChanged {
+                field_id,
+                name_at_create,
+                from_required,
+                to_required,
+            } => write!(
+                f,
+                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed nullability from required={from_required} to required={to_required}; run REFRESH FULL or recreate the MV"
             ),
             Self::TargetTableIdentityChanged { expected, actual } => write!(
                 f,
@@ -275,7 +297,7 @@ fn validate_identity_guards(
 fn check_base_referenced_fields(
     contract: &MvSchemaContract,
     base_schema: &iceberg::spec::Schema,
-) -> Result<Vec<(i32, String, String)>, SchemaEvolutionError> {
+) -> Result<Vec<RebindColumn>, SchemaEvolutionError> {
     let current = base_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &contract.base.schema_at_create.fields {
@@ -294,12 +316,21 @@ fn check_base_referenced_fields(
                 to: current_signature,
             });
         }
+        if field.required != record.required {
+            return Err(SchemaEvolutionError::BaseFieldNullabilityChanged {
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                from_required: record.required,
+                to_required: field.required,
+            });
+        }
         if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-            rebound.push((
-                record.field_id,
-                record.name_at_create.clone(),
-                field.name.clone(),
-            ));
+            rebound.push(RebindColumn {
+                base_table_fqn: contract.base.table_fqn.clone(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                current_name: field.name.clone(),
+            });
         }
     }
     Ok(rebound)
@@ -810,7 +841,109 @@ mod tests {
         assert_eq!(
             decision,
             ContractDecision::CompatibleSafeWithRebind {
-                rebound_columns: vec![(1, "id".to_string(), "renamed_id".to_string())],
+                rebound_columns: vec![RebindColumn {
+                    base_table_fqn: "ice.db.orders".to_string(),
+                    field_id: 1,
+                    name_at_create: "id".to_string(),
+                    current_name: "renamed_id".to_string(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn supplied_base_schema_rejects_referenced_nullability_drift() {
+        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::optional(
+                1,
+                "id",
+                base_type.clone(),
+            ))])
+            .build()
+            .expect("base schema");
+        let target_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    target_type.clone(),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("target schema");
+        let contract = minimal_base_row_id_contract();
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        match decision {
+            ContractDecision::Incompatible(SchemaEvolutionError::BaseFieldNullabilityChanged {
+                field_id,
+                name_at_create,
+                from_required,
+                to_required,
+            }) => {
+                assert_eq!(field_id, 1);
+                assert_eq!(name_at_create, "id");
+                assert!(from_required);
+                assert!(!to_required);
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supplied_base_schema_rebind_payload_includes_base_fqn() {
+        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let base_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "renamed_id",
+                base_type.clone(),
+            ))])
+            .build()
+            .expect("base schema");
+        let target_schema = iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    target_type.clone(),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("target schema");
+        let contract = minimal_base_row_id_contract();
+
+        let decision =
+            validate_schema_contract_after_identity(&contract, &base_schema, &target_schema);
+
+        assert_eq!(
+            decision,
+            ContractDecision::CompatibleSafeWithRebind {
+                rebound_columns: vec![RebindColumn {
+                    base_table_fqn: "ice.db.orders".to_string(),
+                    field_id: 1,
+                    name_at_create: "id".to_string(),
+                    current_name: "renamed_id".to_string(),
+                }],
             }
         );
     }

@@ -10426,9 +10426,8 @@ mod tests {
 /// "column-reference" positions in the AST are rewritten; string literals
 /// and table identifiers are left alone.
 ///
-/// `rebound_columns` is `[(field_id, name_at_create, current_name)]`.
-/// `field_id` is informational here — the rewrite is purely by
-/// case-insensitive name matching.
+/// `rebound_columns` carries the renamed base fields. `field_id` is
+/// informational; the rewrite is purely by case-insensitive name matching.
 ///
 /// Limitation: this rewrite operates on the serialized SQL text, not on
 /// a bound semantic graph. If the stored MV SELECT contains subqueries,
@@ -10439,7 +10438,7 @@ mod tests {
 /// classification rejects unsupported shapes before reaching this code.
 pub(crate) fn rewrite_select_sql_for_rebind(
     stored_sql: &str,
-    rebound_columns: &[(i32, String, String)],
+    rebound_columns: &[crate::engine::mv::schema_contract::RebindColumn],
 ) -> Result<String, String> {
     if rebound_columns.is_empty() {
         return Ok(stored_sql.to_string());
@@ -10447,7 +10446,12 @@ pub(crate) fn rewrite_select_sql_for_rebind(
 
     let rename_map: std::collections::HashMap<String, String> = rebound_columns
         .iter()
-        .map(|(_field_id, old_name, new_name)| (old_name.to_ascii_lowercase(), new_name.clone()))
+        .map(|col| {
+            (
+                col.name_at_create.to_ascii_lowercase(),
+                col.current_name.clone(),
+            )
+        })
         .collect();
 
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
@@ -10597,7 +10601,12 @@ mod rebind_tests {
     #[test]
     fn rewrite_renames_column_in_projection_and_where() {
         let sql = "SELECT id, region, amount FROM base WHERE region = 'US'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rebound = vec![crate::engine::mv::schema_contract::RebindColumn {
+            base_table_fqn: "ice.db.base".to_string(),
+            field_id: 2,
+            name_at_create: "region".to_string(),
+            current_name: "area".to_string(),
+        }];
         let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
         // After rewrite, 'region' is replaced with 'area' in both
         // projection and WHERE clause. The literal 'US' is unchanged.
@@ -10615,7 +10624,12 @@ mod rebind_tests {
     #[test]
     fn rewrite_preserves_string_literals_matching_old_name() {
         let sql = "SELECT id FROM base WHERE region = 'region'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rebound = vec![crate::engine::mv::schema_contract::RebindColumn {
+            base_table_fqn: "ice.db.base".to_string(),
+            field_id: 2,
+            name_at_create: "region".to_string(),
+            current_name: "area".to_string(),
+        }];
         let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
         // The literal 'region' (string value) must be preserved.
         assert!(
@@ -10629,7 +10643,12 @@ mod rebind_tests {
     #[test]
     fn rewrite_is_case_insensitive_on_old_name() {
         let sql = "SELECT id, REGION FROM base";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rebound = vec![crate::engine::mv::schema_contract::RebindColumn {
+            base_table_fqn: "ice.db.base".to_string(),
+            field_id: 2,
+            name_at_create: "region".to_string(),
+            current_name: "area".to_string(),
+        }];
         let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
         assert!(
             rewritten.to_ascii_lowercase().contains("area"),
@@ -10640,7 +10659,12 @@ mod rebind_tests {
     #[test]
     fn rewrite_handles_compound_identifier() {
         let sql = "SELECT base.id, base.region FROM base WHERE base.region = 'US'";
-        let rebound = vec![(2, "region".to_string(), "area".to_string())];
+        let rebound = vec![crate::engine::mv::schema_contract::RebindColumn {
+            base_table_fqn: "ice.db.base".to_string(),
+            field_id: 2,
+            name_at_create: "region".to_string(),
+            current_name: "area".to_string(),
+        }];
         let rewritten = rewrite_select_sql_for_rebind(sql, &rebound).unwrap();
         assert!(
             rewritten.contains("area"),
