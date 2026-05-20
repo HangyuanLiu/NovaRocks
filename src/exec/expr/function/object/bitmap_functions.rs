@@ -837,8 +837,8 @@ fn bitmap_binary_op(
 
     let mut out = BinaryBuilder::new();
     for i in 0..len {
-        let lhs_null = lhs_bin.map_or(true, |a| a.is_null(i));
-        let rhs_null = rhs_bin.map_or(true, |a| a.is_null(i));
+        let lhs_null = lhs_bin.is_none_or(|a| a.is_null(i));
+        let rhs_null = rhs_bin.is_none_or(|a| a.is_null(i));
         if lhs_null || rhs_null {
             out.append_null();
             continue;
@@ -1036,7 +1036,10 @@ mod bitmap_binary_op_tests {
     }
 
     fn decode_row(arr: &BinaryArray, row: usize) -> Vec<u64> {
-        decode_bitmap(arr.value(row)).expect("decode").into_iter().collect()
+        decode_bitmap(arr.value(row))
+            .expect("decode")
+            .into_iter()
+            .collect()
     }
 
     #[test]

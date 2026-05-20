@@ -62,7 +62,9 @@ pub fn eval_object_function(
         "bitmap_max" => super::bitmap_functions::eval_bitmap_max(arena, expr, args, chunk),
         "bitmap_and" => super::bitmap_functions::eval_bitmap_and(arena, expr, args, chunk),
         "bitmap_andnot" => super::bitmap_functions::eval_bitmap_andnot(arena, expr, args, chunk),
-        "bitmap_contains" => super::bitmap_functions::eval_bitmap_contains(arena, expr, args, chunk),
+        "bitmap_contains" => {
+            super::bitmap_functions::eval_bitmap_contains(arena, expr, args, chunk)
+        }
         "bitmap_has_any" => super::bitmap_functions::eval_bitmap_has_any(arena, expr, args, chunk),
         "bitmap_intersect" => {
             super::bitmap_functions::eval_bitmap_intersect(arena, expr, args, chunk)

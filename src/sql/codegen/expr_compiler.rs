@@ -2119,7 +2119,7 @@ fn infer_scalar_function_return_type(
         | "bitmap_from_binary"
         | "bitmap_to_base64" => Ok(DataType::Binary),
         "bitmap_contains" | "bitmap_has_any" => Ok(DataType::Boolean),
-        "bitmap_min" | "bitmap_max" | "bitmap_count" => Ok(DataType::Int64),
+        "bitmap_min" | "bitmap_max" => Ok(DataType::Int64),
         "bitmap_to_array" => Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
