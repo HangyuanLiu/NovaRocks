@@ -561,7 +561,6 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
             | "hll_union"
             | "hll_union_agg"
             | "hll_raw_agg"
-            | "hll_cardinality"
             | "ndv"
             | "variance"
             | "variance_samp"
@@ -846,7 +845,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "bitmap_from_binary"
         | "bitmap_to_base64" => DataType::Binary,
         "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
-        "bitmap_min" | "bitmap_max" | "bitmap_count" => DataType::Int64,
+        "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
