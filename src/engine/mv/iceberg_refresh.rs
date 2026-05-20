@@ -1633,14 +1633,12 @@ fn refresh_single_aggregate_iceberg_mv(
     // current base column names.
     let reclassified_aggregate_shape = if rebind_happened {
         let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new = canonicalize_iceberg_mv_select_query(
-            &new_query,
-            current_catalog,
-            current_database,
-        );
-        let new_shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-            &canonical_new,
-        )?;
+        let canonical_new =
+            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
+        let new_shape =
+            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+                &canonical_new,
+            )?;
         aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
             "iceberg aggregate MV rebind broke aggregate classification".to_string()
         })?
@@ -2193,14 +2191,12 @@ fn refresh_join_aggregate_iceberg_mv(
     // names (join key and group key).
     let reclassified_join_aggregate_shape = if rebind_happened {
         let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new = canonicalize_iceberg_mv_select_query(
-            &new_query,
-            current_catalog,
-            current_database,
-        );
-        let new_shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-            &canonical_new,
-        )?;
+        let canonical_new =
+            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
+        let new_shape =
+            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+                &canonical_new,
+            )?;
         match new_shape {
             IncrementalMvShape::JoinAggregate(shape) => shape,
             _ => {
@@ -10572,4 +10568,3 @@ mod tests {
         });
     }
 }
-

@@ -408,18 +408,12 @@ mod tests {
         );
         // GROUP BY / HAVING / ORDER BY reference the base column directly and
         // do not need an alias.
-        assert!(
-            rewritten.contains("GROUP BY area"),
-            "rewritten={rewritten}"
-        );
+        assert!(rewritten.contains("GROUP BY area"), "rewritten={rewritten}");
         assert!(
             rewritten.contains("HAVING area IS NOT NULL"),
             "rewritten={rewritten}"
         );
-        assert!(
-            rewritten.contains("ORDER BY area"),
-            "rewritten={rewritten}"
-        );
+        assert!(rewritten.contains("ORDER BY area"), "rewritten={rewritten}");
     }
 
     #[test]
@@ -427,10 +421,7 @@ mod tests {
         let sql = "SELECT region, SUM(amount) AS total_amount FROM ice.db.orders GROUP BY region";
         let rewritten =
             rewrite_select_sql_for_rebind(sql, &single("amount", "gross_amount")).unwrap();
-        assert!(
-            rewritten.contains("gross_amount"),
-            "rewritten={rewritten}"
-        );
+        assert!(rewritten.contains("gross_amount"), "rewritten={rewritten}");
         assert!(
             rewritten.contains("total_amount"),
             "alias must stay unchanged: {rewritten}"

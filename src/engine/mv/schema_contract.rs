@@ -24,9 +24,7 @@ pub(crate) struct RebindColumn {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {
     CompatibleSafe,
-    CompatibleSafeWithRebind {
-        rebound_columns: Vec<RebindColumn>,
-    },
+    CompatibleSafeWithRebind { rebound_columns: Vec<RebindColumn> },
     Incompatible(SchemaEvolutionError),
 }
 
