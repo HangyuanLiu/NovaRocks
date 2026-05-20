@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-05-21-mv-rewrite-ivm-design.md` for
 //! design rationale. Reference: StarRocks `materialization/` rules.
 
+pub(crate) mod column_id;
 pub(crate) mod rules;
 pub(crate) mod trace;
 
