@@ -61,7 +61,8 @@ pub(crate) fn optimize(
     //    point loop causes the needed-column set to shrink across iterations
     //    (predicates get reshuffled between join conditions), incorrectly
     //    dropping join-key or select-list columns from scan required_columns.
-    let options = options::OptimizerOptions::default_settings();
+    let options =
+        options::OptimizerOptions::from_session(&options::current_session_optimizer_settings());
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
         &rbo::rules::predicate_pushdown_rbo_rules(),
@@ -98,13 +99,13 @@ pub(crate) fn optimize(
 
     // 7. Explore: apply transformation rules (logical -> logical).
     let transform_rules = rules::all_transformation_rules();
-    explore(&mut memo, &transform_rules, deadline)?;
+    explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
 
     // 8. Implement: apply implementation rules (logical -> physical).
     let impl_rules = rules::all_implementation_rules();
-    implement(&mut memo, &impl_rules);
+    implement(&mut memo, &impl_rules, &options);
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
     stats::derive_group_statistics(&mut memo, table_stats);
@@ -120,6 +121,28 @@ pub(crate) fn optimize(
 
     // 11. Extract best plan.
     extract::extract_best(&memo, root_group, &root_required, &ctx.winners)
+}
+
+/// True if `name` is the stable name of any rule that participates in
+/// the standard `optimize()` rule pipelines (RBO predicate pushdown,
+/// RBO column pruning, CBO transformations, CBO implementations).
+///
+/// Used by the server-side `SET disable_optimizer_rules` parser to
+/// detect typos in rule names so they can be surfaced via `warn!`
+/// without rejecting the SET statement.
+pub(crate) fn is_known_rule_name(name: &str) -> bool {
+    rules::all_transformation_rules()
+        .iter()
+        .any(|r| r.name() == name)
+        || rules::all_implementation_rules()
+            .iter()
+            .any(|r| r.name() == name)
+        || rbo::rules::predicate_pushdown_rbo_rules()
+            .iter()
+            .any(|r| r.name() == name)
+        || rbo::rules::column_pruning_rules()
+            .iter()
+            .any(|r| r.name() == name)
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -141,7 +164,12 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
 /// - Wall-clock deadline exceeded
 const EXPLORE_MAX_ITERATIONS: usize = 16;
 
-fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Result<(), String> {
+fn explore(
+    memo: &mut Memo,
+    rules: &[Box<dyn Rule>],
+    options: &options::OptimizerOptions,
+    deadline: Instant,
+) -> Result<(), String> {
     for _round in 0..EXPLORE_MAX_ITERATIONS {
         if Instant::now() > deadline {
             return Err(format!(
@@ -161,6 +189,9 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
+                    if !options.is_enabled(rule.name()) {
+                        continue;
+                    }
                     // Skip JoinAssociativity when the memo has grown large
                     // to prevent combinatorial explosion. RBO join reorder
                     // already handles join ordering for large join graphs.
@@ -205,7 +236,7 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
 /// Apply implementation rules to all groups.
 ///
 /// Single pass — each logical expr gets physical alternatives once.
-fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
+fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::OptimizerOptions) {
     let mut changed = true;
     while changed {
         changed = false;
@@ -214,6 +245,9 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
+                    if !options.is_enabled(rule.name()) {
+                        continue;
+                    }
                     if rule.matches(&expr.op) {
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
@@ -245,4 +279,23 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
 /// keep a duplicate in the group).
 fn op_equal(a: &Operator, b: &Operator) -> bool {
     format!("{:?}", a) == format!("{:?}", b)
+}
+
+#[cfg(test)]
+mod is_known_rule_name_tests {
+    use super::*;
+
+    #[test]
+    fn is_known_rule_name_recognizes_real_rule() {
+        // JoinCommutativity is a transformation rule that has been stable
+        // for a while; if this assertion fails because the rule was renamed,
+        // pick another known rule name from src/sql/optimizer/rules/.
+        assert!(is_known_rule_name("JoinCommutativity"));
+    }
+
+    #[test]
+    fn is_known_rule_name_rejects_typos() {
+        assert!(!is_known_rule_name("TotallyNotARealRule"));
+        assert!(!is_known_rule_name(""));
+    }
 }

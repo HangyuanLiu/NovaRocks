@@ -711,55 +711,8 @@ impl StandaloneSession {
                 let sqlast::Statement::Query(ref query) = *statement else {
                     return Err("EXPLAIN only supports SELECT queries".to_string());
                 };
-                // Inline any user-defined views before the analyzer sees the
-                // EXPLAINed query. See the `Statement::Query` branch below for
-                // rationale.
-                let mut view_expanded = query.clone();
-                self::view_rewrite::expand_views_in_query(
-                    view_expanded.as_mut(),
-                    &self.inner.views,
-                    current_database,
-                );
-                let query = &view_expanded;
-                // Time-travel in EXPLAIN: rewrite version clauses before registration.
-                let mut time_travel_rewritten;
-                let query = if has_time_travel_refs(query) {
-                    time_travel_rewritten = query.as_ref().clone();
-                    rewrite_time_travel_refs(
-                        &self.inner,
-                        current_catalog,
-                        current_database,
-                        &mut time_travel_rewritten,
-                    )?;
-                    &time_travel_rewritten
-                } else {
-                    query.as_ref()
-                };
-                if current_catalog.is_some() {
-                    register_iceberg_tables_for_query(
-                        &self.inner,
-                        current_catalog,
-                        current_database,
-                        query,
-                    )?;
-                }
-                let mut rewritten_three_part_query;
-                let three_parts = extract_three_part_table_refs(query);
-                let query = if !three_parts.is_empty() {
-                    if current_catalog.is_none() {
-                        register_iceberg_tables_for_query(
-                            &self.inner,
-                            None,
-                            current_database,
-                            query,
-                        )?;
-                    }
-                    rewritten_three_part_query = query.clone();
-                    strip_catalog_from_three_part_names(&mut rewritten_three_part_query);
-                    &rewritten_three_part_query
-                } else {
-                    query
-                };
+                let prepared =
+                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
                 let level = forced_explain_level.unwrap_or({
                     if verbose {
                         crate::sql::explain::ExplainLevel::Verbose
@@ -772,7 +725,32 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = explain_query(query, &catalog, current_database, level)?;
+                let result = explain_query(&prepared, &catalog, current_database, level)?;
+                drop(catalog);
+                Ok(StatementResult::Query(result))
+            }
+            sqlast::Statement::Explain {
+                statement,
+                analyze: true,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
+                };
+                let prepared =
+                    prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
+                let catalog = self
+                    .inner
+                    .catalog
+                    .read()
+                    .expect("standalone catalog read lock");
+                let result = explain_analyze_query(
+                    &prepared,
+                    &catalog,
+                    current_database,
+                    self.inner.exchange_port,
+                    None,
+                )?;
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
@@ -2308,6 +2286,81 @@ fn collapse_distribution_enforcers_for_single_fragment(
     }
 
     node
+}
+
+/// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
+/// inline user-defined views, rewrite time-travel refs, register Iceberg
+/// tables, and strip three-part catalog names. Returns the rewritten query.
+fn prepare_explain_query(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<sqlparser::ast::Query, String> {
+    // Inline any user-defined views before the analyzer sees the query.
+    let mut prepared = query.clone();
+    self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+
+    // Time-travel: rewrite version clauses before Iceberg registration.
+    if has_time_travel_refs(&prepared) {
+        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+    }
+
+    // When current_catalog is an Iceberg catalog, materialize referenced
+    // Iceberg tables into the local catalog first.
+    if current_catalog.is_some() {
+        register_iceberg_tables_for_query(state, current_catalog, current_database, &prepared)?;
+    }
+
+    // Three-part catalog.database.table names: register and strip.
+    let three_parts = extract_three_part_table_refs(&prepared);
+    if !three_parts.is_empty() {
+        if current_catalog.is_none() {
+            register_iceberg_tables_for_query(state, None, current_database, &prepared)?;
+        }
+        strip_catalog_from_three_part_names(&mut prepared);
+    }
+
+    Ok(prepared)
+}
+
+/// Execute the query, then produce an EXPLAIN-style result whose first row is
+/// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the Verbose
+/// plan body. Per-operator runtime stats merge is out of scope for OPT-5;
+/// the pipeline has no systematic profile collection yet.
+fn explain_analyze_query(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<QueryResult, String> {
+    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
+
+    // NOTE: planning_ms covers only the outer analyze + plan_query +
+    // optimize call below; execute_query re-plans internally and its
+    // planning work is charged to execution_ms. This double-count is
+    // an acknowledged limitation; per-operator profile merge in a
+    // follow-up PR will replace the query-level timing summary.
+    let t_plan = Instant::now();
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats)?;
+    let planning_ms = t_plan.elapsed().as_millis() as u64;
+
+    let t_exec = Instant::now();
+    let executed = execute_query(query, catalog, current_database, exchange_port, query_opts)?;
+    let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
+    let execution_ms = t_exec.elapsed().as_millis() as u64;
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
+    ));
+    lines.extend(explain_physical_plan(&physical, ExplainLevel::Analyze));
+
+    build_string_query_result("Explain String", lines)
 }
 
 /// Produce EXPLAIN output for a query without executing it.
