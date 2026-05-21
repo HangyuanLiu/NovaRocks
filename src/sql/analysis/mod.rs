@@ -8,6 +8,7 @@ pub(crate) mod cte;
 use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnId;
 
 // ---------------------------------------------------------------------------
 // Top-level query
@@ -26,6 +27,7 @@ pub(crate) struct ResolvedQuery {
 
 #[derive(Clone, Debug)]
 pub(crate) struct OutputColumn {
+    pub column_id: ColumnId,
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -147,6 +149,12 @@ pub(crate) struct ScanRelation {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
+    /// G1: ColumnId assigned by the analyzer when this table was added to a
+    /// scope. The planner reuses these instead of minting fresh ones so the
+    /// scan output's ColumnIds match the analyzer-produced `ColumnRef`s in
+    /// the rest of the plan (filters, GROUP BY, ORDER BY, Window
+    /// PARTITION BY, etc.).
+    pub column_ids: Vec<ColumnId>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +263,7 @@ pub(crate) struct LambdaParam {
 pub(crate) enum ExprKind {
     /// Resolved column reference.
     ColumnRef {
+        column_id: ColumnId,
         qualifier: Option<String>,
         column: String,
     },

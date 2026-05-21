@@ -672,11 +672,32 @@ impl Rule for JoinToNestLoop {
 
 pub(crate) struct AggToHashAgg;
 
-fn aggregate_group_key_output_ref(expr: &TypedExpr) -> TypedExpr {
+fn aggregate_group_key_output_ref(
+    expr: &TypedExpr,
+    output_column: Option<&crate::sql::analysis::OutputColumn>,
+) -> TypedExpr {
+    // Global aggregate references each Local-emitted group-by slot. Per the
+    // G1 invariant — "pass-through operators (Project, SubqueryAlias, Window)
+    // reuse the upstream ColumnId" — we propagate the input expr's id when
+    // it is itself a ColumnRef. For derived group-by exprs (e.g.
+    // `GROUP BY mod(k, 2)` or `GROUP BY a + b`) the planner has already
+    // minted a fresh ColumnId for the synthesised slot and stored it in the
+    // LogicalAggregate's `output_columns`, so we reuse that id here. Minting
+    // a brand-new id at this point would desynchronise Local's output
+    // distribution from Global's input requirement and the optimizer would
+    // loop trying to enforce an unreachable shuffle.
+    let display_name = typed_expr_display_name(expr);
+    let column_id = match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => output_column
+            .map(|oc| oc.column_id)
+            .unwrap_or(crate::sql::column_id::ColumnId::UNSET),
+    };
     TypedExpr {
         kind: ExprKind::ColumnRef {
+            column_id,
             qualifier: None,
-            column: typed_expr_display_name(expr),
+            column: display_name,
         },
         data_type: expr.data_type.clone(),
         nullable: expr.nullable,
@@ -730,10 +751,16 @@ impl Rule for AggToHashAgg {
             children: expr.children.clone(),
         };
         let local_group_id = memo.new_group(local_mexpr);
+        // LogicalAggregate.output_columns lays out group-by columns first
+        // (in the order they appear in op.group_by), followed by aggregate
+        // result columns. We pair each group_by expr with its corresponding
+        // output_columns entry so derived group-by columns inherit the
+        // ColumnId the planner already minted.
         let global_group_by = op
             .group_by
             .iter()
-            .map(aggregate_group_key_output_ref)
+            .enumerate()
+            .map(|(idx, gb)| aggregate_group_key_output_ref(gb, op.output_columns.get(idx)))
             .collect();
 
         let global = NewExpr {
@@ -1314,10 +1341,12 @@ mod top_n_tests {
 mod eq_pair_tests {
     use super::*;
     use arrow::datatypes::DataType;
+    use crate::sql::column_id::ColumnId;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -1384,12 +1413,14 @@ mod join_demotion_tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{TableDef, TableStorage};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -1403,6 +1434,7 @@ mod join_demotion_tests {
         let output_columns: Vec<OutputColumn> = col_names
             .iter()
             .map(|name| OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: (*name).into(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1592,6 +1624,7 @@ mod join_demotion_tests {
 #[cfg(test)]
 mod window_split_tests {
     use super::*;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::WindowExpr;
     use arrow::datatypes::DataType;
 
@@ -1612,6 +1645,7 @@ mod window_split_tests {
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -1748,6 +1782,7 @@ mod window_split_tests {
 mod two_phase_agg_tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
@@ -1755,6 +1790,7 @@ mod two_phase_agg_tests {
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: name.into(),
             },
@@ -1805,11 +1841,13 @@ mod two_phase_agg_tests {
                 }],
                 output_columns: vec![
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "city".into(),
                         data_type: DataType::Int32,
                         nullable: false,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "sum(amount)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
@@ -1882,11 +1920,13 @@ mod two_phase_agg_tests {
                 }],
                 output_columns: vec![
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "city".into(),
                         data_type: DataType::Int32,
                         nullable: false,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "count(distinct id)".into(),
                         data_type: DataType::Int64,
                         nullable: true,
@@ -1935,11 +1975,13 @@ mod two_phase_agg_tests {
                 }],
                 output_columns: vec![
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "city % 2".into(),
                         data_type: DataType::Int32,
                         nullable: false,
                     },
                     OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "min(amount)".into(),
                         data_type: DataType::Int32,
                         nullable: true,
@@ -1958,7 +2000,7 @@ mod two_phase_agg_tests {
         };
         assert!(matches!(global.mode, AggMode::Global));
         match &global.group_by[0].kind {
-            ExprKind::ColumnRef { qualifier, column } => {
+            ExprKind::ColumnRef { qualifier, column, .. } => {
                 assert!(qualifier.is_none());
                 assert_eq!(column, "city % 2");
             }

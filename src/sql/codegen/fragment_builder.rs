@@ -23,6 +23,7 @@ use crate::types;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::codegen::FragmentId;
+use crate::sql::column_id::ColumnId;
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::helpers::{
@@ -441,7 +442,20 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            scope.add_column(
+            // G1: pick up the per-column ColumnId from `op.columns` so the
+            // scope's by-id index is populated for base-table reads. This is
+            // what lets the optimizer's `DistributionSpec::HashPartitioned`
+            // (which is now a `Vec<ColumnId>`) resolve directly against the
+            // scan's child scope without having to round-trip through the
+            // display name.
+            let col_id = op
+                .columns
+                .iter()
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name))
+                .map(|oc| oc.column_id)
+                .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
+            scope.add_column_with_id(
+                col_id,
                 qualifier.map(|s| s.to_string()),
                 col.name.clone(),
                 binding.clone(),
@@ -642,7 +656,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             });
 
-            project_scope.add_column(
+            // G1: a Project that is itself a pass-through ColumnRef must
+            // expose the upstream ColumnId so the by-id index in the scope
+            // stays continuous across the Project — without this, the
+            // distribution requirement for an Aggregate on top of a
+            // SubqueryAlias-wrapped relation fails to resolve the column.
+            let item_column_id = match &item.expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => crate::sql::column_id::ColumnId::UNSET,
+            };
+            project_scope.add_column_with_id(
+                item_column_id,
                 None,
                 name.clone(),
                 ColumnBinding {
@@ -661,6 +685,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
+                ..
             } = item.expr.kind
             {
                 project_scope.add_qualified_alias(
@@ -1004,10 +1029,22 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: Some(slot_type_desc),
                 nullable,
             };
-            agg_scope.add_column(None, name, binding.clone());
+            // G1: when the group-by expression is itself a ColumnRef with a
+            // real ColumnId, register the agg's output slot under that id so
+            // upstream operators (the SELECT projection on top of a GROUPING
+            // SETS / CUBE Aggregate, the Global merge above a Local agg,
+            // etc.) can resolve the column by id regardless of the slot's
+            // display name. Non-ColumnRef group-by exprs (e.g. `a + b`)
+            // remain name-indexed only.
+            let gb_column_id = match &gb_expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => crate::sql::column_id::ColumnId::UNSET,
+            };
+            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
+                ..
             } = gb_expr.kind
             {
                 agg_scope.add_qualified_alias(q.clone(), column.clone(), binding);
@@ -1399,7 +1436,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -1509,7 +1546,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         } = child;
 
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
-        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -2116,6 +2153,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             table: table_def,
             alias: op.alias.clone(),
             columns: vec![crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::UNSET,
                 name: col_name.clone(),
                 data_type: ArrowDataType::Int64,
                 nullable: false,
@@ -2403,27 +2441,34 @@ impl<'a> PlanFragmentBuilder<'a> {
             .map(|(_, binding)| binding.clone())
             .collect();
 
-        // Register all output columns with the alias as qualifier
+        // Register all output columns with the alias as qualifier. Per the
+        // G1 invariant ("SubqueryAlias does not create new ids, only changes
+        // the display name") we also re-index each binding under the alias's
+        // ColumnId so the by-id lookup follows the column through the alias
+        // boundary.
         for (idx, col) in op.output_columns.iter().enumerate() {
             let col_name_lower = col.name.to_lowercase();
             let binding = child
                 .scope
-                .resolve_column(None, &col_name_lower)
+                .resolve_by_id(col.column_id)
                 .cloned()
-                .or_else(|_| {
-                    child_output_bindings.get(idx).cloned().ok_or_else(|| {
-                        format!(
-                            "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
-                            op.alias,
-                            col.name,
-                            idx,
-                            child_output_bindings.len()
-                        )
-                    })
+                .or_else(|| child.scope.resolve_column(None, &col_name_lower).cloned().ok())
+                .or_else(|| child_output_bindings.get(idx).cloned())
+                .ok_or_else(|| {
+                    format!(
+                        "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
+                        op.alias,
+                        col.name,
+                        idx,
+                        child_output_bindings.len()
+                    )
                 })?;
-            child
-                .scope
-                .add_column(Some(op.alias.clone()), col.name.clone(), binding);
+            child.scope.add_column_with_id(
+                col.column_id,
+                Some(op.alias.clone()),
+                col.name.clone(),
+                binding,
+            );
         }
 
         Ok(child)
@@ -2627,6 +2672,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         &self,
         spec: &crate::sql::optimizer::property::DistributionSpec,
         child_scope: &ExprScope,
+        output_columns: &[crate::sql::analysis::OutputColumn],
     ) -> Result<partitions::TDataPartition, String> {
         match spec {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
@@ -2635,15 +2681,20 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::HashPartitioned(cols) => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
+                //
+                // G1: prefer ColumnId-based lookup against the child scope's
+                // id index. Fall back to the legacy path that resolves a
+                // ColumnId → display name (via output_columns) → name lookup
+                // for scopes / call sites that have not yet been migrated to
+                // register ColumnIds.
                 let mut partition_exprs = Vec::new();
-                let mut used = std::collections::HashSet::new();
-                for col in cols.iter() {
-                    if used.contains(&col.column.to_lowercase()) {
-                        continue; // skip duplicate column names
+                let mut used_ids = std::collections::HashSet::new();
+                let mut used_names = std::collections::HashSet::new();
+                for col_id in cols.iter() {
+                    if used_ids.contains(col_id) {
+                        continue; // skip duplicate column ids
                     }
-                    if let Ok(binding) =
-                        child_scope.resolve_column(col.qualifier.as_deref(), &col.column)
-                    {
+                    if let Some(binding) = child_scope.resolve_by_id(*col_id) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
                         partition_exprs.push(expr_compiler::build_slot_ref_texpr(
@@ -2651,13 +2702,33 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used.insert(col.column.to_lowercase());
+                        used_ids.insert(*col_id);
+                        continue;
+                    }
+                    // Fallback: ColumnId → name (via output_columns) → name lookup.
+                    let col_meta = output_columns.iter().find(|oc| oc.column_id == *col_id);
+                    let col_name = match col_meta {
+                        Some(oc) => oc.name.clone(),
+                        None => continue, // column not in this child's output
+                    };
+                    if used_names.contains(&col_name.to_lowercase()) {
+                        continue; // skip duplicate column names
+                    }
+                    if let Ok(binding) = child_scope.resolve_column(None, &col_name) {
+                        let binding = binding.clone();
+                        let type_desc = expr_compiler::binding_type_desc(&binding)?;
+                        partition_exprs.push(expr_compiler::build_slot_ref_texpr(
+                            binding.slot_id,
+                            binding.tuple_id,
+                            type_desc,
+                        ));
+                        used_names.insert(col_name.to_lowercase());
                     }
                 }
                 if partition_exprs.is_empty() {
                     return Err(format!(
                         "no hash partition columns resolved in child scope from {:?}",
-                        cols.iter().map(|c| &c.column).collect::<Vec<_>>()
+                        cols
                     ));
                 }
                 Ok(partitions::TDataPartition::new(
@@ -2698,7 +2769,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
         } = child;
 
-        let output_partition = self.build_output_partition(&op.spec, &scope)?;
+        let output_partition = self.build_output_partition(&op.spec, &scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
@@ -2831,6 +2902,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     .scope
                     .iter_columns()
                     .map(|(name, binding)| crate::sql::analysis::OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: name.clone(),
                         data_type: binding.data_type.clone(),
                         nullable: binding.nullable,
@@ -3310,6 +3382,7 @@ mod tests {
 
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::UNSET,
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
@@ -3319,6 +3392,7 @@ mod tests {
     fn id_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
                 qualifier: None,
                 column: "id".to_string(),
             },
@@ -3985,6 +4059,7 @@ mod tests {
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
                     left: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: crate::sql::column_id::ColumnId::UNSET,
                             qualifier: Some("ice_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -3993,6 +4068,7 @@ mod tests {
                     },
                     right: TypedExpr {
                         kind: ExprKind::ColumnRef {
+                            column_id: crate::sql::column_id::ColumnId::UNSET,
                             qualifier: Some("managed_t".to_string()),
                             column: "id".to_string(),
                         },
@@ -4114,10 +4190,7 @@ mod tests {
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::HashPartitioned(vec![
-                    crate::sql::optimizer::property::ColumnRef {
-                        qualifier: None,
-                        column: "id".to_string(),
-                    },
+                    crate::sql::column_id::ColumnId::UNSET,
                 ]),
             }),
             children: vec![scan_plan(file.path().to_path_buf())],
