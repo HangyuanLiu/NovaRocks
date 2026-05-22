@@ -165,6 +165,7 @@ pub(crate) enum EnforcerKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::column_id::ColumnId;
 
     #[test]
     fn needed_enforcers_distribution_mismatch() {
@@ -184,6 +185,28 @@ mod tests {
         let provided = PhysicalPropertySet::gather();
         let enforcers = needed_enforcers(&required, &provided);
         assert!(enforcers.is_empty());
+    }
+
+    #[test]
+    fn shuffle_join_output_needs_enforcer_for_narrower_shuffle_agg_requirement() {
+        let required = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let provided = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let enforcers = needed_enforcers(&required, &provided);
+        assert_eq!(enforcers.len(), 1);
+        assert!(matches!(
+            enforcers[0],
+            EnforcerKind::Distribution(DistributionSpec::HashPartitioned {
+                source: HashSource::ShuffleAgg,
+                ..
+            })
+        ));
     }
 }
 

@@ -1170,12 +1170,13 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use super::{ExplainLevel, explain_physical_plan, format_stats_trailer};
+    use super::{ExplainLevel, explain_physical_plan, format_physical_node, format_stats_trailer};
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
+    use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
 
     #[test]
@@ -1271,6 +1272,29 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Decode")),
             "costs explain lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn physical_distribution_explain_prints_hash_source() {
+        let node = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::shuffle_agg([ColumnId(1)]),
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 0.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let mut lines = Vec::new();
+        format_physical_node(&node, ExplainLevel::Normal, 0, &mut lines);
+        let output = lines.join("\n");
+        assert!(
+            output.contains("HASH EXCHANGE (source: ShuffleAgg, hash: [c1])"),
+            "explain output was:\n{output}"
         );
     }
 
