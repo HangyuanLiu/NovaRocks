@@ -920,6 +920,7 @@ pub(crate) fn list_mv_rows(
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
+                dependencies: dependency_display_for_mv(state, mv.mv_id)?,
             });
             continue;
         }
@@ -955,9 +956,31 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
+            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
         });
     }
     Ok(rows)
+}
+
+fn dependency_display_for_mv(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+) -> Result<String, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(String::new());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency display read failed: {e}"))?;
+    let dependencies = state
+        .mv_repo
+        .list_dependencies_by_downstream(read.as_ref(), mv_id)
+        .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
+    Ok(dependencies
+        .iter()
+        .map(|dep| dep.upstream.display_name())
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 #[derive(Clone, Debug)]
@@ -1563,6 +1586,12 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
             nullable: false,
             logical_type: None,
         },
+        QueryResultColumn {
+            name: "Dependencies".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: None,
+        },
     ];
 
     let schema = Arc::new(Schema::new(vec![
@@ -1574,6 +1603,7 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Field::new("LastRefreshRows", DataType::Utf8, true),
         Field::new("BaseTables", DataType::Utf8, false),
         Field::new("SelectText", DataType::Utf8, false),
+        Field::new("Dependencies", DataType::Utf8, false),
     ]));
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(
@@ -1614,6 +1644,11 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| Some(row.select_text.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| Some(row.dependencies.clone()))
                 .collect::<Vec<_>>(),
         )),
     ];
