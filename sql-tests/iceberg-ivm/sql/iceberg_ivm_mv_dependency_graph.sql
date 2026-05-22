@@ -65,8 +65,13 @@ GROUP BY region;
 -- query 6
 -- SHOW MATERIALIZED VIEWS should list both MVs and surface the upstream
 -- dependency of mv_region on mv_orders in the Dependencies column.
+-- The `mv:` prefix only appears in the Dependencies column (added by
+-- MvDependencyObjectRef::display_name for MV-on-MV edges); MV names in the
+-- Name column are bare. Asserting the fully-qualified `mv:` reference
+-- therefore locks the Dependencies column content, not just MV name presence.
 -- @result_contains=mv_orders_${uuid0}
 -- @result_contains=mv_region_${uuid0}
+-- @result_contains=mv:ice_ivm_dep_${uuid0}.dep_${uuid0}.mv_orders_${uuid0}
 SHOW MATERIALIZED VIEWS;
 
 -- query 7
