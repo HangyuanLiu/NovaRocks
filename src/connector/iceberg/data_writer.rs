@@ -512,6 +512,36 @@ fn reannotate_array(
             Ok(Arc::new(new_list) as ArrayRef)
         }
         (a, b) if a == b => Ok(array.clone()),
+        // Decimal128 type mismatch: the SELECT produced a wider DECIMAL(sp,ss)
+        // (e.g. from an explicit CAST) but the iceberg sink expects DECIMAL(tp,ts).
+        // Narrow the array with half-up rounding using the same relaxed cast that
+        // the expression evaluator uses for DECIMAL→DECIMAL casts.
+        (
+            DataType::Decimal128(_, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        ) => crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+            format!(
+                "reannotate_array: coerce Decimal128(_, {source_scale}) \
+                     to Decimal128({target_precision}, {target_scale}) failed: {e}"
+            )
+        }),
+        // Integer narrowing: INSERT-SELECT may produce a wider integer type (e.g. BIGINT/Int64)
+        // when the sink column is a narrower integer (e.g. INT/Int32, SMALLINT/Int16, TINYINT/Int8).
+        // Arrow's default cast uses safe=true semantics: out-of-range values become NULL,
+        // matching the DECIMAL overflow convention used above.
+        (DataType::Int64, DataType::Int32)
+        | (DataType::Int64, DataType::Int16)
+        | (DataType::Int64, DataType::Int8)
+        | (DataType::Int32, DataType::Int16)
+        | (DataType::Int32, DataType::Int8) => {
+            crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+                format!(
+                    "reannotate_array: narrow integer {:?} to {:?} failed: {e}",
+                    array.data_type(),
+                    target_dtype
+                )
+            })
+        }
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
         )),
@@ -958,5 +988,166 @@ mod tests {
             "v parent group must carry LogicalType::Variant; got {:?}",
             v_field.get_basic_info().logical_type_ref()
         );
+    }
+
+    /// reannotate_array must narrow Decimal128(src_p, src_s) → Decimal128(tgt_p, tgt_s)
+    /// with half-up rounding rather than returning an error.
+    #[test]
+    fn reannotate_decimal128_narrows_scale_with_rounding() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // Source: DECIMAL(13, 4) — values as returned by CAST(x AS DECIMAL(13,4)).
+        let src = Arc::new(
+            Decimal128Array::from(vec![
+                Some(12344_i128),  // 1.2344 -> rounds DOWN to 1.23
+                Some(12356_i128),  // 1.2356 -> rounds UP to 1.24
+                Some(-23444_i128), // -2.3444 -> rounds DOWN (toward 0) to -2.34
+                Some(-23456_i128), // -2.3456 -> rounds away from 0 to -2.35
+                None,              // NULL preserves NULL
+            ])
+            .with_precision_and_scale(13, 4)
+            .expect("src decimal"),
+        ) as ArrayRef;
+
+        let target_dtype = DataType::Decimal128(10, 2);
+        let result = reannotate_array(&src, &target_dtype).expect("reannotate must succeed");
+
+        let out = result
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+
+        assert_eq!(out.precision(), 10);
+        assert_eq!(out.scale(), 2);
+        assert_eq!(out.len(), 5);
+
+        // 1.2344 -> 1.23
+        assert_eq!(out.value(0), 123_i128);
+        // 1.2356 -> 1.24
+        assert_eq!(out.value(1), 124_i128);
+        // -2.3444 -> -2.34
+        assert_eq!(out.value(2), -234_i128);
+        // -2.3456 -> -2.35
+        assert_eq!(out.value(3), -235_i128);
+        // NULL
+        assert!(out.is_null(4));
+    }
+
+    /// reannotate_array: same Decimal128 precision and scale is a no-op (fast path).
+    #[test]
+    fn reannotate_decimal128_same_type_is_passthrough() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src = Arc::new(
+            Decimal128Array::from(vec![Some(100_i128), None])
+                .with_precision_and_scale(10, 2)
+                .expect("src"),
+        ) as ArrayRef;
+
+        let target_dtype = DataType::Decimal128(10, 2);
+        let result = reannotate_array(&src, &target_dtype).expect("same-type must succeed");
+        // The early equality check returns the original Arc.
+        assert!(Arc::ptr_eq(&src, &result));
+    }
+
+    /// reannotate_array must narrow Int64 → Int32 losslessly when every value fits.
+    #[test]
+    fn reannotate_int64_narrows_to_int32_lossless() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1_i64),
+            Some(20_i64),
+            Some(99999_i64),
+            None,
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Int32).expect("lossless narrow must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 1_i32);
+        assert_eq!(out.value(1), 20_i32);
+        assert_eq!(out.value(2), 99999_i32);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must produce NULL (not error) when Int64 → Int32 overflows.
+    #[test]
+    fn reannotate_int64_to_int32_overflow_returns_null() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // i32::MAX is 2_147_483_647; values beyond that should become NULL.
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(42_i64),
+            Some(i64::from(i32::MAX) + 1), // overflows
+            Some(-1_i64),
+            None,
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Int32).expect("overflow arm must not return Err");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 42_i32);
+        assert!(out.is_null(1), "overflowing value must become NULL");
+        assert_eq!(out.value(2), -1_i32);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must narrow Int32 → Int16 losslessly.
+    #[test]
+    fn reannotate_int32_narrows_to_int16() {
+        use arrow::array::{ArrayRef, Int16Array, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(100_i32),
+            Some(-200_i32),
+            None,
+            Some(i32::from(i16::MAX) + 1), // overflows i16
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Int16).expect("Int32->Int16 must not return Err");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .expect("Int16Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 100_i16);
+        assert_eq!(out.value(1), -200_i16);
+        assert!(out.is_null(2));
+        assert!(out.is_null(3), "overflow must become NULL");
+    }
+
+    /// reannotate_array: same Int32 type is a passthrough (regression guard).
+    #[test]
+    fn reannotate_int32_same_type_is_passthrough() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![Some(7_i32), None]));
+        let result = reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
+        assert!(Arc::ptr_eq(&src, &result));
     }
 }
