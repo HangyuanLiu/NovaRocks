@@ -195,6 +195,127 @@ pub(crate) fn validate_no_cycle_for_edges(
     Ok(())
 }
 
+pub(crate) fn topological_upstream_order_for_edges(
+    target: &MvDependencyObjectRef,
+    existing_edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
+) -> Result<Vec<MvDependencyObjectRef>, String> {
+    let mut graph: std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>> =
+        std::collections::BTreeMap::new();
+    for (downstream, upstreams) in existing_edges {
+        graph.insert(downstream.clone(), upstreams.clone());
+    }
+
+    let mut permanent = std::collections::BTreeSet::new();
+    let mut temporary = std::collections::BTreeSet::new();
+    let mut ordered = Vec::new();
+
+    fn visit(
+        node: &MvDependencyObjectRef,
+        graph: &std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>>,
+        permanent: &mut std::collections::BTreeSet<MvDependencyObjectRef>,
+        temporary: &mut std::collections::BTreeSet<MvDependencyObjectRef>,
+        ordered: &mut Vec<MvDependencyObjectRef>,
+    ) -> Result<(), String> {
+        if permanent.contains(node) {
+            return Ok(());
+        }
+        if !temporary.insert(node.clone()) {
+            return Err(format!(
+                "dependency cycle detected while planning refresh at {}",
+                node.display_name()
+            ));
+        }
+        for upstream in graph.get(node).cloned().unwrap_or_default() {
+            if upstream.object_type == MvDependencyObjectType::MaterializedView {
+                visit(&upstream, graph, permanent, temporary, ordered)?;
+            }
+        }
+        temporary.remove(node);
+        permanent.insert(node.clone());
+        ordered.push(node.clone());
+        Ok(())
+    }
+
+    visit(target, &graph, &mut permanent, &mut temporary, &mut ordered)?;
+    Ok(ordered)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MvRefreshDependencyStep {
+    pub(crate) object: MvDependencyObjectRef,
+    pub(crate) target: crate::engine::mv::lifecycle::MvTarget,
+    pub(crate) storage_engine: crate::engine::mv::lifecycle::MvStorageEngine,
+}
+
+pub(crate) fn refresh_step_for_dependency_object(
+    object: &MvDependencyObjectRef,
+) -> Result<MvRefreshDependencyStep, String> {
+    if object.object_type != MvDependencyObjectType::MaterializedView {
+        return Err(format!(
+            "refresh dependency object is not a materialized view: {}",
+            object.display_name()
+        ));
+    }
+    let storage_engine = match object.storage_engine {
+        MvDependencyStorageEngine::ManagedLake => {
+            crate::engine::mv::lifecycle::MvStorageEngine::ManagedLake
+        }
+        MvDependencyStorageEngine::Iceberg => {
+            crate::engine::mv::lifecycle::MvStorageEngine::Iceberg
+        }
+        MvDependencyStorageEngine::ExternalTable => {
+            return Err(format!(
+                "external table cannot be refreshed as materialized view: {}",
+                object.display_name()
+            ));
+        }
+    };
+    Ok(MvRefreshDependencyStep {
+        object: object.clone(),
+        target: crate::engine::mv::lifecycle::MvTarget {
+            catalog: object.catalog.clone(),
+            database: object.database_or_namespace.clone(),
+            name: object.name.clone(),
+        },
+        storage_engine,
+    })
+}
+
+pub(crate) fn build_upstream_refresh_steps(
+    state: &Arc<StandaloneState>,
+    requested: &MvDependencyObjectRef,
+) -> Result<Vec<MvRefreshDependencyStep>, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(vec![refresh_step_for_dependency_object(requested)?]);
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency refresh graph read failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load MV definitions for refresh graph failed: {e}"))?;
+
+    let mut edges = Vec::new();
+    for definition in definitions {
+        let target = stored_definition_dependency_ref_from_state(state, &definition)?;
+        let upstream_mvs = state
+            .mv_repo
+            .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
+            .into_iter()
+            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+            .map(|dep| dep.upstream)
+            .collect::<Vec<_>>();
+        edges.push((target, upstream_mvs));
+    }
+
+    topological_upstream_order_for_edges(requested, &edges)?
+        .iter()
+        .map(refresh_step_for_dependency_object)
+        .collect()
+}
+
 pub(crate) fn validate_no_create_cycle(
     state: &Arc<StandaloneState>,
     new_target: &MvDependencyObjectRef,
@@ -312,5 +433,34 @@ mod tests {
         validate_no_cycle_for_edges(&mv_c, &[mv_b], &existing).expect("dag should be accepted");
         let _ = mv_a;
     }
-}
 
+    #[test]
+    fn topological_upstream_order_runs_deepest_first() {
+        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
+        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
+        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
+        let edges = vec![
+            (mv_b.clone(), vec![mv_a.clone()]),
+            (mv_c.clone(), vec![mv_b.clone()]),
+        ];
+
+        let order = topological_upstream_order_for_edges(&mv_c, &edges).expect("order");
+        assert_eq!(order, vec![mv_a, mv_b, mv_c]);
+    }
+
+    #[test]
+    fn topological_upstream_order_deduplicates_shared_dependencies() {
+        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
+        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
+        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
+        let mv_d = iceberg_mv_dependency_ref("ice", "sales", "mv_d");
+        let edges = vec![
+            (mv_b.clone(), vec![mv_a.clone()]),
+            (mv_c.clone(), vec![mv_a.clone()]),
+            (mv_d.clone(), vec![mv_b.clone(), mv_c.clone()]),
+        ];
+
+        let order = topological_upstream_order_for_edges(&mv_d, &edges).expect("order");
+        assert_eq!(order, vec![mv_a, mv_b, mv_c, mv_d]);
+    }
+}
