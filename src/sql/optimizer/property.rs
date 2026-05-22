@@ -180,47 +180,108 @@ impl PhysicalPropertySet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub(crate) enum HashSource {
+    ShuffleAgg,
+    ShuffleJoin,
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum DistributionSpec {
     Any,
     Gather,
-    HashPartitioned(Vec<ColumnId>),
+    HashPartitioned {
+        cols: Vec<ColumnId>,
+        source: HashSource,
+    },
 }
 
 impl DistributionSpec {
+    pub(crate) fn shuffle_agg<I>(cols: I) -> Self
+    where
+        I: IntoIterator<Item = ColumnId>,
+    {
+        Self::hash_partitioned(cols, HashSource::ShuffleAgg)
+    }
+
+    pub(crate) fn shuffle_join<I>(cols: I) -> Self
+    where
+        I: IntoIterator<Item = ColumnId>,
+    {
+        Self::hash_partitioned(cols, HashSource::ShuffleJoin)
+    }
+
+    pub(crate) fn hash_partitioned<I>(cols: I, source: HashSource) -> Self
+    where
+        I: IntoIterator<Item = ColumnId>,
+    {
+        let mut normalized = Vec::new();
+        for col in cols {
+            if col == ColumnId::UNSET || normalized.contains(&col) {
+                continue;
+            }
+            normalized.push(col);
+        }
+        if normalized.is_empty() {
+            DistributionSpec::Any
+        } else {
+            DistributionSpec::HashPartitioned {
+                cols: normalized,
+                source,
+            }
+        }
+    }
+
+    pub(crate) fn hash_cols(&self) -> Option<&[ColumnId]> {
+        match self {
+            DistributionSpec::HashPartitioned { cols, .. } => Some(cols.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hash_source(&self) -> Option<HashSource> {
+        match self {
+            DistributionSpec::HashPartitioned { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
+
     pub fn satisfies(&self, required: &DistributionSpec) -> bool {
         match required {
             DistributionSpec::Any => true,
             DistributionSpec::Gather => matches!(self, DistributionSpec::Gather),
-            DistributionSpec::HashPartitioned(req_cols) => {
-                let DistributionSpec::HashPartitioned(my_cols) = self else {
+            DistributionSpec::HashPartitioned {
+                cols: required_cols,
+                source: required_source,
+            } => {
+                let DistributionSpec::HashPartitioned {
+                    cols: provided_cols,
+                    source: provided_source,
+                } = self
+                else {
                     return false;
                 };
-                // StarRocks-style "containAll" matching: a child that hashes
-                // on a SUPERSET of the required columns satisfies the
-                // requirement. Rationale: if the child's data is
-                // `hash(a, b)`-partitioned, then for any fixed value of
-                // `a`, all rows with that `a` are colocated within the
-                // bucket determined by `(a, b)` for that `a` — and an
-                // operator that only cares about `hash(a)`-locality (e.g.
-                // an aggregate / window grouped only on `a`) is happy to
-                // accept a finer split, since each bucket still contains
-                // only rows of a single `(a, b)` family, and therefore
-                // only rows of a single `a`.
-                //
-                // Concretely: a SHUFFLE_JOIN with eq keys `[l.c0, r.c0]`
-                // emits output partitioned by `hash(l.c0, r.c0)`. A
-                // downstream Window keyed on `PARTITION BY l.c0` only
-                // needs `hash(l.c0)`. Because matched rows share both
-                // `l.c0` and `r.c0`, every bucket from the join is
-                // homogeneous in `l.c0` — so the window can run locally
-                // per bucket without a re-shuffle. (This mirrors
-                // `HashDistributionSpec.satisfyContainAll` in
-                // StarRocks FE; see PR-F1 spec for the worked example.)
-                req_cols.iter().all(|c| my_cols.contains(c))
+                match (*provided_source, *required_source) {
+                    (HashSource::ShuffleAgg, HashSource::ShuffleAgg) => {
+                        hash_cols_subset(provided_cols, required_cols)
+                    }
+                    (HashSource::ShuffleJoin, HashSource::ShuffleJoin) => {
+                        provided_cols == required_cols
+                    }
+                    (HashSource::ShuffleAgg, HashSource::ShuffleJoin) => {
+                        provided_cols == required_cols
+                    }
+                    (HashSource::ShuffleJoin, HashSource::ShuffleAgg) => {
+                        hash_cols_subset(provided_cols, required_cols)
+                    }
+                }
             }
         }
     }
+}
+
+fn hash_cols_subset(left: &[ColumnId], right: &[ColumnId]) -> bool {
+    left.iter().all(|col| right.contains(col))
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -258,54 +319,109 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_partitioned_satisfies_exact_match() {
-        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+    fn shuffle_agg_subset_satisfies_finer_shuffle_agg_requirement() {
+        let provided = DistributionSpec::shuffle_agg([ColumnId(1)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]);
         assert!(provided.satisfies(&required));
     }
 
     #[test]
-    fn hash_partitioned_satisfies_when_provider_has_superset() {
-        // Child hashes on (c1, c2); a downstream operator that only needs
-        // hash(c1) is satisfied because each (c1,c2) bucket is homogeneous
-        // in `c1` — the StarRocks `satisfyContainAll` rule.
-        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
-        assert!(provided.satisfies(&required));
-    }
-
-    #[test]
-    fn hash_partitioned_satisfies_when_required_in_any_position() {
-        // Order within the hash key vector doesn't matter — what matters
-        // is that the required column is part of the hash.
-        let provided =
-            DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
-        assert!(provided.satisfies(&required));
-    }
-
-    #[test]
-    fn hash_partitioned_does_not_satisfy_disjoint_columns() {
-        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(2)]);
+    fn shuffle_agg_superset_does_not_satisfy_coarser_shuffle_agg_requirement() {
+        let provided = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(1)]);
         assert!(!provided.satisfies(&required));
     }
 
     #[test]
-    fn hash_partitioned_does_not_satisfy_when_required_has_extra() {
-        // Provided hash(c1) does NOT satisfy required hash(c1, c2) — a
-        // single bucket of the provider can contain rows with different
-        // `c2` values, so an operator that needs (c1, c2)-locality is not
-        // safe.
-        let provided = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1), ColumnId(2)]);
+    fn shuffle_join_requires_exact_ordered_keys() {
+        let provided = DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]);
+        let exact = DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]);
+        let reordered = DistributionSpec::shuffle_join([ColumnId(2), ColumnId(1)]);
+        let prefix = DistributionSpec::shuffle_join([ColumnId(1)]);
+
+        assert!(provided.satisfies(&exact));
+        assert!(!provided.satisfies(&reordered));
+        assert!(!provided.satisfies(&prefix));
+    }
+
+    #[test]
+    fn shuffle_join_does_not_satisfy_narrower_shuffle_agg_requirement() {
+        let provided = DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(10)]);
+        assert!(!provided.satisfies(&required));
+    }
+
+    #[test]
+    fn cross_source_rules_are_conservative() {
+        let agg_exact = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]);
+        let join_exact = DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]);
+        let join_finer = DistributionSpec::shuffle_join([ColumnId(1)]);
+        let agg_finer_required =
+            DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2), ColumnId(3)]);
+
+        assert!(agg_exact.satisfies(&join_exact));
+        assert!(join_finer.satisfies(&agg_finer_required));
+        assert!(!join_exact.satisfies(&DistributionSpec::shuffle_agg([ColumnId(1)])));
+    }
+
+    #[test]
+    fn hash_constructors_drop_unset_and_dedup_preserving_first_seen_order() {
+        let spec = DistributionSpec::shuffle_agg([
+            ColumnId(3),
+            ColumnId::UNSET,
+            ColumnId(1),
+            ColumnId(3),
+            ColumnId(2),
+        ]);
+
+        assert_eq!(spec.hash_source(), Some(HashSource::ShuffleAgg));
+        assert_eq!(
+            spec.hash_cols(),
+            Some([ColumnId(3), ColumnId(1), ColumnId(2)].as_slice())
+        );
+        match spec {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(source, HashSource::ShuffleAgg);
+                assert_eq!(cols, vec![ColumnId(3), ColumnId(1), ColumnId(2)]);
+            }
+            other => panic!("expected hash distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_partitioned_satisfies_exact_match() {
+        let provided = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]);
+        assert!(provided.satisfies(&required));
+    }
+
+    #[test]
+    fn shuffle_agg_does_not_satisfy_disjoint_columns() {
+        let provided = DistributionSpec::shuffle_agg([ColumnId(1)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(2)]);
+        assert!(!provided.satisfies(&required));
+    }
+
+    #[test]
+    fn shuffle_agg_subset_match_ignores_order() {
+        // Order within the hash key vector doesn't matter — what matters
+        // is that the required column is part of the hash.
+        let provided = DistributionSpec::shuffle_agg([ColumnId(2)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2), ColumnId(3)]);
+        assert!(provided.satisfies(&required));
+    }
+
+    #[test]
+    fn shuffle_join_does_not_satisfy_when_required_has_extra() {
+        let provided = DistributionSpec::shuffle_join([ColumnId(1)]);
+        let required = DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]);
         assert!(!provided.satisfies(&required));
     }
 
     #[test]
     fn gather_does_not_satisfy_hash_partitioned() {
         let provided = DistributionSpec::Gather;
-        let required = DistributionSpec::HashPartitioned(vec![ColumnId(1)]);
+        let required = DistributionSpec::shuffle_agg([ColumnId(1)]);
         assert!(!provided.satisfies(&required));
     }
 
@@ -314,7 +430,7 @@ mod tests {
         for provided in [
             DistributionSpec::Any,
             DistributionSpec::Gather,
-            DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
+            DistributionSpec::shuffle_agg([ColumnId(1)]),
         ] {
             assert!(provided.satisfies(&DistributionSpec::Any));
         }

@@ -38,7 +38,7 @@ impl DeriveOutput for PhysicalHashAggregateOp {
             PhysicalPropertySet::gather()
         } else {
             PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(cols),
+                distribution: DistributionSpec::shuffle_agg(cols),
                 ordering: OrderingSpec::Any,
             }
         }
@@ -66,7 +66,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                     vec![PhysicalPropertySet::gather()]
                 } else {
                     vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::HashPartitioned(cols),
+                        distribution: DistributionSpec::shuffle_agg(cols),
                         ordering: OrderingSpec::Any,
                     }]
                 }
@@ -77,7 +77,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                     vec![PhysicalPropertySet::gather()]
                 } else {
                     vec![PhysicalPropertySet {
-                        distribution: DistributionSpec::HashPartitioned(cols),
+                        distribution: DistributionSpec::shuffle_agg(cols),
                         ordering: OrderingSpec::Any,
                     }]
                 }
@@ -118,7 +118,7 @@ mod tests {
         };
         let props = op.derive_output(&[]);
         match &props.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, .. } => {
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0], ColumnId(3));
             }
@@ -156,7 +156,7 @@ mod tests {
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         match &reqs[0].distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, .. } => {
                 assert_eq!(cols.len(), 2, "Hash on both g and x");
             }
             other => panic!("expected HashPartitioned, got {:?}", other),

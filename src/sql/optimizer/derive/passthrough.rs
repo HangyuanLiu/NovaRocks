@@ -153,7 +153,7 @@ mod tests {
 
     fn hash_one() -> PhysicalPropertySet {
         PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
             ordering: OrderingSpec::Any,
         }
     }
@@ -176,7 +176,7 @@ mod tests {
     fn project_required_is_distribution_blind() {
         let op = make_minimal_project_op();
         let parent_req = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
             ordering: OrderingSpec::Any,
         };
         let child_reqs = op.derive_required(&parent_req, 1);
@@ -209,7 +209,7 @@ mod tests {
     fn passthrough_project_output_preserves_ordering() {
         let op = make_minimal_project_op();
         let child = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(1)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
             ordering: OrderingSpec::Required(vec![SortKey {
                 column: ColumnId(2),
                 asc: true,

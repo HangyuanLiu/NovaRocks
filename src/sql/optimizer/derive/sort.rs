@@ -38,7 +38,7 @@ impl DeriveOutput for PhysicalSortOp {
         } else {
             let partition_cols = typed_exprs_to_column_ids(&self.analytic_partition_exprs);
             if partition_cols.len() == self.analytic_partition_exprs.len() {
-                DistributionSpec::HashPartitioned(partition_cols)
+                DistributionSpec::shuffle_agg(partition_cols)
             } else {
                 DistributionSpec::Gather
             }
@@ -66,7 +66,7 @@ impl DeriveRequired for PhysicalSortOp {
             vec![PhysicalPropertySet::gather()]
         } else {
             vec![PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(partition_cols),
+                distribution: DistributionSpec::shuffle_agg(partition_cols),
                 ordering: OrderingSpec::Any,
             }]
         }

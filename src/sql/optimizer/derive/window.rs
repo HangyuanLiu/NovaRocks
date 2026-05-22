@@ -34,7 +34,7 @@ impl DeriveOutput for PhysicalWindowOp {
             PhysicalPropertySet::any()
         } else {
             PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(partition_cols),
+                distribution: DistributionSpec::shuffle_agg(partition_cols),
                 ordering: OrderingSpec::Any,
             }
         }
@@ -61,7 +61,7 @@ impl DeriveRequired for PhysicalWindowOp {
             vec![PhysicalPropertySet::gather()]
         } else {
             vec![PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(partition_cols),
+                distribution: DistributionSpec::shuffle_agg(partition_cols),
                 ordering: OrderingSpec::Any,
             }]
         }
@@ -103,7 +103,7 @@ mod tests {
         };
         let props = op.derive_output(&[]);
         match &props.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, .. } => {
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0], ColumnId(2));
             }

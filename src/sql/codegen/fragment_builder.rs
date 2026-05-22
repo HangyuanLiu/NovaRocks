@@ -2686,7 +2686,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
                 Ok(unpartitioned_stream_partition())
             }
-            crate::sql::optimizer::property::DistributionSpec::HashPartitioned(cols) => {
+            crate::sql::optimizer::property::DistributionSpec::HashPartitioned { cols, .. } => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
                 //
@@ -4198,9 +4198,7 @@ mod tests {
         let file = NamedTempFile::new().expect("temp parquet path");
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::HashPartitioned(vec![
-                    crate::sql::column_id::ColumnId::UNSET,
-                ]),
+                spec: DistributionSpec::shuffle_agg([crate::sql::column_id::ColumnId::UNSET]),
             }),
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),

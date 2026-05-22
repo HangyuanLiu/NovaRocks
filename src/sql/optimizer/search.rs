@@ -565,12 +565,12 @@ mod cascaded_derivation_tests {
         // The Broadcast Join's winner output must be Hash([c10]) (inherited
         // from the SHUFFLE_JOIN's natural Hash([c10]) output).
         let bj_req = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let bj_winner = ctx.winners.get(&(g_bj, bj_req)).unwrap();
         match &bj_winner.output.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, .. } => {
                 assert!(
                     cols.contains(&ColumnId(10)),
                     "Broadcast Join should inherit Hash with c10, got {:?}",
