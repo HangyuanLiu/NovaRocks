@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,9 +14,11 @@ use crate::meta::{
 const MV_DEFINITION_KIND: &str = "mv.definition";
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";
 const MV_REFRESH_KIND: &str = "mv.refresh";
+const MV_DEPENDENCY_KIND: &str = "mv.dependency";
 const MV_DEFINITION_SCHEMA_VERSION: i32 = 2;
 const MV_TARGET_LOOKUP_SCHEMA_VERSION: i32 = 1;
 const MV_REFRESH_SCHEMA_VERSION: i32 = 1;
+const MV_DEPENDENCY_SCHEMA_VERSION: i32 = 1;
 
 #[derive(Default)]
 pub struct MvMetaRepository;
@@ -64,6 +66,56 @@ pub struct CreateMvDefinitionRequest {
     pub target_table: Option<String>,
     pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
     pub partition_spec: Option<crate::meta::repository::mv_contract::MvPartitionContract>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MvDependencyObjectType {
+    Table,
+    MaterializedView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MvDependencyStorageEngine {
+    ManagedLake,
+    Iceberg,
+    ExternalTable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MvDependencyObjectRef {
+    pub catalog: Option<String>,
+    pub database_or_namespace: String,
+    pub name: String,
+    pub object_type: MvDependencyObjectType,
+    pub storage_engine: MvDependencyStorageEngine,
+}
+
+impl MvDependencyObjectRef {
+    pub fn display_name(&self) -> String {
+        let object = match self.catalog.as_deref() {
+            Some(catalog) => format!("{catalog}.{}.{}", self.database_or_namespace, self.name),
+            None => format!("{}.{}", self.database_or_namespace, self.name),
+        };
+        match self.object_type {
+            MvDependencyObjectType::Table => object,
+            MvDependencyObjectType::MaterializedView => format!("mv:{object}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMvDependency {
+    pub downstream_mv_id: i64,
+    pub upstream: MvDependencyObjectRef,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMvDependencyRequest {
+    pub upstream: MvDependencyObjectRef,
     pub created_at_ms: i64,
 }
 
@@ -840,6 +892,78 @@ impl MvMetaRepository {
         )?;
         Ok(true)
     }
+
+    pub fn replace_dependencies_for_mv(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        downstream_mv_id: i64,
+        dependencies: Vec<CreateMvDependencyRequest>,
+    ) -> RepositoryResult<Vec<StoredMvDependency>> {
+        // Task 1: inline cleanup of any existing dependency rows for this
+        // downstream MV. Task 2 will refactor this into a public
+        // `delete_dependencies_for_mv` helper.
+        let existing = txn.scan(
+            &key_prefix_dependency_by_downstream(downstream_mv_id)?,
+            None,
+        )?;
+        for record in existing {
+            let dependency: StoredMvDependency =
+                decode_record_payload(&record, MV_DEPENDENCY_KIND, MV_DEPENDENCY_SCHEMA_VERSION)?;
+            txn.delete(&record.key, ExpectedRevision::Exact(record.revision))?;
+            txn.delete(
+                &key_dependency_by_upstream(&dependency.upstream, downstream_mv_id)?,
+                ExpectedRevision::Any,
+            )?;
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut stored = Vec::new();
+        for req in dependencies {
+            let key = dependency_object_key(&req.upstream)?;
+            if !seen.insert(key) {
+                continue;
+            }
+            let dependency = StoredMvDependency {
+                downstream_mv_id,
+                upstream: req.upstream,
+                created_at_ms: req.created_at_ms,
+            };
+            put_dependency_indexes(txn, &dependency)?;
+            stored.push(dependency);
+        }
+        Ok(stored)
+    }
+
+    pub fn list_dependencies_by_downstream(
+        &self,
+        txn: &dyn MetaReadTxn,
+        downstream_mv_id: i64,
+    ) -> RepositoryResult<Vec<StoredMvDependency>> {
+        let mut dependencies = txn
+            .scan(
+                &key_prefix_dependency_by_downstream(downstream_mv_id)?,
+                None,
+            )?
+            .into_iter()
+            .map(decode_dependency_record)
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        dependencies.sort_by(|left, right| left.upstream.cmp(&right.upstream));
+        Ok(dependencies)
+    }
+
+    pub fn list_downstream_dependencies(
+        &self,
+        txn: &dyn MetaReadTxn,
+        upstream: &MvDependencyObjectRef,
+    ) -> RepositoryResult<Vec<StoredMvDependency>> {
+        let mut dependencies = txn
+            .scan(&key_prefix_dependency_by_upstream(upstream)?, None)?
+            .into_iter()
+            .map(decode_dependency_record)
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        dependencies.sort_by_key(|dep| dep.downstream_mv_id);
+        Ok(dependencies)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -994,6 +1118,107 @@ fn key_refresh(refresh_id: i64) -> RepositoryResult<MetaKey> {
         NS_MV,
         ["refresh".to_string(), refresh_id.to_string()],
     )?)
+}
+
+fn dependency_object_key(object: &MvDependencyObjectRef) -> RepositoryResult<String> {
+    let catalog = object
+        .catalog
+        .as_deref()
+        .map(normalize_lookup_name)
+        .unwrap_or_else(|| "_".to_string());
+    let object_type = match object.object_type {
+        MvDependencyObjectType::Table => "table",
+        MvDependencyObjectType::MaterializedView => "mv",
+    };
+    let storage_engine = match object.storage_engine {
+        MvDependencyStorageEngine::ManagedLake => "managed_lake",
+        MvDependencyStorageEngine::Iceberg => "iceberg",
+        MvDependencyStorageEngine::ExternalTable => "external_table",
+    };
+    Ok(format!(
+        "{storage_engine}|{object_type}|{}|{}|{}",
+        catalog,
+        normalize_lookup_name(&object.database_or_namespace),
+        normalize_lookup_name(&object.name)
+    ))
+}
+
+fn key_dependency_by_downstream(
+    downstream_mv_id: i64,
+    upstream: &MvDependencyObjectRef,
+) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_MV,
+        [
+            "dependency".to_string(),
+            "by-downstream".to_string(),
+            downstream_mv_id.to_string(),
+            dependency_object_key(upstream)?,
+        ],
+    )?)
+}
+
+fn key_prefix_dependency_by_downstream(downstream_mv_id: i64) -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(
+        NS_MV,
+        [
+            "dependency".to_string(),
+            "by-downstream".to_string(),
+            downstream_mv_id.to_string(),
+        ],
+    )?)
+}
+
+fn key_dependency_by_upstream(
+    upstream: &MvDependencyObjectRef,
+    downstream_mv_id: i64,
+) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_MV,
+        [
+            "dependency".to_string(),
+            "by-upstream".to_string(),
+            dependency_object_key(upstream)?,
+            downstream_mv_id.to_string(),
+        ],
+    )?)
+}
+
+fn key_prefix_dependency_by_upstream(
+    upstream: &MvDependencyObjectRef,
+) -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(
+        NS_MV,
+        [
+            "dependency".to_string(),
+            "by-upstream".to_string(),
+            dependency_object_key(upstream)?,
+        ],
+    )?)
+}
+
+fn decode_dependency_record(record: MetaRecord) -> RepositoryResult<StoredMvDependency> {
+    decode_record_payload(&record, MV_DEPENDENCY_KIND, MV_DEPENDENCY_SCHEMA_VERSION)
+}
+
+fn put_dependency_indexes(
+    txn: &mut dyn MetaWriteTxn,
+    dependency: &StoredMvDependency,
+) -> RepositoryResult<()> {
+    let payload = encode_json_payload(MV_DEPENDENCY_SCHEMA_VERSION, dependency)?;
+    txn.put(MetaRecordPut::new(
+        key_dependency_by_downstream(dependency.downstream_mv_id, &dependency.upstream)?,
+        record_kind(MV_DEPENDENCY_KIND)?,
+        ExpectedRevision::Any,
+        payload.clone(),
+    ))?;
+    txn.put(MetaRecordPut::new(
+        key_dependency_by_upstream(&dependency.upstream, dependency.downstream_mv_id)?,
+        record_kind(MV_DEPENDENCY_KIND)?,
+        ExpectedRevision::Any,
+        payload,
+    ))?;
+    Ok(())
 }
 
 #[cfg(test)]

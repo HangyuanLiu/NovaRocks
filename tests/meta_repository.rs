@@ -18,7 +18,8 @@ use novarocks::meta::repository::managed_txn::{
     ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
 };
 use novarocks::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvMetaRepository,
+    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine, MvMetaRepository,
     MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup, RecordPublishCommitRequest,
     RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome,
     UpdateManagedMvRefreshSummaryRequest,
@@ -3042,6 +3043,85 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
         "SELECT * FROM iceberg.sales.orders"
     );
     assert_eq!(definitions[1].select_sql, "SELECT * FROM local_table");
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_stores_dependency_indexes() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let downstream_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let mv = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "select id from ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: vec![],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("sales".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                schema_contract: None,
+                partition_spec: None,
+                created_at_ms: 100,
+            },
+        )?;
+        txn.commit()?;
+        mv.mv_id
+    };
+
+    let table_ref = MvDependencyObjectRef {
+        catalog: Some("ice".to_string()),
+        database_or_namespace: "sales".to_string(),
+        name: "orders".to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    };
+    let upstream_mv_ref = MvDependencyObjectRef {
+        catalog: Some("ice".to_string()),
+        database_or_namespace: "sales".to_string(),
+        name: "regional_mv".to_string(),
+        object_type: MvDependencyObjectType::MaterializedView,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    };
+
+    {
+        let mut txn = provider.begin_write("replace mv dependencies")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            downstream_id,
+            vec![
+                CreateMvDependencyRequest {
+                    upstream: table_ref.clone(),
+                    created_at_ms: 101,
+                },
+                CreateMvDependencyRequest {
+                    upstream: upstream_mv_ref.clone(),
+                    created_at_ms: 102,
+                },
+            ],
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let by_downstream = repository.list_dependencies_by_downstream(read.as_ref(), downstream_id)?;
+    assert_eq!(
+        by_downstream
+            .iter()
+            .map(|dep| dep.upstream.display_name())
+            .collect::<Vec<_>>(),
+        vec!["ice.sales.orders", "mv:ice.sales.regional_mv"]
+    );
+
+    let reverse = repository.list_downstream_dependencies(read.as_ref(), &upstream_mv_ref)?;
+    assert_eq!(reverse.len(), 1);
+    assert_eq!(reverse[0].downstream_mv_id, downstream_id);
+    assert_eq!(reverse[0].upstream, upstream_mv_ref);
 
     Ok(())
 }
