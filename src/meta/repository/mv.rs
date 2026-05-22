@@ -947,7 +947,24 @@ impl MvMetaRepository {
             .into_iter()
             .map(decode_dependency_record)
             .collect::<RepositoryResult<Vec<_>>>()?;
-        dependencies.sort_by(|left, right| left.upstream.cmp(&right.upstream));
+        // Sort by an explicit tuple key so the API ordering does not silently
+        // change if `MvDependencyObjectRef`'s field order is ever reshuffled.
+        dependencies.sort_by(|left, right| {
+            (
+                &left.upstream.catalog,
+                &left.upstream.database_or_namespace,
+                &left.upstream.name,
+                &left.upstream.object_type,
+                &left.upstream.storage_engine,
+            )
+                .cmp(&(
+                    &right.upstream.catalog,
+                    &right.upstream.database_or_namespace,
+                    &right.upstream.name,
+                    &right.upstream.object_type,
+                    &right.upstream.storage_engine,
+                ))
+        });
         Ok(dependencies)
     }
 
@@ -1120,7 +1137,28 @@ fn key_refresh(refresh_id: i64) -> RepositoryResult<MetaKey> {
     )?)
 }
 
+/// Separator used to pack the dependency object identity into a single key
+/// segment. Real SQL identifiers cannot contain this character; we reject
+/// any value that does so the packed key encoding stays self-validating.
+const DEPENDENCY_KEY_SEPARATOR: char = '|';
+
+fn reject_dependency_separator(field: &str, value: &str) -> RepositoryResult<()> {
+    if value.contains(DEPENDENCY_KEY_SEPARATOR) {
+        return Err(RepositoryError::invalid(format!(
+            "mv dependency field {field} must not contain '{DEPENDENCY_KEY_SEPARATOR}' \
+             (got {value:?})"
+        )));
+    }
+    Ok(())
+}
+
 fn dependency_object_key(object: &MvDependencyObjectRef) -> RepositoryResult<String> {
+    if let Some(catalog) = object.catalog.as_deref() {
+        reject_dependency_separator("catalog", catalog)?;
+    }
+    reject_dependency_separator("database_or_namespace", &object.database_or_namespace)?;
+    reject_dependency_separator("name", &object.name)?;
+
     let catalog = object
         .catalog
         .as_deref()

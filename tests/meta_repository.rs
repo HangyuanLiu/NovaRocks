@@ -3127,6 +3127,123 @@ fn mv_repository_stores_dependency_indexes() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn mv_repository_rejects_dependency_object_key_separator() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let downstream_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let mv = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "select id from ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: vec![],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("sales".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                schema_contract: None,
+                partition_spec: None,
+                created_at_ms: 100,
+            },
+        )?;
+        txn.commit()?;
+        mv.mv_id
+    };
+
+    // name containing '|' must be rejected so that the packed dependency
+    // key cannot collide with another distinct dependency.
+    let bad_name = MvDependencyObjectRef {
+        catalog: Some("ice".to_string()),
+        database_or_namespace: "sales".to_string(),
+        name: "foo|bar".to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    };
+    {
+        let mut txn = provider.begin_write("replace mv dependencies with bad name")?;
+        let err = repository
+            .replace_dependencies_for_mv(
+                txn.as_mut(),
+                downstream_id,
+                vec![CreateMvDependencyRequest {
+                    upstream: bad_name,
+                    created_at_ms: 101,
+                }],
+            )
+            .expect_err("dependency name containing '|' must be rejected");
+        assert_eq!(err.kind(), RepositoryErrorKind::InvalidRequest);
+        assert!(
+            err.to_string().contains("name"),
+            "error should name the offending field, got: {err}"
+        );
+        assert!(
+            err.to_string().contains('|'),
+            "error should mention the '|' separator, got: {err}"
+        );
+    }
+
+    // database_or_namespace containing '|' must also be rejected.
+    let bad_namespace = MvDependencyObjectRef {
+        catalog: Some("ice".to_string()),
+        database_or_namespace: "sa|les".to_string(),
+        name: "orders".to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    };
+    {
+        let mut txn = provider.begin_write("replace mv dependencies with bad namespace")?;
+        let err = repository
+            .replace_dependencies_for_mv(
+                txn.as_mut(),
+                downstream_id,
+                vec![CreateMvDependencyRequest {
+                    upstream: bad_namespace,
+                    created_at_ms: 102,
+                }],
+            )
+            .expect_err("dependency namespace containing '|' must be rejected");
+        assert_eq!(err.kind(), RepositoryErrorKind::InvalidRequest);
+        assert!(
+            err.to_string().contains("database_or_namespace"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    // catalog containing '|' must also be rejected.
+    let bad_catalog = MvDependencyObjectRef {
+        catalog: Some("ic|e".to_string()),
+        database_or_namespace: "sales".to_string(),
+        name: "orders".to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    };
+    {
+        let mut txn = provider.begin_write("replace mv dependencies with bad catalog")?;
+        let err = repository
+            .replace_dependencies_for_mv(
+                txn.as_mut(),
+                downstream_id,
+                vec![CreateMvDependencyRequest {
+                    upstream: bad_catalog,
+                    created_at_ms: 103,
+                }],
+            )
+            .expect_err("dependency catalog containing '|' must be rejected");
+        assert_eq!(err.kind(), RepositoryErrorKind::InvalidRequest);
+        assert!(
+            err.to_string().contains("catalog"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
