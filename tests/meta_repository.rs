@@ -3448,3 +3448,41 @@ fn mv_repository_reports_downstream_dependents_for_drop_guard()
     );
     Ok(())
 }
+
+#[test]
+fn mv_repository_drop_definition_removes_dependency_edges() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let upstream = iceberg_mv_ref("sales", "upstream_mv");
+    let downstream_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let mv =
+            repository.create_definition(txn.as_mut(), sample_mv_definition_request("select 1"))?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            mv.mv_id,
+            vec![CreateMvDependencyRequest {
+                upstream: upstream.clone(),
+                created_at_ms: 42,
+            }],
+        )?;
+        txn.commit()?;
+        mv.mv_id
+    };
+
+    {
+        let mut txn = provider.begin_write("drop mv definition")?;
+        assert!(repository.drop_by_id(txn.as_mut(), downstream_id)?);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(
+        repository
+            .list_downstream_dependencies(read.as_ref(), &upstream)?
+            .is_empty()
+    );
+    Ok(())
+}

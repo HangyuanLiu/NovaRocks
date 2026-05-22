@@ -65,6 +65,7 @@ pub(crate) enum ResolvedTableRef {
     },
 }
 
+#[allow(dead_code)]
 pub(crate) fn extract_base_table_refs(
     resolved: &[ResolvedTableRef],
 ) -> Result<Vec<IcebergTableRef>, String> {
@@ -159,7 +160,13 @@ pub(crate) fn create_mv(
 
     let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
     validate_managed_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
-    let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
+    let created_at_ms = now_ms();
+    let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
+        state,
+        &analysis.resolved_refs,
+        created_at_ms,
+    )?;
+    let base_refs = resolved_dependencies.base_refs;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
@@ -304,8 +311,7 @@ pub(crate) fn create_mv(
         .map_err(|e| {
             format!("create managed materialized view bootstrap txn metadata failed: {e}")
         })?;
-    let created_at_ms = now_ms();
-    state
+    let mv_definition = state
         .mv_repo
         .create_definition_with_id(
             txn.as_mut(),
@@ -324,6 +330,14 @@ pub(crate) fn create_mv(
             },
         )
         .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
+    state
+        .mv_repo
+        .replace_dependencies_for_mv(
+            txn.as_mut(),
+            mv_definition.mv_id,
+            resolved_dependencies.dependencies,
+        )
+        .map_err(|e| format!("persist materialized view dependencies failed: {e}"))?;
 
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut bootstrapped_tablet_ids = Vec::new();
