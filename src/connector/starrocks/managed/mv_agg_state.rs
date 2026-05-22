@@ -1,14 +1,19 @@
 //! Aggregate MV state helpers for aggregate MV incremental refresh.
+//
+// TODO: file is ~4500 lines; consider splitting into mv_agg_state/{layout,
+// merge,negate,derive_visible,value_count_map}.rs submodules if it grows past
+// 5000.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, StringArray, TimestampMicrosecondArray,
+    Int64Array, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_buffer::OffsetBuffer;
 
 use crate::connector::starrocks::managed::ddl::{ManagedPhysicalColumn, managed_physical_column};
 use crate::connector::starrocks::managed::mv_ddl;
@@ -17,7 +22,9 @@ use crate::connector::starrocks::managed::mv_shape::{
 };
 use crate::engine::{QueryResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
+use crate::exec::expr::agg::{
+    AggScalarValue, agg_scalar_from_array, build_agg_scalar_array, compare_agg_scalar_values,
+};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::parser::ast::SqlType;
 
@@ -145,10 +152,7 @@ pub(crate) fn build_aggregate_mv_layout(
         let count_star = matches!(aggregate.input, AggregateInput::Star);
 
         match aggregate.function {
-            AggregateFunctionKind::Count
-            | AggregateFunctionKind::Sum
-            | AggregateFunctionKind::Min
-            | AggregateFunctionKind::Max => {
+            AggregateFunctionKind::Count | AggregateFunctionKind::Sum => {
                 let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
                 validate_state_column_type(
                     aggregate.function,
@@ -168,6 +172,71 @@ pub(crate) fn build_aggregate_mv_layout(
                     data_type: visible.data_type.clone(),
                     sql_type: visible_sql_type,
                     nullable: visible.nullable,
+                    visible_source_index,
+                    aggregate_index,
+                    function: aggregate.function,
+                    state_role: AggregateStateRole::Single,
+                    count_star,
+                });
+            }
+            AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+                // IVM-P5: MIN/MAX state is a value-count detail map
+                // (`Map<input_type, Int64>`). Map keys are the distinct values
+                // observed in the group; values are the per-key occurrence
+                // counts. The rewriter / merge / derive / DDL paths are all
+                // wired through Phase 5. Float keys are still rejected by
+                // `validate_state_column_type` until canonical-NaN handling
+                // lands; non-Float MIN/MAX is fully incremental, including
+                // on DELETE deltas.
+                let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
+                let key_arrow_type = visible.data_type.clone();
+                let key_sql_type = mv_ddl::arrow_data_type_to_sql_type(&key_arrow_type)?;
+                // Iceberg-rust convention: entries-struct field is named
+                // "key_value" (iceberg-0.9 `DEFAULT_MAP_FIELD_NAME`) and the
+                // value field is nullable. Aligning the MV state column
+                // declaration with this convention lets the Iceberg sink
+                // re-annotate field IDs on the runtime chunk without a
+                // schema-name mismatch (the runtime aggregate emits the same
+                // shape via `map_value_count`).
+                let entries_struct = DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new(
+                        "key",
+                        key_arrow_type,
+                        /* nullable = */ false,
+                    )),
+                    Arc::new(Field::new(
+                        "value",
+                        DataType::Int64,
+                        /* nullable = */ true,
+                    )),
+                ]));
+                let map_arrow_type = DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        entries_struct,
+                        /* nullable = */ false,
+                    )),
+                    /* keys_sorted = */ false,
+                );
+                let map_sql_type = SqlType::Map(Box::new(key_sql_type), Box::new(SqlType::BigInt));
+                validate_state_column_type(
+                    aggregate.function,
+                    AggregateStateRole::Single,
+                    &map_arrow_type,
+                    &state_name,
+                )?;
+                physical_columns.push(managed_physical_column(
+                    state_name.clone(),
+                    map_sql_type.clone(),
+                    /* nullable = */ false,
+                    false,
+                    false,
+                ));
+                state_columns.push(AggregateStateColumn {
+                    name: state_name,
+                    data_type: map_arrow_type,
+                    sql_type: map_sql_type,
+                    nullable: false,
                     visible_source_index,
                     aggregate_index,
                     function: aggregate.function,
@@ -277,20 +346,6 @@ pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvSh
     !shape.aggregates.iter().any(|aggregate| {
         aggregate.function == AggregateFunctionKind::Count
             && matches!(aggregate.input, AggregateInput::Star)
-    })
-}
-
-/// Returns true if any state column on the layout uses MIN or MAX.
-/// Used by the refresh dispatch to decide whether to fall back to a full
-/// refresh when the incremental change batch contains DELETE files (MIN/MAX
-/// state has no closed-form retract — see `negate_aggregate_state_chunks`).
-#[allow(dead_code)]
-pub(crate) fn layout_has_min_or_max(layout: &AggregateMvLayout) -> bool {
-    layout.state_columns.iter().any(|col| {
-        matches!(
-            col.function,
-            AggregateFunctionKind::Min | AggregateFunctionKind::Max
-        )
     })
 }
 
@@ -792,16 +847,6 @@ pub(crate) fn negate_aggregate_state_chunks(
         let batch = chunk.batch.clone();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
         for (state_index, state_column) in layout.state_columns.iter().enumerate() {
-            if matches!(
-                state_column.function,
-                AggregateFunctionKind::Min | AggregateFunctionKind::Max
-            ) {
-                panic!(
-                    "MIN/MAX state should not enter negate path: column `{}`. \
-                     DELETE-induced refresh on MV with MIN/MAX must fall back to full refresh.",
-                    state_column.name
-                );
-            }
             let column_index = state_offset + state_index;
             let original = arrays
                 .get(column_index)
@@ -812,7 +857,17 @@ pub(crate) fn negate_aggregate_state_chunks(
                     )
                 })?
                 .clone();
-            arrays[column_index] = negate_state_array(&original, state_column)?;
+            arrays[column_index] = if matches!(
+                state_column.function,
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max
+            ) {
+                // IVM-P5 Phase 4: MIN/MAX state is `Map<K, Int64>`. Negate
+                // the per-entry counts and rebuild the MapArray, preserving
+                // keys and per-row offsets.
+                negate_map_state_array(&original, state_column)?
+            } else {
+                negate_state_array(&original, state_column)?
+            };
         }
         let new_batch = RecordBatch::try_new(batch.schema(), arrays)
             .map_err(|e| format!("rebuild negated state chunk: {e}"))?;
@@ -833,6 +888,97 @@ fn negate_state_array(
             state_column.name, state_column.data_type
         )
     })
+}
+
+/// Negate every per-entry count of a Map-typed state column. Keys are
+/// preserved; per-row offsets and the row-level null mask are passed
+/// through unchanged. Used by `negate_aggregate_state_chunks` for the
+/// MIN/MAX detail-map state.
+fn negate_map_state_array(
+    array: &ArrayRef,
+    state_column: &AggregateStateColumn,
+) -> Result<ArrayRef, String> {
+    let map_array = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+        format!(
+            "negate_map_state_array: state column `{}` is declared Map but array is {:?}",
+            state_column.name,
+            array.data_type()
+        )
+    })?;
+    let original_entries = map_array.entries();
+    if original_entries.num_columns() != 2 {
+        return Err(format!(
+            "negate_map_state_array: state column `{}` entries struct must have 2 fields, got {}",
+            state_column.name,
+            original_entries.num_columns()
+        ));
+    }
+    let keys = original_entries.column(0).clone();
+    let values_array = original_entries.column(1);
+    let values_i64 = values_array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            format!(
+                "negate_map_state_array: state column `{}` map value must be Int64, got {:?}",
+                state_column.name,
+                values_array.data_type()
+            )
+        })?;
+    let mut negated: Vec<Option<i64>> = Vec::with_capacity(values_i64.len());
+    for row in 0..values_i64.len() {
+        if values_i64.is_null(row) {
+            negated.push(None);
+        } else {
+            let neg = values_i64.value(row).checked_neg().ok_or_else(|| {
+                format!(
+                    "negate_map_state_array: i64::MIN cannot be negated on column `{}`",
+                    state_column.name
+                )
+            })?;
+            negated.push(Some(neg));
+        }
+    }
+    let new_values: ArrayRef = Arc::new(Int64Array::from(negated));
+
+    let entries_fields = match original_entries.data_type() {
+        DataType::Struct(fields) => fields.clone(),
+        other => {
+            return Err(format!(
+                "negate_map_state_array: state column `{}` entries type must be Struct, got {other:?}",
+                state_column.name
+            ));
+        }
+    };
+    let new_entries = StructArray::new(
+        entries_fields,
+        vec![keys, new_values],
+        original_entries.nulls().cloned(),
+    );
+
+    let (map_field, ordered) = match &state_column.data_type {
+        DataType::Map(field, ordered) => (field.clone(), *ordered),
+        other => {
+            return Err(format!(
+                "negate_map_state_array: state column `{}` declared type must be Map, got {other:?}",
+                state_column.name
+            ));
+        }
+    };
+    let new_map = MapArray::try_new(
+        map_field,
+        OffsetBuffer::new(map_array.value_offsets().to_vec().into()),
+        new_entries,
+        map_array.nulls().cloned(),
+        ordered,
+    )
+    .map_err(|e| {
+        format!(
+            "negate_map_state_array: rebuild MapArray for column `{}` failed: {e}",
+            state_column.name
+        )
+    })?;
+    Ok(Arc::new(new_map))
 }
 
 fn zero_base_row(delta: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> AggregatePhysicalRow {
@@ -864,11 +1010,12 @@ fn merge_state_value(
             // Same arithmetic as COUNT (NULL-rejecting int addition).
             merge_count_state_value(old, delta, state_column)
         }
-        (AggregateFunctionKind::Min, AggregateStateRole::Single) => {
-            merge_min_max_state_value(old, delta, state_column, MinMax::Min)
-        }
-        (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
-            merge_min_max_state_value(old, delta, state_column, MinMax::Max)
+        (AggregateFunctionKind::Min, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+            // IVM-P5 (Phase 4): MIN/MAX state is a `Map<K, Int64>` value-count
+            // detail map; merge is key-wise count addition followed by
+            // zero-pruning (spec §3.5 — eager pruning at every merge step).
+            merge_value_count_map_state(old, delta, state_column)
         }
         (function, role) => Err(format!(
             "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{}`",
@@ -950,117 +1097,244 @@ fn merge_sum_state_value(
     }
 }
 
-#[derive(Clone, Copy)]
-enum MinMax {
+/// MIN vs MAX selector used by the detail-map derive-visible path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MinMax {
     Min,
     Max,
 }
 
-fn merge_min_max_state_value(
+// ---- IVM-P5 Phase 4: Map<K, Int64> detail-state helpers --------------------
+//
+// MIN/MAX state is a per-group `Map<K, Int64>` where K is the input scalar
+// type and the Int64 value is the (possibly signed) row count of K in the
+// group. Merge is key-wise addition; derive-visible is a MIN/MAX over keys
+// with count > 0; negate flips the sign of every count; prune drops `count
+// == 0` entries.
+//
+// In `AggScalarValue` (re-exported from `exec::expr::agg`), Map is encoded
+// as `AggScalarValue::Map(Vec<(Option<key>, Option<value>)>)`. By contract
+// for this state shape, both key and value are always `Some(...)` — NULL
+// keys/values are never produced by `map_value_count` / `map_value_count_signed`
+// (NULL inputs are skipped by the aggregate).
+
+/// One `(key, value)` map entry as stored inside `AggScalarValue::Map`.
+/// Keeps the helper signatures short and dodges clippy `type_complexity`.
+type MapEntry = (Option<AggScalarValue>, Option<AggScalarValue>);
+
+/// Merge two detail-map state values key-wise and prune zero entries.
+///
+/// Inputs may be `None` (e.g. zero state for a brand-new group, or an empty
+/// delta). At least one of `old` / `delta` is expected to be `Some(Map)` in
+/// practice; the `(None, None)` arm returns `Some(empty Map)` so the
+/// resulting state column stays non-NULL (matches the layout declaration
+/// `nullable = false`).
+fn merge_value_count_map_state(
     old: Option<AggScalarValue>,
     delta: Option<AggScalarValue>,
     state_column: &AggregateStateColumn,
-    op: MinMax,
 ) -> Result<Option<AggScalarValue>, String> {
-    match (old, delta) {
-        (None, None) => Ok(None),
-        (Some(v), None) | (None, Some(v)) => Ok(Some(v)),
-        (Some(a), Some(b)) => Ok(Some(min_max_pair(a, b, state_column, op)?)),
+    let old_entries = take_map_entries(old, state_column)?;
+    let delta_entries = take_map_entries(delta, state_column)?;
+    let mut merged = old_entries;
+    for (key, value) in delta_entries {
+        accumulate_map_entry(&mut merged, key, value, state_column)?;
     }
+    let pruned = prune_zero_entries_from_map_entries(merged);
+    // Sort by key for stable / deterministic output (matches what
+    // `map_value_count`'s `build_array` produces).
+    let pruned = sort_map_entries_by_key(pruned, state_column)?;
+    Ok(Some(AggScalarValue::Map(pruned)))
 }
 
-fn min_max_pair(
-    a: AggScalarValue,
-    b: AggScalarValue,
+/// Extract the entries of a Map-typed state value. `None` is treated as an
+/// empty map. Any other variant is a type-mismatch error.
+fn take_map_entries(
+    value: Option<AggScalarValue>,
     state_column: &AggregateStateColumn,
-    op: MinMax,
-) -> Result<AggScalarValue, String> {
-    use AggScalarValue::*;
-    match (a, b) {
-        (Int64(x), Int64(y)) => Ok(Int64(pick_int64(x, y, op))),
-        (Float64(x), Float64(y)) => Ok(Float64(pick_float64(x, y, op))),
-        (Decimal128(x), Decimal128(y)) => Ok(Decimal128(pick_int128(x, y, op))),
-        (Decimal256(x), Decimal256(y)) => Ok(Decimal256(pick_i256(x, y, op))),
-        (Utf8(x), Utf8(y)) => Ok(Utf8(pick_string(x, y, op))),
-        (Date32(x), Date32(y)) => Ok(Date32(pick_int32(x, y, op))),
-        (Timestamp(x), Timestamp(y)) => Ok(Timestamp(pick_int64(x, y, op))),
-        (a, b) => Err(format!(
-            "MIN/MAX merge type mismatch on column `{}`: a={a:?}, b={b:?}",
+) -> Result<Vec<MapEntry>, String> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(AggScalarValue::Map(entries)) => Ok(entries),
+        Some(other) => Err(format!(
+            "MIN/MAX detail-map state type mismatch on column `{}`: expected Map, got {other:?}",
             state_column.name
         )),
     }
 }
 
-fn pick_int64(x: i64, y: i64, op: MinMax) -> i64 {
-    match op {
-        MinMax::Min => x.min(y),
-        MinMax::Max => x.max(y),
+/// Accumulate one (key, count) pair into a Vec of map entries, summing
+/// counts on key collisions. Linear scan — fine for the per-group map
+/// sizes we expect (distinct values in a delta or merged group).
+///
+/// TODO: For high-cardinality groups, switch to a hash-based merge
+/// (`key_fingerprint` → entry index). Current O(N*M) is intentional
+/// simplicity for the expected per-group cardinality.
+fn accumulate_map_entry(
+    entries: &mut Vec<MapEntry>,
+    key: Option<AggScalarValue>,
+    value: Option<AggScalarValue>,
+    state_column: &AggregateStateColumn,
+) -> Result<(), String> {
+    let new_count = match value {
+        Some(AggScalarValue::Int64(v)) => v,
+        // NULL count entries are not produced by our aggregates; treat
+        // defensively as zero so they don't pollute the merged state.
+        None => 0,
+        Some(other) => {
+            return Err(format!(
+                "MIN/MAX detail-map state on column `{}` has non-Int64 value entry: {other:?}",
+                state_column.name
+            ));
+        }
+    };
+    for (existing_key, existing_value) in entries.iter_mut() {
+        if scalar_keys_equal(existing_key, &key) {
+            let prev = match existing_value {
+                Some(AggScalarValue::Int64(v)) => *v,
+                None => 0,
+                Some(other) => {
+                    return Err(format!(
+                        "MIN/MAX detail-map state on column `{}` has non-Int64 value entry: {other:?}",
+                        state_column.name
+                    ));
+                }
+            };
+            let summed = prev.checked_add(new_count).ok_or_else(|| {
+                format!(
+                    "MIN/MAX detail-map state count overflow on column `{}`",
+                    state_column.name
+                )
+            })?;
+            *existing_value = Some(AggScalarValue::Int64(summed));
+            return Ok(());
+        }
+    }
+    entries.push((key, Some(AggScalarValue::Int64(new_count))));
+    Ok(())
+}
+
+/// Stable equality for map keys. We compare via `compare_agg_scalar_values`
+/// (the same ordering the executor uses for stable map output). `None` keys
+/// are never produced by our aggregates, but we handle them defensively so
+/// behaviour stays deterministic if a corrupted state ever appears.
+fn scalar_keys_equal(left: &Option<AggScalarValue>, right: &Option<AggScalarValue>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(l), Some(r)) => matches!(
+            compare_agg_scalar_values(l, r),
+            Ok(std::cmp::Ordering::Equal)
+        ),
+        _ => false,
     }
 }
 
-fn pick_int32(x: i32, y: i32, op: MinMax) -> i32 {
-    match op {
-        MinMax::Min => x.min(y),
-        MinMax::Max => x.max(y),
-    }
+/// Drop entries whose count is exactly zero. Negative counts are PRESERVED
+/// (whether they survive into "final" state is a flow-level question handled
+/// upstream — see spec §3.5 and Phase-4 task description).
+fn prune_zero_entries_from_map_entries(entries: Vec<MapEntry>) -> Vec<MapEntry> {
+    entries
+        .into_iter()
+        .filter(|(_, v)| !matches!(v, Some(AggScalarValue::Int64(0))))
+        .collect()
 }
 
-fn pick_int128(x: i128, y: i128, op: MinMax) -> i128 {
-    match op {
-        MinMax::Min => x.min(y),
-        MinMax::Max => x.max(y),
-    }
-}
-
-fn pick_i256(
-    x: arrow::datatypes::i256,
-    y: arrow::datatypes::i256,
-    op: MinMax,
-) -> arrow::datatypes::i256 {
-    match op {
-        MinMax::Min => {
-            if x <= y {
-                x
-            } else {
-                y
+/// Sort map entries by key using the same ordering the aggregate executor
+/// emits. Keeps the merged state deterministic across runs and makes
+/// equality assertions in unit tests stable.
+fn sort_map_entries_by_key(
+    mut entries: Vec<MapEntry>,
+    state_column: &AggregateStateColumn,
+) -> Result<Vec<MapEntry>, String> {
+    let mut had_error: Option<String> = None;
+    entries.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(l), Some(r)) => match compare_agg_scalar_values(l, r) {
+            Ok(ord) => ord,
+            Err(_) => {
+                had_error.get_or_insert_with(|| {
+                    format!(
+                        "MIN/MAX detail-map state on column `{}` has incomparable keys: {l:?} vs {r:?}",
+                        state_column.name
+                    )
+                });
+                std::cmp::Ordering::Equal
             }
+        },
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+    });
+    if let Some(err) = had_error {
+        return Err(err);
+    }
+    Ok(entries)
+}
+
+/// Derive the visible MIN/MAX value for a group from its detail-map state.
+///
+/// Iterates entries, skips those with `count <= 0` (the entry is fully
+/// retracted or pending retraction), and reduces over the remaining keys.
+/// Returns `None` when no entry has a positive count — the group is
+/// effectively empty for visible purposes (the existing
+/// `__ivm_row_count == 0` retraction logic will drop the row).
+pub(crate) fn derive_visible_from_detail_map(
+    value: &AggScalarValue,
+    op: MinMax,
+) -> Result<Option<AggScalarValue>, String> {
+    let AggScalarValue::Map(entries) = value else {
+        return Err(format!(
+            "derive_visible_from_detail_map: expected Map, got {value:?}"
+        ));
+    };
+    let mut current: Option<AggScalarValue> = None;
+    for (key, count) in entries {
+        let count_i64 = match count {
+            Some(AggScalarValue::Int64(v)) => *v,
+            None => 0,
+            Some(other) => {
+                return Err(format!(
+                    "derive_visible_from_detail_map: expected Int64 count, got {other:?}"
+                ));
+            }
+        };
+        if count_i64 <= 0 {
+            continue;
+        }
+        let Some(key) = key.clone() else {
+            // NULL key entries are not produced by our aggregates; skip
+            // defensively.
+            continue;
+        };
+        current = Some(match current {
+            None => key,
+            Some(c) => pick_min_max_scalar(c, key, op)?,
+        });
+    }
+    Ok(current)
+}
+
+/// Pick min or max of two scalar values using the executor's stable
+/// comparator. Returns an error if the two values are incomparable
+/// (different variants or NaN floats) — should never happen for
+/// well-formed state, since `map_value_count` keys come from one
+/// typed input column.
+fn pick_min_max_scalar(
+    a: AggScalarValue,
+    b: AggScalarValue,
+    op: MinMax,
+) -> Result<AggScalarValue, String> {
+    let ordering = compare_agg_scalar_values(&a, &b).map_err(|e| {
+        format!("derive_visible_from_detail_map: incomparable map keys: {a:?} vs {b:?}: {e}")
+    })?;
+    let pick_a = match op {
+        MinMax::Min => {
+            ordering == std::cmp::Ordering::Less || ordering == std::cmp::Ordering::Equal
         }
         MinMax::Max => {
-            if x >= y {
-                x
-            } else {
-                y
-            }
+            ordering == std::cmp::Ordering::Greater || ordering == std::cmp::Ordering::Equal
         }
-    }
-}
-
-fn pick_string(x: String, y: String, op: MinMax) -> String {
-    match op {
-        MinMax::Min => x.min(y),
-        MinMax::Max => x.max(y),
-    }
-}
-
-/// Pick min/max for f64 with NaN handling:
-/// - NaN + NaN   → NaN
-/// - NaN + x     → x  (NaN treated as "no real value")
-/// - x   + NaN   → x
-/// - x   + y     → cmp::min/max(x, y)
-fn pick_float64(x: f64, y: f64, op: MinMax) -> f64 {
-    if x.is_nan() && y.is_nan() {
-        return f64::NAN;
-    }
-    if x.is_nan() {
-        return y;
-    }
-    if y.is_nan() {
-        return x;
-    }
-    match op {
-        MinMax::Min => x.min(y),
-        MinMax::Max => x.max(y),
-    }
+    };
+    Ok(if pick_a { a } else { b })
 }
 
 fn int64_state_value(value: Option<AggScalarValue>, state_name: &str) -> Result<i64, String> {
@@ -1112,9 +1386,13 @@ fn zero_state_value(state_column: &AggregateStateColumn) -> Option<AggScalarValu
         }
         (AggregateFunctionKind::Sum, AggregateStateRole::Single)
         | (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum) => None,
-        // MIN/MAX have no identity element; the zero state for an empty
-        // merge buffer must be NULL (None). The first incoming non-NULL
-        // delta value will populate it via merge_min_max_state_value.
+        // MIN/MAX detail-state is a `Map<K, Int64>` value-count map; the
+        // "zero" for a brand-new group is None here. `merge_value_count_map_state`
+        // treats a `None` old as an empty map and folds the delta entries in,
+        // so the first incoming delta populates the map directly. Note the
+        // asymmetry with SUM (also None) is intentional: SUM uses scalar
+        // None as the additive identity, while MIN/MAX None means "empty
+        // detail map", and the merge helper distinguishes them by state shape.
         (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => None,
         // Catch-all for unexpected combinations.
         (function, role) => {
@@ -1179,7 +1457,22 @@ fn validate_loaded_physical_row(
         // column has been sign-flipped, so equality is expected to fail.
         // The merge math reads only state_values, so mismatches are harmless.
         // We keep the check for strict-mode Single-role states only.
-        if !allow_negative_counts && matches!(state_column.state_role, AggregateStateRole::Single) {
+        //
+        // IVM-P5 Phase 4: MIN/MAX-Single state is a `Map<K, Int64>` while the
+        // visible column is scalar K. They never compare equal, so skip the
+        // check for MIN/MAX too — correctness for those is enforced by the
+        // post-merge derive-visible step in `update_visible_values_from_state`.
+        let is_min_max_single = matches!(
+            (state_column.function, state_column.state_role),
+            (
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max,
+                AggregateStateRole::Single
+            )
+        );
+        if !allow_negative_counts
+            && matches!(state_column.state_role, AggregateStateRole::Single)
+            && !is_min_max_single
+        {
             let visible_value =
                 visible_values
                     .get(state_column.visible_source_index)
@@ -1345,25 +1638,102 @@ fn validate_state_column_type(
             )),
         },
         (AggregateFunctionKind::Min, AggregateStateRole::Single)
-        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => match data_type {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => Ok(()),
-            DataType::Boolean => Err(format!(
-                "MIN/MAX state type is unsupported for column `{state_name}`: Boolean"
-            )),
-            other => Err(format!(
-                "MIN/MAX state type is unsupported for column `{state_name}`: {other:?}"
-            )),
-        },
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+            // IVM-P5 (Phase 2): MIN/MAX state is a `Map<input_type, Int64>`
+            // value-count detail map. The Arrow shape follows the iceberg-rust
+            // convention so the Iceberg sink can re-annotate batch field IDs
+            // without a structural mismatch:
+            //   entries-struct field name = "key_value"
+            //   value field nullable = true
+            //   key field non-null
+            // Reject any other Arrow shape with a clear error so future schema
+            // bugs are loud, not silent.
+            let DataType::Map(entries_field, _keys_sorted) = data_type else {
+                return Err(format!(
+                    "MIN/MAX state type for column `{state_name}` must be Map<K, Int64>, got {data_type:?}"
+                ));
+            };
+            if entries_field.name() != "key_value" {
+                return Err(format!(
+                    "MIN/MAX state map entries field for column `{state_name}` must be named `key_value` (iceberg-rust convention), got `{}`",
+                    entries_field.name()
+                ));
+            }
+            let DataType::Struct(struct_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "MIN/MAX state map entries type for column `{state_name}` must be Struct, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if struct_fields.len() != 2 {
+                return Err(format!(
+                    "MIN/MAX state map entries struct for column `{state_name}` must have exactly 2 fields, got {}",
+                    struct_fields.len()
+                ));
+            }
+            let value_field = struct_fields
+                .iter()
+                .find(|f| f.name() == "value")
+                .ok_or_else(|| {
+                    format!(
+                        "MIN/MAX state map entries struct for column `{state_name}` is missing `value` field"
+                    )
+                })?;
+            if value_field.data_type() != &DataType::Int64 {
+                return Err(format!(
+                    "MIN/MAX state map value type for column `{state_name}` must be Int64, got {:?}",
+                    value_field.data_type()
+                ));
+            }
+            if !value_field.is_nullable() {
+                return Err(format!(
+                    "MIN/MAX state map value field for column `{state_name}` must be nullable (iceberg-rust convention)"
+                ));
+            }
+            // Validate the key Arrow type matches the scalar primitives we
+            // accept as MIN/MAX inputs (mirrors the pre-Phase-2 acceptance
+            // list, minus Boolean which AggScalarValue does not support).
+            let key_field = struct_fields
+                .iter()
+                .find(|f| f.name() == "key")
+                .ok_or_else(|| {
+                    format!(
+                        "MIN/MAX state map entries struct for column `{state_name}` is missing `key` field"
+                    )
+                })?;
+            if key_field.is_nullable() {
+                return Err(format!(
+                    "MIN/MAX state map key field for column `{state_name}` must be non-null"
+                ));
+            }
+            match key_field.data_type() {
+                // MIN/MAX detail-state currently can't ingest NaN keys (the
+                // comparator underlying merge/sort returns Err on NaN, which
+                // would silently miscount or hard-error at refresh time).
+                // Reject Float MIN/MAX in detail-state MVs until a follow-up
+                // PR adds canonical-NaN handling.
+                DataType::Float32 | DataType::Float64 => Err(format!(
+                    "MIN/MAX over Float types is not yet supported in incremental MVs \
+                     (column `{state_name}`): NaN handling pending; use a non-Float column or \
+                     non-incremental MV"
+                )),
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Timestamp(_, _) => Ok(()),
+                DataType::Boolean => Err(format!(
+                    "MIN/MAX state key type is unsupported for column `{state_name}`: Boolean"
+                )),
+                other => Err(format!(
+                    "MIN/MAX state key type is unsupported for column `{state_name}`: {other:?}"
+                )),
+            }
+        }
         (function, role) => Err(format!(
             "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{state_name}`"
         )),
@@ -1528,8 +1898,10 @@ where
 
 /// Derive visible column values from the current state values after a merge step.
 ///
-/// For `Single` state_role the visible value is a direct copy of the state value (1:1 mapping).
-/// For AVG, the visible value is derived from the AvgSum and AvgCount sub-states as sum/count.
+/// - For COUNT/SUM-Single the visible is a direct copy of the state (1:1 mapping).
+/// - For MIN/MAX-Single the visible is derived from the detail-map state via
+///   min/max over keys with count > 0.
+/// - For AVG the visible is computed as AvgSum / AvgCount.
 fn update_visible_values_from_state(
     row: &mut AggregatePhysicalRow,
     layout: &AggregateMvLayout,
@@ -1550,15 +1922,51 @@ fn update_visible_values_from_state(
     for state_indexes in by_aggregate.values() {
         let primary = &layout.state_columns[state_indexes[0]];
         match primary.function {
-            AggregateFunctionKind::Count
-            | AggregateFunctionKind::Sum
-            | AggregateFunctionKind::Min
-            | AggregateFunctionKind::Max => {
+            AggregateFunctionKind::Count | AggregateFunctionKind::Sum => {
                 // Single state role: visible = state.
                 let state_index = state_indexes[0];
                 let state_column = &layout.state_columns[state_index];
                 row.visible_values[state_column.visible_source_index] =
                     row.state_values[state_index].clone();
+            }
+            AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+                // IVM-P5 Phase 4: visible MIN/MAX is derived from the
+                // detail-map state by scanning entries with count > 0
+                // and reducing to the min/max key.
+                //
+                // On the materialize/insert path, this is the sole
+                // derivation of visible for MIN/MAX (the rewriter no
+                // longer projects a scalar MIN/MAX value after Phase 3,
+                // so the visible slot starts as None and is populated
+                // here). On the merge path, this overwrites the prior
+                // physical visible value with the post-merge derived
+                // value, which is correct because the detail-map state
+                // reflects every retraction and re-insertion.
+                let state_index = state_indexes[0];
+                let state_column = &layout.state_columns[state_index];
+                let op = match primary.function {
+                    AggregateFunctionKind::Min => MinMax::Min,
+                    AggregateFunctionKind::Max => MinMax::Max,
+                    _ => unreachable!(),
+                };
+                let derived = match row.state_values[state_index].as_ref() {
+                    Some(value @ AggScalarValue::Map(_)) => {
+                        derive_visible_from_detail_map(value, op).map_err(|e| {
+                            format!(
+                                "derive visible for column `{}` failed: {e}",
+                                state_column.name
+                            )
+                        })?
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "MIN/MAX state on column `{}` must be Map, got {other:?}",
+                            state_column.name
+                        ));
+                    }
+                    None => None,
+                };
+                row.visible_values[state_column.visible_source_index] = derived;
             }
             AggregateFunctionKind::Avg => {
                 let (sum_idx, count_idx) = avg_state_indexes(layout, state_indexes)?;
@@ -2108,6 +2516,338 @@ mod tests {
         assert!(err.contains("SUM state type is unsupported"), "err={err}");
         assert!(err.contains("__agg_state_s"), "err={err}");
         assert!(err.contains("Float64"), "err={err}");
+    }
+
+    /// Shape: `select k1, min(v1) as m from ice.ns.orders group by k1`
+    fn min_only_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, min(v1) as m from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    /// Shape: `select k1, max(v1) as m from ice.ns.orders group by k1`
+    fn max_only_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, max(v1) as m from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    /// Output columns for `min/max(v1) as m group by k1`: [k1: Int64, m: <typ>].
+    fn min_max_output_columns(value_type: DataType) -> Vec<OutputColumn> {
+        vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "m".to_string(),
+                data_type: value_type,
+                nullable: true,
+            },
+        ]
+    }
+
+    /// Build the Arrow Map<key_type, Int64> type used by MIN/MAX state.
+    /// Mirrors the iceberg-rust convention applied in `build_aggregate_mv_layout`
+    /// (entries-field name `"key_value"`, value field nullable).
+    fn expected_min_max_state_arrow_type(key_type: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", key_type, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
+
+    #[test]
+    fn build_layout_min_int64_input_produces_map_state_column() {
+        let shape = min_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &min_max_output_columns(DataType::Int64))
+            .expect("layout");
+        assert_eq!(layout.state_columns.len(), 2);
+        let state = &layout.state_columns[0];
+        assert_eq!(state.name, "__agg_state_m");
+        assert_eq!(state.function, AggregateFunctionKind::Min);
+        assert_eq!(state.state_role, AggregateStateRole::Single);
+        assert!(!state.nullable);
+        assert!(!state.count_star);
+        assert_eq!(
+            state.data_type,
+            expected_min_max_state_arrow_type(DataType::Int64)
+        );
+        assert_eq!(
+            state.sql_type,
+            SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt))
+        );
+        // The retraction-count hidden state is the second state column.
+        assert_eq!(
+            layout.state_columns[1].state_role,
+            AggregateStateRole::RetractionCount
+        );
+    }
+
+    #[test]
+    fn build_layout_max_utf8_input_produces_map_state_column() {
+        let shape = max_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &min_max_output_columns(DataType::Utf8))
+            .expect("layout");
+        let state = &layout.state_columns[0];
+        assert_eq!(state.name, "__agg_state_m");
+        assert_eq!(state.function, AggregateFunctionKind::Max);
+        assert_eq!(state.state_role, AggregateStateRole::Single);
+        assert!(!state.nullable);
+        assert_eq!(
+            state.data_type,
+            expected_min_max_state_arrow_type(DataType::Utf8)
+        );
+        assert_eq!(
+            state.sql_type,
+            SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::BigInt))
+        );
+    }
+
+    #[test]
+    fn build_layout_sum_count_avg_branches_unchanged() {
+        // Regression: SUM/COUNT/AVG state columns remain scalar Int64; no Map
+        // shape leaks in from the Phase-2 MIN/MAX change.
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, sum(v1) as s, count(*) as c, avg(v1) as a from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        let columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
+        // Expected state columns (ordering follows shape.aggregates):
+        //   SUM:Single -> Int64
+        //   COUNT(*):Single -> Int64
+        //   AVG:AvgSum -> Int64, AvgCount -> Int64
+        // No RetractionCount hidden state because the shape includes COUNT(*).
+        let state_types: Vec<&DataType> =
+            layout.state_columns.iter().map(|c| &c.data_type).collect();
+        for (idx, dt) in state_types.iter().enumerate() {
+            assert!(
+                !matches!(dt, DataType::Map(..)),
+                "state column {idx} unexpectedly Map: {dt:?}"
+            );
+            assert_eq!(**dt, DataType::Int64, "state column {idx} expected Int64");
+        }
+        // Sanity-check the (function, state_role) ordering: SUM Single,
+        // COUNT(*) Single, AVG AvgSum, AVG AvgCount.
+        let roles: Vec<(AggregateFunctionKind, AggregateStateRole)> = layout
+            .state_columns
+            .iter()
+            .map(|c| (c.function, c.state_role))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (AggregateFunctionKind::Sum, AggregateStateRole::Single),
+                (AggregateFunctionKind::Count, AggregateStateRole::Single),
+                (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum),
+                (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_layout_min_max_combined_with_sum_count() {
+        // Combined shape: min(v1) -> Int64, sum(v1) -> Int64,
+        // count(*) -> Int64, max(s1) -> Utf8.
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, min(v1) as mn, sum(v1) as s, count(*) as c, max(s1) as mx \
+             from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        let columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "mn".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "mx".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &columns).expect("layout");
+        // Expected: [Map<Int64,Int64>, Int64, Int64, Map<Utf8,Int64>],
+        // matching the (Min, Sum, Count(*), Max) aggregate ordering. No
+        // RetractionCount hidden state because COUNT(*) covers it.
+        let expected_types = vec![
+            expected_min_max_state_arrow_type(DataType::Int64),
+            DataType::Int64,
+            DataType::Int64,
+            expected_min_max_state_arrow_type(DataType::Utf8),
+        ];
+        let actual_types: Vec<DataType> = layout
+            .state_columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect();
+        assert_eq!(actual_types, expected_types);
+        // Sanity-check the function ordering matches our expectation.
+        let funcs: Vec<AggregateFunctionKind> =
+            layout.state_columns.iter().map(|c| c.function).collect();
+        assert_eq!(
+            funcs,
+            vec![
+                AggregateFunctionKind::Min,
+                AggregateFunctionKind::Sum,
+                AggregateFunctionKind::Count,
+                AggregateFunctionKind::Max,
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_state_column_type_accepts_map_int64_for_min() {
+        let ok_map = expected_min_max_state_arrow_type(DataType::Int64);
+        validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &ok_map,
+            "__agg_state_m",
+        )
+        .expect("Map<Int64,Int64> must be accepted for MIN");
+
+        let ok_map_utf8 = expected_min_max_state_arrow_type(DataType::Utf8);
+        validate_state_column_type(
+            AggregateFunctionKind::Max,
+            AggregateStateRole::Single,
+            &ok_map_utf8,
+            "__agg_state_m",
+        )
+        .expect("Map<Utf8,Int64> must be accepted for MAX");
+    }
+
+    #[test]
+    fn validate_state_column_type_rejects_map_with_non_int64_value_for_min() {
+        // Map<Int64, Utf8> — wrong value type, must be rejected. Uses the
+        // iceberg-rust entries-field name ("key_value") and nullable value
+        // field so we exercise the value-type check, not the shape check.
+        let bad_map = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Int64, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let err = validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &bad_map,
+            "__agg_state_m",
+        )
+        .expect_err("Map<Int64, Utf8> must be rejected for MIN");
+        assert!(err.contains("value type"), "err={err}");
+        assert!(err.contains("Int64"), "err={err}");
+    }
+
+    #[test]
+    fn validate_state_column_type_rejects_scalar_for_min() {
+        // Pre-Phase-2 scalar Int64 state must now be rejected — MIN/MAX state
+        // is required to be a value-count detail Map.
+        let err = validate_state_column_type(
+            AggregateFunctionKind::Min,
+            AggregateStateRole::Single,
+            &DataType::Int64,
+            "__agg_state_m",
+        )
+        .expect_err("scalar Int64 must be rejected as MIN state type");
+        assert!(err.contains("Map<K, Int64>"), "err={err}");
+    }
+
+    #[test]
+    fn validate_state_column_type_rejects_float_min_max() {
+        // Float MIN/MAX detail-state cannot be supported yet: the underlying
+        // comparator (`compare_agg_scalar_values`) returns `Err` on NaN, which
+        // means `merge_value_count_map_state` / `sort_map_entries_by_key`
+        // would silently miscount or hard-error at refresh time. Reject at
+        // schema-validate time until canonical-NaN handling lands.
+        for key_type in [DataType::Float32, DataType::Float64] {
+            let map = expected_min_max_state_arrow_type(key_type.clone());
+            for function in [AggregateFunctionKind::Min, AggregateFunctionKind::Max] {
+                let result = validate_state_column_type(
+                    function,
+                    AggregateStateRole::Single,
+                    &map,
+                    "__agg_state_m",
+                );
+                let err = result.expect_err(&format!(
+                    "expected Float MIN/MAX rejection error for {key_type:?} {function:?}"
+                ));
+                assert!(
+                    err.contains("Float"),
+                    "expected error to mention Float, got: {err}"
+                );
+                assert!(
+                    err.contains("MIN/MAX"),
+                    "expected error to mention MIN/MAX, got: {err}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2994,111 +3734,459 @@ mod tests {
         assert_eq!(state_cnt.value(0), 4, "state count");
     }
 
-    // ---- MIN/MAX merge tests ----
+    // ---- IVM-P5 Phase 4: MIN/MAX detail-map state helpers ----
 
-    #[test]
-    fn merge_state_value_min_int64() {
-        let column = AggregateStateColumn {
+    /// Build a `Map<key_type, Int64>` MIN-Single state column for use in
+    /// merge / negate / derive tests. The visible column type is the input
+    /// scalar type (matches `build_aggregate_mv_layout`'s wiring).
+    fn min_int64_map_state_column() -> AggregateStateColumn {
+        AggregateStateColumn {
             name: "__agg_state_mn".to_string(),
-            data_type: DataType::Int64,
-            sql_type: SqlType::BigInt,
-            nullable: true,
+            data_type: DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(arrow::datatypes::Fields::from(vec![
+                        Arc::new(Field::new("key", DataType::Int64, false)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            sql_type: SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt)),
+            nullable: false,
             visible_source_index: 0,
             aggregate_index: 0,
             function: AggregateFunctionKind::Min,
             state_role: AggregateStateRole::Single,
             count_star: false,
+        }
+    }
+
+    fn max_int64_map_state_column() -> AggregateStateColumn {
+        let mut col = min_int64_map_state_column();
+        col.name = "__agg_state_mx".to_string();
+        col.function = AggregateFunctionKind::Max;
+        col
+    }
+
+    /// Build a `Map<Int64, Int64>` AggScalarValue from raw `(key, count)` pairs.
+    /// Constructing via `Vec<(Some(...), Some(...))>` keeps the test data
+    /// close to what `agg_scalar_from_array` produces from a real MapArray.
+    fn make_map_state(entries: &[(i64, i64)]) -> AggScalarValue {
+        AggScalarValue::Map(
+            entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        Some(AggScalarValue::Int64(*k)),
+                        Some(AggScalarValue::Int64(*v)),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Extract `(key, count)` pairs from a Map AggScalarValue for assertions.
+    /// Panics on type mismatch — tests should never trigger that, so we
+    /// don't bother propagating errors.
+    fn map_state_pairs(value: &AggScalarValue) -> Vec<(i64, i64)> {
+        let AggScalarValue::Map(entries) = value else {
+            panic!("expected Map AggScalarValue, got {value:?}");
         };
-        // Some(5) min Some(3) = Some(3)
+        entries
+            .iter()
+            .map(|(k, v)| {
+                let k = match k {
+                    Some(AggScalarValue::Int64(k)) => *k,
+                    other => panic!("expected Int64 key, got {other:?}"),
+                };
+                let v = match v {
+                    Some(AggScalarValue::Int64(v)) => *v,
+                    other => panic!("expected Int64 value, got {other:?}"),
+                };
+                (k, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_value_count_map_state_empty_plus_empty() {
+        let column = min_int64_map_state_column();
         let r = merge_state_value(
-            Some(AggScalarValue::Int64(5)),
-            Some(AggScalarValue::Int64(3)),
+            Some(make_map_state(&[])),
+            Some(make_map_state(&[])),
             &column,
         )
-        .unwrap();
-        assert!(
-            matches!(r, Some(AggScalarValue::Int64(3))),
-            "expected Some(Int64(3)), got {r:?}"
+        .expect("merge");
+        let value = r.expect("merged map");
+        assert_eq!(map_state_pairs(&value), Vec::<(i64, i64)>::new());
+    }
+
+    #[test]
+    fn merge_value_count_map_state_populated_plus_empty() {
+        let column = min_int64_map_state_column();
+        let r = merge_state_value(
+            Some(make_map_state(&[(1, 1), (2, 1)])),
+            Some(make_map_state(&[])),
+            &column,
+        )
+        .expect("merge");
+        let value = r.expect("merged map");
+        assert_eq!(map_state_pairs(&value), vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn merge_value_count_map_state_disjoint_keys() {
+        let column = min_int64_map_state_column();
+        let r = merge_state_value(
+            Some(make_map_state(&[(1, 1), (2, 1)])),
+            Some(make_map_state(&[(3, 1), (4, 1)])),
+            &column,
+        )
+        .expect("merge");
+        let value = r.expect("merged map");
+        assert_eq!(
+            map_state_pairs(&value),
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
         );
-        // Some + None -> Some
-        let r = merge_state_value(Some(AggScalarValue::Int64(5)), None, &column).unwrap();
+    }
+
+    #[test]
+    fn merge_value_count_map_state_overlapping_keys() {
+        let column = min_int64_map_state_column();
+        let r = merge_state_value(
+            Some(make_map_state(&[(1, 1), (2, 2)])),
+            Some(make_map_state(&[(2, 3), (3, 1)])),
+            &column,
+        )
+        .expect("merge");
+        let value = r.expect("merged map");
+        // 2 -> 2 + 3 = 5
+        assert_eq!(map_state_pairs(&value), vec![(1, 1), (2, 5), (3, 1)]);
+    }
+
+    #[test]
+    fn merge_value_count_map_state_negative_count_in_delta() {
+        let column = min_int64_map_state_column();
+        // Delta carries (1, -1) and (3, 1); old has (1, 1) and (2, 2).
+        // After per-key sum: (1, 0), (2, 2), (3, 1).
+        // merge_value_count_map_state prunes zero entries (spec §3.5 —
+        // eager pruning at every merge step), so the (1, 0) row drops.
+        let r = merge_state_value(
+            Some(make_map_state(&[(1, 1), (2, 2)])),
+            Some(make_map_state(&[(1, -1), (3, 1)])),
+            &column,
+        )
+        .expect("merge");
+        let value = r.expect("merged map");
+        assert_eq!(map_state_pairs(&value), vec![(2, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn prune_zero_entries_from_map_entries_removes_zero_keeps_others() {
+        // The helper is purely about the value-zero case. Negative counts
+        // (-1 here) are preserved — whether they survive into a "final"
+        // state is a flow-level concern.
+        let AggScalarValue::Map(entries) = make_map_state(&[(1, 1), (2, 0), (3, -1)]) else {
+            panic!("expected Map state");
+        };
+        let pruned = prune_zero_entries_from_map_entries(entries);
+        assert_eq!(
+            map_state_pairs(&AggScalarValue::Map(pruned)),
+            vec![(1, 1), (3, -1)]
+        );
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_min_returns_smallest_active_value() {
+        let map = make_map_state(&[(5, 1), (10, 2), (20, 1)]);
+        let r = derive_visible_from_detail_map(&map, MinMax::Min).expect("derive");
         assert!(
             matches!(r, Some(AggScalarValue::Int64(5))),
             "expected Some(Int64(5)), got {r:?}"
         );
-        // None + Some -> Some
-        let r = merge_state_value(None, Some(AggScalarValue::Int64(5)), &column).unwrap();
-        assert!(
-            matches!(r, Some(AggScalarValue::Int64(5))),
-            "expected Some(Int64(5)), got {r:?}"
-        );
-        // None + None -> None
-        let r = merge_state_value(None, None, &column).unwrap();
-        assert!(r.is_none(), "expected None, got {r:?}");
     }
 
     #[test]
-    fn merge_state_value_max_utf8() {
-        let column = AggregateStateColumn {
-            name: "__agg_state_mx".to_string(),
-            data_type: DataType::Utf8,
-            sql_type: SqlType::String,
-            nullable: true,
-            visible_source_index: 0,
-            aggregate_index: 0,
-            function: AggregateFunctionKind::Max,
-            state_role: AggregateStateRole::Single,
-            count_star: false,
-        };
-        let r = merge_state_value(
-            Some(AggScalarValue::Utf8("apple".to_string())),
-            Some(AggScalarValue::Utf8("banana".to_string())),
-            &column,
-        )
-        .unwrap();
+    fn derive_visible_from_detail_map_max_returns_largest_active_value() {
+        let map = make_map_state(&[(5, 1), (10, 2), (20, 1)]);
+        let r = derive_visible_from_detail_map(&map, MinMax::Max).expect("derive");
         assert!(
-            matches!(r, Some(AggScalarValue::Utf8(ref s)) if s == "banana"),
-            "expected Some(Utf8(\"banana\")), got {r:?}"
+            matches!(r, Some(AggScalarValue::Int64(20))),
+            "expected Some(Int64(20)), got {r:?}"
         );
     }
 
     #[test]
-    fn merge_state_value_min_float64_nan_handling() {
-        let column = AggregateStateColumn {
-            name: "__agg_state_mn".to_string(),
-            data_type: DataType::Float64,
-            sql_type: SqlType::Double,
-            nullable: true,
-            visible_source_index: 0,
-            aggregate_index: 0,
-            function: AggregateFunctionKind::Min,
-            state_role: AggregateStateRole::Single,
-            count_star: false,
-        };
-        // NaN + non-NaN -> non-NaN
-        let r = merge_state_value(
-            Some(AggScalarValue::Float64(f64::NAN)),
-            Some(AggScalarValue::Float64(5.0)),
+    fn derive_visible_from_detail_map_all_zero_returns_none() {
+        let map = make_map_state(&[(1, 0), (2, 0)]);
+        let min = derive_visible_from_detail_map(&map, MinMax::Min).expect("derive min");
+        let max = derive_visible_from_detail_map(&map, MinMax::Max).expect("derive max");
+        assert!(min.is_none(), "expected None, got {min:?}");
+        assert!(max.is_none(), "expected None, got {max:?}");
+    }
+
+    #[test]
+    fn derive_visible_from_detail_map_with_negative_counts_skipped() {
+        // The -1 count at key 1 is excluded from the derivation, so the
+        // visible MIN must be 2 (the smallest key with count > 0).
+        let map = make_map_state(&[(1, -1), (2, 2), (3, 1)]);
+        let r = derive_visible_from_detail_map(&map, MinMax::Min).expect("derive");
+        assert!(
+            matches!(r, Some(AggScalarValue::Int64(2))),
+            "expected Some(Int64(2)), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn merge_then_prune_then_derive_visible_end_to_end() {
+        // INSERT 5 rows over 3 distinct values {10, 20, 30}.
+        // Initial detail state: {10:1, 20:1, 30:1, ... 10:1, 20:1, 30:1}
+        // — but we collapse it into the merged state directly:
+        // {10:1, 20:1, 30:1} (each value once) then later we insert dup rows.
+        // For simplicity: simulate the merged state after the 5-row INSERT
+        // as 10:2, 20:2, 30:1 (5 rows total).
+        let column = min_int64_map_state_column();
+        let after_insert = merge_state_value(
+            None,
+            Some(make_map_state(&[(10, 2), (20, 2), (30, 1)])),
             &column,
         )
-        .unwrap();
-        let v = match r {
-            Some(AggScalarValue::Float64(v)) => v,
-            _ => panic!("expected Float64"),
-        };
-        assert!(!v.is_nan() && v == 5.0);
-        // NaN + NaN -> NaN
-        let r = merge_state_value(
-            Some(AggScalarValue::Float64(f64::NAN)),
-            Some(AggScalarValue::Float64(f64::NAN)),
+        .expect("merge insert")
+        .expect("some");
+        assert_eq!(
+            map_state_pairs(&after_insert),
+            vec![(10, 2), (20, 2), (30, 1)]
+        );
+
+        // DELETE 10 (boundary — 10 was the current MIN). With 2 prior 10s
+        // and one deletion, the merged state has 10 -> 2 + (-1) = 1.
+        // Final MIN is still 10. Spec example deletes BOTH 10s; replicate
+        // that here by passing a -2 delta for the 10 key.
+        let after_delete = merge_state_value(
+            Some(after_insert),
+            Some(make_map_state(&[(10, -2)])),
             &column,
         )
-        .unwrap();
-        let v = match r {
-            Some(AggScalarValue::Float64(v)) => v,
-            _ => panic!("expected Float64"),
+        .expect("merge delete")
+        .expect("some");
+        // The (10, 0) entry gets pruned eagerly in the same call.
+        assert_eq!(map_state_pairs(&after_delete), vec![(20, 2), (30, 1)]);
+
+        // Derive visible MIN — should now be 20 (the second-smallest value).
+        let visible = derive_visible_from_detail_map(&after_delete, MinMax::Min).expect("derive");
+        assert!(
+            matches!(visible, Some(AggScalarValue::Int64(20))),
+            "expected Some(Int64(20)), got {visible:?}"
+        );
+
+        // Sanity-check MAX too.
+        let max = derive_visible_from_detail_map(&after_delete, MinMax::Max).expect("max");
+        assert!(
+            matches!(max, Some(AggScalarValue::Int64(30))),
+            "expected Some(Int64(30)), got {max:?}"
+        );
+        let _ = column;
+    }
+
+    /// Sibling test for `negate_aggregate_state_chunks_flips_count_and_sum`:
+    /// exercise a layout WITH a MIN-Single map state and assert the
+    /// MapArray is negated entry-wise.
+    #[test]
+    fn negate_aggregate_state_chunks_with_min_map_state_flips_counts() {
+        use arrow::array::MapArray;
+
+        let state_col = min_int64_map_state_column();
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "mn".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![state_col.clone()],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
         };
-        assert!(v.is_nan());
+
+        // Build a single-row physical batch:
+        //   row_id = "g"
+        //   visible mn = 10
+        //   state map = {10:1, 20:2}
+        let entries_struct = StructArray::new(
+            arrow::datatypes::Fields::from(vec![
+                Arc::new(Field::new("key", DataType::Int64, false)),
+                Arc::new(Field::new("value", DataType::Int64, true)),
+            ]),
+            vec![
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef,
+            ],
+            None,
+        );
+        let map_field = match &state_col.data_type {
+            DataType::Map(field, _) => field.clone(),
+            other => panic!("unexpected state column type {other:?}"),
+        };
+        let map_array = MapArray::try_new(
+            map_field,
+            OffsetBuffer::new(vec![0_i32, 2].into()),
+            entries_struct,
+            None,
+            false,
+        )
+        .expect("map array");
+
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["g"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(10_i64)])) as ArrayRef,
+                Arc::new(map_array) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+        let negated = negate_aggregate_state_chunks(vec![chunk], &layout).expect("negate");
+
+        assert_eq!(negated.len(), 1);
+        let negated_state = negated[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("state map");
+        let neg_values = negated_state
+            .values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("values");
+        let neg_keys = negated_state
+            .keys()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("keys");
+        assert_eq!((neg_keys.value(0), neg_keys.value(1)), (10, 20));
+        assert_eq!((neg_values.value(0), neg_values.value(1)), (-1, -2));
+
+        // Visible column must be unchanged by negate.
+        let visible = negated[0]
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("visible col");
+        assert_eq!(visible.value(0), 10);
+    }
+
+    /// Sibling of `negate_aggregate_state_chunks_with_min_map_state_flips_counts`
+    /// for the MAX-Single map state. The negate path is function-agnostic (it
+    /// operates on the Arrow MapArray), but cover MAX explicitly so a future
+    /// MIN-specific tweak can't silently regress MAX.
+    #[test]
+    fn negate_aggregate_state_chunks_with_max_map_state_flips_counts() {
+        use arrow::array::MapArray;
+
+        let state_col = max_int64_map_state_column();
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "mx".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![state_col.clone()],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        };
+
+        // Build a single-row physical batch:
+        //   row_id = "g"
+        //   visible mx = 20
+        //   state map = {10:1, 20:2}
+        let entries_struct = StructArray::new(
+            arrow::datatypes::Fields::from(vec![
+                Arc::new(Field::new("key", DataType::Int64, false)),
+                Arc::new(Field::new("value", DataType::Int64, true)),
+            ]),
+            vec![
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef,
+            ],
+            None,
+        );
+        let map_field = match &state_col.data_type {
+            DataType::Map(field, _) => field.clone(),
+            other => panic!("unexpected state column type {other:?}"),
+        };
+        let map_array = MapArray::try_new(
+            map_field,
+            OffsetBuffer::new(vec![0_i32, 2].into()),
+            entries_struct,
+            None,
+            false,
+        )
+        .expect("map array");
+
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["g"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(20_i64)])) as ArrayRef,
+                Arc::new(map_array) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+        let negated = negate_aggregate_state_chunks(vec![chunk], &layout).expect("negate");
+
+        assert_eq!(negated.len(), 1);
+        let negated_state = negated[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("state map");
+        let neg_values = negated_state
+            .values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("values");
+        let neg_keys = negated_state
+            .keys()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("keys");
+        assert_eq!((neg_keys.value(0), neg_keys.value(1)), (10, 20));
+        assert_eq!((neg_values.value(0), neg_values.value(1)), (-1, -2));
+
+        // Visible column must be unchanged by negate.
+        let visible = negated[0]
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("visible col");
+        assert_eq!(visible.value(0), 20);
     }
 
     // ---- End-to-end AVG merge test ----
@@ -3142,54 +4230,6 @@ mod tests {
             .unwrap();
         // (10 + 20) / (2 + 2) = 30 / 4 = 7.5
         assert_eq!(visible.value(0), 7.5);
-    }
-
-    // ---- MIN/MAX negate panic test ----
-
-    #[test]
-    #[should_panic(expected = "MIN/MAX state should not enter negate path")]
-    fn negate_aggregate_state_chunks_min_panics() {
-        let layout = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: vec![AggregateVisibleColumn {
-                name: "mn".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: true,
-                source_index: 0,
-            }],
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_mn".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: true,
-                visible_source_index: 0,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Min,
-                state_role: AggregateStateRole::Single,
-                count_star: false,
-            }],
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-        let schema = Arc::new(physical_schema(&layout));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["g"])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![Some(5)])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![Some(5)])) as ArrayRef,
-            ],
-        )
-        .expect("batch");
-        let chunk = record_batch_to_chunk(batch).expect("chunk");
-        negate_aggregate_state_chunks(vec![chunk], &layout).unwrap();
     }
 
     // ---- Bug C1: AVG Decimal128 scale correctness tests ----
@@ -3422,123 +4462,5 @@ mod tests {
         let rows = load_aggregate_physical_rows(&[chunk], &layout)
             .expect("MIN(Float64) load must succeed");
         assert_eq!(rows.len(), 1);
-    }
-
-    // ---- layout_has_min_or_max tests ----
-
-    #[test]
-    fn layout_has_min_or_max_detects() {
-        let mut layout = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: Vec::new(),
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-        assert!(!layout_has_min_or_max(&layout));
-
-        layout.state_columns.push(AggregateStateColumn {
-            name: "__agg_state_c".to_string(),
-            data_type: DataType::Int64,
-            sql_type: SqlType::BigInt,
-            nullable: false,
-            visible_source_index: 0,
-            aggregate_index: 0,
-            function: AggregateFunctionKind::Count,
-            state_role: AggregateStateRole::Single,
-            count_star: true,
-        });
-        assert!(!layout_has_min_or_max(&layout));
-
-        layout.state_columns.push(AggregateStateColumn {
-            name: "__agg_state_mn".to_string(),
-            data_type: DataType::Int64,
-            sql_type: SqlType::BigInt,
-            nullable: true,
-            visible_source_index: 1,
-            aggregate_index: 1,
-            function: AggregateFunctionKind::Min,
-            state_role: AggregateStateRole::Single,
-            count_star: false,
-        });
-        assert!(layout_has_min_or_max(&layout));
-    }
-
-    #[test]
-    fn fallback_predicate_truth_table_for_min_max() {
-        // Locks the boolean shape of the fall-back gate
-        // (`deletes_present && layout_has_min_or_max(...)`) used in
-        // refresh_aggregate_mv_incremental. The integration path is
-        // not unit-tested here — see spec §8.2: DELETE -> fall-back is
-        // covered exclusively by Rust unit tests rather than the SQL suite.
-        let layout_with_min = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_mn".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: true,
-                visible_source_index: 0,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Min,
-                state_role: AggregateStateRole::Single,
-                count_star: false,
-            }],
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-
-        let layout_count_only = AggregateMvLayout {
-            row_id_column: managed_physical_column(
-                ROW_ID_COLUMN.to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            ),
-            visible_columns: Vec::new(),
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_c".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: false,
-                visible_source_index: 0,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Count,
-                state_role: AggregateStateRole::Single,
-                count_star: true,
-            }],
-            group_key_source_indexes: Vec::new(),
-            physical_columns: Vec::new(),
-        };
-
-        let deletes_present = true;
-
-        // Fall-back fires: deletes present AND layout has MIN/MAX.
-        assert!(deletes_present && layout_has_min_or_max(&layout_with_min));
-
-        // No fall-back: COUNT-only layout does not trigger MIN/MAX gate.
-        assert!(!(deletes_present && layout_has_min_or_max(&layout_count_only)));
-
-        // No fall-back: no deletes regardless of layout — the gate only fires when
-        // both conditions are true. Verify layout_has_min_or_max returns true for
-        // the min layout (confirming the helper works) while the overall predicate
-        // is false because no deletes are present.
-        let no_deletes = false;
-        assert!(layout_has_min_or_max(&layout_with_min));
-        assert!(!(no_deletes && layout_has_min_or_max(&layout_with_min)));
     }
 }
