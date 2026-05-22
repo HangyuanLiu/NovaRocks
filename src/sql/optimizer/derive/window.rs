@@ -34,7 +34,7 @@ impl DeriveOutput for PhysicalWindowOp {
             PhysicalPropertySet::any()
         } else {
             PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(partition_cols),
+                distribution: DistributionSpec::shuffle_agg(partition_cols),
                 ordering: OrderingSpec::Any,
             }
         }
@@ -61,7 +61,7 @@ impl DeriveRequired for PhysicalWindowOp {
             vec![PhysicalPropertySet::gather()]
         } else {
             vec![PhysicalPropertySet {
-                distribution: DistributionSpec::HashPartitioned(partition_cols),
+                distribution: DistributionSpec::shuffle_agg(partition_cols),
                 ordering: OrderingSpec::Any,
             }]
         }
@@ -73,6 +73,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::property::HashSource;
     use crate::sql::planner::plan::WindowExpr;
 
     #[test]
@@ -103,11 +104,11 @@ mod tests {
         };
         let props = op.derive_output(&[]);
         match &props.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
-                assert_eq!(cols.len(), 1);
-                assert_eq!(cols[0], ColumnId(2));
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(2)]);
             }
-            other => panic!("expected HashPartitioned([c0]), got {:?}", other),
+            other => panic!("expected ShuffleAgg([c0]), got {other:?}"),
         }
     }
 

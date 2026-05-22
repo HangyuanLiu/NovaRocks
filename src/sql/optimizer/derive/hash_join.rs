@@ -23,12 +23,6 @@ fn preserves_left(jk: &crate::sql::analysis::JoinKind) -> bool {
     matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
 }
 
-#[allow(dead_code)]
-enum Side {
-    Left,
-    Right,
-}
-
 fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     match &expr.kind {
         crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
@@ -36,18 +30,18 @@ fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     }
 }
 
-fn eq_keys_to_column_ids(
-    eq_conditions: &[PhysicalHashJoinEqCondition],
-    side: Side,
-) -> Vec<ColumnId> {
+fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec<ColumnId> {
     eq_conditions
         .iter()
-        .filter_map(|eq| {
-            let expr = match side {
-                Side::Left => &eq.left,
-                Side::Right => &eq.right,
-            };
-            typed_expr_to_column_id(expr)
+        .flat_map(|eq| {
+            let mut cols = Vec::new();
+            if let Some(col) = typed_expr_to_column_id(&eq.left) {
+                cols.push(col);
+            }
+            if let Some(col) = typed_expr_to_column_id(&eq.right) {
+                cols.push(col);
+            }
+            cols
         })
         .collect()
 }
@@ -57,12 +51,9 @@ fn eq_keys_to_column_ids(
 /// equivalence-class partner from each matching eq pair.
 ///
 /// Rationale: after `JOIN ON L = R`, output rows satisfy `L == R`, so the
-/// output is HashPartitioned by `L` iff it is HashPartitioned by `R`.
-/// Carrying both ids in the output's HashPartitioned vector lets the
-/// optimizer's containAll `satisfies` check accept a downstream requirement
-/// on either side — even when join children get re-oriented (commutativity
-/// or `orient_eq_pair` ambiguity from colliding column names) so that the
-/// physical hash key is on the other side.
+/// output can expose both ids as equivalent hash keys for downstream
+/// source-aware distribution checks. G4 keeps the source on the enriched
+/// distribution; it does not rely on the old global containAll rule.
 fn expand_with_eq_equivalents(
     cols: &[ColumnId],
     eq_conditions: &[PhysicalHashJoinEqCondition],
@@ -93,17 +84,12 @@ impl DeriveOutput for PhysicalHashJoinOp {
                 // partitions both inputs on their respective eq columns, so
                 // its output's HashPartitioned key is an equivalence class
                 // containing every eq column from either side.
-                let mut cols = eq_keys_to_column_ids(&self.eq_conditions, Side::Left);
-                for rc in eq_keys_to_column_ids(&self.eq_conditions, Side::Right) {
-                    if !cols.contains(&rc) {
-                        cols.push(rc);
-                    }
-                }
+                let cols = shuffle_join_column_ids(&self.eq_conditions);
                 PhysicalPropertySet {
                     distribution: if cols.is_empty() {
                         DistributionSpec::Any
                     } else {
-                        DistributionSpec::HashPartitioned(cols)
+                        DistributionSpec::shuffle_join(cols)
                     },
                     ordering: OrderingSpec::Any,
                 }
@@ -120,11 +106,11 @@ impl DeriveOutput for PhysicalHashJoinOp {
                     // of an eq pair (e.g. after JoinCommutativity put the
                     // hash-providing side on the right) is also satisfied.
                     let distribution = match left.distribution {
-                        DistributionSpec::HashPartitioned(cols) => {
-                            DistributionSpec::HashPartitioned(expand_with_eq_equivalents(
-                                &cols,
-                                &self.eq_conditions,
-                            ))
+                        DistributionSpec::HashPartitioned { cols, source } => {
+                            DistributionSpec::hash_partitioned(
+                                expand_with_eq_equivalents(&cols, &self.eq_conditions),
+                                source,
+                            )
                         }
                         other => other,
                     };
@@ -148,26 +134,13 @@ impl DeriveRequired for PhysicalHashJoinOp {
     ) -> Vec<PhysicalPropertySet> {
         match self.distribution {
             JoinDistribution::Shuffle => {
-                let all_cols: Vec<ColumnId> = self
-                    .eq_conditions
-                    .iter()
-                    .flat_map(|eq| {
-                        let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_id(&eq.left) {
-                            v.push(c);
-                        }
-                        if let Some(c) = typed_expr_to_column_id(&eq.right) {
-                            v.push(c);
-                        }
-                        v
-                    })
-                    .collect();
+                let all_cols = shuffle_join_column_ids(&self.eq_conditions);
                 vec![
                     PhysicalPropertySet {
                         distribution: if all_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::HashPartitioned(all_cols.clone())
+                            DistributionSpec::shuffle_join(all_cols.clone())
                         },
                         ordering: OrderingSpec::Any,
                     },
@@ -175,7 +148,7 @@ impl DeriveRequired for PhysicalHashJoinOp {
                         distribution: if all_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::HashPartitioned(all_cols)
+                            DistributionSpec::shuffle_join(all_cols)
                         },
                         ordering: OrderingSpec::Any,
                     },
@@ -208,6 +181,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::property::HashSource;
 
     fn col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -238,7 +212,7 @@ mod tests {
     fn hash_join_broadcast_inner_preserves_left_distribution() {
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let right_out = PhysicalPropertySet::gather();
@@ -247,16 +221,9 @@ mod tests {
         // HashPartitioned([10]) becomes HashPartitioned([10, 20]) because the
         // eq `10 = 20` makes both columns equivalent on the join output.
         match &out.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
-                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(
-                    ids.contains(&ColumnId(10)),
-                    "expected ColumnId(10), got {ids:?}"
-                );
-                assert!(
-                    ids.contains(&ColumnId(20)),
-                    "expected ColumnId(20), got {ids:?}"
-                );
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(10), ColumnId(20)]);
             }
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }
@@ -306,7 +273,8 @@ mod tests {
         // index order.
         for (side_label, req) in [("left", &reqs[0]), ("right", &reqs[1])] {
             match &req.distribution {
-                DistributionSpec::HashPartitioned(cols) => {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    assert_eq!(*source, HashSource::ShuffleJoin);
                     assert_eq!(
                         cols.len(),
                         2,
@@ -336,6 +304,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shuffle_join_output_and_requirements_use_same_interleaved_key_order() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(11),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        };
+        let expected = DistributionSpec::shuffle_join([
+            ColumnId(10),
+            ColumnId(20),
+            ColumnId(11),
+            ColumnId(21),
+        ]);
+
+        let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
+        match &out.distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleJoin);
+                assert_eq!(
+                    cols.as_slice(),
+                    &[ColumnId(10), ColumnId(20), ColumnId(11), ColumnId(21)]
+                );
+            }
+            other => panic!("expected ShuffleJoin interleaved output key, got {other:?}"),
+        }
+        assert_eq!(out.distribution, expected);
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        assert_eq!(reqs.len(), 2);
+        for req in &reqs {
+            match &req.distribution {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    assert_eq!(*source, HashSource::ShuffleJoin);
+                    assert_eq!(
+                        cols.as_slice(),
+                        &[ColumnId(10), ColumnId(20), ColumnId(11), ColumnId(21)]
+                    );
+                }
+                other => panic!("expected ShuffleJoin interleaved required key, got {other:?}"),
+            }
+            assert_eq!(req.distribution, expected);
+        }
+    }
+
     // ── Task 17: Broadcast non-preserves-left → output stays Any ─────────────
 
     fn broadcast_with_type(jk: crate::sql::analysis::JoinKind) -> PhysicalHashJoinOp {
@@ -355,7 +379,7 @@ mod tests {
     fn hash_join_broadcast_right_outer_returns_any() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightOuter);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
@@ -366,7 +390,7 @@ mod tests {
     fn hash_join_broadcast_right_semi_returns_any() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightSemi);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
@@ -377,7 +401,7 @@ mod tests {
     fn hash_join_broadcast_right_anti_returns_any() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightAnti);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
@@ -388,7 +412,7 @@ mod tests {
     fn hash_join_broadcast_full_outer_returns_any() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::FullOuter);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &PhysicalPropertySet::gather()]);
@@ -414,11 +438,11 @@ mod tests {
     fn hash_join_colocate_inner_preserves_left_distribution() {
         let op = colocate_inner(10, 20);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let right_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &right_out]);
@@ -426,7 +450,8 @@ mod tests {
         // HashPartitioned with its eq-equivalence partner so a downstream
         // requirement on either side of the eq pair is satisfied.
         match &out.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(
                     ids.contains(&ColumnId(10)),
@@ -446,11 +471,11 @@ mod tests {
         let mut op = colocate_inner(10, 20);
         op.join_type = crate::sql::analysis::JoinKind::RightOuter;
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let right_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
             ordering: OrderingSpec::Any,
         };
         let out = op.derive_output(&[&left_out, &right_out]);
@@ -472,7 +497,7 @@ mod tests {
     fn hash_join_broadcast_required_never_pushes_hash_to_left() {
         let op = broadcast_inner(10, 20);
         let parent = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let reqs = op.derive_required(&parent, 2);
@@ -493,7 +518,7 @@ mod tests {
     fn hash_join_broadcast_required_right_outer_returns_any_gather() {
         let op = broadcast_with_type(crate::sql::analysis::JoinKind::RightOuter);
         let parent = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let reqs = op.derive_required(&parent, 2);
@@ -505,7 +530,7 @@ mod tests {
     fn hash_join_colocate_required_returns_any_any() {
         let op = colocate_inner(10, 20);
         let parent = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,
         };
         let reqs = op.derive_required(&parent, 2);
@@ -531,13 +556,14 @@ mod tests {
         // duplicate ids.
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(10), ColumnId(20)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)]),
             ordering: OrderingSpec::Any,
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 assert_eq!(cols.len(), 2, "no duplicates expected, got {cols:?}");
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
@@ -555,13 +581,14 @@ mod tests {
         // side of the original SQL eq is still satisfied.
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
-            distribution: DistributionSpec::HashPartitioned(vec![ColumnId(20)]),
+            distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
             ordering: OrderingSpec::Any,
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
                 assert!(ids.contains(&ColumnId(20)));
@@ -587,7 +614,8 @@ mod tests {
         };
         let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned(cols) => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleJoin);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
                 assert!(ids.contains(&ColumnId(20)));

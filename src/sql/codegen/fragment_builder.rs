@@ -2686,7 +2686,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
                 Ok(unpartitioned_stream_partition())
             }
-            crate::sql::optimizer::property::DistributionSpec::HashPartitioned(cols) => {
+            crate::sql::optimizer::property::DistributionSpec::HashPartitioned { cols, .. } => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
                 //
@@ -4196,13 +4196,18 @@ mod tests {
     #[test]
     fn build_maps_hash_distribution_to_hash_partitioned_edge() {
         let file = NamedTempFile::new().expect("temp parquet path");
+        let hash_col = crate::sql::column_id::ColumnId(1);
+        let mut scan = scan_plan(file.path().to_path_buf());
+        scan.output_columns[0].column_id = hash_col;
+        let Operator::PhysicalScan(scan_op) = &mut scan.op else {
+            panic!("expected scan child");
+        };
+        scan_op.columns[0].column_id = hash_col;
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::HashPartitioned(vec![
-                    crate::sql::column_id::ColumnId::UNSET,
-                ]),
+                spec: DistributionSpec::shuffle_agg([hash_col]),
             }),
-            children: vec![scan_plan(file.path().to_path_buf())],
+            children: vec![scan],
             stats: stats(),
             output_columns: output_columns(),
         };

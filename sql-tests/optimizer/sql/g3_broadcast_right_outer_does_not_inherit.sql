@@ -3,7 +3,7 @@
 -- 1. Negative G3 contract: a BROADCAST RIGHT OUTER join does NOT
 --    inherit the left child's distribution because unmatched-right
 --    NULL rows break the partition contract. The Window above must
---    see an explicit HASH EXCHANGE rather than reuse the join output.
+--    see an explicit ShuffleAgg HASH EXCHANGE rather than reuse the join output.
 -- 2. Regression guard against accidentally extending preserves_left
 --    to right-outer.
 DROP TABLE IF EXISTS ${case_db}.g3_ro_left;
