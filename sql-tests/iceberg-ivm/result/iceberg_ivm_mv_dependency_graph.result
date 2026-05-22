@@ -1,0 +1,9 @@
+-- query 8
+region	total_amount	row_count
+east	10	1
+west	20	1
+
+-- query 11
+region	total_amount	row_count
+east	17	2
+west	20	1
