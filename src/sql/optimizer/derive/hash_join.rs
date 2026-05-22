@@ -23,12 +23,6 @@ fn preserves_left(jk: &crate::sql::analysis::JoinKind) -> bool {
     matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
 }
 
-#[allow(dead_code)]
-enum Side {
-    Left,
-    Right,
-}
-
 fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     match &expr.kind {
         crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
@@ -36,18 +30,18 @@ fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     }
 }
 
-fn eq_keys_to_column_ids(
-    eq_conditions: &[PhysicalHashJoinEqCondition],
-    side: Side,
-) -> Vec<ColumnId> {
+fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec<ColumnId> {
     eq_conditions
         .iter()
-        .filter_map(|eq| {
-            let expr = match side {
-                Side::Left => &eq.left,
-                Side::Right => &eq.right,
-            };
-            typed_expr_to_column_id(expr)
+        .flat_map(|eq| {
+            let mut cols = Vec::new();
+            if let Some(col) = typed_expr_to_column_id(&eq.left) {
+                cols.push(col);
+            }
+            if let Some(col) = typed_expr_to_column_id(&eq.right) {
+                cols.push(col);
+            }
+            cols
         })
         .collect()
 }
@@ -93,12 +87,7 @@ impl DeriveOutput for PhysicalHashJoinOp {
                 // partitions both inputs on their respective eq columns, so
                 // its output's HashPartitioned key is an equivalence class
                 // containing every eq column from either side.
-                let mut cols = eq_keys_to_column_ids(&self.eq_conditions, Side::Left);
-                for rc in eq_keys_to_column_ids(&self.eq_conditions, Side::Right) {
-                    if !cols.contains(&rc) {
-                        cols.push(rc);
-                    }
-                }
+                let cols = shuffle_join_column_ids(&self.eq_conditions);
                 PhysicalPropertySet {
                     distribution: if cols.is_empty() {
                         DistributionSpec::Any
@@ -148,20 +137,7 @@ impl DeriveRequired for PhysicalHashJoinOp {
     ) -> Vec<PhysicalPropertySet> {
         match self.distribution {
             JoinDistribution::Shuffle => {
-                let all_cols: Vec<ColumnId> = self
-                    .eq_conditions
-                    .iter()
-                    .flat_map(|eq| {
-                        let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_id(&eq.left) {
-                            v.push(c);
-                        }
-                        if let Some(c) = typed_expr_to_column_id(&eq.right) {
-                            v.push(c);
-                        }
-                        v
-                    })
-                    .collect();
+                let all_cols = shuffle_join_column_ids(&self.eq_conditions);
                 vec![
                     PhysicalPropertySet {
                         distribution: if all_cols.is_empty() {
@@ -334,6 +310,41 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn shuffle_join_output_and_requirements_use_same_interleaved_key_order() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(11),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+        };
+        let expected = DistributionSpec::shuffle_join([
+            ColumnId(10),
+            ColumnId(20),
+            ColumnId(11),
+            ColumnId(21),
+        ]);
+
+        let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
+        assert_eq!(out.distribution, expected);
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].distribution, expected);
+        assert_eq!(reqs[1].distribution, expected);
     }
 
     // ── Task 17: Broadcast non-preserves-left → output stays Any ─────────────
