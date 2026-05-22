@@ -834,6 +834,11 @@ pub(crate) fn drop_mv(
         ));
     }
 
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies(
+        state,
+        &crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name),
+    )?;
+
     crate::connector::starrocks::managed::ddl::drop_managed_table_with_metadata(
         state,
         &db_name,

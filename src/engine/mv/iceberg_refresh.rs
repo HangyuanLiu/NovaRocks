@@ -7241,6 +7241,14 @@ fn preflight_iceberg_mv_drop(
             target.catalog, target.namespace, target.table
         ));
     }
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies(
+        state,
+        &crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        ),
+    )?;
     Ok(true)
 }
 

@@ -47,6 +47,46 @@ pub(crate) fn managed_mv_dependency_ref(database: &str, table: &str) -> MvDepend
     }
 }
 
+pub(crate) fn iceberg_table_object_ref(
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> MvDependencyObjectRef {
+    MvDependencyObjectRef {
+        catalog: Some(catalog.to_string()),
+        database_or_namespace: namespace.to_string(),
+        name: table.to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    }
+}
+
+pub(crate) fn managed_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
+    MvDependencyObjectRef {
+        catalog: None,
+        database_or_namespace: database.to_string(),
+        name: table.to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::ManagedLake,
+    }
+}
+
+pub(crate) fn ensure_no_downstream_dependencies(
+    state: &Arc<StandaloneState>,
+    upstream: &MvDependencyObjectRef,
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency drop guard read failed: {e}"))?;
+    state
+        .mv_repo
+        .ensure_no_downstream_dependencies(read.as_ref(), upstream)
+        .map_err(|e| e.to_string())
+}
+
 pub(crate) fn stored_definition_dependency_ref(
     definition: &StoredMvDefinition,
     managed_name: Option<(&str, &str)>,

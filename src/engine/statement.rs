@@ -1051,6 +1051,16 @@ pub(crate) fn execute_drop_table_statement(
         .read()
         .expect("connector registry read")
         .catalog_backend(target.backend_name)?;
+    let dependency_ref = if target.backend_name == "iceberg" {
+        crate::engine::mv::dependency::iceberg_table_object_ref(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
+    } else {
+        crate::engine::mv::dependency::managed_table_object_ref(&target.namespace, &target.table)
+    };
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
     match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
         Ok(()) => {
             if target.backend_name == "iceberg" {
