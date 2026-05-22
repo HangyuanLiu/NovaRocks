@@ -65,6 +65,7 @@ pub(crate) enum ResolvedTableRef {
     },
 }
 
+#[allow(dead_code)]
 pub(crate) fn extract_base_table_refs(
     resolved: &[ResolvedTableRef],
 ) -> Result<Vec<IcebergTableRef>, String> {
@@ -159,7 +160,21 @@ pub(crate) fn create_mv(
 
     let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
     validate_managed_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
-    let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
+    let created_at_ms = now_ms();
+    let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
+        state,
+        &analysis.resolved_refs,
+        created_at_ms,
+    )?;
+    let dependency_target =
+        crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name);
+    crate::engine::mv::dependency::validate_no_create_cycle(
+        state,
+        &dependency_target,
+        &resolved_dependencies.dependencies,
+    )
+    .map_err(|e| format!("cannot create materialized view {db_name}.{mv_name}: {e}"))?;
+    let base_refs = resolved_dependencies.base_refs;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
@@ -304,8 +319,7 @@ pub(crate) fn create_mv(
         .map_err(|e| {
             format!("create managed materialized view bootstrap txn metadata failed: {e}")
         })?;
-    let created_at_ms = now_ms();
-    state
+    let mv_definition = state
         .mv_repo
         .create_definition_with_id(
             txn.as_mut(),
@@ -324,6 +338,14 @@ pub(crate) fn create_mv(
             },
         )
         .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
+    state
+        .mv_repo
+        .replace_dependencies_for_mv(
+            txn.as_mut(),
+            mv_definition.mv_id,
+            resolved_dependencies.dependencies,
+        )
+        .map_err(|e| format!("persist materialized view dependencies failed: {e}"))?;
 
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut bootstrapped_tablet_ids = Vec::new();
@@ -812,6 +834,11 @@ pub(crate) fn drop_mv(
         ));
     }
 
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies(
+        state,
+        &crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name),
+    )?;
+
     crate::connector::starrocks::managed::ddl::drop_managed_table_with_metadata(
         state,
         &db_name,
@@ -893,6 +920,7 @@ pub(crate) fn list_mv_rows(
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
+                dependencies: dependency_display_for_mv(state, mv.mv_id)?,
             });
             continue;
         }
@@ -928,9 +956,28 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
+            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
         });
     }
     Ok(rows)
+}
+
+fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(String::new());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency display read failed: {e}"))?;
+    let dependencies = state
+        .mv_repo
+        .list_dependencies_by_downstream(read.as_ref(), mv_id)
+        .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
+    Ok(dependencies
+        .iter()
+        .map(|dep| dep.upstream.display_name())
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 #[derive(Clone, Debug)]
@@ -1536,6 +1583,12 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
             nullable: false,
             logical_type: None,
         },
+        QueryResultColumn {
+            name: "Dependencies".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: None,
+        },
     ];
 
     let schema = Arc::new(Schema::new(vec![
@@ -1547,6 +1600,7 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Field::new("LastRefreshRows", DataType::Utf8, true),
         Field::new("BaseTables", DataType::Utf8, false),
         Field::new("SelectText", DataType::Utf8, false),
+        Field::new("Dependencies", DataType::Utf8, false),
     ]));
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(
@@ -1587,6 +1641,11 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| Some(row.select_text.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| Some(row.dependencies.clone()))
                 .collect::<Vec<_>>(),
         )),
     ];

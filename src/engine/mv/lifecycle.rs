@@ -182,6 +182,7 @@ pub(crate) struct MvListRow {
     pub last_refresh_rows: Option<String>,
     pub base_tables: String,
     pub select_text: String,
+    pub dependencies: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -428,16 +428,49 @@ pub(crate) fn refresh_mv(
             MvStorageEngine::ManagedLake,
         )
     };
-    let backend = backend_by_engine(state, engine)?;
-    run_refresh_lifecycle(
-        backend,
-        RefreshRequest {
-            target,
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: db.to_string(),
-            statement: stmt.clone(),
-        },
-    )?;
+    let requested_object = match engine {
+        MvStorageEngine::Iceberg => crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+            target
+                .catalog
+                .as_deref()
+                .ok_or_else(|| "iceberg MV refresh target missing catalog".to_string())?,
+            &target.database,
+            &target.name,
+        ),
+        MvStorageEngine::ManagedLake => {
+            crate::engine::mv::dependency::managed_mv_dependency_ref(&target.database, &target.name)
+        }
+    };
+    let steps =
+        crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
+    for step in steps {
+        let backend = backend_by_engine(state, step.storage_engine)?;
+        let statement = RefreshMaterializedViewStmt {
+            name: crate::sql::parser::ast::ObjectName {
+                parts: match step.target.catalog.as_deref() {
+                    Some(_) => vec![step.target.database.clone(), step.target.name.clone()],
+                    None => vec![step.target.name.clone()],
+                },
+            },
+            full: stmt.full,
+        };
+        let req = RefreshRequest {
+            target: step.target.clone(),
+            current_catalog: step.target.catalog.clone(),
+            current_database: step.target.database.clone(),
+            statement,
+        };
+        if let Err(err) = run_refresh_lifecycle(backend, req) {
+            if step.object != requested_object {
+                return Err(format!(
+                    "cannot refresh materialized view {}: upstream materialized view {} failed: {err}",
+                    requested_object.display_name().trim_start_matches("mv:"),
+                    step.object.display_name().trim_start_matches("mv:")
+                ));
+            }
+            return Err(err);
+        }
+    }
     Ok(StatementResult::Ok)
 }
 

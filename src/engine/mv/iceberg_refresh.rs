@@ -23,8 +23,8 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::managed::model::{IcebergTableRef, ManagedMvStorageEngine};
 use crate::connector::starrocks::managed::mv_ddl::{
-    analyze_mv_select, canonicalize_iceberg_mv_select_query, extract_base_table_refs, now_ms,
-    output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
+    analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms, output_column_to_table_column,
+    resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::connector::starrocks::managed::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
@@ -98,7 +98,29 @@ pub(crate) fn create_iceberg_mv(
         &canonical_select_query,
     )?;
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
-    let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
+    let created_at_ms = now_ms();
+    let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
+        state,
+        &analysis.resolved_refs,
+        created_at_ms,
+    )?;
+    let dependency_target = crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    );
+    crate::engine::mv::dependency::validate_no_create_cycle(
+        state,
+        &dependency_target,
+        &resolved_dependencies.dependencies,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot create materialized view {}.{}.{}: {e}",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    let base_refs = resolved_dependencies.base_refs;
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
     let aggregate_shape = aggregate_shape_for_layout(&shape);
     let loaded_bases = match &shape {
@@ -315,7 +337,6 @@ pub(crate) fn create_iceberg_mv(
 
         // 4. Persist MV metadata in the repository.
         let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
-        let created_at_ms = now_ms();
         let provider = state
             .metadata_provider
             .as_ref()
@@ -323,7 +344,7 @@ pub(crate) fn create_iceberg_mv(
         let mut txn = provider
             .begin_write("create iceberg materialized view definition")
             .map_err(|e| format!("open iceberg mv definition transaction failed: {e}"))?;
-        state
+        let mv_definition = state
             .mv_repo
             .create_definition(
                 txn.as_mut(),
@@ -341,6 +362,14 @@ pub(crate) fn create_iceberg_mv(
                 },
             )
             .map_err(|e| format!("create iceberg MV repository metadata failed: {e}"))?;
+        state
+            .mv_repo
+            .replace_dependencies_for_mv(
+                txn.as_mut(),
+                mv_definition.mv_id,
+                resolved_dependencies.dependencies.clone(),
+            )
+            .map_err(|e| format!("create iceberg MV dependency metadata failed: {e}"))?;
         txn.commit()
             .map_err(|e| format!("commit iceberg MV repository metadata failed: {e}"))?;
         Ok::<(), String>(())
@@ -7212,6 +7241,14 @@ fn preflight_iceberg_mv_drop(
             target.catalog, target.namespace, target.table
         ));
     }
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies(
+        state,
+        &crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        ),
+    )?;
     Ok(true)
 }
 
@@ -9527,10 +9564,16 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
+        // Dependency resolution now runs before the iceberg target table is
+        // created. With no metadata provider attached to the test state, we
+        // fail fast there and the iceberg target table is never created — so
+        // there is nothing to clean up.
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("missing metadata provider should fail after target create");
-        assert!(err.contains("metadata provider required for iceberg mv"));
-        assert!(err.contains("target cleanup=Ok(())"), "err={err}");
+            .expect_err("missing metadata provider should fail before target create");
+        assert!(
+            err.contains("materialized view dependency resolution requires metadata provider"),
+            "err={err}"
+        );
 
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
@@ -9539,7 +9582,7 @@ mod tests {
         assert!(
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
                 .is_err(),
-            "target table should be dropped after post-create failure"
+            "target table should never have been created"
         );
     }
 
