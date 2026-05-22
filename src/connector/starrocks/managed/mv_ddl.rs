@@ -962,10 +962,7 @@ pub(crate) fn list_mv_rows(
     Ok(rows)
 }
 
-fn dependency_display_for_mv(
-    state: &Arc<StandaloneState>,
-    mv_id: i64,
-) -> Result<String, String> {
+fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(String::new());
     };
