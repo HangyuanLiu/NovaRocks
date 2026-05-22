@@ -24,3 +24,26 @@ impl DeriveRequired for PhysicalDistributionOp {
         vec![PhysicalPropertySet::any()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::PhysicalDistributionOp;
+    use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+
+    #[test]
+    fn distribution_enforcer_outputs_required_source() {
+        let op = PhysicalDistributionOp {
+            spec: DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]),
+        };
+        let props = op.derive_output(&[]);
+        match props.distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(source, HashSource::ShuffleJoin);
+                assert_eq!(cols, vec![ColumnId(1), ColumnId(2)]);
+            }
+            other => panic!("expected ShuffleJoin enforcer output, got {other:?}"),
+        }
+    }
+}

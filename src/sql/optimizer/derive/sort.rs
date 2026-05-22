@@ -76,8 +76,9 @@ impl DeriveRequired for PhysicalSortOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::SortItem;
+    use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::property::HashSource;
 
     #[test]
     fn output_properties_sort_has_gather_and_ordering() {
@@ -101,5 +102,31 @@ mod tests {
         let props = op.derive_output(&[]);
         assert_eq!(props.distribution, DistributionSpec::Gather);
         assert!(matches!(props.ordering, OrderingSpec::Required(_)));
+    }
+
+    #[test]
+    fn analytic_sort_requires_shuffle_agg_on_partition_columns() {
+        let partition = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
+                qualifier: None,
+                column: "k".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+        };
+        let op = PhysicalSortOp {
+            items: vec![],
+            analytic_partition_exprs: vec![partition],
+        };
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        match &reqs[0].distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(7)]);
+            }
+            other => panic!("expected ShuffleAgg([c7]), got {other:?}"),
+        }
     }
 }

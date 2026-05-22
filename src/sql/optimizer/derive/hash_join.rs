@@ -184,6 +184,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::property::HashSource;
 
     fn col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -223,16 +224,9 @@ mod tests {
         // HashPartitioned([10]) becomes HashPartitioned([10, 20]) because the
         // eq `10 = 20` makes both columns equivalent on the join output.
         match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
-                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(
-                    ids.contains(&ColumnId(10)),
-                    "expected ColumnId(10), got {ids:?}"
-                );
-                assert!(
-                    ids.contains(&ColumnId(20)),
-                    "expected ColumnId(20), got {ids:?}"
-                );
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(10), ColumnId(20)]);
             }
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }
@@ -282,7 +276,8 @@ mod tests {
         // index order.
         for (side_label, req) in [("left", &reqs[0]), ("right", &reqs[1])] {
             match &req.distribution {
-                DistributionSpec::HashPartitioned { cols, .. } => {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    assert_eq!(*source, HashSource::ShuffleJoin);
                     assert_eq!(
                         cols.len(),
                         2,
@@ -339,12 +334,33 @@ mod tests {
         ]);
 
         let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
+        match &out.distribution {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleJoin);
+                assert_eq!(
+                    cols.as_slice(),
+                    &[ColumnId(10), ColumnId(20), ColumnId(11), ColumnId(21)]
+                );
+            }
+            other => panic!("expected ShuffleJoin interleaved output key, got {other:?}"),
+        }
         assert_eq!(out.distribution, expected);
 
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].distribution, expected);
-        assert_eq!(reqs[1].distribution, expected);
+        for req in &reqs {
+            match &req.distribution {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    assert_eq!(*source, HashSource::ShuffleJoin);
+                    assert_eq!(
+                        cols.as_slice(),
+                        &[ColumnId(10), ColumnId(20), ColumnId(11), ColumnId(21)]
+                    );
+                }
+                other => panic!("expected ShuffleJoin interleaved required key, got {other:?}"),
+            }
+            assert_eq!(req.distribution, expected);
+        }
     }
 
     // ── Task 17: Broadcast non-preserves-left → output stays Any ─────────────
@@ -437,7 +453,8 @@ mod tests {
         // HashPartitioned with its eq-equivalence partner so a downstream
         // requirement on either side of the eq pair is satisfied.
         match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(
                     ids.contains(&ColumnId(10)),
@@ -548,7 +565,8 @@ mod tests {
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 assert_eq!(cols.len(), 2, "no duplicates expected, got {cols:?}");
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
@@ -572,7 +590,8 @@ mod tests {
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
                 assert!(ids.contains(&ColumnId(20)));
@@ -598,7 +617,8 @@ mod tests {
         };
         let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
         match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
+            DistributionSpec::HashPartitioned { cols, source } => {
+                assert_eq!(*source, HashSource::ShuffleJoin);
                 let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
                 assert!(ids.contains(&ColumnId(10)));
                 assert!(ids.contains(&ColumnId(20)));
