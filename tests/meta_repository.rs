@@ -3339,3 +3339,112 @@ fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
 
     Ok(())
 }
+
+fn iceberg_mv_ref(namespace: &str, table: &str) -> MvDependencyObjectRef {
+    MvDependencyObjectRef {
+        catalog: Some("ice".to_string()),
+        database_or_namespace: namespace.to_string(),
+        name: table.to_string(),
+        object_type: MvDependencyObjectType::MaterializedView,
+        storage_engine: MvDependencyStorageEngine::Iceberg,
+    }
+}
+
+#[test]
+fn mv_repository_replaces_dependencies_and_clears_reverse_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let downstream_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let mv =
+            repository.create_definition(txn.as_mut(), sample_mv_definition_request("select 1"))?;
+        txn.commit()?;
+        mv.mv_id
+    };
+    let old_ref = iceberg_mv_ref("sales", "old_mv");
+    let new_ref = iceberg_mv_ref("sales", "new_mv");
+
+    {
+        let mut txn = provider.begin_write("seed mv dependency")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            downstream_id,
+            vec![CreateMvDependencyRequest {
+                upstream: old_ref.clone(),
+                created_at_ms: 10,
+            }],
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("replace mv dependency")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            downstream_id,
+            vec![CreateMvDependencyRequest {
+                upstream: new_ref.clone(),
+                created_at_ms: 11,
+            }],
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(
+        repository
+            .list_downstream_dependencies(read.as_ref(), &old_ref)?
+            .is_empty()
+    );
+    assert_eq!(
+        repository
+            .list_downstream_dependencies(read.as_ref(), &new_ref)?
+            .iter()
+            .map(|dep| dep.downstream_mv_id)
+            .collect::<Vec<_>>(),
+        vec![downstream_id]
+    );
+    Ok(())
+}
+
+#[test]
+fn mv_repository_reports_downstream_dependents_for_drop_guard()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let downstream_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let mv =
+            repository.create_definition(txn.as_mut(), sample_mv_definition_request("select 1"))?;
+        txn.commit()?;
+        mv.mv_id
+    };
+    let upstream = iceberg_mv_ref("sales", "upstream_mv");
+
+    {
+        let mut txn = provider.begin_write("seed dependency")?;
+        repository.replace_dependencies_for_mv(
+            txn.as_mut(),
+            downstream_id,
+            vec![CreateMvDependencyRequest {
+                upstream: upstream.clone(),
+                created_at_ms: 12,
+            }],
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let err = repository
+        .ensure_no_downstream_dependencies(read.as_ref(), &upstream)
+        .expect_err("upstream should be protected");
+    assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    assert!(
+        err.to_string()
+            .contains("mv:ice.sales.upstream_mv has downstream materialized views")
+    );
+    Ok(())
+}

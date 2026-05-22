@@ -408,6 +408,7 @@ impl MvMetaRepository {
             )));
         }
 
+        self.delete_dependencies_for_mv(txn, lookup.mv_id)?;
         txn.delete(&target_key, ExpectedRevision::Exact(record.revision))?;
         txn.delete(
             &key_by_id(lookup.mv_id)?,
@@ -436,6 +437,7 @@ impl MvMetaRepository {
                 ExpectedRevision::Any,
             )?;
         }
+        self.delete_dependencies_for_mv(txn, mv_id)?;
         txn.delete(
             &key_by_id(mv_id)?,
             ExpectedRevision::Exact(definition.record_revision),
@@ -899,22 +901,7 @@ impl MvMetaRepository {
         downstream_mv_id: i64,
         dependencies: Vec<CreateMvDependencyRequest>,
     ) -> RepositoryResult<Vec<StoredMvDependency>> {
-        // Task 1: inline cleanup of any existing dependency rows for this
-        // downstream MV. Task 2 will refactor this into a public
-        // `delete_dependencies_for_mv` helper.
-        let existing = txn.scan(
-            &key_prefix_dependency_by_downstream(downstream_mv_id)?,
-            None,
-        )?;
-        for record in existing {
-            let dependency: StoredMvDependency =
-                decode_record_payload(&record, MV_DEPENDENCY_KIND, MV_DEPENDENCY_SCHEMA_VERSION)?;
-            txn.delete(&record.key, ExpectedRevision::Exact(record.revision))?;
-            txn.delete(
-                &key_dependency_by_upstream(&dependency.upstream, downstream_mv_id)?,
-                ExpectedRevision::Any,
-            )?;
-        }
+        self.delete_dependencies_for_mv(txn, downstream_mv_id)?;
 
         let mut seen = BTreeSet::new();
         let mut stored = Vec::new();
@@ -932,6 +919,46 @@ impl MvMetaRepository {
             stored.push(dependency);
         }
         Ok(stored)
+    }
+
+    pub fn delete_dependencies_for_mv(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        downstream_mv_id: i64,
+    ) -> RepositoryResult<()> {
+        let existing = self.list_dependencies_by_downstream(txn, downstream_mv_id)?;
+        for dependency in existing {
+            txn.delete(
+                &key_dependency_by_downstream(dependency.downstream_mv_id, &dependency.upstream)?,
+                ExpectedRevision::Any,
+            )?;
+            txn.delete(
+                &key_dependency_by_upstream(&dependency.upstream, dependency.downstream_mv_id)?,
+                ExpectedRevision::Any,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_no_downstream_dependencies(
+        &self,
+        txn: &dyn MetaReadTxn,
+        upstream: &MvDependencyObjectRef,
+    ) -> RepositoryResult<()> {
+        let downstream = self.list_downstream_dependencies(txn, upstream)?;
+        if downstream.is_empty() {
+            return Ok(());
+        }
+        let mut ids = downstream
+            .iter()
+            .map(|dep| dep.downstream_mv_id.to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        Err(RepositoryError::conflict(format!(
+            "{} has downstream materialized views: {}",
+            upstream.display_name(),
+            ids.join(", ")
+        )))
     }
 
     pub fn list_dependencies_by_downstream(
