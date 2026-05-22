@@ -232,6 +232,7 @@ impl DistributionSpec {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn hash_cols(&self) -> Option<&[ColumnId]> {
         match self {
             DistributionSpec::HashPartitioned { cols, .. } => Some(cols.as_slice()),
@@ -239,6 +240,7 @@ impl DistributionSpec {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn hash_source(&self) -> Option<HashSource> {
         match self {
             DistributionSpec::HashPartitioned { source, .. } => Some(*source),
