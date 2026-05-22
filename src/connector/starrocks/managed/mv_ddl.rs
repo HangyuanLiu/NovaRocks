@@ -166,6 +166,14 @@ pub(crate) fn create_mv(
         &analysis.resolved_refs,
         created_at_ms,
     )?;
+    let dependency_target =
+        crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name);
+    crate::engine::mv::dependency::validate_no_create_cycle(
+        state,
+        &dependency_target,
+        &resolved_dependencies.dependencies,
+    )
+    .map_err(|e| format!("cannot create materialized view {db_name}.{mv_name}: {e}"))?;
     let base_refs = resolved_dependencies.base_refs;
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in

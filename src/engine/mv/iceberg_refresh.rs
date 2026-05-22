@@ -104,6 +104,22 @@ pub(crate) fn create_iceberg_mv(
         &analysis.resolved_refs,
         created_at_ms,
     )?;
+    let dependency_target = crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    );
+    crate::engine::mv::dependency::validate_no_create_cycle(
+        state,
+        &dependency_target,
+        &resolved_dependencies.dependencies,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot create materialized view {}.{}.{}: {e}",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
     let base_refs = resolved_dependencies.base_refs;
     let shape = classify_incremental_mv_query(&canonical_select_query)?;
     let aggregate_shape = aggregate_shape_for_layout(&shape);

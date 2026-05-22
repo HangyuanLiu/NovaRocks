@@ -146,6 +146,127 @@ pub(crate) fn resolve_create_mv_dependencies(
     })
 }
 
+pub(crate) fn validate_no_cycle_for_edges(
+    new_target: &MvDependencyObjectRef,
+    new_upstreams: &[MvDependencyObjectRef],
+    existing_edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
+) -> Result<(), String> {
+    let mut graph: std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>> =
+        std::collections::BTreeMap::new();
+    for (downstream, upstreams) in existing_edges {
+        graph.insert(downstream.clone(), upstreams.clone());
+    }
+    graph.insert(new_target.clone(), new_upstreams.to_vec());
+
+    fn visit(
+        graph: &std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>>,
+        node: &MvDependencyObjectRef,
+        target: &MvDependencyObjectRef,
+        path: &mut Vec<MvDependencyObjectRef>,
+    ) -> Option<Vec<MvDependencyObjectRef>> {
+        if path.contains(node) {
+            return None;
+        }
+        path.push(node.clone());
+        for upstream in graph.get(node).cloned().unwrap_or_default() {
+            if &upstream == target {
+                let mut cycle = path.clone();
+                cycle.push(upstream);
+                return Some(cycle);
+            }
+            if upstream.object_type == MvDependencyObjectType::MaterializedView
+                && let Some(cycle) = visit(graph, &upstream, target, path)
+            {
+                return Some(cycle);
+            }
+        }
+        path.pop();
+        None
+    }
+
+    if let Some(cycle) = visit(&graph, new_target, new_target, &mut Vec::new()) {
+        let display = cycle
+            .iter()
+            .map(MvDependencyObjectRef::display_name)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        return Err(format!("dependency cycle detected: {display}"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_no_create_cycle(
+    state: &Arc<StandaloneState>,
+    new_target: &MvDependencyObjectRef,
+    new_dependencies: &[CreateMvDependencyRequest],
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open MV dependency graph read failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load MV definitions for dependency cycle check failed: {e}"))?;
+    let mut edges = Vec::new();
+    for definition in definitions {
+        let target = stored_definition_dependency_ref_from_state(state, &definition)?;
+        let dependencies = state
+            .mv_repo
+            .list_dependencies_by_downstream(read.as_ref(), definition.mv_id)
+            .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?
+            .into_iter()
+            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+            .map(|dep| dep.upstream)
+            .collect::<Vec<_>>();
+        edges.push((target, dependencies));
+    }
+    let new_upstreams = new_dependencies
+        .iter()
+        .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+        .map(|dep| dep.upstream.clone())
+        .collect::<Vec<_>>();
+    validate_no_cycle_for_edges(new_target, &new_upstreams, &edges)
+}
+
+fn stored_definition_dependency_ref_from_state(
+    state: &Arc<StandaloneState>,
+    definition: &StoredMvDefinition,
+) -> Result<MvDependencyObjectRef, String> {
+    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
+        return stored_definition_dependency_ref(definition, None);
+    }
+    let managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock");
+    let table = managed
+        .snapshot
+        .tables
+        .iter()
+        .find(|table| table.table_id == definition.mv_id)
+        .ok_or_else(|| {
+            format!(
+                "managed-lake MV definition {} is missing runtime table metadata",
+                definition.mv_id
+            )
+        })?;
+    let database = managed
+        .snapshot
+        .databases
+        .iter()
+        .find(|database| database.db_id == table.db_id)
+        .ok_or_else(|| {
+            format!(
+                "managed-lake MV definition {} is missing runtime database metadata",
+                definition.mv_id
+            )
+        })?;
+    stored_definition_dependency_ref(definition, Some((&database.name, &table.name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,4 +283,34 @@ mod tests {
         assert_eq!(table.display_name(), "ice.sales.orders");
         assert_eq!(mv.display_name(), "mv:ice.sales.orders_mv");
     }
+
+    #[test]
+    fn dependency_cycle_detector_rejects_new_back_edge() {
+        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
+        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
+        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
+        let existing = vec![
+            (mv_a.clone(), vec![mv_b.clone()]),
+            (mv_b.clone(), vec![mv_c.clone()]),
+        ];
+
+        let err = validate_no_cycle_for_edges(&mv_c, &[mv_a.clone()], &existing)
+            .expect_err("c -> a should form a cycle");
+        assert_eq!(
+            err,
+            "dependency cycle detected: mv:ice.sales.mv_c -> mv:ice.sales.mv_a -> mv:ice.sales.mv_b -> mv:ice.sales.mv_c"
+        );
+    }
+
+    #[test]
+    fn dependency_cycle_detector_accepts_dag() {
+        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
+        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
+        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
+        let existing = vec![(mv_b.clone(), vec![mv_a.clone()])];
+
+        validate_no_cycle_for_edges(&mv_c, &[mv_b], &existing).expect("dag should be accepted");
+        let _ = mv_a;
+    }
 }
+
