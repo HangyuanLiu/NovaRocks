@@ -159,7 +159,7 @@ mod tests {
         match &reqs[0].distribution {
             DistributionSpec::HashPartitioned { cols, source } => {
                 assert_eq!(*source, HashSource::ShuffleAgg);
-                assert_eq!(cols.len(), 2, "Hash on both g and x");
+                assert_eq!(cols.as_slice(), &[ColumnId(4), ColumnId(5)]);
             }
             other => panic!("expected ShuffleAgg on both g and x, got {other:?}"),
         }

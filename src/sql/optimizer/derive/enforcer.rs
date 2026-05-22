@@ -34,16 +34,25 @@ mod tests {
 
     #[test]
     fn distribution_enforcer_outputs_required_source() {
-        let op = PhysicalDistributionOp {
-            spec: DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]),
-        };
-        let props = op.derive_output(&[]);
-        match props.distribution {
-            DistributionSpec::HashPartitioned { cols, source } => {
-                assert_eq!(source, HashSource::ShuffleJoin);
-                assert_eq!(cols, vec![ColumnId(1), ColumnId(2)]);
+        for (spec, expected_source) in [
+            (
+                DistributionSpec::shuffle_agg([ColumnId(1), ColumnId(2)]),
+                HashSource::ShuffleAgg,
+            ),
+            (
+                DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]),
+                HashSource::ShuffleJoin,
+            ),
+        ] {
+            let op = PhysicalDistributionOp { spec };
+            let props = op.derive_output(&[]);
+            match props.distribution {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    assert_eq!(source, expected_source);
+                    assert_eq!(cols, vec![ColumnId(1), ColumnId(2)]);
+                }
+                other => panic!("expected hash enforcer output, got {other:?}"),
             }
-            other => panic!("expected ShuffleJoin enforcer output, got {other:?}"),
         }
     }
 }

@@ -121,6 +121,7 @@ mod tests {
         };
 
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
         match &reqs[0].distribution {
             DistributionSpec::HashPartitioned { cols, source } => {
                 assert_eq!(*source, HashSource::ShuffleAgg);
