@@ -551,8 +551,9 @@ mod cascaded_derivation_tests {
         assert!(cost.is_finite(), "search must produce a feasible plan");
 
         // Window group's winner: no enforcer between Window and the
-        // Broadcast Join below. (Broadcast inherits Hash([c10]) from the
-        // SHUFFLE_JOIN below, which is a superset of what Window needs.)
+        // Broadcast Join below. This fixture intentionally uses the same
+        // ColumnId on both join sides, so the inherited hash key is exactly
+        // the window partition key after deduplication.
         let w = ctx
             .winners
             .get(&(root, PhysicalPropertySet::any()))
@@ -562,8 +563,7 @@ mod cascaded_derivation_tests {
             "Window should reuse Broadcast Join's left distribution; no enforcer needed. winner = {w:?}"
         );
 
-        // The Broadcast Join's winner output must be Hash([c10]) (inherited
-        // from the SHUFFLE_JOIN's natural Hash([c10]) output).
+        // The Broadcast Join's winner output must still contain c10.
         let bj_req = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
             ordering: OrderingSpec::Any,

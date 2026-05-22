@@ -51,12 +51,9 @@ fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec
 /// equivalence-class partner from each matching eq pair.
 ///
 /// Rationale: after `JOIN ON L = R`, output rows satisfy `L == R`, so the
-/// output is HashPartitioned by `L` iff it is HashPartitioned by `R`.
-/// Carrying both ids in the output's HashPartitioned vector lets the
-/// optimizer's containAll `satisfies` check accept a downstream requirement
-/// on either side — even when join children get re-oriented (commutativity
-/// or `orient_eq_pair` ambiguity from colliding column names) so that the
-/// physical hash key is on the other side.
+/// output can expose both ids as equivalent hash keys for downstream
+/// source-aware distribution checks. G4 keeps the source on the enriched
+/// distribution; it does not rely on the old global containAll rule.
 fn expand_with_eq_equivalents(
     cols: &[ColumnId],
     eq_conditions: &[PhysicalHashJoinEqCondition],
