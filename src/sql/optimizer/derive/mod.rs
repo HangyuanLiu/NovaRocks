@@ -200,13 +200,13 @@ mod tests {
 
         let enforcers = needed_enforcers(&required, &provided);
         assert_eq!(enforcers.len(), 1);
-        assert!(matches!(
-            enforcers[0],
-            EnforcerKind::Distribution(DistributionSpec::HashPartitioned {
-                source: HashSource::ShuffleAgg,
-                ..
-            })
-        ));
+        match &enforcers[0] {
+            EnforcerKind::Distribution(DistributionSpec::HashPartitioned { cols, source }) => {
+                assert_eq!(*source, HashSource::ShuffleAgg);
+                assert_eq!(cols.as_slice(), &[ColumnId(10)]);
+            }
+            other => panic!("expected ShuffleAgg([c10]) distribution enforcer, got {other:?}"),
+        }
     }
 }
 
