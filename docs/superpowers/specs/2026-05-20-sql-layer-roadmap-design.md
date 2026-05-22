@@ -242,9 +242,15 @@ multi-level Window sharing distribution; Colocate join detection.
 ### §2.3 G4 — `HashDistribution` source type (P1)
 
 **Goal**: Add a `HashSource` tag to `HashPartitioned`:
-`HashPartitioned(Vec<ColumnId>, HashSource)` where `HashSource ∈ {Agg, Join, Bucket, Enforce}`.
-Update `satisfies` to branch on source type: `Agg` allows contain-all (superset satisfies);
-`Join` requires exact-match.
+`HashPartitioned { cols: Vec<ColumnId>, source: HashSource }`. First PR keeps the
+NovaRocks-scoped source set to `HashSource ∈ {ShuffleAgg, ShuffleJoin}`. `ShuffleAgg`
+covers aggregate, window, and partitioned sort requirements; `ShuffleJoin` covers
+shuffle hash join requirements/output. Do not introduce StarRocks `LOCAL`, `BUCKET`,
+or `SHUFFLE_ENFORCE` until NovaRocks has a real scan-local/bucket-aware producer.
+
+Update `satisfies` to branch on source type. `ShuffleAgg` uses the aggregate-safe
+direction: `hash(a)` can satisfy `hash(a, b)`, but `hash(a, b)` cannot satisfy
+`hash(a)`. `ShuffleJoin` remains strict/exact in the first PR.
 
 **Entry files**:
 - `src/sql/optimizer/property.rs` — `DistributionSpec`, `satisfies`
