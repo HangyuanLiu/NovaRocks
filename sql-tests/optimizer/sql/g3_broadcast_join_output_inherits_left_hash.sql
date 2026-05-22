@@ -1,11 +1,11 @@
 -- @tags=optimizer,g3
 -- Test Objective:
--- 1. Lock in the G3 contract: a BROADCAST Inner Join above a SHUFFLE
---    Hash Join inherits the SHUFFLE join's natural Hash([eq_keys])
---    output. Downstream Hash-required operators (here a Window keyed on
---    one of those columns) reuse the distribution and skip an EXCHANGE.
+-- 1. Lock in the G3 contract: a BROADCAST Inner Join preserves its left
+--    child's distribution through passthrough join output derivation.
+--    G4 source-aware semantics then require a ShuffleAgg exchange before
+--    a downstream Window keyed on a narrower analytic partition.
 -- 2. Regression guard for "Broadcast preserves left output" + the
---    `satisfyContainAll` superset rule.
+--    G4 rule that ShuffleJoin output does not satisfy narrower ShuffleAgg.
 DROP TABLE IF EXISTS ${case_db}.g3_bj_left;
 DROP TABLE IF EXISTS ${case_db}.g3_bj_right;
 DROP TABLE IF EXISTS ${case_db}.g3_bj_small;
@@ -16,8 +16,8 @@ INSERT INTO ${case_db}.g3_bj_left  VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.g3_bj_right VALUES (1, 100), (2, 200);
 INSERT INTO ${case_db}.g3_bj_small VALUES (1, 1000);
 -- Inner BROADCAST(small) join above an INNER SHUFFLE join keyed on a.k.
--- Window keyed on a.k reuses the join chain's Hash([a.k, b.k]) without
--- a redundant HASH EXCHANGE above the Broadcast.
+-- Window keyed on a.k must add a ShuffleAgg HASH EXCHANGE above the
+-- Broadcast output instead of reusing the ShuffleJoin source directly.
 EXPLAIN VERBOSE
 SELECT a.k, a.v, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v) AS rn
 FROM ${case_db}.g3_bj_left  a
