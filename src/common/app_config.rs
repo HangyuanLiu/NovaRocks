@@ -223,12 +223,6 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct StandaloneTableConfig {
-    pub name: String,
-    pub path: PathBuf,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct MetadataConfig {
     #[serde(default)]
@@ -279,8 +273,6 @@ pub struct StandaloneServerConfig {
     pub mv_refresh_scheduler_failure_backoff_ms: i64,
     #[serde(default = "default_standalone_mv_refresh_scheduler_max_failure_backoff_ms")]
     pub mv_refresh_scheduler_max_failure_backoff_ms: i64,
-    #[serde(default)]
-    pub tables: Vec<StandaloneTableConfig>,
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -323,7 +315,6 @@ impl Default for StandaloneServerConfig {
                 default_standalone_mv_refresh_scheduler_failure_backoff_ms(),
             mv_refresh_scheduler_max_failure_backoff_ms:
                 default_standalone_mv_refresh_scheduler_max_failure_backoff_ms(),
-            tables: Vec::new(),
         }
     }
 }
@@ -1171,7 +1162,6 @@ starlet_port = 19070
                 mv_refresh_scheduler_max_concurrent: 1,
                 mv_refresh_scheduler_failure_backoff_ms: 60_000,
                 mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
-                tables: Vec::new(),
             })
         );
     }

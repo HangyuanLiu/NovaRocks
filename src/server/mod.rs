@@ -18,9 +18,7 @@ use tokio::task;
 use tracing::{info, warn};
 
 use crate::common::failpoint::{self, FailPointMode};
-use crate::novarocks_config::{
-    NovaRocksConfig, StandaloneServerConfig as AppStandaloneServerConfig,
-};
+use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
 use self::encoding::write_query_result;
@@ -37,17 +35,10 @@ const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneTableConfig {
-    pub name: String,
-    pub path: PathBuf,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneServerOptions {
     pub config_path: Option<PathBuf>,
     pub mysql_port: Option<u16>,
-    pub tables: Vec<StandaloneTableConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,7 +46,6 @@ struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
     mysql_port: u16,
     user: String,
-    tables: Vec<StandaloneTableConfig>,
     refresh_coordinator: RefreshCoordinatorConfig,
 }
 
@@ -64,7 +54,6 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
     let engine = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: resolved.config_path.clone(),
     })?;
-    preload_tables(&engine, &resolved.tables)?;
     crate::engine::register_stream_load_engine(engine.clone());
     let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
         &engine,
@@ -88,15 +77,9 @@ fn resolve_server_options(
 ) -> Result<ResolvedStandaloneServerOptions, String> {
     let active_config_path = resolve_active_config_path(opts.config_path.as_deref());
     let file_cfg = load_active_config(active_config_path.as_deref())?;
-    let config_base_dir = active_config_path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
 
     let mut mysql_port = DEFAULT_MYSQL_PORT;
     let mut user = ROOT_USER.to_string();
-    let mut tables = BTreeMap::new();
     let mut refresh_coordinator = RefreshCoordinatorConfig::default();
 
     if let Some(app_cfg) = file_cfg.as_ref()
@@ -110,30 +93,17 @@ fn resolve_server_options(
             ));
         }
         user = standalone.user.clone();
-        merge_config_tables(&mut tables, standalone, &config_base_dir)?;
         refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
     }
 
     if let Some(port) = opts.mysql_port {
         mysql_port = port;
     }
-    for table in &opts.tables {
-        let key = normalize_identifier(&table.name)?;
-        tables.insert(
-            key,
-            StandaloneTableConfig {
-                name: normalize_identifier(&table.name)?,
-                path: table.path.clone(),
-            },
-        );
-    }
-    let tables = tables.into_values().collect::<Vec<_>>();
 
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
-        tables,
         refresh_coordinator,
     })
 }
@@ -161,39 +131,6 @@ fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, St
             .map_err(|e| format!("load config {} failed: {e}", path.display())),
         _ => Ok(None),
     }
-}
-
-fn merge_config_tables(
-    tables: &mut BTreeMap<String, StandaloneTableConfig>,
-    standalone: &AppStandaloneServerConfig,
-    base_dir: &Path,
-) -> Result<(), String> {
-    for table in &standalone.tables {
-        let key = normalize_identifier(&table.name)?;
-        let path = if table.path.is_absolute() {
-            table.path.clone()
-        } else {
-            base_dir.join(&table.path)
-        };
-        tables.insert(
-            key,
-            StandaloneTableConfig {
-                name: normalize_identifier(&table.name)?,
-                path,
-            },
-        );
-    }
-    Ok(())
-}
-
-fn preload_tables(
-    engine: &StandaloneNovaRocks,
-    tables: &[StandaloneTableConfig],
-) -> Result<(), String> {
-    for table in tables {
-        engine.register_parquet_table(&table.name, &table.path)?;
-    }
-    Ok(())
 }
 
 async fn serve_forever(
