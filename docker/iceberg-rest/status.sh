@@ -67,6 +67,7 @@ echo
 echo "Generated environment:"
 echo "  env: $exports_file"
 echo "  standalone config: ${NOVAROCKS_STANDALONE_CONFIG:-$runtime_dir/standalone-managed-lake.toml}"
+echo "  scheduler standalone config: ${NOVAROCKS_STANDALONE_SCHEDULER_CONFIG:-$runtime_dir/standalone-managed-lake-scheduler.toml}"
 echo "  sql-test config: ${NOVAROCKS_SQL_TEST_CONFIG:-$runtime_dir/sql-test.conf}"
 echo "  REST catalog SQL: ${NOVAROCKS_ICE_REST_CATALOG_SQL:-$runtime_dir/ice-rest-catalog.sql}"
 echo "  REST warehouse: ${NOVAROCKS_ICEBERG_REST_WAREHOUSE:-unknown}"

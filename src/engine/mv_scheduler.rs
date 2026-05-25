@@ -335,7 +335,7 @@ impl RefreshCoordinator {
                     continue;
                 };
                 match self.observed_snapshots.get(&key).copied() {
-                    Some(previous) if snapshot_id > previous => {
+                    Some(previous) if snapshot_id != previous => {
                         self.observed_snapshots.insert(key, snapshot_id);
                         should_enqueue = true;
                     }
@@ -1292,6 +1292,21 @@ mod tests {
 
         assert_eq!(coordinator.pending_mv_ids_for_test(), vec![7]);
         assert!(!coordinator.enqueue_refresh(7, RefreshTaskReason::SnapshotChange));
+    }
+
+    #[test]
+    fn snapshot_watch_enqueues_when_snapshot_id_changes_without_monotonicity() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.tbl", 200);
+        let definition = async_on_change_definition(7, vec!["ice.ns.tbl"]);
+        let mut source = FakeSnapshotSource::new([("ice.ns.tbl", Ok(Some(100)))]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch succeeds");
+
+        assert_eq!(coordinator.pending_mv_ids_for_test(), vec![7]);
     }
 
     #[test]
