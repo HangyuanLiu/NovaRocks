@@ -806,19 +806,18 @@ mod tests {
 
     #[test]
     fn parse_alter_mv_set_refresh_async_interval() {
-        let stmt =
-            parse_one("ALTER MATERIALIZED VIEW analytics.mv1 SET REFRESH ASYNC EVERY INTERVAL 2 HOURS");
+        let stmt = parse_one(
+            "ALTER MATERIALIZED VIEW analytics.mv1 SET REFRESH ASYNC EVERY INTERVAL 2 HOURS",
+        );
         let Statement::AlterMaterializedView(alter) = stmt else {
             panic!("expected ALTER MATERIALIZED VIEW");
         };
         assert_eq!(alter.name.parts, vec!["analytics", "mv1"]);
         assert_eq!(
             alter.action,
-            AlterMaterializedViewAction::SetRefresh(
-                MaterializedViewRefreshPolicy::AsyncInterval {
-                    interval_ms: 7_200_000
-                }
-            )
+            AlterMaterializedViewAction::SetRefresh(MaterializedViewRefreshPolicy::AsyncInterval {
+                interval_ms: 7_200_000
+            })
         );
     }
 
@@ -839,8 +838,9 @@ mod tests {
 
     #[test]
     fn parse_alter_mv_rejects_refresh_immediate() {
-        let err = crate::sql::parser::parse_sql("ALTER MATERIALIZED VIEW mv1 SET REFRESH IMMEDIATE")
-            .expect_err("should reject");
+        let err =
+            crate::sql::parser::parse_sql("ALTER MATERIALIZED VIEW mv1 SET REFRESH IMMEDIATE")
+                .expect_err("should reject");
         assert!(
             err.contains("REFRESH IMMEDIATE is not supported yet"),
             "err={err}"
