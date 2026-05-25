@@ -3264,10 +3264,8 @@ mod tests {
 
     #[test]
     fn parse_alter_column_comment_empty_string() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ALTER COLUMN c COMMENT ''",
-        )
-        .unwrap();
+        let stmt = super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c COMMENT ''")
+            .unwrap();
         let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
             panic!("expected UpdateComment");
         };

@@ -2360,8 +2360,11 @@ pub(crate) fn apply_comment_at(
     comment: &str,
 ) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
-    let new_fields =
-        comment_in_fields(schema.as_struct().fields().to_vec(), path.segments(), comment)?;
+    let new_fields = comment_in_fields(
+        schema.as_struct().fields().to_vec(),
+        path.segments(),
+        comment,
+    )?;
     let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
     Schema::builder()
         .with_fields(arc_fields)

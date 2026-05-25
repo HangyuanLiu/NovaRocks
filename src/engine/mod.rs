@@ -1764,7 +1764,10 @@ fn build_iceberg_create_table_ddl(
             Type::Primitive(PrimitiveType::Fixed(n)) => format!("BINARY({n})"),
             Type::Primitive(PrimitiveType::Binary) => "BINARY".to_string(),
             Type::Primitive(PrimitiveType::Variant) => "VARIANT".to_string(),
-            Type::List(l) => format!("ARRAY<{}>", iceberg_type_to_sql(&l.element_field.field_type)),
+            Type::List(l) => format!(
+                "ARRAY<{}>",
+                iceberg_type_to_sql(&l.element_field.field_type)
+            ),
             Type::Map(m) => format!(
                 "MAP<{},{}>",
                 iceberg_type_to_sql(&m.key_field.field_type),
