@@ -1910,6 +1910,19 @@ fn infer_scalar_function_return_type(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<DataType, String> {
+    // Step B: registry-first. The central signature registry covers
+    // ~250 scalar built-ins (including the cast-match `coalesce`/`if`/
+    // `ifnull` family). When it resolves, its answer wins. The legacy
+    // match below remains for corner cases the registry can't model:
+    // lambda-bodied functions (`array_map`, `transform_*`), composite-
+    // type-aware extractors (`__array_element_at`, `map_keys`), and
+    // permissive type fallbacks (`date_trunc(Utf8, Utf8) -> Datetime`).
+    // Most call sites already try the registry first via
+    // `compile_typed_function_call_with_hint` — this second check keeps
+    // direct callers (tests, sibling helpers) on the same answer.
+    if let Ok(t) = crate::sql::functions::resolve_scalar_function(name, arg_types) {
+        return Ok(t);
+    }
     match name {
         // String functions
         "upper"

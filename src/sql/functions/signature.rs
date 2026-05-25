@@ -57,11 +57,21 @@ pub(crate) enum TypeSpec {
 /// `args` is the parameter list. If `variadic` is true, the last element of
 /// `args` is repeated to absorb extra positional arguments (matches the
 /// `concat(str, str, ...)` style).
+///
+/// `widening` opts the signature into the resolver's widening-cast match
+/// pass. Default-off: only the `coalesce` / `if` / `ifnull` / `case` /
+/// `nvl` / `nullif` family — whose return type is the wider type of all
+/// argument types — should enable this. Structural polymorphic
+/// signatures like `array_append(List<T>, T) -> List<T>` must stay
+/// `widening: false` so a call like `array_append(List<Int64>, Utf8)`
+/// is correctly rejected (instead of silently widening `T` to `Utf8`
+/// and producing `List<Utf8>`).
 #[derive(Clone, Debug)]
 pub(crate) struct Signature {
     pub(crate) args: Vec<TypeSpec>,
     pub(crate) ret: TypeSpec,
     pub(crate) variadic: bool,
+    pub(crate) widening: bool,
 }
 
 impl Signature {
@@ -70,6 +80,7 @@ impl Signature {
             args,
             ret,
             variadic: false,
+            widening: false,
         }
     }
 
@@ -78,7 +89,19 @@ impl Signature {
             args,
             ret,
             variadic: true,
+            widening: false,
         }
+    }
+
+    /// Mark this signature as widening: type variables `Any(name)` will be
+    /// merged via `wider_type` when they appear at multiple positions with
+    /// conflicting concrete types. Use this only for functions like
+    /// `coalesce` / `if` / `ifnull` / `case` whose semantics genuinely
+    /// produce the wider type — not for structural polymorphism like
+    /// `array_append(List<T>, T)`.
+    pub(crate) fn with_widening(mut self) -> Self {
+        self.widening = true;
+        self
     }
 }
 
@@ -180,6 +203,22 @@ pub(crate) fn realize(
     })
 }
 
+/// How `Any(name)` is bound when the same variable shows up at multiple
+/// positions in one signature.
+///
+/// `Strict` requires every occurrence to bind to the same concrete type
+/// — used by the polymorphic match pass.
+///
+/// `Widening` merges conflicting bindings via [`crate::sql::types::wider_type`]
+/// — used by the widening-cast match pass, which is what makes a call
+/// like `coalesce(Int8, Int64)` match the signature
+/// `coalesce(Any("T"), Any("T"), ...) -> Any("T")` and yield `Int64`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BindMode {
+    Strict,
+    Widening,
+}
+
 /// Type-variable bindings produced by polymorphic matching.
 #[derive(Default, Debug)]
 pub(crate) struct Bindings {
@@ -204,6 +243,27 @@ impl Bindings {
         self.entries.push((name, dt.clone()));
         true
     }
+
+    /// Widening bind: if `name` is unbound, bind it to `dt`. If `name` is
+    /// already bound to some `existing`, replace the binding with
+    /// `wider_type(existing, dt)`. Always returns `true` — failure to widen
+    /// means the two types have no common supertype, but that yields
+    /// `wider_type == Utf8` (a deliberate fall-back in NovaRocks today),
+    /// which we accept; downstream codegen / executor will error if the
+    /// widened type is actually nonsensical.
+    pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
+        if let Some(existing) = self.lookup(name) {
+            let widened = crate::sql::types::wider_type(&existing, dt);
+            for entry in self.entries.iter_mut() {
+                if entry.0 == name {
+                    entry.1 = widened.clone();
+                }
+            }
+            return true;
+        }
+        self.entries.push((name, dt.clone()));
+        true
+    }
 }
 
 /// Polymorphic match: try to unify each `spec` against `dt`, recording any
@@ -212,16 +272,27 @@ impl Bindings {
 ///
 /// Anchor variants behave like `anchor_matches`; `Any(name)` binds the
 /// variable; container variants recurse.
+///
+/// `mode` selects how `Any(name)` handles a repeated occurrence:
+/// `BindMode::Strict` rejects different concrete types,
+/// `BindMode::Widening` merges them via `wider_type`. The resolver runs
+/// this twice: once strict (pass 2) and once widening (pass 3, "cast
+/// match") for the few functions like `coalesce` / `if` / `ifnull` /
+/// `case` whose return type is the widening of all argument types.
 pub(crate) fn unify(
     spec: &TypeSpec,
     dt: &DataType,
     bindings: &mut Bindings,
+    mode: BindMode,
 ) -> bool {
     match spec {
-        TypeSpec::Any(name) => bindings.bind(name, dt),
+        TypeSpec::Any(name) => match mode {
+            BindMode::Strict => bindings.bind(name, dt),
+            BindMode::Widening => bindings.bind_widening(name, dt),
+        },
         TypeSpec::List(inner_spec) => match dt {
             DataType::List(field) | DataType::LargeList(field) => {
-                unify(inner_spec, field.data_type(), bindings)
+                unify(inner_spec, field.data_type(), bindings, mode)
             }
             _ => false,
         },
@@ -233,8 +304,8 @@ pub(crate) fn unify(
                 if fields.len() != 2 {
                     return false;
                 }
-                unify(key_spec, fields[0].data_type(), bindings)
-                    && unify(value_spec, fields[1].data_type(), bindings)
+                unify(key_spec, fields[0].data_type(), bindings, mode)
+                    && unify(value_spec, fields[1].data_type(), bindings, mode)
             }
             _ => false,
         },
@@ -309,17 +380,28 @@ mod tests {
     fn unify_binds_type_variable() {
         let spec = TypeSpec::Any("T");
         let mut b = Bindings::default();
-        assert!(unify(&spec, &DataType::Int64, &mut b));
+        assert!(unify(&spec, &DataType::Int64, &mut b, BindMode::Strict));
         assert_eq!(b.lookup("T"), Some(DataType::Int64));
     }
 
     #[test]
-    fn unify_rejects_inconsistent_binding() {
-        // `f(T, T)` called with `(Int64, Utf8)` must fail.
+    fn unify_strict_rejects_inconsistent_binding() {
+        // `f(T, T)` called with `(Int64, Utf8)` must fail in strict mode.
         let arg_spec = TypeSpec::Any("T");
         let mut b = Bindings::default();
-        assert!(unify(&arg_spec, &DataType::Int64, &mut b));
-        assert!(!unify(&arg_spec, &DataType::Utf8, &mut b));
+        assert!(unify(&arg_spec, &DataType::Int64, &mut b, BindMode::Strict));
+        assert!(!unify(&arg_spec, &DataType::Utf8, &mut b, BindMode::Strict));
+    }
+
+    #[test]
+    fn unify_widening_merges_conflicting_bindings() {
+        // `coalesce(T, T)` called with `(Int8, Int64)` in widening mode
+        // binds T to the wider type (Int64).
+        let arg_spec = TypeSpec::Any("T");
+        let mut b = Bindings::default();
+        assert!(unify(&arg_spec, &DataType::Int8, &mut b, BindMode::Widening));
+        assert!(unify(&arg_spec, &DataType::Int64, &mut b, BindMode::Widening));
+        assert_eq!(b.lookup("T"), Some(DataType::Int64));
     }
 
     #[test]
@@ -328,8 +410,8 @@ mod tests {
         let arg0 = TypeSpec::List(Box::new(TypeSpec::Any("T")));
         let arg1 = TypeSpec::Any("T");
         let mut b = Bindings::default();
-        assert!(unify(&arg0, &list_of(DataType::Int64), &mut b));
-        assert!(unify(&arg1, &DataType::Int64, &mut b));
+        assert!(unify(&arg0, &list_of(DataType::Int64), &mut b, BindMode::Strict));
+        assert!(unify(&arg1, &DataType::Int64, &mut b, BindMode::Strict));
         assert_eq!(b.lookup("T"), Some(DataType::Int64));
     }
 

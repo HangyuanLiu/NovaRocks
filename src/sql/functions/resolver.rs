@@ -20,7 +20,7 @@
 use arrow::datatypes::DataType;
 
 use super::registry;
-use super::signature::{Bindings, Signature, anchor_matches, realize, unify};
+use super::signature::{BindMode, Bindings, Signature, anchor_matches, realize, unify};
 
 /// Why a function call could not be resolved against the registry.
 ///
@@ -77,10 +77,27 @@ pub(crate) fn resolve_scalar_function(
         }
     }
 
-    // Pass 2: polymorphic — `Any(name)` variants are allowed to bind.
+    // Pass 2: polymorphic-strict — `Any(name)` binds with equality.
+    // Same name occurring twice must bind to the same concrete type.
     for sig in candidates {
         let mut bindings = Bindings::default();
-        if polymorphic_matches(sig, arg_types, &mut bindings) {
+        if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Strict) {
+            return realize(&sig.ret, &bindings).map_err(ResolveError::BadSignature);
+        }
+    }
+
+    // Pass 3: polymorphic-widening (StarRocks "cast match"). Only
+    // signatures explicitly registered with `with_widening()` opt in
+    // — e.g. `coalesce(Any("T"), ...) -> Any("T")`. Structural
+    // polymorphic signatures like `array_append(List<T>, T) -> List<T>`
+    // are deliberately excluded so a mismatched element type fails the
+    // resolver instead of silently widening through the type variable.
+    for sig in candidates {
+        if !sig.widening {
+            continue;
+        }
+        let mut bindings = Bindings::default();
+        if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Widening) {
             return realize(&sig.ret, &bindings).map_err(ResolveError::BadSignature);
         }
     }
@@ -106,18 +123,19 @@ fn strict_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
 }
 
 /// True iff every spec unifies (anchor- or variable-binding) with the
-/// corresponding argument.
+/// corresponding argument, under the given `BindMode`.
 fn polymorphic_matches(
     sig: &Signature,
     arg_types: &[DataType],
     bindings: &mut Bindings,
+    mode: BindMode,
 ) -> bool {
     if !check_arity(sig, arg_types.len()) {
         return false;
     }
     for (idx, dt) in arg_types.iter().enumerate() {
         let spec = signature_spec_at(sig, idx);
-        if !unify(spec, dt, bindings) {
+        if !unify(spec, dt, bindings, mode) {
             return false;
         }
     }
@@ -222,6 +240,43 @@ mod tests {
             &[list_of(DataType::Int64), DataType::Utf8],
         );
         assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
+    }
+
+    #[test]
+    fn resolve_coalesce_widens_through_cast_match() {
+        // `coalesce(Int8, Int64)` → Int64 via Pass 3 (widening cast).
+        // Strict and polymorphic-strict both fail (T can't be Int8 and
+        // Int64 at once), so this exercises the widening pass.
+        let r = resolve_scalar_function("coalesce", &[DataType::Int8, DataType::Int64]);
+        assert_eq!(r, Ok(DataType::Int64));
+    }
+
+    #[test]
+    fn resolve_if_widens_then_and_else() {
+        // `if(Boolean, Int8, Int64)` → Int64.
+        let r = resolve_scalar_function(
+            "if",
+            &[DataType::Boolean, DataType::Int8, DataType::Int64],
+        );
+        assert_eq!(r, Ok(DataType::Int64));
+    }
+
+    #[test]
+    fn resolve_ifnull_widens_arguments() {
+        // `ifnull(Int8, Float64)` → Float64 (wider).
+        let r = resolve_scalar_function("ifnull", &[DataType::Int8, DataType::Float64]);
+        assert_eq!(r, Ok(DataType::Float64));
+    }
+
+    #[test]
+    fn resolve_coalesce_with_identical_args_no_widening_needed() {
+        // `coalesce(Int64, Int64, Int64)` resolves at Pass 2 (strict
+        // polymorphic) without reaching Pass 3.
+        let r = resolve_scalar_function(
+            "coalesce",
+            &[DataType::Int64, DataType::Int64, DataType::Int64],
+        );
+        assert_eq!(r, Ok(DataType::Int64));
     }
 
     #[test]

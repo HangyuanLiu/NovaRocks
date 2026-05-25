@@ -643,11 +643,49 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Boolean),
     );
 
-    // NOTE: `if`, `ifnull`, `nullif`, `coalesce`, `nvl`, `case` need
-    // type widening across all argument positions (e.g. `coalesce(Int8,
-    // Int64) -> Int64`). The registry's strict + polymorphic match does
-    // not yet model widening, so these stay on the legacy fallback path
-    // (Step B's cast-match pass will cover them).
+    // Conditional / null-handling functions whose return type is the
+    // widening over every argument's type. These rely on the resolver's
+    // pass-3 widening-cast match (`BindMode::Widening`) — strict and
+    // polymorphic-strict won't accept e.g. `coalesce(Int8, Int64)`
+    // because the two `T` slots disagree concretely.
+    //
+    //   ifnull(a, b)     -> wider_type(a, b)
+    //   nullif(a, b)     -> wider_type(a, b)
+    //   nvl(a, b)        -> wider_type(a, b)
+    //   coalesce(...)    -> wider_type over all args
+    //   case(...)        -> wider_type over all args
+    //   if(cond, t, e)   -> wider_type(t, e) — first arg is Boolean
+    for name in ["ifnull", "nullif", "nvl"] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Any("T")],
+                TypeSpec::Any("T"),
+            )
+            .with_widening(),
+        );
+    }
+    for name in ["coalesce", "case"] {
+        add(
+            m,
+            name,
+            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T"))
+                .with_widening(),
+        );
+    }
+    // `if(cond, t, e)`: cond is Boolean, t/e widen. The first position
+    // (Boolean) is concrete so widening doesn't apply there; the two
+    // `Any("T")` slots widen against each other.
+    add(
+        m,
+        "if",
+        Signature::new(
+            vec![TypeSpec::Boolean, TypeSpec::Any("T"), TypeSpec::Any("T")],
+            TypeSpec::Any("T"),
+        )
+        .with_widening(),
+    );
 }
 
 // ---------------------------------------------------------------------------

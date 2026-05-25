@@ -594,6 +594,18 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> DataType {
+    // Step B: the central signature registry is the single source of
+    // truth for nearly all scalar built-ins (~250 names) including the
+    // `coalesce`/`if`/`ifnull` cast-match family. If the registry knows
+    // the function, its answer wins. The legacy match below stays as a
+    // fallback for corner cases the registry can't model: lambda
+    // functions (`array_map`, `transform_*`), composite-type-aware
+    // extractors (`__array_element_at`, `map_keys`), and functions
+    // whose permissive type fallbacks haven't been formalised as
+    // signatures yet.
+    if let Ok(t) = crate::sql::functions::resolve_scalar_function(name, arg_types) {
+        return t;
+    }
     match name {
         // String functions
         "upper"
