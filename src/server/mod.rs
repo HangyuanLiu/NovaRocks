@@ -23,6 +23,7 @@ use crate::version;
 
 use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
 };
@@ -45,6 +46,7 @@ struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
     mysql_port: u16,
     user: String,
+    refresh_coordinator: RefreshCoordinatorConfig,
 }
 
 pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
@@ -53,6 +55,10 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
         config_path: resolved.config_path.clone(),
     })?;
     crate::engine::register_stream_load_engine(engine.clone());
+    let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
+        &engine,
+        resolved.refresh_coordinator.clone(),
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -74,6 +80,7 @@ fn resolve_server_options(
 
     let mut mysql_port = DEFAULT_MYSQL_PORT;
     let mut user = ROOT_USER.to_string();
+    let mut refresh_coordinator = RefreshCoordinatorConfig::default();
 
     if let Some(app_cfg) = file_cfg.as_ref()
         && let Some(standalone) = app_cfg.standalone_server.as_ref()
@@ -86,6 +93,7 @@ fn resolve_server_options(
             ));
         }
         user = standalone.user.clone();
+        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
     }
 
     if let Some(port) = opts.mysql_port {
@@ -96,6 +104,7 @@ fn resolve_server_options(
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
+        refresh_coordinator,
     })
 }
 

@@ -263,6 +263,16 @@ pub struct StandaloneServerConfig {
     pub object_store: Option<StandaloneObjectStoreConfig>,
     #[serde(default)]
     pub mv_default_storage_engine: Option<String>,
+    #[serde(default)]
+    pub mv_refresh_scheduler_enabled: bool,
+    #[serde(default = "default_standalone_mv_refresh_scheduler_interval_ms")]
+    pub mv_refresh_scheduler_interval_ms: u64,
+    #[serde(default = "default_standalone_mv_refresh_scheduler_max_concurrent")]
+    pub mv_refresh_scheduler_max_concurrent: usize,
+    #[serde(default = "default_standalone_mv_refresh_scheduler_failure_backoff_ms")]
+    pub mv_refresh_scheduler_failure_backoff_ms: i64,
+    #[serde(default = "default_standalone_mv_refresh_scheduler_max_failure_backoff_ms")]
+    pub mv_refresh_scheduler_max_failure_backoff_ms: i64,
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -273,6 +283,22 @@ fn default_standalone_server_user() -> String {
     "root".to_string()
 }
 
+fn default_standalone_mv_refresh_scheduler_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_standalone_mv_refresh_scheduler_max_concurrent() -> usize {
+    1
+}
+
+fn default_standalone_mv_refresh_scheduler_failure_backoff_ms() -> i64 {
+    60_000
+}
+
+fn default_standalone_mv_refresh_scheduler_max_failure_backoff_ms() -> i64 {
+    1_800_000
+}
+
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
@@ -281,6 +307,14 @@ impl Default for StandaloneServerConfig {
             warehouse_uri: None,
             object_store: None,
             mv_default_storage_engine: None,
+            mv_refresh_scheduler_enabled: false,
+            mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
+            mv_refresh_scheduler_max_concurrent:
+                default_standalone_mv_refresh_scheduler_max_concurrent(),
+            mv_refresh_scheduler_failure_backoff_ms:
+                default_standalone_mv_refresh_scheduler_failure_backoff_ms(),
+            mv_refresh_scheduler_max_failure_backoff_ms:
+                default_standalone_mv_refresh_scheduler_max_failure_backoff_ms(),
         }
     }
 }
@@ -1123,6 +1157,11 @@ starlet_port = 19070
                 warehouse_uri: None,
                 object_store: None,
                 mv_default_storage_engine: None,
+                mv_refresh_scheduler_enabled: false,
+                mv_refresh_scheduler_interval_ms: 30_000,
+                mv_refresh_scheduler_max_concurrent: 1,
+                mv_refresh_scheduler_failure_backoff_ms: 60_000,
+                mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
             })
         );
     }

@@ -44,6 +44,7 @@ pub(crate) mod managed_ctas;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
+pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod query_prep;
@@ -1808,6 +1809,9 @@ pub(crate) fn dispatch_statement(
         }
         Statement::DropMaterializedView(stmt) => {
             crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
+        }
+        Statement::AlterMaterializedView(stmt) => {
+            crate::engine::mv_flow::alter_mv(state, current_catalog, current_database, &stmt)
         }
         Statement::RefreshMaterializedView(stmt) => {
             crate::engine::mv_flow::refresh_mv(state, current_catalog, current_database, &stmt)

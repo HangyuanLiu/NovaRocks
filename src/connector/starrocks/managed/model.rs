@@ -52,18 +52,11 @@ pub(crate) enum ManagedTableKind {
     MaterializedView,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ManagedMvRefreshMode {
     #[default]
     DeferredManual,
-}
-
-impl ManagedMvRefreshMode {
-    pub(crate) fn as_sql_str(self) -> &'static str {
-        match self {
-            Self::DeferredManual => "DEFERRED_MANUAL",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

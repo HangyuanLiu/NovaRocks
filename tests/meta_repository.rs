@@ -21,8 +21,8 @@ use novarocks::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine, MvMetaRepository,
     MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome,
-    UpdateManagedMvRefreshSummaryRequest,
+    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefreshPolicy,
+    UpdateManagedMvRefreshSummaryRequest, UpdateMvRefreshMetadataRequest,
 };
 use novarocks::meta::repository::{
     RepositoryError, RepositoryErrorKind, decode_json_payload, encode_json_payload, id_scopes,
@@ -101,6 +101,141 @@ fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
         partition_spec: None,
         created_at_ms: 7,
     }
+}
+
+#[test]
+fn mv_repository_refresh_policy_metadata_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            sample_mv_definition_request("select id from orders"),
+        )?;
+        assert_eq!(definition.refresh_policy, StoredMvRefreshPolicy::Manual);
+        assert!(!definition.refresh_paused);
+        assert_eq!(definition.refresh_interval_ms, None);
+        assert_eq!(definition.max_staleness_ms, None);
+        assert_eq!(definition.last_scheduler_error, None);
+        assert_eq!(definition.next_refresh_after_ms, None);
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    {
+        let mut txn = provider.begin_write("update mv refresh metadata")?;
+        let updated = repository.update_refresh_metadata(
+            txn.as_mut(),
+            UpdateMvRefreshMetadataRequest {
+                mv_id,
+                refresh_policy: StoredMvRefreshPolicy::AsyncInterval,
+                refresh_paused: true,
+                refresh_interval_ms: Some(300_000),
+                max_staleness_ms: Some(900_000),
+                last_scheduler_error: Some("catalog timeout".to_string()),
+                next_refresh_after_ms: Some(1_700_000_000_000),
+            },
+        )?;
+        assert_eq!(updated.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let loaded = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should exist");
+    assert_eq!(loaded.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
+    assert!(loaded.refresh_paused);
+    assert_eq!(loaded.refresh_interval_ms, Some(300_000));
+    assert_eq!(loaded.max_staleness_ms, Some(900_000));
+    assert_eq!(
+        loaded.last_scheduler_error.as_deref(),
+        Some("catalog timeout")
+    );
+    assert_eq!(loaded.next_refresh_after_ms, Some(1_700_000_000_000));
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_rejects_invalid_refresh_policy_metadata() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            sample_mv_definition_request("select id from orders"),
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    let mut txn = provider.begin_write("reject invalid refresh metadata")?;
+    let manual_with_interval = repository.update_refresh_metadata(
+        txn.as_mut(),
+        UpdateMvRefreshMetadataRequest {
+            mv_id,
+            refresh_policy: StoredMvRefreshPolicy::Manual,
+            refresh_paused: false,
+            refresh_interval_ms: Some(60_000),
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+        },
+    );
+    assert!(
+        manual_with_interval
+            .expect_err("manual policy must reject interval")
+            .to_string()
+            .contains("cannot set refresh_interval_ms")
+    );
+
+    let interval_without_interval = repository.update_refresh_metadata(
+        txn.as_mut(),
+        UpdateMvRefreshMetadataRequest {
+            mv_id,
+            refresh_policy: StoredMvRefreshPolicy::AsyncInterval,
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+        },
+    );
+    assert!(
+        interval_without_interval
+            .expect_err("interval policy must require interval")
+            .to_string()
+            .contains("requires positive refresh_interval_ms")
+    );
+
+    let negative_staleness = repository.update_refresh_metadata(
+        txn.as_mut(),
+        UpdateMvRefreshMetadataRequest {
+            mv_id,
+            refresh_policy: StoredMvRefreshPolicy::AsyncOnChange,
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: Some(0),
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+        },
+    );
+    assert!(
+        negative_staleness
+            .expect_err("zero max staleness must be rejected")
+            .to_string()
+            .contains("max_staleness_ms must be positive")
+    );
+
+    Ok(())
 }
 
 #[test]

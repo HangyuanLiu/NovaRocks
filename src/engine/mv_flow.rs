@@ -8,9 +8,13 @@ use crate::engine::mv::lifecycle::{
     RefreshError, RefreshRequest,
 };
 use crate::engine::{StandaloneState, StatementResult, execute_query};
+use crate::meta::repository::mv::{
+    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
+    AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
+    DropMaterializedViewStmt, MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
 };
 use crate::sql::parser::query_refs::{
@@ -295,6 +299,100 @@ fn existing_mv_storage_engine_by_target(
     MvStorageEngine::from_sql_str(&definition.storage_engine).map(Some)
 }
 
+fn stored_refresh_policy(
+    policy: &MaterializedViewRefreshPolicy,
+) -> (StoredMvRefreshPolicy, Option<i64>) {
+    match policy {
+        MaterializedViewRefreshPolicy::Manual => (StoredMvRefreshPolicy::Manual, None),
+        MaterializedViewRefreshPolicy::AsyncOnChange => {
+            (StoredMvRefreshPolicy::AsyncOnChange, None)
+        }
+        MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
+            (StoredMvRefreshPolicy::AsyncInterval, Some(*interval_ms))
+        }
+    }
+}
+
+pub(crate) fn refresh_metadata_request_for_create(
+    mv_id: i64,
+    policy: &MaterializedViewRefreshPolicy,
+) -> UpdateMvRefreshMetadataRequest {
+    let (refresh_policy, refresh_interval_ms) = stored_refresh_policy(policy);
+    UpdateMvRefreshMetadataRequest {
+        mv_id,
+        refresh_policy,
+        refresh_paused: false,
+        refresh_interval_ms,
+        max_staleness_ms: None,
+        last_scheduler_error: None,
+        next_refresh_after_ms: None,
+    }
+}
+
+fn refresh_metadata_request_for_policy(
+    definition: &StoredMvDefinition,
+    policy: &MaterializedViewRefreshPolicy,
+    refresh_paused: bool,
+) -> UpdateMvRefreshMetadataRequest {
+    let (refresh_policy, refresh_interval_ms) = stored_refresh_policy(policy);
+    UpdateMvRefreshMetadataRequest {
+        mv_id: definition.mv_id,
+        refresh_policy,
+        refresh_paused,
+        refresh_interval_ms,
+        max_staleness_ms: definition.max_staleness_ms,
+        last_scheduler_error: None,
+        next_refresh_after_ms: None,
+    }
+}
+
+fn load_definition_for_alter(
+    state: &Arc<StandaloneState>,
+    txn: &dyn crate::meta::MetaReadTxn,
+    current_catalog: Option<&str>,
+    db: &str,
+    name: &crate::sql::parser::ast::ObjectName,
+) -> Result<StoredMvDefinition, String> {
+    if current_catalog.is_some() {
+        let target =
+            crate::engine::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
+        if let Some(definition) = state
+            .mv_repo
+            .find_by_target(txn, &target.catalog, &target.namespace, &target.table)
+            .map_err(|e| format!("load MV definition by target failed: {e}"))?
+            && MvStorageEngine::from_sql_str(&definition.storage_engine)?
+                == MvStorageEngine::Iceberg
+        {
+            return Ok(definition);
+        }
+    }
+
+    let (database, mv_name) =
+        crate::connector::starrocks::managed::mv_ddl::resolve_mv_name(name, db)?;
+    let runtime = {
+        let managed = state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock");
+        managed.table(&database, &mv_name).ok().cloned()
+    };
+    let Some(runtime) = runtime else {
+        return Err(format!(
+            "materialized view does not exist: {database}.{mv_name}"
+        ));
+    };
+    if runtime.table.kind
+        != crate::connector::starrocks::managed::model::ManagedTableKind::MaterializedView
+    {
+        return Err(format!("`{database}.{mv_name}` is not a materialized view"));
+    }
+    state
+        .mv_repo
+        .load_by_id(txn, runtime.table.table_id)
+        .map_err(|e| format!("load MV definition failed: {e}"))?
+        .ok_or_else(|| format!("MV definition {} not found", runtime.table.table_id))
+}
+
 fn refresh_error_with_rollback(
     original: RefreshError,
     rollback: Result<(), RefreshError>,
@@ -391,6 +489,53 @@ pub(crate) fn drop_mv(
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
     })?;
+    Ok(StatementResult::Ok)
+}
+
+pub(crate) fn alter_mv(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &AlterMaterializedViewStmt,
+) -> Result<StatementResult, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "ALTER MATERIALIZED VIEW requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("alter materialized view refresh metadata")
+        .map_err(|e| format!("open MV metadata write transaction failed: {e}"))?;
+    let definition =
+        load_definition_for_alter(state, txn.as_ref(), current_catalog, db, &stmt.name)?;
+    let req = match &stmt.action {
+        AlterMaterializedViewAction::SetRefresh(policy) => {
+            refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
+        }
+        AlterMaterializedViewAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy.clone(),
+            refresh_paused: true,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: definition.last_scheduler_error.clone(),
+            next_refresh_after_ms: definition.next_refresh_after_ms,
+        },
+        AlterMaterializedViewAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy.clone(),
+            refresh_paused: false,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: definition.last_scheduler_error.clone(),
+            next_refresh_after_ms: definition.next_refresh_after_ms,
+        },
+    };
+    state
+        .mv_repo
+        .update_refresh_metadata(txn.as_mut(), req)
+        .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit MV refresh metadata failed: {e}"))?;
     Ok(StatementResult::Ok)
 }
 

@@ -46,6 +46,18 @@ pub struct StoredMvDefinition {
     #[serde(default)]
     pub active_refresh_id: Option<i64>,
     pub refresh_target_snapshots: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub refresh_policy: StoredMvRefreshPolicy,
+    #[serde(default)]
+    pub refresh_paused: bool,
+    #[serde(default)]
+    pub refresh_interval_ms: Option<i64>,
+    #[serde(default)]
+    pub max_staleness_ms: Option<i64>,
+    #[serde(default)]
+    pub last_scheduler_error: Option<String>,
+    #[serde(default)]
+    pub next_refresh_after_ms: Option<i64>,
     pub created_at_ms: i64,
 }
 
@@ -67,6 +79,40 @@ pub struct CreateMvDefinitionRequest {
     pub schema_contract: Option<crate::meta::repository::mv_contract::MvSchemaContract>,
     pub partition_spec: Option<crate::meta::repository::mv_contract::MvPartitionContract>,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoredMvRefreshPolicy {
+    #[default]
+    Manual,
+    AsyncOnChange,
+    AsyncInterval,
+}
+
+impl StoredMvRefreshPolicy {
+    pub fn as_sql_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "DEFERRED_MANUAL",
+            Self::AsyncOnChange => "ASYNC_ON_CHANGE",
+            Self::AsyncInterval => "ASYNC_INTERVAL",
+        }
+    }
+
+    fn accepts_interval(&self) -> bool {
+        matches!(self, Self::AsyncInterval)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateMvRefreshMetadataRequest {
+    pub mv_id: i64,
+    pub refresh_policy: StoredMvRefreshPolicy,
+    pub refresh_paused: bool,
+    pub refresh_interval_ms: Option<i64>,
+    pub max_staleness_ms: Option<i64>,
+    pub last_scheduler_error: Option<String>,
+    pub next_refresh_after_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -306,6 +352,12 @@ impl MvMetaRepository {
             refresh_in_progress: false,
             active_refresh_id: None,
             refresh_target_snapshots: BTreeMap::new(),
+            refresh_policy: StoredMvRefreshPolicy::Manual,
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
             created_at_ms: req.created_at_ms,
         };
 
@@ -330,6 +382,29 @@ impl MvMetaRepository {
         }
 
         Ok(definition)
+    }
+
+    pub fn update_refresh_metadata(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: UpdateMvRefreshMetadataRequest,
+    ) -> RepositoryResult<StoredMvDefinition> {
+        validate_refresh_metadata(&req)?;
+        let mut definition = self.load_versioned_by_id(txn, req.mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {} not found", req.mv_id))
+        })?;
+        definition.value.refresh_policy = req.refresh_policy;
+        definition.value.refresh_paused = req.refresh_paused;
+        definition.value.refresh_interval_ms = req.refresh_interval_ms;
+        definition.value.max_staleness_ms = req.max_staleness_ms;
+        definition.value.last_scheduler_error = req.last_scheduler_error;
+        definition.value.next_refresh_after_ms = req.next_refresh_after_ms;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(definition.value)
     }
 
     pub fn load_by_id(
@@ -1132,6 +1207,42 @@ fn definition_target_matches(
             .as_deref()
             .map(normalize_lookup_name)
             == Some(normalize_lookup_name(table))
+}
+
+fn validate_refresh_metadata(req: &UpdateMvRefreshMetadataRequest) -> RepositoryResult<()> {
+    if req.refresh_policy.accepts_interval() {
+        match req.refresh_interval_ms {
+            Some(value) if value > 0 => {}
+            _ => {
+                return Err(RepositoryError::invalid(
+                    "ASYNC_INTERVAL refresh policy requires positive refresh_interval_ms",
+                ));
+            }
+        }
+    } else if req.refresh_interval_ms.is_some() {
+        return Err(RepositoryError::invalid(format!(
+            "{} refresh policy cannot set refresh_interval_ms",
+            req.refresh_policy.as_sql_str()
+        )));
+    }
+
+    if let Some(value) = req.max_staleness_ms
+        && value <= 0
+    {
+        return Err(RepositoryError::invalid(
+            "max_staleness_ms must be positive when set",
+        ));
+    }
+
+    if let Some(value) = req.next_refresh_after_ms
+        && value < 0
+    {
+        return Err(RepositoryError::invalid(
+            "next_refresh_after_ms must be non-negative when set",
+        ));
+    }
+
+    Ok(())
 }
 
 fn key_by_id(mv_id: i64) -> RepositoryResult<MetaKey> {
