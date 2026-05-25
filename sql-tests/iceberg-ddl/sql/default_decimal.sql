@@ -1,7 +1,9 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,decimal
 -- Test Objective:
--- 1. ALTER ADD COLUMN DECIMAL(p, s) DEFAULT v applies correctly to old + new rows.
+-- 1. Validate ALTER ADD COLUMN ... DEFAULT for DECIMAL across multiple
+--    precision/scale combos including DECIMAL(20, 6) (exceeds the single
+--    DECIMAL(10, 2) example in v3_default_primitive_types.sql).
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

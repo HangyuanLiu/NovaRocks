@@ -1,9 +1,8 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,string
 -- Test Objective:
--- 1. ALTER ADD COLUMN STRING / VARCHAR DEFAULT v applies correctly.
--- 2. Empty-string and special-character defaults survive round-trip.
--- Note: CHAR(N) was in the source; Iceberg has no fixed-CHAR so we widen to STRING.
+-- 1. Validate STRING DEFAULT with empty-string, unicode, comma, and newline-escape
+--    literals. v3_default_primitive_types.sql covers only the trivial 'hi' literal.
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

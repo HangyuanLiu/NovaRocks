@@ -1,9 +1,10 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default
 -- Test Objective:
--- 1. ALTER TABLE ADD COLUMN BOOLEAN DEFAULT v applies the default to existing
---    rows (Iceberg initial-default) and to subsequent INSERT-with-subset-columns
---    (Iceberg write-default).
+-- 1. Validate BOOLEAN initial-default + write-default in isolation (one column, two
+--    explicit INSERT patterns: full-list and subset-list).
+-- 2. Complementary to v3_default_primitive_types.sql which exercises BOOLEAN as one
+--    of 11 types in a single combined case.
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

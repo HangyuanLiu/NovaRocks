@@ -1,9 +1,10 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,numeric
 -- Test Objective:
--- 1. ALTER ADD COLUMN with INT/BIGINT/FLOAT/DOUBLE/SMALLINT DEFAULT v applies
---    correctly to old rows and new rows.
--- 2. Negative, zero, and boundary numeric defaults are stored verbatim.
+-- 1. Validate ALTER ADD COLUMN ... DEFAULT for numeric types at boundary values
+--    (negative, zero, very large), which v3_default_primitive_types.sql does not.
+-- 2. Cover SMALLINT/INT/BIGINT/FLOAT/DOUBLE with explicit large/negative/zero
+--    defaults distinct from the small literals in v3_default_primitive_types.
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

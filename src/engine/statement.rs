@@ -2081,6 +2081,10 @@ pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
     {
         return true;
     }
+    // ALTER TABLE t COMMENT 'x'  — set the table-level comment property.
+    if parser.parse_keyword(Keyword::COMMENT) {
+        return true;
+    }
     false
 }
 
@@ -2118,6 +2122,14 @@ pub(crate) fn parse_alter_iceberg_properties_sql(
         let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         let keys = parse_property_keys(&mut parser)?;
         PropertiesOp::Unset { keys, if_exists }
+    } else if parser.parse_keyword(Keyword::COMMENT) {
+        // ALTER TABLE t COMMENT 'x' — shorthand for setting the "comment" property.
+        let comment = parser
+            .parse_literal_string()
+            .map_err(|e| format!("COMMENT expects a string literal: {e}"))?;
+        PropertiesOp::Set {
+            entries: vec![("comment".to_string(), comment)],
+        }
     } else {
         return Err("expected SET or UNSET TBLPROPERTIES".to_string());
     };
@@ -3513,6 +3525,60 @@ mod parse_alter_iceberg_properties_tests {
             parse_alter_iceberg_properties_sql("ALTER TABLE t SET TBLPROPERTIES (foo = 'bar')")
                 .is_err()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Table-level COMMENT tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn looks_like_table_comment() {
+        assert!(looks_like_alter_iceberg_properties(
+            "ALTER TABLE ice.db.t COMMENT 'my table'"
+        ));
+    }
+
+    #[test]
+    fn parse_table_comment() {
+        let stmt =
+            parse_alter_iceberg_properties_sql("ALTER TABLE ice.db.t COMMENT 'my table comment'")
+                .expect("parse");
+        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!("expected Set op")
+        };
+        assert_eq!(
+            entries,
+            vec![("comment".to_string(), "my table comment".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_table_comment_three_part_name() {
+        let stmt =
+            parse_alter_iceberg_properties_sql("ALTER TABLE cat.ns.tbl COMMENT 'hello world'")
+                .expect("parse");
+        assert_eq!(stmt.table.parts, vec!["cat", "ns", "tbl"]);
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!("expected Set op")
+        };
+        assert_eq!(entries[0].0, "comment");
+        assert_eq!(entries[0].1, "hello world");
+    }
+
+    #[test]
+    fn parse_table_comment_empty_string() {
+        let stmt = parse_alter_iceberg_properties_sql("ALTER TABLE t COMMENT ''").expect("parse");
+        let PropertiesOp::Set { entries } = stmt.op else {
+            panic!("expected Set op")
+        };
+        assert_eq!(entries, vec![("comment".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn parse_table_comment_missing_literal_rejected() {
+        // COMMENT without a string literal must error.
+        assert!(parse_alter_iceberg_properties_sql("ALTER TABLE t COMMENT").is_err());
     }
 }
 

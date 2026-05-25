@@ -1,7 +1,8 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,json
 -- Test Objective:
--- 1. ALTER ADD COLUMN JSON DEFAULT v applies correctly with a valid JSON literal.
+-- 1. Validate JSON DEFAULT — a type NOT covered by v3_default_primitive_types.sql.
+-- 2. Positive companion to v3_default_complex_type_rejected.sql (negative).
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

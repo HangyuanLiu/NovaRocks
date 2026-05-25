@@ -1,7 +1,9 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,complex
 -- Test Objective:
--- 1. ALTER ADD COLUMN with ARRAY / MAP DEFAULT applies for empty literals.
+-- 1. Validate ARRAY<INT> and MAP<STRING, INT> DEFAULT with empty-collection literals
+--    ('[]' / '{}'). Positive counterpart to v3_default_complex_type_rejected.sql
+--    (which probes the non-empty / unsupported forms).
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

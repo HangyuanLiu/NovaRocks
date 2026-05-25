@@ -62,6 +62,10 @@ pub(crate) fn parse_create_table_statement(
     let mut legacy_range_partitions = Vec::new();
     let mut parsed_iceberg_partition_clause = false;
     let mut properties = Vec::new();
+    // Table-level COMMENT 'x' is stored separately so that a PROPERTIES(...)
+    // clause later in the same statement does not overwrite it (PROPERTIES
+    // replaces the entire properties vec).  It is merged in after the loop.
+    let mut table_comment: Option<String> = None;
     let mut as_select: Option<Box<sqlparser::ast::Query>> = None;
 
     // Consume all remaining clauses until EOF or semicolon
@@ -90,7 +94,12 @@ pub(crate) fn parse_create_table_statement(
             key_desc = Some(parse_key_desc(parser, TableKeyKind::Primary)?);
         } else if peek_word_eq(parser, 0, "COMMENT") {
             parser.next_token(); // COMMENT
-            parser.next_token(); // string
+            let tok = parser.next_token();
+            // Capture table-level COMMENT for later injection into properties.
+            // Last COMMENT clause wins (matches MySQL behaviour).
+            if let Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) = tok.token {
+                table_comment = Some(s);
+            }
         } else if peek_word_eq(parser, 0, "PARTITION") {
             if is_legacy_partition_clause(parser) {
                 legacy_range_partitions.extend(parse_legacy_range_partitions_or_skip(parser)?);
@@ -169,6 +178,16 @@ pub(crate) fn parse_create_table_statement(
                 return Err(format!("CTAS requires row-lineage=true, got '{v}'"));
             }
         }
+    }
+
+    // Merge table-level COMMENT into properties as the "comment" key.
+    // Done after the loop so a trailing PROPERTIES(...) clause cannot
+    // overwrite the value set by COMMENT.  If the user somehow also set
+    // "comment" inside PROPERTIES we let COMMENT win (last-write-wins
+    // mirrors MySQL behaviour).
+    if let Some(comment) = table_comment {
+        properties.retain(|(k, _): &(String, String)| !k.eq_ignore_ascii_case("comment"));
+        properties.push(("comment".to_string(), comment));
     }
 
     let kind = CreateTableKind::Iceberg {
@@ -1711,5 +1730,46 @@ mod tests {
         };
         assert_eq!(columns[1].aggregation, Some(ColumnAggregation::BitmapUnion));
         assert_eq!(columns[2].aggregation, Some(ColumnAggregation::HllUnion));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Table-level COMMENT preservation tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn parse_create_table_comment_is_captured_in_properties() {
+        let stmt = parse_create_table_one("CREATE TABLE t (id INT) COMMENT 'my table'")
+            .expect("parse with table-level COMMENT");
+        let CreateTableKind::Iceberg { properties, .. } = stmt.kind;
+        let comment_entry = properties.iter().find(|(k, _)| k == "comment");
+        assert!(
+            comment_entry.is_some(),
+            "expected 'comment' key in properties"
+        );
+        assert_eq!(comment_entry.unwrap().1, "my table");
+    }
+
+    #[test]
+    fn parse_create_table_comment_followed_by_properties() {
+        let stmt = parse_create_table_one(
+            "CREATE TABLE t (id INT) COMMENT 'hello' PROPERTIES ('format-version' = '2')",
+        )
+        .expect("parse with COMMENT before PROPERTIES");
+        let CreateTableKind::Iceberg { properties, .. } = stmt.kind;
+        let comment_entry = properties.iter().find(|(k, _)| k == "comment");
+        assert_eq!(comment_entry.map(|(_, v)| v.as_str()), Some("hello"));
+        // format-version should also be present
+        assert!(properties.iter().any(|(k, _)| k == "format-version"));
+    }
+
+    #[test]
+    fn parse_create_table_no_comment_yields_no_comment_property() {
+        let stmt = parse_create_table_one("CREATE TABLE t (id INT)")
+            .expect("parse without table-level COMMENT");
+        let CreateTableKind::Iceberg { properties, .. } = stmt.kind;
+        assert!(
+            !properties.iter().any(|(k, _)| k == "comment"),
+            "no 'comment' key expected when COMMENT clause is absent"
+        );
     }
 }

@@ -896,9 +896,7 @@ impl<'a> ExprCompiler<'a> {
         self.nodes.push(default_expr_node()); // placeholder
 
         // Compile left, inserting cast if needed
-        if left.data_type != compare_type
-            && needs_comparison_cast(&left.data_type, &compare_type)
-        {
+        if left.data_type != compare_type && needs_comparison_cast(&left.data_type, &compare_type) {
             let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
             self.nodes.push(exprs::TExprNode {
                 node_type: exprs::TExprNodeType::CAST_EXPR,
@@ -911,8 +909,7 @@ impl<'a> ExprCompiler<'a> {
         self.compile_typed_inner(left)?;
 
         // Compile right, inserting cast if needed
-        if right.data_type != compare_type
-            && needs_comparison_cast(&right.data_type, &compare_type)
+        if right.data_type != compare_type && needs_comparison_cast(&right.data_type, &compare_type)
         {
             let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
             self.nodes.push(exprs::TExprNode {
@@ -1001,8 +998,7 @@ impl<'a> ExprCompiler<'a> {
             BinOp::Div => "div",
             _ => "add",
         };
-        let result_type =
-            arithmetic_result_type_with_op(&left.data_type, &right.data_type, op_str);
+        let result_type = arithmetic_result_type_with_op(&left.data_type, &right.data_type, op_str);
 
         let parent_idx = self.nodes.len();
         self.nodes.push(default_expr_node()); // placeholder
