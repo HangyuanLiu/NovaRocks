@@ -277,6 +277,8 @@ pub struct StandaloneServerConfig {
     pub mv_refresh_scheduler_max_concurrent: usize,
     #[serde(default = "default_standalone_mv_refresh_scheduler_failure_backoff_ms")]
     pub mv_refresh_scheduler_failure_backoff_ms: i64,
+    #[serde(default = "default_standalone_mv_refresh_scheduler_max_failure_backoff_ms")]
+    pub mv_refresh_scheduler_max_failure_backoff_ms: i64,
     #[serde(default)]
     pub tables: Vec<StandaloneTableConfig>,
 }
@@ -301,6 +303,10 @@ fn default_standalone_mv_refresh_scheduler_failure_backoff_ms() -> i64 {
     60_000
 }
 
+fn default_standalone_mv_refresh_scheduler_max_failure_backoff_ms() -> i64 {
+    1_800_000
+}
+
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
@@ -315,6 +321,8 @@ impl Default for StandaloneServerConfig {
                 default_standalone_mv_refresh_scheduler_max_concurrent(),
             mv_refresh_scheduler_failure_backoff_ms:
                 default_standalone_mv_refresh_scheduler_failure_backoff_ms(),
+            mv_refresh_scheduler_max_failure_backoff_ms:
+                default_standalone_mv_refresh_scheduler_max_failure_backoff_ms(),
             tables: Vec::new(),
         }
     }
@@ -1162,6 +1170,7 @@ starlet_port = 19070
                 mv_refresh_scheduler_interval_ms: 30_000,
                 mv_refresh_scheduler_max_concurrent: 1,
                 mv_refresh_scheduler_failure_backoff_ms: 60_000,
+                mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
                 tables: Vec::new(),
             })
         );

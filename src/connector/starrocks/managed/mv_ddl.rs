@@ -996,6 +996,14 @@ fn refresh_status_for_mv(
     if mv.refresh_in_progress {
         return Ok(("RUNNING".to_string(), retry_after_time));
     }
+    if mv
+        .last_scheduler_error
+        .as_ref()
+        .map(|err| err.trim_start().starts_with("USER_ERROR: "))
+        .unwrap_or(false)
+    {
+        return Ok(("FAILED_USER_ERROR".to_string(), retry_after_time));
+    }
     if mv.last_scheduler_error.is_some()
         && mv
             .next_refresh_after_ms
@@ -2107,6 +2115,53 @@ mod tests {
         assert_eq!(row.max_staleness_ms.as_deref(), Some("900000"));
         assert_eq!(row.refresh_state, "PAUSED");
         assert_eq!(row.retry_after_time.as_deref(), Some("9000000000000"));
+    }
+
+    #[test]
+    fn show_materialized_views_exposes_non_retryable_scheduler_error() {
+        let (state, _dir) = open_state_with_sqlite_store();
+        let mv_id = insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("set mv refresh metadata")
+            .expect("open write txn");
+        state
+            .mv_repo
+            .update_refresh_metadata(
+                txn.as_mut(),
+                UpdateMvRefreshMetadataRequest {
+                    mv_id,
+                    refresh_policy: StoredMvRefreshPolicy::AsyncInterval,
+                    refresh_paused: false,
+                    refresh_interval_ms: Some(300_000),
+                    max_staleness_ms: Some(900_000),
+                    last_scheduler_error: Some("USER_ERROR: unsupported MV shape".to_string()),
+                    next_refresh_after_ms: None,
+                },
+            )
+            .expect("update refresh metadata");
+        txn.commit().expect("commit refresh metadata");
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let rows = list_mv_rows(&state, Some("ice"), &stmt, None).expect("show mvs");
+        let row = rows
+            .iter()
+            .find(|row| row.name == "mv_orders")
+            .expect("mv row should be present");
+
+        assert_eq!(row.refresh_state, "FAILED_USER_ERROR");
+        assert_eq!(
+            row.last_scheduler_error.as_deref(),
+            Some("USER_ERROR: unsupported MV shape")
+        );
+        assert_eq!(row.retry_after_time, None);
     }
 
     #[test]

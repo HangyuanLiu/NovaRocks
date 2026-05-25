@@ -20,15 +20,20 @@ pub(crate) struct RefreshCoordinatorConfig {
     pub(crate) tick_interval_ms: u64,
     pub(crate) max_concurrent_refreshes: usize,
     pub(crate) failure_backoff_ms: i64,
+    pub(crate) max_failure_backoff_ms: i64,
 }
 
 impl RefreshCoordinatorConfig {
     pub(crate) fn from_standalone_config(config: &StandaloneServerConfig) -> Self {
+        let failure_backoff_ms = config.mv_refresh_scheduler_failure_backoff_ms.max(1);
         Self {
             enabled: config.mv_refresh_scheduler_enabled,
             tick_interval_ms: config.mv_refresh_scheduler_interval_ms.max(1),
             max_concurrent_refreshes: config.mv_refresh_scheduler_max_concurrent.max(1),
-            failure_backoff_ms: config.mv_refresh_scheduler_failure_backoff_ms.max(1),
+            failure_backoff_ms,
+            max_failure_backoff_ms: config
+                .mv_refresh_scheduler_max_failure_backoff_ms
+                .max(failure_backoff_ms),
         }
     }
 }
@@ -40,6 +45,7 @@ impl Default for RefreshCoordinatorConfig {
             tick_interval_ms: 30_000,
             max_concurrent_refreshes: 1,
             failure_backoff_ms: 60_000,
+            max_failure_backoff_ms: 1_800_000,
         }
     }
 }
@@ -50,6 +56,7 @@ pub(crate) enum RefreshTaskState {
     Running,
     Succeeded,
     FailedBackoff,
+    FailedUserError,
     BlockedRecovery,
     Paused,
 }
@@ -103,6 +110,7 @@ pub(crate) struct RefreshCoordinator {
     running_mv_ids: BTreeSet<i64>,
     states: BTreeMap<i64, RefreshTaskState>,
     observed_snapshots: BTreeMap<(i64, String), i64>,
+    failure_attempts: BTreeMap<i64, u32>,
 }
 
 impl RefreshCoordinator {
@@ -114,6 +122,7 @@ impl RefreshCoordinator {
             running_mv_ids: BTreeSet::new(),
             states: BTreeMap::new(),
             observed_snapshots: BTreeMap::new(),
+            failure_attempts: BTreeMap::new(),
         }
     }
 
@@ -159,6 +168,7 @@ impl RefreshCoordinator {
             self.running_mv_ids.remove(&entry.mv_id);
             match result {
                 Ok(()) => {
+                    self.failure_attempts.remove(&entry.mv_id);
                     self.states.insert(entry.mv_id, RefreshTaskState::Succeeded);
                 }
                 Err(_) => {
@@ -183,13 +193,7 @@ impl RefreshCoordinator {
             &mut snapshot_source,
             now_ms,
         )? {
-            record_scheduler_failure_metadata(
-                state,
-                error.mv_id,
-                &error.error,
-                now_ms,
-                self.config.failure_backoff_ms,
-            )?;
+            self.record_scheduler_runtime_failure(state, error.mv_id, &error.error, now_ms)?;
         }
         for definition in &metadata.definitions {
             let guard = scheduler_guard_for_definition(
@@ -225,23 +229,45 @@ impl RefreshCoordinator {
             self.running_mv_ids.remove(&entry.mv_id);
             match result {
                 Ok(()) => {
+                    self.failure_attempts.remove(&entry.mv_id);
                     self.states.insert(entry.mv_id, RefreshTaskState::Succeeded);
                     record_scheduler_success_metadata(state, entry.mv_id, now_ms)?;
                 }
                 Err(err) => {
-                    self.states
-                        .insert(entry.mv_id, RefreshTaskState::FailedBackoff);
-                    record_scheduler_failure_metadata(
-                        state,
-                        entry.mv_id,
-                        &err,
-                        now_ms,
-                        self.config.failure_backoff_ms,
-                    )?;
+                    self.record_scheduler_runtime_failure(state, entry.mv_id, &err, now_ms)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn record_scheduler_runtime_failure(
+        &mut self,
+        state: &Arc<crate::engine::StandaloneState>,
+        mv_id: i64,
+        err: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match classify_scheduler_failure(err) {
+            SchedulerFailureClass::Retryable => {
+                let attempt = self.next_failure_attempt(mv_id);
+                let backoff_ms = scheduler_backoff_ms(&self.config, attempt);
+                self.states.insert(mv_id, RefreshTaskState::FailedBackoff);
+                record_scheduler_failure_metadata(state, mv_id, err, now_ms, backoff_ms)?;
+            }
+            SchedulerFailureClass::User => {
+                self.failure_attempts.remove(&mv_id);
+                self.states.insert(mv_id, RefreshTaskState::FailedUserError);
+                record_scheduler_user_error_metadata(state, mv_id, err)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn next_failure_attempt(&mut self, mv_id: i64) -> u32 {
+        let attempt = self.failure_attempts.entry(mv_id).or_insert(0);
+        *attempt = attempt.saturating_add(1).max(1);
+        *attempt
     }
 
     fn poll_snapshot_watch<S: SnapshotSource>(
@@ -356,6 +382,12 @@ pub(crate) fn scheduler_guard_for_definition(
             can_enqueue: false,
         };
     }
+    if has_non_retryable_scheduler_error(definition) {
+        return SchedulerGuardDecision {
+            state: RefreshTaskState::FailedUserError,
+            can_enqueue: false,
+        };
+    }
     SchedulerGuardDecision {
         state: RefreshTaskState::Pending,
         can_enqueue: true,
@@ -408,6 +440,9 @@ pub(crate) fn plan_periodic_refreshes(
 }
 
 fn is_periodic_refresh_due(definition: &StoredMvDefinition, now_ms: i64) -> bool {
+    if has_non_retryable_scheduler_error(definition) {
+        return false;
+    }
     matches!(
         definition.refresh_policy,
         StoredMvRefreshPolicy::AsyncInterval
@@ -459,6 +494,100 @@ pub(crate) fn metadata_update_after_failure(
         max_staleness_ms: definition.max_staleness_ms,
         last_scheduler_error: Some(err.to_string()),
         next_refresh_after_ms: Some(now_ms.saturating_add(failure_backoff_ms.max(1))),
+    }
+}
+
+pub(crate) fn scheduler_backoff_ms(config: &RefreshCoordinatorConfig, attempt: u32) -> i64 {
+    let base = config.failure_backoff_ms.max(1);
+    let max_backoff = config.max_failure_backoff_ms.max(base);
+    let shift = attempt.max(1).saturating_sub(1).min(62);
+    let multiplier = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
+    base.saturating_mul(multiplier).min(max_backoff)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedulerFailureClass {
+    Retryable,
+    User,
+}
+
+fn classify_scheduler_failure(err: &str) -> SchedulerFailureClass {
+    if is_retryable_scheduler_error_text(err) {
+        SchedulerFailureClass::Retryable
+    } else {
+        SchedulerFailureClass::User
+    }
+}
+
+fn is_retryable_scheduler_error_text(err: &str) -> bool {
+    let lower = err.trim().to_ascii_lowercase();
+    if lower.starts_with(USER_ERROR_PREFIX.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    let retryable_markers = [
+        "timeout",
+        "timed out",
+        "temporar",
+        "unavailable",
+        "connection",
+        "connect",
+        "network",
+        "transport",
+        "deadline",
+        "throttl",
+        "too many requests",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "io error",
+        "i/o error",
+        "broken pipe",
+        "reset by peer",
+        "refused",
+    ];
+    if retryable_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    let user_markers = [
+        "unsupported",
+        "not supported",
+        "invalid",
+        "syntax",
+        "parse",
+        "analyze",
+        "analysis",
+        "unknown column",
+        "unknown table",
+        "not found",
+        "does not exist",
+        "ambiguous",
+        "type mismatch",
+        "permission denied",
+    ];
+    !user_markers.iter().any(|marker| lower.contains(marker))
+}
+
+const USER_ERROR_PREFIX: &str = "USER_ERROR: ";
+
+fn has_non_retryable_scheduler_error(definition: &StoredMvDefinition) -> bool {
+    definition
+        .last_scheduler_error
+        .as_ref()
+        .map(|err| err.trim_start().starts_with(USER_ERROR_PREFIX))
+        .unwrap_or(false)
+}
+
+fn scheduler_user_error_text(err: &str) -> String {
+    let trimmed = err.trim();
+    if trimmed.starts_with(USER_ERROR_PREFIX) {
+        trimmed.to_string()
+    } else {
+        format!("{USER_ERROR_PREFIX}{trimmed}")
     }
 }
 
@@ -531,6 +660,24 @@ fn record_scheduler_failure_metadata(
             now_ms,
             failure_backoff_ms,
         ))
+    })
+}
+
+fn record_scheduler_user_error_metadata(
+    state: &Arc<crate::engine::StandaloneState>,
+    mv_id: i64,
+    err: &str,
+) -> Result<(), String> {
+    update_scheduler_metadata(state, mv_id, |definition| {
+        Ok(UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy.clone(),
+            refresh_paused: definition.refresh_paused,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: Some(scheduler_user_error_text(err)),
+            next_refresh_after_ms: None,
+        })
     })
 }
 
@@ -1033,6 +1180,32 @@ mod tests {
         assert_eq!(req.last_scheduler_error, Some("boom".to_string()));
         assert_eq!(req.next_refresh_after_ms, Some(31_500));
         assert_eq!(req.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
+    }
+
+    #[test]
+    fn transient_failures_use_bounded_exponential_backoff() {
+        let config = RefreshCoordinatorConfig {
+            enabled: true,
+            failure_backoff_ms: 1_000,
+            max_failure_backoff_ms: 8_000,
+            ..RefreshCoordinatorConfig::default()
+        };
+
+        assert_eq!(scheduler_backoff_ms(&config, 1), 1_000);
+        assert_eq!(scheduler_backoff_ms(&config, 2), 2_000);
+        assert_eq!(scheduler_backoff_ms(&config, 5), 8_000);
+    }
+
+    #[test]
+    fn non_retryable_user_error_does_not_plan_periodic_retry() {
+        let mut definition = test_definition(7, StoredMvRefreshPolicy::AsyncInterval);
+        definition.refresh_interval_ms = Some(1_000);
+        definition.last_scheduler_error = Some("USER_ERROR: unsupported MV shape".to_string());
+        definition.next_refresh_after_ms = None;
+
+        let decisions = plan_periodic_refreshes(&[definition], 10_000);
+
+        assert!(decisions.is_empty());
     }
 
     #[test]
