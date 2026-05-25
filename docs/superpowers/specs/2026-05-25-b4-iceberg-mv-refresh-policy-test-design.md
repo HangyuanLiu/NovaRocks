@@ -42,8 +42,8 @@ target MV:
 ```sql
 CREATE MATERIALIZED VIEW ...
 DISTRIBUTED BY HASH(...) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
 REFRESH ASYNC EVERY INTERVAL 5 MINUTE
+PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT ...
 ```
 
