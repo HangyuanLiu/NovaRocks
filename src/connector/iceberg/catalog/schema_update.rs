@@ -855,6 +855,197 @@ mod tests {
         // Drop on list element / map key/value is not allowed; only struct fields can be dropped.
     }
 
+    #[test]
+    fn drop_last_field_of_non_nested_struct_is_rejected() {
+        use iceberg::spec::StructType;
+        // STRUCT<v1 INT> — dropping v1 leaves the struct empty.
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "v1",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "c0",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(2, "c1", inner)),
+            ])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.v1").unwrap();
+        let err = apply_drop_at(&schema, &path).expect_err("should reject last-field drop");
+        assert!(
+            err.contains("cannot drop last field of STRUCT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_last_field_of_deeply_nested_struct_is_rejected() {
+        use iceberg::spec::StructType;
+        // outer STRUCT<inner STRUCT<leaf INT>> — dropping leaf leaves inner empty.
+        let leaf_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            21,
+            "leaf",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let outer_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "inner",
+            leaf_struct,
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "outer",
+                outer_struct,
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("outer.inner.leaf").unwrap();
+        let err = apply_drop_at(&schema, &path)
+            .expect_err("should reject last-field drop in nested struct");
+        assert!(
+            err.contains("cannot drop last field of STRUCT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_non_last_field_of_struct_succeeds() {
+        use iceberg::spec::StructType;
+        // STRUCT<v1 INT, v2 INT> — dropping v1 still leaves v2.
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "v1",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "v2",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "c1", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.v1").unwrap();
+        let new = apply_drop_at(&schema, &path).expect("non-last field drop should succeed");
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields().len(), 1);
+        assert_eq!(s.fields()[0].name, "v2");
+    }
+
+    #[test]
+    fn drop_field_from_array_struct_element_succeeds() {
+        use iceberg::spec::{ListType, StructType};
+        // ARRAY<STRUCT<v1 INT, v2 INT>> — dropping v1 still leaves v2 in the element struct.
+        // Field IDs: 1=c0, 2=c1, 10=list-element, 11=v1, 12=v2.
+        let element_struct = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "v1",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "v2",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ]));
+        let element_field = Arc::new(NestedField::list_element(10, element_struct, true));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "c0",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "c1",
+                    Type::List(ListType::new(element_field)),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.element.v1").unwrap();
+        let new = apply_drop_at(&schema, &path)
+            .expect("drop field from ARRAY<STRUCT> element should succeed");
+        let c1_field = &new.as_struct().fields()[1];
+        let Type::List(l) = c1_field.field_type.as_ref() else {
+            panic!("c1 should still be a LIST")
+        };
+        let Type::Struct(s) = l.element_field.field_type.as_ref() else {
+            panic!("element should still be a STRUCT")
+        };
+        assert_eq!(s.fields().len(), 1, "v1 should be dropped, v2 remains");
+        assert_eq!(s.fields()[0].name, "v2");
+    }
+
+    #[test]
+    fn drop_last_field_from_array_struct_element_is_rejected() {
+        use iceberg::spec::{ListType, StructType};
+        // ARRAY<STRUCT<v1 INT>> — dropping the only field must be rejected.
+        // Field IDs: 1=c1, 10=list-element, 11=v1.
+        let element_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "v1",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let element_field = Arc::new(NestedField::list_element(10, element_struct, true));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "c1",
+                Type::List(ListType::new(element_field)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.element.v1").unwrap();
+        let err = apply_drop_at(&schema, &path)
+            .expect_err("dropping last element struct field should be rejected");
+        assert!(
+            err.contains("cannot drop last field of STRUCT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_into_map_still_rejected() {
+        use iceberg::spec::{MapType, StructType};
+        // MAP<STRING, STRUCT<v1 INT>> — dropping into a map must still be rejected.
+        // Field IDs: 1=m, 10=map-key, 11=map-value, 20=v1.
+        let inner_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            20,
+            "v1",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let key = Arc::new(NestedField::map_key_element(
+            10,
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let value = Arc::new(NestedField::map_value_element(11, inner_struct, true));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "m",
+                Type::Map(MapType::new(key, value)),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("m.value.v1").unwrap();
+        let res = apply_drop_at(&schema, &path);
+        assert!(res.is_err(), "drop into MAP should still be rejected");
+    }
+
     // ----- apply_rename_at tests -----
 
     #[test]
@@ -1323,6 +1514,102 @@ mod tests {
     }
 
     #[test]
+    fn add_field_to_array_struct_element_succeeds() {
+        use iceberg::spec::{ListType, StructType};
+        // ARRAY<STRUCT<v1 INT, v2 INT>> — add a new field val1 INT to the element struct.
+        // Field IDs: 1=c0, 2=c1, 10=list-element, 11=v1, 12=v2.
+        let element_struct = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                11,
+                "v1",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "v2",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ]));
+        let element_field = Arc::new(NestedField::list_element(10, element_struct, true));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "c0",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "c1",
+                    Type::List(ListType::new(element_field)),
+                )),
+            ])
+            .build()
+            .unwrap();
+        // Parent path: c1.element — adds val1 inside the array's element struct.
+        let parent = crate::engine::statement::ColumnPath::parse("c1.element").unwrap();
+        let mut last_id = 12;
+        let new = apply_add_at(
+            &schema,
+            &parent,
+            "val1",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        )
+        .expect("add field to ARRAY<STRUCT> element should succeed");
+        let c1_field = &new.as_struct().fields()[1];
+        let Type::List(l) = c1_field.field_type.as_ref() else {
+            panic!("c1 should still be a LIST")
+        };
+        let Type::Struct(s) = l.element_field.field_type.as_ref() else {
+            panic!("element should still be a STRUCT")
+        };
+        assert_eq!(s.fields().len(), 3, "should have v1, v2, val1");
+        assert_eq!(s.fields()[2].name, "val1");
+        assert!(matches!(
+            *s.fields()[2].field_type,
+            Type::Primitive(PrimitiveType::Int)
+        ));
+    }
+
+    #[test]
+    fn add_field_to_array_of_non_struct_is_rejected() {
+        use iceberg::spec::ListType;
+        // ARRAY<INT> — adding a field into a non-struct element must be rejected.
+        // Field IDs: 1=c1, 10=list-element.
+        let element_field = Arc::new(NestedField::list_element(
+            10,
+            Type::Primitive(PrimitiveType::Int),
+            true,
+        ));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "c1",
+                Type::List(ListType::new(element_field)),
+            ))])
+            .build()
+            .unwrap();
+        let parent = crate::engine::statement::ColumnPath::parse("c1.element").unwrap();
+        let mut last_id = 10;
+        let res = apply_add_at(
+            &schema,
+            &parent,
+            "x",
+            &SqlType::Int,
+            None,
+            crate::engine::statement::AddPosition::Default,
+            &mut last_id,
+        );
+        assert!(
+            res.is_err(),
+            "should reject ADD COLUMN into ARRAY<INT> element"
+        );
+    }
+
+    #[test]
     fn apply_set_nullable_at_top_level() {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
@@ -1531,6 +1818,106 @@ mod tests {
         };
         let new = build_updated_schema(&schema, 2, &change).unwrap();
         assert_eq!(new.as_struct().fields()[0].name, "b");
+    }
+
+    #[test]
+    fn apply_comment_at_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "v",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("v").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "value column").unwrap();
+        let field = new.as_struct().fields()[0].as_ref();
+        assert_eq!(field.doc.as_deref(), Some("value column"));
+        assert_eq!(field.id, 1);
+    }
+
+    #[test]
+    fn apply_comment_at_top_level_overwrite() {
+        let mut f = NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Int));
+        f.doc = Some("old comment".to_string());
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(f)])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("v").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "new comment").unwrap();
+        assert_eq!(
+            new.as_struct().fields()[0].doc.as_deref(),
+            Some("new comment")
+        );
+    }
+
+    #[test]
+    fn apply_comment_at_nested() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.street").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "street name").unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields()[0].doc.as_deref(), Some("street name"));
+        assert_eq!(s.fields()[0].id, 11);
+    }
+
+    #[test]
+    fn apply_comment_at_unknown_path_errors() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(super::apply_comment_at(&schema, &path, "doc").is_err());
+    }
+
+    #[test]
+    fn build_updated_schema_dispatches_update_comment() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "v",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::UpdateComment {
+            path: ColumnPath::parse("v").unwrap(),
+            comment: "doc string".to_string(),
+        };
+        let new = build_updated_schema(&schema, 1, &change).unwrap();
+        assert_eq!(
+            new.as_struct().fields()[0].doc.as_deref(),
+            Some("doc string")
+        );
+    }
+
+    #[test]
+    fn build_property_updates_update_comment_is_no_op() {
+        let change = IcebergSchemaChange::UpdateComment {
+            path: ColumnPath::parse("v").unwrap(),
+            comment: "doc string".to_string(),
+        };
+        let updates =
+            build_property_updates_for_test(&std::collections::HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
     }
 
     #[test]
@@ -1913,8 +2300,9 @@ pub(crate) fn find_field_by_path(
 
 /// Rebuild `schema` with the column at `path` removed.
 ///
-/// Only struct fields can be dropped.  Descending into a list element or map key/value
-/// is rejected, because those are not named columns and cannot be individually dropped.
+/// Struct fields can be dropped directly.  Descending into a LIST whose element is a
+/// STRUCT is also supported via the `element` pseudo-segment (e.g. `col.element.field`).
+/// Descending into a MAP key/value is rejected.
 #[allow(dead_code)]
 pub(crate) fn apply_drop_at(schema: &Schema, path: &ColumnPath) -> Result<Schema, String> {
     let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
@@ -1945,7 +2333,7 @@ fn drop_in_fields(
                 // skip = drop this field at the top of the remaining path
                 continue;
             }
-            let new_inner_type = drop_in_type(&f.field_type, &segments[1..])?;
+            let new_inner_type = drop_in_type(&f.field_type, &segments[1..], &f.name)?;
             let mut updated = (*f).clone();
             updated.field_type = Box::new(new_inner_type);
             out.push(updated);
@@ -1959,16 +2347,53 @@ fn drop_in_fields(
     Ok(out)
 }
 
-fn drop_in_type(ty: &Type, segments: &[String]) -> Result<Type, String> {
+fn drop_in_type(ty: &Type, segments: &[String], parent_name: &str) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
             let new = drop_in_fields(s.fields().to_vec(), segments)?;
+            if new.is_empty() {
+                return Err(format!(
+                    "cannot drop last field of STRUCT '{parent_name}': STRUCT must have at least one field"
+                ));
+            }
             let arc_fields: Vec<NestedFieldRef> = new.into_iter().map(Arc::new).collect();
             Ok(Type::Struct(StructType::new(arc_fields)))
         }
-        Type::List(_) | Type::Map(_) => {
-            Err("drop path cannot descend into list element or map key/value".to_string())
+        Type::List(l) => {
+            // Allow descending into a LIST element only when the element is a STRUCT,
+            // and the path begins with the pseudo-segment "element".
+            if segments.is_empty() {
+                return Err("drop path into LIST is missing 'element' segment".to_string());
+            }
+            let head = normalize_identifier(&segments[0])?;
+            if head != "element" {
+                return Err(format!(
+                    "drop path into LIST must use 'element', got '{}'",
+                    &segments[0]
+                ));
+            }
+            // Remaining segments after "element" must address a field inside the struct element.
+            let inner_segments = &segments[1..];
+            match l.element_field.field_type.as_ref() {
+                Type::Struct(s) => {
+                    let new_fields = drop_in_fields(s.fields().to_vec(), inner_segments)?;
+                    if new_fields.is_empty() {
+                        return Err(format!(
+                            "cannot drop last field of STRUCT '{parent_name}.element': STRUCT must have at least one field"
+                        ));
+                    }
+                    let arc_fields: Vec<NestedFieldRef> =
+                        new_fields.into_iter().map(Arc::new).collect();
+                    let mut new_elem = (*l.element_field).clone();
+                    new_elem.field_type = Box::new(Type::Struct(StructType::new(arc_fields)));
+                    Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+                }
+                _ => Err(format!(
+                    "drop path descends into LIST '{parent_name}' whose element is not a STRUCT"
+                )),
+            }
         }
+        Type::Map(_) => Err("drop path cannot descend into map key/value".to_string()),
         _ => Err("drop path descends into non-composite type".to_string()),
     }
 }
@@ -2249,6 +2674,75 @@ fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Resul
     }
 }
 
+/// Rebuild `schema` with the column at `path` having its doc string updated.
+///
+/// Only struct fields are supported; descending into list element / map key/value
+/// is rejected because those are not named columns.
+#[allow(dead_code)]
+pub(crate) fn apply_comment_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    comment: &str,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields = comment_in_fields(
+        schema.as_struct().fields().to_vec(),
+        path.segments(),
+        comment,
+    )?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after comment update: {e}"))
+}
+
+fn comment_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    comment: &str,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("comment update path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if segments.len() == 1 {
+                updated.doc = Some(comment.to_string());
+            } else {
+                let new_inner = comment_in_type(&f.field_type, &segments[1..], comment)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for comment update", head));
+    }
+    Ok(out)
+}
+
+fn comment_in_type(ty: &Type, segments: &[String], comment: &str) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = comment_in_fields(s.fields().to_vec(), segments, comment)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err("ALTER COLUMN COMMENT only supported on struct fields".to_string()),
+    }
+}
+
 fn build_updated_schema(
     current: &Schema,
     last_column_id: i32,
@@ -2297,6 +2791,9 @@ fn build_updated_schema(
         IcebergSchemaChange::Reorder { path, position } => {
             apply_reorder_at(current, path, position)
         }
+        IcebergSchemaChange::UpdateComment { path, comment } => {
+            apply_comment_at(current, path, comment)
+        }
     }
 }
 
@@ -2326,6 +2823,10 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
         }
         IcebergSchemaChange::Reorder { path, .. } => {
             debug_assert!(!path.is_empty(), "Reorder path must be non-empty");
+            path.last().map(|n| vec![n]).unwrap_or_default()
+        }
+        IcebergSchemaChange::UpdateComment { path, .. } => {
+            debug_assert!(!path.is_empty(), "UpdateComment path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
     };
@@ -2642,8 +3143,10 @@ use crate::engine::statement::AddPosition;
 /// Rebuild `schema` with a new column added under `parent` (or at top-level if `parent` is root).
 ///
 /// The new column is inserted at `position` (Default = append, First, After, Before).
-/// Only STRUCT parents are supported; adding into a LIST or MAP element is rejected.
-/// A name-conflict check (case-insensitive) is performed against the target sibling list.
+/// STRUCT parents are supported.  LIST parents whose element is a STRUCT are also supported
+/// via the `element` pseudo-segment (e.g. parent `col.element` adds a field inside the struct
+/// element of list column `col`).  Adding into a MAP or a LIST with non-STRUCT element is
+/// rejected.  A name-conflict check (case-insensitive) is performed against the target sibling list.
 #[allow(dead_code)]
 pub(crate) fn apply_add_at(
     schema: &Schema,
@@ -2754,6 +3257,40 @@ fn add_in_type(
             Ok(Type::Struct(StructType::new(
                 new.into_iter().map(Arc::new).collect(),
             )))
+        }
+        Type::List(l) => {
+            // Allow descending into a LIST element only when the element is a STRUCT,
+            // and the first path segment is the pseudo-name "element".
+            if parent_segments.is_empty() {
+                return Err(
+                    "ADD COLUMN into LIST requires 'element' path segment before the new field name"
+                        .to_string(),
+                );
+            }
+            let head = normalize_identifier(&parent_segments[0])?;
+            if head != "element" {
+                return Err(format!(
+                    "ADD COLUMN into LIST must use 'element', got '{}'",
+                    &parent_segments[0]
+                ));
+            }
+            // Remaining segments after "element" form the sub-path inside the element struct.
+            let inner_segments = &parent_segments[1..];
+            match l.element_field.field_type.as_ref() {
+                Type::Struct(s) => {
+                    let new_fields =
+                        add_in_fields(s.fields().to_vec(), inner_segments, new_field, position)?;
+                    let arc_fields: Vec<NestedFieldRef> =
+                        new_fields.into_iter().map(Arc::new).collect();
+                    let mut new_elem = (*l.element_field).clone();
+                    new_elem.field_type = Box::new(Type::Struct(StructType::new(arc_fields)));
+                    Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+                }
+                _ => Err(
+                    "ADD COLUMN parent path must point to a STRUCT (LIST element is not a STRUCT)"
+                        .to_string(),
+                ),
+            }
         }
         _ => Err("ADD COLUMN parent path must point to a STRUCT".to_string()),
     }
@@ -3048,6 +3585,7 @@ fn build_property_updates(
             }
         }
         IcebergSchemaChange::Reorder { .. } => {}
+        IcebergSchemaChange::UpdateComment { .. } => {}
     }
     Ok(updates)
 }

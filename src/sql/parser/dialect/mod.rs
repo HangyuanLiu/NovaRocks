@@ -177,10 +177,60 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
                     let (precision, scale) = parse_custom_decimal_modifiers(&modifiers);
                     Ok(SqlType::Decimal { precision, scale })
                 }
+                "array" => {
+                    // normalize_for_raw_parse rewrites ARRAY<T> -> ARRAY('T'), so modifiers
+                    // holds one element type string (e.g. "INT", "STRING").
+                    let inner_str = modifiers
+                        .first()
+                        .ok_or_else(|| "ARRAY type requires an element type".to_string())?;
+                    let inner = parse_modifier_to_sql_type(inner_str)?;
+                    Ok(SqlType::Array(Box::new(inner)))
+                }
+                "map" => {
+                    // normalize_for_raw_parse rewrites MAP<K,V> -> MAP('K', 'V'), so modifiers
+                    // holds [key_type_string, value_type_string].
+                    if modifiers.len() < 2 {
+                        return Err("MAP type requires key and value types".to_string());
+                    }
+                    let key = parse_modifier_to_sql_type(&modifiers[0])?;
+                    let value = parse_modifier_to_sql_type(&modifiers[1])?;
+                    Ok(SqlType::Map(Box::new(key), Box::new(value)))
+                }
                 _ => Err(format!("unsupported data type: {name}")),
             }
         }
         other => Err(format!("unsupported data type: {other}")),
+    }
+}
+
+/// Convert a type name string (e.g. "INT", "STRING", "BIGINT") produced by
+/// `normalize_for_raw_parse` as a Custom type modifier back into `SqlType`.
+/// Only primitive types are expected in this position; nested ARRAY/MAP inside
+/// ARRAY/MAP modifiers require a round-trip through the full SQL parser and are
+/// not handled here.
+fn parse_modifier_to_sql_type(s: &str) -> Result<SqlType, String> {
+    match s.trim().to_lowercase().as_str() {
+        "tinyint" | "int8" => Ok(SqlType::TinyInt),
+        "smallint" | "int16" => Ok(SqlType::SmallInt),
+        "int" | "integer" | "int32" => Ok(SqlType::Int),
+        "bigint" | "int64" => Ok(SqlType::BigInt),
+        "largeint" | "int128" => Ok(SqlType::LargeInt),
+        "float" | "float32" => Ok(SqlType::Float),
+        "double" | "float64" => Ok(SqlType::Double),
+        "boolean" | "bool" => Ok(SqlType::Boolean),
+        "string" | "varchar" | "text" => Ok(SqlType::String),
+        "date" => Ok(SqlType::Date),
+        "datetime" | "timestamp" => Ok(SqlType::DateTime),
+        "decimal" => Ok(SqlType::Decimal {
+            precision: 38,
+            scale: 0,
+        }),
+        "binary" | "varbinary" => Ok(SqlType::Binary),
+        "json" | "jsonb" => Ok(SqlType::Json),
+        "bitmap" => Ok(SqlType::Bitmap),
+        "hll" => Ok(SqlType::Hll),
+        "variant" => Ok(SqlType::Variant),
+        other => Err(format!("unsupported type in collection modifier: {other}")),
     }
 }
 
@@ -2207,6 +2257,21 @@ fn utf8_char_width(first_byte: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convert_sql_type_handles_normalized_map_type() {
+        use super::{StarRocksDialect, convert_sql_type};
+        use sqlparser::parser::Parser;
+        let normalized = "MAP('STRING', 'INT')";
+        let mut parser = Parser::new(&StarRocksDialect)
+            .try_with_sql(normalized)
+            .expect("parse");
+        let data_type = parser.parse_data_type().expect("data_type");
+        eprintln!("data_type = {:?}", data_type);
+        let sql_type = convert_sql_type(data_type);
+        eprintln!("sql_type = {:?}", sql_type);
+        assert!(sql_type.is_ok(), "convert_sql_type failed: {:?}", sql_type);
+    }
+
     #[test]
     fn normalize_function_syntax_rewrites_legacy_map_literals() {
         let normalized = super::normalize_for_raw_parse(

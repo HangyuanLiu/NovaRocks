@@ -7,8 +7,54 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Escape a single TSV cell value so it can be safely written to a TSV file.
+///
+/// Characters that would break TSV row / column framing are backslash-escaped:
+///   `\` → `\\`,  `\n` → `\n`,  `\r` → `\r`,  `\t` → `\t`
+///
+/// The escape sequences use the traditional two-character backslash forms so
+/// the result is always a single printable line.
+pub fn escape_cell(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    for ch in cell.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unescape a single TSV cell value that was written by [`escape_cell`].
+pub fn unescape_cell(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut chars = cell.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(c) => {
+                    // Unknown escape: preserve both characters verbatim.
+                    out.push('\\');
+                    out.push(c);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn split_row(line: &str) -> Vec<String> {
-    line.split('\t').map(ToString::to_string).collect()
+    line.split('\t').map(|cell| unescape_cell(cell)).collect()
 }
 
 pub fn parse_result_set(lines: &[String]) -> ResultSet {
@@ -33,9 +79,16 @@ pub fn render_result_set(header: &[String], rows: &[Vec<String>]) -> String {
         return String::new();
     }
 
+    let escape_row = |row: &[String]| -> String {
+        row.iter()
+            .map(|cell| escape_cell(cell))
+            .collect::<Vec<_>>()
+            .join("\t")
+    };
+
     let mut out_lines = Vec::with_capacity(rows.len() + 1);
-    out_lines.push(header.join("\t"));
-    out_lines.extend(rows.iter().map(|row| row.join("\t")));
+    out_lines.push(escape_row(header));
+    out_lines.extend(rows.iter().map(|row| escape_row(row)));
     format!("{}\n", out_lines.join("\n"))
 }
 
@@ -557,6 +610,78 @@ pub fn write_mismatch_artifacts(
     fs::write(out_dir.join("diff.txt"), format!("{}\n", reason))
         .with_context(|| format!("write diff failed: {}", out_dir.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cell_escape_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_plain_string() {
+        let s = "hello world";
+        assert_eq!(unescape_cell(&escape_cell(s)), s);
+    }
+
+    #[test]
+    fn round_trip_newline_in_cell() {
+        let s = "line1\nline2";
+        let escaped = escape_cell(s);
+        // Escaped form must not contain a literal newline.
+        assert!(
+            !escaped.contains('\n'),
+            "escaped cell must not contain newline"
+        );
+        assert_eq!(escaped, r"line1\nline2");
+        assert_eq!(unescape_cell(&escaped), s);
+    }
+
+    #[test]
+    fn round_trip_tab_in_cell() {
+        let s = "col1\tcol2";
+        let escaped = escape_cell(s);
+        assert!(!escaped.contains('\t'), "escaped cell must not contain tab");
+        assert_eq!(escaped, r"col1\tcol2");
+        assert_eq!(unescape_cell(&escaped), s);
+    }
+
+    #[test]
+    fn round_trip_backslash_in_cell() {
+        let s = r"C:\path\file";
+        let escaped = escape_cell(s);
+        assert_eq!(escaped, r"C:\\path\\file");
+        assert_eq!(unescape_cell(&escaped), s);
+    }
+
+    #[test]
+    fn round_trip_mixed_special_chars() {
+        let s = "a,b\nc\td\\e\r";
+        let escaped = escape_cell(s);
+        assert!(!escaped.contains('\n'));
+        assert!(!escaped.contains('\r'));
+        // tabs in this context are field separators; escaped tab must not be a real tab
+        assert!(!escaped.contains('\t'));
+        assert_eq!(unescape_cell(&escaped), s);
+    }
+
+    #[test]
+    fn render_and_parse_result_set_round_trip_with_newline_in_cell() {
+        let header = vec!["id".to_string(), "value".to_string()];
+        let rows = vec![
+            vec!["1".to_string(), "line1\nline2".to_string()],
+            vec!["2".to_string(), "normal".to_string()],
+        ];
+        let rendered = render_result_set(&header, &rows);
+        // The rendered TSV must be exactly 3 physical lines (header + 2 rows + trailing newline).
+        let line_count = rendered.lines().count();
+        assert_eq!(
+            line_count, 3,
+            "expected 3 lines, got {}: {:?}",
+            line_count, rendered
+        );
+        let parsed = parse_result_set(&rendered.lines().map(|l| l.to_string()).collect::<Vec<_>>());
+        assert_eq!(parsed.header, header);
+        assert_eq!(parsed.rows, rows);
+    }
 }
 
 #[cfg(test)]

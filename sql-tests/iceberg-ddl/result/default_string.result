@@ -1,0 +1,10 @@
+-- query 8
+id	name	tag	empty_v	unicode_v	special_v
+1	alice	default		日本語	a,b\nc
+2	bob	default		日本語	a,b\nc
+
+-- query 10
+id	name	tag	empty_v	unicode_v	special_v
+1	alice	default		日本語	a,b\nc
+2	bob	default		日本語	a,b\nc
+3	charlie	default		日本語	a,b\nc

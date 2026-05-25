@@ -25,7 +25,9 @@ use crate::version;
 
 use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
-use crate::engine::statement::looks_like_show_alter_table_optimize;
+use crate::engine::statement::{
+    looks_like_show_alter_table_optimize, looks_like_show_create_table,
+};
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 use crate::sql::optimizer::options::SessionOptimizerSettings;
 
@@ -784,6 +786,7 @@ async fn execute_statement_text(
     if is_session_noop(trimmed)
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
+        && !looks_like_show_create_table(trimmed)
     {
         return Ok(StatementResult::Ok);
     }
@@ -807,6 +810,7 @@ async fn execute_statement_text(
     if !is_supported_embedded_statement(&rewritten)
         && !is_materialized_view_management_statement(&rewritten)
         && !looks_like_show_alter_table_optimize(&rewritten)
+        && !looks_like_show_create_table(&rewritten)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,

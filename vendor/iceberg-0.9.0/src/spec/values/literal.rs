@@ -500,7 +500,30 @@ impl Literal {
                     PrimitiveLiteral::UInt128(Uuid::parse_str(&s)?.as_u128()),
                 ))),
                 (PrimitiveType::Fixed(_), JsonValue::String(_)) => todo!(),
-                (PrimitiveType::Binary, JsonValue::String(_)) => todo!(),
+                (PrimitiveType::Binary, JsonValue::String(s)) => {
+                    // The JSON representation produced by try_into_json is a
+                    // variable-width lowercase hex string (one or two chars per
+                    // byte, without zero-padding for bytes < 0x10).  We decode
+                    // it back by zero-padding to an even length and then
+                    // parsing pairs of hex digits.
+                    let hex = if s.len() % 2 == 0 {
+                        s.clone()
+                    } else {
+                        format!("0{s}")
+                    };
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| {
+                            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!("invalid hex byte in Binary default: {e}"),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<u8>>>()?;
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Binary(bytes))))
+                }
                 (
                     PrimitiveType::Decimal {
                         precision: _,

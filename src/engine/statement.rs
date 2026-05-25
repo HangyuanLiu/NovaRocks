@@ -1375,6 +1375,51 @@ pub(crate) enum IcebergSchemaChange {
         path: ColumnPath,
         position: AddPosition,
     },
+    UpdateComment {
+        path: ColumnPath,
+        comment: String,
+    },
+}
+
+/// Detect `SHOW CREATE TABLE <name>` statements so the server layer can
+/// route them to the engine instead of treating them as session noops.
+pub(crate) fn looks_like_show_create_table(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    // Match "SHOW CREATE TABLE ..." quickly without full parsing.
+    if !lower.starts_with("show") {
+        return false;
+    }
+    let rest = lower["show".len()..].trim_start();
+    if !rest.starts_with("create") {
+        return false;
+    }
+    let rest2 = rest["create".len()..].trim_start();
+    rest2.starts_with("table")
+}
+
+/// Parse `SHOW CREATE TABLE <catalog>.<db>.<table>` and return the parsed
+/// `ObjectName`.  Returns `Err` if parsing fails.
+pub(crate) fn parse_show_create_table(
+    sql: &str,
+) -> Result<crate::sql::parser::ast::ObjectName, String> {
+    use sqlparser::keywords::Keyword;
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
+    parser
+        .expect_keyword(Keyword::SHOW)
+        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
+    parser
+        .expect_keyword(Keyword::CREATE)
+        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
+    parser
+        .expect_keyword(Keyword::TABLE)
+        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
+    let obj = parser
+        .parse_object_name(false)
+        .map_err(|e| format!("parse SHOW CREATE TABLE table name: {e}"))?;
+    crate::sql::parser::dialect::convert_object_name(obj)
 }
 
 pub(crate) fn looks_like_alter_table_optimize(sql: &str) -> bool {
@@ -2225,9 +2270,9 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
             .expect_keyword(Keyword::COLUMN)
             .map_err(|e| e.to_string())?;
         let path = parse_column_path(&mut parser)?;
-        let new_type = crate::sql::parser::dialect::convert_sql_type(
-            parser.parse_data_type().map_err(|e| e.to_string())?,
-        )?;
+        // Use parse_sql_type_definition so that MAP<K,V>/ARRAY<T> work without normalize.
+        let new_type =
+            crate::sql::parser::dialect::create_table::parse_sql_type_definition(&mut parser)?;
         if parser.parse_keyword(Keyword::FIRST)
             || parser.parse_keyword(Keyword::AFTER)
             || crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE")
@@ -2280,9 +2325,14 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
                 path,
                 nullable: true,
             }
+        } else if parser.parse_keyword(Keyword::COMMENT) {
+            let comment = parser
+                .parse_literal_string()
+                .map_err(|e| format!("COMMENT expects a string literal: {e}"))?;
+            IcebergSchemaChange::UpdateComment { path, comment }
         } else {
             return Err(
-                "ALTER COLUMN must be followed by FIRST / AFTER / BEFORE / SET NOT NULL / DROP NOT NULL".to_string(),
+                "ALTER COLUMN must be followed by FIRST / AFTER / BEFORE / SET NOT NULL / DROP NOT NULL / COMMENT".to_string(),
             );
         }
     } else {
@@ -2311,9 +2361,10 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
     let parent_segments = path.segments()[..path.segments().len() - 1].to_vec();
     let parent = ColumnPath::from_segments(parent_segments);
 
-    let data_type = crate::sql::parser::dialect::convert_sql_type(
-        parser.parse_data_type().map_err(|e| e.to_string())?,
-    )?;
+    // Use parse_sql_type_definition (not parser.parse_data_type + convert_sql_type) so that
+    // collection types like MAP<K,V> and ARRAY<T> are parsed via native angle-bracket syntax
+    // rather than going through normalize_for_raw_parse which only rewrites MAP<> inside CAST.
+    let data_type = crate::sql::parser::dialect::create_table::parse_sql_type_definition(parser)?;
     let mut default: Option<DefaultLiteral> = None;
     let mut seen_null = false;
     let mut seen_default = false;
@@ -3127,6 +3178,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_add_column_map_default_empty() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN counts MAP<STRING, INT> DEFAULT '{}'",
+        )
+        .expect("parse MAP column with default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn {
+                name, data_type, ..
+            } => {
+                assert_eq!(name, "counts");
+                assert!(
+                    matches!(data_type, crate::sql::parser::ast::SqlType::Map(_, _)),
+                    "expected Map type, got {:?}",
+                    data_type
+                );
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_add_column_array_default_empty() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN tags ARRAY<INT> DEFAULT '[]'",
+        )
+        .expect("parse ARRAY column with default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn {
+                name, data_type, ..
+            } => {
+                assert_eq!(name, "tags");
+                assert!(
+                    matches!(data_type, crate::sql::parser::ast::SqlType::Array(_)),
+                    "expected Array type, got {:?}",
+                    data_type
+                );
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
     fn parse_add_column_into_nested_struct() {
         let stmt =
             super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN address.zip INT")
@@ -3210,6 +3303,43 @@ mod tests {
             panic!();
         };
         assert_eq!(path.dotted(), "address.street");
+    }
+
+    #[test]
+    fn parse_alter_column_comment() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ALTER COLUMN v COMMENT 'value column'",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
+            panic!("expected UpdateComment");
+        };
+        assert_eq!(path.dotted(), "v");
+        assert_eq!(comment, "value column");
+    }
+
+    #[test]
+    fn parse_alter_column_comment_nested() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ALTER COLUMN address.street COMMENT 'street name'",
+        )
+        .unwrap();
+        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
+            panic!("expected UpdateComment");
+        };
+        assert_eq!(path.dotted(), "address.street");
+        assert_eq!(comment, "street name");
+    }
+
+    #[test]
+    fn parse_alter_column_comment_empty_string() {
+        let stmt = super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c COMMENT ''")
+            .unwrap();
+        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
+            panic!("expected UpdateComment");
+        };
+        assert_eq!(path.dotted(), "c");
+        assert_eq!(comment, "");
     }
 
     #[test]

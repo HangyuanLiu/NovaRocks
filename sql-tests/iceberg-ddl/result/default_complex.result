@@ -1,0 +1,10 @@
+-- query 6
+id	name	tags	counts
+1	alice	[]	{}
+2	bob	[]	{}
+
+-- query 8
+id	name	tags	counts
+1	alice	[]	{}
+2	bob	[]	{}
+3	charlie	[]	{}

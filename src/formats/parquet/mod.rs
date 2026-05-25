@@ -1680,7 +1680,7 @@ fn arrow_type_to_iceberg_type(
     dt: &arrow::datatypes::DataType,
 ) -> Result<iceberg::spec::Type, String> {
     use arrow::datatypes::TimeUnit;
-    use iceberg::spec::{PrimitiveType, Type};
+    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Type};
     Ok(match dt {
         DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         DataType::Int32 => Type::Primitive(PrimitiveType::Int),
@@ -1696,7 +1696,38 @@ fn arrow_type_to_iceberg_type(
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Type::Primitive(PrimitiveType::Timestamp)
         }
-        DataType::Binary => Type::Primitive(PrimitiveType::Binary),
+        DataType::Binary | DataType::LargeBinary => Type::Primitive(PrimitiveType::Binary),
+        // List type: construct a ListType with the element type inferred from the Arrow field.
+        // Field id is a placeholder (used only during empty-default JSON round-trip).
+        DataType::List(element_field) => {
+            let element_type = arrow_type_to_iceberg_type(element_field.data_type())?;
+            Type::List(ListType::new(Arc::new(NestedField::optional(
+                1,
+                "element",
+                element_type,
+            ))))
+        }
+        // Map type: construct from the Arrow entries struct fields (key at index 0, value at 1).
+        DataType::Map(entries_field, _) => {
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "arrow Map field entries must be a Struct, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if entry_fields.len() < 2 {
+                return Err(format!(
+                    "arrow Map entries struct must have at least 2 fields (key, value), got {}",
+                    entry_fields.len()
+                ));
+            }
+            let key_type = arrow_type_to_iceberg_type(entry_fields[0].data_type())?;
+            let value_type = arrow_type_to_iceberg_type(entry_fields[1].data_type())?;
+            Type::Map(MapType::new(
+                Arc::new(NestedField::required(1, "key", key_type)),
+                Arc::new(NestedField::optional(2, "value", value_type)),
+            ))
+        }
         other => {
             return Err(format!(
                 "arrow type {other:?} cannot carry an iceberg default"

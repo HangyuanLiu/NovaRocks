@@ -634,8 +634,7 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
         // MySQL `/*+ ... */` optimizer hints are part of the statement (the
         // server parses them) — stripping them would silently drop SET_VAR
         // values such as `recursive_cte_max_depth`.
-        let sql =
-            "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib; SELECT 2;";
+        let sql = "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib; SELECT 2;";
         let parts = split_sql_statements(sql).expect("split");
         assert_eq!(parts.len(), 2);
         assert_eq!(

@@ -749,7 +749,7 @@ fn parse_column_aggregation(parser: &mut Parser<'_>) -> Option<ColumnAggregation
     Some(aggregation)
 }
 
-fn parse_sql_type_definition(parser: &mut Parser<'_>) -> Result<SqlType, String> {
+pub(crate) fn parse_sql_type_definition(parser: &mut Parser<'_>) -> Result<SqlType, String> {
     if peek_word_eq(parser, 0, "ARRAY") {
         parse_array_sql_type(parser)
     } else if peek_word_eq(parser, 0, "MAP") {
@@ -1053,6 +1053,35 @@ fn parse_string_default(
         SqlType::DateTime => {
             let micros = crate::engine::parquet::parse_datetime_string_to_micros(s)?;
             Ok(DefaultLiteral::DateTime(micros))
+        }
+        // Binary: interpret the SQL string literal as raw UTF-8 bytes.
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => {
+            Ok(DefaultLiteral::Binary(s.as_bytes().to_vec()))
+        }
+        // Array / Map: the string must be a JSON array literal `[]` or
+        // a JSON object literal `{}`.  Non-empty collection literals are
+        // rejected here and surfaced as a follow-up gap.
+        SqlType::Array(_) => {
+            let v = serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| format!("invalid ARRAY DEFAULT literal: {e}"))?;
+            if !v.is_array() {
+                return Err(format!(
+                    "ARRAY DEFAULT must be a JSON array literal (e.g. '[]'), got: {s:?}"
+                ));
+            }
+            // Store the JSON literal as-is; default_literal_to_iceberg converts it.
+            Ok(DefaultLiteral::String(s.to_string()))
+        }
+        SqlType::Map(_, _) => {
+            let v = serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| format!("invalid MAP DEFAULT literal: {e}"))?;
+            if !v.is_object() {
+                return Err(format!(
+                    "MAP DEFAULT must be a JSON object literal (e.g. '{{}}'), got: {s:?}"
+                ));
+            }
+            // Store the JSON literal as-is; default_literal_to_iceberg converts it.
+            Ok(DefaultLiteral::String(s.to_string()))
         }
         other => Err(format!(
             "string DEFAULT not supported for column type {other:?}"
