@@ -142,6 +142,19 @@ pub(crate) struct DropMaterializedViewStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AlterMaterializedViewAction {
+    SetRefresh(MaterializedViewRefreshPolicy),
+    PauseRefresh,
+    ResumeRefresh,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AlterMaterializedViewStmt {
+    pub name: ObjectName,
+    pub action: AlterMaterializedViewAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshMaterializedViewStmt {
     pub name: ObjectName,
     /// `true` when `REFRESH MATERIALIZED VIEW <name> FULL` was parsed.
@@ -162,6 +175,7 @@ pub(crate) struct ShowMaterializedViewsStmt {
 pub(crate) enum Statement {
     CreateMaterializedView(CreateMaterializedViewStmt),
     DropMaterializedView(DropMaterializedViewStmt),
+    AlterMaterializedView(AlterMaterializedViewStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     ShowMaterializedViews(ShowMaterializedViewsStmt),
     AlterIcebergRef(AlterIcebergRefStmt),

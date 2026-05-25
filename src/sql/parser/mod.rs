@@ -55,6 +55,10 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         let stmt = dialect::materialized_view::parse_show_materialized_views(&mut parser)?;
         return Ok(vec![stmt]);
     }
+    if dialect::materialized_view::looks_like_alter_materialized_view(&parser) {
+        let stmt = dialect::materialized_view::parse_alter_materialized_view(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
 
     if dialect::alter_iceberg_ref::looks_like_alter_iceberg_ref(&parser) {
         let stmt = dialect::alter_iceberg_ref::parse_alter_iceberg_ref(&mut parser)?;

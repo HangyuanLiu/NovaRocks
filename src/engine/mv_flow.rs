@@ -394,6 +394,15 @@ pub(crate) fn drop_mv(
     Ok(StatementResult::Ok)
 }
 
+pub(crate) fn alter_mv(
+    _state: &Arc<StandaloneState>,
+    _current_catalog: Option<&str>,
+    _db: &str,
+    _stmt: &crate::sql::parser::ast::AlterMaterializedViewStmt,
+) -> Result<StatementResult, String> {
+    Err("ALTER MATERIALIZED VIEW refresh policy execution is not implemented yet".to_string())
+}
+
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,

@@ -11,9 +11,10 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, peek_word_eq};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
-    MaterializedViewDistribution, MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt, Statement,
+    AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
+    DropMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewDistribution,
+    MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
+    Statement,
 };
 use crate::sql::parser::dialect::create_table::parse_partition_field_expr;
 
@@ -370,6 +371,60 @@ pub(crate) fn parse_drop_materialized_view(parser: &mut Parser<'_>) -> Result<St
     }))
 }
 
+/// Check if the current position looks like `ALTER MATERIALIZED VIEW ...`.
+/// The parser is not advanced.
+pub(crate) fn looks_like_alter_materialized_view(parser: &Parser<'_>) -> bool {
+    parser.peek_keyword(Keyword::ALTER)
+        && peek_word_eq(parser, 1, "MATERIALIZED")
+        && peek_word_eq(parser, 2, "VIEW")
+}
+
+/// Parse `ALTER MATERIALIZED VIEW <name> SET REFRESH ...`.
+///
+/// This phase accepts only refresh policy metadata operations. Other
+/// StarRocks-style MV ALTER forms remain unsupported so they fail fast instead
+/// of being silently ignored.
+pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<Statement, String> {
+    parser
+        .expect_keyword(Keyword::ALTER)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::MATERIALIZED)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::VIEW)
+        .map_err(|e| e.to_string())?;
+    let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
+
+    let action = if parser.parse_keyword(Keyword::SET) {
+        parser
+            .expect_keyword(Keyword::REFRESH)
+            .map_err(|e| format!("expected REFRESH after ALTER MATERIALIZED VIEW ... SET: {e}"))?;
+        AlterMaterializedViewAction::SetRefresh(parse_refresh_clause(parser)?)
+    } else if peek_word_eq(parser, 0, "PAUSE") {
+        parser.next_token();
+        parser
+            .expect_keyword(Keyword::REFRESH)
+            .map_err(|e| format!("expected REFRESH after PAUSE: {e}"))?;
+        AlterMaterializedViewAction::PauseRefresh
+    } else if peek_word_eq(parser, 0, "RESUME") {
+        parser.next_token();
+        parser
+            .expect_keyword(Keyword::REFRESH)
+            .map_err(|e| format!("expected REFRESH after RESUME: {e}"))?;
+        AlterMaterializedViewAction::ResumeRefresh
+    } else {
+        return Err(
+            "expected SET REFRESH, PAUSE REFRESH, or RESUME REFRESH after ALTER MATERIALIZED VIEW"
+                .to_string(),
+        );
+    };
+
+    Ok(Statement::AlterMaterializedView(
+        AlterMaterializedViewStmt { name, action },
+    ))
+}
+
 /// Check if the current position looks like `REFRESH MATERIALIZED VIEW ...`.
 /// The parser is not advanced.
 pub(crate) fn looks_like_refresh_materialized_view(parser: &Parser<'_>) -> bool {
@@ -480,7 +535,8 @@ pub(crate) fn parse_show_materialized_views(parser: &mut Parser<'_>) -> Result<S
 #[cfg(test)]
 mod tests {
     use crate::sql::parser::ast::{
-        IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
+        AlterMaterializedViewAction, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
+        Statement,
     };
     use crate::sql::parser::parse_sql;
 
@@ -746,6 +802,49 @@ mod tests {
         let err = crate::sql::parser::parse_sql("DROP MATERIALIZED VIEW mv1 FORCE")
             .expect_err("should reject");
         assert!(err.to_lowercase().contains("force"), "err={err}");
+    }
+
+    #[test]
+    fn parse_alter_mv_set_refresh_async_interval() {
+        let stmt =
+            parse_one("ALTER MATERIALIZED VIEW analytics.mv1 SET REFRESH ASYNC EVERY INTERVAL 2 HOURS");
+        let Statement::AlterMaterializedView(alter) = stmt else {
+            panic!("expected ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(alter.name.parts, vec!["analytics", "mv1"]);
+        assert_eq!(
+            alter.action,
+            AlterMaterializedViewAction::SetRefresh(
+                MaterializedViewRefreshPolicy::AsyncInterval {
+                    interval_ms: 7_200_000
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn parse_alter_mv_pause_and_resume_refresh() {
+        let pause = parse_one("ALTER MATERIALIZED VIEW mv1 PAUSE REFRESH");
+        let Statement::AlterMaterializedView(pause) = pause else {
+            panic!("expected ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(pause.action, AlterMaterializedViewAction::PauseRefresh);
+
+        let resume = parse_one("ALTER MATERIALIZED VIEW mv1 RESUME REFRESH");
+        let Statement::AlterMaterializedView(resume) = resume else {
+            panic!("expected ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(resume.action, AlterMaterializedViewAction::ResumeRefresh);
+    }
+
+    #[test]
+    fn parse_alter_mv_rejects_refresh_immediate() {
+        let err = crate::sql::parser::parse_sql("ALTER MATERIALIZED VIEW mv1 SET REFRESH IMMEDIATE")
+            .expect_err("should reject");
+        assert!(
+            err.contains("REFRESH IMMEDIATE is not supported yet"),
+            "err={err}"
+        );
     }
 
     #[test]

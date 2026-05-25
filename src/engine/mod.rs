@@ -1809,6 +1809,9 @@ pub(crate) fn dispatch_statement(
         Statement::DropMaterializedView(stmt) => {
             crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
         }
+        Statement::AlterMaterializedView(stmt) => {
+            crate::engine::mv_flow::alter_mv(state, current_catalog, current_database, &stmt)
+        }
         Statement::RefreshMaterializedView(stmt) => {
             crate::engine::mv_flow::refresh_mv(state, current_catalog, current_database, &stmt)
         }
