@@ -93,7 +93,7 @@ mod tests {
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
                     iceberg_table: None,
-                    storage: crate::sql::catalog::TableStorage::S3ParquetFiles { files: Vec::new(), cloud_properties: Default::default() },
+                    source: crate::sql::catalog::ScanSource::ManagedLake,
                 },
                 alias: None,
                 columns: vec![],
