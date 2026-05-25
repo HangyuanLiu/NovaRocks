@@ -1,7 +1,8 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,varbinary
 -- Test Objective:
--- 1. ALTER ADD COLUMN VARBINARY DEFAULT 'literal' applies correctly.
+-- 1. Validate VARBINARY (Iceberg Binary) DEFAULT — a type NOT covered by
+--    v3_default_primitive_types.sql.
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");

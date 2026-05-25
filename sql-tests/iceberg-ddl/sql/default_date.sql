@@ -1,8 +1,9 @@
 -- @order_sensitive=true
 -- @tags=iceberg_ddl,default,date
 -- Test Objective:
--- 1. ALTER ADD COLUMN DATE / DATETIME DEFAULT v applies correctly.
--- 2. Various date / datetime literal forms are accepted as defaults.
+-- 1. Validate DATE and DATETIME DEFAULT with mid-2024 calendar dates.
+--    v3_default_primitive_types.sql uses the epoch + epoch-plus-1, which is
+--    a different reference point.
 
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");
