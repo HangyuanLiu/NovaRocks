@@ -14,6 +14,7 @@ use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_registered_external_table;
 use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use crate::meta::MetaReadTxn;
 use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
@@ -63,40 +64,6 @@ pub(crate) enum ResolvedTableRef {
         database: String,
         table: String,
     },
-}
-
-#[allow(dead_code)]
-pub(crate) fn extract_base_table_refs(
-    resolved: &[ResolvedTableRef],
-) -> Result<Vec<IcebergTableRef>, String> {
-    let mut out = Vec::new();
-    for table_ref in resolved {
-        match table_ref {
-            ResolvedTableRef::Iceberg {
-                catalog,
-                namespace,
-                table,
-            } => {
-                let candidate = IcebergTableRef {
-                    catalog: catalog.clone(),
-                    namespace: namespace.clone(),
-                    table: table.clone(),
-                };
-                if !out.contains(&candidate) {
-                    out.push(candidate);
-                }
-            }
-            ResolvedTableRef::ManagedLake { database, table } => {
-                return Err(format!(
-                    "materialized view base tables must be Iceberg tables; found managed lake table `{database}.{table}`"
-                ));
-            }
-        }
-    }
-    if out.is_empty() {
-        return Err("materialized view base tables must be Iceberg tables".to_string());
-    }
-    Ok(out)
 }
 
 pub(crate) fn resolve_mv_storage_engine(
@@ -168,6 +135,13 @@ pub(crate) fn create_mv(
     )?;
     let dependency_target =
         crate::engine::mv::dependency::managed_mv_dependency_ref(&db_name, &mv_name);
+    // Defensive: this check runs after the managed-lake "already exists" guard
+    // above, so user-facing CREATE statements can't reach it (a brand-new MV
+    // target has no inbound edges, while an existing target fails on existence
+    // first). Kept as a safety net for future paths that bypass the existence
+    // check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or racy
+    // metadata writes. Algorithm coverage lives in
+    // src/engine/mv/dependency.rs::tests.
     crate::engine::mv::dependency::validate_no_create_cycle(
         state,
         &dependency_target,
@@ -867,6 +841,12 @@ pub(crate) fn list_mv_rows(
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(vec![]);
     };
+    // Share a single read transaction across `list_definitions` and every
+    // per-row `dependency_display_for_mv` lookup. This avoids M+1 RAII
+    // open/close cycles for M materialized views and, more importantly,
+    // gives the entire SHOW MATERIALIZED VIEWS result a consistent
+    // metadata snapshot: concurrent CREATE/DROP MV writers cannot make
+    // dependency display drift away from the MV list we just read.
     let read = provider
         .begin_read()
         .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
@@ -920,7 +900,7 @@ pub(crate) fn list_mv_rows(
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
-                dependencies: dependency_display_for_mv(state, mv.mv_id)?,
+                dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
             });
             continue;
         }
@@ -956,22 +936,23 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
-            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
+            dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
         });
     }
     Ok(rows)
 }
 
-fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(String::new());
-    };
-    let read = provider
-        .begin_read()
-        .map_err(|e| format!("open MV dependency display read failed: {e}"))?;
+/// Render the dependency-column text for a single MV row. Callers must pass
+/// the shared read transaction opened by `list_mv_rows` so that every row
+/// observes the same metadata snapshot and we avoid M+1 transaction opens.
+fn dependency_display_for_mv(
+    state: &Arc<StandaloneState>,
+    read: &dyn MetaReadTxn,
+    mv_id: i64,
+) -> Result<String, String> {
     let dependencies = state
         .mv_repo
-        .list_dependencies_by_downstream(read.as_ref(), mv_id)
+        .list_dependencies_by_downstream(read, mv_id)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
@@ -1909,16 +1890,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_base_table_refs_rejects_non_iceberg_tables() {
-        let err = extract_base_table_refs(&[ResolvedTableRef::ManagedLake {
-            database: "analytics".to_string(),
-            table: "orders_raw".to_string(),
-        }])
-        .expect_err("should reject non-iceberg");
-        assert!(err.contains("Iceberg"), "err={err}");
-    }
-
-    #[test]
     fn show_materialized_views_lists_iceberg_relationship_without_managed_table_row() {
         let (state, _dir) = open_state_with_sqlite_store();
         insert_iceberg_mv_relationship(
@@ -2001,25 +1972,6 @@ mod tests {
             mv_definition_exists(&state, mv_id),
             "legacy-owned MV must remain visible through repository reads when legacy drop rejects"
         );
-    }
-
-    #[test]
-    fn extract_base_table_refs_returns_iceberg_fqns() {
-        let refs = extract_base_table_refs(&[
-            ResolvedTableRef::Iceberg {
-                catalog: "iceberg_cat".to_string(),
-                namespace: "ns".to_string(),
-                table: "orders".to_string(),
-            },
-            ResolvedTableRef::Iceberg {
-                catalog: "iceberg_cat".to_string(),
-                namespace: "ns".to_string(),
-                table: "items".to_string(),
-            },
-        ])
-        .expect("ok");
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].fqn(), "iceberg_cat.ns.orders");
     }
 
     #[test]
