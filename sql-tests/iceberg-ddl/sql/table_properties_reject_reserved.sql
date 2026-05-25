@@ -2,8 +2,8 @@
 -- Denylist coverage: each reserved category errors clearly.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.tblprops_reject_${uuid0};
-USE iceberg_cat_${suite_uuid0}.tblprops_reject_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
 DROP TABLE IF EXISTS p;
 CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
 
@@ -34,4 +34,4 @@ ALTER TABLE p UNSET TBLPROPERTIES ('last-column-id');
 
 -- query 8
 DROP TABLE p;
-DROP DATABASE iceberg_cat_${suite_uuid0}.tblprops_reject_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};

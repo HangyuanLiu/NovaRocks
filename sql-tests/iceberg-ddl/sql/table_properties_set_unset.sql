@@ -4,8 +4,8 @@
 -- Each SELECT confirms the table is still queryable after each property change.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.tblprops_${uuid0};
-USE iceberg_cat_${suite_uuid0}.tblprops_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};
 DROP TABLE IF EXISTS p;
 CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
 INSERT INTO p VALUES (1);
@@ -40,4 +40,4 @@ SELECT id FROM p ORDER BY id;
 
 -- query 11
 DROP TABLE p;
-DROP DATABASE iceberg_cat_${suite_uuid0}.tblprops_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_${uuid0};

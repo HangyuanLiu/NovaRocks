@@ -2,8 +2,8 @@
 -- Parser-level rejects: empty parens, duplicate keys, unsupported grammar.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.tblprops_grammar_${uuid0};
-USE iceberg_cat_${suite_uuid0}.tblprops_grammar_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_grammar_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.tblprops_grammar_${uuid0};
 DROP TABLE IF EXISTS p;
 CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
 
@@ -25,4 +25,4 @@ ALTER TABLE p UNSET TBLPROPERTIES ('a', 'a');
 
 -- query 6
 DROP TABLE p;
-DROP DATABASE iceberg_cat_${suite_uuid0}.tblprops_grammar_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_grammar_${uuid0};

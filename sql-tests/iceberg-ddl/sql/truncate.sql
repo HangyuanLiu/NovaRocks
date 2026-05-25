@@ -8,7 +8,7 @@
 -- The runner auto-creates `${case_db}` per case and drops it on cleanup, so
 -- there is no explicit CREATE/DROP DATABASE here. All table refs are 2-part
 -- `${case_db}.<table>` against the suite-level iceberg catalog
--- (`iceberg_cat_${suite_uuid0}`) selected by `SET catalog` at session setup.
+-- (`iceberg_ddl_cat_${suite_uuid0}`) selected by `SET catalog` at session setup.
 
 -- ---------------------------------------------------------------------------
 -- Case 1: TRUNCATE on a v3 row-lineage table
@@ -122,7 +122,7 @@ INSERT INTO ${case_db}.t_branch VALUES (1, 'main_a'), (2, 'main_b');
 -- @skip_result_check=true
 -- ALTER TABLE for branch DDL requires 3-part name (catalog.db.table); see
 -- src/engine/iceberg_ref_flow.rs::resolve_table_parts.
-ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t_branch CREATE BRANCH dev;
+ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch CREATE BRANCH dev;
 
 -- query 24
 -- @skip_result_check=true
@@ -150,7 +150,7 @@ SELECT id, v FROM ${case_db}.t_branch
 
 -- query 29
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EXISTS dev;
+ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EXISTS dev;
 
 -- ---------------------------------------------------------------------------
 -- Case 5: TRUNCATE after DELETE (exercises deletion-vector / position-delete entries)
