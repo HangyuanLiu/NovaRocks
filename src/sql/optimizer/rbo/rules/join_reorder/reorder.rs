@@ -95,9 +95,6 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                         total.max(1)
                     }
                 }
-                TableStorage::LocalParquetFile { path } => std::fs::metadata(path)
-                    .map(|m| m.len())
-                    .unwrap_or(1_000_000),
                 // Iceberg metadata tables (snapshots/history/refs/partitions)
                 // are tiny by design — they enumerate snapshot/history/ref
                 // entries which are bounded by the table's history depth.
@@ -109,6 +106,16 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // them as small for join-reorder purposes; IVM refresh
                 // plans usually do not involve multi-table joins anyway.
                 TableStorage::IcebergDeltaTable { .. } => 1,
+                // Managed-lake tables don't carry per-file size on
+                // `TableDef.storage`; tablet/version info lives on
+                // `PhysicalTableLayout` separately, and the proper row-
+                // count source is the analyzed-stats path. As a heuristic
+                // fallback for join-reorder when stats are absent, treat
+                // them as medium-sized (matches the historical
+                // file-system-metadata fallback the legacy
+                // `LocalParquetFile` arm produced when its placeholder
+                // path didn't exist).
+                TableStorage::ManagedLake => 1_000_000,
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();
