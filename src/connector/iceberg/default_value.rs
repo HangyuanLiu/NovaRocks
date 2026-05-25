@@ -11,7 +11,9 @@
 //! Default value helpers shared by DDL, schema transport, parquet read path,
 //! and INSERT write path.
 
-use iceberg::spec::{FormatVersion, Literal as IcebergLiteral, PrimitiveLiteral};
+use iceberg::spec::{
+    FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral,
+};
 
 use crate::sql::parser::ast::{DefaultLiteral, Literal as AstLiteral, SqlType};
 
@@ -26,6 +28,41 @@ pub(crate) fn default_literal_to_iceberg(
     if matches!(literal, DefaultLiteral::Null) {
         return Ok(None);
     }
+
+    // Array and Map defaults are stored as JSON strings in DefaultLiteral::String
+    // (produced by parse_string_default).  Handle them before the primitive match.
+    match (literal, column_type) {
+        (DefaultLiteral::String(s), SqlType::Array(_)) => {
+            // parse_string_default already validated the value is a JSON array.
+            let v: serde_json::Value =
+                serde_json::from_str(s).map_err(|e| format!("invalid ARRAY DEFAULT JSON: {e}"))?;
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("ARRAY DEFAULT must be a JSON array, got: {s:?}"))?;
+            if !arr.is_empty() {
+                return Err(
+                    "non-empty ARRAY DEFAULT literals are not yet supported; use '[]'".to_string(),
+                );
+            }
+            return Ok(Some(IcebergLiteral::List(vec![])));
+        }
+        (DefaultLiteral::String(s), SqlType::Map(_, _)) => {
+            // parse_string_default already validated the value is a JSON object.
+            let v: serde_json::Value =
+                serde_json::from_str(s).map_err(|e| format!("invalid MAP DEFAULT JSON: {e}"))?;
+            let obj = v
+                .as_object()
+                .ok_or_else(|| format!("MAP DEFAULT must be a JSON object, got: {s:?}"))?;
+            if !obj.is_empty() {
+                return Err(
+                    "non-empty MAP DEFAULT literals are not yet supported; use '{}'".to_string(),
+                );
+            }
+            return Ok(Some(IcebergLiteral::Map(IcebergMap::new())));
+        }
+        _ => {}
+    }
+
     let prim = match (literal, column_type) {
         (DefaultLiteral::Bool(b), SqlType::Boolean) => PrimitiveLiteral::Boolean(*b),
         (DefaultLiteral::Int(v), SqlType::TinyInt) => {
@@ -160,11 +197,36 @@ pub(crate) fn iceberg_literal_to_ast(
             ))
         }
         (
-            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(_)),
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(b)),
             SqlType::Binary | SqlType::Bitmap | SqlType::Hll,
-        ) => Err(format!(
-            "write-default for column type {column_type:?} is not yet supported by the INSERT path"
-        )),
+        ) => {
+            // Represent the byte slice as a Latin-1 string so that
+            // build_local_literal_array (DataType::Binary/LargeBinary) can
+            // round-trip it via latin1_string_to_bytes.  Only bytes in 0..=255
+            // are valid Latin-1; since they are all u8 this is always safe.
+            let s: String = b.iter().map(|&byte| byte as char).collect();
+            Ok(AstLiteral::String(s))
+        }
+        // Empty ARRAY/MAP defaults: produce the empty collection AST node.
+        // Non-empty collection defaults are not yet supported.
+        (IcebergLiteral::List(elems), SqlType::Array(_)) => {
+            if !elems.is_empty() {
+                return Err(format!(
+                    "non-empty ARRAY write-default is not yet supported ({} elements)",
+                    elems.len()
+                ));
+            }
+            Ok(AstLiteral::Array(vec![]))
+        }
+        (IcebergLiteral::Map(map), SqlType::Map(_, _)) => {
+            if !map.is_empty() {
+                return Err(format!(
+                    "non-empty MAP write-default is not yet supported ({} entries)",
+                    map.len()
+                ));
+            }
+            Ok(AstLiteral::Map(vec![]))
+        }
         (lit, ty) => Err(format!(
             "write-default literal type does not match column type: literal={lit:?} column={ty:?}"
         )),
@@ -189,8 +251,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMicrosecondArray,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::DataType;
 
 /// Build an Arrow constant array of length `row_count` whose every element is
@@ -201,6 +264,63 @@ pub(crate) fn literal_to_constant_array(
     target_type: &DataType,
     row_count: usize,
 ) -> Result<ArrayRef, String> {
+    // Handle non-primitive Iceberg literals (List, Map) before the primitive match.
+    match (literal, target_type) {
+        (IcebergLiteral::List(elems), DataType::List(element_field)) => {
+            if !elems.is_empty() {
+                return Err(
+                    "non-empty List initial-default is not yet supported by the read path"
+                        .to_string(),
+                );
+            }
+            // Build a ListArray of `row_count` empty lists.
+            let inner_type = element_field.data_type();
+            let values = arrow::array::new_empty_array(inner_type);
+            // Offsets: 0, 0, 0, … (row_count+1 zeros → all lists are empty)
+            let offsets: Vec<i32> = vec![0; row_count + 1];
+            let list_array = ListArray::new(
+                element_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                values,
+                None,
+            );
+            return Ok(Arc::new(list_array) as ArrayRef);
+        }
+        (IcebergLiteral::Map(map), DataType::Map(entries_field, _)) => {
+            if !map.is_empty() {
+                return Err(
+                    "non-empty Map initial-default is not yet supported by the read path"
+                        .to_string(),
+                );
+            }
+            // Build a MapArray of `row_count` empty maps.
+            // A MapArray uses a StructArray of (keys, values) wrapped with an
+            // offsets buffer.  For all-empty maps the struct has 0 rows.
+            use arrow::array::{MapArray, StructArray};
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "unexpected Map entry field type: {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            let empty_columns: Vec<ArrayRef> = entry_fields
+                .iter()
+                .map(|f| arrow::array::new_empty_array(f.data_type()))
+                .collect();
+            let entries_struct = StructArray::new(entry_fields.clone(), empty_columns, None);
+            let offsets: Vec<i32> = vec![0; row_count + 1];
+            let map_array = MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                entries_struct,
+                None,
+                false,
+            );
+            return Ok(Arc::new(map_array) as ArrayRef);
+        }
+        _ => {}
+    }
+
     let IcebergLiteral::Primitive(prim) = literal else {
         return Err(format!(
             "unsupported initial-default literal kind: {literal:?}"
@@ -240,6 +360,10 @@ pub(crate) fn literal_to_constant_array(
         (PrimitiveLiteral::Binary(b), DataType::Binary) => {
             let slice = b.as_slice();
             Arc::new(BinaryArray::from(vec![slice; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Binary(b), DataType::LargeBinary) => {
+            let slice = b.as_slice();
+            Arc::new(LargeBinaryArray::from(vec![slice; row_count])) as ArrayRef
         }
         (prim, ty) => {
             return Err(format!(
@@ -319,11 +443,12 @@ mod tests {
 
     #[test]
     fn iceberg_to_ast_literal_unsupported_type_errors() {
-        // Binary/Bitmap/HLL still have no write-default support in the INSERT path.
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Binary(vec![0xDE, 0xAD]));
-        let err = iceberg_literal_to_ast(&iceberg, &SqlType::Binary)
-            .expect_err("binary unsupported by insert path");
-        assert!(err.contains("not yet supported"));
+        // Binary write-default is now supported via Latin-1 byte-to-char encoding.
+        // This test verifies that a Binary literal round-trips through iceberg_literal_to_ast.
+        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Binary(b"abc".to_vec()));
+        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::Binary)
+            .expect("binary write-default should now succeed");
+        assert_eq!(ast, AstLiteral::String("abc".to_string()));
     }
 
     #[test]
@@ -488,5 +613,130 @@ mod tests {
         let err =
             literal_to_constant_array(&lit, &DataType::Float64, 1).expect_err("type mismatch");
         assert!(err.contains("unsupported"), "unexpected error: {err}");
+    }
+
+    // --- Binary default ---
+
+    #[test]
+    fn binary_default_from_string_literal() {
+        // DefaultLiteral::Binary constructed from raw bytes (as parse_string_default would do)
+        // should convert to an Iceberg PrimitiveLiteral::Binary.
+        let bytes = b"abc".to_vec();
+        let lit =
+            default_literal_to_iceberg(&DefaultLiteral::Binary(bytes.clone()), &SqlType::Binary)
+                .expect("binary default")
+                .expect("not null");
+        assert!(
+            matches!(lit, IcebergLiteral::Primitive(PrimitiveLiteral::Binary(ref b)) if *b == bytes),
+            "unexpected literal: {lit:?}"
+        );
+    }
+
+    #[test]
+    fn binary_default_empty_string() {
+        let lit = default_literal_to_iceberg(&DefaultLiteral::Binary(vec![]), &SqlType::Binary)
+            .expect("empty binary default")
+            .expect("not null");
+        assert!(
+            matches!(lit, IcebergLiteral::Primitive(PrimitiveLiteral::Binary(ref b)) if b.is_empty()),
+            "expected empty binary literal: {lit:?}"
+        );
+    }
+
+    // --- Array empty default ---
+
+    #[test]
+    fn array_empty_default_from_string_literal() {
+        // parse_string_default stores '[]' as DefaultLiteral::String("[]") for Array types.
+        // default_literal_to_iceberg must convert it to IcebergLiteral::List(vec![]).
+        let lit = default_literal_to_iceberg(
+            &DefaultLiteral::String("[]".to_string()),
+            &SqlType::Array(Box::new(SqlType::Int)),
+        )
+        .expect("array empty default")
+        .expect("not null");
+        assert!(
+            matches!(lit, IcebergLiteral::List(ref v) if v.is_empty()),
+            "expected empty List literal: {lit:?}"
+        );
+    }
+
+    #[test]
+    fn array_non_empty_literal_rejected() {
+        let err = default_literal_to_iceberg(
+            &DefaultLiteral::String("[1,2,3]".to_string()),
+            &SqlType::Array(Box::new(SqlType::Int)),
+        )
+        .expect_err("non-empty array should be rejected");
+        assert!(err.contains("non-empty ARRAY"), "unexpected error: {err}");
+    }
+
+    // --- Map empty default ---
+
+    #[test]
+    fn map_empty_default_from_string_literal() {
+        // parse_string_default stores '{}' as DefaultLiteral::String("{}") for Map types.
+        // default_literal_to_iceberg must convert it to IcebergLiteral::Map(empty).
+        let lit = default_literal_to_iceberg(
+            &DefaultLiteral::String("{}".to_string()),
+            &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+        )
+        .expect("map empty default")
+        .expect("not null");
+        assert!(
+            matches!(lit, IcebergLiteral::Map(ref m) if m.is_empty()),
+            "expected empty Map literal: {lit:?}"
+        );
+    }
+
+    #[test]
+    fn map_non_empty_literal_rejected() {
+        let err = default_literal_to_iceberg(
+            &DefaultLiteral::String(r#"{"k":1}"#.to_string()),
+            &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+        )
+        .expect_err("non-empty map should be rejected");
+        assert!(err.contains("non-empty MAP"), "unexpected error: {err}");
+    }
+
+    // --- literal_to_constant_array for List and Map ---
+
+    #[test]
+    fn literal_to_constant_array_empty_list() {
+        use arrow::array::ListArray;
+        use arrow::datatypes::Field;
+
+        let lit = IcebergLiteral::List(vec![]);
+        let element_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(element_field);
+        let arr = literal_to_constant_array(&lit, &list_type, 3).expect("empty list array");
+        assert_eq!(arr.len(), 3);
+        let list_arr = arr.as_any().downcast_ref::<ListArray>().expect("ListArray");
+        // All 3 rows should be empty lists.
+        for i in 0..3 {
+            let row = list_arr.value(i);
+            assert_eq!(row.len(), 0, "row {i} should be an empty list");
+        }
+    }
+
+    #[test]
+    fn literal_to_constant_array_empty_map() {
+        use arrow::array::MapArray;
+        use arrow::datatypes::{Field, Fields};
+
+        let lit = IcebergLiteral::Map(IcebergMap::new());
+        let entry_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]);
+        let entries_field = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
+        let map_type = DataType::Map(entries_field, false);
+        let arr = literal_to_constant_array(&lit, &map_type, 2).expect("empty map array");
+        assert_eq!(arr.len(), 2);
+        let map_arr = arr.as_any().downcast_ref::<MapArray>().expect("MapArray");
+        for i in 0..2 {
+            let row = map_arr.value(i);
+            assert_eq!(row.len(), 0, "row {i} should be an empty map");
+        }
     }
 }

@@ -119,7 +119,24 @@ fn arrow_data_type_to_sql_type(
         DataType::Utf8 => SqlType::String,
         DataType::Date32 => SqlType::Date,
         DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
-        DataType::Binary => SqlType::Binary,
+        DataType::Binary | DataType::LargeBinary => SqlType::Binary,
+        DataType::List(element_field) => {
+            let inner = arrow_data_type_to_sql_type(element_field.data_type())?;
+            SqlType::Array(Box::new(inner))
+        }
+        DataType::Map(entries_field, _) => {
+            // entries_field is Struct(key: KeyType, value: ValueType)
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                let key_type = arrow_data_type_to_sql_type(fields[0].data_type())?;
+                let value_type = arrow_data_type_to_sql_type(fields[1].data_type())?;
+                SqlType::Map(Box::new(key_type), Box::new(value_type))
+            } else {
+                return Err(format!(
+                    "MAP Arrow type has unexpected entries field type: {:?}",
+                    entries_field.data_type()
+                ));
+            }
+        }
         other => {
             return Err(format!(
                 "unsupported Arrow type for write-default conversion: {other:?}"

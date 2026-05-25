@@ -2215,6 +2215,68 @@ fn build_literal_array(
                 struct_nulls.finish(),
             )))
         }
+        DataType::Map(entries_field, ordered) => {
+            // entries_field is Struct(key: KeyType, value: ValueType).
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "MAP entries field must be STRUCT, got {:?}",
+                    entries_field.data_type()
+                ));
+            };
+            if entry_fields.len() != 2 {
+                return Err(format!(
+                    "MAP entries STRUCT must have 2 fields, got {}",
+                    entry_fields.len()
+                ));
+            }
+            let key_field = &entry_fields[0];
+            let val_field = &entry_fields[1];
+
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            let mut map_nulls = NullBufferBuilder::new(values.len());
+            let mut flat_keys: Vec<&Literal> = Vec::new();
+            let mut flat_vals: Vec<&Literal> = Vec::new();
+            offsets.push(0_i32);
+
+            for literal in values {
+                match literal {
+                    Literal::Null => {
+                        map_nulls.append(false);
+                        offsets.push(i32::try_from(flat_keys.len()).map_err(|_| {
+                            "iceberg insert map entry count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    Literal::Map(items) => {
+                        map_nulls.append(true);
+                        for (k, v) in items {
+                            flat_keys.push(k);
+                            flat_vals.push(v);
+                        }
+                        offsets.push(i32::try_from(flat_keys.len()).map_err(|_| {
+                            "iceberg insert map entry count exceeds i32 range".to_string()
+                        })?);
+                    }
+                    other => {
+                        return Err(format!("literal {:?} is not valid for MAP column", other));
+                    }
+                }
+            }
+
+            let key_array = build_literal_array(key_field.data_type(), &flat_keys, None)?;
+            let val_array = build_literal_array(val_field.data_type(), &flat_vals, None)?;
+            let entries_array = arrow::array::StructArray::new(
+                arrow::datatypes::Fields::from(vec![key_field.clone(), val_field.clone()]),
+                vec![key_array, val_array],
+                None,
+            );
+            Ok(Arc::new(arrow::array::MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                entries_array,
+                map_nulls.finish(),
+                *ordered,
+            )))
+        }
         DataType::LargeBinary => {
             // Variant columns: the literal extractor (`parse_json` arm in
             // `engine/sql_expr.rs::sqlparser_function_to_literal`) packs the

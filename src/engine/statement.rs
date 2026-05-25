@@ -2244,9 +2244,9 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
             .expect_keyword(Keyword::COLUMN)
             .map_err(|e| e.to_string())?;
         let path = parse_column_path(&mut parser)?;
-        let new_type = crate::sql::parser::dialect::convert_sql_type(
-            parser.parse_data_type().map_err(|e| e.to_string())?,
-        )?;
+        // Use parse_sql_type_definition so that MAP<K,V>/ARRAY<T> work without normalize.
+        let new_type =
+            crate::sql::parser::dialect::create_table::parse_sql_type_definition(&mut parser)?;
         if parser.parse_keyword(Keyword::FIRST)
             || parser.parse_keyword(Keyword::AFTER)
             || crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE")
@@ -2335,9 +2335,10 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
     let parent_segments = path.segments()[..path.segments().len() - 1].to_vec();
     let parent = ColumnPath::from_segments(parent_segments);
 
-    let data_type = crate::sql::parser::dialect::convert_sql_type(
-        parser.parse_data_type().map_err(|e| e.to_string())?,
-    )?;
+    // Use parse_sql_type_definition (not parser.parse_data_type + convert_sql_type) so that
+    // collection types like MAP<K,V> and ARRAY<T> are parsed via native angle-bracket syntax
+    // rather than going through normalize_for_raw_parse which only rewrites MAP<> inside CAST.
+    let data_type = crate::sql::parser::dialect::create_table::parse_sql_type_definition(parser)?;
     let mut default: Option<DefaultLiteral> = None;
     let mut seen_null = false;
     let mut seen_default = false;
@@ -3148,6 +3149,48 @@ mod tests {
             panic!();
         };
         assert!(matches!(position, super::AddPosition::Before(ref s) if s == "existing"));
+    }
+
+    #[test]
+    fn parse_add_column_map_default_empty() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN counts MAP<STRING, INT> DEFAULT '{}'",
+        )
+        .expect("parse MAP column with default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn {
+                name, data_type, ..
+            } => {
+                assert_eq!(name, "counts");
+                assert!(
+                    matches!(data_type, crate::sql::parser::ast::SqlType::Map(_, _)),
+                    "expected Map type, got {:?}",
+                    data_type
+                );
+            }
+            _ => panic!("expected AddColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_add_column_array_default_empty() {
+        let stmt = super::parse_alter_iceberg_schema_sql(
+            "ALTER TABLE t ADD COLUMN tags ARRAY<INT> DEFAULT '[]'",
+        )
+        .expect("parse ARRAY column with default");
+        match stmt.change {
+            super::IcebergSchemaChange::AddColumn {
+                name, data_type, ..
+            } => {
+                assert_eq!(name, "tags");
+                assert!(
+                    matches!(data_type, crate::sql::parser::ast::SqlType::Array(_)),
+                    "expected Array type, got {:?}",
+                    data_type
+                );
+            }
+            _ => panic!("expected AddColumn"),
+        }
     }
 
     #[test]
