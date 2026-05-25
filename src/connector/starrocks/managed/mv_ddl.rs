@@ -19,9 +19,11 @@ use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
 };
-use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState, StoredMvDefinition};
 #[cfg(test)]
-use crate::meta::repository::mv::{StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest};
+use crate::meta::repository::mv::{
+    BeginIcebergMvRefreshRequest, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
+use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState, StoredMvDefinition};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
@@ -2108,6 +2110,7 @@ mod tests {
             .find(|row| row.name == "mv_orders")
             .expect("mv row should be present");
 
+        assert_eq!(row.storage_engine, "iceberg");
         assert_eq!(row.refresh_mode, "ASYNC_INTERVAL");
         assert_eq!(row.refresh_paused, "true");
         assert_eq!(row.next_refresh_time.as_deref(), Some("9000000000000"));
@@ -2162,6 +2165,54 @@ mod tests {
             Some("USER_ERROR: unsupported MV shape")
         );
         assert_eq!(row.retry_after_time, None);
+    }
+
+    #[test]
+    fn show_materialized_views_exposes_iceberg_target_blocked_recovery() {
+        let (state, _dir) = open_state_with_sqlite_store();
+        let mv_id = insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed commit-unknown refresh")
+            .expect("open write txn");
+        let refresh = state
+            .mv_repo
+            .begin_iceberg_refresh_intent(
+                txn.as_mut(),
+                BeginIcebergMvRefreshRequest {
+                    mv_id,
+                    target_catalog: "ice".to_string(),
+                    target_namespace: "analytics".to_string(),
+                    target_table: "mv_orders".to_string(),
+                    staging_branch: "__nova_mv_refresh_test".to_string(),
+                    expected_main_snapshot_id: None,
+                    base_snapshots: std::collections::BTreeMap::new(),
+                    marker_token: "marker".to_string(),
+                },
+            )
+            .expect("begin iceberg refresh intent");
+        state
+            .mv_repo
+            .mark_refresh_commit_unknown(txn.as_mut(), refresh.refresh_id)
+            .expect("mark commit unknown");
+        txn.commit().expect("commit refresh metadata");
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let rows = list_mv_rows(&state, Some("ice"), &stmt, None).expect("show mvs");
+        let row = rows
+            .iter()
+            .find(|row| row.name == "mv_orders")
+            .expect("mv row should be present");
+
+        assert_eq!(row.storage_engine, "iceberg");
+        assert_eq!(row.refresh_state, "BLOCKED_RECOVERY");
     }
 
     #[test]

@@ -1209,6 +1209,61 @@ mod tests {
     }
 
     #[test]
+    fn periodic_policy_skips_paused_and_enqueues_after_resume() {
+        let mut paused = test_definition(7, StoredMvRefreshPolicy::AsyncInterval);
+        paused.refresh_interval_ms = Some(1_000);
+        paused.next_refresh_after_ms = Some(500);
+        paused.refresh_paused = true;
+
+        assert!(plan_periodic_refreshes(&[paused.clone()], 1_000).is_empty());
+
+        let mut resumed = paused;
+        resumed.refresh_paused = false;
+
+        let decisions = plan_periodic_refreshes(&[resumed], 1_000);
+
+        assert_eq!(
+            decisions
+                .into_iter()
+                .map(|decision| decision.mv_id)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn scheduler_guard_reports_non_retryable_user_error() {
+        let mut definition = test_definition(7, StoredMvRefreshPolicy::AsyncInterval);
+        definition.refresh_interval_ms = Some(1_000);
+        definition.last_scheduler_error = Some("USER_ERROR: unsupported MV shape".to_string());
+
+        let decision = scheduler_guard_for_definition(&definition, None, 1_000);
+
+        assert_eq!(decision.state, RefreshTaskState::FailedUserError);
+        assert!(!decision.can_enqueue);
+    }
+
+    #[test]
+    fn successful_drain_resets_failure_attempts() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.failure_attempts.insert(7, 3);
+        coordinator.enqueue_refresh(7, RefreshTaskReason::Manual);
+        let mut executor = RecordingRefreshExecutor::default();
+
+        coordinator
+            .drain_ready_for_test(&mut executor, 1_000)
+            .expect("drain succeeds");
+
+        assert_eq!(executor.executed_mv_ids(), vec![7]);
+        assert!(!coordinator.failure_attempts.contains_key(&7));
+        assert_eq!(
+            coordinator.state_for_mv(7),
+            Some(RefreshTaskState::Succeeded)
+        );
+    }
+
+    #[test]
     fn snapshot_watch_does_not_enqueue_when_snapshot_is_unchanged() {
         let mut coordinator =
             RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
