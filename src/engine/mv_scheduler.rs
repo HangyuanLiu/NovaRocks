@@ -4,6 +4,10 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::connector::starrocks::managed::model::IcebergTableRef;
+use crate::connector::starrocks::managed::mv_refresh::{
+    load_current_iceberg_base_table, parse_iceberg_table_refs,
+};
 use crate::meta::repository::mv::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
@@ -86,6 +90,7 @@ pub(crate) struct RefreshCoordinator {
     queued_mv_ids: BTreeSet<i64>,
     running_mv_ids: BTreeSet<i64>,
     states: BTreeMap<i64, RefreshTaskState>,
+    observed_snapshots: BTreeMap<(i64, String), i64>,
 }
 
 impl RefreshCoordinator {
@@ -96,6 +101,7 @@ impl RefreshCoordinator {
             queued_mv_ids: BTreeSet::new(),
             running_mv_ids: BTreeSet::new(),
             states: BTreeMap::new(),
+            observed_snapshots: BTreeMap::new(),
         }
     }
 
@@ -158,6 +164,16 @@ impl RefreshCoordinator {
         now_ms: i64,
     ) -> Result<(), String> {
         let definitions = load_scheduler_definitions(state)?;
+        let mut snapshot_source = IcebergSnapshotSource::new(Arc::clone(state));
+        for error in self.poll_snapshot_watch(&definitions, &mut snapshot_source, now_ms)? {
+            record_scheduler_failure_metadata(
+                state,
+                error.mv_id,
+                &error.error,
+                now_ms,
+                self.config.failure_backoff_ms,
+            )?;
+        }
         for decision in plan_periodic_refreshes(&definitions, now_ms) {
             self.enqueue_refresh(decision.mv_id, RefreshTaskReason::Periodic);
         }
@@ -198,6 +214,109 @@ impl RefreshCoordinator {
             }
         }
         Ok(())
+    }
+
+    fn poll_snapshot_watch<S: SnapshotSource>(
+        &mut self,
+        definitions: &[StoredMvDefinition],
+        source: &mut S,
+        now_ms: i64,
+    ) -> Result<Vec<SnapshotWatchError>, String> {
+        let mut errors = Vec::new();
+        for definition in definitions {
+            if !matches!(
+                definition.refresh_policy,
+                StoredMvRefreshPolicy::AsyncOnChange
+            ) || definition.refresh_paused
+            {
+                continue;
+            }
+            if definition
+                .next_refresh_after_ms
+                .map(|next| next > now_ms)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let base_refs = match parse_iceberg_table_refs(&definition.base_table_refs) {
+                Ok(base_refs) => base_refs,
+                Err(err) => {
+                    self.states
+                        .insert(definition.mv_id, RefreshTaskState::FailedBackoff);
+                    errors.push(SnapshotWatchError {
+                        mv_id: definition.mv_id,
+                        error: err,
+                    });
+                    continue;
+                }
+            };
+            let mut should_enqueue = false;
+            for table_ref in base_refs {
+                let fqn = table_ref.fqn();
+                let key = (definition.mv_id, fqn.clone());
+                let snapshot_id = match source.current_snapshot(&table_ref) {
+                    Ok(snapshot_id) => snapshot_id,
+                    Err(err) => {
+                        self.states
+                            .insert(definition.mv_id, RefreshTaskState::FailedBackoff);
+                        errors.push(SnapshotWatchError {
+                            mv_id: definition.mv_id,
+                            error: err,
+                        });
+                        should_enqueue = false;
+                        break;
+                    }
+                };
+                let Some(snapshot_id) = snapshot_id else {
+                    continue;
+                };
+                match self.observed_snapshots.get(&key).copied() {
+                    Some(previous) if snapshot_id > previous => {
+                        self.observed_snapshots.insert(key, snapshot_id);
+                        should_enqueue = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.observed_snapshots.insert(key, snapshot_id);
+                    }
+                }
+            }
+            if should_enqueue {
+                self.enqueue_refresh(definition.mv_id, RefreshTaskReason::SnapshotChange);
+            }
+        }
+        Ok(errors)
+    }
+}
+
+pub(crate) trait SnapshotSource {
+    fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotWatchError {
+    mv_id: i64,
+    error: String,
+}
+
+pub(crate) struct IcebergSnapshotSource {
+    state: Arc<crate::engine::StandaloneState>,
+}
+
+impl IcebergSnapshotSource {
+    pub(crate) fn new(state: Arc<crate::engine::StandaloneState>) -> Self {
+        Self { state }
+    }
+}
+
+impl SnapshotSource for IcebergSnapshotSource {
+    fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String> {
+        let loaded = load_current_iceberg_base_table(&self.state, table_ref)?;
+        Ok(loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id()))
     }
 }
 
@@ -555,6 +674,37 @@ mod tests {
         failure: Option<String>,
     }
 
+    struct FakeSnapshotSource {
+        snapshots: BTreeMap<String, Result<Option<i64>, String>>,
+    }
+
+    impl FakeSnapshotSource {
+        fn new(
+            entries: impl IntoIterator<Item = (&'static str, Result<Option<i64>, &'static str>)>,
+        ) -> Self {
+            Self {
+                snapshots: entries
+                    .into_iter()
+                    .map(|(fqn, result)| {
+                        (
+                            fqn.to_string(),
+                            result.map_err(|message| message.to_string()),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl SnapshotSource for FakeSnapshotSource {
+        fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String> {
+            self.snapshots
+                .get(&table_ref.fqn())
+                .cloned()
+                .unwrap_or(Ok(None))
+        }
+    }
+
     impl RecordingRefreshExecutor {
         fn failing(message: &str) -> Self {
             Self {
@@ -599,6 +749,31 @@ mod tests {
         ) -> Result<(), String> {
             self.drain_ready(executor, now_ms)
         }
+
+        fn observe_snapshot_for_test(&mut self, mv_id: i64, fqn: &str, snapshot_id: i64) {
+            self.observed_snapshots
+                .insert((mv_id, fqn.to_string()), snapshot_id);
+        }
+
+        fn observed_snapshot_for_test(&self, mv_id: i64, fqn: &str) -> Option<i64> {
+            self.observed_snapshots
+                .get(&(mv_id, fqn.to_string()))
+                .copied()
+        }
+
+        fn pending_mv_ids_for_test(&self) -> Vec<i64> {
+            self.queue.iter().map(|entry| entry.mv_id).collect()
+        }
+
+        fn poll_snapshot_watch_for_test<S: SnapshotSource>(
+            &mut self,
+            definitions: &[StoredMvDefinition],
+            source: &mut S,
+            now_ms: i64,
+        ) -> Result<(), String> {
+            let _errors = self.poll_snapshot_watch(definitions, source, now_ms)?;
+            Ok(())
+        }
     }
 
     fn test_definition(mv_id: i64, refresh_policy: StoredMvRefreshPolicy) -> StoredMvDefinition {
@@ -629,6 +804,15 @@ mod tests {
             next_refresh_after_ms: None,
             created_at_ms: 0,
         }
+    }
+
+    fn async_on_change_definition(mv_id: i64, base_table_refs: Vec<&str>) -> StoredMvDefinition {
+        let mut definition = test_definition(mv_id, StoredMvRefreshPolicy::AsyncOnChange);
+        definition.base_table_refs = base_table_refs
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect();
+        definition
     }
 
     #[test]
@@ -743,5 +927,96 @@ mod tests {
         assert_eq!(req.last_scheduler_error, Some("boom".to_string()));
         assert_eq!(req.next_refresh_after_ms, Some(31_500));
         assert_eq!(req.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
+    }
+
+    #[test]
+    fn snapshot_watch_does_not_enqueue_when_snapshot_is_unchanged() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.tbl", 100);
+        let definition = async_on_change_definition(7, vec!["ice.ns.tbl"]);
+        let mut source = FakeSnapshotSource::new([("ice.ns.tbl", Ok(Some(100)))]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch succeeds");
+
+        assert_eq!(coordinator.pending_len(), 0);
+    }
+
+    #[test]
+    fn snapshot_watch_enqueues_once_when_snapshot_advances() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.tbl", 100);
+        let definition = async_on_change_definition(7, vec!["ice.ns.tbl"]);
+        let mut source = FakeSnapshotSource::new([("ice.ns.tbl", Ok(Some(101)))]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch succeeds");
+
+        assert_eq!(coordinator.pending_mv_ids_for_test(), vec![7]);
+        assert!(!coordinator.enqueue_refresh(7, RefreshTaskReason::SnapshotChange));
+    }
+
+    #[test]
+    fn snapshot_watch_records_error_without_overwriting_known_snapshot() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.tbl", 100);
+        let definition = async_on_change_definition(7, vec!["ice.ns.tbl"]);
+        let mut source = FakeSnapshotSource::new([("ice.ns.tbl", Err("catalog unavailable"))]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch records error");
+
+        assert_eq!(
+            coordinator.observed_snapshot_for_test(7, "ice.ns.tbl"),
+            Some(100)
+        );
+        assert_eq!(
+            coordinator.state_for_mv(7),
+            Some(RefreshTaskState::FailedBackoff)
+        );
+    }
+
+    #[test]
+    fn snapshot_watch_multi_base_enqueues_when_any_snapshot_advances() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.left", 100);
+        coordinator.observe_snapshot_for_test(7, "ice.ns.right", 200);
+        let definition = async_on_change_definition(7, vec!["ice.ns.left", "ice.ns.right"]);
+        let mut source = FakeSnapshotSource::new([
+            ("ice.ns.left", Ok(Some(100))),
+            ("ice.ns.right", Ok(Some(201))),
+        ]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch succeeds");
+
+        assert_eq!(coordinator.pending_mv_ids_for_test(), vec![7]);
+    }
+
+    #[test]
+    fn snapshot_watch_no_current_snapshot_is_noop() {
+        let mut coordinator =
+            RefreshCoordinator::new_for_test(RefreshCoordinatorConfig::enabled_for_test());
+        coordinator.observe_snapshot_for_test(7, "ice.ns.tbl", 100);
+        let definition = async_on_change_definition(7, vec!["ice.ns.tbl"]);
+        let mut source = FakeSnapshotSource::new([("ice.ns.tbl", Ok(None))]);
+
+        coordinator
+            .poll_snapshot_watch_for_test(&[definition], &mut source, 1_000)
+            .expect("snapshot watch succeeds");
+
+        assert_eq!(coordinator.pending_len(), 0);
+        assert_eq!(
+            coordinator.observed_snapshot_for_test(7, "ice.ns.tbl"),
+            Some(100)
+        );
     }
 }
