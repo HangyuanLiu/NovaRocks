@@ -81,12 +81,29 @@ fn out_of_range(type_name: &str, value: i64) -> String {
     format!("DEFAULT value {value} is out of range for {type_name}")
 }
 
+/// Format an unscaled `i128` with the given decimal `scale` as a human-readable
+/// decimal string (e.g. `unscaled=999, scale=2` → `"9.99"`).
+fn i128_unscaled_to_decimal_string(unscaled: i128, scale: u32) -> String {
+    if scale == 0 {
+        return unscaled.to_string();
+    }
+    let negative = unscaled < 0;
+    let abs = unscaled.unsigned_abs();
+    let factor = 10_u128.pow(scale);
+    let int_part = abs / factor;
+    let frac_part = abs % factor;
+    // Zero-pad the fractional part to exactly `scale` digits.
+    let s = format!("{int_part}.{frac_part:0>scale$}", scale = scale as usize);
+    if negative { format!("-{s}") } else { s }
+}
+
 /// Convert an `iceberg::spec::Literal` back to an AST `Literal` for use in the
 /// INSERT write path (filling omitted columns with their write_default).
 ///
-/// Returns `Err` for types that have no native `ast::Literal` variant (Decimal,
-/// Binary, Timestamp, DateTime) — those paths are not yet supported by the
-/// INSERT path.
+/// Returns `Err` for types that are not yet supported by the INSERT path
+/// (Binary/Bitmap/HLL).  Decimal and DateTime are fully supported and
+/// return `AstLiteral::String` that the downstream `build_local_literal_array`
+/// can parse.
 pub(crate) fn iceberg_literal_to_ast(
     literal: &IcebergLiteral,
     column_type: &SqlType,
@@ -122,16 +139,32 @@ pub(crate) fn iceberg_literal_to_ast(
                 })?;
             Ok(AstLiteral::Date(date.format("%Y-%m-%d").to_string()))
         }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Int128(_)), SqlType::Decimal { .. })
-        | (
-            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(_)),
-            SqlType::Binary | SqlType::Bitmap | SqlType::Hll,
-        )
-        | (IcebergLiteral::Primitive(PrimitiveLiteral::Long(_)), SqlType::DateTime) => {
-            Err(format!(
-                "write-default for column type {column_type:?} is not yet supported by the INSERT path"
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Int128(unscaled)),
+            SqlType::Decimal { scale, .. },
+        ) => {
+            // Convert unscaled i128 + scale back to a decimal string like "9.99".
+            // build_local_literal_array handles Literal::String for Decimal128 columns.
+            let s = i128_unscaled_to_decimal_string(*unscaled, *scale as u32);
+            Ok(AstLiteral::String(s))
+        }
+        (IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros)), SqlType::DateTime) => {
+            // Convert microseconds-since-epoch back to "YYYY-MM-DD HH:MM:SS" string.
+            // build_local_literal_array handles Literal::String for Timestamp columns.
+            use chrono::DateTime as ChronoDateTime;
+            let dt = ChronoDateTime::from_timestamp_micros(*micros).ok_or_else(|| {
+                format!("write-default datetime value {micros} µs is out of representable range")
+            })?;
+            Ok(AstLiteral::String(
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string(),
             ))
         }
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(_)),
+            SqlType::Binary | SqlType::Bitmap | SqlType::Hll,
+        ) => Err(format!(
+            "write-default for column type {column_type:?} is not yet supported by the INSERT path"
+        )),
         (lit, ty) => Err(format!(
             "write-default literal type does not match column type: literal={lit:?} column={ty:?}"
         )),
@@ -286,17 +319,85 @@ mod tests {
 
     #[test]
     fn iceberg_to_ast_literal_unsupported_type_errors() {
-        // Decimal has no native ast::Literal variant.
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(12345));
-        let err = iceberg_literal_to_ast(
+        // Binary/Bitmap/HLL still have no write-default support in the INSERT path.
+        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Binary(vec![0xDE, 0xAD]));
+        let err = iceberg_literal_to_ast(&iceberg, &SqlType::Binary)
+            .expect_err("binary unsupported by insert path");
+        assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn write_default_decimal_fills_correct_value() {
+        // 9.99 → unscaled 999 at scale 2
+        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(999));
+        let ast = iceberg_literal_to_ast(
             &iceberg,
             &SqlType::Decimal {
                 precision: 10,
                 scale: 2,
             },
         )
-        .expect_err("decimal unsupported by ast");
-        assert!(err.contains("not yet supported"));
+        .expect("decimal write-default");
+        assert_eq!(ast, AstLiteral::String("9.99".to_string()));
+
+        // Negative: -0.01 → unscaled -1 at scale 2
+        let neg = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(-1));
+        let ast_neg = iceberg_literal_to_ast(
+            &neg,
+            &SqlType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        )
+        .expect("negative decimal");
+        assert_eq!(ast_neg, AstLiteral::String("-0.01".to_string()));
+
+        // Zero scale: integer decimal
+        let int_dec = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(42));
+        let ast_int = iceberg_literal_to_ast(
+            &int_dec,
+            &SqlType::Decimal {
+                precision: 5,
+                scale: 0,
+            },
+        )
+        .expect("zero-scale decimal");
+        assert_eq!(ast_int, AstLiteral::String("42".to_string()));
+    }
+
+    #[test]
+    fn write_default_date_fills_correct_value() {
+        // Days since Unix epoch: 2024-01-01 = 19723 days after 1970-01-01
+        // Verify by computing: days from 1970-01-01 to 2024-01-01
+        // 2024 - 1970 = 54 years, accounting for leap years: 19723
+        let days_2024_01_01: i32 = 19723;
+        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int(days_2024_01_01));
+        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::Date).expect("date write-default");
+        assert_eq!(ast, AstLiteral::Date("2024-01-01".to_string()));
+
+        // Epoch itself
+        let epoch = IcebergLiteral::Primitive(PrimitiveLiteral::Int(0));
+        let ast_epoch = iceberg_literal_to_ast(&epoch, &SqlType::Date).expect("epoch");
+        assert_eq!(ast_epoch, AstLiteral::Date("1970-01-01".to_string()));
+    }
+
+    #[test]
+    fn write_default_datetime_fills_correct_value() {
+        // 2024-01-01 12:00:00 UTC in microseconds since epoch
+        // = 19723 days * 86400 s/day + 12*3600 s = 1704110400 s = 1704110400_000000 µs
+        let micros_2024_01_01_noon: i64 = 1_704_110_400_000_000;
+        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros_2024_01_01_noon));
+        let ast =
+            iceberg_literal_to_ast(&iceberg, &SqlType::DateTime).expect("datetime write-default");
+        assert_eq!(ast, AstLiteral::String("2024-01-01 12:00:00".to_string()));
+
+        // Epoch
+        let epoch = IcebergLiteral::Primitive(PrimitiveLiteral::Long(0));
+        let ast_epoch = iceberg_literal_to_ast(&epoch, &SqlType::DateTime).expect("epoch datetime");
+        assert_eq!(
+            ast_epoch,
+            AstLiteral::String("1970-01-01 00:00:00".to_string())
+        );
     }
 
     #[test]
