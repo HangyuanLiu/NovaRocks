@@ -300,6 +300,31 @@ access_key_secret = "$minio_password"
 enable_path_style_access = true
 EOF
 
+cat > "$runtime_dir/standalone-managed-lake-scheduler.toml" <<EOF
+[server]
+host = "127.0.0.1"
+
+[metadata]
+provider = "sqlite"
+path = "$runtime_dir/standalone-managed-lake.sqlite"
+
+[standalone_server]
+mysql_port = $mysql_port
+user = "root"
+warehouse_uri = "$managed_warehouse"
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 200
+mv_refresh_scheduler_max_concurrent = 1
+mv_refresh_scheduler_failure_backoff_ms = 500
+mv_refresh_scheduler_max_failure_backoff_ms = 2000
+
+[standalone_server.object_store]
+endpoint = "$minio_endpoint"
+access_key_id = "$minio_user"
+access_key_secret = "$minio_password"
+enable_path_style_access = true
+EOF
+
 cat > "$runtime_dir/sql-test.conf" <<EOF
 [cluster]
 host = 127.0.0.1
@@ -414,6 +439,7 @@ export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
 export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
+export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-managed-lake-scheduler.toml"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
 export NOVAROCKS_SPARK_IMAGE="$spark_image"
@@ -464,6 +490,7 @@ cat > "$manifest_file" <<EOF
   "novarocks": {
     "mysql_port": $mysql_port,
     "standalone_config": "$runtime_dir/standalone-managed-lake.toml",
+    "standalone_scheduler_config": "$runtime_dir/standalone-managed-lake-scheduler.toml",
     "sql_test_config": "$runtime_dir/sql-test.conf",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
     "managed_lake_warehouse": "$managed_warehouse",
@@ -496,6 +523,7 @@ Do not guess ports.
 - Manifest: \`$manifest_file\`
 - Env exports: \`$exports_file\`
 - Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`
+- Scheduler-enabled standalone config: \`$runtime_dir/standalone-managed-lake-scheduler.toml\`
 - SQL test config: \`$runtime_dir/sql-test.conf\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
 - Spark defaults: \`$spark_defaults_file\`
@@ -507,7 +535,9 @@ Use:
 source "$current_link/env.sh"
 docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
 cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
 docker/iceberg-rest/spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 \`\`\`
@@ -573,7 +603,9 @@ Use:
   source "$current_link/env.sh"
 $docker_start_hint
   cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
+  cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
   docker/iceberg-rest/spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 EOF
