@@ -1015,11 +1015,12 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     assert_eq!(row.get::<Option<String>, _>(4), Some(None));
     assert_eq!(row.get::<Option<String>, _>(5), Some(None));
     assert_eq!(row.get::<String, _>(6), Some("ice.ns.orders".to_string()));
-    assert!(row
-        .get::<String, _>(7)
-        .expect("select text")
-        .to_ascii_lowercase()
-        .contains("select"));
+    assert!(
+        row.get::<String, _>(7)
+            .expect("select text")
+            .to_ascii_lowercase()
+            .contains("select")
+    );
     assert_eq!(row.get::<String, _>(8), Some("ice.ns.orders".to_string()));
     assert_eq!(row.get::<String, _>(9), Some("false".to_string()));
     assert_eq!(row.get::<Option<String>, _>(10), Some(None));
