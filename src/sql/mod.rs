@@ -1,6 +1,7 @@
 pub(crate) mod analysis;
 pub(crate) mod catalog;
 pub(crate) mod column_id;
+pub(crate) mod functions;
 pub(crate) mod parser;
 pub(crate) mod types;
 

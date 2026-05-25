@@ -1264,7 +1264,21 @@ impl<'a> ExprCompiler<'a> {
             return Ok(return_type);
         }
 
-        let inferred = infer_scalar_function_return_type(name, &arg_types)?;
+        // Step A: ask the centralised signature registry first. If it
+        // doesn't know the function (or none of its registered signatures
+        // match the arg types) fall back to the legacy hand-written
+        // `infer_*` paths so behaviour stays identical for the long tail
+        // of functions Step A hasn't migrated yet.
+        let inferred = match crate::sql::functions::resolve_scalar_function(name, &arg_types) {
+            Ok(t) => t,
+            Err(crate::sql::functions::ResolveError::UnknownFunction)
+            | Err(crate::sql::functions::ResolveError::NoMatchingSignature { .. }) => {
+                infer_scalar_function_return_type(name, &arg_types)?
+            }
+            Err(crate::sql::functions::ResolveError::BadSignature(msg)) => {
+                return Err(format!("signature registry bug for `{name}`: {msg}"));
+            }
+        };
         // Use the analyzer's type hint if available and more specific than inferred
         let return_type = if *type_hint != DataType::Null {
             type_hint.clone()
@@ -2930,8 +2944,139 @@ mod tests {
         aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type,
         infer_scalar_function_return_type, largeint,
     };
-    use arrow::datatypes::{DataType, TimeUnit};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
     use std::sync::Arc;
+
+    /// Cross-validation: for every (function, arg_types) probe in this
+    /// table, the new central signature registry and the legacy
+    /// hand-written `infer_scalar_function_return_type` must agree on the
+    /// return type. The probes cover the Step-A high-frequency function
+    /// families (string / numeric / datetime / array / map). Step B will
+    /// extend the table as more functions are migrated.
+    ///
+    /// If this test fires it means the registry has drifted from the
+    /// legacy path for a function the codegen layer trusts the registry
+    /// to handle — that's a silent correctness bug, since codegen falls
+    /// back to the legacy path only when the registry returns
+    /// `UnknownFunction` or `NoMatchingSignature`. A wrong-but-non-empty
+    /// registry answer would be used silently.
+    #[test]
+    fn registry_agrees_with_legacy_for_step_a_functions() {
+        fn list_of(item: DataType) -> DataType {
+            DataType::List(Arc::new(Field::new("item", item, true)))
+        }
+        fn map_of(k: DataType, v: DataType) -> DataType {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", k, true)),
+                            Arc::new(Field::new("value", v, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            )
+        }
+
+        let probes: Vec<(&str, Vec<DataType>)> = vec![
+            // String
+            ("upper", vec![DataType::Utf8]),
+            ("lower", vec![DataType::Utf8]),
+            ("trim", vec![DataType::Utf8]),
+            ("md5", vec![DataType::Utf8]),
+            ("length", vec![DataType::Utf8]),
+            ("char_length", vec![DataType::Utf8]),
+            ("bit_length", vec![DataType::Utf8]),
+            ("concat", vec![DataType::Utf8, DataType::Utf8]),
+            ("concat", vec![DataType::Utf8; 5]),
+            ("substr", vec![DataType::Utf8, DataType::Int64]),
+            (
+                "substr",
+                vec![DataType::Utf8, DataType::Int64, DataType::Int64],
+            ),
+            ("lpad", vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
+            ("repeat", vec![DataType::Utf8, DataType::Int64]),
+            ("space", vec![DataType::Int64]),
+            // Numeric — preserve-input
+            ("abs", vec![DataType::Int64]),
+            ("abs", vec![DataType::Int32]),
+            ("abs", vec![DataType::Float64]),
+            // Numeric — ceil/floor -> Int64
+            ("ceil", vec![DataType::Float64]),
+            ("floor", vec![DataType::Float64]),
+            // Numeric — pow/log/sqrt -> Float64
+            ("pow", vec![DataType::Float64, DataType::Float64]),
+            ("sqrt", vec![DataType::Float64]),
+            ("ln", vec![DataType::Float64]),
+            ("sin", vec![DataType::Float64]),
+            // Datetime
+            ("now", vec![]),
+            ("current_timestamp", vec![]),
+            ("curdate", vec![]),
+            ("current_date", vec![]),
+            (
+                "year",
+                vec![DataType::Timestamp(TimeUnit::Microsecond, None)],
+            ),
+            (
+                "month",
+                vec![DataType::Timestamp(TimeUnit::Microsecond, None)],
+            ),
+            // Array
+            ("array_length", vec![list_of(DataType::Int64)]),
+            ("cardinality", vec![list_of(DataType::Int64)]),
+            (
+                "array_append",
+                vec![list_of(DataType::Int64), DataType::Int64],
+            ),
+            (
+                "array_contains",
+                vec![list_of(DataType::Int64), DataType::Int64],
+            ),
+            // Map
+            ("map_size", vec![map_of(DataType::Utf8, DataType::Int64)]),
+        ];
+
+        for (name, arg_types) in probes {
+            let registry_result =
+                crate::sql::functions::resolve_scalar_function(name, &arg_types);
+            let legacy_result = infer_scalar_function_return_type(name, &arg_types);
+
+            match (registry_result, legacy_result) {
+                (Ok(reg_ty), Ok(legacy_ty)) => {
+                    assert_eq!(
+                        reg_ty, legacy_ty,
+                        "registry vs legacy disagree on `{name}({:?})`: \
+                         registry={reg_ty:?}, legacy={legacy_ty:?}",
+                        arg_types
+                    );
+                }
+                (Err(reg_err), Ok(legacy_ty)) => {
+                    panic!(
+                        "registry refused `{name}({:?})` (={reg_err:?}) but legacy \
+                         returned `{legacy_ty:?}` — Step A claims to cover this; \
+                         registry signature is wrong or missing",
+                        arg_types
+                    );
+                }
+                (Ok(reg_ty), Err(legacy_err)) => {
+                    panic!(
+                        "registry accepted `{name}({:?})` (={reg_ty:?}) but legacy \
+                         errored out (={legacy_err}); the registry is overreaching",
+                        arg_types
+                    );
+                }
+                (Err(_), Err(_)) => {
+                    // Both fail — probe shouldn't have been in the table.
+                    panic!("both registry and legacy errored on `{name}({:?})`", arg_types);
+                }
+            }
+        }
+    }
 
     #[test]
     fn percentile_family_uses_binary_intermediate_state() {
