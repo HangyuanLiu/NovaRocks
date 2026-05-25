@@ -1007,7 +1007,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
         .expect("show mvs");
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
-    assert_eq!(row.len(), 13);
+    assert_eq!(row.len(), 15);
     assert_eq!(row.get::<String, _>(0), Some("orders_mv".to_string()));
     assert_eq!(row.get::<String, _>(1), Some("analytics".to_string()));
     assert_eq!(row.get::<String, _>(2), Some("managed_lake".to_string()));
@@ -1026,6 +1026,8 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     assert_eq!(row.get::<Option<String>, _>(10), Some(None));
     assert_eq!(row.get::<Option<String>, _>(11), Some(None));
     assert_eq!(row.get::<Option<String>, _>(12), Some(None));
+    assert_eq!(row.get::<String, _>(13), Some("MANUAL".to_string()));
+    assert_eq!(row.get::<Option<String>, _>(14), Some(None));
 }
 
 #[test]

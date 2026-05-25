@@ -187,6 +187,8 @@ pub(crate) struct MvListRow {
     pub next_refresh_time: Option<String>,
     pub last_scheduler_error: Option<String>,
     pub max_staleness_ms: Option<String>,
+    pub refresh_state: String,
+    pub retry_after_time: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

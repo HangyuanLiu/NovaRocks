@@ -19,7 +19,7 @@ use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
 };
-use crate::meta::repository::mv::CreateMvDefinitionRequest;
+use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState, StoredMvDefinition};
 #[cfg(test)]
 use crate::meta::repository::mv::{StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
@@ -871,10 +871,13 @@ pub(crate) fn list_mv_rows(
         .expect("standalone managed lake read lock")
         .snapshot
         .clone();
+    let now_ms = now_ms();
 
     let mut rows = Vec::new();
     for mv in &definitions {
         let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
+        let (refresh_state, retry_after_time) =
+            refresh_status_for_mv(state, read.as_ref(), mv, now_ms)?;
         if let Some(filter) = storage_filter
             && engine != filter
         {
@@ -914,6 +917,8 @@ pub(crate) fn list_mv_rows(
                 next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
                 last_scheduler_error: mv.last_scheduler_error.clone(),
                 max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
+                refresh_state,
+                retry_after_time,
             });
             continue;
         }
@@ -952,9 +957,68 @@ pub(crate) fn list_mv_rows(
             next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
             last_scheduler_error: mv.last_scheduler_error.clone(),
             max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
+            refresh_state,
+            retry_after_time,
         });
     }
     Ok(rows)
+}
+
+fn refresh_status_for_mv(
+    state: &Arc<StandaloneState>,
+    read: &dyn MetaReadTxn,
+    mv: &StoredMvDefinition,
+    now_ms: i64,
+) -> Result<(String, Option<String>), String> {
+    let retry_after_time = mv
+        .last_scheduler_error
+        .as_ref()
+        .and_then(|_| mv.next_refresh_after_ms)
+        .filter(|next| *next > now_ms)
+        .map(|value| value.to_string());
+    if mv.refresh_paused {
+        return Ok(("PAUSED".to_string(), retry_after_time));
+    }
+    if let Some(refresh_id) = mv.active_refresh_id {
+        let refresh = state
+            .mv_repo
+            .load_refresh(read, refresh_id)
+            .map_err(|e| format!("load active MV refresh failed: {e}"))?;
+        if refresh
+            .as_ref()
+            .map(|refresh| refresh.state == MvRefreshState::CommitUnknown)
+            .unwrap_or(false)
+        {
+            return Ok(("BLOCKED_RECOVERY".to_string(), retry_after_time));
+        }
+        return Ok(("RUNNING".to_string(), retry_after_time));
+    }
+    if mv.refresh_in_progress {
+        return Ok(("RUNNING".to_string(), retry_after_time));
+    }
+    if mv.last_scheduler_error.is_some()
+        && mv
+            .next_refresh_after_ms
+            .map(|next| next > now_ms)
+            .unwrap_or(false)
+    {
+        return Ok(("FAILED_BACKOFF".to_string(), retry_after_time));
+    }
+    if matches!(
+        mv.refresh_policy,
+        crate::meta::repository::mv::StoredMvRefreshPolicy::Manual
+    ) {
+        return Ok(("MANUAL".to_string(), retry_after_time));
+    }
+    if mv
+        .next_refresh_after_ms
+        .map(|next| next > now_ms)
+        .unwrap_or(false)
+    {
+        Ok(("SUCCEEDED".to_string(), retry_after_time))
+    } else {
+        Ok(("PENDING".to_string(), retry_after_time))
+    }
 }
 
 /// Render the dependency-column text for a single MV row. Callers must pass
@@ -1609,6 +1673,18 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
             nullable: true,
             logical_type: None,
         },
+        QueryResultColumn {
+            name: "RefreshState".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: None,
+        },
+        QueryResultColumn {
+            name: "RetryAfterTime".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: None,
+        },
     ];
 
     let schema = Arc::new(Schema::new(vec![
@@ -1625,6 +1701,8 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Field::new("NextRefreshTime", DataType::Utf8, true),
         Field::new("LastSchedulerError", DataType::Utf8, true),
         Field::new("MaxStalenessMs", DataType::Utf8, true),
+        Field::new("RefreshState", DataType::Utf8, false),
+        Field::new("RetryAfterTime", DataType::Utf8, true),
     ]));
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(
@@ -1690,6 +1768,16 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| row.max_staleness_ms.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| Some(row.refresh_state.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.retry_after_time.clone())
                 .collect::<Vec<_>>(),
         )),
     ];
@@ -1999,7 +2087,7 @@ mod tests {
                     refresh_interval_ms: Some(300_000),
                     max_staleness_ms: Some(900_000),
                     last_scheduler_error: Some("catalog timeout".to_string()),
-                    next_refresh_after_ms: Some(1_700_000_000_000),
+                    next_refresh_after_ms: Some(9_000_000_000_000),
                 },
             )
             .expect("update refresh metadata");
@@ -2014,9 +2102,11 @@ mod tests {
 
         assert_eq!(row.refresh_mode, "ASYNC_INTERVAL");
         assert_eq!(row.refresh_paused, "true");
-        assert_eq!(row.next_refresh_time.as_deref(), Some("1700000000000"));
+        assert_eq!(row.next_refresh_time.as_deref(), Some("9000000000000"));
         assert_eq!(row.last_scheduler_error.as_deref(), Some("catalog timeout"));
         assert_eq!(row.max_staleness_ms.as_deref(), Some("900000"));
+        assert_eq!(row.refresh_state, "PAUSED");
+        assert_eq!(row.retry_after_time.as_deref(), Some("9000000000000"));
     }
 
     #[test]
