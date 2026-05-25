@@ -315,6 +315,16 @@ pub(crate) fn create_mv(
         .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
     state
         .mv_repo
+        .update_refresh_metadata(
+            txn.as_mut(),
+            crate::engine::mv_flow::refresh_metadata_request_for_create(
+                mv_definition.mv_id,
+                &stmt.refresh_policy,
+            ),
+        )
+        .map_err(|e| format!("persist materialized view refresh metadata failed: {e}"))?;
+    state
+        .mv_repo
         .replace_dependencies_for_mv(
             txn.as_mut(),
             mv_definition.mv_id,

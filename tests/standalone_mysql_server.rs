@@ -1029,6 +1029,75 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
 }
 
 #[test]
+fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_refresh_policy_ddl");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create materialized view orders_mv \
+         distributed by hash(k1) buckets 2 \
+         refresh async every interval 5 minute \
+         as select k1 from ice.ns.orders",
+    )
+    .expect("create mv with refresh policy");
+
+    let created: Vec<Row> = conn
+        .query("show materialized views from analytics")
+        .expect("show mvs after create");
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].get::<String, _>(3),
+        Some("ASYNC_INTERVAL".to_string())
+    );
+    assert_eq!(created[0].get::<String, _>(9), Some("false".to_string()));
+
+    conn.query_drop("alter materialized view orders_mv pause refresh")
+        .expect("pause refresh");
+    let paused: Vec<Row> = conn
+        .query("show materialized views from analytics")
+        .expect("show mvs after pause");
+    assert_eq!(
+        paused[0].get::<String, _>(3),
+        Some("ASYNC_INTERVAL".to_string())
+    );
+    assert_eq!(paused[0].get::<String, _>(9), Some("true".to_string()));
+
+    conn.query_drop("alter materialized view orders_mv set refresh async on change")
+        .expect("set refresh on change");
+    conn.query_drop("alter materialized view orders_mv resume refresh")
+        .expect("resume refresh");
+    let resumed: Vec<Row> = conn
+        .query("show materialized views from analytics")
+        .expect("show mvs after resume");
+    assert_eq!(
+        resumed[0].get::<String, _>(3),
+        Some("ASYNC_ON_CHANGE".to_string())
+    );
+    assert_eq!(resumed[0].get::<String, _>(9), Some("false".to_string()));
+    assert_eq!(resumed[0].get::<Option<String>, _>(10), Some(None));
+}
+
+#[test]
 fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
     let port = alloc_port();
     let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
