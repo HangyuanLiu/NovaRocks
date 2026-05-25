@@ -9,7 +9,7 @@ use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use mysql::prelude::Queryable;
-use mysql::{Conn as MysqlConn, OptsBuilder};
+use mysql::{Conn as MysqlConn, OptsBuilder, Row};
 use novarocks::meta::repository::managed_lake::{
     ManagedLakeMetaRepository, ManagedPartitionState, StageManagedTruncateRequest,
 };
@@ -1002,29 +1002,29 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     )
     .expect("create mv");
 
-    type MvShowRow = (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-    );
-    let rows: Vec<MvShowRow> = conn
+    let rows: Vec<Row> = conn
         .query("show materialized views from analytics")
         .expect("show mvs");
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
-    assert_eq!(row.0, "orders_mv");
-    assert_eq!(row.1, "analytics");
-    assert_eq!(row.2, "managed_lake");
-    assert_eq!(row.3, "DEFERRED_MANUAL");
-    assert_eq!(row.4, None);
-    assert_eq!(row.5, None);
-    assert_eq!(row.6, "ice.ns.orders");
-    assert!(row.7.to_ascii_lowercase().contains("select"));
+    assert_eq!(row.len(), 13);
+    assert_eq!(row.get::<String, _>(0), Some("orders_mv".to_string()));
+    assert_eq!(row.get::<String, _>(1), Some("analytics".to_string()));
+    assert_eq!(row.get::<String, _>(2), Some("managed_lake".to_string()));
+    assert_eq!(row.get::<String, _>(3), Some("DEFERRED_MANUAL".to_string()));
+    assert_eq!(row.get::<Option<String>, _>(4), Some(None));
+    assert_eq!(row.get::<Option<String>, _>(5), Some(None));
+    assert_eq!(row.get::<String, _>(6), Some("ice.ns.orders".to_string()));
+    assert!(row
+        .get::<String, _>(7)
+        .expect("select text")
+        .to_ascii_lowercase()
+        .contains("select"));
+    assert_eq!(row.get::<String, _>(8), Some("ice.ns.orders".to_string()));
+    assert_eq!(row.get::<String, _>(9), Some("false".to_string()));
+    assert_eq!(row.get::<Option<String>, _>(10), Some(None));
+    assert_eq!(row.get::<Option<String>, _>(11), Some(None));
+    assert_eq!(row.get::<Option<String>, _>(12), Some(None));
 }
 
 #[test]
