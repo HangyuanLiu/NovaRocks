@@ -1534,6 +1534,106 @@ mod tests {
     }
 
     #[test]
+    fn apply_comment_at_top_level() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "v",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("v").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "value column").unwrap();
+        let field = new.as_struct().fields()[0].as_ref();
+        assert_eq!(field.doc.as_deref(), Some("value column"));
+        assert_eq!(field.id, 1);
+    }
+
+    #[test]
+    fn apply_comment_at_top_level_overwrite() {
+        let mut f = NestedField::optional(1, "v", Type::Primitive(PrimitiveType::Int));
+        f.doc = Some("old comment".to_string());
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(f)])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("v").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "new comment").unwrap();
+        assert_eq!(
+            new.as_struct().fields()[0].doc.as_deref(),
+            Some("new comment")
+        );
+    }
+
+    #[test]
+    fn apply_comment_at_nested() {
+        use iceberg::spec::StructType;
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "street",
+            Type::Primitive(PrimitiveType::String),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "address", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("address.street").unwrap();
+        let new = super::apply_comment_at(&schema, &path, "street name").unwrap();
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
+        assert_eq!(s.fields()[0].doc.as_deref(), Some("street name"));
+        assert_eq!(s.fields()[0].id, 11);
+    }
+
+    #[test]
+    fn apply_comment_at_unknown_path_errors() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
+        assert!(super::apply_comment_at(&schema, &path, "doc").is_err());
+    }
+
+    #[test]
+    fn build_updated_schema_dispatches_update_comment() {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "v",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let change = IcebergSchemaChange::UpdateComment {
+            path: ColumnPath::parse("v").unwrap(),
+            comment: "doc string".to_string(),
+        };
+        let new = build_updated_schema(&schema, 1, &change).unwrap();
+        assert_eq!(
+            new.as_struct().fields()[0].doc.as_deref(),
+            Some("doc string")
+        );
+    }
+
+    #[test]
+    fn build_property_updates_update_comment_is_no_op() {
+        let change = IcebergSchemaChange::UpdateComment {
+            path: ColumnPath::parse("v").unwrap(),
+            comment: "doc string".to_string(),
+        };
+        let updates =
+            build_property_updates_for_test(&std::collections::HashMap::new(), &change).unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[test]
     fn widen_decimal_precision_increase_same_scale() {
         let curr = Type::Primitive(PrimitiveType::Decimal {
             precision: 10,
@@ -2249,6 +2349,72 @@ fn set_nullable_in_type(ty: &Type, segments: &[String], nullable: bool) -> Resul
     }
 }
 
+/// Rebuild `schema` with the column at `path` having its doc string updated.
+///
+/// Only struct fields are supported; descending into list element / map key/value
+/// is rejected because those are not named columns.
+#[allow(dead_code)]
+pub(crate) fn apply_comment_at(
+    schema: &Schema,
+    path: &ColumnPath,
+    comment: &str,
+) -> Result<Schema, String> {
+    let identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    let new_fields =
+        comment_in_fields(schema.as_struct().fields().to_vec(), path.segments(), comment)?;
+    let arc_fields: Vec<NestedFieldRef> = new_fields.into_iter().map(Arc::new).collect();
+    Schema::builder()
+        .with_fields(arc_fields)
+        .with_identifier_field_ids(identifier_field_ids)
+        .build()
+        .map_err(|e| format!("rebuild schema after comment update: {e}"))
+}
+
+fn comment_in_fields(
+    fields: Vec<Arc<NestedField>>,
+    segments: &[String],
+    comment: &str,
+) -> Result<Vec<NestedField>, String> {
+    if segments.is_empty() {
+        return Err("comment update path is empty".to_string());
+    }
+    let head = normalize_identifier(&segments[0])?;
+    let mut out = Vec::new();
+    let mut matched = false;
+    for f in fields {
+        let f_norm = normalize_identifier(&f.name).ok();
+        if f_norm.as_deref() == Some(head.as_str()) {
+            matched = true;
+            let mut updated = (*f).clone();
+            if segments.len() == 1 {
+                updated.doc = Some(comment.to_string());
+            } else {
+                let new_inner = comment_in_type(&f.field_type, &segments[1..], comment)?;
+                updated.field_type = Box::new(new_inner);
+            }
+            out.push(updated);
+        } else {
+            out.push((*f).clone());
+        }
+    }
+    if !matched {
+        return Err(format!("column '{}' not found for comment update", head));
+    }
+    Ok(out)
+}
+
+fn comment_in_type(ty: &Type, segments: &[String], comment: &str) -> Result<Type, String> {
+    match ty {
+        Type::Struct(s) => {
+            let new = comment_in_fields(s.fields().to_vec(), segments, comment)?;
+            Ok(Type::Struct(StructType::new(
+                new.into_iter().map(Arc::new).collect(),
+            )))
+        }
+        _ => Err("ALTER COLUMN COMMENT only supported on struct fields".to_string()),
+    }
+}
+
 fn build_updated_schema(
     current: &Schema,
     last_column_id: i32,
@@ -2297,6 +2463,9 @@ fn build_updated_schema(
         IcebergSchemaChange::Reorder { path, position } => {
             apply_reorder_at(current, path, position)
         }
+        IcebergSchemaChange::UpdateComment { path, comment } => {
+            apply_comment_at(current, path, comment)
+        }
     }
 }
 
@@ -2326,6 +2495,10 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
         }
         IcebergSchemaChange::Reorder { path, .. } => {
             debug_assert!(!path.is_empty(), "Reorder path must be non-empty");
+            path.last().map(|n| vec![n]).unwrap_or_default()
+        }
+        IcebergSchemaChange::UpdateComment { path, .. } => {
+            debug_assert!(!path.is_empty(), "UpdateComment path must be non-empty");
             path.last().map(|n| vec![n]).unwrap_or_default()
         }
     };
@@ -3048,6 +3221,7 @@ fn build_property_updates(
             }
         }
         IcebergSchemaChange::Reorder { .. } => {}
+        IcebergSchemaChange::UpdateComment { .. } => {}
     }
     Ok(updates)
 }

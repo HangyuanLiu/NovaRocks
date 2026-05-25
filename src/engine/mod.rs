@@ -70,11 +70,12 @@ use self::statement::{
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
     looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
     looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
-    looks_like_show_alter_table_optimize, parse_add_legacy_range_partition_sql,
-    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
-    parse_alter_table_expire_snapshots_sql, parse_alter_table_optimize_sql,
-    parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
-    parse_show_alter_table_optimize_sql,
+    looks_like_show_alter_table_optimize, looks_like_show_create_table,
+    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
+    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
+    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
+    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
+    parse_show_create_table,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -695,6 +696,11 @@ impl StandaloneSession {
             return self.handle_alter_partition_spec(stmt, current_catalog, current_database);
         }
 
+        // SHOW CREATE TABLE ...
+        if looks_like_show_create_table(&normalized) {
+            return self.handle_show_create_table(&normalized, current_catalog, current_database);
+        }
+
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -1205,6 +1211,74 @@ impl StandaloneSession {
         build_show_alter_table_optimize_result(jobs).map(StatementResult::Query)
     }
 
+    fn handle_show_create_table(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let table_name = parse_show_create_table(sql)?;
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.inner,
+            &table_name,
+            current_catalog,
+            current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "SHOW CREATE TABLE only supports Iceberg tables, got `{}` backend",
+                target.backend_name
+            ));
+        }
+        let entry = {
+            let registry = self
+                .inner
+                .iceberg_catalogs
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+            registry.get(&target.catalog)?
+        };
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+        let loaded = crate::connector::iceberg::catalog::registry::load_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        )?;
+        let ddl = build_iceberg_create_table_ddl(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            &loaded,
+        )?;
+        let fields = vec![
+            Field::new("Table", DataType::Utf8, false),
+            Field::new("Create Table", DataType::Utf8, false),
+        ];
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec![target.table.clone()])),
+            Arc::new(StringArray::from(vec![ddl])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("build SHOW CREATE TABLE result failed: {e}"))?;
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                QueryResultColumn {
+                    name: "Table".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "Create Table".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        }))
+    }
+
     fn handle_alter_iceberg_properties(
         &self,
         sql: &str,
@@ -1657,6 +1731,79 @@ fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
         IcebergOptimizeJobState::Finished => "FINISHED",
         IcebergOptimizeJobState::Failed => "FAILED",
     }
+}
+
+/// Generate a `CREATE TABLE` DDL string from a loaded Iceberg table's current
+/// schema.  Column doc strings are emitted as `COMMENT '...'` clauses.
+fn build_iceberg_create_table_ddl(
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    loaded: &crate::connector::iceberg::catalog::registry::IcebergLoadedTable,
+) -> Result<String, String> {
+    use iceberg::spec::{PrimitiveType, Type};
+
+    fn iceberg_type_to_sql(ty: &Type) -> String {
+        match ty {
+            Type::Primitive(PrimitiveType::Boolean) => "BOOLEAN".to_string(),
+            Type::Primitive(PrimitiveType::Int) => "INT".to_string(),
+            Type::Primitive(PrimitiveType::Long) => "BIGINT".to_string(),
+            Type::Primitive(PrimitiveType::Float) => "FLOAT".to_string(),
+            Type::Primitive(PrimitiveType::Double) => "DOUBLE".to_string(),
+            Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+                format!("DECIMAL({precision},{scale})")
+            }
+            Type::Primitive(PrimitiveType::Date) => "DATE".to_string(),
+            Type::Primitive(PrimitiveType::Time) => "TIME".to_string(),
+            Type::Primitive(PrimitiveType::Timestamp)
+            | Type::Primitive(PrimitiveType::Timestamptz)
+            | Type::Primitive(PrimitiveType::TimestampNs)
+            | Type::Primitive(PrimitiveType::TimestamptzNs) => "DATETIME".to_string(),
+            Type::Primitive(PrimitiveType::String) => "STRING".to_string(),
+            Type::Primitive(PrimitiveType::Uuid) => "STRING".to_string(),
+            Type::Primitive(PrimitiveType::Fixed(n)) => format!("BINARY({n})"),
+            Type::Primitive(PrimitiveType::Binary) => "BINARY".to_string(),
+            Type::Primitive(PrimitiveType::Variant) => "VARIANT".to_string(),
+            Type::List(l) => format!("ARRAY<{}>", iceberg_type_to_sql(&l.element_field.field_type)),
+            Type::Map(m) => format!(
+                "MAP<{},{}>",
+                iceberg_type_to_sql(&m.key_field.field_type),
+                iceberg_type_to_sql(&m.value_field.field_type)
+            ),
+            Type::Struct(s) => {
+                let fields: Vec<String> = s
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{} {}", f.name, iceberg_type_to_sql(&f.field_type)))
+                    .collect();
+                format!("STRUCT<{}>", fields.join(", "))
+            }
+        }
+    }
+
+    let schema = loaded.table.metadata().current_schema();
+    let mut col_defs: Vec<String> = Vec::new();
+    for field in schema.as_struct().fields() {
+        let nullable = if field.required { " NOT NULL" } else { "" };
+        let comment = if let Some(doc) = &field.doc {
+            let escaped = doc.replace('\'', "\\'");
+            format!(" COMMENT '{escaped}'")
+        } else {
+            String::new()
+        };
+        col_defs.push(format!(
+            "  `{}` {}{}{}",
+            field.name,
+            iceberg_type_to_sql(&field.field_type),
+            nullable,
+            comment
+        ));
+    }
+
+    Ok(format!(
+        "CREATE TABLE `{catalog}`.`{namespace}`.`{table}` (\n{}\n)",
+        col_defs.join(",\n")
+    ))
 }
 
 // ---------------------------------------------------------------------------
