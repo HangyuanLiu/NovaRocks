@@ -7,8 +7,8 @@
 -- table is populated with non-NULL rows before SET NOT NULL is applied.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_nullable_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_nullable_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
 DROP TABLE IF EXISTS members;
 CREATE TABLE members (
   id INT,
@@ -45,5 +45,5 @@ SELECT id, email FROM members ORDER BY id;
 
 -- query 9
 DROP TABLE members;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_nullable_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
 SET catalog default_catalog;

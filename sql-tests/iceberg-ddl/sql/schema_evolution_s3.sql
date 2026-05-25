@@ -2,8 +2,8 @@
 -- Validate top-level Iceberg schema evolution against an S3-backed catalog.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
 DROP TABLE IF EXISTS orders_s3;
 CREATE TABLE orders_s3 (
   id INT,
@@ -45,5 +45,5 @@ SELECT id, total_amount, note_text FROM orders_s3 ORDER BY id;
 
 -- query 11
 SET catalog default_catalog;
-DROP TABLE iceberg_cat_${suite_uuid0}.schema_evolution_s3_${uuid0}.orders_s3 FORCE;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0}.orders_s3 FORCE;
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};

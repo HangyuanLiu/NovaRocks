@@ -2,8 +2,8 @@
 -- Decimal precision widen happy path + scale-change reject.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_decimal_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_decimal_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_decimal_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_decimal_${uuid0};
 DROP TABLE IF EXISTS sales;
 CREATE TABLE sales (
   id INT,
@@ -33,5 +33,5 @@ ALTER TABLE sales MODIFY COLUMN price DECIMAL(15, 2);
 
 -- query 7
 DROP TABLE sales;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_decimal_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_decimal_${uuid0};
 SET catalog default_catalog;

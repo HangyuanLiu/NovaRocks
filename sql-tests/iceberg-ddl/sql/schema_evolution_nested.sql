@@ -7,8 +7,8 @@
 -- unit tests in `connector::iceberg::catalog::schema_update`.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_nested_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_nested_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
 DROP TABLE IF EXISTS people;
 CREATE TABLE people (
   id INT,
@@ -39,5 +39,5 @@ ALTER TABLE people DROP COLUMN address.bogus;
 
 -- query 8
 DROP TABLE people;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_nested_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
 SET catalog default_catalog;

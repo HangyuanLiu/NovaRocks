@@ -2,8 +2,8 @@
 -- Negative widening matrix.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_reject_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_reject_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
 DROP TABLE IF EXISTS bad;
 CREATE TABLE bad (
   i BIGINT,
@@ -30,5 +30,5 @@ ALTER TABLE bad MODIFY COLUMN ts DATE;
 
 -- query 6
 DROP TABLE bad;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_reject_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
 SET catalog default_catalog;

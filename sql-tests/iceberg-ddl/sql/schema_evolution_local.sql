@@ -2,8 +2,8 @@
 -- Validate top-level Iceberg schema evolution over the local Hadoop-style catalog.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
 DROP TABLE IF EXISTS orders_local;
 CREATE TABLE orders_local (
   id INT,
@@ -71,5 +71,5 @@ ALTER TABLE orders_local DROP COLUMN id;
 
 -- query 19
 SET catalog default_catalog;
-DROP TABLE iceberg_cat_${suite_uuid0}.schema_evolution_local_${uuid0}.orders_local FORCE;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0}.orders_local FORCE;
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};

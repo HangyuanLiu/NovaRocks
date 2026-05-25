@@ -2,8 +2,8 @@
 -- DATE -> TIMESTAMP widen.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.schema_date_${uuid0};
-USE iceberg_cat_${suite_uuid0}.schema_date_${uuid0};
+CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_date_${uuid0};
+USE iceberg_ddl_cat_${suite_uuid0}.schema_date_${uuid0};
 DROP TABLE IF EXISTS events;
 CREATE TABLE events (
   id INT,
@@ -25,5 +25,5 @@ SELECT id, occurred_on FROM events ORDER BY id;
 
 -- query 5
 DROP TABLE events;
-DROP DATABASE iceberg_cat_${suite_uuid0}.schema_date_${uuid0};
+DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_date_${uuid0};
 SET catalog default_catalog;
