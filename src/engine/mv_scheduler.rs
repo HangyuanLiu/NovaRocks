@@ -1,7 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::meta::repository::mv::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::meta::repository::mv::{
+    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use crate::novarocks_config::StandaloneServerConfig;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
@@ -57,6 +62,11 @@ pub(crate) struct RefreshCandidate {
     pub(crate) mv_id: i64,
     pub(crate) policy: StoredMvRefreshPolicy,
     pub(crate) state: RefreshTaskState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeriodicRefreshDecision {
+    pub(crate) mv_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +134,7 @@ impl RefreshCoordinator {
             if self.running_mv_ids.contains(&entry.mv_id) {
                 continue;
             }
+            let _reason = entry.reason;
             self.running_mv_ids.insert(entry.mv_id);
             self.states.insert(entry.mv_id, RefreshTaskState::Running);
             let result = executor.execute_refresh(entry.mv_id);
@@ -140,6 +151,193 @@ impl RefreshCoordinator {
         }
         Ok(())
     }
+
+    fn tick_state(
+        &mut self,
+        state: &Arc<crate::engine::StandaloneState>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let definitions = load_scheduler_definitions(state)?;
+        for decision in plan_periodic_refreshes(&definitions, now_ms) {
+            self.enqueue_refresh(decision.mv_id, RefreshTaskReason::Periodic);
+        }
+        let capacity = self
+            .config
+            .max_concurrent_refreshes
+            .saturating_sub(self.running_mv_ids.len());
+        let mut executor = MetadataRefreshExecutor::new(Arc::clone(state));
+        for _ in 0..capacity {
+            let Some(entry) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued_mv_ids.remove(&entry.mv_id);
+            if self.running_mv_ids.contains(&entry.mv_id) {
+                continue;
+            }
+            let _reason = entry.reason;
+            self.running_mv_ids.insert(entry.mv_id);
+            self.states.insert(entry.mv_id, RefreshTaskState::Running);
+            let result = executor.execute_refresh(entry.mv_id);
+            self.running_mv_ids.remove(&entry.mv_id);
+            match result {
+                Ok(()) => {
+                    self.states.insert(entry.mv_id, RefreshTaskState::Succeeded);
+                    record_scheduler_success_metadata(state, entry.mv_id, now_ms)?;
+                }
+                Err(err) => {
+                    self.states
+                        .insert(entry.mv_id, RefreshTaskState::FailedBackoff);
+                    record_scheduler_failure_metadata(
+                        state,
+                        entry.mv_id,
+                        &err,
+                        now_ms,
+                        self.config.failure_backoff_ms,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn plan_periodic_refreshes(
+    definitions: &[StoredMvDefinition],
+    now_ms: i64,
+) -> Vec<PeriodicRefreshDecision> {
+    definitions
+        .iter()
+        .filter(|definition| {
+            matches!(
+                definition.refresh_policy,
+                StoredMvRefreshPolicy::AsyncInterval
+            ) && !definition.refresh_paused
+                && definition.refresh_interval_ms.is_some()
+                && definition
+                    .next_refresh_after_ms
+                    .map(|next| next <= now_ms)
+                    .unwrap_or(true)
+        })
+        .map(|definition| PeriodicRefreshDecision {
+            mv_id: definition.mv_id,
+        })
+        .collect()
+}
+
+pub(crate) fn metadata_update_after_success(
+    definition: &StoredMvDefinition,
+    now_ms: i64,
+) -> Result<UpdateMvRefreshMetadataRequest, String> {
+    let next_refresh_after_ms = match definition.refresh_policy {
+        StoredMvRefreshPolicy::AsyncInterval => {
+            let interval = definition.refresh_interval_ms.ok_or_else(|| {
+                format!(
+                    "MV definition {} has ASYNC_INTERVAL policy without interval",
+                    definition.mv_id
+                )
+            })?;
+            Some(now_ms.saturating_add(interval))
+        }
+        _ => definition.next_refresh_after_ms,
+    };
+    Ok(UpdateMvRefreshMetadataRequest {
+        mv_id: definition.mv_id,
+        refresh_policy: definition.refresh_policy.clone(),
+        refresh_paused: definition.refresh_paused,
+        refresh_interval_ms: definition.refresh_interval_ms,
+        max_staleness_ms: definition.max_staleness_ms,
+        last_scheduler_error: None,
+        next_refresh_after_ms,
+    })
+}
+
+pub(crate) fn metadata_update_after_failure(
+    definition: &StoredMvDefinition,
+    err: &str,
+    now_ms: i64,
+    failure_backoff_ms: i64,
+) -> UpdateMvRefreshMetadataRequest {
+    UpdateMvRefreshMetadataRequest {
+        mv_id: definition.mv_id,
+        refresh_policy: definition.refresh_policy.clone(),
+        refresh_paused: definition.refresh_paused,
+        refresh_interval_ms: definition.refresh_interval_ms,
+        max_staleness_ms: definition.max_staleness_ms,
+        last_scheduler_error: Some(err.to_string()),
+        next_refresh_after_ms: Some(now_ms.saturating_add(failure_backoff_ms.max(1))),
+    }
+}
+
+fn load_scheduler_definitions(
+    state: &Arc<crate::engine::StandaloneState>,
+) -> Result<Vec<StoredMvDefinition>, String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let txn = provider
+        .begin_read()
+        .map_err(|e| format!("open MV scheduler read transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .list_definitions(txn.as_ref())
+        .map_err(|e| format!("list MV definitions failed: {e}"))
+}
+
+fn record_scheduler_success_metadata(
+    state: &Arc<crate::engine::StandaloneState>,
+    mv_id: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    update_scheduler_metadata(state, mv_id, |definition| {
+        metadata_update_after_success(definition, now_ms)
+    })
+}
+
+fn record_scheduler_failure_metadata(
+    state: &Arc<crate::engine::StandaloneState>,
+    mv_id: i64,
+    err: &str,
+    now_ms: i64,
+    failure_backoff_ms: i64,
+) -> Result<(), String> {
+    update_scheduler_metadata(state, mv_id, |definition| {
+        Ok(metadata_update_after_failure(
+            definition,
+            err,
+            now_ms,
+            failure_backoff_ms,
+        ))
+    })
+}
+
+fn update_scheduler_metadata<F>(
+    state: &Arc<crate::engine::StandaloneState>,
+    mv_id: i64,
+    build_request: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&StoredMvDefinition) -> Result<UpdateMvRefreshMetadataRequest, String>,
+{
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "MV refresh scheduler requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("update MV refresh scheduler metadata")
+        .map_err(|e| format!("open MV scheduler write transaction failed: {e}"))?;
+    let definition = state
+        .mv_repo
+        .load_by_id(txn.as_ref(), mv_id)
+        .map_err(|e| format!("load MV definition failed: {e}"))?
+        .ok_or_else(|| format!("MV definition {mv_id} not found"))?;
+    let req = build_request(&definition)?;
+    state
+        .mv_repo
+        .update_refresh_metadata(txn.as_mut(), req)
+        .map_err(|e| format!("update MV scheduler metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit MV scheduler metadata failed: {e}"))?;
+    Ok(())
 }
 
 pub(crate) struct MetadataRefreshExecutor {
@@ -241,14 +439,19 @@ fn refresh_execution_target_for_definition(
     })
 }
 
-#[derive(Debug)]
 pub(crate) struct RefreshCoordinatorHandle {
     enabled: bool,
+    stop_tx: Option<Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl RefreshCoordinatorHandle {
     pub(crate) fn disabled() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            stop_tx: None,
+            worker: None,
+        }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -256,14 +459,61 @@ impl RefreshCoordinatorHandle {
     }
 }
 
+impl Drop for RefreshCoordinatorHandle {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub(crate) fn start_refresh_coordinator_for_server(
-    _engine: &crate::engine::StandaloneNovaRocks,
+    engine: &crate::engine::StandaloneNovaRocks,
     config: RefreshCoordinatorConfig,
 ) -> RefreshCoordinatorHandle {
     if !config.enabled {
         return RefreshCoordinatorHandle::disabled();
     }
-    RefreshCoordinatorHandle { enabled: true }
+    let state = Arc::clone(&engine.inner);
+    let worker_config = config.clone();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("novarocks-mv-refresh-scheduler".to_string())
+        .spawn(move || {
+            let mut coordinator = RefreshCoordinator::new(worker_config.clone());
+            loop {
+                if let Err(err) = coordinator.tick_state(&state, current_time_ms()) {
+                    tracing::warn!(error = %err, "MV refresh scheduler tick failed");
+                }
+                match stop_rx.recv_timeout(Duration::from_millis(worker_config.tick_interval_ms)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+    match worker {
+        Ok(worker) => RefreshCoordinatorHandle {
+            enabled: true,
+            stop_tx: Some(stop_tx),
+            worker: Some(worker),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start MV refresh scheduler worker");
+            RefreshCoordinatorHandle::disabled()
+        }
+    }
+}
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 pub(crate) fn scan_refresh_candidates(
@@ -451,5 +701,47 @@ mod tests {
             coordinator.state_for_mv(7),
             Some(RefreshTaskState::FailedBackoff)
         );
+    }
+
+    #[test]
+    fn periodic_policy_enqueues_only_when_due() {
+        let mut due = test_definition(1, StoredMvRefreshPolicy::AsyncInterval);
+        due.refresh_interval_ms = Some(10_000);
+        due.next_refresh_after_ms = Some(1_000);
+        let mut future = test_definition(2, StoredMvRefreshPolicy::AsyncInterval);
+        future.refresh_interval_ms = Some(10_000);
+        future.next_refresh_after_ms = Some(2_000);
+
+        let decisions = plan_periodic_refreshes(&[due, future], 1_500);
+
+        assert_eq!(
+            decisions
+                .into_iter()
+                .map(|decision| decision.mv_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn periodic_success_sets_next_refresh_after() {
+        let mut definition = test_definition(1, StoredMvRefreshPolicy::AsyncInterval);
+        definition.refresh_interval_ms = Some(10_000);
+
+        let req = metadata_update_after_success(&definition, 1_500).expect("success metadata");
+
+        assert_eq!(req.last_scheduler_error, None);
+        assert_eq!(req.next_refresh_after_ms, Some(11_500));
+    }
+
+    #[test]
+    fn periodic_failure_sets_backoff_and_preserves_policy() {
+        let definition = test_definition(1, StoredMvRefreshPolicy::AsyncInterval);
+
+        let req = metadata_update_after_failure(&definition, "boom", 1_500, 30_000);
+
+        assert_eq!(req.last_scheduler_error, Some("boom".to_string()));
+        assert_eq!(req.next_refresh_after_ms, Some(31_500));
+        assert_eq!(req.refresh_policy, StoredMvRefreshPolicy::AsyncInterval);
     }
 }
