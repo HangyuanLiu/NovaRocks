@@ -866,7 +866,11 @@ mod tests {
         ))]));
         let schema = Schema::builder()
             .with_fields(vec![
-                Arc::new(NestedField::optional(1, "c0", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(
+                    1,
+                    "c0",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
                 Arc::new(NestedField::optional(2, "c1", inner)),
             ])
             .build()
@@ -894,11 +898,16 @@ mod tests {
             leaf_struct,
         ))]));
         let schema = Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::optional(1, "outer", outer_struct))])
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "outer",
+                outer_struct,
+            ))])
             .build()
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("outer.inner.leaf").unwrap();
-        let err = apply_drop_at(&schema, &path).expect_err("should reject last-field drop in nested struct");
+        let err = apply_drop_at(&schema, &path)
+            .expect_err("should reject last-field drop in nested struct");
         assert!(
             err.contains("cannot drop last field of STRUCT"),
             "unexpected error: {err}"
@@ -910,8 +919,16 @@ mod tests {
         use iceberg::spec::StructType;
         // STRUCT<v1 INT, v2 INT> — dropping v1 still leaves v2.
         let inner = Type::Struct(StructType::new(vec![
-            Arc::new(NestedField::optional(11, "v1", Type::Primitive(PrimitiveType::Int))),
-            Arc::new(NestedField::optional(12, "v2", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                11,
+                "v1",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                12,
+                "v2",
+                Type::Primitive(PrimitiveType::Int),
+            )),
         ]));
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(1, "c1", inner))])
@@ -919,7 +936,9 @@ mod tests {
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("c1.v1").unwrap();
         let new = apply_drop_at(&schema, &path).expect("non-last field drop should succeed");
-        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else { panic!() };
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
+            panic!()
+        };
         assert_eq!(s.fields().len(), 1);
         assert_eq!(s.fields()[0].name, "v2");
     }
