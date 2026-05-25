@@ -1,0 +1,10 @@
+-- query 5
+id	name	flag
+1	alice	1
+2	bob	1
+
+-- query 7
+id	name	flag
+1	alice	1
+2	bob	1
+3	charlie	1
