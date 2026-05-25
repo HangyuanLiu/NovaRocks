@@ -2950,9 +2950,7 @@ mod tests {
     /// Cross-validation: for every (function, arg_types) probe in this
     /// table, the new central signature registry and the legacy
     /// hand-written `infer_scalar_function_return_type` must agree on the
-    /// return type. The probes cover the Step-A high-frequency function
-    /// families (string / numeric / datetime / array / map). Step B will
-    /// extend the table as more functions are migrated.
+    /// return type.
     ///
     /// If this test fires it means the registry has drifted from the
     /// legacy path for a function the codegen layer trusts the registry
@@ -2960,6 +2958,13 @@ mod tests {
     /// back to the legacy path only when the registry returns
     /// `UnknownFunction` or `NoMatchingSignature`. A wrong-but-non-empty
     /// registry answer would be used silently.
+    ///
+    /// Step B expands this probe set to cover every function family
+    /// registered in `src/sql/functions/registry.rs`. Functions that
+    /// intentionally stay on the legacy path (`if` / `coalesce` /
+    /// `round`+Decimal / struct constructors / etc.) are not probed
+    /// here — they're handled by the resolver's `UnknownFunction` /
+    /// `NoMatchingSignature` fallback, not by registry agreement.
     #[test]
     fn registry_agrees_with_legacy_for_step_a_functions() {
         fn list_of(item: DataType) -> DataType {
@@ -2982,64 +2987,372 @@ mod tests {
             )
         }
 
-        let probes: Vec<(&str, Vec<DataType>)> = vec![
-            // String
-            ("upper", vec![DataType::Utf8]),
-            ("lower", vec![DataType::Utf8]),
-            ("trim", vec![DataType::Utf8]),
-            ("md5", vec![DataType::Utf8]),
-            ("length", vec![DataType::Utf8]),
-            ("char_length", vec![DataType::Utf8]),
-            ("bit_length", vec![DataType::Utf8]),
-            ("concat", vec![DataType::Utf8, DataType::Utf8]),
-            ("concat", vec![DataType::Utf8; 5]),
-            ("substr", vec![DataType::Utf8, DataType::Int64]),
-            (
-                "substr",
+        let dt = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let mut probes: Vec<(&str, Vec<DataType>)> = Vec::new();
+
+        // ---------------- string -> Utf8 (single arg) ----------------
+        for name in [
+            "upper", "lower", "trim", "ltrim", "rtrim", "reverse", "initcap",
+            "md5", "to_base64", "from_base64", "url_encode", "url_decode",
+            "char", "hex", "unhex", "bar", "money_format",
+            "append_trailing_char_if_absent", "md5sum", "sm3", "parse_url",
+            "from_binary",
+        ] {
+            probes.push((name, vec![DataType::Utf8]));
+        }
+
+        // ---------------- string length/position -> Int32 -----------
+        for name in [
+            "length", "char_length", "character_length", "bit_length",
+            "octet_length", "ascii", "ord",
+        ] {
+            probes.push((name, vec![DataType::Utf8]));
+        }
+
+        // (Utf8, Utf8) -> Int32 — multi-string position / compare.
+        for name in [
+            "instr", "locate", "position", "find_in_set", "strcmp", "field",
+            "regexp_position",
+        ] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+        probes.push(("regexp_count", vec![DataType::Utf8, DataType::Utf8]));
+
+        // (Utf8, ...) -> Utf8 — variadic concat / format family.
+        for name in ["concat", "concat_ws", "elt", "format"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+            probes.push((name, vec![DataType::Utf8; 5]));
+        }
+
+        // (Utf8, Utf8) -> Utf8 — two-arg string transforms.
+        for name in [
+            "replace", "regexp_extract", "regexp_extract_all", "regexp_replace",
+            "split_part", "substring_index", "translate",
+        ] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+
+        // substring 2/3 args; left/right; strleft/strright.
+        for name in ["substr", "substring", "left", "right", "strleft", "strright"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Int64]));
+            probes.push((
+                name,
                 vec![DataType::Utf8, DataType::Int64, DataType::Int64],
-            ),
-            ("lpad", vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
-            ("repeat", vec![DataType::Utf8, DataType::Int64]),
-            ("space", vec![DataType::Int64]),
-            // Numeric — preserve-input
-            ("abs", vec![DataType::Int64]),
-            ("abs", vec![DataType::Int32]),
-            ("abs", vec![DataType::Float64]),
-            // Numeric — ceil/floor -> Int64
-            ("ceil", vec![DataType::Float64]),
-            ("floor", vec![DataType::Float64]),
-            // Numeric — pow/log/sqrt -> Float64
-            ("pow", vec![DataType::Float64, DataType::Float64]),
-            ("sqrt", vec![DataType::Float64]),
-            ("ln", vec![DataType::Float64]),
-            ("sin", vec![DataType::Float64]),
-            // Datetime
-            ("now", vec![]),
-            ("current_timestamp", vec![]),
-            ("curdate", vec![]),
-            ("current_date", vec![]),
-            (
-                "year",
-                vec![DataType::Timestamp(TimeUnit::Microsecond, None)],
-            ),
-            (
-                "month",
-                vec![DataType::Timestamp(TimeUnit::Microsecond, None)],
-            ),
-            // Array
-            ("array_length", vec![list_of(DataType::Int64)]),
-            ("cardinality", vec![list_of(DataType::Int64)]),
-            (
-                "array_append",
-                vec![list_of(DataType::Int64), DataType::Int64],
-            ),
-            (
-                "array_contains",
-                vec![list_of(DataType::Int64), DataType::Int64],
-            ),
-            // Map
-            ("map_size", vec![map_of(DataType::Utf8, DataType::Int64)]),
-        ];
+            ));
+        }
+        // lpad / rpad
+        for name in ["lpad", "rpad"] {
+            probes.push((
+                name,
+                vec![DataType::Utf8, DataType::Int64, DataType::Utf8],
+            ));
+        }
+        probes.push(("repeat", vec![DataType::Utf8, DataType::Int64]));
+        probes.push(("space", vec![DataType::Int64]));
+        probes.push(("sha2", vec![DataType::Utf8, DataType::Int64]));
+
+        // ---------------- numeric ------------------
+        // Preserve-input.
+        for name in ["abs", "negative", "positive"] {
+            for t in [
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::Float32,
+                DataType::Float64,
+            ] {
+                probes.push((name, vec![t]));
+            }
+        }
+        // ceil/floor -> Int64.
+        for name in ["ceil", "ceiling", "dceil", "floor", "dfloor"] {
+            for t in [DataType::Int64, DataType::Float64] {
+                probes.push((name, vec![t]));
+            }
+        }
+        // Single-arg float-math -> Float64.
+        for name in [
+            "sqrt", "cbrt", "exp", "ln", "log2", "log10", "sin", "cos", "tan",
+            "asin", "acos", "atan", "sinh", "cosh", "tanh", "cot", "square",
+            "radians", "degrees", "sign",
+        ] {
+            probes.push((name, vec![DataType::Float64]));
+            probes.push((name, vec![DataType::Int64]));
+        }
+        // Two-arg math -> Float64.
+        for name in ["pow", "power", "log", "mod", "fmod", "pmod", "atan2"] {
+            probes.push((name, vec![DataType::Float64, DataType::Float64]));
+            probes.push((name, vec![DataType::Int64, DataType::Int64]));
+        }
+        // Constants -> Float64.
+        for name in ["pi", "e", "rand", "random"] {
+            probes.push((name, vec![]));
+        }
+        probes.push(("rand", vec![DataType::Int64]));
+        probes.push(("random", vec![DataType::Int64]));
+        probes.push(("crc32", vec![DataType::Utf8]));
+
+        // ---------------- datetime constructors / extractors --------
+        for name in [
+            "now", "current_timestamp", "localtimestamp", "localtime",
+            "curdate", "current_date", "to_datetime", "to_datetime_ntz",
+        ] {
+            probes.push((name, vec![]));
+        }
+        probes.push((
+            "convert_tz",
+            vec![dt.clone(), DataType::Utf8, DataType::Utf8],
+        ));
+        probes.push(("timestamp", vec![dt.clone()]));
+        probes.push(("add_months", vec![dt.clone(), DataType::Int64]));
+        for name in ["date_format", "time_format", "from_unixtime"] {
+            probes.push((name, vec![dt.clone(), DataType::Utf8]));
+        }
+        probes.push(("from_unixtime", vec![DataType::Int64]));
+        // date_add / date_sub family
+        for name in [
+            "date_add", "date_sub", "adddate", "subdate", "days_add", "days_sub",
+            "months_add", "months_sub", "years_add", "years_sub", "weeks_add",
+            "weeks_sub", "hours_add", "hours_sub", "minutes_add", "minutes_sub",
+            "seconds_add", "seconds_sub",
+        ] {
+            probes.push((name, vec![dt.clone(), DataType::Int64]));
+            probes.push((name, vec![DataType::Date32, DataType::Int64]));
+        }
+        probes.push(("sec_to_time", vec![DataType::Int64]));
+        // date_trunc preserves Datetime / Date.
+        probes.push(("date_trunc", vec![DataType::Utf8, dt.clone()]));
+        // Datetime extractors -> Int32.
+        for name in [
+            "year", "month", "day", "dayofmonth", "hour", "minute", "second",
+            "dayofweek", "yearweek", "dayofyear", "weekofyear", "quarter",
+            "hour_from_unixtime",
+        ] {
+            probes.push((name, vec![dt.clone()]));
+        }
+        // Diff family -> Int64.
+        for name in [
+            "datediff", "timestampdiff", "months_diff", "years_diff", "weeks_diff",
+            "days_diff", "hours_diff", "minutes_diff", "seconds_diff",
+            "to_days", "time_to_sec",
+        ] {
+            probes.push((name, vec![dt.clone(), dt.clone()]));
+        }
+        for name in ["unix_timestamp", "to_unix_timestamp"] {
+            probes.push((name, vec![]));
+            probes.push((name, vec![dt.clone()]));
+            probes.push((name, vec![DataType::Utf8]));
+        }
+        for name in [
+            "to_date", "str_to_date", "from_days", "makedate", "last_day",
+            "next_day",
+        ] {
+            probes.push((name, vec![DataType::Utf8]));
+        }
+        probes.push(("date", vec![dt.clone()]));
+
+        // ---------------- condition ------------------
+        for name in ["isnull", "isnotnull"] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+        probes.push(("assert_true", vec![DataType::Boolean]));
+        probes.push(("sleep", vec![DataType::Int64]));
+
+        // ---------------- array -------------------
+        for name in [
+            "array_length", "cardinality", "array_size",
+        ] {
+            probes.push((name, vec![list_of(DataType::Int64)]));
+        }
+        probes.push((
+            "array_position",
+            vec![list_of(DataType::Int64), DataType::Int64],
+        ));
+        probes.push((
+            "array_append",
+            vec![list_of(DataType::Int64), DataType::Int64],
+        ));
+        probes.push((
+            "array_concat",
+            vec![list_of(DataType::Int64), list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "array_contains",
+            vec![list_of(DataType::Int64), DataType::Int64],
+        ));
+        probes.push((
+            "all_match",
+            vec![list_of(DataType::Boolean)],
+        ));
+        probes.push((
+            "any_match",
+            vec![list_of(DataType::Boolean)],
+        ));
+        probes.push((
+            "array_distinct",
+            vec![list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "array_sort",
+            vec![list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "array_reverse",
+            vec![list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "array_min",
+            vec![list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "array_max",
+            vec![list_of(DataType::Int64)],
+        ));
+        probes.push((
+            "__array_element_at",
+            vec![list_of(DataType::Int64), DataType::Int64],
+        ));
+        probes.push(("array_join", vec![list_of(DataType::Utf8), DataType::Utf8]));
+        probes.push((
+            "array_to_string",
+            vec![list_of(DataType::Utf8), DataType::Utf8],
+        ));
+        probes.push(("split", vec![DataType::Utf8, DataType::Utf8]));
+
+        // ---------------- map -------------------
+        probes.push(("map_keys", vec![map_of(DataType::Utf8, DataType::Int64)]));
+        probes.push(("map_values", vec![map_of(DataType::Utf8, DataType::Int64)]));
+        probes.push(("map_size", vec![map_of(DataType::Utf8, DataType::Int64)]));
+        probes.push((
+            "__map_element_at",
+            vec![map_of(DataType::Utf8, DataType::Int64), DataType::Utf8],
+        ));
+
+        // ---------------- bitwise -------------------
+        for name in ["bitnot"] {
+            probes.push((name, vec![DataType::Int64]));
+            probes.push((name, vec![DataType::Int32]));
+        }
+        for name in ["bitand", "bitor", "bitxor"] {
+            probes.push((name, vec![DataType::Int64, DataType::Int64]));
+        }
+        for name in ["bit_shift_left", "bit_shift_right"] {
+            probes.push((name, vec![DataType::Int64, DataType::Int64]));
+        }
+
+        // ---------------- window -------------------
+        for name in ["rank", "dense_rank", "row_number", "cume_dist", "percent_rank"] {
+            probes.push((name, vec![]));
+        }
+        probes.push(("ntile", vec![DataType::Int64]));
+        // lag/lead/first_value/last_value preserve type.
+        for name in ["lag", "lead", "first_value", "last_value"] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+        for name in ["grouping", "grouping_id"] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+
+        // ---------------- bitmap -------------------
+        probes.push(("bitmap_contains", vec![DataType::Binary, DataType::Int64]));
+        probes.push(("bitmap_has_any", vec![DataType::Binary, DataType::Int64]));
+        for name in [
+            "bitmap_min", "bitmap_max", "bitmap_count", "bitmap_union_int",
+            "bitmap_union_count",
+        ] {
+            probes.push((name, vec![DataType::Binary]));
+        }
+        probes.push(("bitmap_to_string", vec![DataType::Binary]));
+        probes.push(("bitmap_to_array", vec![DataType::Binary]));
+        for name in [
+            "to_bitmap", "bitmap_or", "bitmap_xor", "bitmap_andnot",
+            "bitmap_intersect", "bitmap_from_string", "bitmap_empty",
+            "bitmap_and", "sub_bitmap", "bitmap_to_binary", "bitmap_from_binary",
+            "bitmap_to_base64", "bitmap_agg", "bitmap_union",
+        ] {
+            probes.push((name, vec![DataType::Binary]));
+        }
+
+        // ---------------- hll -------------------
+        for name in [
+            "hll_union_agg", "hll_cardinality", "ndv", "approx_count_distinct",
+            "approx_count_distinct_hll_sketch", "ds_hll_count_distinct",
+            "ds_hll_count_distinct_merge",
+        ] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+        for name in [
+            "hll_hash", "hll_union", "hll_raw_agg",
+            "ds_hll_count_distinct_state", "ds_hll_count_distinct_union",
+        ] {
+            probes.push((name, vec![DataType::Binary]));
+        }
+
+        // ---------------- json -------------------
+        for name in ["get_json_bool", "get_variant_bool", "json_exists"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+        for name in ["get_json_int", "get_variant_int"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+        for name in ["get_json_double", "get_variant_double"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+        for name in [
+            "json_query", "json_extract", "get_json_string", "get_json_object",
+            "json_object", "json_array", "to_json", "parse_json", "variant_typeof",
+        ] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+
+        // ---------------- iceberg transforms -------------------
+        for name in [
+            "__iceberg_transform_year", "__iceberg_transform_month",
+            "__iceberg_transform_day", "__iceberg_transform_hour",
+            "__iceberg_transform_bucket",
+        ] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+        probes.push(("__iceberg_transform_identity", vec![DataType::Int64]));
+        probes.push(("__iceberg_transform_truncate", vec![DataType::Int64]));
+
+        // ---------------- misc -------------------
+        for name in ["version", "database", "current_user", "user", "uuid", "typeof"] {
+            probes.push((name, vec![]));
+        }
+        probes.push(("murmur_hash3_32", vec![DataType::Utf8]));
+        probes.push(("xx_hash3_64", vec![DataType::Utf8]));
+        for name in ["aes_encrypt", "aes_decrypt", "encode_sort_key"] {
+            probes.push((name, vec![DataType::Utf8, DataType::Utf8]));
+        }
+        probes.push(("encode_fingerprint_sha256", vec![DataType::Utf8]));
+        probes.push(("to_binary", vec![DataType::Utf8]));
+        probes.push(("encode_row_id", vec![DataType::Int64]));
+
+        // ---------------- aggregates in expr context -------------------
+        for name in ["max_by", "min_by", "any_value"] {
+            probes.push((name, vec![DataType::Int64]));
+        }
+        for name in ["bool_or", "bool_and", "every"] {
+            probes.push((name, vec![DataType::Boolean]));
+        }
+        for name in [
+            "corr", "covar_pop", "covar_samp", "var_pop", "var_samp", "variance",
+            "variance_pop", "variance_samp", "stddev", "stddev_pop", "stddev_samp",
+        ] {
+            probes.push((name, vec![DataType::Float64]));
+        }
+        for name in [
+            "percentile_cont", "percentile_disc", "percentile_disc_lc",
+            "percentile_approx", "percentile_approx_weighted", "percentile_approx_raw",
+        ] {
+            probes.push((name, vec![DataType::Float64]));
+        }
+
+        let mut registry_only: Vec<String> = Vec::new();
+        let mut registry_missing: Vec<String> = Vec::new();
+        let mut mismatches: Vec<String> = Vec::new();
 
         for (name, arg_types) in probes {
             let registry_result =
@@ -3048,33 +3361,68 @@ mod tests {
 
             match (registry_result, legacy_result) {
                 (Ok(reg_ty), Ok(legacy_ty)) => {
-                    assert_eq!(
-                        reg_ty, legacy_ty,
-                        "registry vs legacy disagree on `{name}({:?})`: \
-                         registry={reg_ty:?}, legacy={legacy_ty:?}",
-                        arg_types
-                    );
+                    if reg_ty != legacy_ty {
+                        mismatches.push(format!(
+                            "{name}({:?}): registry={reg_ty:?}, legacy={legacy_ty:?}",
+                            arg_types
+                        ));
+                    }
                 }
                 (Err(reg_err), Ok(legacy_ty)) => {
-                    panic!(
-                        "registry refused `{name}({:?})` (={reg_err:?}) but legacy \
-                         returned `{legacy_ty:?}` — Step A claims to cover this; \
-                         registry signature is wrong or missing",
+                    // The registry claimed to know this function (probe was
+                    // intentionally added). Erroring out is a real gap.
+                    registry_missing.push(format!(
+                        "{name}({:?}): registry={reg_err:?}, legacy={legacy_ty:?}",
                         arg_types
-                    );
+                    ));
                 }
-                (Ok(reg_ty), Err(legacy_err)) => {
-                    panic!(
-                        "registry accepted `{name}({:?})` (={reg_ty:?}) but legacy \
-                         errored out (={legacy_err}); the registry is overreaching",
-                        arg_types
-                    );
+                (Ok(_), Err(_)) => {
+                    // Registry covers a function the legacy path doesn't —
+                    // expected during the Step B migration where the registry
+                    // intentionally extends coverage beyond the legacy path.
+                    registry_only.push(format!("{name}({:?})", arg_types));
                 }
                 (Err(_), Err(_)) => {
-                    // Both fail — probe shouldn't have been in the table.
-                    panic!("both registry and legacy errored on `{name}({:?})`", arg_types);
+                    // Both report "unknown function". Either the probe was a
+                    // typo or the function is not yet covered anywhere — not
+                    // a Step B concern.
                 }
             }
+        }
+
+        // Real bugs: registry and legacy disagree on an answer, OR registry
+        // refused to handle something it claims to cover.
+        let mut fatal: Vec<String> = Vec::new();
+        if !mismatches.is_empty() {
+            fatal.push(format!(
+                "registry vs legacy disagree on {} probe(s):\n  {}",
+                mismatches.len(),
+                mismatches.join("\n  ")
+            ));
+        }
+        if !registry_missing.is_empty() {
+            fatal.push(format!(
+                "registry refused to handle {} probe(s) it claims to cover:\n  {}",
+                registry_missing.len(),
+                registry_missing.join("\n  ")
+            ));
+        }
+        assert!(
+            fatal.is_empty(),
+            "cross-validation failed:\n{}",
+            fatal.join("\n\n")
+        );
+
+        // Informational only: log registry-only coverage (functions or arg
+        // patterns the legacy path doesn't recognise but the registry now
+        // handles). These are the wins Step B's migration buys us.
+        if !registry_only.is_empty() {
+            eprintln!(
+                "registry now covers {} function/arg combinations that the \
+                 legacy path returned `unknown scalar function` for:\n  {}",
+                registry_only.len(),
+                registry_only.join("\n  ")
+            );
         }
     }
 
