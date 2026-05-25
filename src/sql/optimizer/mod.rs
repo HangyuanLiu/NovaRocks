@@ -66,8 +66,11 @@ pub(crate) fn optimize(
     //    point loop causes the needed-column set to shrink across iterations
     //    (predicates get reshuffled between join conditions), incorrectly
     //    dropping join-key or select-list columns from scan required_columns.
-    let options =
-        options::OptimizerOptions::from_session(&options::current_session_optimizer_settings());
+    let session_settings = options::current_session_optimizer_settings();
+    let options = options::OptimizerOptions::from_session(&session_settings);
+    let mut rewrite_ctx =
+        rewrite::context::RewriteContext::for_query(session_settings.disabled_rules.clone());
+    let plan = rewrite::registry::query_rewrite_pipeline().rewrite(plan, &mut rewrite_ctx)?;
     let rewritten = rbo::driver::rewrite_to_fixed_point(
         plan,
         &rbo::rules::predicate_pushdown_rbo_rules(),
@@ -158,6 +161,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
         || rbo::rules::column_pruning_rules()
             .iter()
             .any(|r| r.name() == name)
+        || rewrite::registry::is_known_rewrite_rule_name(name)
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -299,6 +303,23 @@ fn op_equal(a: &Operator, b: &Operator) -> bool {
 #[cfg(test)]
 mod is_known_rule_name_tests {
     use super::*;
+
+    #[test]
+    fn optimize_accepts_empty_query_rewrite_pipeline() {
+        use std::collections::HashMap;
+
+        use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::planner::plan::{LogicalPlan, ValuesNode};
+
+        let plan = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![],
+        });
+        let factory = ColumnRefFactory::new();
+        let physical = optimize(plan, &HashMap::new(), factory).expect("optimize values");
+        let physical_debug = format!("{physical:?}");
+        assert!(physical_debug.contains("PhysicalValues"));
+    }
 
     #[test]
     fn is_known_rule_name_recognizes_real_rule() {
