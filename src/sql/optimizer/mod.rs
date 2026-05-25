@@ -12,6 +12,7 @@ pub(crate) mod options;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
 pub(crate) mod rbo;
+pub(crate) mod rewrite;
 pub(crate) mod rule;
 pub(crate) mod rules;
 pub(crate) mod runtime_filter_planner;
