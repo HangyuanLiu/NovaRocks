@@ -2,8 +2,8 @@
 -- Validate equality-delete read semantics across Iceberg schema evolution.
 
 -- query 1
-CREATE DATABASE iceberg_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
-USE iceberg_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
+CREATE DATABASE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
+USE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
 DROP TABLE IF EXISTS orders_eq_evo;
 CREATE TABLE orders_eq_evo (
   id INT,
@@ -24,5 +24,5 @@ SELECT id, total_amount FROM orders_eq_evo ORDER BY id;
 
 -- query 3
 SET catalog default_catalog;
-DROP TABLE iceberg_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}.orders_eq_evo FORCE;
-DROP DATABASE iceberg_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
+DROP TABLE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}.orders_eq_evo FORCE;
+DROP DATABASE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};
