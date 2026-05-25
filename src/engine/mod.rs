@@ -1803,8 +1803,21 @@ fn build_iceberg_create_table_ddl(
         ));
     }
 
+    // Emit table-level COMMENT if the "comment" property is set and non-empty.
+    let table_comment = loaded
+        .table
+        .metadata()
+        .properties()
+        .get("comment")
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            let escaped = v.replace('\'', "\\'");
+            format!("\nCOMMENT '{escaped}'")
+        })
+        .unwrap_or_default();
+
     Ok(format!(
-        "CREATE TABLE `{catalog}`.`{namespace}`.`{table}` (\n{}\n)",
+        "CREATE TABLE `{catalog}`.`{namespace}`.`{table}` (\n{}\n){table_comment}",
         col_defs.join(",\n")
     ))
 }
@@ -3390,6 +3403,100 @@ fn stream_load_managed_lake_table(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod build_iceberg_create_table_ddl_tests {
+    use super::build_iceberg_create_table_ddl;
+    use crate::connector::iceberg::catalog::registry::IcebergLoadedTable;
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn loaded_table_with_props(props: HashMap<String, String>) -> IcebergLoadedTable {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("build schema");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "/tmp/test".to_string(),
+            FormatVersion::V2,
+            props,
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+        IcebergLoadedTable {
+            table,
+            columns: vec![],
+            logical_types: HashMap::new(),
+            key_desc: None,
+            column_aggregations: HashMap::new(),
+            object_store_config: None,
+        }
+    }
+
+    #[test]
+    fn emits_comment_when_property_is_set() {
+        let mut props = HashMap::new();
+        props.insert("comment".to_string(), "my table comment".to_string());
+        let loaded = loaded_table_with_props(props);
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(
+            ddl.contains("COMMENT 'my table comment'"),
+            "expected COMMENT clause in DDL, got: {ddl}"
+        );
+    }
+
+    #[test]
+    fn no_comment_clause_when_property_absent() {
+        let loaded = loaded_table_with_props(HashMap::new());
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(
+            !ddl.contains("COMMENT"),
+            "expected no COMMENT clause when property absent, got: {ddl}"
+        );
+    }
+
+    #[test]
+    fn no_comment_clause_when_property_empty() {
+        let mut props = HashMap::new();
+        props.insert("comment".to_string(), String::new());
+        let loaded = loaded_table_with_props(props);
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(
+            !ddl.contains("COMMENT"),
+            "expected no COMMENT clause when property is empty string, got: {ddl}"
+        );
+    }
+
+    #[test]
+    fn comment_with_single_quote_is_escaped() {
+        let mut props = HashMap::new();
+        props.insert("comment".to_string(), "it's great".to_string());
+        let loaded = loaded_table_with_props(props);
+        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
+        assert!(
+            ddl.contains("COMMENT 'it\\'s great'"),
+            "expected escaped single quote in COMMENT, got: {ddl}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
