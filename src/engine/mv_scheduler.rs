@@ -9,7 +9,7 @@ use crate::connector::starrocks::managed::mv_refresh::{
     load_current_iceberg_base_table, parse_iceberg_table_refs,
 };
 use crate::meta::repository::mv::{
-    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+    MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
 use crate::novarocks_config::StandaloneServerConfig;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -71,6 +71,18 @@ pub(crate) struct RefreshCandidate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PeriodicRefreshDecision {
     pub(crate) mv_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveRefreshState {
+    pub(crate) refresh_id: i64,
+    pub(crate) state: MvRefreshState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SchedulerGuardDecision {
+    pub(crate) state: RefreshTaskState,
+    pub(crate) can_enqueue: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,9 +175,14 @@ impl RefreshCoordinator {
         state: &Arc<crate::engine::StandaloneState>,
         now_ms: i64,
     ) -> Result<(), String> {
-        let definitions = load_scheduler_definitions(state)?;
+        let metadata = load_scheduler_metadata(state)?;
         let mut snapshot_source = IcebergSnapshotSource::new(Arc::clone(state));
-        for error in self.poll_snapshot_watch(&definitions, &mut snapshot_source, now_ms)? {
+        for error in self.poll_snapshot_watch(
+            &metadata.definitions,
+            &metadata.active_refreshes,
+            &mut snapshot_source,
+            now_ms,
+        )? {
             record_scheduler_failure_metadata(
                 state,
                 error.mv_id,
@@ -174,8 +191,19 @@ impl RefreshCoordinator {
                 self.config.failure_backoff_ms,
             )?;
         }
-        for decision in plan_periodic_refreshes(&definitions, now_ms) {
-            self.enqueue_refresh(decision.mv_id, RefreshTaskReason::Periodic);
+        for definition in &metadata.definitions {
+            let guard = scheduler_guard_for_definition(
+                definition,
+                metadata.active_refreshes.get(&definition.mv_id),
+                now_ms,
+            );
+            if !guard.can_enqueue {
+                self.states.insert(definition.mv_id, guard.state);
+                continue;
+            }
+            if is_periodic_refresh_due(definition, now_ms) {
+                self.enqueue_refresh(definition.mv_id, RefreshTaskReason::Periodic);
+            }
         }
         let capacity = self
             .config
@@ -219,11 +247,21 @@ impl RefreshCoordinator {
     fn poll_snapshot_watch<S: SnapshotSource>(
         &mut self,
         definitions: &[StoredMvDefinition],
+        active_refreshes: &BTreeMap<i64, ActiveRefreshState>,
         source: &mut S,
         now_ms: i64,
     ) -> Result<Vec<SnapshotWatchError>, String> {
         let mut errors = Vec::new();
         for definition in definitions {
+            let guard = scheduler_guard_for_definition(
+                definition,
+                active_refreshes.get(&definition.mv_id),
+                now_ms,
+            );
+            if !guard.can_enqueue {
+                self.states.insert(definition.mv_id, guard.state);
+                continue;
+            }
             if !matches!(
                 definition.refresh_policy,
                 StoredMvRefreshPolicy::AsyncOnChange
@@ -289,6 +327,41 @@ impl RefreshCoordinator {
     }
 }
 
+pub(crate) fn scheduler_guard_for_definition(
+    definition: &StoredMvDefinition,
+    active_refresh: Option<&ActiveRefreshState>,
+    _now_ms: i64,
+) -> SchedulerGuardDecision {
+    if definition.refresh_paused {
+        return SchedulerGuardDecision {
+            state: RefreshTaskState::Paused,
+            can_enqueue: false,
+        };
+    }
+    if active_refresh
+        .map(|active| active.state == MvRefreshState::CommitUnknown)
+        .unwrap_or(false)
+    {
+        return SchedulerGuardDecision {
+            state: RefreshTaskState::BlockedRecovery,
+            can_enqueue: false,
+        };
+    }
+    if active_refresh.is_some()
+        || definition.refresh_in_progress
+        || definition.active_refresh_id.is_some()
+    {
+        return SchedulerGuardDecision {
+            state: RefreshTaskState::Running,
+            can_enqueue: false,
+        };
+    }
+    SchedulerGuardDecision {
+        state: RefreshTaskState::Pending,
+        can_enqueue: true,
+    }
+}
+
 pub(crate) trait SnapshotSource {
     fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String>;
 }
@@ -326,21 +399,23 @@ pub(crate) fn plan_periodic_refreshes(
 ) -> Vec<PeriodicRefreshDecision> {
     definitions
         .iter()
-        .filter(|definition| {
-            matches!(
-                definition.refresh_policy,
-                StoredMvRefreshPolicy::AsyncInterval
-            ) && !definition.refresh_paused
-                && definition.refresh_interval_ms.is_some()
-                && definition
-                    .next_refresh_after_ms
-                    .map(|next| next <= now_ms)
-                    .unwrap_or(true)
-        })
+        .filter(|definition| scheduler_guard_for_definition(definition, None, now_ms).can_enqueue)
+        .filter(|definition| is_periodic_refresh_due(definition, now_ms))
         .map(|definition| PeriodicRefreshDecision {
             mv_id: definition.mv_id,
         })
         .collect()
+}
+
+fn is_periodic_refresh_due(definition: &StoredMvDefinition, now_ms: i64) -> bool {
+    matches!(
+        definition.refresh_policy,
+        StoredMvRefreshPolicy::AsyncInterval
+    ) && definition.refresh_interval_ms.is_some()
+        && definition
+            .next_refresh_after_ms
+            .map(|next| next <= now_ms)
+            .unwrap_or(true)
 }
 
 pub(crate) fn metadata_update_after_success(
@@ -387,19 +462,49 @@ pub(crate) fn metadata_update_after_failure(
     }
 }
 
-fn load_scheduler_definitions(
+#[derive(Clone, Debug, Default)]
+struct SchedulerMetadata {
+    definitions: Vec<StoredMvDefinition>,
+    active_refreshes: BTreeMap<i64, ActiveRefreshState>,
+}
+
+fn load_scheduler_metadata(
     state: &Arc<crate::engine::StandaloneState>,
-) -> Result<Vec<StoredMvDefinition>, String> {
+) -> Result<SchedulerMetadata, String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(SchedulerMetadata::default());
     };
     let txn = provider
         .begin_read()
         .map_err(|e| format!("open MV scheduler read transaction failed: {e}"))?;
-    state
+    let definitions = state
         .mv_repo
         .list_definitions(txn.as_ref())
-        .map_err(|e| format!("list MV definitions failed: {e}"))
+        .map_err(|e| format!("list MV definitions failed: {e}"))?;
+    let mut active_refreshes = BTreeMap::new();
+    for definition in &definitions {
+        let Some(refresh_id) = definition.active_refresh_id else {
+            continue;
+        };
+        let Some(refresh) = state
+            .mv_repo
+            .load_refresh(txn.as_ref(), refresh_id)
+            .map_err(|e| format!("load active MV refresh failed: {e}"))?
+        else {
+            continue;
+        };
+        active_refreshes.insert(
+            definition.mv_id,
+            ActiveRefreshState {
+                refresh_id,
+                state: refresh.state,
+            },
+        );
+    }
+    Ok(SchedulerMetadata {
+        definitions,
+        active_refreshes,
+    })
 }
 
 fn record_scheduler_success_metadata(
@@ -665,7 +770,7 @@ pub(crate) fn scan_refresh_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv::{StoredMvDefinition, StoredMvRefreshPolicy};
+    use crate::meta::repository::mv::{MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy};
     use std::collections::BTreeMap;
 
     #[derive(Default)]
@@ -771,7 +876,8 @@ mod tests {
             source: &mut S,
             now_ms: i64,
         ) -> Result<(), String> {
-            let _errors = self.poll_snapshot_watch(definitions, source, now_ms)?;
+            let _errors =
+                self.poll_snapshot_watch(definitions, &BTreeMap::new(), source, now_ms)?;
             Ok(())
         }
     }
@@ -1018,5 +1124,39 @@ mod tests {
             coordinator.observed_snapshot_for_test(7, "ice.ns.tbl"),
             Some(100)
         );
+    }
+
+    #[test]
+    fn scheduler_blocks_commit_unknown_refresh() {
+        let mut definition = test_definition(7, StoredMvRefreshPolicy::AsyncInterval);
+        definition.refresh_interval_ms = Some(10_000);
+        definition.active_refresh_id = Some(99);
+        definition.refresh_in_progress = true;
+        let active = ActiveRefreshState {
+            refresh_id: 99,
+            state: MvRefreshState::CommitUnknown,
+        };
+
+        let decision = scheduler_guard_for_definition(&definition, Some(&active), 1_000);
+
+        assert_eq!(decision.state, RefreshTaskState::BlockedRecovery);
+        assert!(!decision.can_enqueue);
+    }
+
+    #[test]
+    fn scheduler_skips_running_refresh_without_reenqueue() {
+        let mut definition = test_definition(7, StoredMvRefreshPolicy::AsyncInterval);
+        definition.refresh_interval_ms = Some(10_000);
+        definition.active_refresh_id = Some(99);
+        definition.refresh_in_progress = true;
+        let active = ActiveRefreshState {
+            refresh_id: 99,
+            state: MvRefreshState::IntentCreated,
+        };
+
+        let decision = scheduler_guard_for_definition(&definition, Some(&active), 1_000);
+
+        assert_eq!(decision.state, RefreshTaskState::Running);
+        assert!(!decision.can_enqueue);
     }
 }
