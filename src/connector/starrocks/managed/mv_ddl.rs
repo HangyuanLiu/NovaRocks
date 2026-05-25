@@ -19,7 +19,9 @@ use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
 };
-use crate::meta::repository::mv::CreateMvDefinitionRequest;
+use crate::meta::repository::mv::{
+    CreateMvDefinitionRequest, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
+};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
@@ -42,8 +44,7 @@ use crate::connector::starrocks::managed::ddl::{
     stored_columns_from_physical_columns, table_columns_from_physical_columns,
 };
 use crate::connector::starrocks::managed::model::{
-    IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedTableKind,
-    ManagedTableState,
+    IcebergTableRef, ManagedMvStorageEngine, ManagedTableKind, ManagedTableState,
 };
 use crate::connector::starrocks::managed::mv_shape::{
     AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
@@ -893,14 +894,16 @@ pub(crate) fn list_mv_rows(
                 name: target_table,
                 database: target_namespace,
                 storage_engine: mv.storage_engine.clone(),
-                refresh_mode: ManagedMvRefreshMode::DeferredManual
-                    .as_sql_str()
-                    .to_string(),
+                refresh_mode: mv.refresh_policy.as_sql_str().to_string(),
                 last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
                 last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
                 base_tables: mv.base_table_refs.join(", "),
                 select_text: mv.select_sql.clone(),
                 dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
+                refresh_paused: mv.refresh_paused.to_string(),
+                next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
+                last_scheduler_error: mv.last_scheduler_error.clone(),
+                max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
             });
             continue;
         }
@@ -929,14 +932,16 @@ pub(crate) fn list_mv_rows(
             name: table.name.clone(),
             database,
             storage_engine: mv.storage_engine.clone(),
-            refresh_mode: ManagedMvRefreshMode::DeferredManual
-                .as_sql_str()
-                .to_string(),
+            refresh_mode: mv.refresh_policy.as_sql_str().to_string(),
             last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
             dependencies: dependency_display_for_mv(state, read.as_ref(), mv.mv_id)?,
+            refresh_paused: mv.refresh_paused.to_string(),
+            next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
+            last_scheduler_error: mv.last_scheduler_error.clone(),
+            max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
         });
     }
     Ok(rows)
@@ -1570,6 +1575,30 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
             nullable: false,
             logical_type: None,
         },
+        QueryResultColumn {
+            name: "RefreshPaused".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: None,
+        },
+        QueryResultColumn {
+            name: "NextRefreshTime".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: None,
+        },
+        QueryResultColumn {
+            name: "LastSchedulerError".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: None,
+        },
+        QueryResultColumn {
+            name: "MaxStalenessMs".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: None,
+        },
     ];
 
     let schema = Arc::new(Schema::new(vec![
@@ -1582,6 +1611,10 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Field::new("BaseTables", DataType::Utf8, false),
         Field::new("SelectText", DataType::Utf8, false),
         Field::new("Dependencies", DataType::Utf8, false),
+        Field::new("RefreshPaused", DataType::Utf8, false),
+        Field::new("NextRefreshTime", DataType::Utf8, true),
+        Field::new("LastSchedulerError", DataType::Utf8, true),
+        Field::new("MaxStalenessMs", DataType::Utf8, true),
     ]));
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(
@@ -1627,6 +1660,26 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| Some(row.dependencies.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| Some(row.refresh_paused.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.next_refresh_time.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.last_scheduler_error.clone())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.max_staleness_ms.clone())
                 .collect::<Vec<_>>(),
         )),
     ];
@@ -1850,10 +1903,10 @@ mod tests {
         namespace: &str,
         table: &str,
         select_sql: &str,
-    ) {
+    ) -> i64 {
         let provider = state.metadata_provider.as_ref().expect("metadata provider");
         let mut txn = provider.begin_write("seed iceberg mv").expect("write txn");
-        state
+        let definition = state
             .mv_repo
             .create_definition(
                 txn.as_mut(),
@@ -1871,7 +1924,9 @@ mod tests {
                 },
             )
             .expect("insert iceberg mv relationship");
+        let mv_id = definition.mv_id;
         txn.commit().expect("commit iceberg mv relationship");
+        mv_id
     }
 
     fn assert_query_result_contains(result: &QueryResult, expected: &str) {
@@ -1906,6 +1961,52 @@ mod tests {
 
         assert_query_result_contains(&result, "mv_orders");
         assert_query_result_contains(&result, "iceberg");
+    }
+
+    #[test]
+    fn show_materialized_views_exposes_refresh_policy_metadata() {
+        let (state, _dir) = open_state_with_sqlite_store();
+        let mv_id = insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("set mv refresh metadata")
+            .expect("open write txn");
+        state
+            .mv_repo
+            .update_refresh_metadata(
+                txn.as_mut(),
+                UpdateMvRefreshMetadataRequest {
+                    mv_id,
+                    refresh_policy: StoredMvRefreshPolicy::AsyncInterval,
+                    refresh_paused: true,
+                    refresh_interval_ms: Some(300_000),
+                    max_staleness_ms: Some(900_000),
+                    last_scheduler_error: Some("catalog timeout".to_string()),
+                    next_refresh_after_ms: Some(1_700_000_000_000),
+                },
+            )
+            .expect("update refresh metadata");
+        txn.commit().expect("commit refresh metadata");
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let rows = list_mv_rows(&state, Some("ice"), &stmt, None).expect("show mvs");
+        let row = rows
+            .iter()
+            .find(|row| row.name == "mv_orders")
+            .expect("mv row should be present");
+
+        assert_eq!(row.refresh_mode, "ASYNC_INTERVAL");
+        assert_eq!(row.refresh_paused, "true");
+        assert_eq!(row.next_refresh_time.as_deref(), Some("1700000000000"));
+        assert_eq!(row.last_scheduler_error.as_deref(), Some("catalog timeout"));
+        assert_eq!(row.max_staleness_ms.as_deref(), Some("900000"));
     }
 
     #[test]
