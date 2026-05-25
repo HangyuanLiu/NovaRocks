@@ -19,9 +19,9 @@ use crate::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
     ManagedTableKind as RepoManagedTableKind,
 };
-use crate::meta::repository::mv::{
-    CreateMvDefinitionRequest, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
-};
+use crate::meta::repository::mv::CreateMvDefinitionRequest;
+#[cfg(test)]
+use crate::meta::repository::mv::{StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
