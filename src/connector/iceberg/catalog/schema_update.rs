@@ -855,6 +855,75 @@ mod tests {
         // Drop on list element / map key/value is not allowed; only struct fields can be dropped.
     }
 
+    #[test]
+    fn drop_last_field_of_non_nested_struct_is_rejected() {
+        use iceberg::spec::StructType;
+        // STRUCT<v1 INT> — dropping v1 leaves the struct empty.
+        let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "v1",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "c0", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(2, "c1", inner)),
+            ])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.v1").unwrap();
+        let err = apply_drop_at(&schema, &path).expect_err("should reject last-field drop");
+        assert!(
+            err.contains("cannot drop last field of STRUCT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_last_field_of_deeply_nested_struct_is_rejected() {
+        use iceberg::spec::StructType;
+        // outer STRUCT<inner STRUCT<leaf INT>> — dropping leaf leaves inner empty.
+        let leaf_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            21,
+            "leaf",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let outer_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            11,
+            "inner",
+            leaf_struct,
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "outer", outer_struct))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("outer.inner.leaf").unwrap();
+        let err = apply_drop_at(&schema, &path).expect_err("should reject last-field drop in nested struct");
+        assert!(
+            err.contains("cannot drop last field of STRUCT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_non_last_field_of_struct_succeeds() {
+        use iceberg::spec::StructType;
+        // STRUCT<v1 INT, v2 INT> — dropping v1 still leaves v2.
+        let inner = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(11, "v1", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(12, "v2", Type::Primitive(PrimitiveType::Int))),
+        ]));
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(1, "c1", inner))])
+            .build()
+            .unwrap();
+        let path = crate::engine::statement::ColumnPath::parse("c1.v1").unwrap();
+        let new = apply_drop_at(&schema, &path).expect("non-last field drop should succeed");
+        let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else { panic!() };
+        assert_eq!(s.fields().len(), 1);
+        assert_eq!(s.fields()[0].name, "v2");
+    }
+
     // ----- apply_rename_at tests -----
 
     #[test]
@@ -2045,7 +2114,7 @@ fn drop_in_fields(
                 // skip = drop this field at the top of the remaining path
                 continue;
             }
-            let new_inner_type = drop_in_type(&f.field_type, &segments[1..])?;
+            let new_inner_type = drop_in_type(&f.field_type, &segments[1..], &f.name)?;
             let mut updated = (*f).clone();
             updated.field_type = Box::new(new_inner_type);
             out.push(updated);
@@ -2059,10 +2128,15 @@ fn drop_in_fields(
     Ok(out)
 }
 
-fn drop_in_type(ty: &Type, segments: &[String]) -> Result<Type, String> {
+fn drop_in_type(ty: &Type, segments: &[String], parent_name: &str) -> Result<Type, String> {
     match ty {
         Type::Struct(s) => {
             let new = drop_in_fields(s.fields().to_vec(), segments)?;
+            if new.is_empty() {
+                return Err(format!(
+                    "cannot drop last field of STRUCT '{parent_name}': STRUCT must have at least one field"
+                ));
+            }
             let arc_fields: Vec<NestedFieldRef> = new.into_iter().map(Arc::new).collect();
             Ok(Type::Struct(StructType::new(arc_fields)))
         }
