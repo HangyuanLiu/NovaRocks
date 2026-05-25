@@ -1,0 +1,105 @@
+-- @sequential=true
+-- @order_sensitive=true
+-- @tags=write_path,mv,iceberg,ivm,storage_engine_iceberg,validation
+-- Test Objective:
+-- 1. Validate that CREATE MATERIALIZED VIEW with PRIMARY KEY is rejected for
+--    Iceberg-target aggregate MVs (PRIMARY KEY is unsupported at the storage level).
+-- 2. Confirm that omitting PRIMARY KEY is accepted (unchanged behavior).
+-- Note: The per-column validations (missing column, nullable, empty PK, duplicate)
+--   are superseded by the iceberg-target aggregate MV blanket rejection, which fires
+--   before any column-level check.
+-- MV is Iceberg-target (PROPERTIES('storage_engine'='iceberg')).
+
+-- query 1
+-- @skip_result_check=true
+CREATE EXTERNAL CATALOG mv_ivm_pk_${uuid0}
+PROPERTIES (
+  "type" = "iceberg",
+  "iceberg.catalog.type" = "hadoop",
+  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_ivm_pk_${uuid0}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "aws.s3.access_key" = "${oss_ak}",
+  "aws.s3.secret_key" = "${oss_sk}",
+  "aws.s3.enable_path_style_access" = "true"
+);
+CREATE DATABASE mv_ivm_pk_${uuid0}.ns_${uuid0};
+CREATE TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders (
+  order_id BIGINT NOT NULL,
+  customer STRING,
+  amount DOUBLE,
+  tags ARRAY<STRING>
+) TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true"
+);
+INSERT INTO mv_ivm_pk_${uuid0}.ns_${uuid0}.orders VALUES
+  (1, 'A', 100.0, ['x']),
+  (2, 'B', 200.0, ['y']);
+SET CATALOG mv_ivm_pk_${uuid0};
+USE ns_${uuid0};
+
+-- query 2
+-- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
+CREATE MATERIALIZED VIEW mv_pk_missing
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (bogus)
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 3
+-- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
+CREATE MATERIALIZED VIEW mv_pk_nullable
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (customer)
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 4
+-- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY
+CREATE MATERIALIZED VIEW mv_pk_nullable2
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (amount)
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 5
+-- @expect_error=PRIMARY KEY clause requires at least one column
+CREATE MATERIALIZED VIEW mv_pk_empty
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY ()
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 6
+-- @expect_error=duplicate column `order_id` in PRIMARY KEY clause
+CREATE MATERIALIZED VIEW mv_pk_dupe
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PRIMARY KEY (order_id, order_id)
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 7
+-- @skip_result_check=true
+CREATE MATERIALIZED VIEW mv_no_pk
+DISTRIBUTED BY HASH(customer) BUCKETS 2
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT customer, count(*) AS c
+FROM orders
+GROUP BY customer;
+
+-- query 8
+-- @skip_result_check=true
+DROP MATERIALIZED VIEW mv_no_pk;
+DROP TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP DATABASE mv_ivm_pk_${uuid0}.ns_${uuid0};
+DROP CATALOG mv_ivm_pk_${uuid0};
