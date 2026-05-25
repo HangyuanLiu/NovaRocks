@@ -97,6 +97,19 @@ pub(crate) struct MaterializedViewDistribution {
     pub bucket_count: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MaterializedViewRefreshPolicy {
+    Manual,
+    AsyncOnChange,
+    AsyncInterval { interval_ms: i64 },
+}
+
+impl Default for MaterializedViewRefreshPolicy {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateMaterializedViewStmt {
     pub name: ObjectName,
@@ -105,7 +118,7 @@ pub(crate) struct CreateMaterializedViewStmt {
     /// columns reference visible MV outputs before the target table is created.
     pub partition_by: Option<Vec<IcebergPartitionFieldExpr>>,
     pub distribution: Option<MaterializedViewDistribution>,
-    pub refresh_manual_explicit: bool,
+    pub refresh_policy: MaterializedViewRefreshPolicy,
     /// Raw SQL text of the SELECT body after `AS`. Produced by re-serializing
     /// the parsed `sqlparser::ast::Query`; used for storage and for
     /// re-parsing on every REFRESH in Phase 1.

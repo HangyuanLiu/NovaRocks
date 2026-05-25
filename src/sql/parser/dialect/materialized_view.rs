@@ -12,8 +12,8 @@ use sqlparser::tokenizer::Token;
 use super::{convert_object_name, peek_word_eq};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
-    MaterializedViewDistribution, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
-    Statement,
+    MaterializedViewDistribution, MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt,
+    ShowMaterializedViewsStmt, Statement,
 };
 use crate::sql::parser::dialect::create_table::parse_partition_field_expr;
 
@@ -66,10 +66,10 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
     }
 
     // Optional REFRESH clause.
-    let refresh_manual_explicit = if parser.parse_keyword(Keyword::REFRESH) {
+    let refresh_policy = if parser.parse_keyword(Keyword::REFRESH) {
         parse_refresh_clause(parser)?
     } else {
-        false
+        MaterializedViewRefreshPolicy::Manual
     };
 
     // Optional PRIMARY KEY (col, ...) clause — IVM Phase-2 opt-in marker.
@@ -139,7 +139,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             if_not_exists,
             partition_by,
             distribution,
-            refresh_manual_explicit,
+            refresh_policy,
             select_sql,
             select_query: *query,
             properties,
@@ -227,7 +227,7 @@ fn parse_distributed_by(
     }))
 }
 
-fn parse_refresh_clause(parser: &mut Parser<'_>) -> Result<bool, String> {
+fn parse_refresh_clause(parser: &mut Parser<'_>) -> Result<MaterializedViewRefreshPolicy, String> {
     // `REFRESH` already consumed by caller.
     if parser.parse_keyword(Keyword::IMMEDIATE) {
         return Err("REFRESH IMMEDIATE is not supported yet".to_string());
@@ -238,14 +238,69 @@ fn parse_refresh_clause(parser: &mut Parser<'_>) -> Result<bool, String> {
     // ASYNC is not a sqlparser keyword; detect it textually.
     if peek_word_eq(parser, 0, "ASYNC") {
         parser.next_token();
-        return Err("REFRESH ASYNC is not supported yet".to_string());
+        return parse_refresh_async_tail(parser);
     }
     // MANUAL is not a sqlparser keyword; detect it textually.
     if !peek_word_eq(parser, 0, "MANUAL") {
-        return Err("expected REFRESH [DEFERRED] MANUAL".to_string());
+        return Err("expected REFRESH [DEFERRED] MANUAL or REFRESH ASYNC ON CHANGE or REFRESH ASYNC EVERY INTERVAL <n> <unit>".to_string());
     }
     parser.next_token(); // MANUAL
-    Ok(true)
+    Ok(MaterializedViewRefreshPolicy::Manual)
+}
+
+fn parse_refresh_async_tail(
+    parser: &mut Parser<'_>,
+) -> Result<MaterializedViewRefreshPolicy, String> {
+    if parser.parse_keyword(Keyword::ON) {
+        if !peek_word_eq(parser, 0, "CHANGE") {
+            return Err("REFRESH ASYNC ON requires CHANGE".to_string());
+        }
+        parser.next_token();
+        return Ok(MaterializedViewRefreshPolicy::AsyncOnChange);
+    }
+    if peek_word_eq(parser, 0, "EVERY") {
+        parser.next_token();
+        if !peek_word_eq(parser, 0, "INTERVAL") {
+            return Err("REFRESH ASYNC EVERY requires INTERVAL <n> <unit>".to_string());
+        }
+        parser.next_token();
+        let value = parser
+            .parse_literal_uint()
+            .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
+        let unit = parser.next_token();
+        let unit = match &unit.token {
+            Token::Word(word) => word.value.as_str(),
+            other => {
+                return Err(format!(
+                    "expected interval unit after REFRESH ASYNC EVERY INTERVAL, got {other:?}"
+                ));
+            }
+        };
+        let interval_ms = refresh_interval_ms(value, unit)?;
+        return Ok(MaterializedViewRefreshPolicy::AsyncInterval { interval_ms });
+    }
+    Err("REFRESH ASYNC requires ON CHANGE or EVERY INTERVAL <n> <unit>".to_string())
+}
+
+fn refresh_interval_ms(value: u64, unit: &str) -> Result<i64, String> {
+    if value == 0 {
+        return Err("REFRESH ASYNC interval must be positive".to_string());
+    }
+    let multiplier = match unit.to_ascii_uppercase().as_str() {
+        "SECOND" | "SECONDS" => 1_000_u64,
+        "MINUTE" | "MINUTES" => 60_000_u64,
+        "HOUR" | "HOURS" => 3_600_000_u64,
+        "DAY" | "DAYS" => 86_400_000_u64,
+        _ => {
+            return Err(format!(
+                "unsupported REFRESH ASYNC interval unit `{unit}`; expected SECOND, MINUTE, HOUR, or DAY"
+            ));
+        }
+    };
+    let ms = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "REFRESH ASYNC interval is too large".to_string())?;
+    i64::try_from(ms).map_err(|_| "REFRESH ASYNC interval is too large".to_string())
 }
 
 /// Parse `(k = v, ...)` and return the key-value pairs.
@@ -424,7 +479,9 @@ pub(crate) fn parse_show_materialized_views(parser: &mut Parser<'_>) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::parser::ast::{IcebergPartitionFieldExpr, Statement};
+    use crate::sql::parser::ast::{
+        IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
+    };
     use crate::sql::parser::parse_sql;
 
     fn parse_one(sql: &str) -> Statement {
@@ -463,7 +520,7 @@ mod tests {
                 .bucket_count,
             Some(4)
         );
-        assert!(mv.refresh_manual_explicit);
+        assert_eq!(mv.refresh_policy, MaterializedViewRefreshPolicy::Manual);
     }
 
     #[test]
@@ -478,7 +535,58 @@ mod tests {
             Statement::CreateMaterializedView(mv) => mv,
             other => panic!("unexpected stmt: {other:?}"),
         };
-        assert!(mv.refresh_manual_explicit);
+        assert_eq!(mv.refresh_policy, MaterializedViewRefreshPolicy::Manual);
+    }
+
+    #[test]
+    fn parse_create_mv_accepts_refresh_async_on_change() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 4 \
+             REFRESH ASYNC ON CHANGE \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        );
+        let Statement::CreateMaterializedView(mv) = stmt else {
+            panic!("expected CREATE MATERIALIZED VIEW");
+        };
+        assert_eq!(
+            mv.refresh_policy,
+            MaterializedViewRefreshPolicy::AsyncOnChange
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_accepts_refresh_async_every_interval() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 4 \
+             REFRESH ASYNC EVERY INTERVAL 5 MINUTE \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        );
+        let Statement::CreateMaterializedView(mv) = stmt else {
+            panic!("expected CREATE MATERIALIZED VIEW");
+        };
+        assert_eq!(
+            mv.refresh_policy,
+            MaterializedViewRefreshPolicy::AsyncInterval {
+                interval_ms: 300_000
+            }
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_rejects_refresh_async_without_trigger() {
+        let err = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
+             REFRESH ASYNC \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        )
+        .expect_err("should reject");
+        assert!(
+            err.contains("REFRESH ASYNC requires ON CHANGE or EVERY INTERVAL"),
+            "unexpected err: {err}"
+        );
     }
 
     #[test]
