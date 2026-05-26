@@ -185,6 +185,15 @@ pub(crate) struct LogicalCTEConsumeOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
+/// Logical dictionary-decode operator. Maps dictionary-encoded child columns
+/// back to their string form. Produced exclusively by the dictionary-rewrite
+/// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
+/// `PhysicalDecodeOp`.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalDecodeOp {
+    pub mappings: Vec<crate::sql::planner::plan::DecodeMapping>,
+}
+
 // ---------------------------------------------------------------------------
 // Physical operator structs
 // ---------------------------------------------------------------------------
@@ -346,6 +355,14 @@ pub(crate) struct PhysicalSubqueryAliasOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
+/// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
+/// turns this into a dictionary-decode execution node; Task 5 only routes
+/// the operator through the optimizer.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalDecodeOp {
+    pub mappings: Vec<crate::sql::planner::plan::DecodeMapping>,
+}
+
 // ---------------------------------------------------------------------------
 // Operator enum
 // ---------------------------------------------------------------------------
@@ -373,6 +390,7 @@ pub(crate) enum Operator {
     LogicalCTEAnchor(LogicalCTEAnchorOp),
     LogicalCTEProduce(LogicalCTEProduceOp),
     LogicalCTEConsume(LogicalCTEConsumeOp),
+    LogicalDecode(LogicalDecodeOp),
 
     // Physical operators
     PhysicalScan(PhysicalScanOp),
@@ -397,6 +415,7 @@ pub(crate) enum Operator {
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
     PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalSubqueryAlias(PhysicalSubqueryAliasOp),
+    PhysicalDecode(PhysicalDecodeOp),
 }
 
 impl Operator {
@@ -423,6 +442,7 @@ impl Operator {
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
+                | Operator::LogicalDecode(_)
         )
     }
 

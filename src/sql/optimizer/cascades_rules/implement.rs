@@ -1264,7 +1264,36 @@ impl Rule for TableFunctionToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 19. SubqueryAliasToPhysical
+// 19. DecodeToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct DecodeToPhysical;
+
+impl Rule for DecodeToPhysical {
+    fn name(&self) -> &str {
+        "DecodeToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalDecode(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalDecode(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: op.mappings.clone(),
+            }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 20. SubqueryAliasToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SubqueryAliasToPhysical;
@@ -1290,6 +1319,52 @@ impl Rule for SubqueryAliasToPhysical {
             }),
             children: expr.children.clone(),
         }]
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{LogicalDecodeOp, LogicalValuesOp};
+    use crate::sql::planner::plan::DecodeMapping;
+
+    #[test]
+    fn decode_to_physical_emits_physical_decode_with_same_mappings() {
+        let mut memo = Memo::new();
+        // Dummy child group so the rule has a valid child slot to forward.
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let mappings = vec![DecodeMapping {
+            dict_column: "a".into(),
+            string_column: "a_str".into(),
+        }];
+        let logical_decode = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalDecode(LogicalDecodeOp {
+                mappings: mappings.clone(),
+            }),
+            children: vec![child_group],
+        };
+
+        let rule = DecodeToPhysical;
+        assert!(rule.matches(&logical_decode.op));
+        let out = rule.apply(&logical_decode, &mut memo);
+
+        assert_eq!(out.len(), 1);
+        match &out[0].op {
+            Operator::PhysicalDecode(p) => assert_eq!(p.mappings, mappings),
+            other => panic!("expected PhysicalDecode, got {:?}", other),
+        }
+        assert_eq!(out[0].children, vec![child_group]);
     }
 }
 

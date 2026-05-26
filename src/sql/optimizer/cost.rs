@@ -57,7 +57,8 @@ pub(crate) fn compute_cost(
         | Operator::LogicalRepeat(_)
         | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
-        | Operator::LogicalCTEConsume(_) => 0.0,
+        | Operator::LogicalCTEConsume(_)
+        | Operator::LogicalDecode(_) => 0.0,
 
         // ------------------------------------------------------------------
         // Physical operators
@@ -152,7 +153,7 @@ pub(crate) fn compute_cost(
         Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,
-        // SubqueryAlias, CTE — lightweight default.
+        // SubqueryAlias, CTE, Decode — lightweight default.
         Operator::PhysicalWindow(_)
         | Operator::PhysicalRepeat(_)
         | Operator::PhysicalUnion(_)
@@ -163,7 +164,8 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalSubqueryAlias(_)
         | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalCTEConsume(_) => own_stats.output_row_count * 0.01,
+        | Operator::PhysicalCTEConsume(_)
+        | Operator::PhysicalDecode(_) => own_stats.output_row_count * 0.01,
     }
 }
 

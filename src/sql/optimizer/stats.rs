@@ -176,6 +176,11 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
+        Operator::LogicalDecode(_) => {
+            // Decode preserves row count and column stats.
+            child_statistics(memo, &expr.children, 0)
+        }
+
         // -- Binary / multi-child operators --
         Operator::LogicalJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
@@ -581,6 +586,11 @@ pub(crate) fn derive_statistics(
         },
         Operator::PhysicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
+        }
+
+        Operator::PhysicalDecode(_) => {
+            // Decode preserves row count and column stats.
+            child_statistics(memo, &expr.children, 0)
         }
     }
 }
@@ -1014,7 +1024,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
         | Operator::LogicalTopN(_)
-        | Operator::LogicalRepeat(_) => {
+        | Operator::LogicalRepeat(_)
+        | Operator::LogicalDecode(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
                     .logical_props
@@ -1103,7 +1114,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalDistribution(_)
-        | Operator::PhysicalRepeat(_) => {
+        | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalDecode(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
                     .logical_props

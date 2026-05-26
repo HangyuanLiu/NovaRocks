@@ -43,6 +43,28 @@ pub(crate) enum LogicalPlan {
     CTEProduce(CTEProduceNode),
     /// Reference to a CTE definition. Leaf node.
     CTEConsume(CTEConsumeNode),
+    /// Low-cardinality dictionary decode: rewrites string columns to their
+    /// dictionary-encoded form upstream and decodes back to strings before
+    /// emission. Inserted by the dictionary-rewrite optimizer rule (Task 7);
+    /// today no optimizer pass produces this variant — Task 5 only adds the
+    /// type-system plumbing.
+    Decode(DecodeNode),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodeNode {
+    pub input: Box<LogicalPlan>,
+    pub mappings: Vec<DecodeMapping>,
+}
+
+/// Per-column mapping from the dictionary-encoded slot back to the original
+/// string slot. `dict_column` is the input column produced by the upstream
+/// dict-encoded plan; `string_column` is the string output exposed to the
+/// rest of the plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeMapping {
+    pub dict_column: String,
+    pub string_column: String,
 }
 
 /// Repeat node for ROLLUP/CUBE/GROUPING SETS.

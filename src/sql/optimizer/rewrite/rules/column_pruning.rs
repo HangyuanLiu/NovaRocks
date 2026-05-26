@@ -302,6 +302,21 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 grouping_fn_args: node.grouping_fn_args,
             })
         }
+
+        LogicalPlan::Decode(node) => {
+            // Decode is not inserted before column pruning runs in v1, but
+            // handle it conservatively: the dictionary inputs are required,
+            // so add them to the needed set before recursing into the child.
+            let mut child_needed = needed.cloned().unwrap_or_default();
+            for mapping in &node.mappings {
+                child_needed.insert(mapping.dict_column.to_lowercase());
+            }
+            let input = prune_inner(*node.input, Some(&child_needed));
+            LogicalPlan::Decode(DecodeNode {
+                input: Box::new(input),
+                mappings: node.mappings,
+            })
+        }
     }
 }
 

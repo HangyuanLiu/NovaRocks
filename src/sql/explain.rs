@@ -259,6 +259,15 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
         LogicalPlan::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
         }
+        LogicalPlan::Decode(node) => {
+            let pairs: Vec<String> = node
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect();
+            out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
+            format_node(&node.input, level, indent + 1, out);
+        }
     }
 }
 
@@ -639,6 +648,20 @@ fn format_physical_node(
             out.push(format!(
                 "{pad}SUBQUERY ALIAS [{}]{costs_suffix}{stats_suffix}",
                 op.alias
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalDecode(op) => {
+            let pairs: Vec<String> = op
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect();
+            out.push(format!(
+                "{pad}DECODE [{}]{costs_suffix}{stats_suffix}",
+                pairs.join(", ")
             ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
@@ -1128,6 +1151,55 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Decode")),
             "costs explain lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn physical_decode_explain_prints_dict_to_string_mapping() {
+        use crate::sql::optimizer::operator::PhysicalDecodeOp;
+        use crate::sql::planner::plan::DecodeMapping;
+
+        let scan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "t1".to_string(),
+                    columns: Vec::new(),
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: Vec::new(),
+                predicates: Vec::new(),
+                required_columns: None,
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+        let decode = PhysicalPlanNode {
+            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: vec![DecodeMapping {
+                    dict_column: "d".to_string(),
+                    string_column: "s".to_string(),
+                }],
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let lines = explain_physical_plan(&decode, ExplainLevel::Normal);
+        let output = lines.join("\n");
+        assert!(
+            output.contains("DECODE [d->s]"),
+            "expected DECODE [d->s] line, got:\n{output}"
         );
     }
 

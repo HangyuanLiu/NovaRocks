@@ -4,9 +4,9 @@ use crate::sql::optimizer::rewrite::context::{RewriteContext, RewriteFailurePoli
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    AggregateNode, CTEAnchorNode, CTEProduceNode, ExceptNode, FilterNode, IntersectNode, JoinNode,
-    LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode, SortNode, SubqueryAliasNode,
-    TableFunctionNode, UnionNode, WindowNode,
+    AggregateNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode, FilterNode,
+    IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode, SortNode,
+    SubqueryAliasNode, TableFunctionNode, UnionNode, WindowNode,
 };
 
 pub(crate) fn rewrite_with_rule(
@@ -225,6 +225,16 @@ fn rewrite_children(
         LogicalPlan::Except(node) => {
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
             Ok((LogicalPlan::Except(ExceptNode { inputs }), changed))
+        }
+        LogicalPlan::Decode(node) => {
+            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
+            Ok((
+                LogicalPlan::Decode(DecodeNode {
+                    input: Box::new(input),
+                    ..node
+                }),
+                changed,
+            ))
         }
     }
 }

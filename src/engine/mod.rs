@@ -2782,6 +2782,7 @@ fn collect_scan_stats(
             }
         }
         LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Decode(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
     }
 }

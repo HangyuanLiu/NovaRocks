@@ -53,8 +53,8 @@ pub(crate) fn passthrough_required_full(
 }
 
 use crate::sql::optimizer::operator::{
-    PhysicalCTEProduceOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp, PhysicalRepeatOp,
-    PhysicalSubqueryAliasOp, PhysicalTableFunctionOp,
+    PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp,
+    PhysicalRepeatOp, PhysicalSubqueryAliasOp, PhysicalTableFunctionOp,
 };
 
 use super::{DeriveOutput, DeriveRequired};
@@ -88,6 +88,7 @@ macro_rules! passthrough_distribution_blind_impls {
 passthrough_distribution_blind_impls!(
     PhysicalFilterOp,
     PhysicalProjectOp,
+    PhysicalDecodeOp,
     PhysicalSubqueryAliasOp,
     PhysicalCTEProduceOp,
     PhysicalRepeatOp,
