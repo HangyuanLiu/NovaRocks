@@ -1286,6 +1286,7 @@ impl Rule for DecodeToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalDecode(PhysicalDecodeOp {
                 mappings: op.mappings.clone(),
+                output_columns: op.output_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1325,9 +1326,12 @@ impl Rule for SubqueryAliasToPhysical {
 #[cfg(test)]
 mod decode_tests {
     use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::optimizer::operator::{LogicalDecodeOp, LogicalValuesOp};
     use crate::sql::planner::plan::DecodeMapping;
+    use arrow::datatypes::DataType;
 
     #[test]
     fn decode_to_physical_emits_physical_decode_with_same_mappings() {
@@ -1351,6 +1355,7 @@ mod decode_tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalDecode(LogicalDecodeOp {
                 mappings: mappings.clone(),
+                output_columns: vec![],
             }),
             children: vec![child_group],
         };
@@ -1365,6 +1370,53 @@ mod decode_tests {
             other => panic!("expected PhysicalDecode, got {:?}", other),
         }
         assert_eq!(out[0].children, vec![child_group]);
+    }
+
+    #[test]
+    fn decode_to_physical_preserves_output_columns() {
+        let mut memo = Memo::new();
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let mappings = vec![DecodeMapping {
+            dict_column: "dict_col".into(),
+            string_column: "string_col".into(),
+        }];
+        // Logical output_columns reflects the post-rename names — i.e.
+        // string_col, not dict_col. The physical operator must surface
+        // the same set verbatim.
+        let logical_outputs = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: "string_col".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        }];
+        let logical_decode = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalDecode(LogicalDecodeOp {
+                mappings,
+                output_columns: logical_outputs.clone(),
+            }),
+            children: vec![child_group],
+        };
+
+        let out = DecodeToPhysical.apply(&logical_decode, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::PhysicalDecode(p) = &out[0].op else {
+            panic!("expected PhysicalDecode");
+        };
+        assert_eq!(p.output_columns.len(), logical_outputs.len());
+        assert_eq!(p.output_columns[0].name, logical_outputs[0].name);
+        assert_eq!(p.output_columns[0].column_id, logical_outputs[0].column_id);
+        assert_eq!(p.output_columns[0].data_type, logical_outputs[0].data_type);
+        assert_eq!(p.output_columns[0].nullable, logical_outputs[0].nullable);
     }
 }
 

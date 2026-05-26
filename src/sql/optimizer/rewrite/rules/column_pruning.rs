@@ -304,17 +304,23 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
         }
 
         LogicalPlan::Decode(node) => {
-            // Decode is not inserted before column pruning runs in v1, but
-            // handle it conservatively: the dictionary inputs are required,
-            // so add them to the needed set before recursing into the child.
+            // Decode renames dict_column -> string_column. The child does not
+            // produce `string_column`, so we must remove it from the needed
+            // set before recursing, and add `dict_column` in its place. If
+            // we left `string_column` in `child_needed` the scan-side pruner
+            // would be told to retain a name that doesn't exist downstream
+            // of Decode's child — a contract violation once Task 7 starts
+            // emitting Decode and column pruning re-runs over it.
             let mut child_needed = needed.cloned().unwrap_or_default();
             for mapping in &node.mappings {
+                child_needed.remove(&mapping.string_column.to_lowercase());
                 child_needed.insert(mapping.dict_column.to_lowercase());
             }
             let input = prune_inner(*node.input, Some(&child_needed));
             LogicalPlan::Decode(DecodeNode {
                 input: Box::new(input),
                 mappings: node.mappings,
+                output_columns: node.output_columns,
             })
         }
     }

@@ -1186,6 +1186,7 @@ mod tests {
                     dict_column: "d".to_string(),
                     string_column: "s".to_string(),
                 }],
+                output_columns: Vec::new(),
             }),
             children: vec![scan],
             stats: Statistics {

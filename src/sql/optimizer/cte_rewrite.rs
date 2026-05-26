@@ -173,6 +173,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
         LogicalPlan::Decode(node) => LogicalPlan::Decode(DecodeNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             mappings: node.mappings,
+            output_columns: node.output_columns,
         }),
     }
 }
@@ -278,6 +279,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
         LogicalPlan::Decode(node) => LogicalPlan::Decode(DecodeNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             mappings: node.mappings,
+            output_columns: node.output_columns,
         }),
     }
 }

@@ -7,7 +7,7 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
-use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -189,9 +189,16 @@ pub(crate) struct LogicalCTEConsumeOp {
 /// back to their string form. Produced exclusively by the dictionary-rewrite
 /// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
 /// `PhysicalDecodeOp`.
+///
+/// `output_columns` mirrors the input group's output columns with each
+/// `dict_column` swapped for its `string_column`. Without it
+/// `derive_output_columns` would surface the child's pre-decode names
+/// (the dict columns) to consumers, and parent lookups for the
+/// string column would fail to resolve.
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalDecodeOp {
-    pub mappings: Vec<crate::sql::planner::plan::DecodeMapping>,
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,9 +365,13 @@ pub(crate) struct PhysicalSubqueryAliasOp {
 /// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
 /// turns this into a dictionary-decode execution node; Task 5 only routes
 /// the operator through the optimizer.
+///
+/// `output_columns` is propagated verbatim from `LogicalDecodeOp` by the
+/// `DecodeToPhysical` implementation rule.
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalDecodeOp {
-    pub mappings: Vec<crate::sql::planner::plan::DecodeMapping>,
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 // ---------------------------------------------------------------------------

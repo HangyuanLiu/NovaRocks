@@ -55,6 +55,14 @@ pub(crate) enum LogicalPlan {
 pub(crate) struct DecodeNode {
     pub input: Box<LogicalPlan>,
     pub mappings: Vec<DecodeMapping>,
+    /// Output columns this Decode exposes upward. Mirrors the input's
+    /// output columns with each `dict_column` swapped for its
+    /// `string_column`. Populated by the rewrite rule that inserts
+    /// Decode (Task 7) and preserved by every downstream pass. The
+    /// optimizer's `derive_output_columns` returns this verbatim — without
+    /// it the parent group would observe the child's `dict_column` name
+    /// rather than `string_column`.
+    pub output_columns: Vec<OutputColumn>,
 }
 
 /// Per-column mapping from the dictionary-encoded slot back to the original
