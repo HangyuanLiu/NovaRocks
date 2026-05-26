@@ -291,6 +291,7 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         assert!((compute_cost(&op, &s, &[]) - 0.0).abs() < f64::EPSILON);
     }

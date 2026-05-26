@@ -14,6 +14,8 @@ use crate::meta::repository::dictionary::{
     DICTIONARY_STATE_ACTIVE, DICTIONARY_STATE_DROPPED, DICTIONARY_STATE_STALE,
     DictionaryMetaRepository, StoredDictionarySnapshot, StoredDictionaryValue,
 };
+use crate::sql::catalog::{ScanSource, TableDef};
+use crate::sql::optimizer::rewrite::context::QueryDictionaryProvider;
 
 #[derive(Clone, Default)]
 pub(crate) struct DictionaryManager {
@@ -280,6 +282,77 @@ fn current_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// `QueryDictionaryProvider` implementation backed by the standalone
+/// engine state. Resolves the active dictionary snapshot for a column
+/// by mapping the `TableDef` into a `DictionaryOwner` and delegating to
+/// `DictionaryManager::load_active_snapshot`. Returns `Ok(None)` for
+/// table sources that do not support dictionaries (metadata tables,
+/// IVM delta scans, etc.) and for missing snapshots.
+pub(crate) struct DictionaryQueryProvider {
+    state: Arc<crate::engine::StandaloneState>,
+}
+
+impl DictionaryQueryProvider {
+    pub(crate) fn new(state: Arc<crate::engine::StandaloneState>) -> Self {
+        Self { state }
+    }
+
+    fn owner_for(
+        &self,
+        table: &TableDef,
+        database: &str,
+    ) -> Result<Option<DictionaryOwner>, String> {
+        match &table.source {
+            ScanSource::StarRocks => {
+                let catalog = self
+                    .state
+                    .starrocks_table
+                    .read()
+                    .map_err(|e| format!("starrocks table catalog read lock poisoned: {e}"))?;
+                let runtime = match catalog.table(database, &table.name) {
+                    Ok(rt) => rt,
+                    Err(_) => return Ok(None),
+                };
+                Ok(Some(DictionaryOwner::StarRocksTable {
+                    database: database.to_string(),
+                    table: table.name.clone(),
+                    db_id: runtime.table.db_id,
+                    table_id: runtime.table.table_id,
+                }))
+            }
+            ScanSource::IcebergDataFiles { table: info, .. } => {
+                Ok(Some(DictionaryOwner::IcebergTable {
+                    catalog: info.catalog.clone(),
+                    namespace: info.namespace.clone(),
+                    table: info.table.clone(),
+                    table_uuid: info.table_uuid.clone(),
+                }))
+            }
+            // Metadata tables and IVM delta scans never participate in
+            // dictionary rewriting.
+            ScanSource::IcebergMetadataTable { .. } | ScanSource::IcebergDeltaTable { .. } => {
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl QueryDictionaryProvider for DictionaryQueryProvider {
+    fn load_active_snapshot(
+        &self,
+        table: &TableDef,
+        database: &str,
+        column_name: &str,
+    ) -> Result<Option<DictionarySnapshot>, String> {
+        let Some(owner) = self.owner_for(table, database)? else {
+            return Ok(None);
+        };
+        self.state
+            .dictionary_manager
+            .load_active_snapshot(&self.state, &owner, column_name)
+    }
 }
 
 #[cfg(test)]

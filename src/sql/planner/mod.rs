@@ -1475,6 +1475,7 @@ fn plan_relation_scoped(
                 columns,
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }))
         }
         Relation::Subquery {
@@ -1652,6 +1653,7 @@ fn plan_iceberg_metadata_scan(
         columns: output_columns,
         predicates: vec![],
         required_columns: None,
+        dict_columns: vec![],
     }))
 }
 
@@ -1826,6 +1828,7 @@ fn plan_iceberg_delta_scan(
         columns: output_columns,
         predicates: vec![],
         required_columns: None,
+        dict_columns: vec![],
     }))
 }
 

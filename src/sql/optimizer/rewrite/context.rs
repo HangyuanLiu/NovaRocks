@@ -1,10 +1,54 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::engine::dictionary::model::DictionarySnapshot;
+use crate::sql::catalog::TableDef;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::statistics::TableStatistics;
+
+/// Loads dictionary snapshots for scan-time low-cardinality string columns.
+/// Implemented by the engine layer (production) and by tests (fakes).
+pub(crate) trait QueryDictionaryProvider: Send + Sync {
+    fn load_active_snapshot(
+        &self,
+        table: &TableDef,
+        database: &str,
+        column_name: &str,
+    ) -> Result<Option<DictionarySnapshot>, String>;
+}
+
+thread_local! {
+    /// Per-thread fallback dictionary provider. Set by
+    /// `StandaloneSession::execute_in_context` for the duration of one
+    /// SQL statement so that the many downstream engine entry points
+    /// that funnel into `optimize()` do not each have to thread the
+    /// provider through their signatures. The provider passed
+    /// explicitly to `optimize()` takes precedence.
+    static CURRENT_DICTIONARY_PROVIDER: RefCell<Option<Arc<dyn QueryDictionaryProvider>>> =
+        const { RefCell::new(None) };
+}
+
+/// Install `provider` as the current-thread fallback for the duration of `f`.
+/// Restores the previous binding on exit (including on panic via the
+/// usual `RefCell` borrow semantics).
+pub(crate) fn with_dictionary_provider<T>(
+    provider: Arc<dyn QueryDictionaryProvider>,
+    f: impl FnOnce() -> T,
+) -> T {
+    CURRENT_DICTIONARY_PROVIDER.with(|cell| {
+        let previous = cell.replace(Some(provider));
+        let result = f();
+        cell.replace(previous);
+        result
+    })
+}
+
+pub(crate) fn current_dictionary_provider() -> Option<Arc<dyn QueryDictionaryProvider>> {
+    CURRENT_DICTIONARY_PROVIDER.with(|cell| cell.borrow().clone())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteConsumer {
@@ -42,6 +86,7 @@ pub(crate) struct RewriteContext {
     extension: Option<Arc<dyn Any + Send + Sync>>,
     query_table_stats: Option<Arc<HashMap<String, TableStatistics>>>,
     deadline: Option<Instant>,
+    dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
 }
 
 impl RewriteContext {
@@ -54,6 +99,7 @@ impl RewriteContext {
             extension: None,
             query_table_stats: None,
             deadline: None,
+            dictionary_provider: None,
         }
     }
 
@@ -118,6 +164,14 @@ impl RewriteContext {
 
     pub(crate) fn set_deadline(&mut self, deadline: Instant) {
         self.deadline = Some(deadline);
+    }
+
+    pub(crate) fn set_dictionary_provider(&mut self, provider: Arc<dyn QueryDictionaryProvider>) {
+        self.dictionary_provider = Some(provider);
+    }
+
+    pub(crate) fn dictionary_provider(&self) -> Option<&Arc<dyn QueryDictionaryProvider>> {
+        self.dictionary_provider.as_ref()
     }
 
     pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {

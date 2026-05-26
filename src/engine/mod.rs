@@ -489,6 +489,28 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<crate::internal_service::TQueryOptions>,
     ) -> Result<StatementResult, String> {
+        // Install the per-statement dictionary provider so optimizer
+        // calls reached through nested engine entry points (insert,
+        // delete, MV refresh, statistics, etc.) can resolve active
+        // dictionary snapshots without each entry point having to
+        // thread the provider through its signature.
+        let provider: std::sync::Arc<
+            dyn crate::sql::optimizer::rewrite::context::QueryDictionaryProvider,
+        > = std::sync::Arc::new(crate::engine::dictionary::DictionaryQueryProvider::new(
+            self.inner.clone(),
+        ));
+        crate::sql::optimizer::rewrite::context::with_dictionary_provider(provider, || {
+            self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
+        })
+    }
+
+    fn execute_in_context_inner(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<crate::internal_service::TQueryOptions>,
+    ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
@@ -2501,7 +2523,7 @@ fn explain_analyze_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2531,7 +2553,7 @@ fn explain_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2587,7 +2609,7 @@ pub(crate) fn execute_query_with_options(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -4068,8 +4090,8 @@ enable_path_style_access = true
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical =
-            crate::sql::optimizer::optimize(logical, &table_stats, factory).expect("optimize");
+        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
+            .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, "default",
         )

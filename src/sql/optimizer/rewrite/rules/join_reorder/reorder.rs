@@ -1339,6 +1339,7 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 
@@ -1697,6 +1698,7 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

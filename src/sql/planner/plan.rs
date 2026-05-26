@@ -179,6 +179,25 @@ pub(crate) struct ScanNode {
     /// Columns actually required by upstream operators (set by column pruning).
     /// `None` means all columns are required (no pruning applied).
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule when a string column on
+    /// this scan is eligible for low-cardinality rewriting. Empty
+    /// everywhere else. Mirrored onto `LogicalScanOp` and
+    /// `PhysicalScanOp` by memo conversion and the `ScanToPhysical`
+    /// implementation rule.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
+}
+
+/// Plan hint for a single dict-encoded string column on a scan.
+/// `source_column` is the original string column name in the scan
+/// output; `dict_column` is the synthetic `Int32` slot name introduced
+/// by the rewrite rule; `dictionary` is the snapshot whose `(id, bytes)`
+/// pairs become a `TGlobalDict` payload at codegen time.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanDictionaryColumn {
+    pub source_column: String,
+    pub dict_column: String,
+    pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
 }
 
 #[derive(Clone, Debug)]

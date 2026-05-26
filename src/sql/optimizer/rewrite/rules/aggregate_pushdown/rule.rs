@@ -69,6 +69,7 @@ mod tests {
                 }],
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             })),
             group_by: vec![],
             aggregates: vec![],
@@ -123,6 +124,7 @@ mod tests {
                     .collect(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             })
         }
 

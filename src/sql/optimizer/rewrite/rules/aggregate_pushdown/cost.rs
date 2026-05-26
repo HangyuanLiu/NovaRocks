@@ -94,6 +94,7 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let mut col_stats = HashMap::new();
         col_stats.insert(

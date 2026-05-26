@@ -154,6 +154,7 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let cost = estimate_operator_cost(&scan_plan, &stats, &[]);
         // cpu = rows * avg_size = 1000 * 100 = 100_000

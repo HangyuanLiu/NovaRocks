@@ -50,12 +50,13 @@ pub(crate) fn optimize(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
+    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
-    //    aggregate pushdown → column pruning.
+    //    aggregate pushdown → column pruning → low-cardinality dict rewrite.
     let session_settings = options::current_session_optimizer_settings();
     let options = options::OptimizerOptions::from_session(&session_settings);
     let mut rewrite_ctx =
@@ -63,6 +64,11 @@ pub(crate) fn optimize(
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_table_stats(table_stats.clone());
     rewrite_ctx.set_deadline(deadline);
+    let dictionary_provider =
+        dictionary_provider.or_else(rewrite::context::current_dictionary_provider);
+    if let Some(provider) = dictionary_provider {
+        rewrite_ctx.set_dictionary_provider(provider);
+    }
     let rewritten =
         rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
 
@@ -276,7 +282,7 @@ mod is_known_rule_name_tests {
             columns: vec![],
         });
         let factory = ColumnRefFactory::new();
-        let physical = optimize(plan, &HashMap::new(), factory).expect("optimize values");
+        let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalValues"));
     }

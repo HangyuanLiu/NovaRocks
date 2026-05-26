@@ -496,6 +496,7 @@ mod tests {
             columns,
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

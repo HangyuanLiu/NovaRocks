@@ -470,9 +470,9 @@ impl Rule for ScanToPhysical {
                 columns: op.columns.clone(),
                 predicates: op.predicates.clone(),
                 required_columns: op.required_columns.clone(),
-                // Task 7 (`LowCardinalityDictionaryRewrite`) will populate
-                // this; the implementation rule leaves it empty.
-                dict_columns: vec![],
+                // Propagated from the logical scan. Populated by Task 7
+                // `LowCardinalityDictionaryRewrite`; empty otherwise.
+                dict_columns: op.dict_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1584,6 +1584,7 @@ mod join_demotion_tests {
                 columns: output_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
         };

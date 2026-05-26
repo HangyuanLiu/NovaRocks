@@ -377,6 +377,7 @@ mod tests {
                 columns: vec![output.clone()],
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             })),
             items: vec![ProjectItem {
                 expr: column_ref(output.column_id, "c1"),

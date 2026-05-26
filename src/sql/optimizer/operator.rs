@@ -9,6 +9,8 @@ use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedE
 use crate::sql::catalog::TableDef;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
+pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
+
 // ---------------------------------------------------------------------------
 // Physical decision enums
 // ---------------------------------------------------------------------------
@@ -57,6 +59,10 @@ pub(crate) struct LogicalScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule on the logical side and
+    /// propagated to `PhysicalScanOp` by `ScanToPhysical`.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,18 +228,6 @@ pub(crate) struct PhysicalScanOp {
     /// production paths today.
     #[allow(dead_code)] // Read by codegen when Task 7 populates it.
     pub dict_columns: Vec<ScanDictionaryColumn>,
-}
-
-/// Plan hint for a single dict-encoded string column on a scan. `source_column`
-/// is the original string column name in the scan output; `dict_column` is the
-/// synthetic INT slot name introduced by codegen; `dictionary` is the snapshot
-/// whose `(id, bytes)` pairs become a `TGlobalDict` payload.
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Fields are read by codegen when Task 7 populates the vec.
-pub(crate) struct ScanDictionaryColumn {
-    pub source_column: String,
-    pub dict_column: String,
-    pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
 }
 
 #[derive(Clone, Debug)]

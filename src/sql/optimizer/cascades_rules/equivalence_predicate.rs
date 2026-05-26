@@ -336,6 +336,7 @@ mod tests {
                 columns: vec![output(id, name)],
                 predicates: Vec::new(),
                 required_columns: None,
+                dict_columns: Vec::new(),
             }),
             children: Vec::new(),
         });

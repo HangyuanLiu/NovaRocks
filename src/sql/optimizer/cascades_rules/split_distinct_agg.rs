@@ -370,6 +370,7 @@ mod tests {
                 columns: vec![],
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
         };

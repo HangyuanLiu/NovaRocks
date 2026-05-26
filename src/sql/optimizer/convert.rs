@@ -24,6 +24,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 columns: node.columns.clone(),
                 predicates: node.predicates.clone(),
                 required_columns: node.required_columns.clone(),
+                dict_columns: node.dict_columns.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -356,6 +357,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let mut memo = Memo::new();
@@ -381,6 +383,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let predicate = TypedExpr {
@@ -427,6 +430,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let produce = LogicalPlan::CTEProduce(crate::sql::planner::plan::CTEProduceNode {
