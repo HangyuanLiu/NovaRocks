@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::meta::{MetaError, MetaErrorKind};
 
+pub mod dictionary;
 pub mod iceberg_catalog;
 pub mod id_scopes;
 pub mod job;

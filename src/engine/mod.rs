@@ -35,6 +35,7 @@ use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
+pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
@@ -199,6 +200,7 @@ pub(crate) struct StandaloneState {
     pub(crate) mv_repo: MvMetaRepository,
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
     pub(crate) job_repo: JobMetaRepository,
+    pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
     /// In-memory registry of user-defined views, keyed by lowercase
     /// (database, view-name). Each entry stores the analysed `Query` AST
@@ -230,6 +232,7 @@ impl Default for StandaloneState {
             mv_repo: MvMetaRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
+            dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,
             views: RwLock::new(std::collections::HashMap::new()),
             virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
