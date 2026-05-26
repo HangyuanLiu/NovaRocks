@@ -213,6 +213,27 @@ pub(crate) struct PhysicalScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule when a string column on this
+    /// scan is eligible for low-cardinality rewriting. Codegen reads this to
+    /// emit a hidden INT dict slot, a `TGlobalDict` payload on the owning
+    /// fragment, and (for StarRocks scans) the
+    /// `TLakeScanNode.dict_string_id_to_int_ids` mapping. Empty in all
+    /// production paths today.
+    #[allow(dead_code)] // Read by codegen when Task 7 populates it.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
+}
+
+/// Plan hint for a single dict-encoded string column on a scan. `source_column`
+/// is the original string column name in the scan output; `dict_column` is the
+/// synthetic INT slot name introduced by codegen; `dictionary` is the snapshot
+/// whose `(id, bytes)` pairs become a `TGlobalDict` payload.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Fields are read by codegen when Task 7 populates the vec.
+pub(crate) struct ScanDictionaryColumn {
+    pub source_column: String,
+    pub dict_column: String,
+    pub dictionary: crate::engine::dictionary::model::DictionarySnapshot,
 }
 
 #[derive(Clone, Debug)]

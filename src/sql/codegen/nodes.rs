@@ -1524,6 +1524,35 @@ pub(crate) fn build_merging_exchange_node(
 }
 
 // ---------------------------------------------------------------------------
+// Decode node
+// ---------------------------------------------------------------------------
+
+/// Build a `TDecodeNode` that maps dictionary-encoded INT slot ids back to
+/// their string slot ids. The decode node is inserted above an upstream
+/// subtree that exposes dict-encoded slots (typically a StarRocks scan); the
+/// BE-side lowering in `src/lower/node/decode.rs` consumes the resulting
+/// `TPlanNode`.
+pub(crate) fn build_decode_node(
+    node_id: i32,
+    row_tuples: Vec<i32>,
+    dict_id_to_string_ids: BTreeMap<i32, i32>,
+) -> plan_nodes::TPlanNode {
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::DECODE_NODE;
+    node.num_children = 1;
+    node.limit = -1;
+    node.row_tuples = row_tuples;
+    node.nullable_tuples = vec![];
+    node.compact_data = true;
+    node.decode_node = Some(plan_nodes::TDecodeNode {
+        dict_id_to_string_ids: Some(dict_id_to_string_ids),
+        string_functions: None,
+    });
+    node
+}
+
+// ---------------------------------------------------------------------------
 // Default plan node
 // ---------------------------------------------------------------------------
 

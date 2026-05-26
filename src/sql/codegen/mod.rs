@@ -84,4 +84,12 @@ pub(crate) struct FragmentBuildResult {
     /// Exchange node IDs in this fragment that consume from CTE fragments:
     /// `(cte_id, exchange_node_id)`.
     pub cte_exchange_nodes: Vec<(CteId, i32)>,
+    /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
+    /// Populated by the fragment builder when a scan exposes a dict-encoded slot.
+    /// `None` when this fragment has no dictionary-encoded slots.
+    pub query_global_dicts: Option<Vec<crate::data::TGlobalDict>>,
+    /// Per-fragment dictionary expressions emitted to
+    /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;
+    /// today this stays `None` because no codegen path populates it.
+    pub query_global_dict_exprs: Option<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
 }

@@ -288,6 +288,7 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let expr = MExpr {
             id: 0,
@@ -416,6 +417,7 @@ mod cascaded_derivation_tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

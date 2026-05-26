@@ -1093,6 +1093,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1137,6 +1138,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1172,6 +1174,7 @@ mod tests {
                 columns: Vec::new(),
                 predicates: Vec::new(),
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1253,6 +1256,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1316,6 +1320,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {

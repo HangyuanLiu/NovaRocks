@@ -210,6 +210,7 @@ mod tests {
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let cost = compute_cost(&op, &s, &[]);
         assert!((cost - 100_000.0).abs() < 1.0);

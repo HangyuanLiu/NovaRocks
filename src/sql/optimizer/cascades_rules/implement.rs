@@ -470,6 +470,9 @@ impl Rule for ScanToPhysical {
                 columns: op.columns.clone(),
                 predicates: op.predicates.clone(),
                 required_columns: op.required_columns.clone(),
+                // Task 7 (`LowCardinalityDictionaryRewrite`) will populate
+                // this; the implementation rule leaves it empty.
+                dict_columns: vec![],
             }),
             children: expr.children.clone(),
         }]

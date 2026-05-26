@@ -297,10 +297,10 @@ impl ExecutionCoordinator {
                 ),
                 None::<i64>, // min_reservation_bytes
                 None::<i64>, // initial_reservation_total_claims
-                None::<Vec<crate::data::TGlobalDict>>,
-                None::<Vec<crate::data::TGlobalDict>>,
+                stream_fr.query_global_dicts.clone(),
+                None::<Vec<crate::data::TGlobalDict>>, // load_global_dicts: streaming-load only
                 None::<planner::TCacheParam>,
-                None::<BTreeMap<i32, crate::exprs::TExpr>>,
+                stream_fr.query_global_dict_exprs.clone(),
                 None::<planner::TGroupExecutionParam>,
             );
 
@@ -410,10 +410,10 @@ impl ExecutionCoordinator {
                 ),
                 None::<i64>, // min_reservation_bytes
                 None::<i64>, // initial_reservation_total_claims
-                None::<Vec<crate::data::TGlobalDict>>,
-                None::<Vec<crate::data::TGlobalDict>>,
+                cte_fr.query_global_dicts.clone(),
+                None::<Vec<crate::data::TGlobalDict>>, // load_global_dicts: streaming-load only
                 None::<planner::TCacheParam>,
-                None::<BTreeMap<i32, crate::exprs::TExpr>>,
+                cte_fr.query_global_dict_exprs.clone(),
                 None::<planner::TGroupExecutionParam>,
             );
 

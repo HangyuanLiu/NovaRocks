@@ -37,12 +37,12 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+    AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp,
     PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
     PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
     PhysicalSubqueryAliasOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp,
-    PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
@@ -167,6 +167,11 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     pub(crate) join_fragment_map: HashMap<i32, FragmentId>,
     /// hash join node_id -> JoinDistribution for RF join mode mapping.
     pub(crate) join_distributions: HashMap<i32, crate::sql::optimizer::operator::JoinDistribution>,
+    /// Per-fragment accumulator of `TGlobalDict` entries emitted by scans
+    /// with non-empty `dict_columns`. Drained into
+    /// `FragmentBuildResult.query_global_dicts` when each fragment is
+    /// finalized. Empty in all production paths until Task 7+.
+    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -194,6 +199,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             scan_tuple_owners: HashMap::new(),
             join_fragment_map: HashMap::new(),
             join_distributions: HashMap::new(),
+            query_global_dicts_per_fragment: HashMap::new(),
         };
 
         // Elide a root-level Gather: on a single node the top-level gather
@@ -234,7 +240,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             })
             .collect();
 
-        // Build the root fragment with a result sink.
+        // Build the root fragment with a result sink. Drain the per-fragment
+        // dictionary accumulator into `query_global_dicts` — for Task 6 this
+        // accumulator is always empty unless a test populates `dict_columns`.
+        let root_dicts = builder
+            .query_global_dicts_per_fragment
+            .remove(&root_fragment_id)
+            .filter(|v| !v.is_empty());
         let root_fragment = FragmentBuildResult {
             fragment_id: root_fragment_id,
             plan: plan_nodes::TPlan::new(result.plan_nodes),
@@ -244,6 +256,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             output_columns,
             cte_id: None,
             cte_exchange_nodes: result.cte_exchange_nodes,
+            // Dictionary plumbing: populated when Task 7+ inserts dict slots.
+            query_global_dicts: root_dicts,
+            query_global_dict_exprs: None,
         };
 
         // Patch all completed (child) fragments with the shared descriptor
@@ -354,6 +369,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalUnion(op) => self.visit_union(op, node),
             Operator::PhysicalIntersect(op) => self.visit_intersect(op, node),
             Operator::PhysicalExcept(op) => self.visit_except(op, node),
+            Operator::PhysicalDecode(op) => self.visit_decode(op, node),
             // Logical operators should never appear in an extracted physical plan
             other if other.is_logical() => Err(format!(
                 "unexpected logical operator in physical plan: {:?}",
@@ -541,6 +557,59 @@ impl<'a> PlanFragmentBuilder<'a> {
             conjuncts
         };
 
+        // Dict-encoded scan columns (Task 5/7 plan hints). For each dict
+        // column we (a) allocate a hidden INT slot inside the scan tuple, (b)
+        // register it in the scope by its `dict_column` name so a downstream
+        // `PhysicalDecode` can find it, (c) build a `TGlobalDict` payload for
+        // the owning fragment, and (d) record a string-slot -> dict-slot
+        // mapping so that StarRocks scans can populate
+        // `TLakeScanNode.dict_string_id_to_int_ids` after the scan node is
+        // built. `dict_columns` is empty in all production paths today.
+        let mut string_to_dict_slot: std::collections::BTreeMap<i32, i32> =
+            std::collections::BTreeMap::new();
+        let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
+        for dict_col in &op.dict_columns {
+            // Resolve the source string column already registered above. The
+            // lookup is unqualified — a scan's tuple is the only source in
+            // scope at this point, so name conflicts are impossible.
+            let string_binding = scope
+                .resolve_column(None, &dict_col.source_column)
+                .map_err(|_| {
+                    format!(
+                        "scan dict_columns references unknown source column `{}`",
+                        dict_col.source_column
+                    )
+                })?
+                .clone();
+
+            let dict_slot_id = self.alloc_slot();
+            let dict_col_pos = (op.table.columns.len()
+                + op.table.iceberg_row_lineage_metadata_columns.len()
+                + dict_slot_to_dict.len()) as i32;
+            self.desc_builder.add_slot(
+                dict_slot_id,
+                scan_tuple_id,
+                &dict_col.dict_column,
+                &DataType::Int32,
+                string_binding.nullable,
+                dict_col_pos,
+            );
+            let dict_binding = ColumnBinding {
+                tuple_id: scan_tuple_id,
+                slot_id: dict_slot_id,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: string_binding.nullable,
+            };
+            scope.add_column(
+                qualifier.map(|s| s.to_string()),
+                dict_col.dict_column.clone(),
+                dict_binding,
+            );
+            string_to_dict_slot.insert(string_binding.slot_id, dict_slot_id);
+            dict_slot_to_dict.push((dict_slot_id, dict_col));
+        }
+
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: op.table.clone(),
@@ -549,12 +618,50 @@ impl<'a> PlanFragmentBuilder<'a> {
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
-        let scan_plan_node = nodes::build_scan_node(
+        let mut scan_plan_node = nodes::build_scan_node(
             scan_node_id,
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
         );
+
+        // Patch the StarRocks lake-scan payload with the dict slot mapping so
+        // the BE side reads the column as dict-encoded INT instead of UTF8.
+        // Iceberg/HDFS scans don't carry this field today; non-StarRocks
+        // dict_columns is a planning bug we should never hit.
+        if !string_to_dict_slot.is_empty() {
+            if let Some(lake) = scan_plan_node.lake_scan_node.as_mut() {
+                lake.dict_string_id_to_int_ids = Some(string_to_dict_slot);
+            } else {
+                return Err(format!(
+                    "scan `{}.{}` has dict_columns but is not a StarRocks lake scan",
+                    op.database, op.table.name,
+                ));
+            }
+        }
+
+        // Emit per-dict-column TGlobalDict payloads onto the owning fragment.
+        let current_frag = self.current_fragment_id()?;
+        for (dict_slot_id, dict_col) in &dict_slot_to_dict {
+            let snapshot = &dict_col.dictionary;
+            let mut ids = Vec::with_capacity(snapshot.values.len());
+            let mut strings = Vec::with_capacity(snapshot.values.len());
+            for value in &snapshot.values {
+                ids.push(value.id);
+                strings.push(value.bytes.clone());
+            }
+            let global_dict = crate::data::TGlobalDict::new(
+                Some(*dict_slot_id),
+                Some(strings),
+                Some(ids),
+                Some(snapshot.version),
+            );
+            self.query_global_dicts_per_fragment
+                .entry(current_frag)
+                .or_default()
+                .push(global_dict);
+        }
+
         self.scan_tables.push(nodes::PlannedScanTable {
             scan_node_id,
             resolved,
@@ -564,7 +671,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         });
 
         // Track tuple -> scan node ownership for runtime filter planning.
-        let current_frag = self.current_fragment_id()?;
         self.scan_tuple_owners.insert(
             scan_tuple_id,
             ScanTupleOwner {
@@ -616,6 +722,68 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
 
         Ok(child)
+    }
+
+    // -------------------------------------------------------------------
+    // visit_decode
+    // -------------------------------------------------------------------
+
+    /// Emit a `TDecodeNode` for a `PhysicalDecodeOp`. The decode op carries
+    /// `DecodeMapping { dict_column, string_column }` pairs naming columns
+    /// already exposed by the child's `ExprScope`; this routine resolves both
+    /// names to their physical slot ids and packs the dict-id → string-id map
+    /// onto the new `TDecodeNode`. The child's scope, tuple ids, and CTE
+    /// exchange list are forwarded unchanged — Task 7 will adjust the scope
+    /// when it actually populates `dict_columns` on the upstream scan.
+    fn visit_decode(
+        &mut self,
+        op: &PhysicalDecodeOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalDecode expected exactly 1 child, got {}",
+                node.children.len()
+            ));
+        }
+        let child = self.visit(&node.children[0])?;
+
+        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
+        for item in &op.mappings {
+            let dict_binding = child
+                .scope
+                .resolve_column(None, &item.dict_column)
+                .map_err(|_| {
+                    format!(
+                        "decode dict column `{}` is not in child scope",
+                        item.dict_column
+                    )
+                })?;
+            let string_binding = child
+                .scope
+                .resolve_column(None, &item.string_column)
+                .map_err(|_| {
+                    format!(
+                        "decode string column `{}` is not in child scope",
+                        item.string_column
+                    )
+                })?;
+            mapping.insert(dict_binding.slot_id, string_binding.slot_id);
+        }
+
+        let decode_node =
+            nodes::build_decode_node(self.alloc_node(), child.tuple_ids.clone(), mapping);
+
+        // Pre-order: decode first, then child nodes.
+        let mut plan_nodes = vec![decode_node];
+        plan_nodes.extend(child.plan_nodes);
+
+        Ok(VisitResult {
+            plan_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
+        })
     }
 
     // -------------------------------------------------------------------
@@ -1450,6 +1618,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         )?;
         let exchange_partition_type = output_partition.type_;
 
+        let child_dicts = self
+            .query_global_dicts_per_fragment
+            .remove(&child_fragment_id)
+            .filter(|v| !v.is_empty());
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
@@ -1467,6 +1639,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .collect(),
             cte_id: None,
             cte_exchange_nodes,
+            query_global_dicts: child_dicts,
+            query_global_dict_exprs: None,
         });
 
         let exchange_node_id = self.alloc_node();
@@ -1564,6 +1738,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         )?;
         let exchange_partition_type = output_partition.type_;
 
+        let child_dicts = self
+            .query_global_dicts_per_fragment
+            .remove(&child_fragment_id)
+            .filter(|v| !v.is_empty());
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
@@ -1581,6 +1759,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .collect(),
             cte_id: None,
             cte_exchange_nodes,
+            query_global_dicts: child_dicts,
+            query_global_dict_exprs: None,
         });
 
         let exchange_node_id = self.alloc_node();
@@ -2873,6 +3053,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             self.build_output_partition(&op.spec, &scope, &node.children[0].output_columns)?;
         let exchange_partition_type = output_partition.type_;
 
+        let child_dicts = self
+            .query_global_dicts_per_fragment
+            .remove(&child_fragment_id)
+            .filter(|v| !v.is_empty());
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(plan_nodes),
@@ -2890,6 +3074,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .collect(),
             cte_id: None,
             cte_exchange_nodes,
+            query_global_dicts: child_dicts,
+            query_global_dict_exprs: None,
         });
 
         let exchange_node_id = self.alloc_node();
@@ -3222,6 +3408,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         let child_result = self.visit(&node.children[0]);
         self.fragment_stack.pop();
         let child = child_result?;
+        let cte_dicts = self
+            .query_global_dicts_per_fragment
+            .remove(&cte_fragment_id)
+            .filter(|v| !v.is_empty());
         let cte_fragment = FragmentBuildResult {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
@@ -3239,6 +3429,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .collect(),
             cte_id: Some(op.cte_id),
             cte_exchange_nodes: child.cte_exchange_nodes,
+            query_global_dicts: cte_dicts,
+            query_global_dict_exprs: None,
         };
         let idx = self.completed_fragments.len();
         self.completed_fragments.push(cte_fragment);
@@ -3425,6 +3617,7 @@ mod tests {
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalGenerateSeriesOp,
         PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
+        ScanDictionaryColumn,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
@@ -3799,6 +3992,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3826,6 +4020,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3857,6 +4052,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3891,6 +4087,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![id_eq_literal(12)],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3925,6 +4122,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![id_eq_literal(12)],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3958,6 +4156,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -3993,6 +4192,7 @@ mod tests {
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
             stats: stats(),
@@ -4571,6 +4771,261 @@ mod tests {
         assert_eq!(
             starrocks_desc.table_type,
             crate::types::TTableType::OLAP_TABLE
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Task 6: codegen dictionary plan interface
+    // -------------------------------------------------------------------
+
+    fn dict_snapshot_a_b() -> crate::engine::dictionary::model::DictionarySnapshot {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
+            DictionaryWatermark,
+        };
+        DictionarySnapshot {
+            dictionary_id: 1,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "default".to_string(),
+                table: "starrocks_t".to_string(),
+                db_id: 11,
+                table_id: 22,
+            },
+            column_id: None,
+            column_name: "id".to_string(),
+            data_type: DataType::Int32,
+            version: 1,
+            watermark: DictionaryWatermark::StarRocks {
+                schema_id: 33,
+                tablets: vec![],
+            },
+            values: vec![
+                DictionaryValue {
+                    id: 1,
+                    bytes: b"a".to_vec(),
+                },
+                DictionaryValue {
+                    id: 2,
+                    bytes: b"b".to_vec(),
+                },
+            ],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        }
+    }
+
+    #[test]
+    fn physical_decode_emits_decode_node() {
+        use crate::sql::optimizer::operator::PhysicalDecodeOp;
+        use crate::sql::planner::plan::DecodeMapping;
+
+        // Build a StarRocks scan that exposes one dict column ("id" string
+        // column gets a sibling "id_dict" INT slot via dict_columns).
+        let layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let scan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "starrocks_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                }],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column: "id".to_string(),
+                    dict_column: "id_dict".to_string(),
+                    dictionary: dict_snapshot_a_b(),
+                }],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: "id".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            }],
+        };
+
+        let decode_plan = PhysicalPlanNode {
+            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: vec![DecodeMapping {
+                    dict_column: "id_dict".to_string(),
+                    string_column: "id".to_string(),
+                }],
+                output_columns: vec![],
+            }),
+            children: vec![scan],
+            stats: stats(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: "id".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            }],
+        };
+
+        let catalog = StarRocksCatalog { layout };
+        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, "default").expect("build");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+
+        // First plan node is the decode node (pre-order).
+        let first = root.plan.nodes.first().expect("decode plan node");
+        assert_eq!(first.node_type, plan_nodes::TPlanNodeType::DECODE_NODE);
+        let decode = first.decode_node.as_ref().expect("decode payload");
+        let mapping = decode
+            .dict_id_to_string_ids
+            .as_ref()
+            .expect("dict_id_to_string_ids");
+        assert!(!mapping.is_empty(), "decode mapping must be non-empty");
+        assert_eq!(mapping.len(), 1);
+        // Both dict slot id and string slot id are 1-based monotonic ids;
+        // the exact values depend on allocator order, so we assert structural
+        // properties rather than absolute slot ids.
+        let (dict_slot, string_slot) = mapping.iter().next().expect("one entry");
+        assert!(
+            dict_slot != string_slot,
+            "dict and string slots must differ"
+        );
+    }
+
+    #[test]
+    fn scan_dict_column_emits_query_global_dict() {
+        let layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "starrocks_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                }],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column: "id".to_string(),
+                    dict_column: "id_dict".to_string(),
+                    dictionary: dict_snapshot_a_b(),
+                }],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: "id".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            }],
+        };
+
+        let catalog = StarRocksCatalog { layout };
+        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+
+        // The fragment should carry one TGlobalDict matching our snapshot.
+        let dicts = root
+            .query_global_dicts
+            .as_ref()
+            .expect("query_global_dicts populated");
+        assert_eq!(dicts.len(), 1, "exactly one dict per source column");
+        let dict = &dicts[0];
+        assert_eq!(dict.ids.as_deref(), Some(&[1, 2][..]));
+        assert_eq!(
+            dict.strings.as_deref(),
+            Some(&[b"a".to_vec(), b"b".to_vec()][..])
+        );
+        // column_id on a TGlobalDict is the dict slot id (an INT slot); we
+        // only assert it is Some, since the exact slot id depends on
+        // allocator ordering.
+        assert!(
+            dict.column_id.is_some(),
+            "TGlobalDict.column_id must be set"
+        );
+
+        // StarRocks scan's TLakeScanNode must carry the
+        // string_slot_id -> dict_slot_id mapping for this column.
+        let scan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let lake = scan_node
+            .lake_scan_node
+            .as_ref()
+            .expect("lake scan payload");
+        let mapping = lake
+            .dict_string_id_to_int_ids
+            .as_ref()
+            .expect("dict_string_id_to_int_ids populated");
+        assert_eq!(mapping.len(), 1);
+        let (string_slot, dict_slot) = mapping.iter().next().expect("one entry");
+        assert_eq!(
+            *dict_slot,
+            dict.column_id.unwrap(),
+            "mapping value must be the dict slot id"
+        );
+        assert!(
+            string_slot != dict_slot,
+            "string slot and dict slot must differ"
         );
     }
 }
