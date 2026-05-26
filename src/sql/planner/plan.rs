@@ -113,7 +113,7 @@ pub(crate) struct WindowExpr {
 }
 
 /// Inline table function: `TABLE(generate_series(start, end, step))`.
-/// Materialized to a temporary parquet file at emission time.
+/// Emitted as a TABLE_FUNCTION_NODE over a one-row parameter input.
 #[derive(Clone, Debug)]
 pub(crate) struct GenerateSeriesNode {
     pub start: i64,
