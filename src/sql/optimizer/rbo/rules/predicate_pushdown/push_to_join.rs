@@ -9,17 +9,17 @@
 //!
 //! Mirrors legacy `push_predicates_through_join` + `factor_common_eq_from_or`
 //! from `src/sql/optimizer/predicate_pushdown.rs`. One step per apply — the
-//! driver's fixed-point handles repeated firing when a newly-formed shape
+//! rewrite pipeline's fixed-point handles repeated firing when a newly-formed shape
 //! exposes further opportunities.
 
 use std::collections::HashSet;
 
-use super::super::super::rule::RewriteRule;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::optimizer::rbo::utils::{
     collect_column_refs, collect_output_columns, collect_qualified_column_refs,
     collect_qualified_output_columns, combine_and, split_and, wrap_remaining_filter,
 };
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 use arrow::datatypes::DataType;
 
@@ -226,7 +226,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
     let pushed_any = !left_preds.is_empty() || !right_preds.is_empty() || !join_preds.is_empty();
 
     // Build the new left child, applying pushed predicates then wrapping in
-    // a Filter. The RBO driver's fixed-point handles continued pushdown on
+    // a Filter. The rewrite pipeline's fixed-point handles continued pushdown on
     // subsequent iterations.
     let new_left = if left_preds.is_empty() {
         *join.left
@@ -443,7 +443,7 @@ fn merge_join_conditions(
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

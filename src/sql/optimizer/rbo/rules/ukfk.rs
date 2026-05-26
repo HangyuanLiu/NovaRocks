@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
-use super::super::rule::RewriteRule;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr};
 use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::optimizer::rbo::utils::{
     collect_qualified_column_refs, collect_qualified_output_columns, combine_and,
 };
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

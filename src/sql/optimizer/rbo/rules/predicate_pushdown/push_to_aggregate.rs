@@ -11,11 +11,11 @@
 
 use std::collections::HashSet;
 
-use super::super::super::rule::RewriteRule;
 use crate::sql::analysis::ExprKind;
 use crate::sql::optimizer::rbo::utils::{
     collect_column_refs, combine_and, split_and, wrap_remaining_filter,
 };
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateAggregate;
@@ -91,7 +91,7 @@ impl RewriteRule for PushDownPredicateAggregate {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

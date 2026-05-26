@@ -5,7 +5,7 @@
 //! violating the "rules don't recurse; the driver walks" rule documented
 //! on `RewriteRule`. Column pruning is fundamentally a *top-down* concern
 //! — a scan cannot know which columns to prune until every ancestor has
-//! declared what it needs — and the RBO driver's bottom-up traversal
+//! declared what it needs — and the rewrite framework's bottom-up traversal
 //! cannot naturally express that. The rule therefore owns the walk. It is
 //! the one documented exception; every other rule stays inside the
 //! one-node-per-apply convention.
@@ -17,15 +17,15 @@
 
 use std::collections::HashSet;
 
-use super::super::rule::RewriteRule;
 use crate::sql::optimizer::rbo::utils::{collect_column_refs, merge_needed};
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 /// Single top-down column-pruning rule.
 ///
 /// Registered once in `all_rbo_rules()`. Apply runs `prune_inner` at the
 /// root level with `None` (no restriction), which recursively walks the
-/// entire tree. The RBO driver's outer tree-level fixed-point will invoke
+/// entire tree. The rewrite pipeline's outer tree-level fixed-point will invoke
 /// the rule once at the root; because `apply` returns `None` when nothing
 /// changed (the `required_columns` field is identical before and after),
 /// the driver terminates after one round when the tree has already been
@@ -38,7 +38,7 @@ impl RewriteRule for PruneColumns {
     }
 
     fn matches(&self, _plan: &LogicalPlan) -> bool {
-        // Column pruning applies at any root. The driver's bottom-up
+        // Column pruning applies at any root. The pipeline's bottom-up
         // traversal means this rule also fires at interior nodes; the
         // idempotent structure of prune_inner (same inputs -> same
         // outputs) makes that harmless — after the first fixed-point
@@ -311,7 +311,7 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

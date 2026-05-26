@@ -1,12 +1,9 @@
-//! Rule-based optimization (RBO) phase: tree-level fixed-point rewrites
-//! over `LogicalPlan` before Memo insertion.
+//! Query logical rewrite rule library.
 //!
-//! Mirrors StarRocks FE's `TaskScheduler.rewriteIterative` model: a
-//! shared `RewriteRule` trait, a single bottom-up driver, and a central
-//! `RuleSet`. Rules are pure local rewrites; the driver owns traversal
-//! and iteration.
+//! The execution driver lives in `sql::optimizer::rewrite`. This module keeps
+//! the existing query rule implementations and utility helpers while the new
+//! rewrite framework owns traversal, fixed-point iteration, disabling, and
+//! tracing.
 
-pub(crate) mod driver;
-pub(crate) mod rule;
 pub(crate) mod rules;
 pub(crate) mod utils;

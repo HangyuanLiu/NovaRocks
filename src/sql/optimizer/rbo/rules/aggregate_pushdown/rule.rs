@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::optimizer::rbo::rule::RewriteRule;
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -45,7 +45,7 @@ impl RewriteRule for AggregatePushdownRule {
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{AggregateNode, ScanNode};
     use arrow::datatypes::DataType;

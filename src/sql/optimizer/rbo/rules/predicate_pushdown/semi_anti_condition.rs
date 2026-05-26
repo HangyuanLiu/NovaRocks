@@ -9,20 +9,20 @@
 //!     ON (corr)
 //!
 //! Matches `LogicalJoin` with a SEMI/ANTI join_type AND an inner condition
-//! from which at least one conjunct is right-only. One step — the driver's
+//! from which at least one conjunct is right-only. One step — the rewrite pipeline's
 //! fixed-point and other rules (e.g. PushDownPredicateScan) take over on
 //! the pushed filter afterwards.
 //!
 //! Mirrors legacy `push_semi_condition_into_children` from
 //! `src/sql/optimizer/predicate_pushdown.rs`. Ported verbatim except for
-//! being exposed through the RewriteRule trait.
+//! being exposed through the new logical rewrite rule trait.
 
-use super::super::super::rule::RewriteRule;
 use crate::sql::analysis::{JoinKind, TypedExpr};
 use crate::sql::optimizer::rbo::utils::{
     collect_column_refs, collect_output_columns, collect_qualified_column_refs,
     collect_qualified_output_columns, combine_and, split_and,
 };
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushSemiAntiRightOnlyCondition;
@@ -115,7 +115,7 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

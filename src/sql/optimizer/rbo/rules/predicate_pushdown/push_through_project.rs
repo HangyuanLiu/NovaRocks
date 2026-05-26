@@ -3,20 +3,20 @@
 //! Pushes conjuncts that reference only pass-through (i.e. bare
 //! `ColumnRef`) projection items below the Project, leaving conjuncts
 //! that touch computed expressions as a residual Filter above. One step
-//! only — the driver's bottom-up walker will push further at the next
+//! only — the rewrite pipeline's bottom-up walker will push further at the next
 //! round.
 //!
 //! Mirrors the `LogicalPlan::Project(proj)` arm of legacy
 //! `predicate_pushdown::push_filter_into`, with the difference that this
-//! rule does NOT recurse (driver owns traversal).
+//! rule does NOT recurse; the rewrite framework owns traversal.
 
 use std::collections::HashSet;
 
-use super::super::super::rule::RewriteRule;
 use crate::sql::analysis::ExprKind;
 use crate::sql::optimizer::rbo::utils::{
     collect_column_refs, combine_and, split_and, wrap_remaining_filter,
 };
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateProject;
@@ -92,7 +92,7 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 

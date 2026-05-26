@@ -1,4 +1,4 @@
-//! Per-optimize-call configuration shared by the RBO and CBO drivers.
+//! Per-optimize-call configuration shared by logical rewrite and CBO drivers.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -37,13 +37,13 @@ pub(crate) fn current_session_optimizer_settings() -> SessionOptimizerSettings {
 
 /// Controls which rules fire and bounds resource use.
 ///
-/// Constructed once per `optimize()` call. Held by both the RBO driver
-/// (`rbo::driver::rewrite_to_fixed_point`) and the CBO search loop. Rule
-/// names live in a single namespace shared across `RewriteRule` (RBO) and
-/// `Rule` (CBO); names must be unique across both trait families.
+/// Constructed once per `optimize()` call. Held by both the logical rewrite
+/// pipeline and the CBO search loop. Rule names live in a single namespace
+/// shared across logical rewrite and CBO rules; names must be unique across
+/// both rule families.
 pub(crate) struct OptimizerOptions {
     disabled_rules: HashSet<String>,
-    /// Hard cap on the RBO driver's tree-level fixed-point loop.
+    /// Hard cap on each logical rewrite stage's tree-level fixed-point loop.
     pub rbo_max_iterations: usize,
     /// Hard cap on the CBO Memo group count (existing constant; documented here).
     #[allow(dead_code)]
