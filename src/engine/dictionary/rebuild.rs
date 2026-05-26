@@ -24,6 +24,13 @@ use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 /// columns. Returns the number of snapshots that were persisted. Both
 /// StarRocks and Iceberg backends are handled; any other backend (or no
 /// metadata provider configured) results in `Ok(0)`.
+///
+/// This path is best-effort with respect to concurrent writes: a write that
+/// commits between the per-column `SELECT DISTINCT` scan and `upsert_snapshot`
+/// may leave a freshly-persisted Active snapshot that already observes a
+/// pre-write watermark. The next successful write invokes `mark_table_stale`,
+/// which flips the snapshot into STALE so subsequent queries see it as
+/// missing.
 pub(crate) fn rebuild_for_analyze_full(
     state: &Arc<StandaloneState>,
     database: &str,
@@ -180,6 +187,13 @@ fn is_string_or_binary(ty: &DataType) -> bool {
     )
 }
 
+/// Escape every backtick in `s` by doubling it, matching MySQL's identifier
+/// quoting rules. The caller is responsible for wrapping the result in
+/// backticks.
+fn quote_backticks(s: &str) -> String {
+    s.replace('`', "``")
+}
+
 /// Issue `SELECT DISTINCT <column> FROM <db>.<table> WHERE <column> IS NOT
 /// NULL ORDER BY <column>` against the standalone engine and assign monotonic
 /// ids starting at 1 in result order.
@@ -189,13 +203,14 @@ fn collect_distinct_values(
     table: &str,
     column: &ColumnDef,
 ) -> Result<Vec<DictionaryValue>, String> {
+    let escaped_column = quote_backticks(&column.name);
     let sql = format!(
         "SELECT DISTINCT `{}` FROM `{}`.`{}` WHERE `{}` IS NOT NULL ORDER BY `{}`",
-        column.name.replace('`', "``"),
-        database.replace('`', "``"),
-        table.replace('`', "``"),
-        column.name.replace('`', "``"),
-        column.name.replace('`', "``"),
+        escaped_column,
+        quote_backticks(database),
+        quote_backticks(table),
+        escaped_column,
+        escaped_column,
     );
     let statement = crate::sql::parser::parse_normalized_sql_raw(&sql)
         .map_err(|e| format!("dictionary distinct parse failed: {e}"))?;
@@ -373,12 +388,11 @@ mod tests {
     }
 
     #[test]
-    fn analyze_sample_does_not_build_dictionary() {
-        // ANALYZE SAMPLE never invokes rebuild_for_analyze_full from
-        // handle_analyze_statement; verify by directly probing the metadata
-        // store after no rebuild calls have happened.
+    fn empty_state_has_no_snapshots() {
+        // A freshly-opened metadata store should return no active snapshot for
+        // an arbitrary owner; this guards against accidental snapshots leaking
+        // into the store on initialization.
         let (_dir, state) = open_state();
-        // No upsert calls — assert the snapshot lookup is empty.
         let manager = &state.dictionary_manager;
         let owner = DictionaryOwner::StarRocksTable {
             database: "demo".to_string(),

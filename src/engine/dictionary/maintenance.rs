@@ -20,6 +20,57 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::dictionary::model::DictionaryOwner;
 use crate::sql::catalog::ScanSource;
 
+/// Enumerate dictionary owners for every table in `namespace_target`. Used by
+/// DROP DATABASE to invalidate dictionaries for all child tables before the
+/// namespace itself is removed. Best-effort: missing or partially-registered
+/// tables are silently skipped (the DROP path is already best-effort).
+pub(crate) fn collect_namespace_owners(
+    state: &Arc<StandaloneState>,
+    namespace_target: &TargetBackend,
+) -> Vec<DictionaryOwner> {
+    let mut owners = Vec::new();
+    match namespace_target.backend_name {
+        "starrocks" => {
+            let starrocks = state
+                .starrocks_table
+                .read()
+                .expect("standalone StarRocks table read lock");
+            let Ok(tables) = starrocks.list_tables_in_database(&namespace_target.namespace) else {
+                return owners;
+            };
+            for table_name in tables {
+                if let Ok(runtime) = starrocks.table(&namespace_target.namespace, &table_name) {
+                    owners.push(DictionaryOwner::StarRocksTable {
+                        database: runtime.database_name.clone(),
+                        table: runtime.table.name.clone(),
+                        db_id: runtime.table.db_id,
+                        table_id: runtime.table.table_id,
+                    });
+                }
+            }
+        }
+        "iceberg" => {
+            // The standalone catalog mirrors registered iceberg tables under
+            // the namespace; iterate everything that resolves there.
+            let logical = state.catalog.read().expect("standalone catalog read lock");
+            for table_name in logical.table_names_in_database(&namespace_target.namespace) {
+                if let Ok(table_def) = logical.get(&namespace_target.namespace, &table_name)
+                    && let ScanSource::IcebergDataFiles { table: info, .. } = &table_def.source
+                {
+                    owners.push(DictionaryOwner::IcebergTable {
+                        catalog: info.catalog.clone(),
+                        namespace: info.namespace.clone(),
+                        table: info.table.clone(),
+                        table_uuid: info.table_uuid.clone(),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    owners
+}
+
 pub(crate) fn mark_table_stale(
     state: &StandaloneState,
     owner: &DictionaryOwner,
