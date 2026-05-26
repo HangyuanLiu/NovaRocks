@@ -2523,6 +2523,7 @@ fn explain_analyze_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
@@ -2553,6 +2554,7 @@ fn explain_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
 
     let mut lines = Vec::new();
@@ -2609,6 +2611,7 @@ pub(crate) fn execute_query_with_options(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or

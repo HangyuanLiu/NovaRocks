@@ -3,10 +3,16 @@
 //! Distinct from `crate::sql::optimizer::rewrite::context::RewriteContext`:
 //! this struct lives for one application of
 //! `LowCardinalityDictionaryRewriteRule` and tracks the dict-eligible
-//! scan columns plus the boundaries where dict columns must be decoded
-//! back to their string form.
+//! scan columns (keyed by `ScanColumnKey`).
+//!
+//! Per-subtree column visibility — i.e. "in this branch of the plan,
+//! which output column name resolves to which dict column / snapshot"
+//! — lives on the `DictScope` value that the rewriter threads up
+//! through its recursive calls, *not* on this context. That separation
+//! is what stops two scans with a column of the same name from
+//! colliding in a single global map.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::dictionary::model::DictionarySnapshot;
@@ -31,27 +37,53 @@ impl ScanColumnKey {
     }
 }
 
-/// State accumulated by the rule's collector and consumed by the
+/// What the rewriter needs to know about a single dict-encoded column
+/// that is currently visible in a subtree's output. `string_column` is
+/// the name the column is published under in the current scope (may
+/// differ from the base scan column name due to Project aliases);
+/// `dict_column` is the synthetic Int32 slot the scan emits; `snapshot`
+/// is the dictionary itself.
+#[derive(Clone, Debug)]
+pub(crate) struct DictBinding {
+    pub dict_column: String,
+    pub snapshot: Arc<DictionarySnapshot>,
+}
+
+/// Per-subtree map from the current scope's output column name to its
+/// dict binding. Threaded as a return value alongside each rewritten
+/// subtree so two scans of the same logical column name in different
+/// branches cannot collide (each branch carries its own scope).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DictScope {
+    bindings: BTreeMap<String, DictBinding>,
+}
+
+impl DictScope {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&mut self, output_name: String, binding: DictBinding) {
+        self.bindings
+            .insert(output_name.to_ascii_lowercase(), binding);
+    }
+
+    pub(crate) fn get(&self, output_name: &str) -> Option<&DictBinding> {
+        self.bindings.get(&output_name.to_ascii_lowercase())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+/// Rule-global state accumulated by the collector and consumed by the
 /// rewriter. Conservative by design: any scan-side dictionary column
 /// that reaches a node the rewriter does not understand is decoded
 /// before that node.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DictionaryRewriteContext {
     scan_columns: BTreeMap<ScanColumnKey, Arc<DictionarySnapshot>>,
-    string_to_dict_column: BTreeMap<String, String>,
-    /// Map from dict column name back to the original string column
-    /// name. Used by the rewriter when materializing a `Decode` node.
-    dict_to_string_column: BTreeMap<String, String>,
-    /// Reverse lookup from string column to the snapshot used to encode
-    /// it. Needed when the rewriter inserts a `Decode` and must locate
-    /// the `dict_column` and snapshot mapping.
-    string_to_snapshot: BTreeMap<String, Arc<DictionarySnapshot>>,
-    /// Decode boundaries collected by the collector (string columns
-    /// that must be available in string form to a downstream consumer
-    /// such as Sort with non-order-preserving snapshot, Window, set
-    /// op, etc.).
-    #[allow(dead_code)] // reserved for Task 8 join/union refinements
-    decode_boundaries: BTreeSet<String>,
     changed: bool,
 }
 
@@ -72,31 +104,8 @@ impl DictionaryRewriteContext {
         key: ScanColumnKey,
         snapshot: DictionarySnapshot,
     ) {
-        let dict_column = Self::dict_column_name(&key.table, &key.column);
         let snapshot = Arc::new(snapshot);
-        let string_name = key.column.clone();
-        self.scan_columns.insert(key, snapshot.clone());
-        self.string_to_dict_column
-            .insert(string_name.clone(), dict_column.clone());
-        self.dict_to_string_column
-            .insert(dict_column.clone(), string_name.clone());
-        self.string_to_snapshot.insert(string_name, snapshot);
-    }
-
-    pub(crate) fn dict_column_for(&self, column: &str) -> Option<&str> {
-        self.string_to_dict_column
-            .get(&column.to_ascii_lowercase())
-            .map(String::as_str)
-    }
-
-    pub(crate) fn string_column_for(&self, dict_column: &str) -> Option<&str> {
-        self.dict_to_string_column
-            .get(dict_column)
-            .map(String::as_str)
-    }
-
-    pub(crate) fn snapshot_for_string(&self, column: &str) -> Option<&Arc<DictionarySnapshot>> {
-        self.string_to_snapshot.get(&column.to_ascii_lowercase())
+        self.scan_columns.insert(key, snapshot);
     }
 
     pub(crate) fn mark_changed(&mut self) {
@@ -107,8 +116,10 @@ impl DictionaryRewriteContext {
         self.changed
     }
 
-    pub(crate) fn has_any_dict_column(&self) -> bool {
-        !self.string_to_dict_column.is_empty()
+    /// True if any scan column has a registered snapshot. Used as a
+    /// fast-fail gate before running the rewriter.
+    pub(crate) fn has_any_scan_column(&self) -> bool {
+        !self.scan_columns.is_empty()
     }
 
     pub(crate) fn dict_eligible_columns_for_scan(
@@ -130,6 +141,37 @@ impl DictionaryRewriteContext {
 mod tests {
     use super::*;
 
+    fn fake_snapshot(name: &str) -> DictBinding {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryWatermark,
+        };
+        use arrow::datatypes::DataType;
+        DictBinding {
+            dict_column: format!("__nr_dict_{name}"),
+            snapshot: Arc::new(DictionarySnapshot {
+                dictionary_id: 1,
+                owner: DictionaryOwner::StarRocksTable {
+                    database: "db".to_string(),
+                    table: "t".to_string(),
+                    db_id: 1,
+                    table_id: 2,
+                },
+                column_id: Some(10),
+                column_name: name.to_string(),
+                data_type: DataType::Utf8,
+                version: 1,
+                watermark: DictionaryWatermark::Iceberg {
+                    snapshot_id: None,
+                    schema_id: 0,
+                },
+                values: vec![],
+                null_id: 0,
+                state: DictionaryState::Active,
+                order_preserving: true,
+            }),
+        }
+    }
+
     #[test]
     fn dict_column_name_lowercases() {
         assert_eq!(
@@ -139,12 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn dict_column_for_lookup_is_case_insensitive() {
-        let mut ctx = DictionaryRewriteContext::default();
-        ctx.string_to_dict_column
-            .insert("name".to_string(), "__nr_dict_t_name".to_string());
-        assert_eq!(ctx.dict_column_for("name"), Some("__nr_dict_t_name"));
-        assert_eq!(ctx.dict_column_for("NAME"), Some("__nr_dict_t_name"));
-        assert!(ctx.dict_column_for("other").is_none());
+    fn scope_lookup_is_case_insensitive() {
+        let mut scope = DictScope::new();
+        scope.insert("Name".to_string(), fake_snapshot("name"));
+        assert!(scope.get("name").is_some());
+        assert!(scope.get("NAME").is_some());
+        assert!(scope.get("other").is_none());
     }
 }

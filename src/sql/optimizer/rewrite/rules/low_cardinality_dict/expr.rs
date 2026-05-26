@@ -5,7 +5,7 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
-use super::context::DictionaryRewriteContext;
+use super::context::DictScope;
 
 pub(crate) fn is_string_like(data_type: &DataType) -> bool {
     matches!(
@@ -29,21 +29,21 @@ pub(crate) fn column_ref_name(expr: &TypedExpr) -> Option<&str> {
 }
 
 /// Rewrite a top-level column reference to point at the dict column,
-/// when the rewrite context has registered a mapping. The synthesized
+/// when `scope` exposes a binding for that column. The synthesized
 /// node carries `DataType::Int32` and preserves the source nullability.
 /// Non-`ColumnRef` expressions and unknown columns are returned
 /// unchanged.
-pub(crate) fn rewrite_column_ref(expr: &TypedExpr, ctx: &DictionaryRewriteContext) -> TypedExpr {
+pub(crate) fn rewrite_column_ref_with_scope(expr: &TypedExpr, scope: &DictScope) -> TypedExpr {
     if let ExprKind::ColumnRef {
         column, qualifier, ..
     } = &expr.kind
-        && let Some(dict_col) = ctx.dict_column_for(column)
+        && let Some(binding) = scope.get(column)
     {
         return TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::UNSET,
                 qualifier: qualifier.clone(),
-                column: dict_col.to_string(),
+                column: binding.dict_column.clone(),
             },
             data_type: DataType::Int32,
             nullable: expr.nullable,
@@ -53,44 +53,43 @@ pub(crate) fn rewrite_column_ref(expr: &TypedExpr, ctx: &DictionaryRewriteContex
 }
 
 /// True when `expr` references (anywhere in its tree) a column that has
-/// a dict mapping. Used by the rewriter to decide whether a Project
-/// item must keep its string source available (i.e. insert a Decode
-/// boundary) or can be rewritten to the dict column.
+/// a dict mapping in `scope`. Used by the rewriter to decide whether a
+/// Project item must keep its string source available (i.e. insert a
+/// Decode boundary) or can be rewritten to the dict column.
 ///
 /// `TODO(task-8)`: consumed by Task 8 when the rewriter inspects
 /// project items and join predicates for derived dictionary usage.
 #[allow(dead_code)]
-pub(crate) fn expr_references_string_column(
-    expr: &TypedExpr,
-    ctx: &DictionaryRewriteContext,
-) -> bool {
+pub(crate) fn expr_references_string_column(expr: &TypedExpr, scope: &DictScope) -> bool {
     match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => ctx.dict_column_for(column).is_some(),
+        ExprKind::ColumnRef { column, .. } => scope.get(column).is_some(),
         ExprKind::Literal(_) | ExprKind::LambdaParamRef { .. } => false,
         ExprKind::BinaryOp { left, right, .. } => {
-            expr_references_string_column(left, ctx) || expr_references_string_column(right, ctx)
+            expr_references_string_column(left, scope)
+                || expr_references_string_column(right, scope)
         }
-        ExprKind::UnaryOp { expr, .. } => expr_references_string_column(expr, ctx),
+        ExprKind::UnaryOp { expr, .. } => expr_references_string_column(expr, scope),
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            args.iter().any(|a| expr_references_string_column(a, ctx))
+            args.iter().any(|a| expr_references_string_column(a, scope))
         }
-        ExprKind::LambdaFunction { body, .. } => expr_references_string_column(body, ctx),
+        ExprKind::LambdaFunction { body, .. } => expr_references_string_column(body, scope),
         ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
-            expr_references_string_column(expr, ctx)
+            expr_references_string_column(expr, scope)
         }
         ExprKind::InList { expr, list, .. } => {
-            expr_references_string_column(expr, ctx)
-                || list.iter().any(|e| expr_references_string_column(e, ctx))
+            expr_references_string_column(expr, scope)
+                || list.iter().any(|e| expr_references_string_column(e, scope))
         }
         ExprKind::Between {
             expr, low, high, ..
         } => {
-            expr_references_string_column(expr, ctx)
-                || expr_references_string_column(low, ctx)
-                || expr_references_string_column(high, ctx)
+            expr_references_string_column(expr, scope)
+                || expr_references_string_column(low, scope)
+                || expr_references_string_column(high, scope)
         }
         ExprKind::Like { expr, pattern, .. } => {
-            expr_references_string_column(expr, ctx) || expr_references_string_column(pattern, ctx)
+            expr_references_string_column(expr, scope)
+                || expr_references_string_column(pattern, scope)
         }
         ExprKind::Case {
             operand,
@@ -99,16 +98,17 @@ pub(crate) fn expr_references_string_column(
         } => {
             operand
                 .as_deref()
-                .is_some_and(|e| expr_references_string_column(e, ctx))
+                .is_some_and(|e| expr_references_string_column(e, scope))
                 || when_then.iter().any(|(w, t)| {
-                    expr_references_string_column(w, ctx) || expr_references_string_column(t, ctx)
+                    expr_references_string_column(w, scope)
+                        || expr_references_string_column(t, scope)
                 })
                 || else_expr
                     .as_deref()
-                    .is_some_and(|e| expr_references_string_column(e, ctx))
+                    .is_some_and(|e| expr_references_string_column(e, scope))
         }
         ExprKind::IsTruthValue { expr, .. } | ExprKind::Nested(expr) => {
-            expr_references_string_column(expr, ctx)
+            expr_references_string_column(expr, scope)
         }
         ExprKind::WindowCall {
             args,
@@ -116,15 +116,15 @@ pub(crate) fn expr_references_string_column(
             order_by,
             ..
         } => {
-            args.iter().any(|e| expr_references_string_column(e, ctx))
+            args.iter().any(|e| expr_references_string_column(e, scope))
                 || partition_by
                     .iter()
-                    .any(|e| expr_references_string_column(e, ctx))
+                    .any(|e| expr_references_string_column(e, scope))
                 || order_by
                     .iter()
-                    .any(|s| expr_references_string_column(&s.expr, ctx))
+                    .any(|s| expr_references_string_column(&s.expr, scope))
         }
         ExprKind::SubqueryPlaceholder { .. } => false,
-        ExprKind::Lambda { body, .. } => expr_references_string_column(body, ctx),
+        ExprKind::Lambda { body, .. } => expr_references_string_column(body, scope),
     }
 }
