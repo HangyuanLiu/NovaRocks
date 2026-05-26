@@ -1,8 +1,10 @@
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+use crate::sql::optimizer::statistics::TableStatistics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteConsumer {
@@ -38,6 +40,8 @@ pub(crate) struct RewriteContext {
     policy: RewritePolicy,
     trace: RewriteTrace,
     extension: Option<Arc<dyn Any + Send + Sync>>,
+    query_table_stats: Option<Arc<HashMap<String, TableStatistics>>>,
+    deadline: Option<Instant>,
 }
 
 impl RewriteContext {
@@ -48,6 +52,8 @@ impl RewriteContext {
             policy: RewritePolicy::default(),
             trace: RewriteTrace::default(),
             extension: None,
+            query_table_stats: None,
+            deadline: None,
         }
     }
 
@@ -101,6 +107,29 @@ impl RewriteContext {
     {
         self.extension.as_ref()?.downcast_ref::<T>()
     }
+
+    pub(crate) fn set_query_table_stats(&mut self, table_stats: HashMap<String, TableStatistics>) {
+        self.query_table_stats = Some(Arc::new(table_stats));
+    }
+
+    pub(crate) fn query_table_stats(&self) -> Option<&HashMap<String, TableStatistics>> {
+        self.query_table_stats.as_deref()
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() > deadline)
+        {
+            Err(format!("optimizer timeout during {operation}"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +181,22 @@ mod tests {
             Some(&TestExtension { value: 7 })
         );
         assert!(ctx.extension::<String>().is_none());
+    }
+
+    #[test]
+    fn query_context_exposes_table_statistics() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "db.tbl".to_string(),
+            TableStatistics {
+                row_count: 10,
+                column_stats: HashMap::new(),
+            },
+        );
+
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_table_stats(stats);
+
+        assert!(ctx.query_table_stats().unwrap().contains_key("db.tbl"));
     }
 }

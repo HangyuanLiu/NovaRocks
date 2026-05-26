@@ -9,8 +9,8 @@
 
 use std::collections::HashSet;
 
-use super::super::super::rule::RewriteRule;
 use crate::sql::optimizer::rbo::utils::{collect_column_refs, split_and, wrap_remaining_filter};
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateScan;
@@ -55,7 +55,7 @@ impl RewriteRule for PushDownPredicateScan {
         }
 
         if !pushed_any {
-            // No change — re-wrap the untouched filter so the driver's
+            // No change — re-wrap the untouched filter so the pipeline's
             // "Option::None = no-op" contract holds.
             return None;
         }
@@ -68,7 +68,7 @@ impl RewriteRule for PushDownPredicateScan {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn returns_none_when_nothing_pushed() {
         // Filter references a column the scan does not expose — nothing
-        // is pushable; rule must return None so the driver's fixed-point
+        // is pushable; rule must return None so the pipeline's fixed-point
         // terminates on this shape.
         let scan = scan_with_cols(&["a"]);
         let filter = LogicalPlan::Filter(FilterNode {

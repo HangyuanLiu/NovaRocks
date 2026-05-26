@@ -3,13 +3,13 @@
 //!
 //! **Convention exception.** Like PruneColumns, this rule recurses
 //! internally: it takes the full plan tree, finds inner-join chains,
-//! flattens them, runs cost-based reorder, and rebuilds. The RBO driver's
-//! bottom-up traversal can't express global join-graph optimization.
+//! flattens them, runs cost-based reorder, and rebuilds. A generic
+//! bottom-up local traversal can't express global join-graph optimization.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::optimizer::rbo::rule::RewriteRule;
+use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -59,7 +59,7 @@ impl RewriteRule for JoinReorderRule {
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{TableDef, ScanSource};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::ScanNode;
     use arrow::datatypes::DataType;

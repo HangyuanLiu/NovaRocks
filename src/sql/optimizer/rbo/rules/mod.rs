@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::rule::RewriteRule;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) mod aggregate_pushdown;
@@ -12,7 +12,7 @@ pub(crate) mod join_reorder;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ukfk;
 
-pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
+pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(column_pruning::PruneColumns),
         Box::new(ukfk::PruneUkFkJoin),
@@ -28,7 +28,7 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn RewriteRule>> {
 /// causes the needed-column set to shrink across iterations as
 /// predicates get reshuffled, incorrectly dropping join-key or
 /// select-list columns from scan required_columns.
-pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
+pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     predicate_pushdown::predicate_pushdown_rules()
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn predicate_pushdown_rbo_rules() -> Vec<Box<dyn RewriteRule>> {
 #[allow(dead_code)]
 pub(crate) fn join_reorder_rules(
     table_stats: &HashMap<String, TableStatistics>,
-) -> Vec<Box<dyn RewriteRule>> {
+) -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![Box::new(join_reorder::JoinReorderRule::new(Arc::new(
         table_stats.clone(),
     )))]
@@ -51,7 +51,7 @@ pub(crate) fn join_reorder_rules(
 #[allow(dead_code)]
 pub(crate) fn all_rbo_rules(
     table_stats: &HashMap<String, TableStatistics>,
-) -> Vec<Box<dyn RewriteRule>> {
+) -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
     all.extend(predicate_pushdown_rbo_rules());
     all.extend(column_pruning_rules());

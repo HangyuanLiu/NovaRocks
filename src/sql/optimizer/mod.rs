@@ -43,7 +43,7 @@ const EXPLORE_MAX_GROUPS: usize = 5000;
 
 /// Main entry point for the Cascades optimizer.
 ///
-/// Takes a logical plan and table statistics, applies RBO rewrites,
+/// Takes a logical plan and table statistics, applies query logical rewrites,
 /// converts to Memo, explores logical alternatives, generates physical
 /// alternatives, runs top-down cost-based search with property enforcement,
 /// and extracts the best physical plan.
@@ -54,51 +54,18 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
-    // 1. RBO four-pass pattern: push → reorder → push → prune.
-    //    Matches the legacy pipeline exactly:
-    //    - push_down_predicates
-    //    - reorder_joins_cbo
-    //    - push_down_predicates (again, catches post-reorder opportunities)
-    //    - prune_columns (LAST — sees the final stable plan)
-    //
-    //    Column pruning MUST run after all pushdown + reorder passes are
-    //    complete. Mixing PruneColumns with PushDownPredicate in a fixed-
-    //    point loop causes the needed-column set to shrink across iterations
-    //    (predicates get reshuffled between join conditions), incorrectly
-    //    dropping join-key or select-list columns from scan required_columns.
+    // 1. Query logical rewrite pipeline. The ordered stages preserve the
+    //    legacy-safe sequence: pushdown → join reorder → pushdown →
+    //    aggregate pushdown → column pruning.
     let session_settings = options::current_session_optimizer_settings();
     let options = options::OptimizerOptions::from_session(&session_settings);
     let mut rewrite_ctx =
         rewrite::context::RewriteContext::for_query(session_settings.disabled_rules.clone());
-    let plan = rewrite::registry::query_rewrite_pipeline().rewrite(plan, &mut rewrite_ctx)?;
-    let rewritten = rbo::driver::rewrite_to_fixed_point(
-        plan,
-        &rbo::rules::predicate_pushdown_rbo_rules(),
-        &options,
-        deadline,
-    )?;
-    let rewritten = rbo::rules::join_reorder::reorder_joins_cbo(rewritten, table_stats);
-    let rewritten = rbo::driver::rewrite_to_fixed_point(
-        rewritten,
-        &rbo::rules::predicate_pushdown_rbo_rules(),
-        &options,
-        deadline,
-    )?;
-    // OPT-1: aggregate pushdown. Runs after predicates settle and joins
-    // are reordered (so the join shape is final), but before column
-    // pruning (which needs to see the partial aggregate's required cols).
-    let rewritten = rbo::driver::rewrite_to_fixed_point(
-        rewritten,
-        &rbo::rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
-        &options,
-        deadline,
-    )?;
-    let rewritten = rbo::driver::rewrite_to_fixed_point(
-        rewritten,
-        &rbo::rules::column_pruning_rules(),
-        &options,
-        deadline,
-    )?;
+    rewrite_ctx.policy_mut().max_iterations = options.rbo_max_iterations;
+    rewrite_ctx.set_query_table_stats(table_stats.clone());
+    rewrite_ctx.set_deadline(deadline);
+    let rewritten =
+        rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
 
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
@@ -142,8 +109,8 @@ pub(crate) fn optimize(
 }
 
 /// True if `name` is the stable name of any rule that participates in
-/// the standard `optimize()` rule pipelines (RBO predicate pushdown,
-/// RBO column pruning, CBO transformations, CBO implementations).
+/// the standard `optimize()` rule pipelines (query logical rewrite,
+/// CBO transformations, CBO implementations).
 ///
 /// Used by the server-side `SET disable_optimizer_rules` parser to
 /// detect typos in rule names so they can be surfaced via `warn!`
@@ -153,12 +120,6 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
         .iter()
         .any(|r| r.name() == name)
         || rules::all_implementation_rules()
-            .iter()
-            .any(|r| r.name() == name)
-        || rbo::rules::predicate_pushdown_rbo_rules()
-            .iter()
-            .any(|r| r.name() == name)
-        || rbo::rules::column_pruning_rules()
             .iter()
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
@@ -305,7 +266,7 @@ mod is_known_rule_name_tests {
     use super::*;
 
     #[test]
-    fn optimize_accepts_empty_query_rewrite_pipeline() {
+    fn optimize_accepts_migrated_query_rewrite_pipeline() {
         use std::collections::HashMap;
 
         use crate::sql::column_id::ColumnRefFactory;

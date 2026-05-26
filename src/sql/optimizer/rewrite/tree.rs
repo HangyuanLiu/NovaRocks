@@ -246,13 +246,11 @@ fn rewrite_plan_list(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use arrow::datatypes::DataType;
 
     use super::rewrite_with_rule;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -389,9 +387,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             iceberg_table: None,
-            storage: TableStorage::LocalParquetFile {
-                path: PathBuf::from("/tmp/rewrite-test.parquet"),
-            },
+            source: ScanSource::StarRocks,
         }
     }
 

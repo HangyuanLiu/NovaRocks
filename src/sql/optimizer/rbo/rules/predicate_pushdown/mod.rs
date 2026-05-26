@@ -5,7 +5,7 @@
 //!
 //! Unlike `PruneColumns` (documented exception — top-down, recurses
 //! internally), these rules follow the convention: `apply` performs one
-//! shape rewrite at this node only; the driver's bottom-up + fixed-point
+//! shape rewrite at this node only; the rewrite pipeline's bottom-up + fixed-point
 //! walker handles traversal and repeated firing.
 //!
 //! Replaces the legacy `src/sql/optimizer/predicate_pushdown.rs` single
@@ -19,10 +19,10 @@ pub(crate) mod push_to_join;
 pub(crate) mod push_to_scan;
 pub(crate) mod semi_anti_condition;
 
-use super::super::rule::RewriteRule;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 
 /// Every predicate-pushdown rule in canonical application order.
-pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn RewriteRule>> {
+pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(push_to_scan::PushDownPredicateScan),
         Box::new(push_through_project::PushDownPredicateProject),
