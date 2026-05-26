@@ -12,24 +12,40 @@ use super::context::DictScope;
 /// represented as a query-local derived dictionary on top of a dict-encoded
 /// source column. Used by Task 8 item 4 (derived dictionary expressions).
 ///
-/// TODO(task-8-derived): wire this into the rewriter and codegen — Task 8
-/// keeps the list here as the contract surface but does not yet allocate
-/// query-local dict slots for derived expressions. See item 4 in the plan
+/// TODO(post-Task-9): Derived dict expressions (upper/lower/trim/ltrim/rtrim)
+/// require emitting `TExprNodeType::DICT_EXPR` into `FragmentBuildResult`,
+/// extending `query_global_dict_exprs`, and threading new state from the
+/// rewriter into codegen. Not exercised by the Task 9 SQL goldens — defer
+/// until a query case actually demands it. See item 4 in the plan
 /// (`docs/superpowers/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`).
 #[allow(dead_code)]
 pub(crate) const DERIVED_DICT_FUNCTIONS: &[&str] = &["upper", "lower", "trim", "ltrim", "rtrim"];
 
-/// Allowlist of aggregate function names whose argument may consume a dict
-/// id slot directly (without a preceding Decode). For `min` / `max` the
-/// rewriter additionally requires the snapshot to be order-preserving.
-pub(crate) const DICT_AGG_FUNCTIONS: &[&str] = &[
-    "count",
-    "min",
-    "max",
-    "any_value",
-    "array_agg",
-    "approx_count_distinct",
-];
+/// Allowlist of aggregate functions whose argument may consume a dict-id
+/// slot directly (without a preceding Decode).
+///
+/// Only aggregates whose *result type* is independent of the dict-encoded
+/// string argument are safe here:
+///
+/// * `count` — returns BIGINT regardless of input encoding.
+/// * `approx_count_distinct` — returns BIGINT regardless of input encoding.
+///
+/// `DISTINCT` is safe for both functions because dict ids are 1:1 with
+/// source strings (the dictionary is the encoding of the column's distinct
+/// values), so distinct-on-id and distinct-on-string produce the same
+/// cardinality.
+///
+/// TODO(task-8-min-max): `min` / `max` / `any_value` / `array_agg` look
+/// tempting (their argument is a single string column), but rewriting them
+/// to take a dict-id argument makes the aggregate emit `Int32` dict ids
+/// while the declared `OutputColumn` is still the source string type
+/// (Utf8 / LargeUtf8). Downstream consumers would silently see typed-as-
+/// Utf8 values that are actually dict ids — a wrong-result bug. A correct
+/// rewrite needs to also decode the aggregate's result column (similar to
+/// the group-by Decode boundary in `rewrite_aggregate`), which is a non-
+/// trivial refactor of the aggregate path. Deferred until that result-
+/// column decode is built out.
+pub(crate) const DICT_AGG_FUNCTIONS: &[&str] = &["count", "approx_count_distinct"];
 
 /// True when two dictionary snapshots are compatible enough that a Join /
 /// UNION ALL can safely compare and union their dict id columns directly,
@@ -41,10 +57,22 @@ pub(crate) const DICT_AGG_FUNCTIONS: &[&str] = &[
 /// * `version` — same on-disk encoding of the dictionary.
 /// * `column_name` (case-insensitive) — same logical column.
 ///
-/// `order_preserving` and `null_id` are intentionally NOT part of the key:
-/// equi-join / UNION ALL semantics only need the encoding to agree, not the
-/// ordering relation.
+/// `order_preserving` is intentionally NOT part of the key: equi-join /
+/// UNION ALL semantics only need the encoding to agree, not the ordering
+/// relation.
+///
+/// Two compatible snapshots must also encode NULL to the same id. Today
+/// ANALYZE FULL always sets `null_id = 0`, so this is a global invariant
+/// and the helper relies on it (it does not compare `null_id`
+/// structurally). If a future code path produces a snapshot with
+/// `null_id != 0`, this helper must be updated to compare `null_id` too —
+/// otherwise dict-id equality on a NULL row would diverge from string
+/// equality. The `debug_assert!` below pins the invariant in debug builds.
 pub(crate) fn dict_keys_compatible(left: &DictionarySnapshot, right: &DictionarySnapshot) -> bool {
+    debug_assert_eq!(
+        left.null_id, right.null_id,
+        "dict_keys_compatible relies on a shared null_id; ANALYZE FULL must use null_id = 0"
+    );
     left.owner.stable_key() == right.owner.stable_key()
         && left.version == right.version
         && left.column_name.eq_ignore_ascii_case(&right.column_name)

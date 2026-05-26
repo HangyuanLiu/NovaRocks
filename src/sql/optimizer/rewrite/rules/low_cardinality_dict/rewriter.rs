@@ -12,10 +12,14 @@
 //!   dict slot; if the aggregate exposes a string group-by column
 //!   upward, insert a `Decode` above the aggregate so consumers still
 //!   see the string value. Aggregate function arguments are routed
-//!   through `DICT_AGG_FUNCTIONS`: `count` / `any_value` / `array_agg`
-//!   / `approx_count_distinct` may consume the dict id directly,
-//!   `min` / `max` may only when the snapshot is order-preserving, and
-//!   anything else falls back to a per-aggregate decode of the input.
+//!   through `DICT_AGG_FUNCTIONS`: `count` and `approx_count_distinct`
+//!   may consume the dict id directly (their result type — BIGINT — is
+//!   independent of the input encoding); anything else keeps its
+//!   string-column argument, which the scan still emits alongside the
+//!   dict slot. `min` / `max` / `any_value` / `array_agg` are
+//!   intentionally NOT rewritten today — they would emit Int32 dict ids
+//!   under a still-Utf8 result column. See the TODO(task-8-min-max) note
+//!   on `DICT_AGG_FUNCTIONS` in `expr.rs`.
 //! * `Sort` / `TopN-via-Sort`: when a sort key has an order-preserving
 //!   snapshot, rewrite the key to the dict slot; otherwise insert a
 //!   `Decode` between the sort and its input so the sort still sees
@@ -27,8 +31,14 @@
 //! * `Join` (Task 8 item 1): hash-join equality predicates over two
 //!   dict-encoded sides whose snapshots are `dict_keys_compatible`
 //!   keep dict columns on BOTH sides and compare on the dict id slot.
-//!   Otherwise each side is wrapped in a Decode below the join. Non-
-//!   equality conditions always decode.
+//!   Otherwise each side is wrapped in a Decode below the join.
+//!   Non-equality conjuncts (e.g. `<`, `>`, `LIKE`, function calls) are
+//!   not rewritten, and any column they reference is decoded below the
+//!   join so the predicate sees strings. This applies uniformly to
+//!   `Inner` and `Cross` joins today; outer / semi / anti join variants
+//!   are pinned by tests and follow the same rewrite (the join itself
+//!   generates the NULL on unmatched outer rows — the equi-key
+//!   comparison is unchanged regardless of `JoinKind`).
 //! * `Union` (Task 8 item 2): UNION ALL preserves dict columns only
 //!   when *every* input exposes the same `dict_keys_compatible`
 //!   snapshot for that output column; otherwise every input is
@@ -113,13 +123,17 @@ fn rewrite_node(
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::Repeat(_)
         | LogicalPlan::SubqueryAlias(_)
-        // TODO(task-8-cte): multi-consumer CTEs with matching dict
+        // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
-        // on the producer output. Task 8 keeps the conservative
-        // behaviour (decode at the producer / consumer boundary) and
-        // pins it in `cte_anchor_always_decodes_at_boundary`. Single-
-        // use CTEs are already inlined before this rule runs, so the
-        // observable surface here is narrow.
+        // on the producer output. Doing so requires a fix-up pass over
+        // every consumer of a `CTEProduce` (the current top-down
+        // rewrite cannot see all consumers while rewriting the
+        // producer). Task 8 keeps the conservative behaviour (decode
+        // at the producer / consumer boundary) and pins it in
+        // `cte_anchor_always_decodes_at_boundary`. Single-use CTEs are
+        // already inlined before this rule runs, so the observable
+        // surface here is narrow. Deferred until a Task 9+ query case
+        // demands it.
         | LogicalPlan::CTEAnchor(_)
         | LogicalPlan::CTEProduce(_) => decode_boundary(plan, ctx),
         // Leaves that produce no dict columns of their own.
@@ -402,17 +416,23 @@ fn rewrite_sort(
 
 /// Per-aggregate-call argument rewrite (Task 8 item 5).
 ///
-/// * `count(*)` — unchanged.
-/// * `count(col)` — may consume dict id; arg rewritten to dict slot.
-/// * `min(col)` / `max(col)` — may consume dict id ONLY when the
-///   snapshot is order-preserving; otherwise the arg keeps its string
-///   ref (the scan still emits the string column alongside).
-/// * `any_value` / `array_agg` / `approx_count_distinct` — may consume
-///   dict id unconditionally.
-/// * `array_agg(col ORDER BY col)` — only rewrite when the order
-///   expression is itself order-preserving on the same column.
-/// * Aggregates outside the allowlist — unchanged (their string arg
-///   remains a string column ref).
+/// * `count(*)` — unchanged (no args to rewrite).
+/// * `count(col)` / `count(DISTINCT col)` — may consume dict id; arg
+///   rewritten to the dict slot. `DISTINCT` is safe because dict ids
+///   are 1:1 with source strings.
+/// * `approx_count_distinct(col)` — same as `count(DISTINCT col)`; the
+///   distinct count over dict ids equals the distinct count over
+///   strings.
+/// * Aggregates outside the allowlist — unchanged. Their string-column
+///   argument remains a string ref; the scan still emits the original
+///   string column alongside the dict slot, so no decode is required
+///   solely for the agg-arg path. (Group-by keys are handled separately
+///   in `rewrite_aggregate` and ARE wrapped in a post-aggregate decode.)
+///
+/// `agg.distinct` is not inspected here. After narrowing the allowlist
+/// to `count` and `approx_count_distinct` (see `DICT_AGG_FUNCTIONS`),
+/// the only rewrites possible are over those two functions, and
+/// `DISTINCT` is safe for both.
 fn rewrite_aggregate_call(
     mut agg: AggregateCall,
     input_scope: &DictScope,
@@ -426,8 +446,11 @@ fn rewrite_aggregate_call(
     if lower == "count" && agg.args.is_empty() {
         return agg;
     }
-    let requires_order_preserving = matches!(lower.as_str(), "min" | "max");
 
+    // Neither `count` nor `approx_count_distinct` accepts an ORDER BY
+    // clause in SQL — but the AST node carries the slot anyway. Keep a
+    // defensive check: if the agg ever carries an ORDER BY over a
+    // non-order-preserving dict column, fall back to the string arg.
     let order_by_dict_compatible = agg.order_by.iter().all(|item| {
         match &item.expr.kind {
             ExprKind::ColumnRef { column, .. } => match input_scope.get(column) {
@@ -447,20 +470,18 @@ fn rewrite_aggregate_call(
     for arg in agg.args.drain(..) {
         if let ExprKind::ColumnRef { column, .. } = &arg.kind
             && let Some(binding) = input_scope.get(column)
+            && order_by_dict_compatible
         {
-            let order_ok = !requires_order_preserving || binding.snapshot.order_preserving;
-            if order_ok && order_by_dict_compatible {
-                // Idempotency: an already-dict-rewritten arg (post first
-                // pipeline iteration) keeps the same ColumnRef without
-                // marking the rewrite changed; otherwise the pipeline's
-                // fixed-point loop would never terminate.
-                let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
-                new_args.push(rewrite_column_ref_with_scope(&arg, input_scope));
-                if !already_dict {
-                    rewrote_any_arg = true;
-                }
-                continue;
+            // Idempotency: an already-dict-rewritten arg (post first
+            // pipeline iteration) keeps the same ColumnRef without
+            // marking the rewrite changed; otherwise the pipeline's
+            // fixed-point loop would never terminate.
+            let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+            new_args.push(rewrite_column_ref_with_scope(&arg, input_scope));
+            if !already_dict {
+                rewrote_any_arg = true;
             }
+            continue;
         }
         new_args.push(arg);
     }
@@ -524,10 +545,19 @@ fn rewrite_join(
     let mut keep_right: std::collections::BTreeSet<String> = Default::default();
     for pair in &aligned {
         keep_left.insert(pair.left_column.to_ascii_lowercase());
+        // Future-proofing: the dict column name never appears in
+        // `plan_output_columns` lookup keys today (the scan publishes it
+        // alongside the source column, and `wrap_with_decode_except`
+        // skips entries whose source name is in `keep`), so this insert
+        // is dead in the current shape. Kept so that future plans which
+        // already carry rewritten `ColumnRef`s in non-equality
+        // conjuncts — pointing at the dict column directly — still
+        // route through the keep set without an unintended decode.
         if let Some(b) = left_scope.get(&pair.left_column) {
             keep_left.insert(b.dict_column.to_ascii_lowercase());
         }
         keep_right.insert(pair.right_column.to_ascii_lowercase());
+        // See the note on `keep_left` above — same reasoning.
         if let Some(b) = right_scope.get(&pair.right_column) {
             keep_right.insert(b.dict_column.to_ascii_lowercase());
         }

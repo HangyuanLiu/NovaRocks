@@ -669,6 +669,101 @@ mod tests {
         assert_eq!(r_col, "__nr_dict_t2_name");
     }
 
+    /// Helper: build the same two-scan equi-join fixture used by
+    /// `same_dictionary_join_uses_dict_keys`, parameterized on
+    /// `JoinKind`. Returns the rewritten plan for the caller to assert
+    /// on.
+    fn run_same_dict_join_with_kind(kind: crate::sql::analysis::JoinKind) -> LogicalPlan {
+        let scan_t1 = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: make_named_table("t1", "name"),
+            alias: None,
+            columns: vec![named_output_column("name")],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        });
+        let scan_t2 = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: make_named_table("t2", "name"),
+            alias: None,
+            columns: vec![named_output_column("name")],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        });
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_t1),
+            right: Box::new(scan_t2),
+            join_type: kind,
+            condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+        });
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
+            snapshot: named_snapshot("name", true),
+        }));
+        let table_stats = HashMap::new();
+        let pipeline = query_rewrite_pipeline(&table_stats);
+        pipeline.rewrite(join, &mut ctx).unwrap()
+    }
+
+    /// Assert that the rewritten plan is a `Join` whose left/right
+    /// inputs are plain `Scan`s (no decode wrappers) and whose equi
+    /// condition compares the dict id slots on each side.
+    fn assert_dict_id_equi_join(rewritten: LogicalPlan) {
+        let LogicalPlan::Join(join) = rewritten else {
+            panic!("expected join root, got {rewritten:?}");
+        };
+        let LogicalPlan::Scan(left_scan) = *join.left else {
+            panic!("expected left scan kept dict-encoded, got {:?}", *join.left);
+        };
+        assert_eq!(left_scan.dict_columns.len(), 1);
+        let LogicalPlan::Scan(right_scan) = *join.right else {
+            panic!(
+                "expected right scan kept dict-encoded, got {:?}",
+                *join.right
+            );
+        };
+        assert_eq!(right_scan.dict_columns.len(), 1);
+        let cond = join.condition.expect("equi-join keeps a condition");
+        let Ek::BinaryOp {
+            left, op, right, ..
+        } = cond.kind
+        else {
+            panic!("expected BinaryOp condition");
+        };
+        assert!(matches!(op, BinOp::Eq));
+        let Ek::ColumnRef { column: l_col, .. } = left.kind else {
+            panic!("expected left ColumnRef in condition");
+        };
+        let Ek::ColumnRef { column: r_col, .. } = right.kind else {
+            panic!("expected right ColumnRef in condition");
+        };
+        assert_eq!(l_col, "__nr_dict_t1_name");
+        assert_eq!(r_col, "__nr_dict_t2_name");
+    }
+
+    #[test]
+    fn left_outer_same_dictionary_join_uses_dict_keys() {
+        // LEFT OUTER JOIN over two dict-encoded sides with compatible
+        // snapshots: the equi-key comparison is unchanged (the join
+        // itself generates the NULL on unmatched right rows — the
+        // equi-comparison happens before NULL padding). The rewrite
+        // must keep dict columns on both sides and compare on dict ids.
+        let rewritten = run_same_dict_join_with_kind(crate::sql::analysis::JoinKind::LeftOuter);
+        assert_dict_id_equi_join(rewritten);
+    }
+
+    #[test]
+    fn semi_same_dictionary_join_uses_dict_keys() {
+        // LEFT SEMI JOIN over two dict-encoded sides with compatible
+        // snapshots: same reasoning as the outer case — the semi-join
+        // existence test reduces to the equi-key comparison, which is
+        // safe to perform on dict ids.
+        let rewritten = run_same_dict_join_with_kind(crate::sql::analysis::JoinKind::LeftSemi);
+        assert_dict_id_equi_join(rewritten);
+    }
+
     #[test]
     fn different_dictionary_join_decodes_keys() {
         // Two scans with disagreeing dict versions per table: the
@@ -939,9 +1034,16 @@ mod tests {
     }
 
     #[test]
-    fn min_order_preserving_uses_dict_id() {
-        // MIN(s) on an order-preserving snapshot: arg may be rewritten
-        // to the dict slot.
+    fn min_order_preserving_decodes_before_aggregate() {
+        // MIN(s) on an order-preserving snapshot: even though the
+        // dictionary is order-preserving, `min` is NOT on the dict-id
+        // allowlist (`DICT_AGG_FUNCTIONS`). The reason is the result-
+        // type mismatch — rewriting the arg to the Int32 dict slot
+        // would make the aggregate emit Int32 dict ids while the
+        // declared output column type is still Utf8, a silent wrong-
+        // result bug. The rewrite must therefore keep the arg as the
+        // string column (the scan still exposes it alongside the dict
+        // slot). See `DICT_AGG_FUNCTIONS` and TODO(task-8-min-max).
         let scan = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
             table: make_table(),
@@ -970,7 +1072,7 @@ mod tests {
             already_pushed: false,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        install_provider(&mut ctx, true);
+        install_provider(&mut ctx, true); // order-preserving
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
@@ -979,9 +1081,74 @@ mod tests {
         };
         let arg = agg.aggregates[0].args.first().expect("min(s) has 1 arg");
         let Ek::ColumnRef { column, .. } = &arg.kind else {
-            panic!("min arg must be a ColumnRef");
+            panic!("min arg must remain a ColumnRef");
+        };
+        // CRITICAL: the arg must still reference the string column,
+        // NOT the Int32 dict slot — otherwise the aggregate's declared
+        // Utf8 result column would carry Int32 dict ids.
+        assert_eq!(
+            column, "s",
+            "min(s) must keep the string column even when the snapshot is order-preserving"
+        );
+        assert_eq!(arg.data_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn count_distinct_col_consumes_dict_id() {
+        // COUNT(DISTINCT s): dict ids are 1:1 with source strings, so
+        // distinct-on-dict-id has the same cardinality as
+        // distinct-on-string. The arg must be rewritten to the Int32
+        // dict slot, and the aggregate's BIGINT result is independent
+        // of the input encoding — no output-type mismatch.
+        let scan = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: make_table(),
+            alias: None,
+            columns: vec![s_output_column()],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        });
+        let aggregate = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![],
+            aggregates: vec![AggregateCall {
+                name: "count".to_string(),
+                args: vec![s_column_ref()],
+                distinct: true,
+                result_type: DataType::Int64,
+                order_by: vec![],
+            }],
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "cnt".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            already_pushed: false,
+        });
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        install_provider(&mut ctx, true);
+        let table_stats = HashMap::new();
+        let pipeline = query_rewrite_pipeline(&table_stats);
+        let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
+        let LogicalPlan::Aggregate(agg) = rewritten else {
+            panic!("expected aggregate root, got {rewritten:?}");
+        };
+        assert_eq!(agg.aggregates.len(), 1);
+        assert!(
+            agg.aggregates[0].distinct,
+            "DISTINCT flag must be preserved through the rewrite"
+        );
+        let arg = agg.aggregates[0]
+            .args
+            .first()
+            .expect("count(DISTINCT s) has 1 arg");
+        let Ek::ColumnRef { column, .. } = &arg.kind else {
+            panic!("count(DISTINCT) arg must be a ColumnRef");
         };
         assert_eq!(column, "__nr_dict_t_s");
+        assert_eq!(arg.data_type, DataType::Int32);
     }
 
     #[test]
