@@ -63,10 +63,10 @@ select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 lim
 -- query 8
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=Decode
+-- @result_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN COSTS SELECT DISTINCT c8 FROM all_t0;
+EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t0;
 
 -- query 9
 -- @retry_count=60
