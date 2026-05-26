@@ -35,17 +35,10 @@ pub(crate) fn derive_statistics(
             output_row_count: vals.rows.len() as f64,
             column_statistics: HashMap::new(),
         },
-        Operator::LogicalGenerateSeries(gs) => {
-            let rows = if gs.step != 0 {
-                ((gs.end - gs.start) / gs.step + 1).max(0) as f64
-            } else {
-                1.0
-            };
-            Statistics {
-                output_row_count: rows,
-                column_statistics: HashMap::new(),
-            }
-        }
+        Operator::LogicalGenerateSeries(gs) => Statistics {
+            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            column_statistics: HashMap::new(),
+        },
         Operator::LogicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
         }
@@ -582,17 +575,10 @@ pub(crate) fn derive_statistics(
             column_statistics: HashMap::new(),
         },
 
-        Operator::PhysicalGenerateSeries(gs) => {
-            let rows = if gs.step != 0 {
-                ((gs.end - gs.start) / gs.step + 1).max(0) as f64
-            } else {
-                1.0
-            };
-            Statistics {
-                output_row_count: rows,
-                column_statistics: HashMap::new(),
-            }
-        }
+        Operator::PhysicalGenerateSeries(gs) => Statistics {
+            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            column_statistics: HashMap::new(),
+        },
         Operator::PhysicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
         }

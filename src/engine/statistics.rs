@@ -1965,12 +1965,22 @@ fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
 fn generate_series_row_count(start: i64, end: i64, step: i64) -> i64 {
     if step == 0 {
         0
-    } else if step > 0 && start <= end {
-        ((end - start) / step) + 1
-    } else if step < 0 && start >= end {
-        ((start - end) / step.abs()) + 1
     } else {
-        0
+        let start = i128::from(start);
+        let end = i128::from(end);
+        let step = i128::from(step);
+        let count = if step > 0 {
+            if start > end {
+                0
+            } else {
+                (end - start) / step + 1
+            }
+        } else if start < end {
+            0
+        } else {
+            (start - end) / step.abs() + 1
+        };
+        i64::try_from(count).unwrap_or(i64::MAX)
     }
 }
 
@@ -2360,6 +2370,14 @@ mod tests {
         assert_eq!(
             estimate_column_min_max(&source, 0, &DataType::Int64),
             ("2".to_string(), "10".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_series_row_count_saturates_wide_range() {
+        assert_eq!(
+            super::generate_series_row_count(i64::MIN, i64::MAX, 1),
+            i64::MAX
         );
     }
 }

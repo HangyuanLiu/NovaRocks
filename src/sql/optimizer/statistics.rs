@@ -50,6 +50,26 @@ impl Statistics {
     }
 }
 
+pub(crate) fn generate_series_row_count_f64(start: i64, end: i64, step: i64) -> f64 {
+    if step == 0 {
+        return 1.0;
+    }
+    let start = i128::from(start);
+    let end = i128::from(end);
+    let step = i128::from(step);
+    if step > 0 {
+        if start > end {
+            return 0.0;
+        }
+        ((end - start) / step + 1) as f64
+    } else {
+        if start < end {
+            return 0.0;
+        }
+        ((start - end) / step.abs() + 1) as f64
+    }
+}
+
 /// Three-dimensional cost estimate (aligned with StarRocks CostEstimate).
 #[derive(Clone, Debug, Default)]
 pub struct CostEstimate {
@@ -375,6 +395,13 @@ mod tests {
         assert!((c.cpu_cost - 40.0).abs() < f64::EPSILON);
         assert!((c.memory_cost - 30.0).abs() < f64::EPSILON);
         assert!((c.network_cost - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn generate_series_row_count_uses_wide_arithmetic() {
+        assert_eq!(generate_series_row_count_f64(10, 2, -2), 5.0);
+        assert_eq!(generate_series_row_count_f64(2, 10, -2), 0.0);
+        assert!(generate_series_row_count_f64(i64::MIN, i64::MAX, 1).is_finite());
     }
 
     #[test]

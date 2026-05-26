@@ -48,17 +48,10 @@ pub(crate) fn estimate_statistics(
             output_row_count: v.rows.len() as f64,
             column_statistics: HashMap::new(),
         },
-        LogicalPlan::GenerateSeries(g) => {
-            let rows = if g.step != 0 {
-                ((g.end - g.start) / g.step + 1).max(0) as f64
-            } else {
-                1.0
-            };
-            Statistics {
-                output_row_count: rows,
-                column_statistics: HashMap::new(),
-            }
-        }
+        LogicalPlan::GenerateSeries(g) => Statistics {
+            output_row_count: generate_series_row_count_f64(g.start, g.end, g.step),
+            column_statistics: HashMap::new(),
+        },
         LogicalPlan::TableFunction(t) => {
             let child = estimate_statistics(&t.input, table_stats);
             let estimated_rows = child.output_row_count * 3.0;

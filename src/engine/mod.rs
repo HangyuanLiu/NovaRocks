@@ -3997,12 +3997,11 @@ enable_path_style_access = true
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
-        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+        use crate::sql::catalog::{
+            ColumnDef, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
+        };
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
-        // Build a synthetic `tbl(id int, name varchar)` table-def directly.
-        // The fragment builder only consults columns + storage shape; no
-        // parquet bytes are ever read on this code path.
         let mut catalog = super::InMemoryCatalog::default();
         let table = TableDef {
             name: "tbl".to_string(),
@@ -4025,9 +4024,19 @@ enable_path_style_access = true
             iceberg_row_lineage_metadata_columns: vec![],
             source: ScanSource::StarRocks,
         };
+        let layout = PhysicalTableLayout {
+            db_id: 1,
+            table_id: 2,
+            schema_id: 3,
+            tablets: vec![ManagedTabletRef {
+                tablet_id: 4,
+                partition_id: 5,
+                version: 6,
+            }],
+        };
         catalog
-            .register("default", table)
-            .expect("register synthetic tbl");
+            .register_managed_table("default", table, layout)
+            .expect("register managed tbl");
 
         let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)

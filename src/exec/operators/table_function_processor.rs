@@ -48,6 +48,8 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
+const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize = u32::MAX as usize;
+
 /// Factory for table-function processors that expand each input row to variable output rows.
 pub struct TableFunctionProcessorFactory {
     name: String,
@@ -550,6 +552,7 @@ impl TableFunctionProcessorOperator {
         let num_rows = chunk.len();
         let mut row_counts = Vec::with_capacity(num_rows);
         let mut series_values: Vec<Option<i128>> = Vec::new();
+        let mut total_output_rows = 0usize;
         for row in 0..num_rows {
             let start = self.int_like_arg_to_i128(&start_col, row, 0, "generate_series")?;
             let end = self.int_like_arg_to_i128(&end_col, row, 1, "generate_series")?;
@@ -566,6 +569,7 @@ impl TableFunctionProcessorOperator {
                     let count = generate_series_count(start, end, step)?;
                     if count == 0 {
                         if self.is_left_join {
+                            checked_add_table_function_rows(&mut total_output_rows, 1)?;
                             row_counts.push(1);
                             series_values.push(None);
                         } else {
@@ -574,6 +578,7 @@ impl TableFunctionProcessorOperator {
                         continue;
                     }
 
+                    checked_add_table_function_rows(&mut total_output_rows, count)?;
                     row_counts.push(count);
                     let mut current = start;
                     for _ in 0..count {
@@ -588,6 +593,7 @@ impl TableFunctionProcessorOperator {
                 }
                 _ => {
                     if self.is_left_join {
+                        checked_add_table_function_rows(&mut total_output_rows, 1)?;
                         row_counts.push(1);
                         series_values.push(None);
                     } else {
@@ -597,10 +603,6 @@ impl TableFunctionProcessorOperator {
             }
         }
 
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
-        }
         if total_output_rows == 0 {
             return self.empty_output_chunk();
         }
@@ -1139,5 +1141,35 @@ fn generate_series_count(start: i128, end: i128, step: i128) -> Result<usize, St
         let count = diff / step_abs + 1;
         usize::try_from(count)
             .map_err(|_| format!("table function generate_series count overflow: {count}"))
+    }
+}
+
+fn checked_add_table_function_rows(total: &mut usize, rows: usize) -> Result<(), String> {
+    *total = total
+        .checked_add(rows)
+        .ok_or_else(|| "table function output too large".to_string())?;
+    if *total > MAX_TABLE_FUNCTION_OUTPUT_ROWS {
+        return Err("table function output too large".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_series_count_handles_descending_steps() {
+        assert_eq!(generate_series_count(10, 2, -2).expect("count"), 5);
+        assert_eq!(generate_series_count(2, 10, -2).expect("count"), 0);
+    }
+
+    #[test]
+    fn table_function_output_row_guard_rejects_before_materialization() {
+        let mut total = 0usize;
+        checked_add_table_function_rows(&mut total, MAX_TABLE_FUNCTION_OUTPUT_ROWS)
+            .expect("max rows accepted");
+        let err = checked_add_table_function_rows(&mut total, 1).expect_err("too many rows");
+        assert!(err.contains("output too large"));
     }
 }
