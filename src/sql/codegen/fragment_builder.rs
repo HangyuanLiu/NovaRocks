@@ -46,7 +46,7 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
-use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::planner::plan::AggregateCall;
 
 // ---------------------------------------------------------------------------
@@ -142,7 +142,6 @@ fn add_iceberg_equality_delete_required_columns(
 
 pub(crate) struct PlanFragmentBuilder<'a> {
     catalog: &'a dyn CatalogProvider,
-    current_database: &'a str,
     desc_builder: DescriptorTableBuilder,
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
@@ -178,11 +177,10 @@ impl<'a> PlanFragmentBuilder<'a> {
     pub(crate) fn build(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
-        current_database: &str,
+        _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         let mut builder = PlanFragmentBuilder {
             catalog,
-            current_database,
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_node_id: 1,
@@ -2109,113 +2107,163 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalGenerateSeriesOp,
         _node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use std::sync::Arc;
-
-        // Generate the series values
-        let mut values = Vec::new();
-        let mut v = op.start;
-        if op.step > 0 {
-            while v <= op.end {
-                values.push(v);
-                v += op.step;
-            }
-        } else {
-            while v >= op.end {
-                values.push(v);
-                v += op.step;
-            }
+        if op.step == 0 {
+            return Err("generate_series step size cannot equal zero".to_string());
         }
 
-        // Build a temporary parquet file
+        let param_tuple_id = self.alloc_tuple();
+        let param_values_node_id = self.alloc_node();
+        let int64_type_desc = type_infer::arrow_type_to_type_desc(&DataType::Int64)?;
+
+        let empty_scope = ExprScope::new();
+        let mut param_slots = Vec::with_capacity(3);
+        let mut param_exprs = Vec::with_capacity(3);
+        for (idx, (name, value)) in [
+            ("__gs_start", op.start),
+            ("__gs_end", op.end),
+            ("__gs_step", op.step),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot_id = self.alloc_slot();
+            self.desc_builder.add_slot_with_type_desc(
+                slot_id,
+                param_tuple_id,
+                name,
+                int64_type_desc.clone(),
+                false,
+                idx as i32,
+            );
+            param_slots.push(slot_id);
+            param_exprs.push(self.compile_int64_literal(value, &empty_scope)?);
+        }
+        self.desc_builder.add_tuple(param_tuple_id, None);
+
+        let mut param_values_node = nodes::default_plan_node();
+        param_values_node.node_id = param_values_node_id;
+        param_values_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        param_values_node.num_children = 0;
+        param_values_node.row_tuples = vec![param_tuple_id];
+        param_values_node.nullable_tuples = vec![];
+        param_values_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: param_tuple_id,
+            result_expr_lists: vec![],
+            const_expr_lists: vec![param_exprs],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+
+        let output_tuple_id = self.alloc_tuple();
+        let table_fn_node_id = self.alloc_node();
         let col_name = &op.column_name;
-        let schema = Arc::new(Schema::new(vec![Field::new(
+
+        let slot_id = self.alloc_slot();
+        self.desc_builder.add_slot_with_type_desc(
+            slot_id,
+            output_tuple_id,
             col_name,
-            ArrowDataType::Int64,
+            int64_type_desc.clone(),
             false,
-        )]));
-        let col_array = Arc::new(Int64Array::from(values));
-        let batch = RecordBatch::try_new(schema, vec![col_array])
-            .map_err(|e| format!("build generate_series batch failed: {e}"))?;
+            0,
+        );
+        self.desc_builder.add_tuple(output_tuple_id, None);
 
-        let dir = std::env::temp_dir().join("novarocks_generate_series");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create generate_series dir failed: {e}"))?;
-        let path = dir.join(format!(
-            "gs_{}_{}_{}_{}.parquet",
-            op.start, op.end, op.step, self.next_node_id
-        ));
-        crate::sql::codegen::write_parquet_to_path(&path, &batch)?;
-        let file_len = std::fs::metadata(&path)
-            .map_err(|e| format!("stat generate_series parquet failed: {e}"))?
-            .len();
-        let file_len = i64::try_from(file_len)
-            .map_err(|_| "generate_series parquet file is too large".to_string())?;
-
-        // Build a TableDef wrapping the synthetic parquet file as a single-
-        // file S3 source. The scan path is happy to consume local
-        // (file:// or absolute) paths through this lane (see
-        // `connector/iceberg/catalog/backend.rs` comment near the
-        // multi-file empty-cloud-properties branch).
-        let table_def = crate::sql::catalog::TableDef {
-            name: op.alias.as_deref().unwrap_or("generate_series").to_string(),
-            columns: vec![crate::sql::catalog::ColumnDef {
-                name: col_name.clone(),
-                data_type: ArrowDataType::Int64,
+        let mut scope = ExprScope::new();
+        let qualifier = op
+            .alias
+            .clone()
+            .unwrap_or_else(|| "generate_series".to_string());
+        scope.add_column(
+            Some(qualifier),
+            col_name.clone(),
+            ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: DataType::Int64,
+                type_desc: Some(int64_type_desc.clone()),
                 nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
-                table: crate::sql::catalog::IcebergTableInfo {
-                    catalog: "generate_series".to_string(),
-                    namespace: self.current_database.to_string(),
-                    table: op.alias.as_deref().unwrap_or("generate_series").to_string(),
-                    table_uuid: None,
-                    current_snapshot_id: None,
-                    schema_id: 0,
-                    location: path.display().to_string(),
-                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
-                    serialized_metadata: None,
-                },
-                files: vec![crate::sql::catalog::IcebergDataFileInfo {
-                    path: path.display().to_string(),
-                    size: file_len,
-                    row_count: None,
-                    column_stats: None,
-                    partition_spec_id: None,
-                    partition_key: None,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    delete_files: Vec::new(),
-                    manifest_path: None,
-                    partition_values: Vec::new(),
-                }],
-                cloud_properties: Default::default(),
             },
-        };
+        );
 
-        // Create a PhysicalScanOp and delegate to visit_scan
-        let scan_op = PhysicalScanOp {
-            database: self.current_database.to_string(),
-            table: table_def,
-            alias: op.alias.clone(),
-            columns: vec![crate::sql::analysis::OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: col_name.clone(),
-                data_type: ArrowDataType::Int64,
-                nullable: false,
-            }],
-            predicates: vec![],
-            required_columns: None,
-        };
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: int64_type_desc.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: "generate_series".to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: vec![
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                ],
+                ret_type: int64_type_desc.clone(),
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    vec![int64_type_desc.clone()],
+                    None::<String>,
+                    Some(false),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
 
-        // Use a dummy node (visit_scan only reads the op, not the children)
-        self.visit_scan(&scan_op, _node)
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(Vec::new()),
+            Some(vec![slot_id]),
+            Some(true),
+        ));
+
+        Ok(VisitResult {
+            plan_nodes: vec![table_fn_plan_node, param_values_node],
+            scope,
+            tuple_ids: vec![output_tuple_id],
+            cte_exchange_nodes: Vec::new(),
+        })
+    }
+
+    fn compile_int64_literal(
+        &self,
+        value: i64,
+        empty_scope: &ExprScope,
+    ) -> Result<exprs::TExpr, String> {
+        let typed = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut compiler = ExprCompiler::new(self.slot_allocator(), empty_scope);
+        compiler.compile_typed(&typed)
     }
 
     // -------------------------------------------------------------------
@@ -3375,8 +3423,8 @@ mod tests {
         IcebergTableInfo, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
     };
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
+        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalGenerateSeriesOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp, PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
@@ -4278,6 +4326,80 @@ mod tests {
         let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         assert!(build.edges.is_empty());
+    }
+
+    #[test]
+    fn build_generate_series_emits_table_function_without_scan_source() {
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3_000_000,
+                step: 1,
+                column_name: "generate_series".to_string(),
+                alias: Some("gs".to_string()),
+            }),
+            children: vec![],
+            stats: Statistics {
+                output_row_count: 3_000_000.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: "generate_series".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+        };
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let root = build.fragment_results.first().expect("root fragment");
+        assert!(root.exec_params.per_node_scan_ranges.is_empty());
+        assert!(
+            root.plan.nodes.iter().all(|node| {
+                !matches!(
+                    node.node_type,
+                    plan_nodes::TPlanNodeType::HDFS_SCAN_NODE
+                        | plan_nodes::TPlanNodeType::LAKE_SCAN_NODE
+                )
+            }),
+            "generate_series must not be emitted as a scan: {:?}",
+            root.plan.nodes
+        );
+        let table_function = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE)
+            .and_then(|node| node.table_function_node.as_ref())
+            .expect("table function node");
+        assert_eq!(
+            table_function.param_columns.as_ref().expect("params").len(),
+            3
+        );
+        assert!(
+            table_function
+                .outer_columns
+                .as_ref()
+                .expect("outer columns")
+                .is_empty()
+        );
+        assert_eq!(
+            table_function
+                .fn_result_columns
+                .as_ref()
+                .expect("result columns")
+                .len(),
+            1
+        );
+        let union = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::UNION_NODE)
+            .and_then(|node| node.union_node.as_ref())
+            .expect("parameter values node");
+        assert_eq!(union.const_expr_lists.len(), 1);
+        assert_eq!(union.const_expr_lists[0].len(), 3);
     }
 
     #[test]

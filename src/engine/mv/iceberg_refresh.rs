@@ -6192,22 +6192,25 @@ fn build_iceberg_table_def_for_snapshot_scan(
             crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
                 &base.catalog,
                 &base.namespace,
-                &synthetic_name,
+                &base.table,
                 loaded,
             )?;
+        table_def.name = synthetic_name;
         table_def
             .iceberg_row_lineage_metadata_columns
             .retain(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN);
         return Ok(table_def);
     }
-    crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry,
         &base.catalog,
         &base.namespace,
-        &synthetic_name,
+        &base.table,
         loaded,
         data_files,
-    )
+    )?;
+    table_def.name = synthetic_name;
+    Ok(table_def)
 }
 
 fn incremental_refresh_iceberg_join_mv(

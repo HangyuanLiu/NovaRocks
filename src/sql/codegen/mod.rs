@@ -85,26 +85,3 @@ pub(crate) struct FragmentBuildResult {
     /// `(cte_id, exchange_node_id)`.
     pub cte_exchange_nodes: Vec<(CteId, i32)>,
 }
-
-// ---------------------------------------------------------------------------
-// Parquet write utility (used by generate_series emission)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn write_parquet_to_path(
-    path: &std::path::Path,
-    batch: &arrow::record_batch::RecordBatch,
-) -> Result<(), String> {
-    use parquet::arrow::ArrowWriter;
-
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("create local parquet file failed: {e}"))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
-        .map_err(|e| format!("create local parquet writer failed: {e}"))?;
-    writer
-        .write(batch)
-        .map_err(|e| format!("write local parquet batch failed: {e}"))?;
-    writer
-        .close()
-        .map_err(|e| format!("close local parquet writer failed: {e}"))?;
-    Ok(())
-}
