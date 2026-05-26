@@ -406,9 +406,25 @@ fn get_join_key_ndv(
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
 
     fn make_table_stats(
         name: &str,
@@ -463,9 +479,9 @@ mod tests {
                 name: name.to_string(),
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
-                source: ScanSource::S3ParquetFiles {
-                    files: vec![S3FileInfo {
+                source: ScanSource::IcebergDataFiles {
+                    table: test_iceberg_table_info(),
+                    files: vec![IcebergDataFileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
                         size: 1000,
                         row_count: Some(1000),

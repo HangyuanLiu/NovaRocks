@@ -320,7 +320,6 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
             source: ScanSource::StarRocks,
         }
     }

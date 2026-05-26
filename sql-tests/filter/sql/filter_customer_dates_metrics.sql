@@ -2,7 +2,7 @@
 -- @tags=filter,metrics,self_contained
 -- Test Objective:
 -- 1. Validate filter metric counting on customer/date predicates.
--- 2. Prevent regressions where this case depends on preloaded SSB data.
+-- 2. Prevent regressions where this case depends on shared SSB fixture state.
 -- Test Flow:
 -- 1. Create/reset minimal customer and dates tables.
 -- 2. Insert deterministic rows covering IN, equality, and year filters.

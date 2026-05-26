@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::Fields;
@@ -618,7 +618,6 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
         name: runtime.table.name.clone(),
         columns,
         iceberg_row_lineage_metadata_columns: vec![],
-        iceberg_table: None,
         source: ScanSource::StarRocks,
     })
 }

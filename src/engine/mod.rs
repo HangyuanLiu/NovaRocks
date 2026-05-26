@@ -1489,8 +1489,7 @@ impl StandaloneSession {
 
     /// Consolidated INSERT handler using sqlparser AST. All INSERT targets
     /// flow through the custom parser so the shared dispatch in
-    /// `execute_insert_statement` chooses between managed-lake and iceberg
-    /// backends. The retired local-parquet backend is no longer consulted.
+    /// `execute_insert_statement` chooses between standalone table backends.
     fn handle_sqlparser_insert(
         &self,
         insert: &sqlparser::ast::Insert,
@@ -2691,7 +2690,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 }
 
 /// Walk the logical plan tree and collect table-level statistics for all scan
-/// nodes that reference S3ParquetFiles storage.
+/// nodes that reference IcebergDataFiles storage.
 fn build_table_stats_from_plan(
     plan: &crate::sql::planner::plan::LogicalPlan,
 ) -> std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics> {
@@ -2709,7 +2708,8 @@ fn collect_scan_stats(
 
     match plan {
         LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::ScanSource::S3ParquetFiles {
+            if let crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table,
                 files,
                 cloud_properties,
             } = &s.table.source
@@ -2718,7 +2718,7 @@ fn collect_scan_stats(
                 // the table's current snapshot. Any failure quietly degrades
                 // to manifest heuristics (see StatsLoader contract).
                 let (ndv_by_name, name_to_field_id) =
-                    load_iceberg_puffin_ndv(s.table.iceberg_table.as_ref(), cloud_properties);
+                    load_iceberg_puffin_ndv(Some(table), cloud_properties);
                 if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
                     files,
                     &s.table.columns,
@@ -3997,7 +3997,7 @@ enable_path_style_access = true
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
-        use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         // Build a synthetic `tbl(id int, name varchar)` table-def directly.
@@ -4023,11 +4023,7 @@ enable_path_style_access = true
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: Vec::<S3FileInfo>::new(),
-                cloud_properties: Default::default(),
-            },
+            source: ScanSource::StarRocks,
         };
         catalog
             .register("default", table)

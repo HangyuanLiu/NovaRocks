@@ -10,8 +10,8 @@ use crate::connector::backend::{
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
-    ColumnDef, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, S3FileInfo, ScanSource,
-    TableDef,
+    ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    ScanSource, TableDef,
 };
 use crate::sql::parser::ast::Literal;
 
@@ -166,6 +166,7 @@ impl TableSource for IcebergTableSource {
         };
         build_iceberg_table_def_with_data_files(
             &entry,
+            &table.catalog,
             &table.namespace,
             &table.table,
             loaded,
@@ -180,12 +181,20 @@ impl TableSource for IcebergTableSource {
 
 pub(crate) fn build_iceberg_table_def_with_files(
     entry: &IcebergCatalogEntry,
+    catalog_name: &str,
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
 ) -> Result<TableDef, String> {
-    build_iceberg_table_def_with_data_files(entry, namespace, table_name, loaded, data_files)
+    build_iceberg_table_def_with_data_files(
+        entry,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
+        data_files,
+    )
 }
 
 /// IVM-A1 helper: build a `TableDef` for the base table without registering
@@ -220,6 +229,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
 /// Returns Err if the table metadata does not declare v3 row-lineage; A1
 /// requires v3 row-lineage to compute the apply key.
 pub(crate) fn build_iceberg_table_def_for_delta_scan(
+    catalog_name: &str,
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
@@ -231,10 +241,12 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
              write.row-lineage=true before creating the MV"
         ));
     }
-    let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let columns =
         hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
-    let source = empty_iceberg_scan_source();
+    let schema = iceberg_schema_def(loaded.table.metadata().current_schema());
+    let iceberg_table_info =
+        build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
+    let source = empty_iceberg_scan_source(iceberg_table_info.clone());
     let iceberg_row_lineage_metadata_columns = vec![
         ColumnDef {
             name: "_file".to_string(),
@@ -276,19 +288,18 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
         name: table_name.to_string(),
         columns,
         iceberg_row_lineage_metadata_columns,
-        iceberg_table,
         source,
     })
 }
 
 fn build_iceberg_table_def_with_data_files(
     entry: &IcebergCatalogEntry,
+    catalog_name: &str,
     namespace: &str,
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
 ) -> Result<TableDef, String> {
-    let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let has_data_files = !data_files.is_empty();
     // Row-lineage metadata columns (_row_id etc.) are only usable when every
     // data file in the snapshot carries a first_row_id.  Files written by
@@ -299,12 +310,16 @@ fn build_iceberg_table_def_with_data_files(
     let all_files_have_first_row_id = data_files.iter().all(|f| f.first_row_id.is_some());
     let columns =
         hide_novarocks_mv_internal_columns(loaded.table.metadata(), loaded.columns.clone())?;
+    let schema = iceberg_schema_def(loaded.table.metadata().current_schema());
+    let iceberg_table_info =
+        build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
-        ScanSource::S3ParquetFiles {
+        ScanSource::IcebergDataFiles {
+            table: iceberg_table_info.clone(),
             files: data_files
                 .into_iter()
-                .map(data_file_with_stats_to_s3_file_info)
+                .map(data_file_with_stats_to_iceberg_data_file_info)
                 .collect(),
             cloud_properties,
         }
@@ -313,15 +328,16 @@ fn build_iceberg_table_def_with_data_files(
         // Keep the per-file lineage metadata by using the multi-file scan
         // shape with empty cloud properties; file:// paths are handled by the
         // local scan path and do not require object-store credentials.
-        ScanSource::S3ParquetFiles {
+        ScanSource::IcebergDataFiles {
+            table: iceberg_table_info.clone(),
             files: data_files
                 .into_iter()
-                .map(data_file_with_stats_to_s3_file_info)
+                .map(data_file_with_stats_to_iceberg_data_file_info)
                 .collect(),
             cloud_properties: Default::default(),
         }
     } else {
-        empty_iceberg_scan_source()
+        empty_iceberg_scan_source(iceberg_table_info)
     };
 
     let iceberg_row_lineage_metadata_columns = if has_data_files
@@ -378,7 +394,6 @@ fn build_iceberg_table_def_with_data_files(
         name: table_name.to_string(),
         columns,
         iceberg_row_lineage_metadata_columns,
-        iceberg_table,
         source,
     })
 }
@@ -464,8 +479,10 @@ fn hidden_internal_column_names(
     out
 }
 
-fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats) -> S3FileInfo {
-    S3FileInfo {
+fn data_file_with_stats_to_iceberg_data_file_info(
+    file: super::registry::DataFileWithStats,
+) -> IcebergDataFileInfo {
+    IcebergDataFileInfo {
         path: file.path,
         size: file.size,
         row_count: file.record_count,
@@ -481,18 +498,28 @@ fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats
     }
 }
 
-fn build_iceberg_table_info(loaded: &IcebergLoadedTable) -> IcebergTableInfo {
-    // Serialise the iceberg `TableMetadata` so a subsequent metadata-table
-    // reference (`t$snapshots` etc.) can hand the JSON to the JVM scanner
-    // bridge without having to re-resolve the table at codegen time. Loss
-    // of serialisation is non-fatal for normal data scans, so we fall back
-    // to None instead of failing here.
-    let serialized_metadata = serde_json::to_string(loaded.table.metadata()).ok();
-    IcebergTableInfo {
+fn build_iceberg_table_info(
+    catalog_name: &str,
+    namespace_name: &str,
+    table_name: &str,
+    loaded: &IcebergLoadedTable,
+    schema: IcebergSchemaDef,
+) -> Result<IcebergTableInfo, String> {
+    let table = &loaded.table;
+    Ok(IcebergTableInfo {
+        catalog: catalog_name.to_string(),
+        namespace: namespace_name.to_string(),
+        table: table_name.to_string(),
+        table_uuid: Some(table.metadata().uuid().to_string()),
+        current_snapshot_id: table.metadata().current_snapshot_id(),
+        schema_id: table.metadata().current_schema_id(),
         location: loaded.table.metadata().location().to_string(),
-        schema: iceberg_schema_def(loaded.table.metadata().current_schema()),
-        serialized_metadata,
-    }
+        schema,
+        serialized_metadata: Some(
+            serde_json::to_string(table.metadata())
+                .map_err(|err| format!("serialize iceberg table metadata failed: {err}"))?,
+        ),
+    })
 }
 
 fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
@@ -579,14 +606,13 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 
 /// Storage marker for an Iceberg table that has no data files yet.
 ///
-/// The scan path treats `S3ParquetFiles { files: vec![] }` as "no
+/// The scan path treats `IcebergDataFiles { files: vec![] }` as "no
 /// ranges to read"; the runtime returns an empty result without ever
-/// touching the filesystem. This replaces the previous
-/// `/tmp/novarocks_iceberg_empty/${ns}_${tbl}.parquet` placeholder file
-/// — that was a workaround for the `LocalParquetFile` lane which is
-/// being retired.
-fn empty_iceberg_scan_source() -> ScanSource {
-    ScanSource::S3ParquetFiles {
+/// touching the filesystem. This keeps empty Iceberg tables represented as
+/// catalog-owned scan sources instead of synthetic placeholder files.
+fn empty_iceberg_scan_source(table: IcebergTableInfo) -> ScanSource {
+    ScanSource::IcebergDataFiles {
+        table,
         files: Vec::new(),
         cloud_properties: Default::default(),
     }
@@ -806,6 +832,7 @@ mod tests {
     fn empty_v3_row_lineage_table_def_hides_metadata_columns() {
         let table_def = build_iceberg_table_def_with_data_files(
             &test_entry(),
+            "ice",
             "db",
             "t",
             v3_row_lineage_loaded_table(),
@@ -820,6 +847,7 @@ mod tests {
     fn non_empty_v3_row_lineage_table_def_keeps_metadata_columns() {
         let table_def = build_iceberg_table_def_with_data_files(
             &test_entry(),
+            "ice",
             "db",
             "t",
             v3_row_lineage_loaded_table(),
@@ -839,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn data_file_with_stats_to_s3_file_info_preserves_read_metadata() {
+    fn data_file_with_stats_to_iceberg_data_file_info_preserves_read_metadata() {
         let file = crate::connector::iceberg::catalog::registry::DataFileWithStats {
             path: "s3://bucket/table/data.parquet".to_string(),
             size: 12,
@@ -855,18 +883,18 @@ mod tests {
             delete_files: vec![],
         };
 
-        let s3_file = data_file_with_stats_to_s3_file_info(file);
+        let data_file = data_file_with_stats_to_iceberg_data_file_info(file);
 
-        assert_eq!(s3_file.partition_spec_id, Some(7));
-        assert_eq!(s3_file.partition_key.as_deref(), Some("city=A"));
-        assert_eq!(s3_file.first_row_id, Some(100));
-        assert_eq!(s3_file.data_sequence_number, Some(11));
-        assert_eq!(s3_file.ivm_change_op, None);
+        assert_eq!(data_file.partition_spec_id, Some(7));
+        assert_eq!(data_file.partition_key.as_deref(), Some("city=A"));
+        assert_eq!(data_file.first_row_id, Some(100));
+        assert_eq!(data_file.data_sequence_number, Some(11));
+        assert_eq!(data_file.ivm_change_op, None);
         assert_eq!(
-            s3_file.manifest_path.as_deref(),
+            data_file.manifest_path.as_deref(),
             Some("s3://bucket/table/metadata/manifest.avro")
         );
-        assert!(s3_file.delete_files.is_empty());
+        assert!(data_file.delete_files.is_empty());
     }
 
     #[test]

@@ -108,6 +108,12 @@ pub struct IcebergSchemaDef {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IcebergTableInfo {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_uuid: Option<String>,
+    pub current_snapshot_id: Option<i64>,
+    pub schema_id: i32,
     pub location: String,
     pub schema: IcebergSchemaDef,
     /// JSON-serialized iceberg `TableMetadata`. Required when the table
@@ -125,7 +131,7 @@ pub struct IcebergTableInfo {
 }
 
 #[derive(Clone, Debug)]
-pub struct S3FileInfo {
+pub struct IcebergDataFileInfo {
     pub path: String,
     pub size: i64,
     /// Row count from Iceberg file metadata. None for non-Iceberg sources.
@@ -178,9 +184,9 @@ pub struct PhysicalTableLayout {
 ///
 /// - `StarRocks`: managed-lake table; the actual tablet/version
 ///   layout flows separately through `PhysicalTableLayout`.
-/// - `S3ParquetFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped /
-///   `generate_series` parquet files — a concrete list of data files
-///   plus optional cloud-store credentials.
+/// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
+///   parquet files — a concrete list of data files plus table identity
+///   and optional cloud-store credentials.
 /// - `IcebergMetadataTable`: synthetic source for iceberg metadata
 ///   tables (`t$snapshots` etc.); the operator reads
 ///   `iceberg::spec::TableMetadata` natively in Rust.
@@ -195,8 +201,9 @@ pub enum ScanSource {
     /// variant is a marker without payload — the catalog only needs to
     /// know "this table flows through the managed-lake scan path".
     StarRocks,
-    S3ParquetFiles {
-        files: Vec<S3FileInfo>,
+    IcebergDataFiles {
+        table: IcebergTableInfo,
+        files: Vec<IcebergDataFileInfo>,
         cloud_properties: BTreeMap<String, String>,
     },
     /// Synthetic scan source for an Iceberg metadata-table reference
@@ -209,6 +216,7 @@ pub enum ScanSource {
     /// was removed in favor of iceberg-rust) — see
     /// `src/connector/iceberg/metadata.rs`.
     IcebergMetadataTable {
+        table: IcebergTableInfo,
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
         /// JSON-serialized iceberg-rust `TableMetadata` (produced by
         /// `serde_json::to_string` in
@@ -234,9 +242,7 @@ pub enum ScanSource {
     /// carries only the lightweight identity and snapshot range so the
     /// Thrift plan stays small.
     IcebergDeltaTable {
-        catalog: String,
-        namespace: String,
-        table: String,
+        table: IcebergTableInfo,
         from_snapshot_id: i64,
         to_snapshot_id: i64,
     },
@@ -254,7 +260,6 @@ pub struct TableDef {
     /// scope as resolvable pseudo-columns but **not** into `SELECT *`
     /// expansion.
     pub iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
-    pub iceberg_table: Option<IcebergTableInfo>,
     pub source: ScanSource,
 }
 
@@ -284,8 +289,39 @@ pub trait CatalogProvider {
 mod tests {
     use super::*;
 
+    fn test_iceberg_table_info(schema: IcebergSchemaDef) -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema,
+            serialized_metadata: None,
+        }
+    }
+
     #[test]
     fn table_def_can_carry_iceberg_schema_metadata() {
+        let iceberg = test_iceberg_table_info(IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 10,
+                name: "order_id".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![IcebergSchemaFieldDef {
+                    field_id: 11,
+                    name: "nested".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    children: vec![],
+                }],
+            }],
+        });
         let table = TableDef {
             name: "orders".to_string(),
             columns: vec![ColumnDef {
@@ -296,35 +332,17 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: Some(IcebergTableInfo {
-                location: "file:///tmp/orders".to_string(),
-                schema: IcebergSchemaDef {
-                    fields: vec![IcebergSchemaFieldDef {
-                        field_id: 10,
-                        name: "order_id".to_string(),
-                        initial_default: None,
-                        write_default: None,
-                        initial_default_json: None,
-                        children: vec![IcebergSchemaFieldDef {
-                            field_id: 11,
-                            name: "nested".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            children: vec![],
-                        }],
-                    }],
-                },
-                serialized_metadata: None,
-            }),
-            source: ScanSource::S3ParquetFiles {
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
             },
         };
 
-        let iceberg = table.iceberg_table.expect("iceberg table metadata");
-        assert_eq!(iceberg.location, "file:///tmp/orders");
+        let ScanSource::IcebergDataFiles { table: iceberg, .. } = table.source else {
+            panic!("expected iceberg data files");
+        };
+        assert_eq!(iceberg.location, "file:///tmp/test_table");
         assert_eq!(iceberg.schema.fields[0].field_id, 10);
         assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
     }

@@ -960,6 +960,7 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     let has_data_files = !files.is_empty();
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry,
+        &target.catalog,
         &target.namespace,
         &target.table,
         loaded,
@@ -6189,6 +6190,7 @@ fn build_iceberg_table_def_for_snapshot_scan(
     if data_files.is_empty() {
         let mut table_def =
             crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
+                &base.catalog,
                 &base.namespace,
                 &synthetic_name,
                 loaded,
@@ -6200,6 +6202,7 @@ fn build_iceberg_table_def_for_snapshot_scan(
     }
     crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry,
+        &base.catalog,
         &base.namespace,
         &synthetic_name,
         loaded,

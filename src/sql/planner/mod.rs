@@ -8,7 +8,7 @@ pub(crate) mod plan;
 
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
-use crate::sql::catalog::{IcebergDeleteFileContent, S3FileInfo};
+use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use plan::*;
@@ -1608,20 +1608,24 @@ fn plan_iceberg_metadata_scan(
             nullable: c.nullable,
         })
         .collect();
-    let serialized_table = rel
-        .table
-        .iceberg_table
-        .as_ref()
-        .and_then(|i| i.serialized_metadata.clone())
+    let table_info = iceberg_table_info(&rel.table.source)
         .ok_or_else(|| {
             format!(
-                "iceberg metadata table {} requires serialized metadata; \
+                "iceberg metadata table {} requires iceberg table identity; \
                  table was not loaded through an iceberg catalog",
                 rel.table.name
             )
-        })?;
+        })?
+        .clone();
+    let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
+        format!(
+            "iceberg metadata table {} requires serialized metadata; \
+                 table was not loaded through an iceberg catalog",
+            rel.table.name
+        )
+    })?;
     let cloud_properties = match &rel.table.source {
-        ScanSource::S3ParquetFiles {
+        ScanSource::IcebergDataFiles {
             cloud_properties, ..
         } => cloud_properties.clone(),
         _ => Default::default(),
@@ -1633,8 +1637,8 @@ fn plan_iceberg_metadata_scan(
         name: synthetic_name,
         columns: column_defs,
         iceberg_row_lineage_metadata_columns: vec![],
-        iceberg_table: rel.table.iceberg_table.clone(),
         source: ScanSource::IcebergMetadataTable {
+            table: table_info,
             metadata_table_type: rel.metadata_table_type,
             serialized_table,
             cloud_properties,
@@ -1668,7 +1672,7 @@ fn build_iceberg_metadata_payload(
     use crate::sql::catalog::ScanSource;
     match metadata_table_type {
         IcebergMetadataTableType::Partitions => {
-            let ScanSource::S3ParquetFiles { files, .. } = storage else {
+            let ScanSource::IcebergDataFiles { files, .. } = storage else {
                 return Err(
                     "iceberg partitions metadata table requires catalog-resolved data files"
                         .to_string(),
@@ -1680,7 +1684,7 @@ fn build_iceberg_metadata_payload(
     }
 }
 
-fn build_iceberg_partitions_payload(files: &[S3FileInfo]) -> Result<String, String> {
+fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<String, String> {
     let mut groups = std::collections::BTreeMap::<(i32, String), PartitionMetadataAgg>::new();
     for file in files {
         let spec_id = file.partition_spec_id.ok_or_else(|| {
@@ -1794,6 +1798,14 @@ fn plan_iceberg_delta_scan(
         });
     }
 
+    let table_info = iceberg_table_info(&rel.table.source)
+        .ok_or_else(|| {
+            format!(
+                "iceberg delta scan {}.{}.{} requires iceberg table identity",
+                rel.catalog, rel.namespace, rel.table_name
+            )
+        })?
+        .clone();
     let synthetic_table = TableDef {
         name: rel.table.name.clone(),
         columns: rel.table.columns.clone(),
@@ -1801,11 +1813,8 @@ fn plan_iceberg_delta_scan(
             .table
             .iceberg_row_lineage_metadata_columns
             .clone(),
-        iceberg_table: rel.table.iceberg_table.clone(),
         source: ScanSource::IcebergDeltaTable {
-            catalog: rel.catalog,
-            namespace: rel.namespace.clone(),
-            table: rel.table_name.clone(),
+            table: table_info,
             from_snapshot_id: rel.from_snapshot_id,
             to_snapshot_id: rel.to_snapshot_id,
         },
@@ -1818,6 +1827,17 @@ fn plan_iceberg_delta_scan(
         predicates: vec![],
         required_columns: None,
     }))
+}
+
+fn iceberg_table_info(
+    source: &crate::sql::catalog::ScanSource,
+) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    match source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        crate::sql::catalog::ScanSource::StarRocks => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1903,7 +1923,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "maps" => Ok(TableDef {
@@ -1937,7 +1956,6 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 other => Err(format!("unknown test table: {other}")),

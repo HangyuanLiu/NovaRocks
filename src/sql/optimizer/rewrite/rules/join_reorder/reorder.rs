@@ -79,7 +79,7 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
     match plan {
         LogicalPlan::Scan(s) => {
             let raw_size = match &s.table.source {
-                ScanSource::S3ParquetFiles { files, .. } => {
+                ScanSource::IcebergDataFiles { files, .. } => {
                     // Prefer row_count when available (from Iceberg metadata).
                     // Fall back to file size in bytes if any file lacks row_count.
                     let all_have_row_count =
@@ -111,10 +111,7 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                 // `PhysicalTableLayout` separately, and the proper row-
                 // count source is the analyzed-stats path. As a heuristic
                 // fallback for join-reorder when stats are absent, treat
-                // them as medium-sized (matches the historical
-                // file-system-metadata fallback the legacy
-                // `LocalParquetFile` arm produced when its placeholder
-                // path didn't exist).
+                // them as medium-sized until analyzed statistics are present.
                 ScanSource::StarRocks => 1_000_000,
             };
             // Apply selectivity for pushed-down predicates on the scan
@@ -1275,9 +1272,25 @@ fn expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
 
     /// Helper: build a `TableDef` backed by S3 parquet files with the given
     /// total byte size.
@@ -1292,9 +1305,9 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: vec![S3FileInfo {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
+                files: vec![IcebergDataFileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
                     row_count: None,
@@ -1589,9 +1602,9 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: vec![S3FileInfo {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
+                files: vec![IcebergDataFileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
                     row_count: Some(row_count),

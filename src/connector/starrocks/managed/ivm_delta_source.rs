@@ -193,6 +193,7 @@ pub(crate) fn execute_delta_source_query(
     };
     let table_def = build_iceberg_delta_table_def_with_files(
         &entry,
+        &catalog_name,
         &namespace,
         &table_name,
         input.loaded.clone(),

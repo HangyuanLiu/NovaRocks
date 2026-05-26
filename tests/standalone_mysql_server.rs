@@ -1,47 +1,17 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
 use novarocks::meta::repository::managed_lake::{
     ManagedLakeMetaRepository, ManagedPartitionState, StageManagedTruncateRequest,
 };
 use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
-use parquet::arrow::ArrowWriter;
-use tempfile::{NamedTempFile, TempDir};
-
-fn write_parquet_file(rows: &[(i32, Option<&str>)]) -> NamedTempFile {
-    let file = NamedTempFile::new().expect("create temp file");
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int32Array::from(
-                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|(_, name)| *name).collect::<Vec<_>>(),
-            )),
-        ],
-    )
-    .expect("build record batch");
-    let writer_file = std::fs::File::create(file.path()).expect("open parquet output");
-    let mut writer =
-        ArrowWriter::try_new(writer_file, schema, None).expect("create parquet writer");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close parquet writer");
-    file
-}
+use tempfile::TempDir;
 
 fn alloc_port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -342,15 +312,12 @@ fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> Str
 }
 
 #[test]
-fn standalone_mysql_server_accepts_queries_and_session_noops() {
-    let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b")), (3, None)]);
+fn standalone_mysql_server_accepts_queries_and_session_noops_without_bootstrap_tables() {
     let port = alloc_port();
     let args = vec![
         "standalone-server".to_string(),
         "--port".to_string(),
         port.to_string(),
-        "--table".to_string(),
-        format!("tbl={}", parquet.path().display()),
     ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
@@ -364,68 +331,17 @@ fn standalone_mysql_server_accepts_queries_and_session_noops() {
     conn.query_drop("SET character_set_results = NULL")
         .expect("SET character_set_results = NULL");
 
-    let rows: Vec<(i32, Option<String>)> = conn.query("select * from tbl").expect("select *");
-    assert_eq!(
-        rows,
-        vec![
-            (1, Some("a".to_string())),
-            (2, Some("b".to_string())),
-            (3, None),
-        ]
-    );
-
-    let filtered: Vec<(Option<String>,)> = conn
-        .query("select name from tbl where id = 2")
-        .expect("filtered select");
-    assert_eq!(filtered, vec![(Some("b".to_string()),)]);
-}
-
-#[test]
-fn standalone_mysql_server_loads_tables_from_config_and_cli_overrides_duplicates() {
-    let config_parquet = write_parquet_file(&[(1, Some("config"))]);
-    let cli_parquet = write_parquet_file(&[(9, Some("cli"))]);
-    let port = alloc_port();
-    let config = NamedTempFile::new().expect("create config");
-    std::fs::write(
-        config.path(),
-        format!(
-            r#"[standalone_server]
-mysql_port = {port}
-user = "root"
-
-[[standalone_server.tables]]
-name = "tbl"
-path = "{}"
-"#,
-            config_parquet.path().display()
-        ),
-    )
-    .expect("write config");
-
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config.path().display().to_string(),
-        "--table".to_string(),
-        format!("tbl={}", cli_parquet.path().display()),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
-
-    let rows: Vec<(i32, Option<String>)> = conn.query("select * from tbl").expect("select *");
-    assert_eq!(rows, vec![(9, Some("cli".to_string()))]);
+    let rows: Vec<(i32,)> = conn.query("select 1").expect("select constant");
+    assert_eq!(rows, vec![(1,)]);
 }
 
 #[test]
 fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
-    let parquet = write_parquet_file(&[(1, Some("a"))]);
     let port = alloc_port();
     let args = vec![
         "standalone-server".to_string(),
         "--port".to_string(),
         port.to_string(),
-        "--table".to_string(),
-        format!("tbl={}", parquet.path().display()),
     ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
@@ -454,11 +370,6 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
         .pass(Some("secret".to_string()));
     let _err = MysqlConn::new(bad_password).expect_err("non-empty password must fail");
 }
-
-// `standalone_mysql_server_supports_basic_ddl_without_preloaded_tables`
-// exercised the removed local-parquet `CREATE TABLE ... PROPERTIES("path"="...")`
-// shorthand. The managed-lake round-trip test below now covers the bare
-// `CREATE TABLE` + default-DDL path end-to-end.
 
 #[test]
 fn standalone_mysql_server_supports_minimal_iceberg_flow() {
@@ -694,12 +605,6 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
         .expect("execute multi-statement iceberg step");
     assert_eq!(rows, vec![(Some("b".to_string()),)]);
 }
-
-// `standalone_mysql_server_supports_json_stream_load_for_local_tables` is
-// removed along with the local-parquet backend. Task 5 rewired the HTTP
-// stream-load endpoint to managed lake; a managed-lake stream-load smoke
-// test belongs with the managed-lake round-trip suite below and is covered
-// indirectly by `engine::tests` at the lib level.
 
 #[test]
 fn standalone_mysql_server_managed_lake_round_trip() {

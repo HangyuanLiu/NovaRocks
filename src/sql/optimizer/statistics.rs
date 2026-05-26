@@ -80,7 +80,7 @@ pub struct TableStatistics {
     pub column_stats: HashMap<String, ColumnStatistic>,
 }
 
-/// Build table-level statistics from `S3FileInfo` entries.
+/// Build table-level statistics from `IcebergDataFileInfo` entries.
 ///
 /// Aggregates row counts and per-column Iceberg statistics across all files.
 /// Returns `None` if no file has a row count (e.g., non-Iceberg sources).
@@ -91,7 +91,7 @@ pub struct TableStatistics {
 /// behavior).
 #[allow(dead_code)] // kept for tests and external callers that do not have column schema handy
 pub fn build_table_statistics(
-    files: &[crate::sql::catalog::S3FileInfo],
+    files: &[crate::sql::catalog::IcebergDataFileInfo],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_columns(files, &[])
 }
@@ -101,7 +101,7 @@ pub fn build_table_statistics(
 /// `TableDef::columns` so that `column.name` maps to the correct Arrow
 /// `DataType` for decoding.
 pub fn build_table_statistics_with_columns(
-    files: &[crate::sql::catalog::S3FileInfo],
+    files: &[crate::sql::catalog::IcebergDataFileInfo],
     columns: &[crate::sql::catalog::ColumnDef],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
@@ -120,7 +120,7 @@ pub fn build_table_statistics_with_columns(
 ///   2. Manifest `value_counts` (as an upper bound).
 ///   3. `sqrt(non_null) * 10` heuristic.
 pub fn build_table_statistics_with_ndv(
-    files: &[crate::sql::catalog::S3FileInfo],
+    files: &[crate::sql::catalog::IcebergDataFileInfo],
     columns: &[crate::sql::catalog::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     _name_to_field_id: &HashMap<String, i32>,
@@ -516,9 +516,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_decodes_int_min_max() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
 
-        let file = S3FileInfo {
+        let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -558,9 +558,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_skips_string_bounds() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
 
-        let file = S3FileInfo {
+        let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(50),
@@ -599,9 +599,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_without_columns_uses_heuristic_ndv() {
-        use crate::sql::catalog::{IcebergColumnStats, S3FileInfo};
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
-        let file = S3FileInfo {
+        let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -632,9 +632,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
 
-        let file = S3FileInfo {
+        let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -678,9 +678,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, S3FileInfo};
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
 
-        let file = S3FileInfo {
+        let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(1_000),

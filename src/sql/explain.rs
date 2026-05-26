@@ -1,12 +1,8 @@
 //! EXPLAIN plan formatter — produces text from LogicalPlan or PhysicalPlan.
 
-use std::collections::HashSet;
 use std::fmt::Write;
-use std::fs::File;
 
-use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::catalog::ScanSource;
@@ -805,7 +801,7 @@ fn scan_supports_decode_hint(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks => {
             required_columns.iter().any(|required| {
                 table
                     .columns
@@ -828,7 +824,7 @@ fn scan_supports_min_max_stats(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {}
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         ScanSource::IcebergMetadataTable { .. } => return false,
         // IVM delta-scan is a synthetic placeholder; no parquet stats.
@@ -1033,7 +1029,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Fields};
@@ -1048,7 +1044,7 @@ mod tests {
     use crate::sql::optimizer::statistics::Statistics;
 
     #[test]
-    fn s3_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {
+    fn starrocks_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {
         let column = ColumnDef {
             name: "c_2_0".to_string(),
             data_type: DataType::FixedSizeBinary(16),
@@ -1063,11 +1059,7 @@ mod tests {
                     name: "t3".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1096,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_scan_costs_explain_reports_decode_for_string_required_columns() {
+    fn starrocks_scan_costs_explain_reports_decode_for_string_required_columns() {
         let column = ColumnDef {
             name: "c8".to_string(),
             data_type: DataType::Utf8,
@@ -1111,11 +1103,7 @@ mod tests {
                     name: "all_t0".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1181,11 +1169,7 @@ mod tests {
                     name: "t1".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1248,11 +1232,7 @@ mod tests {
                     name: "ice_tbl".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {

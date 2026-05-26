@@ -82,25 +82,35 @@ pub(crate) struct ScanTupleOwner {
     pub fragment_id: FragmentId,
 }
 
+fn iceberg_table_info(
+    source: &crate::sql::catalog::ScanSource,
+) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    match source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        crate::sql::catalog::ScanSource::StarRocks => None,
+    }
+}
+
 fn add_iceberg_equality_delete_required_columns(
     required: &mut std::collections::HashSet<String>,
     table: &crate::sql::catalog::TableDef,
 ) -> Result<(), String> {
-    let crate::sql::catalog::ScanSource::S3ParquetFiles { files, .. } = &table.source else {
+    let crate::sql::catalog::ScanSource::IcebergDataFiles {
+        table: iceberg,
+        files,
+        ..
+    } = &table.source
+    else {
         return Ok(());
     };
-    let field_id_to_name: HashMap<i32, String> = table
-        .iceberg_table
-        .as_ref()
-        .map(|iceberg| {
-            iceberg
-                .schema
-                .fields
-                .iter()
-                .map(|field| (field.field_id, field.name.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let field_id_to_name: HashMap<i32, String> = iceberg
+        .schema
+        .fields
+        .iter()
+        .map(|field| (field.field_id, field.name.clone()))
+        .collect();
     for file in files {
         for delete_file in &file.delete_files {
             if delete_file.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
@@ -409,8 +419,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             .as_ref()
             .map(|layout| layout.table_id)
             .or_else(|| {
-                op.table
-                    .iceberg_table
+                iceberg_table_info(&op.table.source)
                     .is_some()
                     .then_some(synthetic_iceberg_table_id(scan_node_id))
             });
@@ -2160,9 +2169,19 @@ impl<'a> PlanFragmentBuilder<'a> {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: crate::sql::catalog::ScanSource::S3ParquetFiles {
-                files: vec![crate::sql::catalog::S3FileInfo {
+            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table: crate::sql::catalog::IcebergTableInfo {
+                    catalog: "generate_series".to_string(),
+                    namespace: self.current_database.to_string(),
+                    table: op.alias.as_deref().unwrap_or("generate_series").to_string(),
+                    table_uuid: None,
+                    current_snapshot_id: None,
+                    schema_id: 0,
+                    location: path.display().to_string(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                },
+                files: vec![crate::sql::catalog::IcebergDataFileInfo {
                     path: path.display().to_string(),
                     size: file_len,
                     row_count: None,
@@ -3350,10 +3369,10 @@ mod tests {
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDeleteFileContent,
-        IcebergDeleteFileFormat, IcebergDeleteFileInfo, IcebergPartitionFieldValue,
-        IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-        ManagedTabletRef, PhysicalTableLayout, S3FileInfo, ScanSource, TableDef,
+        CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDataFileInfo,
+        IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+        IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
+        IcebergTableInfo, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
     };
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinEqCondition,
@@ -3362,6 +3381,35 @@ mod tests {
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
+
+    fn test_iceberg_table_info_with_schema(fields: Vec<IcebergSchemaFieldDef>) -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields },
+            serialized_metadata: None,
+        }
+    }
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        test_iceberg_table_info_with_schema(vec![])
+    }
+
+    fn test_iceberg_table_info_with_id_schema() -> IcebergTableInfo {
+        test_iceberg_table_info_with_schema(vec![IcebergSchemaFieldDef {
+            field_id: 1,
+            name: "id".to_string(),
+            initial_default: None,
+            write_default: None,
+            initial_default_json: None,
+            children: vec![],
+        }])
+    }
 
     struct DummyCatalog;
 
@@ -3456,8 +3504,8 @@ mod tests {
         }
     }
 
-    fn iceberg_i32_file(path: &str, min: i32, max: i32) -> S3FileInfo {
-        S3FileInfo {
+    fn iceberg_i32_file(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
             path: path.to_string(),
             size: 128,
             row_count: Some(10),
@@ -3482,8 +3530,8 @@ mod tests {
         }
     }
 
-    fn iceberg_i32_partition_file(path: &str, id: i32) -> S3FileInfo {
-        S3FileInfo {
+    fn iceberg_i32_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
             path: path.to_string(),
             size: 128,
             row_count: Some(10),
@@ -3550,15 +3598,9 @@ mod tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: Some(IcebergTableInfo {
-                location: "file:///warehouse/ice_t".to_string(),
-                schema: IcebergSchemaDef {
-                    fields: iceberg_schema_fields,
-                },
-                serialized_metadata: None,
-            }),
-            source: ScanSource::S3ParquetFiles {
-                files: vec![crate::sql::catalog::S3FileInfo {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info_with_schema(iceberg_schema_fields),
+                files: vec![crate::sql::catalog::IcebergDataFileInfo {
                     path: "s3://bucket/data.parquet".to_string(),
                     size: 1,
                     row_count: Some(1),
@@ -3686,9 +3728,9 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: vec![crate::sql::catalog::S3FileInfo {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![crate::sql::catalog::IcebergDataFileInfo {
                             path: path.display().to_string(),
                             size: 0,
                             row_count: None,
@@ -3730,11 +3772,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: vec![],
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: output_columns(),
@@ -3761,21 +3799,8 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: Some(IcebergTableInfo {
-                        location: "file:///warehouse/ice_t".to_string(),
-                        schema: IcebergSchemaDef {
-                            fields: vec![IcebergSchemaFieldDef {
-                                field_id: 1,
-                                name: "id".to_string(),
-                                initial_default: None,
-                                write_default: None,
-                                initial_default_json: None,
-                                children: vec![],
-                            }],
-                        },
-                        serialized_metadata: None,
-                    }),
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_id_schema(),
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
                     },
@@ -3805,21 +3830,8 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: Some(IcebergTableInfo {
-                        location: "s3://bucket/warehouse/ice_t".to_string(),
-                        schema: IcebergSchemaDef {
-                            fields: vec![IcebergSchemaFieldDef {
-                                field_id: 1,
-                                name: "id".to_string(),
-                                initial_default: None,
-                                write_default: None,
-                                initial_default_json: None,
-                                children: vec![],
-                            }],
-                        },
-                        serialized_metadata: None,
-                    }),
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_id_schema(),
                         files: vec![
                             iceberg_i32_file("s3://bucket/file-1-5.parquet", 1, 5),
                             iceberg_i32_file("s3://bucket/file-10-20.parquet", 10, 20),
@@ -3852,21 +3864,8 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: Some(IcebergTableInfo {
-                        location: "s3://bucket/warehouse/ice_t".to_string(),
-                        schema: IcebergSchemaDef {
-                            fields: vec![IcebergSchemaFieldDef {
-                                field_id: 1,
-                                name: "id".to_string(),
-                                initial_default: None,
-                                write_default: None,
-                                initial_default_json: None,
-                                children: vec![],
-                            }],
-                        },
-                        serialized_metadata: None,
-                    }),
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_id_schema(),
                         files: vec![
                             iceberg_i32_partition_file("s3://bucket/id-1.parquet", 1),
                             iceberg_i32_partition_file("s3://bucket/id-12.parquet", 12),
@@ -3901,21 +3900,8 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: Some(IcebergTableInfo {
-                        location: "s3://bucket/warehouse/ice_t".to_string(),
-                        schema: IcebergSchemaDef {
-                            fields: vec![IcebergSchemaFieldDef {
-                                field_id: 1,
-                                name: "id".to_string(),
-                                initial_default: None,
-                                write_default: None,
-                                initial_default_json: None,
-                                children: vec![],
-                            }],
-                        },
-                        serialized_metadata: None,
-                    }),
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
                     },
@@ -3949,21 +3935,8 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: Some(IcebergTableInfo {
-                        location: "s3://bucket/warehouse/ice_t".to_string(),
-                        schema: IcebergSchemaDef {
-                            fields: vec![IcebergSchemaFieldDef {
-                                field_id: 1,
-                                name: "id".to_string(),
-                                initial_default: None,
-                                write_default: None,
-                                initial_default_json: None,
-                                children: vec![],
-                            }],
-                        },
-                        serialized_metadata: None,
-                    }),
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
                     },

@@ -2782,7 +2782,7 @@ mod data_file_with_stats_tests {
     }
 
     /// Regression test: data_sequence_number must be threaded from the
-    /// DataFileWithStats struct through to S3FileInfo.  The full
+    /// DataFileWithStats struct through to IcebergDataFileInfo.  The full
     /// extract_data_files_with_stats -> build_iceberg_table_def_with_data_files
     /// path is covered by Task 5's integration tests; this test validates the
     /// struct plumbing so a future refactor cannot drop the field silently.

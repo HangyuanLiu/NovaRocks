@@ -117,7 +117,7 @@ impl DescriptorTableBuilder {
         db_name: &str,
         table: &TableDef,
     ) {
-        if let Some(iceberg) = table.iceberg_table.as_ref() {
+        if let Some(iceberg) = iceberg_table_info(&table.source) {
             self.add_iceberg_table(table_id, db_name, table, iceberg);
         } else {
             self.add_table(table_id, db_name, &table.name, table.columns.len() as i32);
@@ -216,6 +216,17 @@ impl DescriptorTableBuilder {
     }
 }
 
+fn iceberg_table_info(
+    source: &crate::sql::catalog::ScanSource,
+) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    match source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        crate::sql::catalog::ScanSource::StarRocks => None,
+    }
+}
+
 fn to_thrift_iceberg_schema(schema: &IcebergSchemaDef) -> descriptors::TIcebergSchema {
     descriptors::TIcebergSchema::new(Some(
         schema
@@ -292,8 +303,39 @@ mod tests {
     use super::*;
     use crate::sql::catalog::{ColumnDef, IcebergTableInfo, ScanSource};
 
+    fn test_iceberg_table_info(schema: IcebergSchemaDef) -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///warehouse/orders".to_string(),
+            schema,
+            serialized_metadata: None,
+        }
+    }
+
     #[test]
     fn descriptor_builder_emits_iceberg_schema_field_ids() {
+        let iceberg = test_iceberg_table_info(IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 7,
+                name: "order_id".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![IcebergSchemaFieldDef {
+                    field_id: 8,
+                    name: "nested".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    children: vec![],
+                }],
+            }],
+        });
         let table = TableDef {
             name: "orders".to_string(),
             columns: vec![ColumnDef {
@@ -304,28 +346,8 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: Some(IcebergTableInfo {
-                location: "file:///warehouse/orders".to_string(),
-                schema: IcebergSchemaDef {
-                    fields: vec![IcebergSchemaFieldDef {
-                        field_id: 7,
-                        name: "order_id".to_string(),
-                        initial_default: None,
-                        write_default: None,
-                        initial_default_json: None,
-                        children: vec![IcebergSchemaFieldDef {
-                            field_id: 8,
-                            name: "nested".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            children: vec![],
-                        }],
-                    }],
-                },
-                serialized_metadata: None,
-            }),
-            source: ScanSource::S3ParquetFiles {
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg,
                 files: vec![],
                 cloud_properties: Default::default(),
             },

@@ -4533,7 +4533,6 @@ enable_path_style_access = true
                         ],
                         source: ScanSource::StarRocks,
                         iceberg_row_lineage_metadata_columns: vec![],
-                        iceberg_table: None,
                     },
                 )
                 .expect("register orders table");

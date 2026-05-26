@@ -12,8 +12,8 @@ use crate::types;
 use super::resolve::ResolvedTable;
 
 use crate::sql::catalog::{
-    IcebergColumnStats, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-    IcebergPartitionValue, S3FileInfo, ScanSource,
+    IcebergColumnStats, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergDeleteFileInfo, IcebergPartitionValue, ScanSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -67,15 +67,13 @@ fn build_iceberg_delta_scan_node(
     let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) = match &resolved.table.source
     {
         ScanSource::IcebergDeltaTable {
-            catalog,
-            namespace,
             table,
             from_snapshot_id,
             to_snapshot_id,
         } => (
-            catalog.clone(),
-            namespace.clone(),
-            table.clone(),
+            table.catalog.clone(),
+            table.namespace.clone(),
+            table.table.clone(),
             *from_snapshot_id,
             *to_snapshot_id,
         ),
@@ -131,7 +129,7 @@ fn build_hdfs_scan_node(
     node.compact_data = true;
 
     let cloud_config = match &resolved.table.source {
-        ScanSource::S3ParquetFiles {
+        ScanSource::IcebergDataFiles {
             cloud_properties, ..
         }
         | ScanSource::IcebergMetadataTable {
@@ -590,7 +588,7 @@ pub(crate) fn build_exec_params_multi(
                 .collect()
         } else {
             match &resolved.table.source {
-                ScanSource::S3ParquetFiles { files, .. } => {
+                ScanSource::IcebergDataFiles { files, .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
                     let change_op_slot = planned_change_op_slot(planned);
                     let mut ranges = Vec::new();
@@ -688,7 +686,7 @@ fn int_literal_expr(value: i64) -> exprs::TExpr {
     exprs::TExpr::new(vec![super::expr_compiler::int_literal_node(value)])
 }
 
-fn file_may_satisfy_min_max(file: &S3FileInfo, predicates: &[MinMaxPredicate]) -> bool {
+fn file_may_satisfy_min_max(file: &IcebergDataFileInfo, predicates: &[MinMaxPredicate]) -> bool {
     if predicates.is_empty() {
         return true;
     }
@@ -707,7 +705,10 @@ fn file_may_satisfy_min_max(file: &S3FileInfo, predicates: &[MinMaxPredicate]) -
     })
 }
 
-fn partition_may_satisfy_predicate(file: &S3FileInfo, predicate: &MinMaxPredicate) -> Option<bool> {
+fn partition_may_satisfy_predicate(
+    file: &IcebergDataFileInfo,
+    predicate: &MinMaxPredicate,
+) -> Option<bool> {
     let partition = file.partition_values.iter().find(|value| {
         value.transform.eq_ignore_ascii_case("identity")
             && value.source_column.eq_ignore_ascii_case(predicate.column())
@@ -931,7 +932,7 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
 }
 
 fn build_hdfs_scan_range_params_for_file(
-    file: &S3FileInfo,
+    file: &IcebergDataFileInfo,
     change_op_slot: Option<types::TSlotId>,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
@@ -954,7 +955,7 @@ fn build_hdfs_scan_range_params_for_file(
         .collect()
 }
 
-fn plan_hdfs_file_splits(file: &S3FileInfo) -> Vec<(i64, i64)> {
+fn plan_hdfs_file_splits(file: &IcebergDataFileInfo) -> Vec<(i64, i64)> {
     let file_len = file.size.max(0);
     if file_len <= ICEBERG_SCAN_SPLIT_TARGET_BYTES
         || file.first_row_id.is_some()
@@ -1250,8 +1251,24 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::codegen::resolve::ResolvedTable;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
 
     fn hdfs_range(
         params: &crate::internal_service::TScanRangeParams,
@@ -1320,9 +1337,9 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: vec![S3FileInfo {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![IcebergDataFileInfo {
                             path: "s3://bucket/path/file.parquet".to_string(),
                             size: 1024,
                             row_count: Some(1),
@@ -1376,9 +1393,9 @@ mod tests {
                         write_default: None,
                         logical_type: None,
                     }],
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: vec![S3FileInfo {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![IcebergDataFileInfo {
                             path: "s3://bucket/path/file.parquet".to_string(),
                             size: 1024,
                             row_count: Some(1),
