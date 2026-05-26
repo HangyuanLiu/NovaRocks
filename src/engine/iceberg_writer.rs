@@ -244,6 +244,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     //    see the new snapshot. The standalone catalog rebuilds its TableDef
     //    on the next register_iceberg_tables_for_query call.
     invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
 
     Ok(StatementResult::Ok)
 }

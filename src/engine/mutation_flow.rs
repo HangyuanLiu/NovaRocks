@@ -320,6 +320,7 @@ fn execute_mor_update(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -531,6 +532,7 @@ fn execute_cow_update(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -1790,6 +1792,7 @@ fn execute_merge_matched_delete(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -1851,6 +1854,7 @@ fn execute_merge_unmatched_insert(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 

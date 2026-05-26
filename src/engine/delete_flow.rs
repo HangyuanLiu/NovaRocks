@@ -266,6 +266,7 @@ pub(crate) fn execute_delete_statement(
 
     // Invalidate caches so subsequent SELECTs see the new snapshot.
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, &target)?;
 
     Ok(StatementResult::Ok)
 }

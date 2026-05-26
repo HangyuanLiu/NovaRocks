@@ -40,6 +40,10 @@ pub fn iceberg_optimize_job() -> IdScope {
     stable("job.iceberg_optimize")
 }
 
+pub fn dictionary_snapshot() -> IdScope {
+    stable("dictionary.snapshot")
+}
+
 pub fn custom(value: impl Into<String>) -> Result<IdScope, MetaError> {
     IdScope::new(value)
 }

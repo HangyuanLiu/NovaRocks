@@ -720,6 +720,16 @@ fn write_chunks_into_starrocks_partition_inner(
         }
     }
     commit_catalog_visible_version(state, &mut starrocks, &plan, prepared.commit_version)?;
+    // Capture (database, table) names while the write lock is still held so
+    // the dictionary invalidation call below can resolve the owner without
+    // needing the write lock back.
+    let name_for_dict = starrocks
+        .runtime_by_table_id(plan.table_id)
+        .map(|runtime| (runtime.database_name.clone(), runtime.table.name.clone()));
+    drop(starrocks);
+    if let Some((db, table)) = name_for_dict {
+        crate::engine::dictionary::maintenance::mark_starrocks_table_stale(state, &db, &table)?;
+    }
 
     Ok(total_rows)
 }
@@ -1188,6 +1198,13 @@ pub(crate) fn delete_starrocks_table_by_predicate(
         .write()
         .expect("standalone StarRocks table write lock");
     commit_catalog_visible_version(state, &mut starrocks, &plan, prepared.commit_version)?;
+    let name_for_dict = starrocks
+        .runtime_by_table_id(plan.table_id)
+        .map(|runtime| (runtime.database_name.clone(), runtime.table.name.clone()));
+    drop(starrocks);
+    if let Some((db, table)) = name_for_dict {
+        crate::engine::dictionary::maintenance::mark_starrocks_table_stale(state, &db, &table)?;
+    }
     Ok(())
 }
 

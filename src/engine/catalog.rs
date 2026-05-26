@@ -72,6 +72,19 @@ impl InMemoryCatalog {
         self.databases.keys().map(String::as_str)
     }
 
+    /// Enumerate the (already-normalized) table names registered in the
+    /// in-memory catalog under `database_name`. Returns an empty list if
+    /// the database does not exist.
+    pub(crate) fn table_names_in_database(&self, database_name: &str) -> Vec<String> {
+        let Ok(db_key) = normalize_identifier(database_name) else {
+            return Vec::new();
+        };
+        self.databases
+            .get(&db_key)
+            .map(|db| db.tables.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn register(&mut self, database_name: &str, table: TableDef) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let db = self

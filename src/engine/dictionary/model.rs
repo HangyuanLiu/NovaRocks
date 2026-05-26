@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DictionaryOwner {
@@ -18,7 +19,38 @@ pub(crate) enum DictionaryOwner {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl DictionaryOwner {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            DictionaryOwner::StarRocksTable { .. } => "starrocks_table",
+            DictionaryOwner::IcebergTable { .. } => "iceberg_table",
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        match self {
+            DictionaryOwner::StarRocksTable {
+                database,
+                table,
+                db_id,
+                table_id,
+            } => {
+                format!("db={database};table={table};db_id={db_id};table_id={table_id}")
+            }
+            DictionaryOwner::IcebergTable {
+                catalog,
+                namespace,
+                table,
+                table_uuid,
+            } => format!(
+                "catalog={catalog};namespace={namespace};table={table};uuid={}",
+                table_uuid.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DictionaryWatermark {
     StarRocks {
         schema_id: i64,
@@ -30,7 +62,13 @@ pub(crate) enum DictionaryWatermark {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl DictionaryWatermark {
+    pub(crate) fn stable_json(&self) -> String {
+        serde_json::to_string(self).expect("dictionary watermark serializes")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StarRocksTabletWatermark {
     pub(crate) tablet_id: i64,
     pub(crate) partition_id: i64,

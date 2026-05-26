@@ -489,6 +489,21 @@ fn handle_analyze_statement(
         columns.join(",")
     };
     add_analyze_status(state, &key, &status_columns, "FULL", false);
+    // Dictionary rebuild only applies to `ANALYZE FULL TABLE`. Plain
+    // `ANALYZE TABLE` and `ANALYZE SAMPLE TABLE` paths must not rebuild
+    // dictionaries — the SAMPLE branch already returned above and the plain
+    // ANALYZE TABLE path reaches here but only the FULL prefix should drive
+    // a rebuild.
+    if lower.starts_with("analyze full table ") {
+        let analyze_columns = analyze_column_list(sql)?;
+        let rebuilt = crate::engine::dictionary::rebuild::rebuild_for_analyze_full(
+            state,
+            &key.db,
+            &key.table,
+            analyze_columns.as_deref(),
+        )?;
+        tracing::debug!("rebuilt {rebuilt} dictionary snapshots for ANALYZE FULL");
+    }
     Ok(())
 }
 
