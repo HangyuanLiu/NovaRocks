@@ -728,13 +728,24 @@ impl<'a> PlanFragmentBuilder<'a> {
     // visit_decode
     // -------------------------------------------------------------------
 
-    /// Emit a `TDecodeNode` for a `PhysicalDecodeOp`. The decode op carries
-    /// `DecodeMapping { dict_column, string_column }` pairs naming columns
-    /// already exposed by the child's `ExprScope`; this routine resolves both
-    /// names to their physical slot ids and packs the dict-id → string-id map
-    /// onto the new `TDecodeNode`. The child's scope, tuple ids, and CTE
-    /// exchange list are forwarded unchanged — Task 7 will adjust the scope
-    /// when it actually populates `dict_columns` on the upstream scan.
+    /// Emit a `TDecodeNode` for a `PhysicalDecodeOp`.
+    ///
+    /// The BE-side decode (see `src/lower/node/decode.rs`) treats the decode
+    /// as a Project that allocates a new output tuple. For each `(dict_id,
+    /// string_id)` pair in `dict_id_to_string_ids`:
+    /// * `dict_id` is an EXISTING child slot (the encoded Int32 dict slot).
+    /// * `string_id` is a NEW slot in the decode's own tuple — the slot
+    ///   that materializes the decoded string value.
+    /// All other child slots pass through the decode unchanged: the new
+    /// tuple "borrows" their slot ids verbatim (matches the StarRocks
+    /// `DecodeNode` codegen, where a new `TupleDescriptor` reuses the
+    /// child's slot ids for passthrough columns and adds a fresh slot
+    /// id per decoded column).
+    ///
+    /// The string slot id is freshly allocated here — it is NOT expected
+    /// to be in the child scope, because the rewriter inserts the Decode
+    /// above operators (e.g. `Aggregate(group_by = dict)`) that strip
+    /// the source string slot from their output.
     fn visit_decode(
         &mut self,
         op: &PhysicalDecodeOp,
@@ -748,7 +759,12 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         let child = self.visit(&node.children[0])?;
 
-        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
+        // Resolve the encoded (Int32 dict) slot per mapping from the
+        // child scope. The dict column name MUST be in the child scope
+        // — the rewriter is the only producer of decode mappings, and
+        // it only creates one when its input subtree publishes the
+        // dict column.
+        let mut decoded_targets: BTreeMap<String, i32> = BTreeMap::new();
         for item in &op.mappings {
             let dict_binding = child
                 .scope
@@ -758,21 +774,116 @@ impl<'a> PlanFragmentBuilder<'a> {
                         "decode dict column `{}` is not in child scope",
                         item.dict_column
                     )
-                })?;
-            let string_binding = child
-                .scope
-                .resolve_column(None, &item.string_column)
-                .map_err(|_| {
-                    format!(
-                        "decode string column `{}` is not in child scope",
-                        item.string_column
-                    )
-                })?;
-            mapping.insert(dict_binding.slot_id, string_binding.slot_id);
+                })?
+                .clone();
+            decoded_targets.insert(
+                item.string_column.to_ascii_lowercase(),
+                dict_binding.slot_id,
+            );
         }
 
+        // Allocate the decode's new output tuple. New string slots live
+        // here; passthrough slots are re-registered here under the same
+        // slot id they used in the child tuple.
+        let decode_tuple_id = self.alloc_tuple();
+        let mut decode_scope = ExprScope::new();
+        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
+        let mut consumed_dict_slots: std::collections::BTreeSet<i32> = Default::default();
+
+        // Decoded-column output schema: prefer the op's declared
+        // `output_columns` (carries the post-decode names + types as
+        // the rewriter built them). Fall back to the child's column
+        // ordering when the rewriter handed us an empty vector (older
+        // test paths).
+        let output_columns: Vec<(String, DataType, bool)> = if op.output_columns.is_empty() {
+            child
+                .scope
+                .iter_columns()
+                .map(|(name, binding)| (name.clone(), binding.data_type.clone(), binding.nullable))
+                .collect()
+        } else {
+            op.output_columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                .collect()
+        };
+
+        let mut col_pos: i32 = 0;
+        for (name, data_type, nullable) in &output_columns {
+            let lower = name.to_ascii_lowercase();
+            if let Some(child_dict_slot) = decoded_targets.get(&lower) {
+                // Decoded string output: allocate a NEW slot in the
+                // decode's tuple. The mapping pairs the child's dict
+                // slot with this new string slot.
+                let string_slot_id = self.alloc_slot();
+                self.desc_builder.add_slot(
+                    string_slot_id,
+                    decode_tuple_id,
+                    name,
+                    data_type,
+                    *nullable,
+                    col_pos,
+                );
+                if consumed_dict_slots.insert(*child_dict_slot) {
+                    mapping.insert(*child_dict_slot, string_slot_id);
+                }
+                decode_scope.add_column(
+                    None,
+                    name.clone(),
+                    ColumnBinding {
+                        tuple_id: decode_tuple_id,
+                        slot_id: string_slot_id,
+                        data_type: data_type.clone(),
+                        type_desc: None,
+                        nullable: *nullable,
+                    },
+                );
+                col_pos += 1;
+            } else if let Ok(child_binding) = child.scope.resolve_column(None, name) {
+                // Passthrough: re-register the child's slot id under
+                // the decode's new tuple, matching the StarRocks BE
+                // contract (passthrough slots keep their slot id and
+                // gain a new tuple parent).
+                let child_binding = child_binding.clone();
+                self.desc_builder.add_slot(
+                    child_binding.slot_id,
+                    decode_tuple_id,
+                    name,
+                    &child_binding.data_type,
+                    child_binding.nullable,
+                    col_pos,
+                );
+                decode_scope.add_column(
+                    None,
+                    name.clone(),
+                    ColumnBinding {
+                        tuple_id: decode_tuple_id,
+                        slot_id: child_binding.slot_id,
+                        data_type: child_binding.data_type.clone(),
+                        type_desc: child_binding.type_desc.clone(),
+                        nullable: child_binding.nullable,
+                    },
+                );
+                col_pos += 1;
+            } else {
+                return Err(format!(
+                    "decode output column `{}` is not in child scope and not a decoded mapping",
+                    name
+                ));
+            }
+        }
+
+        if mapping.len() != op.mappings.len() {
+            return Err(format!(
+                "decode mappings unresolved: declared {} entries, materialized {}",
+                op.mappings.len(),
+                mapping.len()
+            ));
+        }
+
+        self.desc_builder.add_tuple(decode_tuple_id, None);
         let decode_node =
-            nodes::build_decode_node(self.alloc_node(), child.tuple_ids.clone(), mapping);
+            nodes::build_decode_node(self.alloc_node(), vec![decode_tuple_id], mapping);
 
         // Pre-order: decode first, then child nodes.
         let mut plan_nodes = vec![decode_node];
@@ -780,8 +891,8 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         Ok(VisitResult {
             plan_nodes,
-            scope: child.scope,
-            tuple_ids: child.tuple_ids,
+            scope: decode_scope,
+            tuple_ids: vec![decode_tuple_id],
             cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
@@ -4940,7 +5051,12 @@ mod tests {
                     dict_column: "id_dict".to_string(),
                     string_column: "id".to_string(),
                 }],
-                output_columns: vec![],
+                output_columns: vec![OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                }],
             }),
             children: vec![scan],
             stats: stats(),
@@ -4961,16 +5077,38 @@ mod tests {
             .find(|fragment| fragment.fragment_id == build.root_fragment_id)
             .expect("root fragment");
 
-        // Resolve the actual scan output slot ids from the descriptor table
-        // so the assertions are tied to the underlying scan, not to a guess
-        // about allocator ordering.
-        let expected_string_slot = slot_id_by_name(&root.desc_tbl, "id");
-        let expected_dict_slot = slot_id_by_name(&root.desc_tbl, "id_dict");
-        assert_ne!(expected_string_slot, expected_dict_slot);
+        // The decode allocates a NEW tuple with a NEW Utf8 slot named
+        // `id` (the decoded output, distinct from the scan's `id`
+        // slot). The `dict_id_to_string_ids` mapping pairs the scan's
+        // dict slot with the decode tuple's new string slot.
+        let desc_tbl = &root.desc_tbl;
+        let slots = desc_tbl
+            .slot_descriptors
+            .as_ref()
+            .expect("slot_descriptors");
+        let tuples = &desc_tbl.tuple_descriptors;
+        assert_eq!(tuples.len(), 2, "expected scan tuple + decode tuple");
+        let scan_tuple_id = tuples[0].id.expect("scan tuple id");
+        let decode_tuple_id = tuples[1].id.expect("decode tuple id");
+        let scan_dict_slot = slots
+            .iter()
+            .find(|s| s.parent == Some(scan_tuple_id) && s.col_name.as_deref() == Some("id_dict"))
+            .and_then(|s| s.id)
+            .expect("scan id_dict slot");
+        let decode_string_slot = slots
+            .iter()
+            .find(|s| s.parent == Some(decode_tuple_id) && s.col_name.as_deref() == Some("id"))
+            .and_then(|s| s.id)
+            .expect("decode id slot");
 
         // First plan node is the decode node (pre-order).
         let first = root.plan.nodes.first().expect("decode plan node");
         assert_eq!(first.node_type, plan_nodes::TPlanNodeType::DECODE_NODE);
+        assert_eq!(
+            first.row_tuples,
+            vec![decode_tuple_id],
+            "decode row_tuples must reference the new decode tuple"
+        );
         let decode = first.decode_node.as_ref().expect("decode payload");
         let mapping = decode
             .dict_id_to_string_ids
@@ -4978,16 +5116,13 @@ mod tests {
             .expect("dict_id_to_string_ids");
         assert_eq!(mapping.len(), 1);
         let (dict_slot, string_slot) = mapping.iter().next().expect("one entry");
-        // Decode mapping slot ids must match the scan output slot ids for the
-        // same (source_column, dict_column) pair — swapping the (key, value)
-        // sides of the map would otherwise pass undetected.
         assert_eq!(
-            *dict_slot, expected_dict_slot,
+            *dict_slot, scan_dict_slot,
             "decode mapping key must be the scan's dict slot id"
         );
         assert_eq!(
-            *string_slot, expected_string_slot,
-            "decode mapping value must be the scan's string slot id"
+            *string_slot, decode_string_slot,
+            "decode mapping value must be the decode tuple's new string slot id"
         );
     }
 
