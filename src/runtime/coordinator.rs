@@ -509,8 +509,8 @@ impl ExecutionCoordinator {
             &mut arena,
             &tuple_slots,
             Some(&desc_tbl),
-            None, // query_global_dicts
-            None, // query_global_dict_exprs
+            root_fragment.query_global_dicts.as_deref(), // query_global_dicts
+            root_fragment.query_global_dict_exprs.as_ref(), // query_global_dict_exprs
             Some(&root_exec_params),
             query_options.as_ref(),
             None, // db_name

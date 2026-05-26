@@ -576,8 +576,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .resolve_column(None, &dict_col.source_column)
                 .map_err(|_| {
                     format!(
-                        "scan dict_columns references unknown source column `{}`",
-                        dict_col.source_column
+                        "scan `{}.{}` dict_columns references unknown source column `{}`",
+                        op.database, op.table.name, dict_col.source_column
                     )
                 })?
                 .clone();
@@ -643,7 +643,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Emit per-dict-column TGlobalDict payloads onto the owning fragment.
         let current_frag = self.current_fragment_id()?;
         for (dict_slot_id, dict_col) in &dict_slot_to_dict {
-            let snapshot = &dict_col.dictionary;
+            let snapshot = dict_col.dictionary.as_ref();
             let mut ids = Vec::with_capacity(snapshot.values.len());
             let mut strings = Vec::with_capacity(snapshot.values.len());
             for value in &snapshot.values {
@@ -4778,12 +4778,12 @@ mod tests {
     // Task 6: codegen dictionary plan interface
     // -------------------------------------------------------------------
 
-    fn dict_snapshot_a_b() -> crate::engine::dictionary::model::DictionarySnapshot {
+    fn dict_snapshot_a_b() -> std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot> {
         use crate::engine::dictionary::model::{
             DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
             DictionaryWatermark,
         };
-        DictionarySnapshot {
+        std::sync::Arc::new(DictionarySnapshot {
             dictionary_id: 1,
             owner: DictionaryOwner::StarRocksTable {
                 database: "default".to_string(),
@@ -4812,6 +4812,77 @@ mod tests {
             null_id: 0,
             state: DictionaryState::Active,
             order_preserving: true,
+        })
+    }
+
+    fn dict_snapshot_x_y_z() -> std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>
+    {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
+            DictionaryWatermark,
+        };
+        std::sync::Arc::new(DictionarySnapshot {
+            dictionary_id: 2,
+            owner: DictionaryOwner::StarRocksTable {
+                database: "default".to_string(),
+                table: "starrocks_t".to_string(),
+                db_id: 11,
+                table_id: 22,
+            },
+            column_id: None,
+            column_name: "name".to_string(),
+            data_type: DataType::Int32,
+            version: 3,
+            watermark: DictionaryWatermark::StarRocks {
+                schema_id: 33,
+                tablets: vec![],
+            },
+            values: vec![
+                DictionaryValue {
+                    id: 10,
+                    bytes: b"x".to_vec(),
+                },
+                DictionaryValue {
+                    id: 11,
+                    bytes: b"y".to_vec(),
+                },
+                DictionaryValue {
+                    id: 12,
+                    bytes: b"z".to_vec(),
+                },
+            ],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        })
+    }
+
+    /// Look up the slot id of a slot by its column name in `desc_tbl`.
+    /// Panics if no such slot exists — the caller is asserting that the
+    /// builder produced a slot with the expected name.
+    fn slot_id_by_name(desc_tbl: &crate::descriptors::TDescriptorTable, column_name: &str) -> i32 {
+        let slots = desc_tbl
+            .slot_descriptors
+            .as_ref()
+            .expect("slot_descriptors populated");
+        for slot in slots {
+            if slot.col_name.as_deref() == Some(column_name) {
+                return slot.id.expect("slot id populated");
+            }
+        }
+        panic!("no slot named `{}` in desc_tbl", column_name);
+    }
+
+    fn starrocks_layout() -> PhysicalTableLayout {
+        PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
         }
     }
 
@@ -4822,16 +4893,7 @@ mod tests {
 
         // Build a StarRocks scan that exposes one dict column ("id" string
         // column gets a sibling "id_dict" INT slot via dict_columns).
-        let layout = PhysicalTableLayout {
-            db_id: 11,
-            table_id: 22,
-            schema_id: 33,
-            tablets: vec![StarRocksTabletRef {
-                tablet_id: 101,
-                partition_id: 201,
-                version: 7,
-            }],
-        };
+        let layout = starrocks_layout();
         let scan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
                 database: "default".to_string(),
@@ -4899,6 +4961,13 @@ mod tests {
             .find(|fragment| fragment.fragment_id == build.root_fragment_id)
             .expect("root fragment");
 
+        // Resolve the actual scan output slot ids from the descriptor table
+        // so the assertions are tied to the underlying scan, not to a guess
+        // about allocator ordering.
+        let expected_string_slot = slot_id_by_name(&root.desc_tbl, "id");
+        let expected_dict_slot = slot_id_by_name(&root.desc_tbl, "id_dict");
+        assert_ne!(expected_string_slot, expected_dict_slot);
+
         // First plan node is the decode node (pre-order).
         let first = root.plan.nodes.first().expect("decode plan node");
         assert_eq!(first.node_type, plan_nodes::TPlanNodeType::DECODE_NODE);
@@ -4907,35 +4976,209 @@ mod tests {
             .dict_id_to_string_ids
             .as_ref()
             .expect("dict_id_to_string_ids");
-        assert!(!mapping.is_empty(), "decode mapping must be non-empty");
         assert_eq!(mapping.len(), 1);
-        // Both dict slot id and string slot id are 1-based monotonic ids;
-        // the exact values depend on allocator order, so we assert structural
-        // properties rather than absolute slot ids.
         let (dict_slot, string_slot) = mapping.iter().next().expect("one entry");
-        assert!(
-            dict_slot != string_slot,
-            "dict and string slots must differ"
+        // Decode mapping slot ids must match the scan output slot ids for the
+        // same (source_column, dict_column) pair — swapping the (key, value)
+        // sides of the map would otherwise pass undetected.
+        assert_eq!(
+            *dict_slot, expected_dict_slot,
+            "decode mapping key must be the scan's dict slot id"
+        );
+        assert_eq!(
+            *string_slot, expected_string_slot,
+            "decode mapping value must be the scan's string slot id"
         );
     }
 
     #[test]
     fn scan_dict_column_emits_query_global_dict() {
-        let layout = PhysicalTableLayout {
-            db_id: 11,
-            table_id: 22,
-            schema_id: 33,
-            tablets: vec![StarRocksTabletRef {
-                tablet_id: 101,
-                partition_id: 201,
-                version: 7,
-            }],
-        };
+        let layout = starrocks_layout();
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "starrocks_t".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "id".to_string(),
+                            data_type: DataType::Utf8,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "name".to_string(),
+                            data_type: DataType::Utf8,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
+                        name: "id".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
+                        name: "name".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![
+                    ScanDictionaryColumn {
+                        source_column: "id".to_string(),
+                        dict_column: "id_dict".to_string(),
+                        dictionary: dict_snapshot_a_b(),
+                    },
+                    ScanDictionaryColumn {
+                        source_column: "name".to_string(),
+                        dict_column: "name_dict".to_string(),
+                        dictionary: dict_snapshot_x_y_z(),
+                    },
+                ],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![
+                OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+                OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "name".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+            ],
+        };
+
+        let catalog = StarRocksCatalog { layout };
+        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+
+        // Resolve scan output slot ids by column name — both string columns
+        // and both dict-encoded INT companion columns must materialize in the
+        // descriptor table.
+        let id_string_slot = slot_id_by_name(&root.desc_tbl, "id");
+        let id_dict_slot = slot_id_by_name(&root.desc_tbl, "id_dict");
+        let name_string_slot = slot_id_by_name(&root.desc_tbl, "name");
+        let name_dict_slot = slot_id_by_name(&root.desc_tbl, "name_dict");
+        // All four slot ids must be distinct.
+        let slots = [
+            id_string_slot,
+            id_dict_slot,
+            name_string_slot,
+            name_dict_slot,
+        ];
+        for i in 0..slots.len() {
+            for j in (i + 1)..slots.len() {
+                assert_ne!(slots[i], slots[j], "scan slot ids must be distinct");
+            }
+        }
+
+        // The fragment should carry two TGlobalDicts, one per source column.
+        let dicts = root
+            .query_global_dicts
+            .as_ref()
+            .expect("query_global_dicts populated");
+        assert_eq!(dicts.len(), 2, "one TGlobalDict per dict_column");
+
+        // Match each TGlobalDict back to its dict slot id and check payload.
+        let id_dict = dicts
+            .iter()
+            .find(|d| d.column_id == Some(id_dict_slot))
+            .expect("TGlobalDict for id_dict slot");
+        assert_eq!(id_dict.ids.as_deref(), Some(&[1, 2][..]));
+        assert_eq!(
+            id_dict.strings.as_deref(),
+            Some(&[b"a".to_vec(), b"b".to_vec()][..])
+        );
+        let name_dict = dicts
+            .iter()
+            .find(|d| d.column_id == Some(name_dict_slot))
+            .expect("TGlobalDict for name_dict slot");
+        assert_eq!(name_dict.ids.as_deref(), Some(&[10, 11, 12][..]));
+        assert_eq!(
+            name_dict.strings.as_deref(),
+            Some(&[b"x".to_vec(), b"y".to_vec(), b"z".to_vec()][..])
+        );
+        // Distinct column_ids on the two TGlobalDicts.
+        assert_ne!(id_dict.column_id, name_dict.column_id);
+
+        // StarRocks scan's TLakeScanNode must carry the
+        // string_slot_id -> dict_slot_id mapping for both columns. We assert
+        // both directions of the contract here so swapping (key, value) would
+        // fail the test.
+        let scan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let lake = scan_node
+            .lake_scan_node
+            .as_ref()
+            .expect("lake scan payload");
+        let mapping = lake
+            .dict_string_id_to_int_ids
+            .as_ref()
+            .expect("dict_string_id_to_int_ids populated");
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(
+            mapping.get(&id_string_slot).copied(),
+            Some(id_dict_slot),
+            "id string slot must map to id dict slot"
+        );
+        assert_eq!(
+            mapping.get(&name_string_slot).copied(),
+            Some(name_dict_slot),
+            "name string slot must map to name dict slot"
+        );
+    }
+
+    #[test]
+    fn scan_dict_column_on_non_starrocks_scan_errors() {
+        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+
+        // Build an Iceberg scan (non-StarRocks ScanSource) carrying a
+        // dict_columns entry. visit_scan must reject this in codegen rather
+        // than silently dropping the mapping, because TLakeScanNode is the
+        // only payload that carries dict_string_id_to_int_ids today.
+        let iceberg_table_info = IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "ns".to_string(),
+            table: "t".to_string(),
+            table_uuid: None,
+            current_snapshot_id: None,
+            schema_id: 0,
+            location: "s3://b/t".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "ice_t".to_string(),
                     columns: vec![ColumnDef {
                         name: "id".to_string(),
                         data_type: DataType::Utf8,
@@ -4944,7 +5187,11 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks,
+                    source: ScanSource::IcebergDataFiles {
+                        table: iceberg_table_info,
+                        files: vec![],
+                        cloud_properties: std::collections::BTreeMap::new(),
+                    },
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -4971,61 +5218,33 @@ mod tests {
             }],
         };
 
-        let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
-
-        let root = build
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
-            .expect("root fragment");
-
-        // The fragment should carry one TGlobalDict matching our snapshot.
-        let dicts = root
-            .query_global_dicts
-            .as_ref()
-            .expect("query_global_dicts populated");
-        assert_eq!(dicts.len(), 1, "exactly one dict per source column");
-        let dict = &dicts[0];
-        assert_eq!(dict.ids.as_deref(), Some(&[1, 2][..]));
-        assert_eq!(
-            dict.strings.as_deref(),
-            Some(&[b"a".to_vec(), b"b".to_vec()][..])
-        );
-        // column_id on a TGlobalDict is the dict slot id (an INT slot); we
-        // only assert it is Some, since the exact slot id depends on
-        // allocator ordering.
+        // Use an iceberg-only catalog (returns None for physical_layout) so
+        // codegen routes the scan through the HDFS-style scan node instead of
+        // the StarRocks lake scan path. visit_scan should then reject
+        // dict_columns because the HDFS scan payload does not carry
+        // dict_string_id_to_int_ids.
+        struct IcebergCatalog;
+        impl CatalogProvider for IcebergCatalog {
+            fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
+                Err("not used".to_string())
+            }
+            fn get_physical_layout(
+                &self,
+                _database: &str,
+                _table: &str,
+            ) -> Result<Option<PhysicalTableLayout>, String> {
+                Ok(None)
+            }
+        }
+        let catalog = IcebergCatalog;
+        let err = match PlanFragmentBuilder::build(&plan, &catalog, "default") {
+            Ok(_) => panic!("non-StarRocks scan with dict_columns must error"),
+            Err(e) => e,
+        };
         assert!(
-            dict.column_id.is_some(),
-            "TGlobalDict.column_id must be set"
-        );
-
-        // StarRocks scan's TLakeScanNode must carry the
-        // string_slot_id -> dict_slot_id mapping for this column.
-        let scan_node = root
-            .plan
-            .nodes
-            .iter()
-            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
-            .expect("lake scan node");
-        let lake = scan_node
-            .lake_scan_node
-            .as_ref()
-            .expect("lake scan payload");
-        let mapping = lake
-            .dict_string_id_to_int_ids
-            .as_ref()
-            .expect("dict_string_id_to_int_ids populated");
-        assert_eq!(mapping.len(), 1);
-        let (string_slot, dict_slot) = mapping.iter().next().expect("one entry");
-        assert_eq!(
-            *dict_slot,
-            dict.column_id.unwrap(),
-            "mapping value must be the dict slot id"
-        );
-        assert!(
-            string_slot != dict_slot,
-            "string slot and dict slot must differ"
+            err.contains("is not a StarRocks lake scan"),
+            "error must explain why dict_columns is rejected, got: {}",
+            err,
         );
     }
 }

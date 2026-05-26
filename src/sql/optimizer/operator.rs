@@ -233,7 +233,7 @@ pub(crate) struct PhysicalScanOp {
 pub(crate) struct ScanDictionaryColumn {
     pub source_column: String,
     pub dict_column: String,
-    pub dictionary: crate::engine::dictionary::model::DictionarySnapshot,
+    pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
 }
 
 #[derive(Clone, Debug)]
