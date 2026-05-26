@@ -656,7 +656,7 @@ mod tests {
         // an object-store URI. The lake scan flow must surface an explicit
         // error instead of synthesising a config from unrelated tablets.
         //
-        // This test deliberately reuses the managed-lake runtime mutex
+        // This test deliberately reuses the StarRocks table runtime mutex
         // (`lock_runtime_test_state`) so the registry clear here cannot
         // race against a test that has just populated the registry via
         // `register_tablet_runtime`.

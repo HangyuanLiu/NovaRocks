@@ -87,7 +87,7 @@ pub(crate) fn run_insert(
     // error rather than the generic OVERWRITE one.
     if matches!(overwrite_mode, OverwriteMode::DynamicPartitions)
         && target.backend_name != "iceberg"
-        && target.backend_name != "managed"
+        && target.backend_name != "starrocks"
     {
         return Err(format!(
             "INSERT OVERWRITE PARTITIONS is only supported for iceberg backends, \
@@ -99,7 +99,7 @@ pub(crate) fn run_insert(
     // INSERT OVERWRITE is only supported on iceberg backends in phase 1.
     // For non-iceberg targets, fail fast with a clear message instead of
     // silently doing INSERT INTO.
-    if is_overwrite && target.backend_name != "iceberg" && target.backend_name != "managed" {
+    if is_overwrite && target.backend_name != "iceberg" && target.backend_name != "starrocks" {
         return Err(format!(
             "INSERT OVERWRITE is only supported for iceberg backends in phase 1, \
              target uses backend `{}`",
@@ -125,8 +125,8 @@ pub(crate) fn run_insert(
         );
     }
 
-    if target.backend_name == "managed" && matches!(overwrite_mode, OverwriteMode::FullTable) {
-        crate::connector::truncate_managed_table(state, &target.namespace, &target.table)?;
+    if target.backend_name == "starrocks" && matches!(overwrite_mode, OverwriteMode::FullTable) {
+        crate::connector::truncate_starrocks_table(state, &target.namespace, &target.table)?;
     }
 
     match source {

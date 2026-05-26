@@ -994,7 +994,7 @@ fn estimate_insert_source_stats(
     source: &InsertSource,
 ) -> Result<Option<Vec<ColumnStatRow>>, String> {
     // Stats estimation is only meaningful for tables registered in the
-    // in-memory local catalog (managed-lake tables register themselves on
+    // in-memory local catalog (StarRocks tables register themselves on
     // CREATE; iceberg external tables register themselves at query-prep
     // time per SELECT). For INSERTs that target an iceberg table without
     // any prior SELECT, the local catalog has no entry — silently skip
@@ -1247,7 +1247,7 @@ fn add_analyze_status(
 
 fn ensure_normal_usage(state: &Arc<StandaloneState>, key: &TableKey) -> Result<(), String> {
     // Column-usage tracking is only meaningful for tables registered in the
-    // in-memory local catalog (managed-lake tables register on CREATE;
+    // in-memory local catalog (StarRocks tables register on CREATE;
     // iceberg external tables register at query-prep time). For SELECTs
     // against iceberg tables that haven't been seen yet — e.g. the very
     // first SELECT after CREATE TABLE — observe_query runs before

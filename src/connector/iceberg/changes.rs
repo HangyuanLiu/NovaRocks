@@ -1435,7 +1435,7 @@ fn equality_change_to_delete_spec(
 }
 
 /// Read every data file removed by an overwrite snapshot and return its row
-/// content as `RecordBatch`es. Managed-lake IVM (`ivm_delta_source.rs`)
+/// content as `RecordBatch`es. StarRocks table IVM (`ivm_delta_source.rs`)
 /// feeds these into a temp parquet table the MV SELECT then reads from.
 /// Iceberg-MV IVM (Task 13 onward) uses the lineage-bearing
 /// `scan_deleted_data_file_rows_with_visibility_and_v3_lineage` variant

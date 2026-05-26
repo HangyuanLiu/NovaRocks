@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks::meta::repository::managed_lake::{
-    ManagedLakeMetaRepository, ManagedPartitionState, StageManagedTruncateRequest,
+use novarocks::meta::repository::starrocks_table::{
+    StageStarRocksTruncateRequest, StarRocksPartitionState, StarRocksTableMetaRepository,
 };
 use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 use tempfile::TempDir;
@@ -173,7 +173,7 @@ fn run_curl_stream_load(
     String::from_utf8(output.stdout).expect("decode curl stdout")
 }
 
-fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+fn starrocks_table_endpoint_reachable(endpoint: &str) -> bool {
     let stripped = endpoint
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -196,18 +196,18 @@ fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
     std::net::TcpStream::connect_timeout(
         &format!("{host}:{port}")
             .parse()
-            .expect("managed lake endpoint socket addr"),
+            .expect("StarRocks table endpoint socket addr"),
         Duration::from_secs(1),
     )
     .is_ok()
 }
 
-fn maybe_write_managed_lake_config(mysql_port: u16) -> Option<(TempDir, PathBuf)> {
+fn maybe_write_starrocks_table_config(mysql_port: u16) -> Option<(TempDir, PathBuf)> {
     let endpoint =
         std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
-    if !managed_lake_endpoint_reachable(&endpoint) {
+    if !starrocks_table_endpoint_reachable(&endpoint) {
         eprintln!(
-            "skipping standalone managed-lake mysql test: object store endpoint is unreachable: {endpoint}"
+            "skipping standalone StarRocks table mysql test: object store endpoint is unreachable: {endpoint}"
         );
         return None;
     }
@@ -220,7 +220,7 @@ fn maybe_write_managed_lake_config(mysql_port: u16) -> Option<(TempDir, PathBuf)
         .unwrap_or_else(|_| "admin123".to_string());
     let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
     let root_prefix =
-        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-starrocks-table-tests".to_string());
     let run_id = format!(
         "mysql_{}_{}",
         std::process::id(),
@@ -236,7 +236,7 @@ fn maybe_write_managed_lake_config(mysql_port: u16) -> Option<(TempDir, PathBuf)
         format!("s3://{bucket}/{root_prefix}/{run_id}")
     };
 
-    let config_dir = TempDir::new().expect("create managed lake config dir");
+    let config_dir = TempDir::new().expect("create StarRocks table config dir");
     let config_path = config_dir.path().join("novarocks.toml");
     std::fs::write(
         &config_path,
@@ -258,14 +258,14 @@ enable_path_style_access = true
 "#
         ),
     )
-    .expect("write managed lake config");
+    .expect("write StarRocks table config");
     Some((config_dir, config_path))
 }
 
-fn metadata_path_for_managed_config(config_path: &Path) -> PathBuf {
+fn metadata_path_for_starrocks_table_config(config_path: &Path) -> PathBuf {
     config_path
         .parent()
-        .expect("managed config path has parent")
+        .expect("StarRocks table config path has parent")
         .join("meta")
         .join("catalog.db")
 }
@@ -279,7 +279,7 @@ fn s3_test_value(primary: &str, fallback_env: &str, default: &str) -> String {
 fn unique_iceberg_warehouse(prefix: &str) -> String {
     let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
     let root_prefix =
-        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-starrocks-table-tests".to_string());
     let run_id = format!(
         "{}_{}_{}",
         prefix,
@@ -607,9 +607,9 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 }
 
 #[test]
-fn standalone_mysql_server_managed_lake_round_trip() {
+fn standalone_mysql_server_starrocks_table_round_trip() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
 
@@ -627,7 +627,7 @@ fn standalone_mysql_server_managed_lake_round_trip() {
     conn.query_drop(
         "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
     )
-    .expect("create managed table");
+    .expect("create StarRocks table");
     conn.query_drop("insert into orders values (1, 'a'), (2, 'b')")
         .expect("insert rows");
 
@@ -643,7 +643,7 @@ fn standalone_mysql_server_managed_lake_round_trip() {
     );
 
     conn.query_drop("truncate table orders")
-        .expect("truncate managed table");
+        .expect("truncate StarRocks table");
     let empty_rows: Vec<(Option<i32>, Option<String>)> = conn
         .query("select k1, v1 from orders order by k1")
         .expect("select after truncate");
@@ -657,22 +657,22 @@ fn standalone_mysql_server_managed_lake_round_trip() {
     assert_eq!(rows_after_reinsert, vec![(Some(3), Some("c".to_string()))]);
 
     conn.query_drop("drop table orders")
-        .expect("drop managed table");
+        .expect("drop StarRocks table");
     let err = conn
         .query::<(i32,), _>("select k1 from orders")
-        .expect_err("query after managed drop should fail");
+        .expect_err("query after StarRocks drop should fail");
     assert!(
         err.to_string()
             .to_ascii_lowercase()
             .contains("unknown table"),
-        "unexpected error after managed drop: {err}"
+        "unexpected error after StarRocks drop: {err}"
     );
 }
 
 #[test]
 fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_happy");
@@ -784,7 +784,7 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_noop");
@@ -830,7 +830,7 @@ fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged(
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_append");
@@ -878,7 +878,7 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
 #[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_show");
@@ -915,7 +915,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     assert_eq!(row.len(), 15);
     assert_eq!(row.get::<String, _>(0), Some("orders_mv".to_string()));
     assert_eq!(row.get::<String, _>(1), Some("analytics".to_string()));
-    assert_eq!(row.get::<String, _>(2), Some("managed_lake".to_string()));
+    assert_eq!(row.get::<String, _>(2), Some("starrocks".to_string()));
     assert_eq!(row.get::<String, _>(3), Some("DEFERRED_MANUAL".to_string()));
     assert_eq!(row.get::<Option<String>, _>(4), Some(None));
     assert_eq!(row.get::<Option<String>, _>(5), Some(None));
@@ -938,7 +938,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
 #[test]
 fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_refresh_policy_ddl");
@@ -1007,7 +1007,7 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
 #[test]
 fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
 
@@ -1026,7 +1026,7 @@ fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
         "create table base_table (k1 int, v2 bigint) \
          duplicate key(k1) distributed by hash(k1) buckets 2",
     )
-    .expect("create managed table");
+    .expect("create StarRocks table");
 
     let err = conn
         .query_drop(
@@ -1044,11 +1044,11 @@ fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
 #[test]
 fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
     let port = alloc_port();
-    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+    let Some((_config_dir, config_path)) = maybe_write_starrocks_table_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
-    let metadata_path = metadata_path_for_managed_config(&config_path);
+    let metadata_path = metadata_path_for_starrocks_table_config(&config_path);
 
     let args = vec![
         "standalone-server".to_string(),
@@ -1084,10 +1084,10 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
         let mut write = provider
             .begin_write("inject creating mv refresh partition")
             .expect("begin metadata write");
-        let repo = ManagedLakeMetaRepository::default();
+        let repo = StarRocksTableMetaRepository::default();
         let snapshot = repo
             .load_snapshot(write.as_ref())
-            .expect("load managed metadata");
+            .expect("load StarRocks metadata");
         let table = snapshot
             .tables
             .iter()
@@ -1096,7 +1096,7 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
             .expect("orders_mv metadata");
         repo.stage_truncate_partition(
             write.as_mut(),
-            StageManagedTruncateRequest {
+            StageStarRocksTruncateRequest {
                 table_id: table.table_id,
                 db_id: table.db_id,
                 bucket_num: table.bucket_num,
@@ -1119,14 +1119,14 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
 
         let provider = SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
         let read = provider.begin_read().expect("begin metadata read");
-        let snapshot = ManagedLakeMetaRepository::default()
+        let snapshot = StarRocksTableMetaRepository::default()
             .load_snapshot(read.as_ref())
-            .expect("load managed metadata");
+            .expect("load StarRocks metadata");
         assert!(
             !snapshot
                 .partitions
                 .iter()
-                .any(|partition| partition.state == ManagedPartitionState::Creating)
+                .any(|partition| partition.state == StarRocksPartitionState::Creating)
         );
     }
 }

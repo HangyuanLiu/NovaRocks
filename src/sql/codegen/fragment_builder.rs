@@ -3420,7 +3420,7 @@ mod tests {
         CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDataFileInfo,
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
         IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
-        IcebergTableInfo, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
+        IcebergTableInfo, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
     };
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalGenerateSeriesOp,
@@ -3475,13 +3475,13 @@ mod tests {
         }
     }
 
-    struct ManagedCatalog {
+    struct StarRocksCatalog {
         layout: PhysicalTableLayout,
     }
 
-    impl CatalogProvider for ManagedCatalog {
+    impl CatalogProvider for StarRocksCatalog {
         fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
-            Err("not used in managed scan builder tests".to_string())
+            Err("not used in StarRocks scan builder tests".to_string())
         }
 
         fn get_physical_layout(
@@ -3494,7 +3494,7 @@ mod tests {
     }
 
     struct MixedCatalog {
-        managed_layout: PhysicalTableLayout,
+        starrocks_layout: PhysicalTableLayout,
     }
 
     impl CatalogProvider for MixedCatalog {
@@ -3507,8 +3507,8 @@ mod tests {
             _database: &str,
             table: &str,
         ) -> Result<Option<PhysicalTableLayout>, String> {
-            if table == "managed_t" {
-                Ok(Some(self.managed_layout.clone()))
+            if table == "starrocks_t" {
+                Ok(Some(self.starrocks_layout.clone()))
             } else {
                 Ok(None)
             }
@@ -3806,12 +3806,12 @@ mod tests {
         }
     }
 
-    fn managed_scan_plan() -> PhysicalPlanNode {
+    fn starrocks_scan_plan() -> PhysicalPlanNode {
         PhysicalPlanNode {
             op: Operator::PhysicalScan(PhysicalScanOp {
                 database: "default".to_string(),
                 table: TableDef {
-                    name: "managed_t".to_string(),
+                    name: "starrocks_t".to_string(),
                     columns: vec![ColumnDef {
                         name: "id".to_string(),
                         data_type: DataType::Int32,
@@ -4128,7 +4128,7 @@ mod tests {
         );
     }
 
-    fn mixed_managed_iceberg_join_plan() -> PhysicalPlanNode {
+    fn mixed_starrocks_iceberg_join_plan() -> PhysicalPlanNode {
         PhysicalPlanNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
@@ -4145,7 +4145,7 @@ mod tests {
                     right: TypedExpr {
                         kind: ExprKind::ColumnRef {
                             column_id: crate::sql::column_id::ColumnId::UNSET,
-                            qualifier: Some("managed_t".to_string()),
+                            qualifier: Some("starrocks_t".to_string()),
                             column: "id".to_string(),
                         },
                         data_type: DataType::Int32,
@@ -4156,7 +4156,7 @@ mod tests {
                 other_condition: None,
                 distribution: JoinDistribution::Colocate,
             }),
-            children: vec![iceberg_scan_plan(), managed_scan_plan()],
+            children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
         }
@@ -4403,19 +4403,19 @@ mod tests {
     }
 
     #[test]
-    fn build_managed_scan_emits_lake_scan_with_internal_ranges() {
+    fn build_starrocks_scan_emits_lake_scan_with_internal_ranges() {
         let layout = PhysicalTableLayout {
             db_id: 11,
             table_id: 22,
             schema_id: 33,
-            tablets: vec![ManagedTabletRef {
+            tablets: vec![StarRocksTabletRef {
                 tablet_id: 101,
                 partition_id: 201,
                 version: 7,
             }],
         };
-        let plan = managed_scan_plan();
-        let catalog = ManagedCatalog { layout };
+        let plan = starrocks_scan_plan();
+        let catalog = StarRocksCatalog { layout };
 
         let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
@@ -4440,7 +4440,7 @@ mod tests {
             .tuple_descriptors
             .iter()
             .find(|tuple| tuple.id == Some(1))
-            .expect("managed scan tuple descriptor");
+            .expect("StarRocks scan tuple descriptor");
         assert_eq!(tuple_desc.table_id, Some(22));
 
         let table_descs = root
@@ -4451,9 +4451,9 @@ mod tests {
         let table_desc = table_descs
             .iter()
             .find(|table| table.id == 22)
-            .expect("managed table descriptor");
+            .expect("StarRocks table descriptor");
         assert_eq!(table_desc.db_name, "default");
-        assert_eq!(table_desc.table_name, "managed_t");
+        assert_eq!(table_desc.table_name, "starrocks_t");
 
         let ranges = root
             .exec_params
@@ -4470,11 +4470,11 @@ mod tests {
         assert_eq!(internal.partition_id, Some(201));
         assert_eq!(internal.version, "7");
         assert_eq!(internal.db_name, "default");
-        assert_eq!(internal.table_name.as_deref(), Some("managed_t"));
+        assert_eq!(internal.table_name.as_deref(), Some("starrocks_t"));
     }
 
     #[test]
-    fn non_managed_iceberg_scan_uses_synthetic_descriptor_table_id() {
+    fn iceberg_scan_without_starrocks_layout_uses_synthetic_descriptor_table_id() {
         let build = PlanFragmentBuilder::build(&iceberg_scan_plan(), &DummyCatalog, "default")
             .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
@@ -4519,13 +4519,13 @@ mod tests {
     }
 
     #[test]
-    fn mixed_managed_and_iceberg_scan_table_ids_do_not_collide() {
+    fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
         let catalog = MixedCatalog {
-            managed_layout: PhysicalTableLayout {
+            starrocks_layout: PhysicalTableLayout {
                 db_id: 11,
                 table_id: 1,
                 schema_id: 33,
-                tablets: vec![ManagedTabletRef {
+                tablets: vec![StarRocksTabletRef {
                     tablet_id: 101,
                     partition_id: 201,
                     version: 7,
@@ -4534,7 +4534,7 @@ mod tests {
         };
 
         let build =
-            PlanFragmentBuilder::build(&mixed_managed_iceberg_join_plan(), &catalog, "default")
+            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, "default")
                 .expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         let tuple_descs = &root.desc_tbl.tuple_descriptors;
@@ -4543,13 +4543,13 @@ mod tests {
             .find(|tuple| tuple.id == Some(1))
             .and_then(|tuple| tuple.table_id)
             .expect("iceberg tuple table id");
-        let managed_table_id = tuple_descs
+        let starrocks_table_id = tuple_descs
             .iter()
             .find(|tuple| tuple.id == Some(2))
             .and_then(|tuple| tuple.table_id)
-            .expect("managed tuple table id");
-        assert_ne!(iceberg_table_id, managed_table_id);
-        assert_eq!(managed_table_id, 1);
+            .expect("StarRocks tuple table id");
+        assert_ne!(iceberg_table_id, starrocks_table_id);
+        assert_eq!(starrocks_table_id, 1);
 
         let table_descs = root
             .desc_tbl
@@ -4564,12 +4564,12 @@ mod tests {
             iceberg_desc.table_type,
             crate::types::TTableType::ICEBERG_TABLE
         );
-        let managed_desc = table_descs
+        let starrocks_desc = table_descs
             .iter()
-            .find(|table| table.id == managed_table_id)
-            .expect("managed table descriptor");
+            .find(|table| table.id == starrocks_table_id)
+            .expect("StarRocks table descriptor");
         assert_eq!(
-            managed_desc.table_type,
+            starrocks_desc.table_type,
             crate::types::TTableType::OLAP_TABLE
         );
     }

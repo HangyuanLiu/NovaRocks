@@ -1,5 +1,5 @@
 -- @order_sensitive=true
--- Validate FOR VERSION AS OF '<ref>' time-travel against a REST-managed
+-- Validate FOR VERSION AS OF '<ref>' time-travel against a REST catalog
 -- table. Uses branch names (not snapshot ids) so the recorded result is
 -- deterministic across runs.
 

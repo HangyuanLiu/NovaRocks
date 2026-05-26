@@ -236,11 +236,11 @@ fn endpoint_reachable(endpoint: &str) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
-/// When the runner config declares a managed-lake warehouse, fail fast if the
+/// When the runner config declares a StarRocks table warehouse, fail fast if the
 /// object-store endpoint is not reachable. Without this probe, the first
 /// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
-fn ensure_managed_lake_prereqs(runner_config: &RunnerConfig) -> Result<()> {
-    if !runner_config.values.contains_key("managed_lake_warehouse") {
+fn ensure_starrocks_table_prereqs(runner_config: &RunnerConfig) -> Result<()> {
+    if !runner_config.values.contains_key("starrocks_table_warehouse") {
         return Ok(());
     }
     let endpoint = runner_config
@@ -1636,7 +1636,7 @@ fn main() -> Result<()> {
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
-    ensure_managed_lake_prereqs(&runner_config)?;
+    ensure_starrocks_table_prereqs(&runner_config)?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {

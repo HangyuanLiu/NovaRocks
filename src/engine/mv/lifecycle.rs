@@ -25,7 +25,7 @@ impl MvStorageEngine {
 
     pub(crate) fn backend_name(self) -> &'static str {
         match self {
-            Self::StarRocks => "managed",
+            Self::StarRocks => "starrocks",
             Self::Iceberg => "iceberg",
         }
     }
@@ -120,12 +120,12 @@ pub(crate) struct RefreshPlan {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendRefreshPlan {
-    StarRocks(ManagedLakeRefreshPlan),
+    StarRocks(StarRocksTableRefreshPlan),
     Iceberg(IcebergRefreshPlan),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ManagedLakeRefreshPlan {
+pub(crate) struct StarRocksTableRefreshPlan {
     pub stmt: RefreshMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -151,12 +151,12 @@ pub(crate) struct RefreshOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) enum BackendRefreshOutcome {
-    StarRocks(ManagedLakeRefreshOutcome),
+    StarRocks(StarRocksTableRefreshOutcome),
     Iceberg(IcebergRefreshOutcome),
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ManagedLakeRefreshOutcome {
+pub(crate) struct StarRocksTableRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn storage_engine_maps_to_backend_name() {
         assert_eq!(MvStorageEngine::StarRocks.as_sql_str(), "starrocks");
-        assert_eq!(MvStorageEngine::StarRocks.backend_name(), "managed");
+        assert_eq!(MvStorageEngine::StarRocks.backend_name(), "starrocks");
         assert_eq!(MvStorageEngine::Iceberg.as_sql_str(), "iceberg");
         assert_eq!(MvStorageEngine::Iceberg.backend_name(), "iceberg");
         assert_eq!(
@@ -286,7 +286,7 @@ mod tests {
             MvStorageEngine::Iceberg
         );
         assert!(
-            MvStorageEngine::from_sql_str("managed")
+            MvStorageEngine::from_sql_str("starrocks")
                 .unwrap_err()
                 .contains("unknown materialized view storage_engine"),
         );

@@ -4,7 +4,7 @@
 // regarding copyright ownership.
 
 //! Encode FE-level `DeletePredicateTerms` into the wire `DeletePredicatePb`
-//! that gets persisted into rowset metadata for DUP/UNIQUE/AGG managed-lake
+//! that gets persisted into rowset metadata for DUP/UNIQUE/AGG StarRocks table
 //! tables. `sub_predicates` is left empty: it is the legacy hybrid
 //! key/value string format used by the StarRocks shared-nothing path, and
 //! lake mode reads only the structured `binary_predicates` / `in_predicates`

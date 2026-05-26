@@ -1390,7 +1390,7 @@ fn resolve_merge_insert_columns(
 
     // Empty `INSERT VALUES (...)` (no column list) means "values match target
     // schema in declaration order". Iceberg row-lineage columns (`_row_id`
-    // etc.) are reserved/managed and never appear in the user-visible target
+    // etc.) are reserved/owned and never appear in the user-visible target
     // schema returned from `iceberg_table_columns`, so we don't have to
     // filter them here.
     if action.columns.is_empty() {

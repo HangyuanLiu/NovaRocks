@@ -20,7 +20,7 @@ use crate::sql::parser::ast::{
 
 /// Request to create a table. Unified shape across all catalog backends;
 /// backends ignore fields that don't apply to them (e.g. `bucket_count` is
-/// managed-lake-only).
+/// StarRocks table-only).
 #[derive(Clone, Debug)]
 pub(crate) struct CreateTableRequest {
     pub catalog: String,
@@ -45,7 +45,7 @@ pub(crate) struct ResolvedTable {
 }
 
 /// Catalog-plane operations: create/drop namespace and create/drop/load
-/// tables. Implemented once per catalog type (iceberg, managed-lake, ...).
+/// tables. Implemented once per catalog type (iceberg, StarRocks table, ...).
 pub(crate) trait CatalogBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -119,7 +119,7 @@ pub(crate) trait TableSink: Send + Sync {
 }
 
 /// Materialized-view backend: CREATE / DROP / REFRESH / SHOW. Today only
-/// managed-lake implements this. Future backends (e.g. iceberg-as-MV-target)
+/// StarRocks table implements this. Future backends (e.g. iceberg-as-MV-target)
 /// plug in here.
 pub(crate) trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;

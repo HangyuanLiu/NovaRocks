@@ -3,7 +3,7 @@
 //! Holds the logical `InMemoryCatalog` (databases -> tables + physical
 //! layouts) and the `normalize_identifier` helper used across the SQL
 //! and engine layers. Everything here is backend-agnostic — the
-//! managed-lake and iceberg subsystems both query this catalog for
+//! StarRocks table and iceberg subsystems both query this catalog for
 //! table metadata.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // interchangeably without double-defining the types.
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
-    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
+    CatalogProvider, ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
 };
 
 #[derive(Clone, Debug)]
@@ -90,7 +90,7 @@ impl InMemoryCatalog {
         Ok(())
     }
 
-    pub(crate) fn register_managed_table(
+    pub(crate) fn register_starrocks_table(
         &mut self,
         database_name: &str,
         table: TableDef,
@@ -328,13 +328,13 @@ mod tests {
     }
 
     #[test]
-    fn register_managed_table_tracks_and_clears_physical_layout() {
+    fn register_starrocks_table_tracks_and_clears_physical_layout() {
         let mut catalog = InMemoryCatalog::default();
         let layout = PhysicalTableLayout {
             db_id: 10,
             table_id: 20,
             schema_id: 30,
-            tablets: vec![ManagedTabletRef {
+            tablets: vec![StarRocksTabletRef {
                 tablet_id: 40,
                 partition_id: 50,
                 version: 60,
@@ -342,21 +342,25 @@ mod tests {
         };
 
         catalog
-            .register_managed_table(DEFAULT_DATABASE, test_table("managed_tbl"), layout.clone())
-            .expect("register managed table");
+            .register_starrocks_table(
+                DEFAULT_DATABASE,
+                test_table("starrocks_tbl"),
+                layout.clone(),
+            )
+            .expect("register StarRocks table");
         assert_eq!(
             catalog
-                .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")
+                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
                 .expect("physical layout lookup"),
             Some(layout.clone())
         );
 
         catalog
-            .register(DEFAULT_DATABASE, test_table("managed_tbl"))
+            .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
             .expect("overwrite with logical table");
         assert_eq!(
             catalog
-                .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")
+                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
                 .expect("physical layout cleared"),
             None
         );

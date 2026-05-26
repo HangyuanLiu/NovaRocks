@@ -12,7 +12,7 @@
 --   Iceberg-target projection/filter MV on an unpartitioned Iceberg v3
 --   row-lineage base table.
 -- Note:
---   The original managed-lake case used PRIMARY KEY on the MV; Iceberg-target
+--   The original StarRocks table case used PRIMARY KEY on the MV; Iceberg-target
 --   MVs reject PRIMARY KEY, so the MV is defined without it. The test point
 --   (delete propagation to hidden-column projection MV) is preserved via the
 --   row-lineage delete mechanism.

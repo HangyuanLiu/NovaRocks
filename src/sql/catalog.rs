@@ -165,7 +165,7 @@ pub struct IcebergDataFileInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ManagedTabletRef {
+pub struct StarRocksTabletRef {
     pub tablet_id: i64,
     pub partition_id: i64,
     pub version: i64,
@@ -176,13 +176,13 @@ pub struct PhysicalTableLayout {
     pub db_id: i64,
     pub table_id: i64,
     pub schema_id: i64,
-    pub tablets: Vec<ManagedTabletRef>,
+    pub tablets: Vec<StarRocksTabletRef>,
 }
 
 /// Plan-time description of how the scan operator enumerates physical
 /// inputs for a table. Each variant covers a different lane:
 ///
-/// - `StarRocks`: managed-lake table; the actual tablet/version
+/// - `StarRocks`: StarRocks table; the actual tablet/version
 ///   layout flows separately through `PhysicalTableLayout`.
 /// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
 ///   parquet files — a concrete list of data files plus table identity
@@ -194,12 +194,12 @@ pub struct PhysicalTableLayout {
 ///   scans; the actual change-file list is resolved at lower time.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
-    /// Managed-lake table: data lives in object storage (s3:// or
+    /// StarRocks table: data lives in object storage (s3:// or
     /// file://) and metadata lives in a `MetaStoreProvider` (currently
     /// SQLite). The per-table physical layout (tablet/partition/version
     /// list) is carried separately on `PhysicalTableLayout`, so this
     /// variant is a marker without payload — the catalog only needs to
-    /// know "this table flows through the managed-lake scan path".
+    /// know "this table flows through the StarRocks table scan path".
     StarRocks,
     IcebergDataFiles {
         table: IcebergTableInfo,

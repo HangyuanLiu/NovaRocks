@@ -407,7 +407,7 @@ pub struct MvRefreshFinalizeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpdateManagedMvRefreshSummaryRequest {
+pub struct UpdateStarRocksMvRefreshSummaryRequest {
     pub mv_id: i64,
     pub last_refresh_ms: i64,
     pub last_refresh_rows: i64,
@@ -422,7 +422,7 @@ impl MvMetaRepository {
         req: CreateMvDefinitionRequest,
     ) -> RepositoryResult<StoredMvDefinition> {
         loop {
-            let mv_id = txn.allocate_id(id_scopes::managed_table())?;
+            let mv_id = txn.allocate_id(id_scopes::starrocks_table())?;
             if self.load_by_id(txn, mv_id)?.is_none() {
                 return self.create_definition_with_id(txn, mv_id, req);
             }
@@ -445,7 +445,7 @@ impl MvMetaRepository {
             )));
         }
         loop {
-            let reserved = txn.allocate_id(id_scopes::managed_table())?;
+            let reserved = txn.allocate_id(id_scopes::starrocks_table())?;
             if reserved >= mv_id {
                 return Ok(());
             }
@@ -1010,10 +1010,10 @@ impl MvMetaRepository {
         )
     }
 
-    pub fn update_managed_refresh_summary_if_present(
+    pub fn update_starrocks_refresh_summary_if_present(
         &self,
         txn: &mut dyn MetaWriteTxn,
-        req: UpdateManagedMvRefreshSummaryRequest,
+        req: UpdateStarRocksMvRefreshSummaryRequest,
     ) -> RepositoryResult<bool> {
         let Some(mut definition) = self.load_versioned_by_id(txn, req.mv_id)? else {
             return Ok(false);

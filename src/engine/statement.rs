@@ -2,12 +2,12 @@
 //!
 //! Top-level dispatchers (`execute_create_database_statement`,
 //! `execute_insert_statement`, etc.) route statements to the in-memory
-//! catalog, the iceberg registry, or the managed lake based on the parsed name
+//! catalog, the iceberg registry, or the StarRocks table based on the parsed name
 //! and current catalog/database session context.
 
 use std::sync::Arc;
 
-use crate::connector::truncate_managed_table as truncate_managed_lake_table;
+use crate::connector::truncate_starrocks_table as truncate_starrocks_table_fn;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::name_resolve::resolve_local_table_name;
 use crate::engine::{
@@ -846,7 +846,7 @@ pub(crate) fn execute_create_table_statement(
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     // CTAS dispatch: when the statement carries an AS SELECT clause, route
-    // managed-lake targets to the managed CTAS helper and iceberg targets
+    // StarRocks table targets to the StarRocks table CTAS helper and iceberg targets
     // to the iceberg helper. The parser already rejected
     // non-iceberg-compatible CTAS forms (branch target / format-version=2 /
     // explicit columns / etc.).
@@ -857,8 +857,8 @@ pub(crate) fn execute_create_table_statement(
             current_catalog,
             current_database,
         )?;
-        if target.backend_name == "managed" {
-            return crate::engine::managed_ctas::execute_managed_ctas(
+        if target.backend_name == "starrocks" {
+            return crate::engine::starrocks_table_ctas::execute_starrocks_table_ctas(
                 state,
                 stmt,
                 current_catalog,
@@ -883,10 +883,10 @@ pub(crate) fn execute_create_table_statement(
         } => {
             if current_catalog.is_none()
                 && stmt.name.parts.len() <= 2
-                && state.managed_lake_config.is_none()
+                && state.starrocks_table_config.is_none()
             {
                 return Err(
-                    "managed lake is not configured; set `warehouse_uri` to run CREATE TABLE"
+                    "StarRocks table is not configured; set `warehouse_uri` to run CREATE TABLE"
                         .to_string(),
                 );
             }
@@ -941,7 +941,7 @@ pub(crate) fn execute_create_table_statement(
                 partition_fields,
                 properties,
             })?;
-            if !legacy_range_partitions.is_empty() && target.backend_name == "managed" {
+            if !legacy_range_partitions.is_empty() && target.backend_name == "starrocks" {
                 state
                     .catalog
                     .write()
@@ -1074,7 +1074,7 @@ pub(crate) fn execute_drop_table_statement(
             &target.table,
         )
     } else {
-        crate::engine::mv::dependency::managed_table_object_ref(&target.namespace, &target.table)
+        crate::engine::mv::dependency::starrocks_table_object_ref(&target.namespace, &target.table)
     };
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
     match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
@@ -1137,15 +1137,15 @@ pub(crate) fn execute_truncate_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    // Managed-lake check only applies to local (1- or 2-part) names with no
+    // StarRocks table check only applies to local (1- or 2-part) names with no
     // active external catalog. Three-part names (catalog.db.table) are always
     // routed to the iceberg backend resolver below.
     if current_catalog.is_none() && name.parts.len() <= 2 {
         let resolved = resolve_local_table_name(name, current_database)?;
         if state
-            .managed_lake
+            .starrocks_table
             .read()
-            .expect("standalone managed lake read lock")
+            .expect("standalone StarRocks table read lock")
             .contains_table(&resolved.database, &resolved.table)?
         {
             if target_ref != "main" {
@@ -1153,7 +1153,7 @@ pub(crate) fn execute_truncate_table_statement(
                     "TRUNCATE TABLE: branch target `{target_ref}` is only supported for iceberg tables"
                 ));
             }
-            return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
+            return truncate_starrocks_table_fn(state, &resolved.database, &resolved.table);
         }
     }
 
@@ -1167,7 +1167,7 @@ pub(crate) fn execute_truncate_table_statement(
     )?;
     if target.backend_name != "iceberg" {
         return Err(format!(
-            "TRUNCATE TABLE only supports managed-lake or iceberg tables: {}.{}",
+            "TRUNCATE TABLE only supports StarRocks table or iceberg tables: {}.{}",
             target.namespace, target.table
         ));
     }

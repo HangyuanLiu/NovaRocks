@@ -164,7 +164,7 @@ fn mv_definition_round_trip_uses_json_string_contract_dto() -> TestResult {
         base_table_refs: vec!["iceberg.rest.db.orders".to_string()],
         primary_key_columns: vec!["id".to_string()],
         storage_engine: "iceberg".to_string(),
-        target_catalog: Some("managed".to_string()),
+        target_catalog: Some("starrocks".to_string()),
         target_namespace: Some("mv".to_string()),
         target_table: Some("mv_orders".to_string()),
         schema_contract: Some(

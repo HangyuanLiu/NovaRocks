@@ -43,7 +43,7 @@ use crate::connector::iceberg::commit::{
     ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
     run_iceberg_commit,
 };
-use crate::connector::starrocks::managed::mv_refresh::query_result_to_chunks;
+use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use crate::engine::{StandaloneState, StatementResult};
@@ -390,7 +390,7 @@ pub(crate) fn run_select_to_chunks_and_schema(
     // CTAS context: SELECT may reference iceberg tables (1-part or 2-part
     // names) that need registration into the standalone in-memory catalog
     // before planning. resolve_table_target dispatches between iceberg and
-    // managed-lake based on whether current_catalog is supplied: passing
+    // StarRocks table based on whether current_catalog is supplied: passing
     // Some(target.catalog) routes the unqualified refs to iceberg, mirroring
     // the standalone server's SELECT path (engine/mod.rs:611).
     let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {

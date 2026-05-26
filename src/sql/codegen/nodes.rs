@@ -243,7 +243,7 @@ fn build_lake_scan_node(
     let layout = resolved
         .physical_layout
         .as_ref()
-        .expect("managed scan requires physical layout");
+        .expect("StarRocks scan requires physical layout");
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
@@ -577,7 +577,7 @@ pub(crate) fn build_exec_params_multi(
         let ranges = if let Some(layout) = resolved.physical_layout.as_ref() {
             if layout.tablets.is_empty() {
                 return Err(format!(
-                    "managed table {}.{} has no active tablets",
+                    "StarRocks table {}.{} has no active tablets",
                     resolved.database, resolved.table.name
                 ));
             }
@@ -616,13 +616,13 @@ pub(crate) fn build_exec_params_multi(
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
                 ScanSource::StarRocks => {
-                    // Managed-lake tables reach this builder via the
+                    // StarRocks tables reach this builder via the
                     // outer `if let Some(layout)` branch above; falling
                     // through to here means the planner produced a
                     // `StarRocks` TableDef without a populated
                     // `PhysicalTableLayout`, which is a bug.
                     return Err(format!(
-                        "managed-lake table {}.{} reached scan-range builder \
+                        "StarRocks table {}.{} reached scan-range builder \
                          without a physical layout",
                         resolved.database, resolved.table.name
                     ));
@@ -1007,7 +1007,7 @@ fn validate_iceberg_delete_apply_cost(
 fn build_internal_scan_range_params(
     resolved: &ResolvedTable,
     layout: &crate::sql::catalog::PhysicalTableLayout,
-    tablet: &crate::sql::catalog::ManagedTabletRef,
+    tablet: &crate::sql::catalog::StarRocksTabletRef,
 ) -> internal_service::TScanRangeParams {
     let internal_scan_range = plan_nodes::TInternalScanRange::new(
         vec![],

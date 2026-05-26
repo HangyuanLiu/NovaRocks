@@ -5,10 +5,10 @@ use crate::meta::{MetaError, MetaErrorKind};
 pub mod iceberg_catalog;
 pub mod id_scopes;
 pub mod job;
-pub mod managed_lake;
-pub mod managed_txn;
 pub mod mv;
 pub mod mv_contract;
+pub mod starrocks_table;
+pub mod starrocks_txn;
 
 pub use crate::meta::payload::{decode_payload_for_kind, encode_record_payload};
 
@@ -22,11 +22,11 @@ pub(crate) mod test_avro_seed {
 
     use crate::meta::MetaPayload;
     use crate::meta::repository::job::{StoredEraseJob, StoredIcebergOptimizeJob};
-    use crate::meta::repository::managed_lake::{
-        StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
-        StoredManagedTable, StoredManagedTablet,
+    use crate::meta::repository::starrocks_table::{
+        StoredStarRocksColumn, StoredStarRocksDatabase, StoredStarRocksIndex,
+        StoredStarRocksPartition, StoredStarRocksTable, StoredStarRocksTablet,
     };
-    use crate::meta::repository::managed_txn::StoredManagedTxn;
+    use crate::meta::repository::starrocks_txn::StoredStarRocksTxn;
     use crate::meta::repository::{RepositoryError, RepositoryResult, encode_record_payload};
 
     pub(crate) fn encode_seed_payload(
@@ -34,14 +34,14 @@ pub(crate) mod test_avro_seed {
         payload: &serde_json::Value,
     ) -> RepositoryResult<MetaPayload> {
         match kind {
-            "managed.database" => encode_from_json::<StoredManagedDatabase>(kind, payload),
-            "managed.table" => encode_from_json::<StoredManagedTable>(kind, payload),
-            "managed.schema" => encode_from_json::<StoredManagedSchemaAvro>(kind, payload),
-            "managed.column" => encode_from_json::<StoredManagedColumn>(kind, payload),
-            "managed.partition" => encode_from_json::<StoredManagedPartition>(kind, payload),
-            "managed.index" => encode_from_json::<StoredManagedIndex>(kind, payload),
-            "managed.tablet" => encode_from_json::<StoredManagedTablet>(kind, payload),
-            "managed.txn" => encode_from_json::<StoredManagedTxn>(kind, payload),
+            "starrocks.database" => encode_from_json::<StoredStarRocksDatabase>(kind, payload),
+            "starrocks.table" => encode_from_json::<StoredStarRocksTable>(kind, payload),
+            "starrocks.schema" => encode_from_json::<StoredStarRocksSchemaAvro>(kind, payload),
+            "starrocks.column" => encode_from_json::<StoredStarRocksColumn>(kind, payload),
+            "starrocks.partition" => encode_from_json::<StoredStarRocksPartition>(kind, payload),
+            "starrocks.index" => encode_from_json::<StoredStarRocksIndex>(kind, payload),
+            "starrocks.tablet" => encode_from_json::<StoredStarRocksTablet>(kind, payload),
+            "starrocks.txn" => encode_from_json::<StoredStarRocksTxn>(kind, payload),
             "job.erase" => encode_from_json::<StoredEraseJob>(kind, payload),
             "job.iceberg_optimize" => encode_from_json::<StoredIcebergOptimizeJob>(kind, payload),
             _ => Err(RepositoryError::invalid(format!(
@@ -63,7 +63,7 @@ pub(crate) mod test_avro_seed {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    struct StoredManagedSchemaAvro {
+    struct StoredStarRocksSchemaAvro {
         schema_id: i64,
         table_id: i64,
         schema_version: i64,

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 
-use crate::connector::starrocks::managed::state_codec::{
+use crate::connector::starrocks::table::state_codec::{
     MultisetEntry, decode_multiset_self_describing,
 };
 use crate::exec::chunk::Chunk;
@@ -119,7 +119,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::starrocks::managed::state_codec::encode_multiset;
+    use crate::connector::starrocks::table::state_codec::encode_multiset;
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
         let mut builder = BinaryBuilder::new();

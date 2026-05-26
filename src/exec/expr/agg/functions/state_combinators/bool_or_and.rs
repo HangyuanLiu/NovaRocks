@@ -7,7 +7,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
+use crate::connector::starrocks::table::state_codec::{decode_bool_state, encode_bool_state};
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
@@ -421,7 +421,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow_buffer::NullBufferBuilder;
 
-    use crate::connector::starrocks::managed::state_codec::{decode_bool_state, encode_bool_state};
+    use crate::connector::starrocks::table::state_codec::{decode_bool_state, encode_bool_state};
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 

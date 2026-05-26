@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use novarocks::meta::keys::{NS_JOB, NS_MANAGED_TXN};
+use novarocks::meta::keys::{NS_JOB, NS_STARROCKS_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties, IcebergNamespaceRecord,
 };
@@ -9,26 +9,27 @@ use novarocks::meta::repository::job::{
     CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
     IcebergOptimizeJobState, JobMetaRepository, JobState,
 };
-use novarocks::meta::repository::managed_lake::{
-    CreateManagedColumnRequest, CreateManagedDatabaseRequest, CreateManagedTableLayoutRequest,
-    CreateManagedTableRequest, ManagedIndexState, ManagedLakeMetaRepository, ManagedPartitionState,
-    ManagedTableKind, ManagedTableState, StageManagedMvRefreshRequest, StageManagedTruncateRequest,
-};
-use novarocks::meta::repository::managed_txn::{
-    ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
-};
 use novarocks::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine, MvMetaRepository,
     MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup, RecordPublishCommitRequest,
     RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefreshPolicy,
-    UpdateManagedMvRefreshSummaryRequest, UpdateMvRefreshMetadataRequest,
+    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::mv_contract::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
     MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
     TargetContract, TargetVisibleColumn,
+};
+use novarocks::meta::repository::starrocks_table::{
+    CreateStarRocksColumnRequest, CreateStarRocksDatabaseRequest,
+    CreateStarRocksTableLayoutRequest, CreateStarRocksTableRequest, StageStarRocksMvRefreshRequest,
+    StageStarRocksTruncateRequest, StarRocksIndexState, StarRocksPartitionState,
+    StarRocksTableKind, StarRocksTableMetaRepository, StarRocksTableState,
+};
+use novarocks::meta::repository::starrocks_txn::{
+    StarRocksTxnRepository, StarRocksTxnState, StoredStarRocksTxn,
 };
 use novarocks::meta::repository::{
     RepositoryError, RepositoryErrorKind, decode_payload_for_kind, encode_record_payload, id_scopes,
@@ -39,35 +40,35 @@ use novarocks::meta::{
 };
 use serde::{Deserialize, Serialize};
 
-fn create_managed_table_with_partition(
+fn create_starrocks_table_with_partition(
     provider: &SqliteMetaStoreProvider,
-    repository: &ManagedLakeMetaRepository,
+    repository: &StarRocksTableMetaRepository,
 ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
-    create_named_managed_table_with_partition(provider, repository, "orders")
+    create_named_starrocks_table_with_partition(provider, repository, "orders")
 }
 
-fn create_named_managed_table_with_partition(
+fn create_named_starrocks_table_with_partition(
     provider: &SqliteMetaStoreProvider,
-    repository: &ManagedLakeMetaRepository,
+    repository: &StarRocksTableMetaRepository,
     table_name: &str,
 ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
-    let mut txn = provider.begin_write("create managed lake objects")?;
+    let mut txn = provider.begin_write("create StarRocks table objects")?;
     let database = repository.create_database(
         txn.as_mut(),
-        CreateManagedDatabaseRequest {
+        CreateStarRocksDatabaseRequest {
             name: format!("{table_name}_db"),
         },
     )?;
     let table = repository.create_table(
         txn.as_mut(),
-        CreateManagedTableRequest {
+        CreateStarRocksTableRequest {
             db_id: database.db_id,
             name: table_name.to_string(),
             keys_type: "DUP_KEYS".to_string(),
             bucket_num: 2,
             current_schema_id: 10,
-            state: ManagedTableState::Active,
-            kind: ManagedTableKind::Table,
+            state: StarRocksTableState::Active,
+            kind: StarRocksTableKind::Table,
         },
     )?;
     let partition = repository.create_partition(txn.as_mut(), table.table_id, table_name, 1)?;
@@ -75,15 +76,15 @@ fn create_named_managed_table_with_partition(
     Ok((table.table_id, partition.partition_id))
 }
 
-fn put_managed_txn_record(
+fn put_starrocks_txn_record(
     txn: &mut dyn novarocks::meta::MetaWriteTxn,
-    managed_txn: StoredManagedTxn,
+    starrocks_txn: StoredStarRocksTxn,
 ) -> Result<(), Box<dyn std::error::Error>> {
     txn.put(MetaRecordPut::new(
-        MetaKey::new(NS_MANAGED_TXN, [managed_txn.txn_id.to_string()])?,
-        MetaRecordKind::new("managed.txn")?,
+        MetaKey::new(NS_STARROCKS_TXN, [starrocks_txn.txn_id.to_string()])?,
+        MetaRecordKind::new("starrocks.txn")?,
         ExpectedRevision::NotExists,
-        encode_record_payload("managed.txn", &managed_txn)?,
+        encode_record_payload("starrocks.txn", &starrocks_txn)?,
     ))?;
     Ok(())
 }
@@ -93,7 +94,7 @@ fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
         select_sql: select_sql.to_string(),
         base_table_refs: vec!["ice.sales.orders".to_string()],
         primary_key_columns: vec!["id".to_string()],
-        storage_engine: "managed_lake".to_string(),
+        storage_engine: "starrocks".to_string(),
         target_catalog: None,
         target_namespace: None,
         target_table: None,
@@ -363,12 +364,15 @@ fn repository_avro_payload_round_trips_sample_payload() -> Result<(), Box<dyn st
 
 #[test]
 fn repository_id_scopes_are_stable_strings() {
-    assert_eq!(id_scopes::managed_db().as_str(), "managed.db");
-    assert_eq!(id_scopes::managed_table().as_str(), "managed.table");
-    assert_eq!(id_scopes::managed_partition().as_str(), "managed.partition");
-    assert_eq!(id_scopes::managed_index().as_str(), "managed.index");
-    assert_eq!(id_scopes::managed_tablet().as_str(), "managed.tablet");
-    assert_eq!(id_scopes::managed_txn().as_str(), "managed.txn");
+    assert_eq!(id_scopes::starrocks_db().as_str(), "starrocks.db");
+    assert_eq!(id_scopes::starrocks_table().as_str(), "starrocks.table");
+    assert_eq!(
+        id_scopes::starrocks_partition().as_str(),
+        "starrocks.partition"
+    );
+    assert_eq!(id_scopes::starrocks_index().as_str(), "starrocks.index");
+    assert_eq!(id_scopes::starrocks_tablet().as_str(), "starrocks.tablet");
+    assert_eq!(id_scopes::starrocks_txn().as_str(), "starrocks.txn");
     assert_eq!(id_scopes::mv_id().as_str(), "mv.id");
     assert_eq!(id_scopes::refresh_id().as_str(), "refresh.id");
     assert_eq!(id_scopes::erase_job().as_str(), "job.erase");
@@ -380,16 +384,16 @@ fn repository_id_scopes_are_stable_strings() {
 
 #[test]
 fn repository_namespaces_are_stable_strings() {
-    assert_eq!(NS_MANAGED_TXN, "managed.txn");
+    assert_eq!(NS_STARROCKS_TXN, "starrocks.txn");
     assert_eq!(NS_JOB, "job");
 }
 
 #[test]
 fn repository_error_display_is_domain_facing() {
-    let err = RepositoryError::conflict("managed txn state changed");
+    let err = RepositoryError::conflict("StarRocks txn state changed");
     assert_eq!(
         err.to_string(),
-        "metadata repository conflict: managed txn state changed"
+        "metadata repository conflict: StarRocks txn state changed"
     );
 }
 
@@ -957,30 +961,30 @@ fn job_repository_finish_pending_returns_conflict() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn managed_lake_repository_creates_database_table_and_active_partition()
+fn starrocks_table_repository_creates_database_table_and_active_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let repository = ManagedLakeMetaRepository::default();
+    let repository = StarRocksTableMetaRepository::default();
 
     {
-        let mut txn = provider.begin_write("create managed lake objects")?;
+        let mut txn = provider.begin_write("create StarRocks table objects")?;
         let database = repository.create_database(
             txn.as_mut(),
-            CreateManagedDatabaseRequest {
+            CreateStarRocksDatabaseRequest {
                 name: "db1".to_string(),
             },
         )?;
         let table = repository.create_table(
             txn.as_mut(),
-            CreateManagedTableRequest {
+            CreateStarRocksTableRequest {
                 db_id: database.db_id,
                 name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
-                state: ManagedTableState::Creating,
-                kind: ManagedTableKind::MaterializedView,
+                state: StarRocksTableState::Creating,
+                kind: StarRocksTableKind::MaterializedView,
             },
         )?;
         repository.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
@@ -1003,11 +1007,17 @@ fn managed_lake_repository_creates_database_table_and_active_partition()
     assert_eq!(snapshot.tables[0].keys_type, "DUP_KEYS");
     assert_eq!(snapshot.tables[0].bucket_num, 2);
     assert_eq!(snapshot.tables[0].current_schema_id, 10);
-    assert_eq!(snapshot.tables[0].state, ManagedTableState::Creating);
-    assert_eq!(snapshot.tables[0].kind, ManagedTableKind::MaterializedView);
+    assert_eq!(snapshot.tables[0].state, StarRocksTableState::Creating);
+    assert_eq!(
+        snapshot.tables[0].kind,
+        StarRocksTableKind::MaterializedView
+    );
     assert_eq!(snapshot.partitions[0].table_id, snapshot.tables[0].table_id);
     assert_eq!(snapshot.partitions[0].name, "orders");
-    assert_eq!(snapshot.partitions[0].state, ManagedPartitionState::Active);
+    assert_eq!(
+        snapshot.partitions[0].state,
+        StarRocksPartitionState::Active
+    );
     assert_eq!(snapshot.partitions[0].visible_version, 1);
     assert_eq!(snapshot.partitions[0].next_version, 2);
 
@@ -1015,43 +1025,43 @@ fn managed_lake_repository_creates_database_table_and_active_partition()
 }
 
 #[test]
-fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn std::error::Error>>
-{
+fn starrocks_table_repository_rejects_duplicate_table_name()
+-> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let repository = ManagedLakeMetaRepository::default();
+    let repository = StarRocksTableMetaRepository::default();
 
     let err = {
-        let mut txn = provider.begin_write("create duplicate managed lake table")?;
+        let mut txn = provider.begin_write("create duplicate StarRocks table")?;
         let database = repository.create_database(
             txn.as_mut(),
-            CreateManagedDatabaseRequest {
+            CreateStarRocksDatabaseRequest {
                 name: "db1".to_string(),
             },
         )?;
         repository.create_table(
             txn.as_mut(),
-            CreateManagedTableRequest {
+            CreateStarRocksTableRequest {
                 db_id: database.db_id,
                 name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
-                state: ManagedTableState::Active,
-                kind: ManagedTableKind::Table,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::Table,
             },
         )?;
         repository
             .create_table(
                 txn.as_mut(),
-                CreateManagedTableRequest {
+                CreateStarRocksTableRequest {
                     db_id: database.db_id,
                     name: "ORDERS".to_string(),
                     keys_type: "DUP_KEYS".to_string(),
                     bucket_num: 2,
                     current_schema_id: 10,
-                    state: ManagedTableState::Active,
-                    kind: ManagedTableKind::Table,
+                    state: StarRocksTableState::Active,
+                    kind: StarRocksTableKind::Table,
                 },
             )
             .expect_err("case-insensitive duplicate table name should fail")
@@ -1063,28 +1073,28 @@ fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn managed_lake_repository_drops_table_and_purges_owned_rows()
+fn starrocks_table_repository_drops_table_and_purges_owned_rows()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let managed_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
+    let starrocks_table_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
     let job_repo = JobMetaRepository::default();
 
     let (table_id, _partition_id, bootstrap_txn_id) = {
-        let mut txn = provider.begin_write("create managed table layout")?;
-        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
-        let created = managed_repo.create_table_layout(
+        let mut txn = provider.begin_write("create StarRocks table layout")?;
+        let database = starrocks_table_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = starrocks_table_repo.create_table_layout(
             txn.as_mut(),
-            CreateManagedTableLayoutRequest {
+            CreateStarRocksTableLayoutRequest {
                 db_id: database.db_id,
                 table_name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
-                kind: ManagedTableKind::Table,
+                kind: StarRocksTableKind::Table,
                 schema_version: 0,
                 tablet_schema_pb: vec![1, 2, 3],
-                columns: vec![CreateManagedColumnRequest {
+                columns: vec![CreateStarRocksColumnRequest {
                     column_name: "id".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
@@ -1109,9 +1119,9 @@ fn managed_lake_repository_drops_table_and_purges_owned_rows()
     };
 
     {
-        let mut txn = provider.begin_write("drop managed table")?;
+        let mut txn = provider.begin_write("drop StarRocks table")?;
         txn_repo.ensure_no_inflight_for_table(txn.as_ref(), table_id)?;
-        managed_repo.mark_table_dropping(txn.as_mut(), table_id)?;
+        starrocks_table_repo.mark_table_dropping(txn.as_mut(), table_id)?;
         job_repo.create_erase_job(
             txn.as_mut(),
             CreateEraseJobRequest {
@@ -1126,9 +1136,12 @@ fn managed_lake_repository_drops_table_and_purges_owned_rows()
 
     {
         let read = provider.begin_read()?;
-        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
-        assert_eq!(snapshot.tables[0].state, ManagedTableState::Dropping);
-        assert_eq!(snapshot.partitions[0].state, ManagedPartitionState::Retired);
+        let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
+        assert_eq!(snapshot.tables[0].state, StarRocksTableState::Dropping);
+        assert_eq!(
+            snapshot.partitions[0].state,
+            StarRocksPartitionState::Retired
+        );
         assert_eq!(snapshot.indexes.len(), 1);
         let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1000)?;
         assert_eq!(jobs.len(), 1);
@@ -1137,14 +1150,14 @@ fn managed_lake_repository_drops_table_and_purges_owned_rows()
     }
 
     {
-        let mut txn = provider.begin_write("purge dropped managed table")?;
+        let mut txn = provider.begin_write("purge dropped StarRocks table")?;
         txn_repo.delete_for_table(txn.as_mut(), table_id)?;
-        managed_repo.purge_retired_table_metadata(txn.as_mut(), table_id)?;
+        starrocks_table_repo.purge_retired_table_metadata(txn.as_mut(), table_id)?;
         txn.commit()?;
     }
 
     let read = provider.begin_read()?;
-    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
     assert!(snapshot.tables.is_empty());
     assert!(snapshot.schemas.is_empty());
     assert!(snapshot.columns.is_empty());
@@ -1157,28 +1170,28 @@ fn managed_lake_repository_drops_table_and_purges_owned_rows()
 }
 
 #[test]
-fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
+fn starrocks_table_repository_stages_activates_and_purges_truncate_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let managed_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
+    let starrocks_table_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
     let job_repo = JobMetaRepository::default();
 
     let (table_id, db_id, old_partition_id) = {
-        let mut txn = provider.begin_write("create managed table layout")?;
-        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
-        let created = managed_repo.create_table_layout(
+        let mut txn = provider.begin_write("create StarRocks table layout")?;
+        let database = starrocks_table_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = starrocks_table_repo.create_table_layout(
             txn.as_mut(),
-            CreateManagedTableLayoutRequest {
+            CreateStarRocksTableLayoutRequest {
                 db_id: database.db_id,
                 table_name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
-                kind: ManagedTableKind::Table,
+                kind: StarRocksTableKind::Table,
                 schema_version: 0,
                 tablet_schema_pb: vec![1, 2, 3],
-                columns: vec![CreateManagedColumnRequest {
+                columns: vec![CreateStarRocksColumnRequest {
                     column_name: "id".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
@@ -1200,9 +1213,9 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
     let staged = {
         let mut txn = provider.begin_write("stage truncate partition")?;
         txn_repo.ensure_no_inflight_for_table(txn.as_ref(), table_id)?;
-        let staged = managed_repo.stage_truncate_partition(
+        let staged = starrocks_table_repo.stage_truncate_partition(
             txn.as_mut(),
-            StageManagedTruncateRequest {
+            StageStarRocksTruncateRequest {
                 table_id,
                 db_id,
                 bucket_num: 2,
@@ -1216,10 +1229,10 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
 
     {
         let read = provider.begin_read()?;
-        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
         assert!(snapshot.partitions.iter().any(|partition| {
             partition.partition_id == staged.partition_id
-                && partition.state == ManagedPartitionState::Creating
+                && partition.state == StarRocksPartitionState::Creating
         }));
         assert_eq!(staged.tablet_ids.len(), 2);
         assert_eq!(
@@ -1233,7 +1246,7 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
 
     {
         let mut txn = provider.begin_write("activate truncate partition")?;
-        managed_repo.activate_truncate_partition(
+        starrocks_table_repo.activate_truncate_partition(
             txn.as_mut(),
             table_id,
             old_partition_id,
@@ -1256,7 +1269,7 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
 
     {
         let read = provider.begin_read()?;
-        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
         let old_partition = snapshot
             .partitions
             .iter()
@@ -1267,8 +1280,8 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
             .iter()
             .find(|partition| partition.partition_id == staged.partition_id)
             .expect("new partition");
-        assert_eq!(old_partition.state, ManagedPartitionState::Retired);
-        assert_eq!(new_partition.state, ManagedPartitionState::Active);
+        assert_eq!(old_partition.state, StarRocksPartitionState::Retired);
+        assert_eq!(new_partition.state, StarRocksPartitionState::Active);
         assert_eq!(new_partition.visible_version, 1);
         let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1100)?;
         assert_eq!(jobs[0].partition_id, Some(old_partition_id));
@@ -1277,12 +1290,12 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
     {
         let mut txn = provider.begin_write("purge retired truncate partition")?;
         txn_repo.delete_for_partition(txn.as_mut(), old_partition_id)?;
-        managed_repo.purge_retired_partition_metadata(txn.as_mut(), old_partition_id)?;
+        starrocks_table_repo.purge_retired_partition_metadata(txn.as_mut(), old_partition_id)?;
         txn.commit()?;
     }
 
     let read = provider.begin_read()?;
-    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
     assert!(
         snapshot
             .partitions
@@ -1306,27 +1319,27 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
 }
 
 #[test]
-fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
+fn starrocks_table_repository_stages_and_activates_mv_refresh_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let managed_repo = ManagedLakeMetaRepository::default();
+    let starrocks_table_repo = StarRocksTableMetaRepository::default();
     let job_repo = JobMetaRepository::default();
 
     let (table_id, db_id, old_partition_id) = {
-        let mut txn = provider.begin_write("create managed mv layout")?;
-        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
-        let created = managed_repo.create_table_layout(
+        let mut txn = provider.begin_write("create StarRocks MV layout")?;
+        let database = starrocks_table_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = starrocks_table_repo.create_table_layout(
             txn.as_mut(),
-            CreateManagedTableLayoutRequest {
+            CreateStarRocksTableLayoutRequest {
                 db_id: database.db_id,
                 table_name: "orders_mv".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
-                kind: ManagedTableKind::MaterializedView,
+                kind: StarRocksTableKind::MaterializedView,
                 schema_version: 0,
                 tablet_schema_pb: vec![1, 2, 3],
-                columns: vec![CreateManagedColumnRequest {
+                columns: vec![CreateStarRocksColumnRequest {
                     column_name: "id".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
@@ -1346,10 +1359,10 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
     };
 
     let staged = {
-        let mut txn = provider.begin_write("stage managed mv refresh partition")?;
-        let staged = managed_repo.stage_mv_refresh_partition(
+        let mut txn = provider.begin_write("stage StarRocks MV refresh partition")?;
+        let staged = starrocks_table_repo.stage_mv_refresh_partition(
             txn.as_mut(),
-            StageManagedMvRefreshRequest {
+            StageStarRocksMvRefreshRequest {
                 table_id,
                 db_id,
                 bucket_num: 2,
@@ -1362,11 +1375,11 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
     };
 
     {
-        let mut txn = provider.begin_write("reject overlapping managed mv refresh")?;
-        let err = managed_repo
+        let mut txn = provider.begin_write("reject overlapping StarRocks MV refresh")?;
+        let err = starrocks_table_repo
             .stage_mv_refresh_partition(
                 txn.as_mut(),
-                StageManagedMvRefreshRequest {
+                StageStarRocksMvRefreshRequest {
                     table_id,
                     db_id,
                     bucket_num: 2,
@@ -1380,13 +1393,13 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
 
     {
         let read = provider.begin_read()?;
-        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
         let staged_partition = snapshot
             .partitions
             .iter()
             .find(|partition| partition.partition_id == staged.partition_id)
             .expect("staged partition");
-        assert_eq!(staged_partition.state, ManagedPartitionState::Creating);
+        assert_eq!(staged_partition.state, StarRocksPartitionState::Creating);
         assert_eq!(staged.tablet_ids.len(), 2);
         assert_eq!(
             staged.partition_root_path,
@@ -1398,8 +1411,8 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
     }
 
     {
-        let mut txn = provider.begin_write("activate managed mv refresh partition")?;
-        managed_repo.activate_mv_refresh_partition(
+        let mut txn = provider.begin_write("activate StarRocks MV refresh partition")?;
+        starrocks_table_repo.activate_mv_refresh_partition(
             txn.as_mut(),
             table_id,
             old_partition_id,
@@ -1421,7 +1434,7 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
     }
 
     let read = provider.begin_read()?;
-    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    let snapshot = starrocks_table_repo.load_snapshot(read.as_ref())?;
     let old_partition = snapshot
         .partitions
         .iter()
@@ -1432,8 +1445,8 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
         .iter()
         .find(|partition| partition.partition_id == staged.partition_id)
         .expect("new partition");
-    assert_eq!(old_partition.state, ManagedPartitionState::Retired);
-    assert_eq!(new_partition.state, ManagedPartitionState::Active);
+    assert_eq!(old_partition.state, StarRocksPartitionState::Retired);
+    assert_eq!(new_partition.state, StarRocksPartitionState::Active);
     assert_eq!(new_partition.visible_version, 2);
     assert_eq!(new_partition.next_version, 3);
     let new_index = snapshot
@@ -1441,7 +1454,7 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
         .iter()
         .find(|index| index.index_id == staged.index_id)
         .expect("new index");
-    assert_eq!(new_index.state, ManagedIndexState::Active);
+    assert_eq!(new_index.state, StarRocksIndexState::Active);
     let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1100)?;
     assert_eq!(jobs[0].partition_id, Some(old_partition_id));
 
@@ -1449,31 +1462,31 @@ fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
 }
 
 #[test]
-fn managed_txn_repository_prepare_written_visible_advances_partition()
+fn starrocks_txn_repository_prepare_written_visible_advances_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
 
     let (table_id, partition_id) = {
-        let mut txn = provider.begin_write("create managed lake objects")?;
+        let mut txn = provider.begin_write("create StarRocks table objects")?;
         let database = meta_repo.create_database(
             txn.as_mut(),
-            CreateManagedDatabaseRequest {
+            CreateStarRocksDatabaseRequest {
                 name: "db1".to_string(),
             },
         )?;
         let table = meta_repo.create_table(
             txn.as_mut(),
-            CreateManagedTableRequest {
+            CreateStarRocksTableRequest {
                 db_id: database.db_id,
                 name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
-                state: ManagedTableState::Active,
-                kind: ManagedTableKind::Table,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::Table,
             },
         )?;
         let partition = meta_repo.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
@@ -1482,24 +1495,24 @@ fn managed_txn_repository_prepare_written_visible_advances_partition()
     };
 
     let txn_id = {
-        let mut txn = provider.begin_write("commit managed lake txn")?;
-        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
-        assert_eq!(managed_txn.table_id, table_id);
-        assert_eq!(managed_txn.partition_id, partition_id);
-        assert_eq!(managed_txn.base_version, 1);
-        assert_eq!(managed_txn.commit_version, 2);
-        assert_eq!(managed_txn.state, ManagedTxnState::Prepared);
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
-        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
+        let mut txn = provider.begin_write("commit StarRocks table txn")?;
+        let starrocks_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        assert_eq!(starrocks_txn.table_id, table_id);
+        assert_eq!(starrocks_txn.partition_id, partition_id);
+        assert_eq!(starrocks_txn.base_version, 1);
+        assert_eq!(starrocks_txn.commit_version, 2);
+        assert_eq!(starrocks_txn.state, StarRocksTxnState::Prepared);
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), starrocks_txn.txn_id)?;
         txn.commit()?;
-        managed_txn.txn_id
+        starrocks_txn.txn_id
     };
 
     let read = provider.begin_read()?;
     let loaded = txn_repo
         .load(read.as_ref(), txn_id)?
-        .expect("managed txn should persist");
-    assert_eq!(loaded.state, ManagedTxnState::Visible);
+        .expect("StarRocks txn should persist");
+    assert_eq!(loaded.state, StarRocksTxnState::Visible);
 
     let partition = meta_repo
         .load_partition(read.as_ref(), partition_id)?
@@ -1511,31 +1524,31 @@ fn managed_txn_repository_prepare_written_visible_advances_partition()
 }
 
 #[test]
-fn managed_txn_repository_abort_does_not_advance_partition()
+fn starrocks_txn_repository_abort_does_not_advance_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
 
     let (table_id, partition_id) = {
-        let mut txn = provider.begin_write("create managed lake objects")?;
+        let mut txn = provider.begin_write("create StarRocks table objects")?;
         let database = meta_repo.create_database(
             txn.as_mut(),
-            CreateManagedDatabaseRequest {
+            CreateStarRocksDatabaseRequest {
                 name: "db1".to_string(),
             },
         )?;
         let table = meta_repo.create_table(
             txn.as_mut(),
-            CreateManagedTableRequest {
+            CreateStarRocksTableRequest {
                 db_id: database.db_id,
                 name: "orders".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
-                state: ManagedTableState::Active,
-                kind: ManagedTableKind::Table,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::Table,
             },
         )?;
         let partition = meta_repo.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
@@ -1544,18 +1557,18 @@ fn managed_txn_repository_abort_does_not_advance_partition()
     };
 
     let txn_id = {
-        let mut txn = provider.begin_write("abort managed lake txn")?;
-        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
-        txn_repo.mark_aborted(txn.as_mut(), managed_txn.txn_id)?;
+        let mut txn = provider.begin_write("abort StarRocks table txn")?;
+        let starrocks_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_aborted(txn.as_mut(), starrocks_txn.txn_id)?;
         txn.commit()?;
-        managed_txn.txn_id
+        starrocks_txn.txn_id
     };
 
     let read = provider.begin_read()?;
     let loaded = txn_repo
         .load(read.as_ref(), txn_id)?
-        .expect("managed txn should persist");
-    assert_eq!(loaded.state, ManagedTxnState::Aborted);
+        .expect("StarRocks txn should persist");
+    assert_eq!(loaded.state, StarRocksTxnState::Aborted);
 
     let partition = meta_repo
         .load_partition(read.as_ref(), partition_id)?
@@ -1566,55 +1579,55 @@ fn managed_txn_repository_abort_does_not_advance_partition()
 }
 
 #[test]
-fn managed_txn_repository_mark_written_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
+fn starrocks_txn_repository_mark_written_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
-    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
+    let (table_id, partition_id) = create_starrocks_table_with_partition(&provider, &meta_repo)?;
 
     let txn_id = {
         let mut txn = provider.begin_write("retry mark written")?;
-        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        let starrocks_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
         txn.commit()?;
-        managed_txn.txn_id
+        starrocks_txn.txn_id
     };
 
     let read = provider.begin_read()?;
     let loaded = txn_repo
         .load(read.as_ref(), txn_id)?
-        .expect("managed txn should persist");
-    assert_eq!(loaded.state, ManagedTxnState::Written);
+        .expect("StarRocks txn should persist");
+    assert_eq!(loaded.state, StarRocksTxnState::Written);
 
     Ok(())
 }
 
 #[test]
-fn managed_txn_repository_mark_visible_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
+fn starrocks_txn_repository_mark_visible_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
-    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
+    let (table_id, partition_id) = create_starrocks_table_with_partition(&provider, &meta_repo)?;
 
     let txn_id = {
         let mut txn = provider.begin_write("retry mark visible")?;
-        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
-        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
-        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        let starrocks_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), starrocks_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), starrocks_txn.txn_id)?;
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
         txn.commit()?;
-        managed_txn.txn_id
+        starrocks_txn.txn_id
     };
 
     let read = provider.begin_read()?;
     let loaded = txn_repo
         .load(read.as_ref(), txn_id)?
-        .expect("managed txn should persist");
-    assert_eq!(loaded.state, ManagedTxnState::Visible);
+        .expect("StarRocks txn should persist");
+    assert_eq!(loaded.state, StarRocksTxnState::Visible);
     let partition = meta_repo
         .load_partition(read.as_ref(), partition_id)?
         .expect("partition should persist");
@@ -1625,26 +1638,26 @@ fn managed_txn_repository_mark_visible_is_retry_safe() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn managed_txn_repository_rejects_illegal_commit_version() -> Result<(), Box<dyn std::error::Error>>
-{
+fn starrocks_txn_repository_rejects_illegal_commit_version()
+-> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
-    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
+    let (table_id, partition_id) = create_starrocks_table_with_partition(&provider, &meta_repo)?;
 
     let txn_id = {
-        let mut txn = provider.begin_write("create invalid managed txn")?;
-        let txn_id = txn.allocate_id(id_scopes::managed_txn())?;
-        put_managed_txn_record(
+        let mut txn = provider.begin_write("create invalid StarRocks txn")?;
+        let txn_id = txn.allocate_id(id_scopes::starrocks_txn())?;
+        put_starrocks_txn_record(
             txn.as_mut(),
-            StoredManagedTxn {
+            StoredStarRocksTxn {
                 txn_id,
                 table_id,
                 partition_id,
                 base_version: 1,
                 commit_version: 3,
-                state: ManagedTxnState::Written,
+                state: StarRocksTxnState::Written,
                 retry_at_ms: None,
                 updated_at_ms: 0,
             },
@@ -1653,7 +1666,7 @@ fn managed_txn_repository_rejects_illegal_commit_version() -> Result<(), Box<dyn
         txn_id
     };
 
-    let mut txn = provider.begin_write("mark invalid managed txn visible")?;
+    let mut txn = provider.begin_write("mark invalid StarRocks txn visible")?;
     let err = txn_repo
         .mark_visible(&meta_repo, txn.as_mut(), txn_id)
         .expect_err("illegal commit version should fail");
@@ -1663,33 +1676,33 @@ fn managed_txn_repository_rejects_illegal_commit_version() -> Result<(), Box<dyn
 }
 
 #[test]
-fn managed_txn_repository_rejects_partition_table_mismatch()
+fn starrocks_txn_repository_rejects_partition_table_mismatch()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
 
     let (table_id, other_partition_id) = {
-        let (table_id, _) = create_managed_table_with_partition(&provider, &meta_repo)?;
+        let (table_id, _) = create_starrocks_table_with_partition(&provider, &meta_repo)?;
         let (other_table_id, other_partition_id) =
-            create_named_managed_table_with_partition(&provider, &meta_repo, "lineitem")?;
+            create_named_starrocks_table_with_partition(&provider, &meta_repo, "lineitem")?;
         assert_ne!(table_id, other_table_id);
         (table_id, other_partition_id)
     };
 
     let txn_id = {
-        let mut txn = provider.begin_write("create mismatched managed txn")?;
-        let txn_id = txn.allocate_id(id_scopes::managed_txn())?;
-        put_managed_txn_record(
+        let mut txn = provider.begin_write("create mismatched StarRocks txn")?;
+        let txn_id = txn.allocate_id(id_scopes::starrocks_txn())?;
+        put_starrocks_txn_record(
             txn.as_mut(),
-            StoredManagedTxn {
+            StoredStarRocksTxn {
                 txn_id,
                 table_id,
                 partition_id: other_partition_id,
                 base_version: 1,
                 commit_version: 2,
-                state: ManagedTxnState::Written,
+                state: StarRocksTxnState::Written,
                 retry_at_ms: None,
                 updated_at_ms: 0,
             },
@@ -1698,7 +1711,7 @@ fn managed_txn_repository_rejects_partition_table_mismatch()
         txn_id
     };
 
-    let mut txn = provider.begin_write("mark mismatched managed txn visible")?;
+    let mut txn = provider.begin_write("mark mismatched StarRocks txn visible")?;
     let err = txn_repo
         .mark_visible(&meta_repo, txn.as_mut(), txn_id)
         .expect_err("partition table mismatch should fail");
@@ -1708,28 +1721,28 @@ fn managed_txn_repository_rejects_partition_table_mismatch()
 }
 
 #[test]
-fn managed_txn_repository_rejects_partition_next_version_mismatch()
+fn starrocks_txn_repository_rejects_partition_next_version_mismatch()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
-    let meta_repo = ManagedLakeMetaRepository::default();
-    let txn_repo = ManagedLakeTxnRepository::default();
-    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+    let meta_repo = StarRocksTableMetaRepository::default();
+    let txn_repo = StarRocksTxnRepository::default();
+    let (table_id, partition_id) = create_starrocks_table_with_partition(&provider, &meta_repo)?;
 
     let txn_id = {
-        let mut txn = provider.begin_write("prepare managed txn with stale partition next")?;
-        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
-        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        let mut txn = provider.begin_write("prepare StarRocks txn with stale partition next")?;
+        let starrocks_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), starrocks_txn.txn_id)?;
         let (revision, mut partition) = meta_repo
             .load_versioned_partition(txn.as_ref(), partition_id)?
             .expect("partition should persist");
         partition.next_version = 99;
         meta_repo.update_partition_exact(txn.as_mut(), &partition, revision)?;
         txn.commit()?;
-        managed_txn.txn_id
+        starrocks_txn.txn_id
     };
 
-    let mut txn = provider.begin_write("mark managed txn visible with stale partition next")?;
+    let mut txn = provider.begin_write("mark StarRocks txn visible with stale partition next")?;
     let err = txn_repo
         .mark_visible(&meta_repo, txn.as_mut(), txn_id)
         .expect_err("partition next_version mismatch should fail");
@@ -1740,7 +1753,7 @@ fn managed_txn_repository_rejects_partition_next_version_mismatch()
 
 #[test]
 fn key_helpers_reject_unescaped_path_separators() {
-    let err = MetaKey::new("managed", ["table", "bad/name"]).expect_err("slash must fail");
+    let err = MetaKey::new("starrocks", ["table", "bad/name"]).expect_err("slash must fail");
     assert!(
         err.to_string()
             .contains("invalid metadata key path segment")
@@ -1805,7 +1818,7 @@ fn mv_repository_creates_and_drops_definition_with_explicit_id()
                 select_sql: "SELECT id FROM ice.sales.orders".to_string(),
                 base_table_refs: vec!["ice.sales.orders".to_string()],
                 primary_key_columns: vec!["id".to_string()],
-                storage_engine: "managed_lake".to_string(),
+                storage_engine: "starrocks".to_string(),
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,
@@ -1876,15 +1889,15 @@ fn mv_repository_reserves_explicit_ids_for_future_allocation()
 }
 
 #[test]
-fn mv_repository_shares_id_allocator_with_managed_tables() -> Result<(), Box<dyn std::error::Error>>
-{
+fn mv_repository_shares_id_allocator_with_starrocks_tables()
+-> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
     let mv_repository = MvMetaRepository::default();
-    let managed_repository = ManagedLakeMetaRepository::default();
+    let starrocks_table_repository = StarRocksTableMetaRepository::default();
 
     {
-        let mut txn = provider.begin_write("create iceberg mv then managed mv")?;
+        let mut txn = provider.begin_write("create iceberg mv then StarRocks MV")?;
         let iceberg_mv = mv_repository.create_definition(
             txn.as_mut(),
             CreateMvDefinitionRequest {
@@ -1902,32 +1915,32 @@ fn mv_repository_shares_id_allocator_with_managed_tables() -> Result<(), Box<dyn
         )?;
         assert_eq!(iceberg_mv.mv_id, 1);
 
-        let database = managed_repository.create_database(
+        let database = starrocks_table_repository.create_database(
             txn.as_mut(),
-            CreateManagedDatabaseRequest {
+            CreateStarRocksDatabaseRequest {
                 name: "analytics".to_string(),
             },
         )?;
-        let managed_mv_table = managed_repository.create_table(
+        let starrocks_mv_table = starrocks_table_repository.create_table(
             txn.as_mut(),
-            CreateManagedTableRequest {
+            CreateStarRocksTableRequest {
                 db_id: database.db_id,
-                name: "managed_orders_mv".to_string(),
+                name: "starrocks_orders_mv".to_string(),
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
-                state: ManagedTableState::Active,
-                kind: ManagedTableKind::MaterializedView,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::MaterializedView,
             },
         )?;
-        assert_eq!(managed_mv_table.table_id, 2);
+        assert_eq!(starrocks_mv_table.table_id, 2);
 
-        let managed_mv = mv_repository.create_definition_with_id(
+        let starrocks_mv = mv_repository.create_definition_with_id(
             txn.as_mut(),
-            managed_mv_table.table_id,
+            starrocks_mv_table.table_id,
             sample_mv_definition_request("SELECT id FROM ice.sales.lineitem"),
         )?;
-        assert_eq!(managed_mv.mv_id, managed_mv_table.table_id);
+        assert_eq!(starrocks_mv.mv_id, starrocks_mv_table.table_id);
         txn.commit()?;
     }
 
@@ -2571,7 +2584,7 @@ fn mv_repository_finalize_rejects_mismatched_published_snapshot()
 }
 
 #[test]
-fn mv_repository_managed_summary_rejects_active_commit_unknown()
+fn mv_repository_starrocks_summary_rejects_active_commit_unknown()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
@@ -2586,11 +2599,11 @@ fn mv_repository_managed_summary_rejects_active_commit_unknown()
     }
 
     {
-        let mut txn = provider.begin_write("update managed summary")?;
+        let mut txn = provider.begin_write("update StarRocks summary")?;
         let err = repository
-            .update_managed_refresh_summary_if_present(
+            .update_starrocks_refresh_summary_if_present(
                 txn.as_mut(),
-                UpdateManagedMvRefreshSummaryRequest {
+                UpdateStarRocksMvRefreshSummaryRequest {
                     mv_id,
                     last_refresh_ms: 20,
                     last_refresh_rows: 3,
@@ -3129,7 +3142,7 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
                 select_sql: "SELECT * FROM local_table".to_string(),
                 base_table_refs: vec!["local_table".to_string()],
                 primary_key_columns: vec!["id".to_string()],
-                storage_engine: "managed".to_string(),
+                storage_engine: "starrocks".to_string(),
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,

@@ -40,9 +40,9 @@ mod lifecycle_tests {
     use crate::connector::backend::MvBackend;
     use crate::engine::mv::lifecycle::{
         BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-        ManagedLakeRefreshOutcome, ManagedLakeRefreshPlan, MvBaseRef, MvListRow, MvStorageEngine,
-        MvTarget, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome, RefreshPlan,
-        RefreshRequest,
+        MvBaseRef, MvListRow, MvStorageEngine, MvTarget, RefreshCtx, RefreshError, RefreshMode,
+        RefreshOutcome, RefreshPlan, RefreshRequest, StarRocksTableRefreshOutcome,
+        StarRocksTableRefreshPlan,
     };
 
     #[derive(Default)]
@@ -109,7 +109,7 @@ mod lifecycle_tests {
                 affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
                     "mock MV backend does not plan affected partitions",
                 ),
-                backend_plan: BackendRefreshPlan::StarRocks(ManagedLakeRefreshPlan {
+                backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {
                     stmt: req.statement,
                     current_catalog: req.current_catalog,
                     current_database: req.current_database,
@@ -133,7 +133,7 @@ mod lifecycle_tests {
                 base_snapshots: Default::default(),
                 base_table_uuids: Default::default(),
                 target_snapshot_id: None,
-                backend_outcome: BackendRefreshOutcome::StarRocks(ManagedLakeRefreshOutcome {
+                backend_outcome: BackendRefreshOutcome::StarRocks(StarRocksTableRefreshOutcome {
                     completed_inside_execute: true,
                 }),
             })
@@ -257,7 +257,7 @@ mod lifecycle_tests {
 
 fn default_mv_storage_engine(state: &Arc<StandaloneState>) -> &str {
     state
-        .managed_lake_config
+        .starrocks_table_config
         .as_ref()
         .map(|config| config.mv_default_storage_engine.as_str())
         .unwrap_or("starrocks")
@@ -267,7 +267,7 @@ fn storage_engine_for_create(
     state: &Arc<StandaloneState>,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<MvStorageEngine, String> {
-    let resolved = crate::connector::starrocks::managed::mv_ddl::resolve_mv_storage_engine(
+    let resolved = crate::connector::starrocks::table::mv_ddl::resolve_mv_storage_engine(
         &stmt.properties,
         default_mv_storage_engine(state),
     )?;
@@ -368,13 +368,13 @@ fn load_definition_for_alter(
     }
 
     let (database, mv_name) =
-        crate::connector::starrocks::managed::mv_ddl::resolve_mv_name(name, db)?;
+        crate::connector::starrocks::table::mv_ddl::resolve_mv_name(name, db)?;
     let runtime = {
-        let managed = state
-            .managed_lake
+        let starrocks = state
+            .starrocks_table
             .read()
-            .expect("standalone managed lake read lock");
-        managed.table(&database, &mv_name).ok().cloned()
+            .expect("standalone StarRocks table read lock");
+        starrocks.table(&database, &mv_name).ok().cloned()
     };
     let Some(runtime) = runtime else {
         return Err(format!(
@@ -382,7 +382,7 @@ fn load_definition_for_alter(
         ));
     };
     if runtime.table.kind
-        != crate::connector::starrocks::managed::model::ManagedTableKind::MaterializedView
+        != crate::connector::starrocks::table::model::StarRocksTableKind::MaterializedView
     {
         return Err(format!("`{database}.{mv_name}` is not a materialized view"));
     }
@@ -563,7 +563,7 @@ pub(crate) fn refresh_mv(
         )
     } else {
         let (database, name) =
-            crate::connector::starrocks::managed::mv_ddl::resolve_mv_name(&stmt.name, db)?;
+            crate::connector::starrocks::table::mv_ddl::resolve_mv_name(&stmt.name, db)?;
         (
             MvTarget {
                 catalog: None,
@@ -582,9 +582,10 @@ pub(crate) fn refresh_mv(
             &target.database,
             &target.name,
         ),
-        MvStorageEngine::StarRocks => {
-            crate::engine::mv::dependency::managed_mv_dependency_ref(&target.database, &target.name)
-        }
+        MvStorageEngine::StarRocks => crate::engine::mv::dependency::starrocks_mv_dependency_ref(
+            &target.database,
+            &target.name,
+        ),
     };
     let steps =
         crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
@@ -643,7 +644,7 @@ pub(crate) fn list_mvs(
             .then(left.name.cmp(&right.name))
     });
     Ok(StatementResult::Query(
-        crate::connector::starrocks::managed::mv_ddl::build_mv_rows_result(&rows)?,
+        crate::connector::starrocks::table::mv_ddl::build_mv_rows_result(&rows)?,
     ))
 }
 
@@ -765,7 +766,7 @@ pub(crate) fn execute_query_for_mv_refresh(
 }
 
 fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::table::model::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -776,7 +777,7 @@ fn normalize_incremental_mv_base_ref(
 
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
-    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::table::model::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
@@ -880,8 +881,8 @@ mod tests {
         *query
     }
 
-    fn base_ref() -> crate::connector::starrocks::managed::model::IcebergTableRef {
-        crate::connector::starrocks::managed::model::IcebergTableRef {
+    fn base_ref() -> crate::connector::starrocks::table::model::IcebergTableRef {
+        crate::connector::starrocks::table::model::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),
