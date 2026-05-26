@@ -63,7 +63,7 @@ pub(crate) enum ResolvedTableRef {
         namespace: String,
         table: String,
     },
-    ManagedLake {
+    StarRocks {
         database: String,
         table: String,
     },
@@ -92,7 +92,7 @@ pub(crate) fn create_mv(
         .managed_lake_config
         .as_ref()
         .map(|c| c.mv_default_storage_engine.as_str())
-        .unwrap_or("managed_lake");
+        .unwrap_or("starrocks");
     let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
     {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
@@ -305,7 +305,7 @@ pub(crate) fn create_mv(
                 select_sql: stmt.select_sql.clone(),
                 base_table_refs: iceberg_table_ref_fqns(&base_refs),
                 primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
-                storage_engine: ManagedMvStorageEngine::ManagedLake.as_sql_str().to_string(),
+                storage_engine: ManagedMvStorageEngine::StarRocks.as_sql_str().to_string(),
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,
@@ -1479,7 +1479,7 @@ fn collect_table_refs_from_factor(
                         namespace: current_database.to_ascii_lowercase(),
                         table: table.clone(),
                     },
-                    None => ResolvedTableRef::ManagedLake {
+                    None => ResolvedTableRef::StarRocks {
                         database: current_database.to_ascii_lowercase(),
                         table: table.clone(),
                     },
@@ -1490,14 +1490,14 @@ fn collect_table_refs_from_factor(
                         namespace: database.clone(),
                         table: table.clone(),
                     },
-                    None => ResolvedTableRef::ManagedLake {
+                    None => ResolvedTableRef::StarRocks {
                         database: database.clone(),
                         table: table.clone(),
                     },
                 },
                 _ => {
                     let rendered = parts.join(".");
-                    ResolvedTableRef::ManagedLake {
+                    ResolvedTableRef::StarRocks {
                         database: current_database.to_ascii_lowercase(),
                         table: rendered,
                     }
@@ -1867,7 +1867,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
-            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_default_storage_engine: "starrocks".to_string(),
         }
     }
 
@@ -1969,7 +1969,7 @@ mod tests {
                     select_sql: "SELECT k1, v1 FROM ice.ns.orders".to_string(),
                     base_table_refs: vec!["ice.ns.orders".to_string()],
                     primary_key_columns: Vec::new(),
-                    storage_engine: ManagedMvStorageEngine::ManagedLake.as_sql_str().to_string(),
+                    storage_engine: ManagedMvStorageEngine::StarRocks.as_sql_str().to_string(),
                     target_catalog: None,
                     target_namespace: None,
                     target_table: None,
@@ -2231,7 +2231,7 @@ mod tests {
             &state,
             Some("ice"),
             &stmt,
-            Some(MvStorageEngine::ManagedLake),
+            Some(MvStorageEngine::StarRocks),
         )
         .expect("managed rows");
         let iceberg = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::Iceberg))
@@ -2242,7 +2242,7 @@ mod tests {
         assert!(
             managed
                 .iter()
-                .all(|row| row.storage_engine == "managed_lake")
+                .all(|row| row.storage_engine == "starrocks")
         );
         assert!(iceberg.iter().all(|row| row.storage_engine == "iceberg"));
     }
@@ -2700,7 +2700,7 @@ GROUP BY k1",
         let stmt = parse_create_mv(stmt_sql);
         // resolve_storage_engine takes (PROPERTIES, default_from_config) and returns the resolved enum.
         let resolved =
-            resolve_mv_storage_engine(&stmt.properties, "managed_lake").expect("resolve");
+            resolve_mv_storage_engine(&stmt.properties, "starrocks").expect("resolve");
         assert_eq!(resolved, ManagedMvStorageEngine::Iceberg);
     }
 
@@ -2721,7 +2721,7 @@ GROUP BY k1",
             PROPERTIES('storage_engine' = 'duckdb') \
             AS SELECT k FROM ice.ns.t";
         let stmt = parse_create_mv(stmt_sql);
-        let err = resolve_mv_storage_engine(&stmt.properties, "managed_lake").unwrap_err();
+        let err = resolve_mv_storage_engine(&stmt.properties, "starrocks").unwrap_err();
         assert!(err.contains("duckdb"));
     }
 
