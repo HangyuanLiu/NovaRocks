@@ -47,6 +47,7 @@ use crate::engine::mv::lifecycle::{
     MvTarget, RefreshError, RefreshMode, RefreshPlan,
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
+use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
@@ -1277,6 +1278,7 @@ pub(crate) fn refresh_iceberg_mv(
             &iceberg_catalog,
             &target_loaded.table,
             expected_main_snapshot_id_from_table(&target_loaded.table),
+            current_catalog,
             current_database,
             &mv_definition,
             &base_refs,
@@ -1380,11 +1382,6 @@ pub(crate) fn refresh_iceberg_mv(
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
         rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
-    let expected_main_snapshot_id = target_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
     let staging_branch = format!(
         "__nova_mv_refresh_{}_{}",
         mv_definition.mv_id,
@@ -1399,6 +1396,24 @@ pub(crate) fn refresh_iceberg_mv(
             base_ref.fqn()
         ));
     }
+
+    let ctx = IcebergMvRefreshContext::new(
+        target.clone(),
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query.clone()),
+        Arc::from(base_refs.clone()),
+        Arc::new(pin.clone()),
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_loaded.table.clone(),
+    )?;
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg MV refresh context constructed"
+    );
 
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
@@ -1418,24 +1433,19 @@ pub(crate) fn refresh_iceberg_mv(
                 state,
                 &target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
             first_refresh_iceberg_mv(
                 state,
-                &target,
-                &target_entry,
-                &iceberg_catalog,
-                expected_main_snapshot_id,
+                &ctx,
                 &staging_branch,
                 refresh_id,
-                current_database,
-                mv_definition,
-                &pinned_full_select_sql,
                 base_ref,
                 cur,
                 &current_table_uuid,
+                &pinned_full_select_sql,
             )
         }
 
@@ -1466,12 +1476,7 @@ pub(crate) fn refresh_iceberg_mv(
         // Incremental: base snapshot has advanced.
         (Some(prev), Some(cur)) => incremental_refresh_iceberg_mv(
             state,
-            &target,
-            &target_entry,
-            &iceberg_catalog,
-            expected_main_snapshot_id,
-            current_database,
-            mv_definition,
+            &ctx,
             base_ref,
             prev,
             cur,
@@ -1653,18 +1658,22 @@ fn refresh_single_aggregate_iceberg_mv(
         }
     };
     let mv_definition = &effective_definition;
+    // Canonicalize once; reused for both reclassification (rebind branch) and
+    // ctx construction below.
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
     // When rebind rewrote stored SELECT, the original `aggregate_shape`
     // captured by `plan_iceberg_aggregate_mv_refresh` still references the
     // pre-rebind base column names. Reclassify against the rewritten SQL so
     // downstream signed-delta/full-state rewrites consistently use the
     // current base column names.
     let reclassified_aggregate_shape = if rebind_happened {
-        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new =
-            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
         let new_shape =
             crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-                &canonical_new,
+                &canonical_select_query,
             )?;
         aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
             "iceberg aggregate MV rebind broke aggregate classification".to_string()
@@ -1673,6 +1682,23 @@ fn refresh_single_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
+    let ctx = IcebergMvRefreshContext::new(
+        target.clone(),
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        Arc::new(pin.clone()),
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg MV refresh context constructed"
+    );
 
     match previous {
         None => {
@@ -1691,17 +1717,10 @@ fn refresh_single_aggregate_iceberg_mv(
             )?;
             first_refresh_iceberg_aggregate_mv(
                 state,
-                target,
-                target_entry,
-                iceberg_catalog,
-                expected_main_snapshot_id,
+                &ctx,
                 &staging_branch,
                 refresh_id,
-                current_catalog,
-                current_database,
-                mv_definition,
                 aggregate_shape,
-                &pin,
             )
         }
         Some(prev) if prev == current => {
@@ -1721,44 +1740,35 @@ fn refresh_single_aggregate_iceberg_mv(
         }
         Some(prev) => incremental_refresh_iceberg_aggregate_mv(
             state,
-            target,
-            target_entry,
-            iceberg_catalog,
-            target_table,
-            expected_main_snapshot_id,
-            current_catalog,
-            current_database,
-            mv_definition,
-            schema_contract,
+            &ctx,
             base_ref,
             prev,
             current,
             &loaded,
             aggregate_shape,
-            &pin,
         ),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_aggregate_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    _schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    ctx: &IcebergMvRefreshContext,
     base_ref: &IcebergTableRef,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     aggregate_shape: &AggregateMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let target_table = &ctx.target_table;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_catalog = ctx.rewrite.current_catalog.as_deref();
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let schema_contract = &*ctx.rewrite.schema_contract;
+    let pin = &*ctx.rewrite.pin;
     let batch = match plan_changes(
         &loaded_base.table,
         previous_snapshot_id,
@@ -1896,7 +1906,7 @@ fn incremental_refresh_iceberg_aggregate_mv(
         target_table,
         expected_main_snapshot_id,
         mv_definition,
-        _schema_contract,
+        schema_contract,
         &layout,
         &delta_chunks,
         pin.to_snapshot_map(),
@@ -2385,16 +2395,20 @@ fn refresh_join_aggregate_iceberg_mv(
     );
     let effective_definition = decision.into_definition(mv_definition)?;
     let mv_definition = &effective_definition;
+    // Canonicalize once; reused for both reclassification (rebind branch) and
+    // ctx construction below.
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
     // Reclassify the join aggregate shape against the rewritten SELECT so
     // downstream signed-delta / branch rewrites use the current base column
     // names (join key and group key).
     let reclassified_join_aggregate_shape = if rebind_happened {
-        let new_query = parse_mv_select_query(&mv_definition.select_sql)?;
-        let canonical_new =
-            canonicalize_iceberg_mv_select_query(&new_query, current_catalog, current_database);
         let new_shape =
             crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
-                &canonical_new,
+                &canonical_select_query,
             )?;
         match new_shape {
             IncrementalMvShape::JoinAggregate(shape) => shape,
@@ -2415,6 +2429,23 @@ fn refresh_join_aggregate_iceberg_mv(
         aggregate_shape.clone()
     };
     let aggregate_shape = &reclassified_aggregate_shape;
+    let ctx = IcebergMvRefreshContext::new(
+        target.clone(),
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        Arc::new(pin.clone()),
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg MV refresh context constructed"
+    );
 
     let left_current = pin
         .get(left_ref)
@@ -2440,17 +2471,10 @@ fn refresh_join_aggregate_iceberg_mv(
             )?;
             first_refresh_iceberg_aggregate_mv(
                 state,
-                target,
-                target_entry,
-                iceberg_catalog,
-                expected_main_snapshot_id,
+                &ctx,
                 &staging_branch,
                 refresh_id,
-                current_catalog,
-                current_database,
-                mv_definition,
                 aggregate_shape,
-                &pin,
             )
         }
         (Some(left_prev), Some(right_prev))
@@ -2472,15 +2496,7 @@ fn refresh_join_aggregate_iceberg_mv(
         }
         (Some(left_prev), Some(right_prev)) => incremental_refresh_iceberg_join_aggregate_mv(
             state,
-            target,
-            target_entry,
-            iceberg_catalog,
-            target_table,
-            expected_main_snapshot_id,
-            current_catalog,
-            current_database,
-            mv_definition,
-            schema_contract,
+            &ctx,
             left_ref,
             right_ref,
             left_prev,
@@ -2491,7 +2507,6 @@ fn refresh_join_aggregate_iceberg_mv(
             &right_loaded,
             join_aggregate_shape,
             aggregate_shape,
-            &pin,
         ),
         _ => Err(format!(
             "iceberg join aggregate MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
@@ -2503,15 +2518,7 @@ fn refresh_join_aggregate_iceberg_mv(
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_join_aggregate_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    _schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    ctx: &IcebergMvRefreshContext,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
     left_previous_snapshot_id: i64,
@@ -2522,8 +2529,17 @@ fn incremental_refresh_iceberg_join_aggregate_mv(
     right_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     join_aggregate_shape: &JoinAggregateMvShape,
     aggregate_shape: &AggregateMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let target_table = &ctx.target_table;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_catalog = ctx.rewrite.current_catalog.as_deref();
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let schema_contract = &*ctx.rewrite.schema_contract;
+    let pin = &*ctx.rewrite.pin;
     let left_batch = plan_join_aggregate_side_changes(
         target,
         "left",
@@ -2611,7 +2627,7 @@ fn incremental_refresh_iceberg_join_aggregate_mv(
         target_table,
         expected_main_snapshot_id,
         mv_definition,
-        _schema_contract,
+        schema_contract,
         &layout,
         &delta_chunks,
         pin.to_snapshot_map(),
@@ -4051,19 +4067,21 @@ fn drop_iceberg_mv_staging_branch(
 #[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
+    ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    pinned_full_select_sql: &str,
     base_ref: &IcebergTableRef,
     base_snapshot_id: i64,
     current_table_uuid: &str,
+    pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+
     // 1. Run SELECT and collect chunks.
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
@@ -4228,21 +4246,21 @@ fn run_mv_full_select_result(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_aggregate_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
+    ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
     aggregate_shape: &AggregateMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_catalog = ctx.rewrite.current_catalog.as_deref();
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
     let chunks = match prepare_aggregate_first_refresh_chunks(
         state,
         current_catalog,
@@ -5313,6 +5331,7 @@ fn refresh_iceberg_join_mv(
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
     expected_main_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
@@ -5425,6 +5444,34 @@ fn refresh_iceberg_join_mv(
         .get(right_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
 
+    // Construct the refresh context once, after pin capture and join schema
+    // contract validation. The early no-op match arms above return BEFORE pin
+    // capture because `RefreshSnapshotPin::capture` errors out if any base
+    // lacks a current snapshot — hoisting pin capture would regress those
+    // no-op paths into errors. Option (b) from the design spec.
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let ctx = IcebergMvRefreshContext::new(
+        target.clone(),
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        Arc::new(pin.clone()),
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg MV refresh context constructed"
+    );
+
     match (left_previous, right_previous) {
         (None, None) => {
             let staging_branch = format!(
@@ -5442,16 +5489,10 @@ fn refresh_iceberg_join_mv(
             )?;
             first_refresh_iceberg_join_mv(
                 state,
-                target,
-                target_entry,
-                iceberg_catalog,
-                expected_main_snapshot_id,
+                &ctx,
                 &staging_branch,
                 refresh_id,
-                current_database,
-                mv_definition,
                 shape,
-                &pin,
                 left_ref,
                 right_ref,
             )
@@ -5475,15 +5516,9 @@ fn refresh_iceberg_join_mv(
         }
         (Some(_), Some(_)) => incremental_refresh_iceberg_join_mv(
             state,
-            target,
-            target_entry,
-            iceberg_catalog,
-            expected_main_snapshot_id,
-            current_database,
-            mv_definition,
+            &ctx,
             &[left_ref.clone(), right_ref.clone()],
             shape,
-            &pin,
         ),
         _ => Err(format!(
             "iceberg join MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
@@ -5699,22 +5734,22 @@ fn finalize_iceberg_mv_metadata_only_refresh(
     Ok(StatementResult::Ok)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
+    ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
     shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
         iceberg_catalog,
         target,
@@ -6178,19 +6213,19 @@ fn build_iceberg_table_def_for_snapshot_scan(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
+    ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
     shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
+    let pin = &*ctx.rewrite.pin;
     if base_refs.len() != 2 {
         return Err("iceberg join MV refresh requires exactly two base tables".to_string());
     }
@@ -6660,12 +6695,7 @@ fn normalize_join_branch_snapshot_tables(
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
+    ctx: &IcebergMvRefreshContext,
     base_ref: &IcebergTableRef,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
@@ -6673,6 +6703,12 @@ fn incremental_refresh_iceberg_mv(
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
+    let target = &ctx.rewrite.target;
+    let target_entry = &*ctx.target_entry;
+    let iceberg_catalog = &ctx.iceberg_catalog;
+    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let current_database = ctx.rewrite.current_database.as_str();
+    let mv_definition = &*ctx.rewrite.mv_definition;
     // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
     // safely, rebuild instead of risking an incorrect incremental result.
     let batch = match plan_changes(
