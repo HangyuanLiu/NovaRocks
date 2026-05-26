@@ -523,12 +523,39 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         // the SELECT modifier and `(col)` is a Nested expression.
         sqlast::Expr::Nested(inner) => expr_display_name(inner),
         sqlast::Expr::Value(value) => format_literal_display_name(&value.value),
-        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect::<Vec<_>>()
-            .join("."),
+        // MySQL/StarRocks convention: a `t.col` column reference (or
+        // `db.tbl.col` and deeper qualifications, and `struct_col.field`
+        // struct subfield access) displays as just the trailing identifier
+        // in the result header. The qualifier chain only exists for
+        // disambiguation during name resolution.
+        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+            parts.last().unwrap().value.clone()
+        }
         sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+            // When the root is an identifier (a column / qualified column
+            // reference) and the access chain is purely a series of Dot
+            // accesses, the MySQL-style header is just the trailing field
+            // name: `t.s.field`, `c2.field`, `db.tbl.col` all show as the
+            // last segment.
+            //
+            // Skip this shortcut when the root is a function call or any
+            // other non-identifier expression — e.g. `row(map1).col1` keeps
+            // the full path because the user is extracting a named field
+            // from an inline value expression, not naming a base column.
+            let root_is_ident = matches!(
+                root.as_ref(),
+                sqlast::Expr::Identifier(_) | sqlast::Expr::CompoundIdentifier(_)
+            );
+            let all_dot = !access_chain.is_empty()
+                && access_chain
+                    .iter()
+                    .all(|a| matches!(a, sqlast::AccessExpr::Dot(_)));
+            if root_is_ident
+                && all_dot
+                && let Some(sqlast::AccessExpr::Dot(last)) = access_chain.last()
+            {
+                return expr_display_name_preserve_path(last);
+            }
             let mut out = expr_display_name_preserve_path(root);
             for access in access_chain {
                 match access {
@@ -615,7 +642,14 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
         sqlast::Expr::BinaryOp { left, op, right } => {
             let left_str = expr_display_name_with_parens(left);
             let right_str = expr_display_name_with_parens(right);
-            format!("{left_str} {op} {right_str}")
+            // StarRocks renders `<>` as `!=` in result-column display names;
+            // sqlparser's `Display` keeps the user's original spelling, so
+            // canonicalise here.
+            let op_str = match op {
+                sqlast::BinaryOperator::NotEq => "!=".to_string(),
+                _ => format!("{op}"),
+            };
+            format!("{left_str} {op_str} {right_str}")
         }
         // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
         // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
@@ -715,14 +749,20 @@ fn format_cast_type(data_type: &sqlast::DataType) -> String {
         sqlast::DataType::Custom(name, modifiers) => {
             let lower = name.to_string().to_ascii_lowercase();
             match lower.as_str() {
+                // StarRocks renders `MAP<…>` casts in uppercase, with the
+                // *inner* types also uppercased and **without** MySQL-style
+                // width modifiers (so `int(11)` collapses to `INT`,
+                // `array<int(11)>` becomes `ARRAY<INT>`, etc.). The
+                // separator between key and value is a bare comma — no
+                // space. This is asymmetric with the STRUCT renderer,
+                // which keeps everything lowercase + width-bearing.
                 "map" => format!(
-                    "{}<{}>",
-                    lower,
+                    "MAP<{}>",
                     modifiers
                         .iter()
-                        .map(|m| format_cast_type_modifier(m))
+                        .map(|m| format_cast_type_modifier_for_map(m))
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(",")
                 ),
                 "struct" => format!(
                     "{}<{}>",
@@ -791,6 +831,70 @@ fn canonicalize_array_inner_scalar(inner: &str) -> String {
 fn format_cast_type_modifier(modifier: &str) -> String {
     let trimmed = modifier.trim();
     format_cast_type_token(trimmed)
+}
+
+/// MAP variant of `format_cast_type_modifier` — StarRocks uppercases the
+/// inner types in a `MAP<…>` cast and strips MySQL-style width modifiers,
+/// e.g. `int` and `int(11)` both display as `INT`, `array<int>` becomes
+/// `ARRAY<INT>`, and nested `MAP<…>` recurses with the same rules.
+fn format_cast_type_modifier_for_map(modifier: &str) -> String {
+    fn rewrite(token: &str) -> String {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        // Nested collection: `array<…>`, `map<…>`, `struct<…>`. Walk the
+        // outer name and re-render with the MAP-flavored rules.
+        if let Some(open) = trimmed.find('<')
+            && trimmed.ends_with('>')
+        {
+            let head = trimmed[..open].trim();
+            let inner = &trimmed[open + 1..trimmed.len() - 1];
+            let head_upper = head.to_ascii_uppercase();
+            let parts = split_at_top_level_commas(inner);
+            let rendered = parts
+                .iter()
+                .map(|p| rewrite(p.trim()))
+                .collect::<Vec<_>>()
+                .join(",");
+            return format!("{head_upper}<{rendered}>");
+        }
+        // Bare scalar — strip any `(N)` / `(P,S)` width and uppercase.
+        let base = if let Some(paren) = trimmed.find('(') {
+            trimmed[..paren].trim()
+        } else {
+            trimmed
+        };
+        base.to_ascii_uppercase()
+    }
+    rewrite(modifier)
+}
+
+/// Split `inner` (the text between angle brackets) on top-level commas,
+/// respecting nested `<…>` and `(…)`.
+fn split_at_top_level_commas(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::new();
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth_angle += 1,
+            b'>' => depth_angle -= 1,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b',' if depth_angle == 0 && depth_paren == 0 => {
+                out.push(&inner[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < inner.len() {
+        out.push(&inner[start..]);
+    }
+    out
 }
 
 /// Render a single `struct<…>` field spec back as `name type`, applying the
@@ -972,6 +1076,21 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     }
     if canonical_name == "map" {
         return format_map_display_name(function);
+    }
+    // `element_at(container, key)` is rendered as `container[key]` to match
+    // the subscript-syntax variant — the two forms are semantically identical
+    // and downstream consumers (sql-tests, MySQL clients reading column
+    // headers) expect a single canonical name regardless of which spelling
+    // the user wrote.
+    if canonical_name == "element_at"
+        && let sqlast::FunctionArguments::List(list) = &function.args
+        && list.args.len() == 2
+        && matches!(list.args[0], sqlast::FunctionArg::Unnamed(_))
+        && matches!(list.args[1], sqlast::FunctionArg::Unnamed(_))
+    {
+        let container = format_function_arg_display_name(&list.args[0]);
+        let key = format_function_arg_display_name(&list.args[1]);
+        return format!("{container}[{key}]");
     }
     let formatted_args =
         format_function_arguments_with_ignore_nulls_after_first(&function.args, &canonical_name)
