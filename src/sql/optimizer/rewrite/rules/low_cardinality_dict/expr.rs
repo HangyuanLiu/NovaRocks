@@ -2,10 +2,53 @@
 
 use arrow::datatypes::DataType;
 
+use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
 use super::context::DictScope;
+
+/// Allowlist of deterministic single-string-argument functions that can be
+/// represented as a query-local derived dictionary on top of a dict-encoded
+/// source column. Used by Task 8 item 4 (derived dictionary expressions).
+///
+/// TODO(task-8-derived): wire this into the rewriter and codegen — Task 8
+/// keeps the list here as the contract surface but does not yet allocate
+/// query-local dict slots for derived expressions. See item 4 in the plan
+/// (`docs/superpowers/plans/2026-05-26-low-cardinality-dictionary-rewrite.md`).
+#[allow(dead_code)]
+pub(crate) const DERIVED_DICT_FUNCTIONS: &[&str] = &["upper", "lower", "trim", "ltrim", "rtrim"];
+
+/// Allowlist of aggregate function names whose argument may consume a dict
+/// id slot directly (without a preceding Decode). For `min` / `max` the
+/// rewriter additionally requires the snapshot to be order-preserving.
+pub(crate) const DICT_AGG_FUNCTIONS: &[&str] = &[
+    "count",
+    "min",
+    "max",
+    "any_value",
+    "array_agg",
+    "approx_count_distinct",
+];
+
+/// True when two dictionary snapshots are compatible enough that a Join /
+/// UNION ALL can safely compare and union their dict id columns directly,
+/// without decoding either side first.
+///
+/// The check covers three fields:
+///
+/// * `owner.stable_key()` — same logical table.
+/// * `version` — same on-disk encoding of the dictionary.
+/// * `column_name` (case-insensitive) — same logical column.
+///
+/// `order_preserving` and `null_id` are intentionally NOT part of the key:
+/// equi-join / UNION ALL semantics only need the encoding to agree, not the
+/// ordering relation.
+pub(crate) fn dict_keys_compatible(left: &DictionarySnapshot, right: &DictionarySnapshot) -> bool {
+    left.owner.stable_key() == right.owner.stable_key()
+        && left.version == right.version
+        && left.column_name.eq_ignore_ascii_case(&right.column_name)
+}
 
 pub(crate) fn is_string_like(data_type: &DataType) -> bool {
     matches!(

@@ -72,6 +72,29 @@ impl DictScope {
         self.bindings.get(&output_name.to_ascii_lowercase())
     }
 
+    /// Resolve a column name that is EITHER the output (string) column
+    /// name OR the synthesized dict column name. Returns the binding
+    /// plus the output (source) name the binding is registered under.
+    ///
+    /// Used by the Task 8 Join / Union rewriters to recognize predicates
+    /// and project items that were already rewritten in a prior pipeline
+    /// iteration (where the column ref is on the dict slot directly).
+    pub(crate) fn resolve_either(&self, name: &str) -> Option<(&str, &DictBinding)> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(binding) = self.bindings.get(&lower) {
+            return Some((
+                self.bindings.get_key_value(&lower).unwrap().0.as_str(),
+                binding,
+            ));
+        }
+        for (k, b) in &self.bindings {
+            if b.dict_column.eq_ignore_ascii_case(name) {
+                return Some((k.as_str(), b));
+            }
+        }
+        None
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
