@@ -37,6 +37,87 @@ pub(crate) struct ImvVersionRef {
     _private: (),
 }
 
+/// Returns true if `plan` contains any `ImvDelta` or `ImvVersion` node at
+/// any depth. The Validation stage uses this to detect unresolved markers.
+pub(crate) fn plan_contains_imv_marker(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => true,
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_) => false,
+        LogicalPlan::Filter(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Project(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Aggregate(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Sort(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Limit(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Window(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::TableFunction(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::SubqueryAlias(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Repeat(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::CTEProduce(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Decode(n) => plan_contains_imv_marker(&n.input),
+        LogicalPlan::Join(n) => {
+            plan_contains_imv_marker(&n.left) || plan_contains_imv_marker(&n.right)
+        }
+        LogicalPlan::CTEAnchor(n) => {
+            plan_contains_imv_marker(&n.produce) || plan_contains_imv_marker(&n.consumer)
+        }
+        LogicalPlan::Union(n) => n.inputs.iter().any(plan_contains_imv_marker),
+        LogicalPlan::Intersect(n) => n.inputs.iter().any(plan_contains_imv_marker),
+        LogicalPlan::Except(n) => n.inputs.iter().any(plan_contains_imv_marker),
+    }
+}
+
+/// Returns the distinct kinds of marker present in `plan`, in stable
+/// order. Used by the Validation stage's error message.
+pub(crate) fn collect_marker_kinds(plan: &LogicalPlan) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    collect_into(plan, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn collect_into(plan: &LogicalPlan, found: &mut Vec<&'static str>) {
+    match plan {
+        LogicalPlan::ImvDelta(n) => {
+            found.push("ImvDelta");
+            collect_into(&n.input, found);
+        }
+        LogicalPlan::ImvVersion(n) => {
+            found.push("ImvVersion");
+            collect_into(&n.input, found);
+        }
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_) => {}
+        LogicalPlan::Filter(n) => collect_into(&n.input, found),
+        LogicalPlan::Project(n) => collect_into(&n.input, found),
+        LogicalPlan::Aggregate(n) => collect_into(&n.input, found),
+        LogicalPlan::Sort(n) => collect_into(&n.input, found),
+        LogicalPlan::Limit(n) => collect_into(&n.input, found),
+        LogicalPlan::Window(n) => collect_into(&n.input, found),
+        LogicalPlan::TableFunction(n) => collect_into(&n.input, found),
+        LogicalPlan::SubqueryAlias(n) => collect_into(&n.input, found),
+        LogicalPlan::Repeat(n) => collect_into(&n.input, found),
+        LogicalPlan::CTEProduce(n) => collect_into(&n.input, found),
+        LogicalPlan::Decode(n) => collect_into(&n.input, found),
+        LogicalPlan::Join(n) => {
+            collect_into(&n.left, found);
+            collect_into(&n.right, found);
+        }
+        LogicalPlan::CTEAnchor(n) => {
+            collect_into(&n.produce, found);
+            collect_into(&n.consumer, found);
+        }
+        LogicalPlan::Union(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),
+        LogicalPlan::Intersect(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),
+        LogicalPlan::Except(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +148,58 @@ mod tests {
             version_ref: ImvVersionRef::default(),
         };
         assert!(matches!(*node.input, LogicalPlan::Values(_)));
+    }
+
+    #[test]
+    fn plan_contains_imv_marker_false_for_plain_plan() {
+        let plan = empty_values_plan();
+        assert!(!plan_contains_imv_marker(&plan));
+    }
+
+    #[test]
+    fn plan_contains_imv_marker_true_for_root_delta() {
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(empty_values_plan()),
+            is_root: true,
+            action_column: None,
+        });
+        assert!(plan_contains_imv_marker(&plan));
+    }
+
+    #[test]
+    fn plan_contains_imv_marker_true_for_nested_version() {
+        use crate::sql::planner::plan::LimitNode;
+        // Build Limit(Limit(ImvVersion(Values))). The marker is
+        // deeply nested; the helper must recurse.
+        let nested = LogicalPlan::ImvVersion(ImvVersionNode {
+            input: Box::new(empty_values_plan()),
+            version_ref: ImvVersionRef::default(),
+        });
+        let inner = LogicalPlan::Limit(LimitNode {
+            input: Box::new(nested),
+            limit: None,
+            offset: None,
+        });
+        let outer = LogicalPlan::Limit(LimitNode {
+            input: Box::new(inner),
+            limit: None,
+            offset: None,
+        });
+        assert!(plan_contains_imv_marker(&outer));
+    }
+
+    #[test]
+    fn collect_marker_kinds_reports_each_distinct_kind() {
+        let delta = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(LogicalPlan::ImvVersion(ImvVersionNode {
+                input: Box::new(empty_values_plan()),
+                version_ref: ImvVersionRef::default(),
+            })),
+            is_root: true,
+            action_column: None,
+        });
+        let mut kinds = collect_marker_kinds(&delta);
+        kinds.sort();
+        assert_eq!(kinds, vec!["ImvDelta", "ImvVersion"]);
     }
 }
