@@ -480,22 +480,14 @@ mod tests {
 
     #[test]
     fn regular_query_pipeline_does_not_produce_markers() {
+        use std::collections::HashMap;
         use crate::sql::optimizer::rewrite::context::RewriteContext;
-        use crate::sql::optimizer::rewrite::pipeline::RewritePipeline;
-        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
 
-        // RewritePipeline::new is the constructor used by the query
-        // rewrite path. With no rules, it must leave the plan unchanged
-        // and never introduce a marker.
-        let pipeline = RewritePipeline::new(
-            vec![
-                RewritePhase::LogicalNormalize,
-                RewritePhase::StructuralRewrite,
-                RewritePhase::SemanticRewrite,
-                RewritePhase::Validation,
-            ],
-            Vec::new(),
-        );
+        // Exercise the real query rewrite pipeline (the one used by the
+        // optimizer before CBO) to ensure it never introduces IMV markers
+        // on a plain non-IMV plan.
+        let pipeline = query_rewrite_pipeline(&HashMap::new());
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
 
         let out = pipeline
