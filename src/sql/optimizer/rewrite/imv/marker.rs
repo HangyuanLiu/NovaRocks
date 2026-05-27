@@ -51,7 +51,8 @@ pub(crate) struct ImvVersionRef {
 /// Once the flag is set it stays set for the lifetime of this object.
 /// Callers **must** construct a fresh `WrapRootInImvDeltaRule` (and
 /// therefore a fresh `RewritePipeline`) for every independent `rewrite()`
-/// invocation.  Production code satisfies this contract: `run_imv_rewrite()`
+/// invocation.  When Task 7 registers this rule into the IMV pipeline,
+/// the production path will satisfy this contract: `run_imv_rewrite()`
 /// calls `build_imv_pipeline()` which allocates a new pipeline—and a new
 /// rule instance—on every call.  Reusing the same pipeline across multiple
 /// `rewrite()` calls is incorrect: the second call will silently skip
@@ -87,6 +88,12 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         }
         // Plan was already wrapped before the pipeline ran (e.g. re-entry
         // on a previously wrapped plan): record the fact and skip.
+        // This store-then-return-false pattern is load-bearing: the side effect
+        // prevents TopDown traversal from descending into the child of the existing
+        // ImvDelta wrapper. This relies on the rewrite framework calling matches()
+        // during actual traversal, not for speculative probing. The TopDown traversal
+        // will call matches() on the ImvDelta node itself; if we returned true instead,
+        // we would try to wrap it again, creating a double-wrapped root.
         if matches!(
             plan,
             LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })
