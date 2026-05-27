@@ -44,10 +44,18 @@ pub(crate) struct ImvVersionRef {
 }
 
 /// Wraps the root of an IMV refresh plan in `ImvDelta { is_root: true }`.
-/// One-shot per pipeline run: the `wrapped` flag is set on the first
-/// apply and short-circuits every subsequent `matches()` so the rule
-/// fires exactly once even though TopDown traversal would otherwise
-/// revisit the child of the new `ImvDelta`.
+///
+/// # Instance-scope one-shot state
+///
+/// `wrapped` is stored on the **rule instance**, not in `RewriteContext`.
+/// Once the flag is set it stays set for the lifetime of this object.
+/// Callers **must** construct a fresh `WrapRootInImvDeltaRule` (and
+/// therefore a fresh `RewritePipeline`) for every independent `rewrite()`
+/// invocation.  Production code satisfies this contract: `run_imv_rewrite()`
+/// calls `build_imv_pipeline()` which allocates a new pipeline—and a new
+/// rule instance—on every call.  Reusing the same pipeline across multiple
+/// `rewrite()` calls is incorrect: the second call will silently skip
+/// wrapping because `wrapped` is already `true`.
 pub(crate) struct WrapRootInImvDeltaRule {
     wrapped: AtomicBool,
 }
@@ -241,6 +249,52 @@ mod tests {
             rows: vec![],
             columns: vec![],
         })
+    }
+
+    /// Two independent invocations each using their **own** fresh rule/pipeline
+    /// must both succeed.  This documents the required usage contract: callers
+    /// (i.e. `build_imv_pipeline` / `run_imv_rewrite`) must never reuse the
+    /// same `WrapRootInImvDeltaRule` instance across multiple `rewrite()` calls
+    /// because the `wrapped` flag is per-instance and is never reset.
+    #[test]
+    fn two_fresh_pipelines_each_wrap_independently() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+
+        fn make_pipeline() -> RewritePipeline {
+            RewritePipeline::from_stages(vec![RewriteStage::new(
+                "imv-delta-marker",
+                RewritePhase::StructuralRewrite,
+                vec![Box::new(WrapRootInImvDeltaRule::new())],
+            )])
+        }
+
+        // First invocation — fresh rule instance
+        let out1 = make_pipeline()
+            .rewrite(
+                empty_values_plan(),
+                &mut RewriteContext::for_mv_refresh(Vec::<String>::new()),
+            )
+            .unwrap();
+        assert!(
+            matches!(out1, LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })),
+            "first fresh pipeline must wrap the root"
+        );
+
+        // Second invocation — another fresh rule instance (simulates a second
+        // `run_imv_rewrite()` call the way `build_imv_pipeline()` works in
+        // production).
+        let out2 = make_pipeline()
+            .rewrite(
+                empty_values_plan(),
+                &mut RewriteContext::for_mv_refresh(Vec::<String>::new()),
+            )
+            .unwrap();
+        assert!(
+            matches!(out2, LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })),
+            "second fresh pipeline must also wrap the root independently"
+        );
     }
 
     #[test]
