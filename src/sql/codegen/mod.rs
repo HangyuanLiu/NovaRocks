@@ -33,6 +33,20 @@ pub(crate) struct PlanBuildResult {
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
     pub exec_params: internal_service::TPlanFragmentExecParams,
     pub output_columns: Vec<OutputColumn>,
+    /// Per-fragment dictionary payload required by `lower_decode_node` and
+    /// `lower_lake_scan_node` to build their `query_global_dict_map`. When
+    /// `LowCardinalityDictionaryRewrite` has fired, this carries one
+    /// `TGlobalDict` per encoded slot id surfaced by this fragment;
+    /// otherwise `None`. The execution path (`execute_plan`) must thread
+    /// these into `lower_plan` — without them, every Decode in the plan
+    /// fails with `missing query global dict for encoded slot_id=<N>`.
+    pub query_global_dicts: Option<Vec<crate::data::TGlobalDict>>,
+    /// Derived dictionary expressions keyed by target dict slot id. Mirrors
+    /// `FragmentBuildResult.query_global_dict_exprs`. Empty today (Task 8
+    /// derived-expr support is deferred); kept here so the execution path's
+    /// `lower_plan` call signature stays consistent across single- and
+    /// multi-fragment plans.
+    pub query_global_dict_exprs: Option<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
 }
 
 #[derive(Clone)]

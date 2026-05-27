@@ -60,6 +60,14 @@ set pipeline_dop=2;
 USE ${case_db};
 select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
+-- Trigger dictionary metadata collection for the low-cardinality string
+-- columns before the EXPLAIN assertion below. Without this NovaRocks
+-- standalone never builds dictionary snapshots and the rewrite cannot
+-- fire (legacy StarRocks auto-collected stats; we require explicit ANALYZE).
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE all_t0;
+
 -- query 8
 -- @retry_count=60
 -- @retry_interval_ms=1000
@@ -183,10 +191,10 @@ select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6
 -- query 24
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=Decode
+-- @result_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN COSTS SELECT DISTINCT c20 FROM all_t0;
+EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t0;
 
 -- query 25
 -- @retry_count=60
@@ -411,6 +419,12 @@ insert into all_decimal SELECT x%100, x%200, x%200, x%200 FROM TABLE(generate_se
 USE ${case_db};
 select distinct c1,c2,c3,c4 from all_decimal order by 1,2,3,4 limit 100,3;
 
+-- Populate dictionary + per-column stats before the min-max / Decode
+-- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE all_decimal;
+
 -- query 73
 -- @retry_count=60
 -- @retry_interval_ms=1000
@@ -538,6 +552,12 @@ insert into all_numbers_t0 SELECT x%128, x%200, x%200, x%200, x%200, x%128, x%20
 -- query 96
 USE ${case_db};
 select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
+
+-- Populate dictionary + per-column stats before the min-max assertions
+-- below. NovaRocks standalone needs explicit ANALYZE FULL.
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE all_numbers_t0;
 
 -- query 97
 -- @retry_count=60
@@ -929,6 +949,11 @@ properties (
 USE ${case_db};
 insert into trand values(1,1);
 
+-- Populate stats after the first insert before the min-max assertion.
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE trand;
+
 -- query 169
 -- @retry_count=60
 -- @retry_interval_ms=1000
@@ -945,6 +970,11 @@ select k1 from trand group by k1;
 -- @skip_result_check=true
 USE ${case_db};
 insert into trand values(2,2);
+
+-- Re-collect stats after the second insert before the min-max assertion.
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE trand;
 
 -- query 172
 -- @retry_count=60
@@ -996,6 +1026,12 @@ insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM T
 -- query 176
 USE ${case_db};
 select distinct c1, c2, c3, c4, c5, c6, c7, c8 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
+
+-- Populate dictionary + per-column stats before the min-max / DECODE
+-- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
+-- @skip_result_check=true
+USE ${case_db};
+ANALYZE FULL TABLE all_t1;
 
 -- query 177
 -- @retry_count=60
