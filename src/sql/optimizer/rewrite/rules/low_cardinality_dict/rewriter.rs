@@ -169,24 +169,46 @@ fn rewrite_scan(mut scan: ScanNode, ctx: &mut DictionaryRewriteContext) -> (Scan
         return (scan, scope);
     }
     for (col_name, snapshot) in eligible {
-        // Locate the source column descriptor to preserve nullability.
-        let (source_name, nullable) = match scan
+        // Locate the source column descriptor to preserve nullability and
+        // its column_id so the rewritten OutputColumn keeps a stable id
+        // for downstream resolution.
+        let (source_name, nullable, source_column_id) = match scan
             .columns
             .iter()
             .find(|c| c.name.to_ascii_lowercase() == col_name.to_ascii_lowercase())
         {
-            Some(c) => (c.name.clone(), c.nullable),
+            Some(c) => (c.name.clone(), c.nullable, c.column_id),
             None => continue,
         };
         let dict_column = DictionaryRewriteContext::dict_column_name(&scan.table.name, &col_name);
-        scan.columns.push(OutputColumn {
-            column_id: ColumnId::UNSET,
-            name: dict_column.clone(),
-            data_type: DataType::Int32,
-            nullable,
-        });
+        // Bug B fix: REPLACE the source string OutputColumn with the dict
+        // INT slot rather than adding a sibling. The codegen `visit_scan`
+        // walks `scan.columns` (filtered by `required_columns`) to decide
+        // which slots end up in the scan tuple; if we kept the original
+        // string column here, the BE would receive BOTH the source string
+        // slot AND the dict slot in the lake-scan layout and the
+        // `dict_int_to_string` rewrite at `src/lower/node/lake_scan.rs`
+        // would collapse them onto the same storage slot id (duplicate
+        // slot id in chunk schema contract). Every downstream reference
+        // to the source column is already retargeted to the dict column
+        // by `rewrite_project` / `rewrite_aggregate` / `rewrite_sort` /
+        // `rewrite_join`; the final user-facing string materialization
+        // happens at a `Decode` boundary inserted by those arms (or by
+        // `wrap_with_decode` for conservative parents).
+        for col in scan.columns.iter_mut() {
+            if col.name.eq_ignore_ascii_case(&source_name) {
+                col.name = dict_column.clone();
+                col.data_type = DataType::Int32;
+                col.nullable = nullable;
+                col.column_id = source_column_id;
+            }
+        }
         if let Some(required) = scan.required_columns.as_mut() {
-            required.push(dict_column.clone());
+            for entry in required.iter_mut() {
+                if entry.eq_ignore_ascii_case(&source_name) {
+                    *entry = dict_column.clone();
+                }
+            }
         }
         scan.dict_columns.push(ScanDictionaryColumn {
             source_column: source_name.clone(),
@@ -210,23 +232,40 @@ fn rewrite_project(
     ctx: &mut DictionaryRewriteContext,
 ) -> Result<(LogicalPlan, DictScope), String> {
     let (input, input_scope) = rewrite_node(*node.input, ctx)?;
-    // Task 7 scope: do not rewrite project items themselves. Projects
-    // that re-emit a string column do so by carrying its dict alias up
-    // implicitly; the parent boundary (or the final user-facing
-    // projection) is what decides whether a Decode is needed.
-    // TODO(task-8): rewrite project items so derived dict expressions
-    // (`upper(s)`, `concat(s, '!')`, etc.) operate on the dict id.
+    // Task 7 scope: do not rewrite arbitrary project item expressions
+    // (derived dict expressions like `upper(s)` are TODO(task-8)). But
+    // plain ColumnRef items MUST be retargeted to the dict slot now —
+    // after the Bug B fix the scan publishes only `__nr_dict_<t>_<c>`,
+    // not the source string column, so a ColumnRef("s") in the project
+    // body cannot resolve at codegen. The output_name stays the same;
+    // only the expression's inner column ref + data type change.
     //
     // For plain column-alias items (`SELECT s AS t FROM ...`), propagate
     // the dict binding under the alias name so a downstream boundary
     // can still find the dict column to decode.
     let mut output_scope = DictScope::new();
-    for item in &node.items {
-        if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
+    let mut items: Vec<crate::sql::analysis::ProjectItem> = Vec::with_capacity(node.items.len());
+    for item in node.items.into_iter() {
+        if let ExprKind::ColumnRef { column, .. } = &item.expr.kind
             && let Some(binding) = input_scope.get(column)
         {
             output_scope.insert(item.output_name.clone(), binding.clone());
+            // Idempotency: don't double-rewrite when the column is
+            // already the dict slot (post-iteration-1 of the pipeline's
+            // fixed-point loop).
+            let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+            let rewritten = if already_dict {
+                item.expr.clone()
+            } else {
+                rewrite_column_ref_with_scope(&item.expr, &input_scope)
+            };
+            items.push(crate::sql::analysis::ProjectItem {
+                expr: rewritten,
+                output_name: item.output_name,
+            });
+            continue;
         }
+        items.push(item);
     }
     // Bug A fix: ColumnPruning leaves residual Project nodes between Scan
     // and Aggregate/Sort/etc. Without propagating the hidden dict slot
@@ -242,12 +281,17 @@ fn rewrite_project(
     // that decide to decode at the boundary (Join/Union/CTE →
     // wrap_with_decode) see the dict slot in plan_output_columns and
     // pair it with the source binding via the alias-aware DictScope
-    // lookup.
-    let mut items = node.items;
+    // lookup; `wrap_with_decode` dedupes the dict_column so a Project
+    // that already exposes the source name does not produce two
+    // DecodeMappings pointing at the same slot.
     let existing_names: std::collections::BTreeSet<String> = items
         .iter()
         .map(|i| i.output_name.to_ascii_lowercase())
         .collect();
+    // Look up the dict slot's nullability from the input plan's output
+    // columns so the inserted pass-through item matches the scan's
+    // declared shape. Defaults to `true` if not found (no production
+    // path hits the fallback today, but it stays defensive).
     let input_cols = plan_output_columns(&input);
     for (_source, binding) in input_scope.iter() {
         let dict_name = binding.dict_column.clone();
@@ -930,11 +974,21 @@ fn wrap_with_decode_except(
     let mut decoded_scope = DictScope::new();
     for col in plan_output_columns(&plan) {
         let key = col.name.to_ascii_lowercase();
-        if keep.contains(&key) {
+        // Bug B aftermath: the Scan's published output column is now
+        // named after the dict column directly (e.g. `__nr_dict_t_s`),
+        // not the user-facing source name. The `keep` set is built from
+        // source names (and the dict_column names where available), so
+        // resolve via `resolve_either` and also check whether the
+        // resolved SOURCE name is in `keep` — otherwise a Union ALL with
+        // matching snapshots would still wrap each input in a Decode,
+        // defeating the dict-preservation path.
+        if let Some((source_name, b)) = scope.resolve_either(&col.name) {
+            if keep.contains(&source_name.to_ascii_lowercase()) {
+                continue;
+            }
+            decoded_scope.insert(source_name.to_string(), b.clone());
+        } else if keep.contains(&key) {
             continue;
-        }
-        if let Some(b) = scope.get(&col.name) {
-            decoded_scope.insert(col.name, b.clone());
         }
     }
     if decoded_scope.is_empty() {
@@ -972,22 +1026,28 @@ fn rewrite_union(
     // with mutually compatible snapshots. Start from the first input's
     // bindings; intersect with each subsequent input. DictScope doesn't
     // expose its map directly, so we probe each input's plan output
-    // columns by name.
+    // columns by name. After Bug B's FE rewrite, the published output
+    // column is named after the dict slot (`__nr_dict_t_<col>`); use
+    // `resolve_either` so the lookup also succeeds for that shape, and
+    // key `preserved` by the SOURCE name so subsequent inputs are
+    // matched on a stable user-facing identifier.
     let mut preserved: std::collections::BTreeMap<String, DictBinding> = Default::default();
     if let Some((first_plan, first_scope)) = rewritten_inputs.first() {
         for col in plan_output_columns(first_plan) {
-            if let Some(b) = first_scope.get(&col.name) {
-                preserved.insert(col.name.to_ascii_lowercase(), b.clone());
+            if let Some((source_name, b)) = first_scope.resolve_either(&col.name) {
+                preserved.insert(source_name.to_ascii_lowercase(), b.clone());
             }
         }
     }
     for (plan, scope) in rewritten_inputs.iter().skip(1) {
         let cols = plan_output_columns(plan);
         preserved.retain(|name, kept| {
-            let matching = cols
-                .iter()
-                .find(|c| c.name.to_ascii_lowercase() == *name)
-                .and_then(|c| scope.get(&c.name));
+            let matching = cols.iter().find_map(|c| {
+                scope
+                    .resolve_either(&c.name)
+                    .filter(|(src, _)| src.eq_ignore_ascii_case(name))
+                    .map(|(_, b)| b)
+            });
             match matching {
                 Some(other) => dict_keys_compatible(&kept.snapshot, &other.snapshot),
                 None => false,
@@ -1120,12 +1180,33 @@ pub(crate) fn wrap_with_decode(
     let mut mappings: Vec<DecodeMapping> = Vec::new();
     let mut renamed_outputs: Vec<OutputColumn> = Vec::new();
     let mut wrapped_any = false;
-    for col in plan_output_columns(&plan) {
-        if let Some(binding) = scope.get(&col.name) {
+    // Dedupe dict_column references: the Bug A fix adds a pass-through
+    // ProjectItem for the dict slot so downstream Aggregate / Sort
+    // codegen can resolve it. When a Decode wraps that Project, the
+    // plan output ends up with BOTH the source name AND the dict slot
+    // name resolving to the same binding — emit only one DecodeMapping
+    // and drop the duplicate output column.
+    let mut seen_dict_columns: std::collections::BTreeSet<String> = Default::default();
+    for mut col in plan_output_columns(&plan) {
+        // After Bug B's FE rewrite, a Scan's output column is named
+        // after the dict column (`__nr_dict_t_s`) directly. Resolve by
+        // EITHER the user-facing source name OR the dict column name so
+        // the post-decode column is restored to the source name with
+        // the snapshot's data type (Utf8).
+        if let Some((source_name, binding)) = scope.resolve_either(&col.name) {
+            let dict_key = binding.dict_column.to_ascii_lowercase();
+            if !seen_dict_columns.insert(dict_key) {
+                // Already emitted a Decode for this dict column under a
+                // sibling output (typically the source name). Skip the
+                // duplicate so the Decode output isn't double-listed.
+                continue;
+            }
             mappings.push(DecodeMapping {
                 dict_column: binding.dict_column.clone(),
-                string_column: col.name.clone(),
+                string_column: source_name.to_string(),
             });
+            col.name = source_name.to_string();
+            col.data_type = binding.snapshot.data_type.clone();
             wrapped_any = true;
         }
         renamed_outputs.push(col);

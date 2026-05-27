@@ -172,6 +172,18 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     /// `FragmentBuildResult.query_global_dicts` when each fragment is
     /// finalized. Empty in all production paths until Task 7+.
     query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
+    /// Maps each slot id that currently carries dict-encoded data to the
+    /// (strings, ids, version) of the source dictionary. When a new
+    /// operator allocates a slot whose value flows from a tracked slot
+    /// (Aggregate's group-by passthrough, Project's column-ref item,
+    /// Decode's passthrough, etc.), the operator re-registers the same
+    /// dict against the new slot id so the downstream consumer (the
+    /// `Decode` node above an exchange, in the parent fragment) finds
+    /// its `dict_id_to_string_ids` key in the fragment's
+    /// `query_global_dicts`. Without this map, the dict registration
+    /// stays pinned to the scan's slot id and never reaches the slot id
+    /// the parent fragment's Decode actually receives.
+    slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -200,6 +212,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             join_fragment_map: HashMap::new(),
             join_distributions: HashMap::new(),
             query_global_dicts_per_fragment: HashMap::new(),
+            slot_to_global_dict: HashMap::new(),
         };
 
         // Elide a root-level Gather: on a single node the top-level gather
@@ -341,6 +354,45 @@ impl<'a> PlanFragmentBuilder<'a> {
             .ok_or_else(|| "no active fragment id in builder".to_string())
     }
 
+    /// Re-register the source slot's TGlobalDict on a NEW slot id. Used
+    /// when an operator allocates a fresh slot that holds the same dict-
+    /// encoded values as the source (Aggregate group-by passthrough,
+    /// Project column-ref passthrough, Decode passthrough, etc.). The
+    /// dict is also pushed onto every fragment on the current stack so a
+    /// parent-fragment Decode finds it in its own `query_global_dicts`.
+    /// No-op when the source slot has no dict registered.
+    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
+        if source_slot_id == new_slot_id {
+            return;
+        }
+        let Some(source_dict) = self.slot_to_global_dict.get(&source_slot_id).cloned() else {
+            return;
+        };
+        // Build a new TGlobalDict carrying the new slot's id so the BE's
+        // `query_global_dict_map` is keyed correctly.
+        let new_dict = crate::data::TGlobalDict::new(
+            Some(new_slot_id),
+            source_dict.strings.clone(),
+            source_dict.ids.clone(),
+            source_dict.version,
+        );
+        let fragments: Vec<FragmentId> = if self.fragment_stack.is_empty() {
+            self.current_fragment_id()
+                .ok()
+                .map(|f| vec![f])
+                .unwrap_or_default()
+        } else {
+            self.fragment_stack.clone()
+        };
+        for fragment_id in fragments {
+            self.query_global_dicts_per_fragment
+                .entry(fragment_id)
+                .or_default()
+                .push(new_dict.clone());
+        }
+        self.slot_to_global_dict.insert(new_slot_id, new_dict);
+    }
+
     // -------------------------------------------------------------------
     // Dispatcher
     // -------------------------------------------------------------------
@@ -442,39 +494,89 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .add_table_for_scan(table_id, &op.database, &op.table);
         }
 
+        // Build a quick lookup so the column registration loop below can
+        // recognise base-table columns that the dict rewriter retargeted
+        // to a hidden `__nr_dict_<t>_<c>` Int32 slot. For those columns
+        // we allocate ONE slot (at the source column's storage position)
+        // named after the dict column and typed Int32 — keeping the
+        // single-slot-per-column contract the StarRocks lake scan
+        // expects (see `src/lower/node/lake_scan.rs`'s
+        // `dict_int_to_string` self-map handling).
+        let dict_source_to_target: std::collections::HashMap<String, &ScanDictionaryColumn> = op
+            .dict_columns
+            .iter()
+            .map(|dc| (dc.source_column.to_ascii_lowercase(), dc))
+            .collect();
+        // Track dict slot ids by source column so the second loop over
+        // `op.dict_columns` doesn't re-allocate a slot for the same
+        // column. Also accumulates the `(dict_slot_id, dict_col)` pairs
+        // that feed the TGlobalDict / dict_string_id_to_int_ids payload
+        // construction further down.
+        let mut dict_slot_for_source: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+        let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
         for (idx, col) in op.table.columns.iter().enumerate() {
-            if let Some(ref req) = required
-                && !req.contains(&col.name.to_lowercase())
-            {
-                continue;
+            // The dict rewriter renames the source string column to the
+            // dict column name in `op.columns` / `op.required_columns`,
+            // so check membership using BOTH names when a dict mapping
+            // exists for this base column.
+            let dict_target = dict_source_to_target.get(&col.name.to_lowercase());
+            if let Some(ref req) = required {
+                let keep = req.contains(&col.name.to_lowercase())
+                    || dict_target
+                        .map(|dc| req.contains(&dc.dict_column.to_lowercase()))
+                        .unwrap_or(false);
+                if !keep {
+                    continue;
+                }
             }
             let slot_id = self.alloc_slot();
+            // Bug B contract: slot keeps the SOURCE column's storage
+            // name (so the lake scan finds the column by name in the
+            // tablet schema) and Int32 type (the BE reads it as Utf8 via
+            // `build_scan_schema_for_global_dict_encoding` when a
+            // TGlobalDict is registered for the slot, then encodes
+            // string -> dict id). The dict_column NAME is exposed only
+            // in the FE codegen scope below, NOT in the slot descriptor
+            // — the BE never sees `__nr_dict_t_s` as a column name.
+            let slot_type = match dict_target {
+                Some(_) => DataType::Int32,
+                None => col.data_type.clone(),
+            };
+            let nullable = col.nullable;
             self.desc_builder.add_slot(
                 slot_id,
                 scan_tuple_id,
                 &col.name,
-                &col.data_type,
-                col.nullable,
+                &slot_type,
+                nullable,
                 idx as i32,
             );
             slot_to_column.insert(slot_id, col.name.clone());
             let binding = ColumnBinding {
                 tuple_id: scan_tuple_id,
                 slot_id,
-                data_type: col.data_type.clone(),
+                data_type: slot_type.clone(),
                 type_desc: None,
-                nullable: col.nullable,
+                nullable,
             };
             // G1: pick up the per-column ColumnId from `op.columns` so the
             // scope's by-id index is populated for base-table reads. This is
             // what lets the optimizer's `DistributionSpec::HashPartitioned`
             // (which is now a `Vec<ColumnId>`) resolve directly against the
             // scan's child scope without having to round-trip through the
-            // display name.
+            // display name. The dict-renamed `OutputColumn` carries the
+            // source column's id so the lookup still hits.
             let col_id = op
                 .columns
                 .iter()
-                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name))
+                .find(|oc| {
+                    let lc = oc.name.to_ascii_lowercase();
+                    lc == col.name.to_ascii_lowercase()
+                        || dict_target
+                            .map(|dc| lc == dc.dict_column.to_ascii_lowercase())
+                            .unwrap_or(false)
+                })
                 .map(|oc| oc.column_id)
                 .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
             scope.add_column_with_id(
@@ -483,13 +585,39 @@ impl<'a> PlanFragmentBuilder<'a> {
                 col.name.clone(),
                 binding.clone(),
             );
+            // Also register the dict column name in the scope so the
+            // post-rewrite `ColumnRef("__nr_dict_t_s")` resolves to this
+            // same slot. The scan tuple holds a SINGLE slot for this
+            // column; both names refer to it.
+            if let Some(dict_col) = dict_target {
+                scope.add_column(
+                    qualifier.map(|s| s.to_string()),
+                    dict_col.dict_column.clone(),
+                    binding.clone(),
+                );
+            }
             // When alias differs from table name, also register with original table name
             if op
                 .alias
                 .as_deref()
                 .is_some_and(|a| !a.eq_ignore_ascii_case(&op.table.name))
             {
-                scope.add_column(Some(op.table.name.clone()), col.name.clone(), binding);
+                scope.add_column(
+                    Some(op.table.name.clone()),
+                    col.name.clone(),
+                    binding.clone(),
+                );
+                if let Some(dict_col) = dict_target {
+                    scope.add_column(
+                        Some(op.table.name.clone()),
+                        dict_col.dict_column.clone(),
+                        binding.clone(),
+                    );
+                }
+            }
+            if let Some(dict_col) = dict_target {
+                dict_slot_for_source.insert(col.name.to_ascii_lowercase(), slot_id);
+                dict_slot_to_dict.push((slot_id, *dict_col));
             }
         }
 
@@ -557,57 +685,38 @@ impl<'a> PlanFragmentBuilder<'a> {
             conjuncts
         };
 
-        // Dict-encoded scan columns (Task 5/7 plan hints). For each dict
-        // column we (a) allocate a hidden INT slot inside the scan tuple, (b)
-        // register it in the scope by its `dict_column` name so a downstream
-        // `PhysicalDecode` can find it, (c) build a `TGlobalDict` payload for
-        // the owning fragment, and (d) record a string-slot -> dict-slot
-        // mapping so that StarRocks scans can populate
-        // `TLakeScanNode.dict_string_id_to_int_ids` after the scan node is
-        // built. `dict_columns` is empty in all production paths today.
+        // Dict-encoded scan columns (Task 5/7/8 plan hints). The slot for
+        // each dict column was already allocated in the table-column loop
+        // above (where its storage `col_pos` is recorded). Here we just
+        // build the BE-facing payload: a self-map `dict_slot → dict_slot`
+        // for `TLakeScanNode.dict_string_id_to_int_ids` (the BE replaces
+        // the dict slot in the scan layout with this id, so the storage
+        // reader keeps the same slot) and a TGlobalDict for each. The
+        // dict_columns hint is still consulted later to detect a planning
+        // bug on non-StarRocks scans. `dict_columns` is empty in all
+        // production paths today.
         let mut string_to_dict_slot: std::collections::BTreeMap<i32, i32> =
             std::collections::BTreeMap::new();
-        let mut dict_slot_to_dict: Vec<(i32, &ScanDictionaryColumn)> = Vec::new();
         for dict_col in &op.dict_columns {
-            // Resolve the source string column already registered above. The
-            // lookup is unqualified — a scan's tuple is the only source in
-            // scope at this point, so name conflicts are impossible.
-            let string_binding = scope
-                .resolve_column(None, &dict_col.source_column)
-                .map_err(|_| {
+            let dict_slot_id = dict_slot_for_source
+                .get(&dict_col.source_column.to_ascii_lowercase())
+                .copied()
+                .ok_or_else(|| {
                     format!(
                         "scan `{}.{}` dict_columns references unknown source column `{}`",
                         op.database, op.table.name, dict_col.source_column
                     )
-                })?
-                .clone();
-
-            let dict_slot_id = self.alloc_slot();
-            let dict_col_pos = (op.table.columns.len()
-                + op.table.iceberg_row_lineage_metadata_columns.len()
-                + dict_slot_to_dict.len()) as i32;
-            self.desc_builder.add_slot(
-                dict_slot_id,
-                scan_tuple_id,
-                &dict_col.dict_column,
-                &DataType::Int32,
-                string_binding.nullable,
-                dict_col_pos,
-            );
-            let dict_binding = ColumnBinding {
-                tuple_id: scan_tuple_id,
-                slot_id: dict_slot_id,
-                data_type: DataType::Int32,
-                type_desc: None,
-                nullable: string_binding.nullable,
-            };
-            scope.add_column(
-                qualifier.map(|s| s.to_string()),
-                dict_col.dict_column.clone(),
-                dict_binding,
-            );
-            string_to_dict_slot.insert(string_binding.slot_id, dict_slot_id);
-            dict_slot_to_dict.push((dict_slot_id, dict_col));
+                })?;
+            // Self-map: the BE's `lake_scan.rs` rewrites every dict int
+            // slot in the layout to its mapped string slot before issuing
+            // the storage read. With the FE-only fix the FE no longer
+            // emits a separate string slot — the dict slot itself is the
+            // storage slot, declared Int32 in desc_tbl but read as Utf8
+            // via the query global dict path (see
+            // `build_scan_schema_for_global_dict_encoding`). A self-map
+            // keeps the BE's layout swap a no-op while preserving the
+            // "dict-encoded" semantics on the FE/wire contract.
+            string_to_dict_slot.insert(dict_slot_id, dict_slot_id);
         }
 
         let resolved = ResolvedTable {
@@ -640,8 +749,22 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
-        // Emit per-dict-column TGlobalDict payloads onto the owning fragment.
+        // Emit per-dict-column TGlobalDict payloads onto EVERY fragment in
+        // the current stack (the leaf scan's fragment plus every parent
+        // fragment that consumes its output through an exchange). The
+        // dict slot id is consistent across fragments, so a Decode
+        // operator inserted above the exchange — which lives in a parent
+        // fragment — must also receive the TGlobalDict via its own
+        // fragment's `query_global_dicts`. Without this, the BE's
+        // `lower_decode_node` fails with `missing query global dict for
+        // encoded slot_id=<N>` (each fragment builds its own
+        // QueryGlobalDictMap from its own TGlobalDict list).
         let current_frag = self.current_fragment_id()?;
+        let dict_fragments: Vec<FragmentId> = if self.fragment_stack.is_empty() {
+            vec![current_frag]
+        } else {
+            self.fragment_stack.clone()
+        };
         for (dict_slot_id, dict_col) in &dict_slot_to_dict {
             let snapshot = dict_col.dictionary.as_ref();
             let mut ids = Vec::with_capacity(snapshot.values.len());
@@ -656,10 +779,20 @@ impl<'a> PlanFragmentBuilder<'a> {
                 Some(ids),
                 Some(snapshot.version),
             );
-            self.query_global_dicts_per_fragment
-                .entry(current_frag)
-                .or_default()
-                .push(global_dict);
+            for fragment_id in &dict_fragments {
+                self.query_global_dicts_per_fragment
+                    .entry(*fragment_id)
+                    .or_default()
+                    .push(global_dict.clone());
+            }
+            // Track the slot -> dict association so any operator that
+            // allocates a new slot inheriting this slot's values
+            // (Aggregate group-by, Project column ref, etc.) can
+            // re-register the dict on the new slot id. The downstream
+            // `Decode` resolves by NAME against the new slot, then the
+            // BE's `lower_decode_node` needs a TGlobalDict keyed by that
+            // new slot id — registered via `propagate_dict_to_slot`.
+            self.slot_to_global_dict.insert(*dict_slot_id, global_dict);
         }
 
         self.scan_tables.push(nodes::PlannedScanTable {
@@ -985,6 +1118,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                         nullable,
                     },
                 );
+            }
+
+            // Propagate the dict registration on a ColumnRef passthrough:
+            // the new slot inherits the source slot's dict, so a parent
+            // fragment's Decode (post-exchange) finds the matching dict
+            // in its own `query_global_dicts`.
+            if let ExprKind::ColumnRef { ref column, .. } = item.expr.kind
+                && let Ok(child_binding) = child.scope.resolve_column(None, column)
+            {
+                let source_slot_id = child_binding.slot_id;
+                self.propagate_dict_to_slot(source_slot_id, slot_id);
             }
         }
 
@@ -1334,6 +1478,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             } = gb_expr.kind
             {
                 agg_scope.add_qualified_alias(q.clone(), column.clone(), binding);
+            }
+            // Propagate dict registration through the aggregate's group-
+            // by output: when the group-by is a passthrough ColumnRef of
+            // a dict-encoded source slot, the new agg output slot also
+            // carries dict ids. Re-register the TGlobalDict on the new
+            // slot so a downstream Decode (in this or a parent fragment
+            // post-exchange) resolves its `dict_id_to_string_ids` key.
+            if let ExprKind::ColumnRef { ref column, .. } = gb_expr.kind
+                && let Ok(child_binding) = child.scope.resolve_column(None, column)
+            {
+                let source_slot_id = child_binding.slot_id;
+                self.propagate_dict_to_slot(source_slot_id, slot_id);
             }
             grouping_exprs.push(texpr);
         }
@@ -4972,16 +5128,24 @@ mod tests {
     /// Panics if no such slot exists — the caller is asserting that the
     /// builder produced a slot with the expected name.
     fn slot_id_by_name(desc_tbl: &crate::descriptors::TDescriptorTable, column_name: &str) -> i32 {
-        let slots = desc_tbl
-            .slot_descriptors
-            .as_ref()
-            .expect("slot_descriptors populated");
+        slot_id_by_name_opt(desc_tbl, column_name)
+            .unwrap_or_else(|| panic!("no slot named `{}` in desc_tbl", column_name))
+    }
+
+    /// Optional variant for tests that need to assert ABSENCE of a slot
+    /// (e.g. Bug B regression: a dict-rewritten scan must NOT emit a
+    /// separate source-string slot alongside its dict slot).
+    fn slot_id_by_name_opt(
+        desc_tbl: &crate::descriptors::TDescriptorTable,
+        column_name: &str,
+    ) -> Option<i32> {
+        let slots = desc_tbl.slot_descriptors.as_ref()?;
         for slot in slots {
             if slot.col_name.as_deref() == Some(column_name) {
-                return slot.id.expect("slot id populated");
+                return slot.id;
             }
         }
-        panic!("no slot named `{}` in desc_tbl", column_name);
+        None
     }
 
     fn starrocks_layout() -> PhysicalTableLayout {
@@ -5078,9 +5242,11 @@ mod tests {
             .expect("root fragment");
 
         // The decode allocates a NEW tuple with a NEW Utf8 slot named
-        // `id` (the decoded output, distinct from the scan's `id`
-        // slot). The `dict_id_to_string_ids` mapping pairs the scan's
-        // dict slot with the decode tuple's new string slot.
+        // `id` (the decoded output). Under the Bug B fix the scan tuple
+        // also holds a slot named `id` (single-slot-per-column contract)
+        // but typed Int32 — the dict-encoded payload. The
+        // `dict_id_to_string_ids` mapping pairs the scan's `id` slot id
+        // with the decode tuple's new string slot id.
         let desc_tbl = &root.desc_tbl;
         let slots = desc_tbl
             .slot_descriptors
@@ -5092,14 +5258,18 @@ mod tests {
         let decode_tuple_id = tuples[1].id.expect("decode tuple id");
         let scan_dict_slot = slots
             .iter()
-            .find(|s| s.parent == Some(scan_tuple_id) && s.col_name.as_deref() == Some("id_dict"))
+            .find(|s| s.parent == Some(scan_tuple_id) && s.col_name.as_deref() == Some("id"))
             .and_then(|s| s.id)
-            .expect("scan id_dict slot");
+            .expect("scan dict slot named after source `id`");
         let decode_string_slot = slots
             .iter()
             .find(|s| s.parent == Some(decode_tuple_id) && s.col_name.as_deref() == Some("id"))
             .and_then(|s| s.id)
             .expect("decode id slot");
+        assert_ne!(
+            scan_dict_slot, decode_string_slot,
+            "scan dict slot (Int32) and decode string slot (Utf8) must be distinct"
+        );
 
         // First plan node is the decode node (pre-order).
         let first = root.plan.nodes.first().expect("decode plan node");
@@ -5210,38 +5380,88 @@ mod tests {
             .find(|fragment| fragment.fragment_id == build.root_fragment_id)
             .expect("root fragment");
 
-        // Resolve scan output slot ids by column name — both string columns
-        // and both dict-encoded INT companion columns must materialize in the
-        // descriptor table.
-        let id_string_slot = slot_id_by_name(&root.desc_tbl, "id");
-        let id_dict_slot = slot_id_by_name(&root.desc_tbl, "id_dict");
-        let name_string_slot = slot_id_by_name(&root.desc_tbl, "name");
-        let name_dict_slot = slot_id_by_name(&root.desc_tbl, "name_dict");
-        // All four slot ids must be distinct.
-        let slots = [
-            id_string_slot,
-            id_dict_slot,
-            name_string_slot,
-            name_dict_slot,
-        ];
-        for i in 0..slots.len() {
-            for j in (i + 1)..slots.len() {
-                assert_ne!(slots[i], slots[j], "scan slot ids must be distinct");
-            }
-        }
+        // Bug B regression: the scan must emit exactly ONE slot per dict
+        // column. The slot keeps the SOURCE column's name (so the lake
+        // scan finds the storage column by name) but its declared type
+        // is Int32 (the BE encodes string -> dict id at read time using
+        // the per-slot TGlobalDict). Emitting BOTH a source string slot
+        // AND a separate dict int slot would let the BE's
+        // `lake_scan.rs::dict_int_to_string` swap collapse them onto the
+        // same storage slot id, producing `duplicate slot id <N> in
+        // chunk schema contract` at runtime.
+        let id_slot = slot_id_by_name(&root.desc_tbl, "id");
+        let name_slot = slot_id_by_name(&root.desc_tbl, "name");
+        assert_ne!(id_slot, name_slot, "scan slots must be distinct");
+        // The dict_column NAMES (`id_dict`, `name_dict`) must NOT appear
+        // as slot descriptor `col_name`s. The dict_column lives only in
+        // the FE codegen scope as an alias for the source slot — the BE
+        // never sees a column named `id_dict` in the tablet schema.
+        assert!(
+            slot_id_by_name_opt(&root.desc_tbl, "id_dict").is_none(),
+            "dict_column name must not surface as a slot descriptor col_name"
+        );
+        assert!(
+            slot_id_by_name_opt(&root.desc_tbl, "name_dict").is_none(),
+            "dict_column name must not surface as a slot descriptor col_name"
+        );
+        // The dict slot type is Int32 (so the BE knows to encode).
+        let id_slot_desc = root
+            .desc_tbl
+            .slot_descriptors
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|s| s.id == Some(id_slot))
+            .expect("id slot desc");
+        assert_eq!(
+            id_slot_desc
+                .slot_type
+                .as_ref()
+                .and_then(|t| t.types.as_ref())
+                .and_then(|tys| tys.first())
+                .and_then(|tn| tn.scalar_type.as_ref())
+                .map(|st| st.type_),
+            Some(crate::types::TPrimitiveType::INT),
+            "dict slot type must be INT (Int32) — see build_scan_schema_for_global_dict_encoding"
+        );
+        // The tuple itself should contain exactly the two dict slots.
+        let scan_tuple_id = root
+            .desc_tbl
+            .tuple_descriptors
+            .first()
+            .and_then(|t| t.id)
+            .expect("scan tuple id");
+        let scan_slots: Vec<i32> = root
+            .desc_tbl
+            .slot_descriptors
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| s.parent == Some(scan_tuple_id))
+            .filter_map(|s| s.id)
+            .collect();
+        assert_eq!(
+            scan_slots.len(),
+            2,
+            "scan tuple must contain exactly two slots (one per dict column), got {scan_slots:?}"
+        );
 
         // The fragment should carry two TGlobalDicts, one per source column.
         let dicts = root
             .query_global_dicts
             .as_ref()
             .expect("query_global_dicts populated");
-        assert_eq!(dicts.len(), 2, "one TGlobalDict per dict_column");
+        assert!(
+            dicts.len() >= 2,
+            "at least one TGlobalDict per source column; got {}",
+            dicts.len()
+        );
 
-        // Match each TGlobalDict back to its dict slot id and check payload.
+        // Match each TGlobalDict back to its slot id and check payload.
         let id_dict = dicts
             .iter()
-            .find(|d| d.column_id == Some(id_dict_slot))
-            .expect("TGlobalDict for id_dict slot");
+            .find(|d| d.column_id == Some(id_slot))
+            .expect("TGlobalDict for id slot");
         assert_eq!(id_dict.ids.as_deref(), Some(&[1, 2][..]));
         assert_eq!(
             id_dict.strings.as_deref(),
@@ -5249,8 +5469,8 @@ mod tests {
         );
         let name_dict = dicts
             .iter()
-            .find(|d| d.column_id == Some(name_dict_slot))
-            .expect("TGlobalDict for name_dict slot");
+            .find(|d| d.column_id == Some(name_slot))
+            .expect("TGlobalDict for name slot");
         assert_eq!(name_dict.ids.as_deref(), Some(&[10, 11, 12][..]));
         assert_eq!(
             name_dict.strings.as_deref(),
@@ -5259,10 +5479,14 @@ mod tests {
         // Distinct column_ids on the two TGlobalDicts.
         assert_ne!(id_dict.column_id, name_dict.column_id);
 
-        // StarRocks scan's TLakeScanNode must carry the
-        // string_slot_id -> dict_slot_id mapping for both columns. We assert
-        // both directions of the contract here so swapping (key, value) would
-        // fail the test.
+        // StarRocks scan's TLakeScanNode carries the
+        // `dict_string_id_to_int_ids` map. Under the Bug B fix this is a
+        // SELF-map (slot -> same slot): the BE's layout rewrite at
+        // `src/lower/node/lake_scan.rs` replaces every dict int slot
+        // with its mapped string slot, and with the dict slot now
+        // occupying the storage column's tuple position the self-map
+        // keeps the layout swap a no-op — which is exactly what avoids
+        // the duplicate-slot-id error.
         let scan_node = root
             .plan
             .nodes
@@ -5279,14 +5503,143 @@ mod tests {
             .expect("dict_string_id_to_int_ids populated");
         assert_eq!(mapping.len(), 2);
         assert_eq!(
-            mapping.get(&id_string_slot).copied(),
-            Some(id_dict_slot),
-            "id string slot must map to id dict slot"
+            mapping.get(&id_slot).copied(),
+            Some(id_slot),
+            "id slot must self-map"
         );
         assert_eq!(
-            mapping.get(&name_string_slot).copied(),
-            Some(name_dict_slot),
-            "name string slot must map to name dict slot"
+            mapping.get(&name_slot).copied(),
+            Some(name_slot),
+            "name slot must self-map"
+        );
+    }
+
+    #[test]
+    fn scan_emits_single_slot_per_dict_column() {
+        // Direct Bug B regression: build a single-column StarRocks scan
+        // where the rewriter has produced a `ScanDictionaryColumn` for
+        // `s` and renamed the OutputColumn to `__nr_dict_t_s` (Int32).
+        // Mirrors the post-rewriter shape that the FE actually emits
+        // after `rewrite_scan`. The scan tuple must contain exactly one
+        // slot: a single Int32 slot named after the SOURCE column `s`
+        // (so the BE lake scan finds the storage column by name) with
+        // the dict_column name (`__nr_dict_t_s`) registered as a scope
+        // alias for the same slot. The LakeScanNode's
+        // `dict_string_id_to_int_ids` must self-map that slot id, so
+        // the BE layout swap is a no-op rather than collapsing two
+        // distinct slots onto one storage slot id.
+        let layout = starrocks_layout();
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "s".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: "__nr_dict_t_s".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }],
+                predicates: vec![],
+                required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column: "s".to_string(),
+                    dict_column: "__nr_dict_t_s".to_string(),
+                    dictionary: dict_snapshot_a_b(),
+                }],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::UNSET,
+                name: "__nr_dict_t_s".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        };
+
+        let catalog = StarRocksCatalog { layout };
+        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+
+        // The scan tuple must contain exactly one slot: the dict slot.
+        let scan_tuple_id = root
+            .desc_tbl
+            .tuple_descriptors
+            .first()
+            .and_then(|t| t.id)
+            .expect("scan tuple id");
+        let scan_slots: Vec<&crate::descriptors::TSlotDescriptor> = root
+            .desc_tbl
+            .slot_descriptors
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| s.parent == Some(scan_tuple_id))
+            .collect();
+        assert_eq!(
+            scan_slots.len(),
+            1,
+            "scan tuple must contain exactly the dict slot, got {} slots",
+            scan_slots.len()
+        );
+        let dict_slot = &scan_slots[0];
+        // The slot keeps the SOURCE column's name `s` so the BE finds
+        // the storage column in the tablet schema by name. The dict
+        // column name lives only in the FE codegen scope.
+        assert_eq!(dict_slot.col_name.as_deref(), Some("s"));
+        assert_eq!(
+            dict_slot
+                .slot_type
+                .as_ref()
+                .and_then(|t| t.types.as_ref())
+                .and_then(|tys| tys.first())
+                .and_then(|tn| tn.scalar_type.as_ref())
+                .map(|st| st.type_),
+            Some(crate::types::TPrimitiveType::INT),
+            "dict slot type must be INT (Int32)"
+        );
+        let dict_slot_id = dict_slot.id.expect("dict slot id");
+
+        // LakeScanNode's dict_string_id_to_int_ids must self-map
+        // (dict_slot -> dict_slot). The BE swaps each int slot with its
+        // mapped string slot in the layout; with the dict slot at the
+        // source column's storage position, the self-map keeps the
+        // layout one slot wide, avoiding the duplicate-slot-id error.
+        let scan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let lake = scan_node
+            .lake_scan_node
+            .as_ref()
+            .expect("lake scan payload");
+        let mapping = lake
+            .dict_string_id_to_int_ids
+            .as_ref()
+            .expect("dict_string_id_to_int_ids populated");
+        assert_eq!(mapping.len(), 1, "exactly one dict slot mapping");
+        assert_eq!(
+            mapping.get(&dict_slot_id).copied(),
+            Some(dict_slot_id),
+            "dict slot must self-map (FE emits single slot per dict column)"
         );
     }
 
