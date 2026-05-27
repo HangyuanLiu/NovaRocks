@@ -198,8 +198,6 @@ mod tests {
             is_root: true,
             action_column: None,
         });
-        let mut kinds = collect_marker_kinds(&delta);
-        kinds.sort();
-        assert_eq!(kinds, vec!["ImvDelta", "ImvVersion"]);
+        assert_eq!(collect_marker_kinds(&delta), vec!["ImvDelta", "ImvVersion"]);
     }
 }
