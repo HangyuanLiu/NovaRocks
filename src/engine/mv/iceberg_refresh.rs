@@ -6274,18 +6274,24 @@ fn plan_canonical_select_for_imv(
     })
 }
 
-/// Run the (PR-α no-op) IMV optimizer pipeline against `ctx`, discarding the
-/// outcome. Logs a structured summary on success and a warning on failure.
+/// Run the IMV optimizer pipeline against `ctx`, discarding the outcome.
+/// Logs a structured summary on success and a warning on failure.
 ///
-/// Failures are non-fatal in PR-α: the rewrite outcome is discarded anyway,
-/// so an IMV-pipeline error must not break a base-table refresh. The plan's
-/// original `?`-fail-fast wiring (PR-α tasks 10-12) was tightened to
-/// log-and-continue after the iceberg-ivm suite exposed an A11
-/// schema-evolution case (renamed referenced column) where re-planning the
-/// canonical select against the latest base schema fails by design even
-/// though the hand-built refresh path handles the rename correctly.
-/// Surface the gap as a warn-level log so PR-β consumers can audit it,
-/// without breaking refresh behavior in PR-α.
+/// PR-β state: the pipeline now actively wraps the root in `ImvDelta`
+/// (imv-delta-marker stage) and rejects unresolved markers in
+/// imv-validation. Until task 4+ adds rules that consume the marker,
+/// every refresh attempt produces a `Validation` Reject — that is
+/// expected and non-fatal here. Refresh continues with the hand-built
+/// path; this function only logs the failure as a warning so a future
+/// task can audit IMV-pipeline progress without breaking refresh
+/// behavior.
+///
+/// The original `?`-fail-fast wiring was tightened to log-and-continue
+/// in PR-α after the iceberg-ivm suite exposed an A11 schema-evolution
+/// case (renamed referenced column) where re-planning the canonical
+/// select against the latest base schema fails by design even though
+/// the hand-built refresh path handles the rename correctly. PR-β
+/// inherits that swallow.
 fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRefreshContext) {
     let result = (|| -> Result<
         crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
