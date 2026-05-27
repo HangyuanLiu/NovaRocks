@@ -1409,7 +1409,7 @@ pub(crate) fn refresh_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (previous_snapshot_id, current_snapshot_id) {
@@ -1697,7 +1697,7 @@ fn refresh_single_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match previous {
@@ -2447,7 +2447,7 @@ fn refresh_join_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     let left_current = pin
@@ -5475,7 +5475,7 @@ fn refresh_iceberg_join_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (left_previous, right_previous) {
