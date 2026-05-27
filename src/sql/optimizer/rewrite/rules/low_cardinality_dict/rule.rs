@@ -523,6 +523,85 @@ mod tests {
         assert_eq!(left_decode.mappings[0].string_column, "t");
     }
 
+    #[test]
+    fn project_propagates_dict_slot_to_aggregate() {
+        // Bug A regression: ColumnPruning leaves a residual Project
+        // between Scan and Aggregate. The rewriter must extend that
+        // Project with a sibling pass-through item for the hidden dict
+        // slot so the codegen ExprScope above the Project carries the
+        // `__nr_dict_t_s` slot. Without it the Aggregate's rewritten
+        // group-by ColumnRef on `__nr_dict_t_s` fails to resolve
+        // (`Column '__nr_dict_t_s' cannot be resolved`).
+        let scan = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: make_table(),
+            alias: None,
+            columns: vec![s_output_column()],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        });
+        let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: s_column_ref(),
+                output_name: "s".to_string(),
+            }],
+        });
+        let aggregate = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(project),
+            group_by: vec![s_column_ref()],
+            aggregates: vec![],
+            output_columns: vec![s_output_column()],
+            already_pushed: false,
+        });
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        install_provider(&mut ctx, true);
+        let table_stats = HashMap::new();
+        let pipeline = query_rewrite_pipeline(&table_stats);
+        let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
+        // Outer shape: Decode → Aggregate(grp=__nr_dict_t_s) → Project →
+        // Scan. The critical assertion is that the Project items contain
+        // BOTH the original `s` item AND a pass-through `__nr_dict_t_s`
+        // item — that's what makes the Aggregate's dict-slot group-by
+        // resolvable at codegen time.
+        let LogicalPlan::Decode(decode) = rewritten else {
+            panic!("expected decode root, got {rewritten:?}");
+        };
+        let LogicalPlan::Aggregate(agg) = *decode.input else {
+            panic!("expected aggregate under decode");
+        };
+        let key = agg.group_by.first().expect("group by present");
+        let ExprKind::ColumnRef { column, .. } = &key.kind else {
+            panic!("group-by must be a column ref");
+        };
+        assert_eq!(column, "__nr_dict_t_s");
+        let LogicalPlan::Project(proj) = *agg.input else {
+            panic!("expected project under aggregate");
+        };
+        let item_names: Vec<&str> = proj.items.iter().map(|i| i.output_name.as_str()).collect();
+        assert!(
+            item_names.contains(&"s"),
+            "project must still emit the original `s` item; got {item_names:?}"
+        );
+        assert!(
+            item_names.contains(&"__nr_dict_t_s"),
+            "project must propagate the hidden dict slot; got {item_names:?}"
+        );
+        // The pass-through dict item must be a plain ColumnRef on the
+        // dict slot with Int32 data type.
+        let dict_item = proj
+            .items
+            .iter()
+            .find(|i| i.output_name == "__nr_dict_t_s")
+            .expect("dict item present");
+        assert_eq!(dict_item.expr.data_type, DataType::Int32);
+        let ExprKind::ColumnRef { column: c, .. } = &dict_item.expr.kind else {
+            panic!("dict pass-through must be a ColumnRef");
+        };
+        assert_eq!(c, "__nr_dict_t_s");
+    }
+
     // -------------------------------------------------------------------
     // Task 8 — completion tests
     // -------------------------------------------------------------------

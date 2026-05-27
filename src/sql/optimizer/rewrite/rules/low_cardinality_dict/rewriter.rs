@@ -228,10 +228,54 @@ fn rewrite_project(
             output_scope.insert(item.output_name.clone(), binding.clone());
         }
     }
+    // Bug A fix: ColumnPruning leaves residual Project nodes between Scan
+    // and Aggregate/Sort/etc. Without propagating the hidden dict slot
+    // through those Projects, the codegen ExprScope built from project
+    // items does not contain `__nr_dict_<table>_<col>`, so downstream
+    // operators that the dict rewriter has retargeted to the dict slot
+    // (e.g. an Aggregate whose group-by was rewritten to `__nr_dict_t_s`)
+    // fail to resolve the column. Append a sibling pass-through
+    // ProjectItem for every dict binding visible at the input whose dict
+    // column name is not already produced by an existing item. The
+    // user-facing root projection does not name `__nr_dict_*` columns in
+    // its items, so the extra slot is hidden from query results. Parents
+    // that decide to decode at the boundary (Join/Union/CTE →
+    // wrap_with_decode) see the dict slot in plan_output_columns and
+    // pair it with the source binding via the alias-aware DictScope
+    // lookup.
+    let mut items = node.items;
+    let existing_names: std::collections::BTreeSet<String> = items
+        .iter()
+        .map(|i| i.output_name.to_ascii_lowercase())
+        .collect();
+    let input_cols = plan_output_columns(&input);
+    for (_source, binding) in input_scope.iter() {
+        let dict_name = binding.dict_column.clone();
+        if existing_names.contains(&dict_name.to_ascii_lowercase()) {
+            continue;
+        }
+        let nullable = input_cols
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&dict_name))
+            .map(|c| c.nullable)
+            .unwrap_or(true);
+        items.push(crate::sql::analysis::ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::UNSET,
+                    qualifier: None,
+                    column: dict_name.clone(),
+                },
+                data_type: DataType::Int32,
+                nullable,
+            },
+            output_name: dict_name,
+        });
+    }
     Ok((
         LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
-            items: node.items,
+            items,
         }),
         output_scope,
     ))

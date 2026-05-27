@@ -98,6 +98,13 @@ impl DictScope {
     pub(crate) fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    /// Iterate `(output_name, binding)` pairs registered in this scope.
+    /// Used by Project propagation to emit sibling pass-through items for
+    /// each dict slot visible at the input.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &DictBinding)> {
+        self.bindings.iter()
+    }
 }
 
 /// Rule-global state accumulated by the collector and consumed by the
