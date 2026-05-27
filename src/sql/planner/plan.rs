@@ -57,6 +57,9 @@ pub(crate) enum LogicalPlan {
     /// IMV marker: "scan input over a snapshot window". Emitted by task 4
     /// scan-binding rules; consumed before lowering. Same panic-on-leak
     /// rule as `ImvDelta`.
+    // PR-β scaffolding: task 4 constructs ImvVersion during scan-binding;
+    // the variant exists here so the type is wired through the plan tree.
+    #[allow(dead_code)]
     ImvVersion(crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode),
 }
 
