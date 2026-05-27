@@ -116,6 +116,49 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
     }
 }
 
+use crate::sql::optimizer::rewrite::result::RewriteDiagnostic;
+
+/// Validation-stage rule. Rejects any plan that still carries an IMV
+/// marker (`ImvDelta` or `ImvVersion`) by the time the pipeline reaches
+/// the `imv-validation` stage. The for-MV-refresh policy is FailFast,
+/// so rejection becomes `Err(message)` for `run_imv_rewrite`'s caller.
+pub(crate) struct UnresolvedMarkerCheckRule;
+
+impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
+    fn name(&self) -> &'static str {
+        "UnresolvedMarkerCheck"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::Validation
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        // TopDown fires at the root first. Once apply() rejects, the
+        // framework aborts the phase (FailFast policy), so children are
+        // never visited.
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+        plan_contains_imv_marker(plan)
+    }
+
+    fn apply(
+        &self,
+        plan: LogicalPlan,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let markers = collect_marker_kinds(&plan);
+        Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
+            "UnresolvedMarkerCheck",
+            format!(
+                "IVM rewrite failed to resolve incremental markers: {markers:?}"
+            ),
+        )))
+    }
+}
+
 /// Returns true if `plan` contains any `ImvDelta` or `ImvVersion` node at
 /// any depth. The Validation stage uses this to detect unresolved markers.
 pub(crate) fn plan_contains_imv_marker(plan: &LogicalPlan) -> bool {
@@ -373,5 +416,65 @@ mod tests {
             action_column: None,
         });
         assert_eq!(collect_marker_kinds(&delta), vec!["ImvDelta", "ImvVersion"]);
+    }
+
+    #[test]
+    fn marker_unresolved_yields_rejected_outcome() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
+
+        // imv-delta-marker wraps; imv-validation rejects. Build a minimal
+        // two-stage pipeline that mirrors the production stage names.
+        let pipeline = RewritePipeline::from_stages(vec![
+            RewriteStage::new(
+                "imv-delta-marker",
+                RewritePhase::StructuralRewrite,
+                vec![Box::new(WrapRootInImvDeltaRule::new())],
+            ),
+            RewriteStage::new(
+                "imv-validation",
+                RewritePhase::Validation,
+                vec![Box::new(UnresolvedMarkerCheckRule)],
+            ),
+        ]);
+
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let err = pipeline
+            .rewrite(empty_values_plan(), &mut ctx)
+            .expect_err("Validation must reject the wrapped-but-unconsumed plan");
+        assert!(
+            err.starts_with("IVM rewrite failed to resolve incremental markers:"),
+            "unexpected error message: {err}"
+        );
+        assert!(err.contains("\"ImvDelta\""), "kind list missing: {err}");
+
+        // Trace must record the rejection under the rule's name.
+        assert!(ctx.trace().events().iter().any(|e| matches!(
+            e,
+            RewriteTraceEvent::RuleRejected { rule, .. }
+                if *rule == "UnresolvedMarkerCheck"
+        )));
+    }
+
+    #[test]
+    fn validation_passes_when_no_marker_present() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+
+        // Validation alone, no wrap rule. Plain plan → no marker → pass.
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "imv-validation",
+            RewritePhase::Validation,
+            vec![Box::new(UnresolvedMarkerCheckRule)],
+        )]);
+
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let out = pipeline
+            .rewrite(empty_values_plan(), &mut ctx)
+            .expect("plain plan must pass validation");
+        assert!(matches!(out, LogicalPlan::Values(_)));
     }
 }
