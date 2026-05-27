@@ -4,7 +4,7 @@ use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::descriptors;
 use crate::exprs;
 use crate::internal_service;
-use crate::lower::expr::parse_min_max_conjunct_with_column_resolver;
+use crate::lower::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
@@ -42,10 +42,7 @@ pub(crate) fn build_scan_node(
     if resolved.physical_layout.is_some() {
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
-    if matches!(
-        resolved.table.source,
-        ScanSource::IcebergDeltaTable { .. }
-    ) {
+    if matches!(resolved.table.source, ScanSource::IcebergDeltaTable { .. }) {
         return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
     build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
@@ -67,23 +64,23 @@ fn build_iceberg_delta_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
-    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) =
-        match &resolved.table.source {
-            ScanSource::IcebergDeltaTable {
-                catalog,
-                namespace,
-                table,
-                from_snapshot_id,
-                to_snapshot_id,
-            } => (
-                catalog.clone(),
-                namespace.clone(),
-                table.clone(),
-                *from_snapshot_id,
-                *to_snapshot_id,
-            ),
-            _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
-        };
+    let (catalog, namespace, table, from_snapshot_id, to_snapshot_id) = match &resolved.table.source
+    {
+        ScanSource::IcebergDeltaTable {
+            catalog,
+            namespace,
+            table,
+            from_snapshot_id,
+            to_snapshot_id,
+        } => (
+            catalog.clone(),
+            namespace.clone(),
+            table.clone(),
+            *from_snapshot_id,
+            *to_snapshot_id,
+        ),
+        _ => unreachable!("build_iceberg_delta_scan_node called on non-IcebergDeltaTable"),
+    };
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
@@ -148,20 +145,20 @@ fn build_hdfs_scan_node(
         _ => None,
     };
 
-    let (serialized_table, metadata_table_type, serialized_predicate) =
-        match &resolved.table.source {
-            ScanSource::IcebergMetadataTable {
-                metadata_table_type,
-                serialized_table,
-                metadata_payload,
-                ..
-            } => (
-                Some(serialized_table.clone()),
-                Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
-                metadata_payload.clone(),
-            ),
-            _ => (None, None, None),
-        };
+    let (serialized_table, metadata_table_type, serialized_predicate) = match &resolved.table.source
+    {
+        ScanSource::IcebergMetadataTable {
+            metadata_table_type,
+            serialized_table,
+            metadata_payload,
+            ..
+        } => (
+            Some(serialized_table.clone()),
+            Some(iceberg_metadata_table_type_thrift_str(metadata_table_type).to_string()),
+            metadata_payload.clone(),
+        ),
+        _ => (None, None, None),
+    };
 
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
         Some(scan_tuple_id),
@@ -661,15 +658,15 @@ pub(crate) fn build_exec_params_multi(
 fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredicate> {
     let mut predicates = Vec::new();
     for conjunct in &planned.min_max_conjuncts {
-        let parsed = parse_min_max_conjunct_with_column_resolver(conjunct, |slot_ref| {
+        let parsed = parse_min_max_conjuncts_with_column_resolver(conjunct, |slot_ref| {
             planned
                 .slot_to_column
                 .get(&slot_ref.slot_id)
                 .cloned()
                 .ok_or_else(|| format!("slot_id {} has no scan column", slot_ref.slot_id))
         });
-        if let Ok(Some(predicate)) = parsed {
-            predicates.push(predicate);
+        if let Ok(parsed) = parsed {
+            predicates.extend(parsed);
         }
     }
     predicates
@@ -1253,7 +1250,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, ScanSource};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
     use crate::sql::codegen::resolve::ResolvedTable;
 
     fn hdfs_range(
