@@ -18,6 +18,7 @@ pub(crate) struct ImvRewriteInput {
     pub deadline: Option<Instant>,
 }
 
+#[derive(Debug)]
 pub(crate) struct ImvRewriteOutcome {
     pub plan: LogicalPlan,
     pub trace: RewriteTrace,
