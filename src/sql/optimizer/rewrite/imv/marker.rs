@@ -144,17 +144,11 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
         plan_contains_imv_marker(plan)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlan,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let markers = collect_marker_kinds(&plan);
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
             "UnresolvedMarkerCheck",
-            format!(
-                "IVM rewrite failed to resolve incremental markers: {markers:?}"
-            ),
+            format!("IVM rewrite failed to resolve incremental markers: {markers:?}"),
         )))
     }
 }
@@ -328,7 +322,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(out1, LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })),
+            matches!(
+                out1,
+                LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })
+            ),
             "first fresh pipeline must wrap the root"
         );
 
@@ -342,7 +339,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(out2, LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })),
+            matches!(
+                out2,
+                LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })
+            ),
             "second fresh pipeline must also wrap the root independently"
         );
     }
@@ -421,8 +421,8 @@ mod tests {
     #[test]
     fn marker_unresolved_yields_rejected_outcome() {
         use crate::sql::optimizer::rewrite::context::RewriteContext;
-        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
 
         // imv-delta-marker wraps; imv-validation rejects. Build a minimal
@@ -461,8 +461,8 @@ mod tests {
     #[test]
     fn validation_passes_when_no_marker_present() {
         use crate::sql::optimizer::rewrite::context::RewriteContext;
-        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 
         // Validation alone, no wrap rule. Plain plan → no marker → pass.
         let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
@@ -480,9 +480,9 @@ mod tests {
 
     #[test]
     fn regular_query_pipeline_does_not_produce_markers() {
-        use std::collections::HashMap;
         use crate::sql::optimizer::rewrite::context::RewriteContext;
         use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+        use std::collections::HashMap;
 
         // Exercise the real query rewrite pipeline (the one used by the
         // optimizer before CBO) to ensure it never introduces IMV markers

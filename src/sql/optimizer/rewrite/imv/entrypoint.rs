@@ -238,10 +238,7 @@ mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: vec![
-                "NoSuchRule".to_string(),
-                "WrapRootInImvDelta".to_string(),
-            ],
+            disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
         })
         .expect("unknown disabled rule must not break the pipeline");
