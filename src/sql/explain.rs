@@ -268,6 +268,9 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
             format_node(&node.input, level, indent + 1, out);
         }
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 

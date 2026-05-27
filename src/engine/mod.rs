@@ -2811,6 +2811,9 @@ fn collect_scan_stats(
         LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Decode(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 
