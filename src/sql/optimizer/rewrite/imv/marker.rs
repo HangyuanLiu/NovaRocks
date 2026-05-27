@@ -89,11 +89,11 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         // Plan was already wrapped before the pipeline ran (e.g. re-entry
         // on a previously wrapped plan): record the fact and skip.
         // This store-then-return-false pattern is load-bearing: the side effect
-        // prevents TopDown traversal from descending into the child of the existing
-        // ImvDelta wrapper. This relies on the rewrite framework calling matches()
-        // during actual traversal, not for speculative probing. The TopDown traversal
-        // will call matches() on the ImvDelta node itself; if we returned true instead,
-        // we would try to wrap it again, creating a double-wrapped root.
+        // ensures that when TopDown traversal descends into the children of the
+        // existing ImvDelta wrapper, the matches() call on those descendants will
+        // return false, preventing apply() from running on them. TopDown still visits
+        // all nodes; the wrapped flag just short-circuits matches() to prevent
+        // double-wrapping.
         if matches!(
             plan,
             LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })
