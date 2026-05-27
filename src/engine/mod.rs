@@ -2420,6 +2420,8 @@ fn single_fragment_plan(
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
+        query_global_dicts: fragment.query_global_dicts,
+        query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
 }
 
@@ -2969,6 +2971,8 @@ fn execute_plan(
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;
     let exec_params = result.exec_params;
+    let query_global_dicts = result.query_global_dicts;
+    let query_global_dict_exprs = result.query_global_dict_exprs;
 
     let mut tuple_slots = build_tuple_slot_order(Some(&desc_tbl));
     reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
@@ -2981,8 +2985,8 @@ fn execute_plan(
         &mut arena,
         &tuple_slots,
         Some(&desc_tbl),
-        None,
-        None,
+        query_global_dicts.as_deref(),
+        query_global_dict_exprs.as_ref(),
         Some(&exec_params),
         query_opts.as_ref(),
         None,

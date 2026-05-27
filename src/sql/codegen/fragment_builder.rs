@@ -892,28 +892,41 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         let child = self.visit(&node.children[0])?;
 
-        // Resolve the encoded (Int32 dict) slot per mapping from the
-        // child scope. The dict column name MUST be in the child scope
-        // — the rewriter is the only producer of decode mappings, and
-        // it only creates one when its input subtree publishes the
-        // dict column.
-        let mut decoded_targets: BTreeMap<String, i32> = BTreeMap::new();
-        for item in &op.mappings {
-            let dict_binding = child
-                .scope
-                .resolve_column(None, &item.dict_column)
-                .map_err(|_| {
-                    format!(
-                        "decode dict column `{}` is not in child scope",
-                        item.dict_column
-                    )
-                })?
-                .clone();
-            decoded_targets.insert(
-                item.string_column.to_ascii_lowercase(),
-                dict_binding.slot_id,
-            );
-        }
+        // Build `dict_slot_id -> (string_column_name, data_type, nullable)`
+        // for every declared mapping. The dict column name MUST be in the
+        // child scope — the rewriter is the only producer of decode
+        // mappings, and it only creates one when its input subtree
+        // publishes the dict column. The `op.output_columns` declared
+        // name / type is consulted only as a hint for the post-decode
+        // string column's data type; we default to Utf8 when the
+        // rewriter handed us no declared output column.
+        let dict_target_meta: BTreeMap<i32, (String, DataType, bool)> = op
+            .mappings
+            .iter()
+            .map(|item| {
+                let dict_binding = child
+                    .scope
+                    .resolve_column(None, &item.dict_column)
+                    .map_err(|_| {
+                        format!(
+                            "decode dict column `{}` is not in child scope",
+                            item.dict_column
+                        )
+                    })?;
+                let declared = op
+                    .output_columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&item.string_column));
+                let data_type = declared
+                    .map(|c| c.data_type.clone())
+                    .unwrap_or(DataType::Utf8);
+                let nullable = declared.map(|c| c.nullable).unwrap_or(true);
+                Ok::<_, String>((
+                    dict_binding.slot_id,
+                    (item.string_column.clone(), data_type, nullable),
+                ))
+            })
+            .collect::<Result<_, _>>()?;
 
         // Allocate the decode's new output tuple. New string slots live
         // here; passthrough slots are re-registered here under the same
@@ -923,28 +936,31 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
         let mut consumed_dict_slots: std::collections::BTreeSet<i32> = Default::default();
 
-        // Decoded-column output schema: prefer the op's declared
-        // `output_columns` (carries the post-decode names + types as
-        // the rewriter built them). Fall back to the child's column
-        // ordering when the rewriter handed us an empty vector (older
-        // test paths).
-        let output_columns: Vec<(String, DataType, bool)> = if op.output_columns.is_empty() {
-            child
-                .scope
-                .iter_columns()
-                .map(|(name, binding)| (name.clone(), binding.data_type.clone(), binding.nullable))
-                .collect()
-        } else {
-            op.output_columns
-                .iter()
-                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-                .collect()
-        };
+        // Iterate the child's ordered columns. For each child column whose
+        // slot id matches a declared dict source slot (`mappings.dict_column`),
+        // allocate a fresh string slot in the decode tuple and surface it
+        // under the mapping's `string_column` name. All other child columns
+        // pass through verbatim: same slot id, same name.
+        //
+        // Why iterate child scope rather than `op.output_columns`: the
+        // optimizer's `output_columns` carries analyzer-level names (often
+        // SELECT aliases like `sum(c3) AS sc3`), but the aggregate codegen
+        // registers slots under unaliased display names (`sum(c3)`). The
+        // outer Project compiles `AggregateCall` references against the
+        // display name, so Decode must republish that display name verbatim
+        // for resolution to succeed.
+
+        let child_columns: Vec<(String, ColumnBinding)> = child
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
 
         let mut col_pos: i32 = 0;
-        for (name, data_type, nullable) in &output_columns {
-            let lower = name.to_ascii_lowercase();
-            if let Some(child_dict_slot) = decoded_targets.get(&lower) {
+        for (child_name, child_binding) in &child_columns {
+            if let Some((string_name, data_type, nullable)) =
+                dict_target_meta.get(&child_binding.slot_id)
+            {
                 // Decoded string output: allocate a NEW slot in the
                 // decode's tuple. The mapping pairs the child's dict
                 // slot with this new string slot.
@@ -952,17 +968,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                 self.desc_builder.add_slot(
                     string_slot_id,
                     decode_tuple_id,
-                    name,
+                    string_name,
                     data_type,
                     *nullable,
                     col_pos,
                 );
-                if consumed_dict_slots.insert(*child_dict_slot) {
-                    mapping.insert(*child_dict_slot, string_slot_id);
+                if consumed_dict_slots.insert(child_binding.slot_id) {
+                    mapping.insert(child_binding.slot_id, string_slot_id);
                 }
                 decode_scope.add_column(
                     None,
-                    name.clone(),
+                    string_name.clone(),
                     ColumnBinding {
                         tuple_id: decode_tuple_id,
                         slot_id: string_slot_id,
@@ -971,24 +987,22 @@ impl<'a> PlanFragmentBuilder<'a> {
                         nullable: *nullable,
                     },
                 );
-                col_pos += 1;
-            } else if let Ok(child_binding) = child.scope.resolve_column(None, name) {
+            } else {
                 // Passthrough: re-register the child's slot id under
                 // the decode's new tuple, matching the StarRocks BE
                 // contract (passthrough slots keep their slot id and
                 // gain a new tuple parent).
-                let child_binding = child_binding.clone();
                 self.desc_builder.add_slot(
                     child_binding.slot_id,
                     decode_tuple_id,
-                    name,
+                    child_name,
                     &child_binding.data_type,
                     child_binding.nullable,
                     col_pos,
                 );
                 decode_scope.add_column(
                     None,
-                    name.clone(),
+                    child_name.clone(),
                     ColumnBinding {
                         tuple_id: decode_tuple_id,
                         slot_id: child_binding.slot_id,
@@ -997,13 +1011,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                         nullable: child_binding.nullable,
                     },
                 );
-                col_pos += 1;
-            } else {
-                return Err(format!(
-                    "decode output column `{}` is not in child scope and not a decoded mapping",
-                    name
-                ));
             }
+            col_pos += 1;
         }
 
         if mapping.len() != op.mappings.len() {
