@@ -692,9 +692,26 @@ fn explain_hints_for_scan(
         return LocalScanExplainHints::default();
     }
 
+    // Translate any hidden dict-encoded slot names (`__nr_dict_<table>_<col>`,
+    // emitted by `LowCardinalityDictionaryRewrite`) back to their source
+    // string columns before checking format-level capabilities. The
+    // dict slot is a synthetic Int32 that the scan reader produces *from*
+    // the underlying storage column, so the on-disk min-max / decode-hint
+    // semantics belong to the source column, not the dict slot.
+    let resolved: Vec<String> = required_columns
+        .iter()
+        .map(|required| {
+            op.dict_columns
+                .iter()
+                .find(|d| d.dict_column.eq_ignore_ascii_case(required))
+                .map(|d| d.source_column.clone())
+                .unwrap_or_else(|| required.clone())
+        })
+        .collect();
+
     LocalScanExplainHints {
-        has_decode: scan_supports_decode_hint(&op.table, required_columns),
-        has_min_max_stats: scan_supports_min_max_stats(&op.table, required_columns),
+        has_decode: scan_supports_decode_hint(&op.table, &resolved),
+        has_min_max_stats: scan_supports_min_max_stats(&op.table, &resolved),
     }
 }
 
