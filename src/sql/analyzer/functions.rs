@@ -154,6 +154,9 @@ fn validate_scalar_function_call_impl(
     if matches!(name, "array_contains_all" | "array_contains_seq") {
         validate_array_pair_arguments(name, arg_types)?;
     }
+    if is_mv_state_scalar_function(name) {
+        validate_mv_state_scalar_function(name, arg_types)?;
+    }
     let expected_arity = match name {
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
         | "array_max" => Some(1usize),
@@ -164,6 +167,59 @@ fn validate_scalar_function_call_impl(
     if let Some(expected) = expected_arity
         && arg_types.len() != expected
     {
+        return Err(no_matching_signature(name, arg_types));
+    }
+    Ok(())
+}
+
+fn is_mv_state_scalar_function(name: &str) -> bool {
+    matches!(
+        name,
+        "count_state_union"
+            | "count_state_visible"
+            | "count_distinct_state_union"
+            | "count_distinct_state_visible"
+            | "approx_count_distinct_state_union"
+            | "approx_count_distinct_state_visible"
+            | "avg_state_union"
+            | "avg_state_visible"
+            | "sum_state_union"
+            | "sum_state_visible"
+            | "min_state_union"
+            | "min_state_visible"
+            | "max_state_union"
+            | "max_state_visible"
+            | "bool_or_state_union"
+            | "bool_or_state_visible"
+            | "bool_and_state_union"
+            | "bool_and_state_visible"
+    )
+}
+
+fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Result<(), String> {
+    let binary_arg = |ty: &DataType| matches!(ty, DataType::Binary | DataType::LargeBinary);
+    let expected = match name {
+        "count_state_union"
+        | "count_distinct_state_union"
+        | "approx_count_distinct_state_union"
+        | "avg_state_union"
+        | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
+        | "bool_or_state_union"
+        | "bool_and_state_union" => 2,
+        "count_state_visible"
+        | "count_distinct_state_visible"
+        | "approx_count_distinct_state_visible"
+        | "avg_state_visible"
+        | "sum_state_visible"
+        | "min_state_visible"
+        | "max_state_visible"
+        | "bool_or_state_visible"
+        | "bool_and_state_visible" => 1,
+        _ => return Ok(()),
+    };
+    if arg_types.len() != expected || arg_types.iter().any(|ty| !binary_arg(ty)) {
         return Err(no_matching_signature(name, arg_types));
     }
     Ok(())
@@ -543,70 +599,93 @@ fn sum_map_value_type_name(data_type: &DataType) -> &'static str {
 
 pub(super) fn is_aggregate_function(name: &str) -> bool {
     // Keep in sync with expr_compiler::is_aggregate_function.
+    is_state_combinator_aggregate_function(name)
+        || matches!(
+            name,
+            "count"
+                | "sum"
+                | "avg"
+                | "min"
+                | "max"
+                | "count_if"
+                | "any_value"
+                | "group_concat"
+                | "string_agg"
+                | "bitmap_agg"
+                | "bitmap_union"
+                | "bitmap_union_count"
+                | "bitmap_union_int"
+                | "multi_distinct_count"
+                | "array_agg"
+                | "array_agg_distinct"
+                | "array_unique_agg"
+                | "sum_map"
+                | "map_agg"
+                | "percentile_approx"
+                | "percentile_approx_weighted"
+                | "percentile_cont"
+                | "percentile_disc"
+                | "percentile_disc_lc"
+                | "percentile_union"
+                | "approx_count_distinct"
+                | "approx_count_distinct_hll_sketch"
+                | "approx_top_k"
+                | "ds_hll_accumulate"
+                | "ds_hll_combine"
+                | "ds_hll_estimate"
+                | "ds_hll_count_distinct"
+                | "ds_hll_count_distinct_union"
+                | "ds_hll_count_distinct_merge"
+                | "hll_union"
+                | "hll_union_agg"
+                | "hll_raw_agg"
+                | "ndv"
+                | "variance"
+                | "variance_samp"
+                | "variance_pop"
+                | "var_samp"
+                | "var_pop"
+                | "stddev"
+                | "stddev_samp"
+                | "stddev_pop"
+                | "covar_samp"
+                | "covar_pop"
+                | "corr"
+                | "max_by"
+                | "min_by"
+                | "mann_whitney_u_test"
+                | "bool_or"
+                | "bool_and"
+                | "boolor_agg"
+                | "booland_agg"
+                | "every"
+                | "min_n"
+                | "max_n"
+                | "dict_merge"
+        )
+}
+
+fn is_state_combinator_aggregate_function(name: &str) -> bool {
     matches!(
         name,
-        "count"
-            | "sum"
-            | "avg"
-            | "min"
-            | "max"
-            | "count_if"
-            | "any_value"
-            | "group_concat"
-            | "string_agg"
-            | "bitmap_agg"
-            | "bitmap_union"
-            | "bitmap_union_count"
-            | "bitmap_union_int"
-            | "multi_distinct_count"
-            | "array_agg"
-            | "array_agg_distinct"
-            | "array_unique_agg"
-            | "sum_map"
-            | "map_agg"
-            | "map_value_count"
-            | "map_value_count_signed"
-            | "percentile_approx"
-            | "percentile_approx_weighted"
-            | "percentile_cont"
-            | "percentile_disc"
-            | "percentile_disc_lc"
-            | "percentile_union"
-            | "approx_count_distinct"
-            | "approx_count_distinct_hll_sketch"
-            | "approx_top_k"
-            | "ds_hll_accumulate"
-            | "ds_hll_combine"
-            | "ds_hll_estimate"
-            | "ds_hll_count_distinct"
-            | "ds_hll_count_distinct_union"
-            | "ds_hll_count_distinct_merge"
-            | "hll_union"
-            | "hll_union_agg"
-            | "hll_raw_agg"
-            | "ndv"
-            | "variance"
-            | "variance_samp"
-            | "variance_pop"
-            | "var_samp"
-            | "var_pop"
-            | "stddev"
-            | "stddev_samp"
-            | "stddev_pop"
-            | "covar_samp"
-            | "covar_pop"
-            | "corr"
-            | "max_by"
-            | "min_by"
-            | "mann_whitney_u_test"
-            | "bool_or"
-            | "bool_and"
-            | "boolor_agg"
-            | "booland_agg"
-            | "every"
-            | "min_n"
-            | "max_n"
-            | "dict_merge"
+        "count_state"
+            | "count_state_signed"
+            | "sum_state"
+            | "sum_state_signed"
+            | "avg_state"
+            | "avg_state_signed"
+            | "min_state"
+            | "min_state_signed"
+            | "max_state"
+            | "max_state_signed"
+            | "bool_or_state"
+            | "bool_or_state_signed"
+            | "bool_and_state"
+            | "bool_and_state_signed"
+            | "count_distinct_state"
+            | "count_distinct_state_signed"
+            | "approx_count_distinct_state"
+            | "approx_count_distinct_state_signed"
     )
 }
 
@@ -881,6 +960,21 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "bitmap_to_base64" => DataType::Binary,
         "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
         "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
+        "count_state_union"
+        | "count_distinct_state_union"
+        | "approx_count_distinct_state_union"
+        | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
+        | "bool_or_state_union"
+        | "bool_and_state_union" => DataType::Binary,
+        "count_state_visible"
+        | "count_distinct_state_visible"
+        | "approx_count_distinct_state_visible"
+        | "sum_state_visible"
+        | "min_state_visible"
+        | "max_state_visible" => DataType::Int64,
+        "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Int64,
@@ -1293,6 +1387,8 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         )))
     };
     match name {
+        name if is_state_combinator_aggregate_function(name) => DataType::Binary,
+
         "count"
         | "count_if"
         | "bitmap_union_count"
@@ -1372,29 +1468,6 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
                 false,
             )
         }
-        "map_value_count" | "map_value_count_signed" => {
-            // Output type: Map<input_type_K, Int64>. The first argument's type is the key.
-            // Uses the iceberg-rust convention (entries-field name "key_value",
-            // value field nullable) so the MIN/MAX IVM detail-state map can
-            // flow into the Iceberg sink without a field-name / nullability
-            // mismatch when the sink re-annotates field IDs.
-            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
-            DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
-                    "key_value",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, false)),
-                            Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            )
-        }
-
         "variance" | "variance_samp" | "variance_pop" | "var_samp" | "var_pop" | "stddev"
         | "stddev_samp" | "stddev_pop" | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => DataType::Boolean,
@@ -1494,6 +1567,172 @@ mod tests {
             infer_scalar_return_type("to_binary", &[DataType::Utf8, DataType::Utf8]),
             DataType::Binary
         );
+    }
+
+    #[test]
+    fn count_state_scalar_functions_require_binary_inputs() {
+        assert_eq!(
+            infer_scalar_return_type("count_state_union", &[DataType::Binary, DataType::Binary]),
+            DataType::Binary
+        );
+        assert_eq!(
+            infer_scalar_return_type("count_state_visible", &[DataType::Binary]),
+            DataType::Int64
+        );
+        validate_scalar_function_call("count_state_union", &[DataType::Binary, DataType::Binary])
+            .unwrap();
+        validate_scalar_function_call("count_state_visible", &[DataType::Binary]).unwrap();
+
+        let err = validate_scalar_function_call("count_state_union", &[DataType::Utf8])
+            .expect_err("count_state_union should reject non-binary arity/type");
+        assert_eq!(
+            err,
+            "No matching function with signature: count_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn bool_state_scalar_functions_require_binary_inputs() {
+        for name in ["bool_or_state_union", "bool_and_state_union"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::Binary, DataType::Binary]),
+                DataType::Binary
+            );
+            validate_scalar_function_call(name, &[DataType::LargeBinary, DataType::Binary])
+                .unwrap();
+        }
+
+        for name in ["bool_or_state_visible", "bool_and_state_visible"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::LargeBinary]),
+                DataType::Boolean
+            );
+            validate_scalar_function_call(name, &[DataType::Binary]).unwrap();
+        }
+
+        let err = validate_scalar_function_call("bool_or_state_union", &[DataType::Utf8])
+            .expect_err("bool_or_state_union should reject non-binary arity/type");
+        assert_eq!(
+            err,
+            "No matching function with signature: bool_or_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn sum_state_scalar_functions_require_binary_inputs() {
+        assert_eq!(
+            infer_scalar_return_type("sum_state_union", &[DataType::Binary, DataType::Binary]),
+            DataType::Binary
+        );
+        assert_eq!(
+            infer_scalar_return_type("sum_state_visible", &[DataType::LargeBinary]),
+            DataType::Int64
+        );
+        validate_scalar_function_call(
+            "sum_state_union",
+            &[DataType::LargeBinary, DataType::Binary],
+        )
+        .unwrap();
+        validate_scalar_function_call("sum_state_visible", &[DataType::Binary]).unwrap();
+
+        let err = validate_scalar_function_call("sum_state_visible", &[DataType::Utf8])
+            .expect_err("sum_state_visible should reject non-binary type");
+        assert_eq!(
+            err,
+            "No matching function with signature: sum_state_visible(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn avg_state_scalar_functions_require_binary_inputs() {
+        assert_eq!(
+            infer_scalar_return_type("avg_state_union", &[DataType::Binary, DataType::Binary]),
+            DataType::Binary
+        );
+        assert_eq!(
+            infer_scalar_return_type("avg_state_visible", &[DataType::LargeBinary]),
+            DataType::Float64
+        );
+        validate_scalar_function_call(
+            "avg_state_union",
+            &[DataType::LargeBinary, DataType::Binary],
+        )
+        .unwrap();
+        validate_scalar_function_call("avg_state_visible", &[DataType::Binary]).unwrap();
+
+        let err = validate_scalar_function_call("avg_state_visible", &[DataType::Utf8])
+            .expect_err("avg_state_visible should reject non-binary type");
+        assert_eq!(
+            err,
+            "No matching function with signature: avg_state_visible(varchar(255))."
+        );
+
+        let err = validate_scalar_function_call(
+            "avg_state_visible",
+            &[DataType::Binary, DataType::Int64],
+        )
+        .expect_err("avg_state_visible should not expose decimal-scale arg to direct SQL");
+        assert_eq!(
+            err,
+            "No matching function with signature: avg_state_visible(varbinary, bigint(20))."
+        );
+    }
+
+    #[test]
+    fn min_max_state_scalar_functions_require_binary_inputs() {
+        for name in ["min_state_union", "max_state_union"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::Binary, DataType::Binary]),
+                DataType::Binary
+            );
+            validate_scalar_function_call(name, &[DataType::LargeBinary, DataType::Binary])
+                .unwrap();
+        }
+
+        for name in ["min_state_visible", "max_state_visible"] {
+            assert_eq!(
+                infer_scalar_return_type(name, &[DataType::LargeBinary]),
+                DataType::Int64
+            );
+            validate_scalar_function_call(name, &[DataType::Binary]).unwrap();
+        }
+
+        let err = validate_scalar_function_call("min_state_union", &[DataType::Utf8])
+            .expect_err("min_state_union should reject non-binary arity/type");
+        assert_eq!(
+            err,
+            "No matching function with signature: min_state_union(varchar(255))."
+        );
+    }
+
+    #[test]
+    fn distinct_state_scalar_functions_require_binary_inputs() {
+        for (union, visible) in [
+            ("count_distinct_state_union", "count_distinct_state_visible"),
+            (
+                "approx_count_distinct_state_union",
+                "approx_count_distinct_state_visible",
+            ),
+        ] {
+            assert_eq!(
+                infer_scalar_return_type(union, &[DataType::Binary, DataType::Binary]),
+                DataType::Binary
+            );
+            assert_eq!(
+                infer_scalar_return_type(visible, &[DataType::LargeBinary]),
+                DataType::Int64
+            );
+            validate_scalar_function_call(union, &[DataType::LargeBinary, DataType::Binary])
+                .unwrap();
+            validate_scalar_function_call(visible, &[DataType::Binary]).unwrap();
+
+            let err = validate_scalar_function_call(visible, &[DataType::Utf8])
+                .expect_err("distinct state visible should reject non-binary input");
+            assert_eq!(
+                err,
+                format!("No matching function with signature: {visible}(varchar(255)).")
+            );
+        }
     }
 
     #[test]
@@ -1665,6 +1904,37 @@ mod tests {
             infer_agg_return_type("sum", std::slice::from_ref(&largeint_type)),
             largeint_type
         );
+    }
+
+    #[test]
+    fn state_combinator_aggregate_functions_return_binary_state() {
+        for name in [
+            "count_state",
+            "count_state_signed",
+            "sum_state",
+            "sum_state_signed",
+            "avg_state",
+            "avg_state_signed",
+            "min_state",
+            "min_state_signed",
+            "max_state",
+            "max_state_signed",
+            "bool_or_state",
+            "bool_or_state_signed",
+            "bool_and_state",
+            "bool_and_state_signed",
+            "count_distinct_state",
+            "count_distinct_state_signed",
+            "approx_count_distinct_state",
+            "approx_count_distinct_state_signed",
+        ] {
+            assert!(is_aggregate_function(name), "{name}");
+            assert_eq!(
+                infer_agg_return_type(name, &[DataType::Int64, DataType::Int8]),
+                DataType::Binary,
+                "{name}"
+            );
+        }
     }
 
     #[test]

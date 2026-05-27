@@ -24,6 +24,14 @@ use super::{AggInputView, AggSpec, AggStatePtr};
 #[derive(Clone, Debug)]
 pub(super) enum AggKind {
     Count,
+    CountState,
+    CountStateSigned,
+    BoolState,
+    BoolStateSigned,
+    MinState,
+    MaxState,
+    MinStateSigned,
+    MaxStateSigned,
     CountDistinct,
     CountIf,
     SumInt,
@@ -31,6 +39,10 @@ pub(super) enum AggKind {
     SumFloat,
     SumDecimal128,
     SumDecimal256,
+    SumStateInt64,
+    SumStateDecimal128,
+    SumStateSignedInt64,
+    SumStateSignedDecimal128,
     MinInt,
     MaxInt,
     MinFloat,
@@ -75,8 +87,6 @@ pub(super) enum AggKind {
     },
     MultiDistinctSum,
     MapAgg,
-    MapValueCount,
-    MapValueCountSigned,
     SumMap,
     ArrayAgg {
         is_distinct: bool,
@@ -126,10 +136,9 @@ mod ds_hll;
 mod ds_theta;
 mod group_concat;
 mod histogram;
-mod hll_raw;
+pub(crate) mod hll_raw;
 mod mann_whitney_u_test;
 mod map_agg;
-mod map_value_count;
 mod max;
 mod max_by;
 mod min;
@@ -138,6 +147,7 @@ mod multi_distinct_sum;
 mod percentile;
 mod percentile_placeholder;
 mod retention;
+mod state_combinators;
 mod sum;
 mod sum_map;
 mod variance;
@@ -162,7 +172,6 @@ use histogram::{HistogramAgg, HistogramHllNdvAgg};
 use hll_raw::HllRawAgg;
 use mann_whitney_u_test::MannWhitneyUTestAgg;
 use map_agg::MapAggAgg;
-use map_value_count::MapValueCountAgg;
 use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
@@ -171,6 +180,15 @@ use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
+use state_combinators::approx_count_distinct::{
+    ApproxCountDistinctStateAgg, ApproxCountDistinctStateSignedAgg,
+};
+use state_combinators::avg::{AvgStateAgg, AvgStateSignedAgg};
+use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
+use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
+use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStateSignedAgg};
+use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
+use state_combinators::sum::{SumStateAgg, SumStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
@@ -227,13 +245,28 @@ pub(super) trait AggregateFunction {
 }
 
 static COUNT: CountAgg = CountAgg;
+static COUNT_STATE: CountStateAgg = CountStateAgg;
+static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
+static COUNT_DISTINCT_STATE: CountDistinctStateAgg = CountDistinctStateAgg;
+static COUNT_DISTINCT_STATE_SIGNED: CountDistinctStateSignedAgg = CountDistinctStateSignedAgg;
+static APPROX_COUNT_DISTINCT_STATE: ApproxCountDistinctStateAgg = ApproxCountDistinctStateAgg;
+static APPROX_COUNT_DISTINCT_STATE_SIGNED: ApproxCountDistinctStateSignedAgg =
+    ApproxCountDistinctStateSignedAgg;
+static BOOL_STATE: BoolStateAgg = BoolStateAgg;
+static BOOL_STATE_SIGNED: BoolStateSignedAgg = BoolStateSignedAgg;
+static MIN_MAX_STATE: MinMaxStateAgg = MinMaxStateAgg;
+static MIN_MAX_STATE_SIGNED: MinMaxStateSignedAgg = MinMaxStateSignedAgg;
 static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
 static SUM: SumAgg = SumAgg;
+static SUM_STATE: SumStateAgg = SumStateAgg;
+static SUM_STATE_SIGNED: SumStateSignedAgg = SumStateSignedAgg;
 static MIN: MinAgg = MinAgg;
 static MAX: MaxAgg = MaxAgg;
 static AVG: AvgAgg = AvgAgg;
+static AVG_STATE: AvgStateAgg = AvgStateAgg;
+static AVG_STATE_SIGNED: AvgStateSignedAgg = AvgStateSignedAgg;
 static ARRAY_AGG: ArrayAggAgg = ArrayAggAgg;
 static VAR_STD: VarStdAgg = VarStdAgg;
 static ANY_VALUE: AnyValueAgg = AnyValueAgg;
@@ -243,7 +276,6 @@ static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
 static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
 static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
 static MAP_AGG: MapAggAgg = MapAggAgg;
-static MAP_VALUE_COUNT: MapValueCountAgg = MapValueCountAgg;
 static SUM_MAP: SumMapAgg = SumMapAgg;
 static RETENTION: RetentionAgg = RetentionAgg;
 static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
@@ -263,13 +295,27 @@ static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
 fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
     match canonical_agg_name(func.name.as_str()) {
         "count" => Ok(&COUNT),
+        "count_state" => Ok(&COUNT_STATE),
+        "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
+        "count_distinct_state" => Ok(&COUNT_DISTINCT_STATE),
+        "count_distinct_state_signed" => Ok(&COUNT_DISTINCT_STATE_SIGNED),
+        "approx_count_distinct_state" => Ok(&APPROX_COUNT_DISTINCT_STATE),
+        "approx_count_distinct_state_signed" => Ok(&APPROX_COUNT_DISTINCT_STATE_SIGNED),
+        "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
+        "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
+        "min_state" | "max_state" => Ok(&MIN_MAX_STATE),
+        "min_state_signed" | "max_state_signed" => Ok(&MIN_MAX_STATE_SIGNED),
         "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
         "sum" => Ok(&SUM),
+        "sum_state" => Ok(&SUM_STATE),
+        "sum_state_signed" => Ok(&SUM_STATE_SIGNED),
         "min" => Ok(&MIN),
         "max" => Ok(&MAX),
         "avg" => Ok(&AVG),
+        "avg_state" => Ok(&AVG_STATE),
+        "avg_state_signed" => Ok(&AVG_STATE_SIGNED),
         "array_agg" | "array_agg_distinct" | "array_unique_agg" => Ok(&ARRAY_AGG),
         "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
         | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
@@ -282,7 +328,6 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
         "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
         "map_agg" => Ok(&MAP_AGG),
-        "map_value_count" | "map_value_count_signed" => Ok(&MAP_VALUE_COUNT),
         "sum_map" => Ok(&SUM_MAP),
         "retention" => Ok(&RETENTION),
         "window_funnel" => Ok(&WINDOW_FUNNEL),
@@ -312,6 +357,12 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
 fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
     match kind {
         AggKind::Count => &COUNT,
+        AggKind::CountState => &COUNT_STATE,
+        AggKind::CountStateSigned => &COUNT_STATE_SIGNED,
+        AggKind::BoolState => &BOOL_STATE,
+        AggKind::BoolStateSigned => &BOOL_STATE_SIGNED,
+        AggKind::MinState | AggKind::MaxState => &MIN_MAX_STATE,
+        AggKind::MinStateSigned | AggKind::MaxStateSigned => &MIN_MAX_STATE_SIGNED,
         AggKind::CountDistinct => &COUNT_DISTINCT,
         AggKind::CountIf => &COUNT_IF,
         AggKind::GroupConcat { .. } => &GROUP_CONCAT,
@@ -320,6 +371,8 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         | AggKind::SumFloat
         | AggKind::SumDecimal128
         | AggKind::SumDecimal256 => &SUM,
+        AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => &SUM_STATE,
+        AggKind::SumStateSignedInt64 | AggKind::SumStateSignedDecimal128 => &SUM_STATE_SIGNED,
         AggKind::MinInt
         | AggKind::MinFloat
         | AggKind::MinBool
@@ -352,7 +405,6 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
         AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
         AggKind::MapAgg => &MAP_AGG,
-        AggKind::MapValueCount | AggKind::MapValueCountSigned => &MAP_VALUE_COUNT,
         AggKind::SumMap => &SUM_MAP,
         AggKind::Retention => &RETENTION,
         AggKind::WindowFunnel => &WINDOW_FUNNEL,

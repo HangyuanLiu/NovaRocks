@@ -50,6 +50,7 @@ static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLoc
     register_hll_fns(&mut m);
     register_json_fns(&mut m);
     register_iceberg_transform_fns(&mut m);
+    register_mv_state_fns(&mut m);
     register_misc_fns(&mut m);
     register_aggregate_in_expr_fns(&mut m);
     m
@@ -1132,6 +1133,94 @@ fn register_hll_fns(m: &mut HashMap<String, Vec<Signature>>) {
             m,
             name,
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IVM materialized view state functions.
+// ---------------------------------------------------------------------------
+
+fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    // Direct SQL calls see only opaque VARBINARY input, so visible functions
+    // use a default return type here. MV query rewrite must stamp the
+    // original aggregate return type onto the FunctionCall before execution.
+    add(
+        m,
+        "count_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "count_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "count_distinct_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "count_distinct_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "approx_count_distinct_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "approx_count_distinct_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "avg_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "avg_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Float64),
+    );
+    add(
+        m,
+        "sum_state_union",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "sum_state_visible",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    for name in ["min_state_union", "max_state_union"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+        );
+    }
+    for name in ["min_state_visible", "max_state_visible"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+        );
+    }
+    for name in ["bool_or_state_union", "bool_and_state_union"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
+        );
+    }
+    for name in ["bool_or_state_visible", "bool_and_state_visible"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Binary], TypeSpec::Boolean),
         );
     }
 }
