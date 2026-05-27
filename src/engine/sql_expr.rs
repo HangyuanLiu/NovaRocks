@@ -11,6 +11,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use crate::engine::record_batch_to_chunk;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -303,6 +304,79 @@ pub(crate) fn negate_literal(literal: Literal) -> Result<Literal, String> {
     }
 }
 
+fn literal_to_json_key(literal: Literal) -> Result<Option<String>, String> {
+    Ok(match literal {
+        Literal::Null => None,
+        Literal::Bool(v) => Some(if v { "true" } else { "false" }.to_string()),
+        Literal::Int(v) => Some(v.to_string()),
+        Literal::Float(v) => Some(v.to_string()),
+        Literal::String(v) | Literal::Date(v) => Some(v),
+        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => {
+            return Err("json_object key does not support complex type".to_string());
+        }
+    })
+}
+
+fn literal_to_json_value(literal: Literal) -> Result<JsonValue, String> {
+    Ok(match literal {
+        Literal::Null => JsonValue::Null,
+        Literal::Bool(v) => JsonValue::Bool(v),
+        Literal::Int(v) => JsonValue::Number(JsonNumber::from(v)),
+        Literal::Float(v) => JsonNumber::from_f64(v)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Literal::String(v) | Literal::Date(v) => {
+            serde_json::from_str::<JsonValue>(&v).unwrap_or(JsonValue::String(v))
+        }
+        Literal::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(literal_to_json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Literal::Map(entries) => {
+            let mut map = JsonMap::new();
+            for (key, value) in entries {
+                if let Some(key) = literal_to_json_key(key)? {
+                    map.insert(key, literal_to_json_value(value)?);
+                } else {
+                    return Ok(JsonValue::Null);
+                }
+            }
+            JsonValue::Object(map)
+        }
+        Literal::Struct(fields) => JsonValue::Array(
+            fields
+                .into_iter()
+                .map(literal_to_json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    })
+}
+
+fn json_object_literal(args: &[&sqlparser::ast::Expr]) -> Result<Literal, String> {
+    let mut object = JsonMap::new();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let key = sqlparser_expr_to_literal(args[idx])?;
+        let Some(key) = literal_to_json_key(key)? else {
+            return Ok(Literal::Null);
+        };
+        let value = if let Some(value_expr) = args.get(idx + 1) {
+            literal_to_json_value(sqlparser_expr_to_literal(value_expr)?)?
+        } else {
+            JsonValue::Null
+        };
+        object.insert(key, value);
+        idx += 2;
+    }
+    let json_text = serde_json::to_string(&JsonValue::Object(object))
+        .map_err(|e| format!("json_object stringify failed: {e}"))?;
+    let bytes = crate::exec::variant_encode::encode_json_text_to_variant_bytes(&json_text)
+        .map_err(|e| format!("json_object failed: {e}"))?;
+    Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+}
+
 pub(crate) fn literal_to_i128_for_integer(
     literal: &Literal,
     type_name: &str,
@@ -371,6 +445,7 @@ pub(crate) fn sqlparser_function_to_literal(
                 .map_err(|_| "array_repeat count is too large".to_string())?;
             Ok(Literal::Array(vec![value; repeat]))
         }
+        "json_object" => json_object_literal(&args),
         "array_append" => {
             if args.len() != 2 {
                 return Err("array_append expects 2 arguments".to_string());

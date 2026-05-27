@@ -109,11 +109,17 @@ fn comparator_sign(array: &ArrayRef, idx: usize) -> Result<i8, String> {
     }
 }
 
-fn validate_comparator(matrix: &[i8], len: usize) -> Result<(), String> {
+fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), String> {
     let at = |i: usize, j: usize| matrix[i * len + j];
 
     for i in 0..len {
         if at(i, i) != 0 {
+            if nulls[i] && at(i, i) > 0 {
+                continue;
+            }
+            if at(i, i) > 0 {
+                return Err("Comparator violates incomparability transitivity.".to_string());
+            }
             return Err("Comparator violates irreflexivity.".to_string());
         }
     }
@@ -121,6 +127,9 @@ fn validate_comparator(matrix: &[i8], len: usize) -> Result<(), String> {
     for i in 0..len {
         for j in 0..len {
             if i == j {
+                continue;
+            }
+            if nulls[i] && nulls[j] {
                 continue;
             }
             let ij = at(i, j);
@@ -138,6 +147,9 @@ fn validate_comparator(matrix: &[i8], len: usize) -> Result<(), String> {
     for i in 0..len {
         for j in 0..len {
             for k in 0..len {
+                if nulls[i] || nulls[j] || nulls[k] {
+                    continue;
+                }
                 if at(i, j) < 0 && at(j, k) < 0 && at(i, k) >= 0 {
                     return Err("Comparator violates transitivity.".to_string());
                 }
@@ -376,7 +388,10 @@ pub fn eval_array_sort_lambda(
                 start,
                 len,
             )?;
-            validate_comparator(&matrix, len)?;
+            let nulls = (0..len)
+                .map(|idx| values.is_null(start + idx))
+                .collect::<Vec<_>>();
+            validate_comparator(&matrix, len, &nulls)?;
             let mut positions: Vec<usize> = (0..len).collect();
             insertion_sort_indices(&matrix, len, &mut positions);
             for pos in positions {

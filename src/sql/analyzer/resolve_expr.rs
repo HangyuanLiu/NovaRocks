@@ -213,7 +213,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 negated,
             } => {
                 use super::literal_coercion::coerce_literal_for_comparison;
-                let expr_typed = self.analyze_expr(in_expr, scope)?;
+                let mut expr_typed = self.analyze_expr(in_expr, scope)?;
                 // StarRocks-aligned implicit literal coercion: when the IN
                 // expression is `column IN (lit, lit, ...)`, coerce each
                 // string literal to the column's type before emitting the
@@ -227,18 +227,49 @@ impl<'a> super::AnalyzerContext<'a> {
                 // because they have no scalar identity. Reject upfront so the
                 // user sees a clear error before lowering / codegen.
                 let kw = if *negated { "NOT IN" } else { "IN" };
-                if let Some(logical) = scope.logical_type_of_expr(&expr_typed) {
+                if let Some(logical) = scope
+                    .logical_type_of_expr(&expr_typed)
+                    .filter(is_bitmap_or_hll_type)
+                {
                     let col = column_name_of_expr(&expr_typed);
                     return Err(format!(
                         "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
                     ));
                 }
                 for item in &list_typed {
-                    if let Some(logical) = scope.logical_type_of_expr(item) {
+                    if let Some(logical) = scope
+                        .logical_type_of_expr(item)
+                        .filter(is_bitmap_or_hll_type)
+                    {
                         let col = column_name_of_expr(item);
                         return Err(format!(
                             "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
                         ));
+                    }
+                }
+                for item in &list_typed {
+                    if incompatible_complex_compare(&expr_typed.data_type, &item.data_type)
+                        .is_some()
+                    {
+                        return Err(in_predicate_type_error(
+                            &expr_typed.data_type,
+                            &item.data_type,
+                        ));
+                    }
+                }
+                let common_type = list_typed
+                    .iter()
+                    .fold(expr_typed.data_type.clone(), |acc, item| {
+                        wider_type(&acc, &item.data_type)
+                    });
+                if expr_typed.data_type != common_type
+                    && data_type_contains_null(&expr_typed.data_type)
+                {
+                    expr_typed = cast_null_preserving_target_type(expr_typed, &common_type);
+                }
+                for item in &mut list_typed {
+                    if item.data_type != common_type && data_type_contains_null(&item.data_type) {
+                        *item = cast_null_preserving_target_type(item.clone(), &common_type);
                     }
                 }
                 Ok(TypedExpr {
@@ -275,7 +306,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 // they have no ordering. Reject upfront so the user sees a
                 // clear error before lowering / codegen.
                 for operand in [&expr_typed, &low_typed, &high_typed] {
-                    if let Some(logical) = scope.logical_type_of_expr(operand) {
+                    if let Some(logical) = scope
+                        .logical_type_of_expr(operand)
+                        .filter(is_bitmap_or_hll_type)
+                    {
                         let col = column_name_of_expr(operand);
                         return Err(format!(
                             "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
@@ -375,11 +409,9 @@ impl<'a> super::AnalyzerContext<'a> {
                         }
                     }
                     if ident_parts.len() >= 2 {
-                        let mut current =
-                            self.analyze_compound_identifier(&ident_parts, scope)?;
+                        let mut current = self.analyze_compound_identifier(&ident_parts, scope)?;
                         for access in &access_chain[chain_start..] {
-                            current =
-                                self.analyze_compound_field_access(current, access, scope)?;
+                            current = self.analyze_compound_field_access(current, access, scope)?;
                         }
                         return Ok(current);
                     }
@@ -487,7 +519,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 // is dropped before the subquery is planned so we cannot
                 // wait until later.
                 let in_expr_typed = self.analyze_expr(in_expr, scope)?;
-                if let Some(logical) = scope.logical_type_of_expr(&in_expr_typed) {
+                if is_json_in_subquery_operand(&in_expr_typed, scope) {
+                    return Err("In predicate of JSON does not support subquery".to_string());
+                }
+                if let Some(logical) = scope
+                    .logical_type_of_expr(&in_expr_typed)
+                    .filter(is_bitmap_or_hll_type)
+                {
                     let col = column_name_of_expr(&in_expr_typed);
                     let kw = if *negated { "NOT IN" } else { "IN" };
                     return Err(format!(
@@ -517,25 +555,22 @@ impl<'a> super::AnalyzerContext<'a> {
             // Scalar subquery: (SELECT ...)
             sqlast::Expr::Subquery(subquery) => {
                 let id = self.alloc_subquery_id();
-                // We don't know the exact scalar type yet; it will be resolved
-                // during subquery rewriting. Use Null as placeholder.
+                let data_type = self.infer_scalar_subquery_data_type(subquery);
                 let kind = SubqueryKind::Scalar;
                 self.collected_subqueries.borrow_mut().push(SubqueryInfo {
                     id,
                     kind: kind.clone(),
                     subquery: subquery.clone(),
-                    data_type: DataType::Null,
+                    data_type: data_type.clone(),
                     in_expr: None,
                 });
-                // Return a placeholder with Null type; the rewrite pass will
-                // replace it with a ColumnRef of the proper type.
                 Ok(TypedExpr {
                     kind: ExprKind::SubqueryPlaceholder {
                         id,
                         kind,
-                        data_type: DataType::Null,
+                        data_type: data_type.clone(),
                     },
-                    data_type: DataType::Null,
+                    data_type,
                     nullable: true,
                 })
             }
@@ -546,7 +581,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let value = typed_str.value.to_string();
                 // For DATE literals, constant-fold to Date32 integer value
                 if target == DataType::Date32 {
-                    let date_str = value.trim_matches('\'');
+                    let date_str = value.trim_matches(|c| c == '\'' || c == '"');
                     let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
                         .map_err(|e| format!("invalid date literal '{date_str}': {e}"))?
                         .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
@@ -716,8 +751,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                         fields.len()
                                     ));
                                 }
-                                let field_name =
-                                    fields[(*pos as usize) - 1].name().clone();
+                                let field_name = fields[(*pos as usize) - 1].name().clone();
                                 self.analyze_struct_field_access(base, field_name)
                             }
                             _ => Err(format!(
@@ -752,6 +786,26 @@ impl<'a> super::AnalyzerContext<'a> {
                 Err("array slice syntax is not supported".to_string())
             }
         }
+    }
+
+    fn infer_scalar_subquery_data_type(&self, subquery: &sqlast::Query) -> DataType {
+        let saved_collected_len = self.collected_subqueries.borrow().len();
+        let saved_next_subquery_id = self.next_subquery_id.get();
+        let inferred = self
+            .analyze_query(subquery)
+            .ok()
+            .and_then(|query| {
+                query
+                    .output_columns
+                    .first()
+                    .map(|col| col.data_type.clone())
+            })
+            .unwrap_or(DataType::Null);
+        self.collected_subqueries
+            .borrow_mut()
+            .truncate(saved_collected_len);
+        self.next_subquery_id.set(saved_next_subquery_id);
+        inferred
     }
 
     fn analyze_compound_identifier(
@@ -789,15 +843,16 @@ impl<'a> super::AnalyzerContext<'a> {
             return Ok(current);
         }
 
-        let build_column_ref = |column_id, data_type, nullable, qualifier: Option<String>, column: &str| TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id,
-                qualifier,
-                column: column.to_lowercase(),
-            },
-            data_type,
-            nullable,
-        };
+        let build_column_ref =
+            |column_id, data_type, nullable, qualifier: Option<String>, column: &str| TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier,
+                    column: column.to_lowercase(),
+                },
+                data_type,
+                nullable,
+            };
 
         // Form 1: parts[0] is a qualifier, parts[1] is a column, parts[2..] are
         // struct subfields. Supports `t.col`, `t.col.field`, `t.col.f1.f2`, …
@@ -1090,12 +1145,18 @@ impl<'a> super::AnalyzerContext<'a> {
                     sqlast::BinaryOperator::Spaceship => "<=>",
                     _ => unreachable!(),
                 };
-                if let Some(logical) = scope.logical_type_of_expr(&left_typed) {
+                if let Some(logical) = scope
+                    .logical_type_of_expr(&left_typed)
+                    .filter(is_bitmap_or_hll_type)
+                {
                     return Err(format!(
                         "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
                     ));
                 }
-                if let Some(logical) = scope.logical_type_of_expr(&right_typed) {
+                if let Some(logical) = scope
+                    .logical_type_of_expr(&right_typed)
+                    .filter(is_bitmap_or_hll_type)
+                {
                     return Err(format!(
                         "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
                     ));
@@ -1105,10 +1166,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 // Cases like `array<int> = [map{...}, null]` would otherwise
                 // fall through to a runtime CAST that produces a confusing
                 // error; surface a clear analyzer-level message instead.
-                if let Some(reason) = incompatible_complex_compare(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                ) {
+                if let Some(reason) =
+                    incompatible_complex_compare(&left_typed.data_type, &right_typed.data_type)
+                {
                     return Err(format!(
                         "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
                     ));
@@ -1397,6 +1457,16 @@ impl<'a> super::AnalyzerContext<'a> {
                 nullable: false,
             });
         }
+        if matches!(name.as_str(), "array_length" | "cardinality")
+            && arg_exprs.len() == 1
+            && let Some(len) = syntactic_array_literal_len(arg_exprs[0])
+        {
+            return Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(len as i64)),
+                data_type: DataType::Int64,
+                nullable: false,
+            });
+        }
         if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
             return Err("group_concat should have at least one input.".to_string());
         }
@@ -1413,11 +1483,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 );
             }
         }
-        // Expand StarRocks-style `time_slice` / `date_slice` arguments so the
-        // executor sees (datetime, value, unit, boundary?):
-        //   * `INTERVAL N UNIT` is split into a numeric value + unit string.
-        //   * Bare identifiers `ceil` / `floor` in the boundary slot are
-        //     promoted to string literals (StarRocks accepts both unquoted).
+        if name == "any_value" && is_distinct {
+            return Err("Getting syntax error".to_string());
+        }
         // `date_add(dt, INTERVAL expr <UNIT>)` / `date_sub(...)` in MySQL
         // syntax: route to the unit-specific function (`seconds_add`,
         // `days_add`, etc.) and unwrap the Interval into its plain value
@@ -1454,59 +1522,102 @@ impl<'a> super::AnalyzerContext<'a> {
                 Vec::new()
             };
 
-        let time_slice_rewrites: Vec<sqlast::Expr> =
-            if matches!(name.as_str(), "time_slice" | "date_slice") && !arg_exprs.is_empty() {
-                let mut rewritten: Vec<sqlast::Expr> = Vec::with_capacity(arg_exprs.len() + 1);
-                for (idx, e) in arg_exprs.iter().enumerate() {
-                    // Position 1 is the interval; expand it into value + unit.
-                    if idx == 1
-                        && let sqlast::Expr::Interval(interval) = e
-                    {
-                        // StarRocks rejects non-integer constant
-                        // intervals at planning time; mirror that error
-                        // here rather than silently producing NULL.
-                        if !is_integer_const_literal(interval.value.as_ref()) {
-                            return Err(format!(
-                                "{name} requires second parameter must be a constant interval"
-                            ));
-                        }
-                        rewritten.push((*interval.value).clone());
-                        let unit = interval
-                            .leading_field
-                            .as_ref()
-                            .map(|f| format!("{f}").to_ascii_lowercase())
-                            .unwrap_or_else(|| "second".to_string());
-                        rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                            value: sqlast::Value::SingleQuotedString(unit),
-                            span: sqlparser::tokenizer::Span::empty(),
-                        }));
-                        continue;
-                    }
-                    let token = match e {
-                        sqlast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
-                        sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                            Some(parts[0].value.to_ascii_lowercase())
-                        }
-                        _ => None,
-                    };
-                    if let Some(token) = token
-                        && matches!(token.as_str(), "ceil" | "floor")
-                    {
-                        rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                            value: sqlast::Value::SingleQuotedString(token),
-                            span: sqlparser::tokenizer::Span::empty(),
-                        }));
-                    } else {
-                        rewritten.push((*e).clone());
-                    }
+        let array_generate_rewrites: Vec<sqlast::Expr> = if date_add_interval_rewrites.is_empty()
+            && name == "array_generate"
+            && arg_exprs.len() == 3
+        {
+            if let sqlast::Expr::Interval(interval) = arg_exprs[2] {
+                if !is_integer_const_literal(interval.value.as_ref()) {
+                    return Err(
+                        "array_generate requires step parameter must be a constant integer"
+                            .to_string(),
+                    );
                 }
-                rewritten
+                let unit = interval
+                    .leading_field
+                    .as_ref()
+                    .map(|f| format!("{f}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "second".to_string());
+                vec![
+                    (*arg_exprs[0]).clone(),
+                    (*arg_exprs[1]).clone(),
+                    signed_integer_literal_expr(interval.value.as_ref())
+                        .unwrap_or_else(|| (*interval.value).clone()),
+                    sqlast::Expr::Value(sqlast::ValueWithSpan {
+                        value: sqlast::Value::SingleQuotedString(unit),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }),
+                ]
             } else {
                 Vec::new()
-            };
-        let effective_arg_exprs: Vec<&sqlast::Expr> = if !date_add_interval_rewrites.is_empty()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Expand StarRocks-style `time_slice` / `date_slice` arguments so the
+        // executor sees (datetime, value, unit, boundary?):
+        //   * `INTERVAL N UNIT` is split into a numeric value + unit string.
+        //   * Bare identifiers `ceil` / `floor` in the boundary slot are
+        //     promoted to string literals (StarRocks accepts both unquoted).
+        let time_slice_rewrites: Vec<sqlast::Expr> = if date_add_interval_rewrites.is_empty()
+            && array_generate_rewrites.is_empty()
+            && matches!(name.as_str(), "time_slice" | "date_slice")
+            && !arg_exprs.is_empty()
         {
+            let mut rewritten: Vec<sqlast::Expr> = Vec::with_capacity(arg_exprs.len() + 1);
+            for (idx, e) in arg_exprs.iter().enumerate() {
+                // Position 1 is the interval; expand it into value + unit.
+                if idx == 1
+                    && let sqlast::Expr::Interval(interval) = e
+                {
+                    // StarRocks rejects non-integer constant
+                    // intervals at planning time; mirror that error
+                    // here rather than silently producing NULL.
+                    if !is_integer_const_literal(interval.value.as_ref()) {
+                        return Err(format!(
+                            "{name} requires second parameter must be a constant interval"
+                        ));
+                    }
+                    rewritten.push((*interval.value).clone());
+                    let unit = interval
+                        .leading_field
+                        .as_ref()
+                        .map(|f| format!("{f}").to_ascii_lowercase())
+                        .unwrap_or_else(|| "second".to_string());
+                    rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
+                        value: sqlast::Value::SingleQuotedString(unit),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }));
+                    continue;
+                }
+                let token = match e {
+                    sqlast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                    sqlast::Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                        Some(parts[0].value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                };
+                if let Some(token) = token
+                    && matches!(token.as_str(), "ceil" | "floor")
+                {
+                    rewritten.push(sqlast::Expr::Value(sqlast::ValueWithSpan {
+                        value: sqlast::Value::SingleQuotedString(token),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }));
+                } else {
+                    rewritten.push((*e).clone());
+                }
+            }
+            rewritten
+        } else {
+            Vec::new()
+        };
+
+        let effective_arg_exprs: Vec<&sqlast::Expr> = if !date_add_interval_rewrites.is_empty() {
             date_add_interval_rewrites.iter().collect()
+        } else if !array_generate_rewrites.is_empty() {
+            array_generate_rewrites.iter().collect()
         } else if !time_slice_rewrites.is_empty() {
             time_slice_rewrites.iter().collect()
         } else {
@@ -1590,6 +1701,16 @@ impl<'a> super::AnalyzerContext<'a> {
 
         self.validate_ds_hll_arguments(&name, &args_typed)?;
 
+        if name == "array_flatten"
+            && let Some(DataType::List(item)) = arg_types.first()
+            && !matches!(item.data_type(), DataType::List(_))
+        {
+            return Err(format!(
+                "The only one input of array_flatten should be an array of arrays, rather than {}",
+                starrocks_error_type_name(&arg_types[0])
+            ));
+        }
+
         if name == "array_agg" && is_distinct {
             if args_typed
                 .first()
@@ -1650,6 +1771,9 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.over {
+            if name == "any_value" {
+                return Err("any_value not supported with OVER clause".to_string());
+            }
             // StarRocks rejects LEAD/LAG when the third (default) argument
             // doesn't match a per-shape type rule. The error message echoes
             // the value column's type (INT/FLOAT/DECIMAL...) and is asserted
@@ -2016,7 +2140,13 @@ impl<'a> super::AnalyzerContext<'a> {
     ) -> Result<Option<TypedExpr>, String> {
         if !matches!(
             name,
-            "array_map" | "transform" | "any_match" | "all_match" | "array_filter" | "filter"
+            "array_map"
+                | "transform"
+                | "any_match"
+                | "all_match"
+                | "array_filter"
+                | "filter"
+                | "array_sort"
         ) {
             return Ok(None);
         }
@@ -2031,6 +2161,61 @@ impl<'a> super::AnalyzerContext<'a> {
             .collect::<Vec<_>>();
         if array_exprs.is_empty() {
             return Err(format!("{name} expects at least one ARRAY argument"));
+        }
+
+        if name == "array_sort" {
+            if array_exprs.len() != 1 || params.len() != 2 {
+                return Err(
+                    "array_sort lambda comparator expects one ARRAY argument and two lambda parameters"
+                        .to_string(),
+                );
+            }
+            let source = self.analyze_expr(array_exprs[0], scope)?;
+            let (item_type, item_nullable) = match &source.data_type {
+                DataType::List(item) => (item.data_type().clone(), item.is_nullable()),
+                DataType::Null => (DataType::Null, true),
+                other => return Err(format!("array_sort expects ARRAY argument, got {other:?}")),
+            };
+            let lambda_params = params
+                .iter()
+                .map(|param_name| LambdaParam {
+                    name: param_name.clone(),
+                    slot_id: self.alloc_lambda_slot_id(),
+                    data_type: item_type.clone(),
+                    nullable: item_nullable,
+                })
+                .collect::<Vec<_>>();
+            let mut lambda_scope = scope.clone();
+            for param in &lambda_params {
+                lambda_scope.add_lambda_param(param.clone());
+            }
+            let body = self.analyze_expr(&lambda_body, &lambda_scope)?;
+            if typed_expr_contains_column_ref(&body)
+                || typed_expr_contains_nondeterministic_call(&body)
+                || !typed_expr_references_all_lambda_params(&body, &lambda_params)
+            {
+                return Err(
+                    "Lambda function in sort_array should only depend on both two arguments and contain no non-deterministic functions"
+                        .to_string(),
+                );
+            }
+            let lambda = TypedExpr {
+                data_type: body.data_type.clone(),
+                nullable: body.nullable,
+                kind: ExprKind::LambdaFunction {
+                    params: lambda_params,
+                    body: Box::new(body),
+                },
+            };
+            return Ok(Some(TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "array_sort_lambda".to_string(),
+                    args: vec![source.clone(), lambda],
+                    distinct: false,
+                },
+                data_type: source.data_type,
+                nullable: true,
+            }));
         }
 
         let mut array_args = Vec::with_capacity(array_exprs.len());
@@ -2069,7 +2254,7 @@ impl<'a> super::AnalyzerContext<'a> {
         for param in &lambda_params {
             lambda_scope.add_lambda_param(param.clone());
         }
-        let body = self.analyze_expr(lambda_body, &lambda_scope)?;
+        let body = self.analyze_expr(&lambda_body, &lambda_scope)?;
         let lambda = TypedExpr {
             data_type: body.data_type.clone(),
             nullable: body.nullable,
@@ -2795,6 +2980,57 @@ fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
     }
 }
 
+fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
+    matches!(
+        scope.logical_type_of_expr(expr),
+        Some(crate::sql::SqlType::Json)
+    ) || matches!(
+        json_semantic_group_by_type_name(expr).as_deref(),
+        Some("json")
+    )
+}
+
+fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
+    matches!(
+        sql_type,
+        crate::sql::SqlType::Bitmap | crate::sql::SqlType::Hll
+    )
+}
+
+fn data_type_contains_null(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null => true,
+        DataType::List(field) => data_type_contains_null(field.data_type()),
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return false;
+            };
+            fields
+                .iter()
+                .any(|field| data_type_contains_null(field.data_type()))
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| data_type_contains_null(field.data_type())),
+        _ => false,
+    }
+}
+
+fn in_predicate_type_error(left: &DataType, right: &DataType) -> String {
+    if data_type_is_complex(left) && data_type_is_complex(right) {
+        "of in predict are not compatible".to_string()
+    } else {
+        "in predicate type does not support comparison".to_string()
+    }
+}
+
+fn data_type_is_complex(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_)
+    )
+}
+
 fn is_non_groupable_map_constructor(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::FunctionCall { name, .. } => name == "map",
@@ -3433,7 +3669,7 @@ fn parse_array_sortby_lambda(expr: &sqlast::Expr) -> Option<(String, &sqlast::Ex
 
 fn find_lambda_argument<'a>(
     arg_exprs: &[&'a sqlast::Expr],
-) -> Option<(usize, Vec<String>, &'a sqlast::Expr)> {
+) -> Option<(usize, Vec<String>, sqlast::Expr)> {
     if let Some((idx, params, body)) = arg_exprs
         .first()
         .and_then(|expr| parse_lambda_expr(expr))
@@ -3447,7 +3683,7 @@ fn find_lambda_argument<'a>(
         .map(|(params, body)| (arg_exprs.len() - 1, params, body))
 }
 
-fn parse_lambda_expr(expr: &sqlast::Expr) -> Option<(Vec<String>, &sqlast::Expr)> {
+fn parse_lambda_expr(expr: &sqlast::Expr) -> Option<(Vec<String>, sqlast::Expr)> {
     match expr {
         sqlast::Expr::Lambda(lambda) => Some((
             lambda
@@ -3455,13 +3691,25 @@ fn parse_lambda_expr(expr: &sqlast::Expr) -> Option<(Vec<String>, &sqlast::Expr)
                 .iter()
                 .map(|ident| ident.value.to_lowercase())
                 .collect(),
-            lambda.body.as_ref(),
+            (*lambda.body).clone(),
         )),
         sqlast::Expr::BinaryOp {
             left,
             op: sqlast::BinaryOperator::Arrow,
             right,
-        } => parse_lambda_params(left).map(|params| (params, right.as_ref())),
+        } => parse_lambda_params(left).map(|params| (params, (**right).clone())),
+        sqlast::Expr::BinaryOp { left, op, right } => {
+            parse_lambda_expr(left).map(|(params, body)| {
+                (
+                    params,
+                    sqlast::Expr::BinaryOp {
+                        left: Box::new(body),
+                        op: op.clone(),
+                        right: right.clone(),
+                    },
+                )
+            })
+        }
         sqlast::Expr::Nested(inner) => parse_lambda_expr(inner),
         _ => None,
     }
@@ -3832,11 +4080,62 @@ fn is_integer_const_literal(expr: &sqlast::Expr) -> bool {
             value: sqlast::Value::Number(s, _),
             ..
         }) => s.parse::<i64>().is_ok(),
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s),
+            ..
+        }) => s.parse::<i64>().is_ok(),
         sqlast::Expr::UnaryOp {
             op: sqlast::UnaryOperator::Minus | sqlast::UnaryOperator::Plus,
             expr,
         } => is_integer_const_literal(expr),
         _ => false,
+    }
+}
+
+fn signed_integer_literal_expr(expr: &sqlast::Expr) -> Option<sqlast::Expr> {
+    match expr {
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(s, long),
+            ..
+        }) if s.parse::<i64>().is_ok() => Some(sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(s.clone(), *long),
+            span: sqlparser::tokenizer::Span::empty(),
+        })),
+        sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s),
+            ..
+        }) if s.parse::<i64>().is_ok() => Some(sqlast::Expr::Value(sqlast::ValueWithSpan {
+            value: sqlast::Value::Number(s.clone(), false),
+            span: sqlparser::tokenizer::Span::empty(),
+        })),
+        sqlast::Expr::UnaryOp {
+            op: sqlast::UnaryOperator::Minus,
+            expr,
+        } => signed_integer_literal_expr(expr).and_then(|inner| match inner {
+            sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::Number(s, long),
+                ..
+            }) if !s.starts_with('-') => Some(sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::Number(format!("-{s}"), long),
+                span: sqlparser::tokenizer::Span::empty(),
+            })),
+            _ => None,
+        }),
+        sqlast::Expr::UnaryOp {
+            op: sqlast::UnaryOperator::Plus,
+            expr,
+        } => signed_integer_literal_expr(expr),
+        sqlast::Expr::Nested(inner) => signed_integer_literal_expr(inner),
+        _ => None,
+    }
+}
+
+fn syntactic_array_literal_len(expr: &sqlast::Expr) -> Option<usize> {
+    match expr {
+        sqlast::Expr::Array(array) => Some(array.elem.len()),
+        sqlast::Expr::Nested(inner) => syntactic_array_literal_len(inner),
+        sqlast::Expr::Cast { expr, .. } => syntactic_array_literal_len(expr),
+        _ => None,
     }
 }
 
@@ -3983,9 +4282,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                                 _ => (format!("col{}", i + 1), DataType::Null),
                             };
                             std::sync::Arc::new(arrow::datatypes::Field::new(
-                                field_name,
-                                value_type,
-                                true,
+                                field_name, value_type, true,
                             ))
                         })
                         .collect();
@@ -4060,6 +4357,20 @@ fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
         }
         DataType::Null => "null".to_string(),
         other => format!("{:?}", other).to_lowercase(),
+    }
+}
+
+fn starrocks_error_type_name(dt: &DataType) -> String {
+    match dt {
+        DataType::Int8 => "tinyint(4)".to_string(),
+        DataType::Int16 => "smallint(6)".to_string(),
+        DataType::Int32 => "int(11)".to_string(),
+        DataType::Int64 => "bigint(20)".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar(65533)".to_string(),
+        DataType::List(field) => {
+            format!("array<{}>", starrocks_error_type_name(field.data_type()))
+        }
+        other => arrow_type_to_starrocks_name(other),
     }
 }
 
@@ -4162,6 +4473,185 @@ fn column_name_of_expr(expr: &TypedExpr) -> String {
     }
 }
 
+fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::ColumnRef { .. } => true,
+        ExprKind::BinaryOp { left, right, .. } => {
+            typed_expr_contains_column_ref(left) || typed_expr_contains_column_ref(right)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_column_ref(expr),
+        ExprKind::FunctionCall { args, .. }
+        | ExprKind::AggregateCall { args, .. }
+        | ExprKind::WindowCall { args, .. } => args.iter().any(typed_expr_contains_column_ref),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| typed_expr_contains_column_ref(expr))
+                || when_then.iter().any(|(when, then)| {
+                    typed_expr_contains_column_ref(when) || typed_expr_contains_column_ref(then)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| typed_expr_contains_column_ref(expr))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            typed_expr_contains_column_ref(expr)
+                || typed_expr_contains_column_ref(low)
+                || typed_expr_contains_column_ref(high)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            typed_expr_contains_column_ref(expr) || typed_expr_contains_column_ref(pattern)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            typed_expr_contains_column_ref(expr) || list.iter().any(typed_expr_contains_column_ref)
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            typed_expr_contains_column_ref(body)
+        }
+        _ => false,
+    }
+}
+
+fn typed_expr_contains_nondeterministic_call(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::FunctionCall { name, args, .. } => {
+            matches!(
+                name.as_str(),
+                "rand" | "random" | "uuid" | "now" | "current_timestamp" | "current_time"
+            ) || args.iter().any(typed_expr_contains_nondeterministic_call)
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            typed_expr_contains_nondeterministic_call(left)
+                || typed_expr_contains_nondeterministic_call(right)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_nondeterministic_call(expr),
+        ExprKind::AggregateCall { args, .. } | ExprKind::WindowCall { args, .. } => {
+            args.iter().any(typed_expr_contains_nondeterministic_call)
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| typed_expr_contains_nondeterministic_call(expr))
+                || when_then.iter().any(|(when, then)| {
+                    typed_expr_contains_nondeterministic_call(when)
+                        || typed_expr_contains_nondeterministic_call(then)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| typed_expr_contains_nondeterministic_call(expr))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            typed_expr_contains_nondeterministic_call(expr)
+                || typed_expr_contains_nondeterministic_call(low)
+                || typed_expr_contains_nondeterministic_call(high)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            typed_expr_contains_nondeterministic_call(expr)
+                || typed_expr_contains_nondeterministic_call(pattern)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            typed_expr_contains_nondeterministic_call(expr)
+                || list.iter().any(typed_expr_contains_nondeterministic_call)
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            typed_expr_contains_nondeterministic_call(body)
+        }
+        _ => false,
+    }
+}
+
+fn typed_expr_references_all_lambda_params(expr: &TypedExpr, params: &[LambdaParam]) -> bool {
+    let mut referenced = std::collections::HashSet::new();
+    collect_lambda_param_refs(expr, &mut referenced);
+    params
+        .iter()
+        .all(|param| referenced.contains(param.name.as_str()))
+}
+
+fn collect_lambda_param_refs<'a>(
+    expr: &'a TypedExpr,
+    referenced: &mut std::collections::HashSet<&'a str>,
+) {
+    match &expr.kind {
+        ExprKind::LambdaParamRef { name, .. } => {
+            referenced.insert(name.as_str());
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_lambda_param_refs(left, referenced);
+            collect_lambda_param_refs(right, referenced);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. } => collect_lambda_param_refs(expr, referenced),
+        ExprKind::FunctionCall { args, .. }
+        | ExprKind::AggregateCall { args, .. }
+        | ExprKind::WindowCall { args, .. } => {
+            for arg in args {
+                collect_lambda_param_refs(arg, referenced);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_lambda_param_refs(operand, referenced);
+            }
+            for (when, then) in when_then {
+                collect_lambda_param_refs(when, referenced);
+                collect_lambda_param_refs(then, referenced);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_lambda_param_refs(else_expr, referenced);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_lambda_param_refs(expr, referenced);
+            collect_lambda_param_refs(low, referenced);
+            collect_lambda_param_refs(high, referenced);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_lambda_param_refs(expr, referenced);
+            collect_lambda_param_refs(pattern, referenced);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_lambda_param_refs(expr, referenced);
+            for item in list {
+                collect_lambda_param_refs(item, referenced);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+            collect_lambda_param_refs(body, referenced);
+        }
+        _ => {}
+    }
+}
+
 /// Best-effort defaults for MySQL-style `@@var` session variables. We do not
 /// yet store per-session state for these, so we just hand back the value the
 /// regression tests assume so they can run end-to-end. Unknown names resolve
@@ -4224,12 +4714,14 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
     // disqualifying signal; pairs of incompatible scalars (e.g. Int32 vs
     // Utf8) are left to the existing CAST kernel.
     match (left, right) {
-        (DataType::List(l), DataType::List(r)) | (DataType::LargeList(l), DataType::LargeList(r)) => {
+        (DataType::List(l), DataType::List(r))
+        | (DataType::LargeList(l), DataType::LargeList(r)) => {
             incompatible_complex_compare(l.data_type(), r.data_type())
                 .map(|inner| format!("ARRAY of incompatible elements ({inner})"))
         }
         (DataType::Map(l, _), DataType::Map(r, _)) => {
-            let (DataType::Struct(lf), DataType::Struct(rf)) = (l.data_type(), r.data_type()) else {
+            let (DataType::Struct(lf), DataType::Struct(rf)) = (l.data_type(), r.data_type())
+            else {
                 return None;
             };
             if lf.len() != 2 || rf.len() != 2 {
@@ -4248,9 +4740,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
                 ));
             }
             for (a, b) in lf.iter().zip(rf.iter()) {
-                if let Some(inner) =
-                    incompatible_complex_compare(a.data_type(), b.data_type())
-                {
+                if let Some(inner) = incompatible_complex_compare(a.data_type(), b.data_type()) {
                     return Some(format!("STRUCT field `{}` ({inner})", a.name()));
                 }
             }

@@ -36,10 +36,10 @@ pub(super) struct AnalyzerScope {
     /// `COALESCE(left.id, right.id)` so that null-padding on either side
     /// still produces the correct merged value.
     computed_columns: HashMap<String, crate::sql::analysis::TypedExpr>,
-    /// Logical type tags for columns whose Arrow `DataType` is ambiguous —
-    /// today only BITMAP and HLL, both stored as `DataType::Binary`. The
-    /// analyzer consults this side-table to reject misuse (ORDER BY /
-    /// GROUP BY / comparison / key / distribution). Keyed by lower-cased
+    /// Logical type tags for columns whose Arrow `DataType` is ambiguous
+    /// (for example JSON-as-Utf8 or BITMAP/HLL-as-Binary). The analyzer
+    /// consults this side-table to reject or special-case semantics that
+    /// depend on the original StarRocks logical type. Keyed by lower-cased
     /// (qualifier, column) and the unqualified column name.
     qualified_logical_types: HashMap<(String, String), crate::sql::SqlType>,
     unqualified_logical_types: HashMap<String, crate::sql::SqlType>,
@@ -66,8 +66,8 @@ impl AnalyzerScope {
     }
 
     /// Look up the logical type tag for a column reference. Returns the
-    /// StarRocks `SqlType` for BITMAP/HLL columns; `None` for all other
-    /// columns (including those whose Arrow type fully describes them).
+    /// StarRocks `SqlType` for tagged columns; `None` for columns whose Arrow
+    /// type fully describes them.
     pub(super) fn logical_type_for(
         &self,
         qualifier: Option<&str>,
@@ -86,10 +86,8 @@ impl AnalyzerScope {
 
     /// Convenience: if `expr` is a `ColumnRef`, return the column's logical
     /// type tag. Returns `None` for expressions that are not direct column
-    /// references — the BITMAP/HLL fail-fast checks only need to recognise
-    /// the column-ref case because comparison / sort / group of *derived*
-    /// BITMAP/HLL values would already have been rejected when the producer
-    /// function was resolved.
+    /// references. Derived logical values are detected by their producer
+    /// expressions where needed.
     pub(super) fn logical_type_of_expr(
         &self,
         expr: &crate::sql::analysis::TypedExpr,

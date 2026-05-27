@@ -18,6 +18,7 @@ use tokio::task;
 use tracing::{info, warn};
 
 use crate::common::failpoint::{self, FailPointMode};
+use crate::common::util::format_mysql_container_value_with_schema;
 use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
@@ -720,6 +721,7 @@ async fn execute_statement_text(
     }
 
     if let Some((name, value)) = parse_set_user_variable_query(trimmed) {
+        let value = materialize_user_variable_value(shim, &value).await?;
         shim.user_variables.insert(name, value);
         return Ok(StatementResult::Ok);
     }
@@ -766,8 +768,14 @@ async fn execute_statement_text(
         ));
     }
 
+    execute_sql_in_worker(shim, rewritten).await
+}
+
+async fn execute_sql_in_worker(
+    shim: &NovaRocksMysqlShim,
+    sql: String,
+) -> Result<StatementResult, (ErrorKind, String)> {
     let session = shim.engine.session();
-    let sql = rewritten;
     let current_catalog = shim.current_catalog.clone();
     let current_db = shim.current_db.clone();
     let query_timeout = shim.query_timeout_secs;
@@ -800,10 +808,6 @@ async fn execute_statement_text(
             match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
                 Ok(join_result) => join_result,
                 Err(_elapsed) => {
-                    // The blocking task continues to run in the background
-                    // (tokio cannot cancel spawn_blocking work). The client
-                    // sees an error and may disconnect; the worker thread
-                    // will finish on its own and its result is discarded.
                     return Err((
                         ErrorKind::ER_QUERY_INTERRUPTED,
                         format!("Query exceeded timeout of {secs}s"),
@@ -825,6 +829,72 @@ async fn execute_statement_text(
             format!("standalone query worker failed: {err}"),
         )),
     }
+}
+
+async fn materialize_user_variable_value(
+    shim: &NovaRocksMysqlShim,
+    value: &str,
+) -> Result<String, (ErrorKind, String)> {
+    let Some(inner_query) = parenthesized_query(value) else {
+        return Ok(value.to_string());
+    };
+    let rewritten = substitute_session_user_variables(inner_query, &shim.user_variables)
+        .map_err(|err| (ErrorKind::ER_PARSE_ERROR, err))?;
+    match execute_sql_in_worker(shim, rewritten).await? {
+        StatementResult::Query(result) => query_result_to_user_variable_literal(&result),
+        StatementResult::Ok => Err((
+            ErrorKind::ER_WRONG_VALUE,
+            "user variable assignment query did not return a value".to_string(),
+        )),
+    }
+}
+
+fn parenthesized_query(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let lower = inner.to_ascii_lowercase();
+    (lower.starts_with("select ") || lower.starts_with("with ")).then_some(inner)
+}
+
+fn query_result_to_user_variable_literal(
+    result: &crate::engine::QueryResult,
+) -> Result<String, (ErrorKind, String)> {
+    if result.columns.len() != 1 {
+        return Err((
+            ErrorKind::ER_OPERAND_COLUMNS,
+            format!(
+                "user variable assignment expected 1 column, got {}",
+                result.columns.len()
+            ),
+        ));
+    }
+    let row_count = result.row_count();
+    if row_count == 0 {
+        return Ok("null".to_string());
+    }
+    if row_count > 1 {
+        return Err((
+            ErrorKind::ER_SUBQUERY_NO_1_ROW,
+            "Subquery returns more than 1 row".to_string(),
+        ));
+    }
+    for chunk in &result.chunks {
+        if chunk.len() == 0 {
+            continue;
+        }
+        let column = chunk
+            .columns()
+            .first()
+            .ok_or((ErrorKind::ER_UNKNOWN_ERROR, "empty query chunk".to_string()))?;
+        let field_schema = chunk
+            .chunk_schema()
+            .slots()
+            .first()
+            .map(|slot| slot.field_schema());
+        return format_mysql_container_value_with_schema(column, 0, field_schema)
+            .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err));
+    }
+    Ok("null".to_string())
 }
 
 fn resolve_catalog_name(

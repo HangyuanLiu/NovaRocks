@@ -11,11 +11,10 @@ pub struct ColumnDef {
     pub write_default: Option<iceberg::spec::Literal>,
     /// Logical (StarRocks) type when the Arrow `data_type` collapses several
     /// distinct logical kinds onto the same storage representation. Today the
-    /// only consumers are BITMAP and HLL columns: both materialise as
-    /// `DataType::Binary`, but the analyzer needs to distinguish them from a
-    /// raw `BINARY` column so it can reject misuse (ORDER BY / GROUP BY /
-    /// comparison / key / distribution). `None` means "the Arrow type is the
-    /// authoritative type".
+    /// consumers are logical types such as JSON, BITMAP, and HLL when they
+    /// materialise as generic Arrow storage. The analyzer uses this side table
+    /// to preserve StarRocks semantics that are not encoded in Arrow alone.
+    /// `None` means "the Arrow type is the authoritative type".
     pub logical_type: Option<crate::sql::SqlType>,
 }
 

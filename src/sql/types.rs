@@ -142,6 +142,9 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Struct(left_fields), DataType::Struct(right_fields))
             if left_fields.len() == right_fields.len() =>
         {
+            if let Some(fields) = wider_struct_fields_by_name(left_fields, right_fields) {
+                return DataType::Struct(fields);
+            }
             DataType::Struct(Fields::from(
                 left_fields
                     .iter()
@@ -207,8 +210,35 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
         (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
+        (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int16,
         _ => a.clone(),
     }
+}
+
+fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> Option<Fields> {
+    let right_by_name = right_fields
+        .iter()
+        .map(|field| (field.name().as_str(), field))
+        .collect::<std::collections::HashMap<_, _>>();
+    if left_fields
+        .iter()
+        .any(|field| !right_by_name.contains_key(field.name().as_str()))
+    {
+        return None;
+    }
+    Some(Fields::from(
+        left_fields
+            .iter()
+            .map(|left_field| {
+                let right_field = right_by_name.get(left_field.name().as_str())?;
+                Some(Arc::new(Field::new(
+                    left_field.name(),
+                    wider_type(left_field.data_type(), right_field.data_type()),
+                    left_field.is_nullable() || right_field.is_nullable(),
+                )))
+            })
+            .collect::<Option<Vec<_>>>()?,
+    ))
 }
 
 fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {

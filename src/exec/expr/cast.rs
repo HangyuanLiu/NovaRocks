@@ -1784,6 +1784,9 @@ fn cast_with_special_rules_with_field_schema(
     if target_type == &DataType::Null {
         return Ok(new_null_array(&DataType::Null, array.len()));
     }
+    if array.data_type() == &DataType::Null {
+        return Ok(new_null_array(target_type, array.len()));
+    }
     match (array.data_type(), target_type) {
         (DataType::Utf8, DataType::Date32) => {
             let arr = array
@@ -3755,6 +3758,27 @@ fn cast_variant_array(
                 builder.append_value(micros);
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
+            let mut values = Vec::with_capacity(variant_arr.len());
+            for row in 0..variant_arr.len() {
+                let value = match parse_variant(variant_arr, row) {
+                    Some(v) => v,
+                    None => {
+                        values.push(None);
+                        continue;
+                    }
+                };
+                if is_variant_null(&value).unwrap_or(true) {
+                    values.push(None);
+                    continue;
+                }
+                let json_text = value.to_json_local()?;
+                let json = serde_json::from_str::<JsonValue>(&json_text)
+                    .map_err(|e| format!("CAST VARIANT complex JSON parse failed: {e}"))?;
+                values.push(Some(json));
+            }
+            cast_json_values_to_target(&values, target_type, None)
         }
         _ => Err("CAST from VARIANT is not supported".to_string()),
     }

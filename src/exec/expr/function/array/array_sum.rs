@@ -18,7 +18,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, ListArray,
+    Int16Array, Int32Array, Int64Array, ListArray, StringArray,
 };
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -87,6 +87,36 @@ where
             }
             has_value = true;
             sum += value_at(values, idx);
+        }
+        out.push(has_value.then_some(sum));
+    }
+    out
+}
+
+fn sum_utf8_rows(list: &ListArray, values: &StringArray, chunk_len: usize) -> Vec<Option<f64>> {
+    let offsets = list.value_offsets();
+    let mut out = Vec::with_capacity(chunk_len);
+    for row in 0..chunk_len {
+        let row_idx = super::common::row_index(row, list.len());
+        if list.is_null(row_idx) {
+            out.push(None);
+            continue;
+        }
+
+        let start = offsets[row_idx] as usize;
+        let end = offsets[row_idx + 1] as usize;
+        let mut sum = 0.0_f64;
+        let mut has_value = false;
+        for idx in start..end {
+            if values.is_null(idx) {
+                continue;
+            }
+            if let Ok(value) = values.value(idx).trim().parse::<f64>()
+                && value.is_finite()
+            {
+                has_value = true;
+                sum += value;
+            }
         }
         out.push(has_value.then_some(sum));
     }
@@ -227,6 +257,10 @@ pub fn eval_array_sum(
                 chunk.len(),
                 |a, idx| a.value(idx),
             ))) as ArrayRef
+        }
+        arrow::datatypes::DataType::Utf8 => {
+            let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+            Arc::new(Float64Array::from(sum_utf8_rows(list, values, chunk.len()))) as ArrayRef
         }
         arrow::datatypes::DataType::Decimal128(precision, scale) => {
             let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
