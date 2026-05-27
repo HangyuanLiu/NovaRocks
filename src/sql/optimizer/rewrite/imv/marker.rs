@@ -5,7 +5,13 @@
 //! stage of the IMV pipeline wraps the root; the `imv-validation` stage
 //! rejects any plan that still carries a marker afterwards.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::LogicalPlan;
 
 /// `Delta(plan)` — "compute the incremental of plan". Typically wraps the
@@ -35,6 +41,64 @@ pub(crate) struct ImvVersionNode {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImvVersionRef {
     _private: (),
+}
+
+/// Wraps the root of an IMV refresh plan in `ImvDelta { is_root: true }`.
+/// One-shot per pipeline run: the `wrapped` flag is set on the first
+/// apply and short-circuits every subsequent `matches()` so the rule
+/// fires exactly once even though TopDown traversal would otherwise
+/// revisit the child of the new `ImvDelta`.
+pub(crate) struct WrapRootInImvDeltaRule {
+    wrapped: AtomicBool,
+}
+
+impl WrapRootInImvDeltaRule {
+    pub(crate) fn new() -> Self {
+        Self {
+            wrapped: AtomicBool::new(false),
+        }
+    }
+}
+
+impl LogicalRewriteRule for WrapRootInImvDeltaRule {
+    fn name(&self) -> &'static str {
+        "WrapRootInImvDelta"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+        if self.wrapped.load(Ordering::SeqCst) {
+            return false;
+        }
+        // Plan was already wrapped before the pipeline ran (e.g. re-entry
+        // on a previously wrapped plan): record the fact and skip.
+        if matches!(
+            plan,
+            LogicalPlan::ImvDelta(ImvDeltaNode { is_root: true, .. })
+        ) {
+            self.wrapped.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        self.wrapped.store(true, Ordering::SeqCst);
+        Ok(RewriteResult::Changed(LogicalPlan::ImvDelta(
+            ImvDeltaNode {
+                input: Box::new(plan),
+                is_root: true,
+                action_column: None,
+            },
+        )))
+    }
 }
 
 /// Returns true if `plan` contains any `ImvDelta` or `ImvVersion` node at
@@ -122,6 +186,55 @@ fn collect_into(plan: &LogicalPlan, found: &mut Vec<&'static str>) {
 mod tests {
     use super::*;
     use crate::sql::planner::plan::{LogicalPlan, ValuesNode};
+
+    #[test]
+    fn wrap_rule_wraps_plain_root_once() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+
+        let plan = empty_values_plan();
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "imv-delta-marker",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(WrapRootInImvDeltaRule::new())],
+        )]);
+
+        let out = pipeline.rewrite(plan, &mut ctx).unwrap();
+
+        let LogicalPlan::ImvDelta(delta) = out else {
+            panic!("expected ImvDelta at root");
+        };
+        assert!(delta.is_root);
+        assert!(delta.action_column.is_none());
+        assert!(matches!(*delta.input, LogicalPlan::Values(_)));
+    }
+
+    #[test]
+    fn wrap_rule_is_idempotent_on_already_wrapped_plan() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+
+        let already = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(empty_values_plan()),
+            is_root: true,
+            action_column: None,
+        });
+        let before = format!("{already:?}");
+
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "imv-delta-marker",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(WrapRootInImvDeltaRule::new())],
+        )]);
+
+        let out = pipeline.rewrite(already, &mut ctx).unwrap();
+        assert_eq!(format!("{out:?}"), before, "wrap must not double-wrap");
+    }
 
     fn empty_values_plan() -> LogicalPlan {
         LogicalPlan::Values(ValuesNode {
