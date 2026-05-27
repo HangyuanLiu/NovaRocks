@@ -25,7 +25,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::connector::starrocks::managed::state_codec::{
+use crate::connector::starrocks::table::state_codec::{
     KeyValue, MultisetEntry, decode_multiset_self_describing, decode_multiset_with_key_type,
     encode_multiset, key_type_tag_for_data_type, read_key, union_multisets,
 };
@@ -377,7 +377,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryBuilder, Float64Array, Int64Array};
 
     use super::*;
-    use crate::connector::starrocks::managed::state_codec::{
+    use crate::connector::starrocks::table::state_codec::{
         decode_multiset_with_key_type, write_key_at,
     };
 

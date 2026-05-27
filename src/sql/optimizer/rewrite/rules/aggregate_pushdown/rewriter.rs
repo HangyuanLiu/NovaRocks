@@ -153,7 +153,6 @@ mod tests {
                 name: name.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: ScanSource::StarRocks,
             },
             alias: None,
@@ -168,6 +167,7 @@ mod tests {
                 .collect(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

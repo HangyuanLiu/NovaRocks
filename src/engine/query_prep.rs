@@ -634,7 +634,10 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     };
     let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table_name)?;
     crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
-        namespace, table_name, loaded,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
     )
 }
 
@@ -673,12 +676,18 @@ pub(crate) fn build_iceberg_table_def_with_files(
         )
         .collect();
     crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
-        &entry, namespace, table_name, loaded, data_files,
+        &entry,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
+        data_files,
     )
 }
 
 pub(crate) fn build_iceberg_delta_table_def_with_files(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    catalog_name: &str,
     namespace: &str,
     table_name: &str,
     loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -687,7 +696,12 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
     let change_ops = validate_delta_file_change_ops(&data_files)?;
     let data_files = iceberg_files_for_query_to_stats(data_files);
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
-        entry, namespace, table_name, loaded, data_files,
+        entry,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
+        data_files,
     )?;
     stamp_delta_table_def_change_ops(&mut table_def, &change_ops)?;
     Ok(table_def)
@@ -774,9 +788,10 @@ fn stamp_delta_table_def_change_ops(
             logical_type: None,
         });
 
-    let ScanSource::S3ParquetFiles { files, .. } = &mut table_def.source else {
+    let ScanSource::IcebergDataFiles { files, .. } = &mut table_def.source else {
         return Err(
-            "iceberg delta source requires S3 parquet file storage for synthetic files".to_string(),
+            "iceberg delta source requires Iceberg data-file storage for synthetic files"
+                .to_string(),
         );
     };
     if files.len() != change_ops.len() {
@@ -795,8 +810,22 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::engine::query_prep::IcebergFileForQuery;
-    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::parser::ast::ObjectName;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
         let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse sql");
@@ -941,9 +970,9 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: vec![crate::sql::catalog::S3FileInfo {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
+                files: vec![crate::sql::catalog::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -971,7 +1000,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
+        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(1));
@@ -1012,9 +1041,9 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: vec![crate::sql::catalog::S3FileInfo {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
+                files: vec![crate::sql::catalog::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -1052,7 +1081,7 @@ mod tests {
                 ("__change_op", &arrow::datatypes::DataType::Int8, false),
             ]
         );
-        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
+        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(-1));
@@ -1061,9 +1090,9 @@ mod tests {
     #[test]
     fn delta_table_builder_accepts_empty_iceberg_storage() {
         // The IVM-A1 delta source `stamp_delta_table_def_change_ops`
-        // requires the base table to be backed by `S3ParquetFiles`
+        // requires the base table to be backed by `IcebergDataFiles`
         // (real or synthetic). An empty Iceberg snapshot legitimately
-        // produces `S3ParquetFiles { files: vec![] }` (see
+        // produces `IcebergDataFiles { files: vec![] }` (see
         // `connector/iceberg/catalog/backend.rs::empty_iceberg_scan_source`);
         // ensure that path round-trips correctly when stamping with an
         // empty change-op slice.
@@ -1071,8 +1100,8 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
             },
@@ -1089,7 +1118,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let ScanSource::S3ParquetFiles { files, .. } = &table_def.source else {
+        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
             panic!("expected empty delta to use s3 parquet storage");
         };
         assert!(files.is_empty());

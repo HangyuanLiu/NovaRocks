@@ -11,7 +11,7 @@ Scope:
 - metadata-only / no-op refresh behavior
 - target catalog visibility and DROP cleanup
 
-Managed-lake materialized views over Iceberg base tables remain in
+StarRocks table materialized views over Iceberg base tables remain in
 `sql-tests/mv-on-iceberg`. Keeping the suites separate makes the Iceberg-backed
 MV target path usable as a clean regression gate for Iceberg-backed MV work.
 
@@ -20,6 +20,6 @@ Recommended invocation:
 ```bash
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite iceberg-ivm \
-  --config tests/sql-test-runner/conf/standalone_managed_lake.conf \
+  --config tests/sql-test-runner/conf/standalone_starrocks_table.conf \
   --mode verify
 ```

@@ -83,7 +83,6 @@ mod tests {
                 name: table.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: ScanSource::StarRocks,
             },
             alias: None,
@@ -95,6 +94,7 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let mut col_stats = HashMap::new();
         col_stats.insert(

@@ -1681,7 +1681,7 @@ fn rewrite_overwrite_partitions(sql: &str) -> Result<String, String> {
     Ok(output)
 }
 
-/// Strip a bare `FROM dual` so the managed-lake path doesn't need a real
+/// Strip a bare `FROM dual` so the StarRocks table path doesn't need a real
 /// `dual` table. Only rewrites when the `FROM dual` appears at top-level
 /// with nothing meaningful after it (end of string, `;`, or a comment).
 /// Anything else (WHERE/GROUP/HAVING/LIMIT/ORDER/JOIN) is left untouched

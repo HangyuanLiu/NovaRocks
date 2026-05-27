@@ -320,6 +320,7 @@ fn execute_mor_update(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -531,6 +532,7 @@ fn execute_cow_update(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -1390,7 +1392,7 @@ fn resolve_merge_insert_columns(
 
     // Empty `INSERT VALUES (...)` (no column list) means "values match target
     // schema in declaration order". Iceberg row-lineage columns (`_row_id`
-    // etc.) are reserved/managed and never appear in the user-visible target
+    // etc.) are reserved/owned and never appear in the user-visible target
     // schema returned from `iceberg_table_columns`, so we don't have to
     // filter them here.
     if action.columns.is_empty() {
@@ -1790,6 +1792,7 @@ fn execute_merge_matched_delete(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 
@@ -1851,6 +1854,7 @@ fn execute_merge_unmatched_insert(
     })??;
 
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, target)?;
+    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
     Ok(StatementResult::Ok)
 }
 

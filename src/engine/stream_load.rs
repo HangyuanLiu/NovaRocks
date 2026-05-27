@@ -2,7 +2,7 @@
 //!
 //! These helpers take the raw request body (CSV or JSON) and produce
 //! `Vec<Vec<Literal>>` rows that any INSERT backend can consume. They
-//! intentionally live outside the `local/` module so the managed-lake
+//! intentionally live outside the `local/` module so the StarRocks table
 //! stream load (and any future backend) can share them.
 
 use csv::{ReaderBuilder, Terminator, Trim};

@@ -1,6 +1,6 @@
 -- BITMAP / HLL type misuse fail-fast checks.
 --
--- This case verifies that the analyzer / managed-lake DDL layer rejects
+-- This case verifies that the analyzer / StarRocks table DDL layer rejects
 -- the five misuse patterns documented in the BITMAP / HLL plan (PR-B2):
 --   1. ORDER BY  on a BITMAP / HLL column
 --   2. GROUP BY  on a BITMAP / HLL column

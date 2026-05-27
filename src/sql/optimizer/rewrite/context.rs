@@ -1,10 +1,71 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::engine::dictionary::model::DictionarySnapshot;
+use crate::sql::catalog::TableDef;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::statistics::TableStatistics;
+
+/// Loads dictionary snapshots for scan-time low-cardinality string columns.
+/// Implemented by the engine layer (production) and by tests (fakes).
+pub(crate) trait QueryDictionaryProvider: Send + Sync {
+    fn load_active_snapshot(
+        &self,
+        table: &TableDef,
+        database: &str,
+        column_name: &str,
+    ) -> Result<Option<DictionarySnapshot>, String>;
+}
+
+thread_local! {
+    /// Per-thread fallback dictionary provider. Set by
+    /// `StandaloneSession::execute_in_context` for the duration of one
+    /// SQL statement so that the many downstream engine entry points
+    /// that funnel into `optimize()` do not each have to thread the
+    /// provider through their signatures. The provider passed
+    /// explicitly to `optimize()` takes precedence.
+    static CURRENT_DICTIONARY_PROVIDER: RefCell<Option<Arc<dyn QueryDictionaryProvider>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII guard restoring the previous dictionary provider on scope exit.
+/// Restoration runs in `Drop`, which fires on both normal return and
+/// stack unwinding from a panic. This guarantees the TLS slot cannot
+/// leak a provider into the next query that lands on the same worker
+/// thread (e.g. a `spawn_blocking` pool thread).
+struct DictionaryProviderGuard {
+    previous: Option<Arc<dyn QueryDictionaryProvider>>,
+}
+
+impl Drop for DictionaryProviderGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT_DICTIONARY_PROVIDER.with(|cell| {
+            cell.replace(previous);
+        });
+    }
+}
+
+/// Install `provider` as the current-thread fallback for the duration
+/// of `f`. The previous binding is restored on scope exit by an RAII
+/// guard, so a panic inside `f` still restores correctly during stack
+/// unwinding (relevant on worker pools where the same thread is reused
+/// across queries).
+pub(crate) fn with_dictionary_provider<T>(
+    provider: Arc<dyn QueryDictionaryProvider>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let previous = CURRENT_DICTIONARY_PROVIDER.with(|cell| cell.replace(Some(provider)));
+    let _guard = DictionaryProviderGuard { previous };
+    f()
+}
+
+pub(crate) fn current_dictionary_provider() -> Option<Arc<dyn QueryDictionaryProvider>> {
+    CURRENT_DICTIONARY_PROVIDER.with(|cell| cell.borrow().clone())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteConsumer {
@@ -42,6 +103,7 @@ pub(crate) struct RewriteContext {
     extension: Option<Arc<dyn Any + Send + Sync>>,
     query_table_stats: Option<Arc<HashMap<String, TableStatistics>>>,
     deadline: Option<Instant>,
+    dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
 }
 
 impl RewriteContext {
@@ -54,6 +116,7 @@ impl RewriteContext {
             extension: None,
             query_table_stats: None,
             deadline: None,
+            dictionary_provider: None,
         }
     }
 
@@ -120,6 +183,14 @@ impl RewriteContext {
         self.deadline = Some(deadline);
     }
 
+    pub(crate) fn set_dictionary_provider(&mut self, provider: Arc<dyn QueryDictionaryProvider>) {
+        self.dictionary_provider = Some(provider);
+    }
+
+    pub(crate) fn dictionary_provider(&self) -> Option<&Arc<dyn QueryDictionaryProvider>> {
+        self.dictionary_provider.as_ref()
+    }
+
     pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {
         if self
             .deadline
@@ -181,6 +252,93 @@ mod tests {
             Some(&TestExtension { value: 7 })
         );
         assert!(ctx.extension::<String>().is_none());
+    }
+
+    // --- Item 2 (Critical) regression: with_dictionary_provider RAII ---
+
+    /// Marker provider that records its label so the test can prove
+    /// which `Arc` is currently installed in the TLS slot.
+    struct LabelledProvider {
+        label: &'static str,
+    }
+
+    impl QueryDictionaryProvider for LabelledProvider {
+        fn load_active_snapshot(
+            &self,
+            _table: &TableDef,
+            _database: &str,
+            _column_name: &str,
+        ) -> Result<Option<DictionarySnapshot>, String> {
+            Err(format!("LabelledProvider({})", self.label))
+        }
+    }
+
+    fn current_provider_label() -> Option<String> {
+        let provider = current_dictionary_provider()?;
+        // Trigger load_active_snapshot to extract the embedded label.
+        // We have no `TableDef::dummy()` helper handy, so reach for the
+        // engine layer's dictionary model and synthesize one inline.
+        use crate::sql::catalog::{ScanSource, TableDef};
+        let table = TableDef {
+            name: "probe".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks,
+        };
+        let err = provider
+            .load_active_snapshot(&table, "db", "col")
+            .err()
+            .expect("LabelledProvider always errors");
+        Some(err)
+    }
+
+    #[test]
+    fn with_dictionary_provider_restores_after_panic() {
+        // Sanity: TLS starts unset for this thread.
+        let baseline = current_dictionary_provider();
+
+        let outer: Arc<dyn QueryDictionaryProvider> = Arc::new(LabelledProvider { label: "outer" });
+        with_dictionary_provider(outer.clone(), || {
+            assert_eq!(
+                current_provider_label().as_deref(),
+                Some("LabelledProvider(outer)"),
+                "outer provider must be visible inside its scope"
+            );
+
+            // Now run an inner scope that installs a different provider
+            // and panics. The outer provider must be restored after
+            // the catch_unwind.
+            let inner_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let inner: Arc<dyn QueryDictionaryProvider> =
+                    Arc::new(LabelledProvider { label: "inner" });
+                with_dictionary_provider(inner, || {
+                    assert_eq!(
+                        current_provider_label().as_deref(),
+                        Some("LabelledProvider(inner)")
+                    );
+                    panic!("simulated optimizer panic");
+                });
+            }));
+            assert!(inner_result.is_err(), "inner closure must propagate panic");
+
+            // RAII guard from with_dictionary_provider must have
+            // restored the outer provider on unwind.
+            assert_eq!(
+                current_provider_label().as_deref(),
+                Some("LabelledProvider(outer)"),
+                "outer provider must be restored after inner panic"
+            );
+        });
+
+        // Outer scope exited normally — TLS must match the pre-test
+        // state (None on a fresh thread; otherwise whatever the
+        // surrounding test runner installed).
+        let after = current_dictionary_provider();
+        match (baseline.as_ref(), after.as_ref()) {
+            (None, None) => {}
+            (Some(a), Some(b)) => assert!(Arc::ptr_eq(a, b)),
+            _ => panic!("TLS provider state differs across with_dictionary_provider call"),
+        }
     }
 
     #[test]

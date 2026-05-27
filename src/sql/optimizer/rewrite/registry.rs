@@ -43,6 +43,11 @@ pub(crate) fn query_rewrite_pipeline(
             RewritePhase::StructuralRewrite,
             rules::column_pruning_rules(),
         ),
+        RewriteStage::new(
+            "LowCardinalityDictionaryRewrite",
+            RewritePhase::StructuralRewrite,
+            rules::low_cardinality_dictionary_rules(),
+        ),
     ])
 }
 
@@ -93,6 +98,7 @@ mod tests {
                 "AggregatePushdown",
                 "EliminateUniqueAggregate",
                 "JoinReorder",
+                "LowCardinalityDictionaryRewrite",
                 "PruneColumns",
                 "PruneUkFkJoin",
                 "PushDownPredicateAggregate",
@@ -138,6 +144,9 @@ mod tests {
         assert!(!is_known_rewrite_rule_name(""));
         assert!(is_known_rewrite_rule_name("AggregatePushdown"));
         assert!(is_known_rewrite_rule_name("PushDownPredicateProject"));
+        assert!(is_known_rewrite_rule_name(
+            "LowCardinalityDictionaryRewrite"
+        ));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
     }
 

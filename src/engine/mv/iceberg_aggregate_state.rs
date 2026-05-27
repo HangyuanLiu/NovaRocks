@@ -5,7 +5,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::starrocks::managed::mv_agg_state::{
+use crate::connector::starrocks::table::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, load_aggregate_physical_rows,
     merge_aggregate_state_batches_with_retractions,
 };
@@ -513,12 +513,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::connector::starrocks::managed::ddl::managed_physical_column;
-    use crate::connector::starrocks::managed::mv_agg_state::{
+    use crate::connector::starrocks::table::ddl::starrocks_physical_column;
+    use crate::connector::starrocks::table::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::managed::mv_shape::AggregateFunctionKind;
-    use crate::connector::starrocks::managed::state_codec::encode_count_state;
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+    use crate::connector::starrocks::table::state_codec::encode_count_state;
     use crate::sql::parser::ast::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
@@ -534,7 +534,7 @@ mod tests {
     }
 
     fn test_count_layout() -> AggregateMvLayout {
-        let row_id_column = managed_physical_column(
+        let row_id_column = starrocks_physical_column(
             "__row_id__".to_string(),
             SqlType::String,
             false,
@@ -542,10 +542,10 @@ mod tests {
             true,
         );
         let region_column =
-            managed_physical_column("region".to_string(), SqlType::String, true, true, false);
+            starrocks_physical_column("region".to_string(), SqlType::String, true, true, false);
         let count_column =
-            managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-        let count_state_column = managed_physical_column(
+            starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+        let count_state_column = starrocks_physical_column(
             "__agg_state_c".to_string(),
             SqlType::Binary,
             false,
@@ -1355,7 +1355,7 @@ mod tests {
     fn validate_physical_schema_accepts_min_max_state_map_with_field_id_metadata() {
         use std::collections::HashMap;
 
-        let row_id_column = managed_physical_column(
+        let row_id_column = starrocks_physical_column(
             "__row_id__".to_string(),
             SqlType::String,
             false,
@@ -1363,10 +1363,10 @@ mod tests {
             true,
         );
         let region_column =
-            managed_physical_column("region".to_string(), SqlType::String, true, true, false);
+            starrocks_physical_column("region".to_string(), SqlType::String, true, true, false);
         let mn_column =
-            managed_physical_column("mn".to_string(), SqlType::BigInt, true, true, false);
-        let state_column = managed_physical_column(
+            starrocks_physical_column("mn".to_string(), SqlType::BigInt, true, true, false);
+        let state_column = starrocks_physical_column(
             "__agg_state_mn".to_string(),
             SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt)),
             false,

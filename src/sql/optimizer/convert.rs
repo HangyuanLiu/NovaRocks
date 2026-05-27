@@ -3,8 +3,8 @@
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
     LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp, LogicalCTEProduceOp,
-    LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp,
-    LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
+    LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp,
+    LogicalJoinOp, LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
     LogicalSubqueryAliasOp, LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp,
     LogicalWindowOp, Operator,
 };
@@ -24,6 +24,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 columns: node.columns.clone(),
                 predicates: node.predicates.clone(),
                 required_columns: node.required_columns.clone(),
+                dict_columns: node.dict_columns.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -296,6 +297,20 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.cte_produce_groups.insert(node.cte_id, group_id);
             group_id
         }
+
+        LogicalPlan::Decode(node) => {
+            let child = logical_plan_to_memo(&node.input, memo);
+            let op = Operator::LogicalDecode(LogicalDecodeOp {
+                mappings: node.mappings.clone(),
+                output_columns: node.output_columns.clone(),
+            });
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op,
+                children: vec![child],
+            };
+            memo.new_group(expr)
+        }
     }
 }
 
@@ -320,7 +335,6 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
             source: ScanSource::StarRocks,
         }
     }
@@ -343,6 +357,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let mut memo = Memo::new();
@@ -368,6 +383,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let predicate = TypedExpr {
@@ -414,6 +430,7 @@ mod tests {
             columns: dummy_output_columns(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
 
         let produce = LogicalPlan::CTEProduce(crate::sql::planner::plan::CTEProduceNode {

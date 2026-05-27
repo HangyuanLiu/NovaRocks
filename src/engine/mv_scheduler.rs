@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::connector::starrocks::managed::model::IcebergTableRef;
-use crate::connector::starrocks::managed::mv_refresh::{
+use crate::connector::starrocks::table::model::IcebergTableRef;
+use crate::connector::starrocks::table::mv_refresh::{
     load_current_iceberg_base_table, parse_iceberg_table_refs,
 };
 use crate::meta::repository::mv::{
@@ -792,15 +792,15 @@ fn refresh_execution_target_for_definition(
     }
 
     let table = state
-        .managed_repo
+        .starrocks_table_repo
         .load_table(txn, definition.mv_id)
-        .map_err(|e| format!("load managed MV table failed: {e}"))?
-        .ok_or_else(|| format!("managed MV table {} not found", definition.mv_id))?;
+        .map_err(|e| format!("load StarRocks MV table failed: {e}"))?
+        .ok_or_else(|| format!("StarRocks MV table {} not found", definition.mv_id))?;
     let database = state
-        .managed_repo
+        .starrocks_table_repo
         .load_database(txn, table.db_id)
-        .map_err(|e| format!("load managed MV database failed: {e}"))?
-        .ok_or_else(|| format!("managed database {} not found", table.db_id))?;
+        .map_err(|e| format!("load StarRocks MV database failed: {e}"))?
+        .ok_or_else(|| format!("StarRocks database {} not found", table.db_id))?;
     Ok(RefreshExecutionTarget {
         current_catalog: None,
         current_database: database.name,

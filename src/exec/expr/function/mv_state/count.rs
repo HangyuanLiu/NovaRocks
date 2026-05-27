@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 
-use crate::connector::starrocks::managed::state_codec::{decode_count_state, encode_count_state};
+use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
@@ -101,9 +101,7 @@ pub(crate) fn eval_count_state_visible_array(input: &ArrayRef) -> Result<ArrayRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::managed::state_codec::{
-        decode_count_state, encode_count_state,
-    };
+    use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
     use arrow::array::{Array, BinaryArray, BinaryBuilder, Int64Array};
     use std::sync::Arc;
 

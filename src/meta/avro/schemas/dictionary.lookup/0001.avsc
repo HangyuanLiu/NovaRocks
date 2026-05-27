@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "DictionaryLookup",
+  "namespace": "novarocks.meta.dictionary",
+  "fields": [
+    { "name": "owner_kind", "type": "string" },
+    { "name": "owner_key", "type": "string" },
+    { "name": "column_name", "type": "string" },
+    { "name": "dictionary_id", "type": "long" }
+  ]
+}

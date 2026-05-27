@@ -243,6 +243,16 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
+        LogicalPlan::Decode(d) => {
+            // Decode replaces dict columns with their string counterparts
+            // but otherwise passes through the child's output set.
+            let mut cols = collect_output_columns(&d.input);
+            for mapping in &d.mappings {
+                cols.remove(&mapping.dict_column.to_lowercase());
+                cols.insert(mapping.string_column.to_lowercase());
+            }
+            cols
+        }
     }
 }
 
@@ -489,6 +499,13 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 let col_name = col.name.to_lowercase();
                 out.insert((Some(alias_lower.clone()), col_name.clone()));
                 out.insert((None, col_name));
+            }
+        }
+        LogicalPlan::Decode(d) => {
+            collect_qualified_output_columns_inner(&d.input, out);
+            // Decode adds string output columns alongside the dict inputs.
+            for mapping in &d.mappings {
+                out.insert((None, mapping.string_column.to_lowercase()));
             }
         }
     }

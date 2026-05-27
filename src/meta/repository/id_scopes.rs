@@ -1,27 +1,27 @@
 use crate::meta::{IdScope, MetaError};
 
-pub fn managed_db() -> IdScope {
-    stable("managed.db")
+pub fn starrocks_db() -> IdScope {
+    stable("starrocks.db")
 }
 
-pub fn managed_table() -> IdScope {
-    stable("managed.table")
+pub fn starrocks_table() -> IdScope {
+    stable("starrocks.table")
 }
 
-pub fn managed_partition() -> IdScope {
-    stable("managed.partition")
+pub fn starrocks_partition() -> IdScope {
+    stable("starrocks.partition")
 }
 
-pub fn managed_index() -> IdScope {
-    stable("managed.index")
+pub fn starrocks_index() -> IdScope {
+    stable("starrocks.index")
 }
 
-pub fn managed_tablet() -> IdScope {
-    stable("managed.tablet")
+pub fn starrocks_tablet() -> IdScope {
+    stable("starrocks.tablet")
 }
 
-pub fn managed_txn() -> IdScope {
-    stable("managed.txn")
+pub fn starrocks_txn() -> IdScope {
+    stable("starrocks.txn")
 }
 
 pub fn mv_id() -> IdScope {
@@ -38,6 +38,10 @@ pub fn erase_job() -> IdScope {
 
 pub fn iceberg_optimize_job() -> IdScope {
     stable("job.iceberg_optimize")
+}
+
+pub fn dictionary_snapshot() -> IdScope {
+    stable("dictionary.snapshot")
 }
 
 pub fn custom(value: impl Into<String>) -> Result<IdScope, MetaError> {

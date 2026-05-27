@@ -3,7 +3,7 @@
 //! Holds the logical `InMemoryCatalog` (databases -> tables + physical
 //! layouts) and the `normalize_identifier` helper used across the SQL
 //! and engine layers. Everything here is backend-agnostic — the
-//! managed-lake and iceberg subsystems both query this catalog for
+//! StarRocks table and iceberg subsystems both query this catalog for
 //! table metadata.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // interchangeably without double-defining the types.
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
-    CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, ScanSource, TableDef,
+    CatalogProvider, ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
 };
 
 #[derive(Clone, Debug)]
@@ -72,6 +72,19 @@ impl InMemoryCatalog {
         self.databases.keys().map(String::as_str)
     }
 
+    /// Enumerate the (already-normalized) table names registered in the
+    /// in-memory catalog under `database_name`. Returns an empty list if
+    /// the database does not exist.
+    pub(crate) fn table_names_in_database(&self, database_name: &str) -> Vec<String> {
+        let Ok(db_key) = normalize_identifier(database_name) else {
+            return Vec::new();
+        };
+        self.databases
+            .get(&db_key)
+            .map(|db| db.tables.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn register(&mut self, database_name: &str, table: TableDef) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let db = self
@@ -90,7 +103,7 @@ impl InMemoryCatalog {
         Ok(())
     }
 
-    pub(crate) fn register_managed_table(
+    pub(crate) fn register_starrocks_table(
         &mut self,
         database_name: &str,
         table: TableDef,
@@ -323,19 +336,18 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
             source: ScanSource::StarRocks,
         }
     }
 
     #[test]
-    fn register_managed_table_tracks_and_clears_physical_layout() {
+    fn register_starrocks_table_tracks_and_clears_physical_layout() {
         let mut catalog = InMemoryCatalog::default();
         let layout = PhysicalTableLayout {
             db_id: 10,
             table_id: 20,
             schema_id: 30,
-            tablets: vec![ManagedTabletRef {
+            tablets: vec![StarRocksTabletRef {
                 tablet_id: 40,
                 partition_id: 50,
                 version: 60,
@@ -343,21 +355,25 @@ mod tests {
         };
 
         catalog
-            .register_managed_table(DEFAULT_DATABASE, test_table("managed_tbl"), layout.clone())
-            .expect("register managed table");
+            .register_starrocks_table(
+                DEFAULT_DATABASE,
+                test_table("starrocks_tbl"),
+                layout.clone(),
+            )
+            .expect("register StarRocks table");
         assert_eq!(
             catalog
-                .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")
+                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
                 .expect("physical layout lookup"),
             Some(layout.clone())
         );
 
         catalog
-            .register(DEFAULT_DATABASE, test_table("managed_tbl"))
+            .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
             .expect("overwrite with logical table");
         assert_eq!(
             catalog
-                .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")
+                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
                 .expect("physical layout cleared"),
             None
         );

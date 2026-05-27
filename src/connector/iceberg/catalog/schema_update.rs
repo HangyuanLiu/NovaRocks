@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_rejects_managed_mv_explicit_column_dependency() {
+    fn drop_rejects_starrocks_mv_explicit_column_dependency() {
         let mv_sqls = vec!["SELECT id FROM ice.ns.orders".to_string()];
         let err =
             reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect_err("drop dependency");
@@ -214,13 +214,13 @@ mod tests {
     }
 
     #[test]
-    fn drop_allows_managed_mv_unrelated_column_dependency() {
+    fn drop_allows_starrocks_mv_unrelated_column_dependency() {
         let mv_sqls = vec!["SELECT v FROM ice.ns.orders".to_string()];
         reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect("unrelated column");
     }
 
     #[test]
-    fn drop_rejects_managed_mv_select_wildcard_dependency() {
+    fn drop_rejects_starrocks_mv_select_wildcard_dependency() {
         let mv_sqls = vec!["SELECT * FROM ice.ns.orders".to_string()];
         let err =
             reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect_err("drop dependency");
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_rejects_managed_mv_qualified_wildcard_dependency() {
+    fn drop_rejects_starrocks_mv_qualified_wildcard_dependency() {
         for sql in [
             "SELECT o.* FROM ice.ns.orders o",
             "SELECT orders.* FROM ice.ns.orders",
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_allows_managed_mv_count_star_without_column_token() {
+    fn drop_allows_starrocks_mv_count_star_without_column_token() {
         let mv_sqls = vec!["SELECT COUNT(*) FROM ice.ns.orders".to_string()];
         reject_drop_dependencies_for_test("id", &[], &mv_sqls).expect("count star");
     }
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_nested_blocked_by_managed_mv_referencing_leaf() {
+    fn drop_nested_blocked_by_starrocks_mv_referencing_leaf() {
         let res = reject_drop_dependencies_for_test(
             "address.street",
             &[],
@@ -2848,10 +2848,10 @@ fn reject_drop_dependencies_for_test(
     equality_delete_columns: &[String],
     mv_sqls: &[String],
 ) -> Result<(), String> {
-    let target = ManagedMvTarget::new("ice", "ns", "orders")?;
+    let target = StarRocksMvTarget::new("ice", "ns", "orders")?;
     let mv_dependencies = mv_sqls
         .iter()
-        .map(|sql| ManagedMvDependency {
+        .map(|sql| StarRocksMvDependency {
             select_sql: sql.clone(),
             target: target.clone(),
         })
@@ -2862,7 +2862,7 @@ fn reject_drop_dependencies_for_test(
 fn reject_drop_dependencies(
     column: &str,
     equality_delete_columns: &[String],
-    mv_dependencies: &[ManagedMvDependency],
+    mv_dependencies: &[StarRocksMvDependency],
 ) -> Result<(), String> {
     let target_segments = normalize_dotted_path(column)?;
     if target_segments.is_empty() {
@@ -2883,9 +2883,9 @@ fn reject_drop_dependencies(
         .expect("checked non-empty above")
         .as_str();
     for dependency in mv_dependencies {
-        if managed_mv_depends_on_column(dependency, leaf) {
+        if starrocks_mv_depends_on_column(dependency, leaf) {
             return Err(format!(
-                "DROP COLUMN `{column}` is blocked because a managed materialized view references it"
+                "DROP COLUMN `{column}` is blocked because a StarRocks materialized view references it"
             ));
         }
     }
@@ -2910,19 +2910,19 @@ fn path_overlaps(a: &[String], b: &[String]) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct ManagedMvDependency {
+struct StarRocksMvDependency {
     select_sql: String,
-    target: ManagedMvTarget,
+    target: StarRocksMvTarget,
 }
 
 #[derive(Clone, Debug)]
-struct ManagedMvTarget {
+struct StarRocksMvTarget {
     catalog: String,
     namespace: String,
     table: String,
 }
 
-impl ManagedMvTarget {
+impl StarRocksMvTarget {
     fn new(catalog: &str, namespace: &str, table: &str) -> Result<Self, String> {
         Ok(Self {
             catalog: normalize_identifier(catalog)?,
@@ -2938,8 +2938,8 @@ impl ManagedMvTarget {
     }
 }
 
-fn managed_mv_depends_on_column(
-    dependency: &ManagedMvDependency,
+fn starrocks_mv_depends_on_column(
+    dependency: &StarRocksMvDependency,
     normalized_identifier: &str,
 ) -> bool {
     sql_mentions_identifier(&dependency.select_sql, normalized_identifier)
@@ -2952,7 +2952,7 @@ fn sql_mentions_identifier(sql: &str, normalized_identifier: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(normalized_identifier))
 }
 
-fn sql_projects_target_wildcard(sql: &str, target: &ManagedMvTarget) -> bool {
+fn sql_projects_target_wildcard(sql: &str, target: &StarRocksMvTarget) -> bool {
     let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;
     };
@@ -2965,7 +2965,10 @@ fn sql_projects_target_wildcard(sql: &str, target: &ManagedMvTarget) -> bool {
     query_projects_target_wildcard(&query, target)
 }
 
-fn query_projects_target_wildcard(query: &sqlparser::ast::Query, target: &ManagedMvTarget) -> bool {
+fn query_projects_target_wildcard(
+    query: &sqlparser::ast::Query,
+    target: &StarRocksMvTarget,
+) -> bool {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             if query_projects_target_wildcard(&cte.query, target) {
@@ -2978,7 +2981,7 @@ fn query_projects_target_wildcard(query: &sqlparser::ast::Query, target: &Manage
 
 fn set_expr_projects_target_wildcard(
     set_expr: &sqlparser::ast::SetExpr,
-    target: &ManagedMvTarget,
+    target: &StarRocksMvTarget,
 ) -> bool {
     match set_expr {
         sqlparser::ast::SetExpr::Select(select) => select_projects_target_wildcard(select, target),
@@ -2993,7 +2996,7 @@ fn set_expr_projects_target_wildcard(
 
 fn select_projects_target_wildcard(
     select: &sqlparser::ast::Select,
-    target: &ManagedMvTarget,
+    target: &StarRocksMvTarget,
 ) -> bool {
     let mut target_qualifiers = HashSet::new();
     for table_with_joins in &select.from {
@@ -3017,7 +3020,7 @@ fn select_projects_target_wildcard(
 
 fn collect_target_qualifiers_from_table_with_joins(
     table_with_joins: &sqlparser::ast::TableWithJoins,
-    target: &ManagedMvTarget,
+    target: &StarRocksMvTarget,
     qualifiers: &mut HashSet<String>,
 ) -> bool {
     if collect_target_qualifiers_from_factor(&table_with_joins.relation, target, qualifiers) {
@@ -3033,7 +3036,7 @@ fn collect_target_qualifiers_from_table_with_joins(
 
 fn collect_target_qualifiers_from_factor(
     factor: &sqlparser::ast::TableFactor,
-    target: &ManagedMvTarget,
+    target: &StarRocksMvTarget,
     qualifiers: &mut HashSet<String>,
 ) -> bool {
     match factor {
@@ -3097,7 +3100,10 @@ fn expr_qualifier_keys(expr: &sqlparser::ast::Expr) -> Vec<String> {
     }
 }
 
-fn object_name_matches_target(name: &sqlparser::ast::ObjectName, target: &ManagedMvTarget) -> bool {
+fn object_name_matches_target(
+    name: &sqlparser::ast::ObjectName,
+    target: &StarRocksMvTarget,
+) -> bool {
     let parts = normalized_object_name_parts(name);
     match parts.as_deref() {
         Some([catalog, namespace, table]) => {
@@ -3829,14 +3835,14 @@ fn protect_schema_change(
             &loaded.table,
         )?;
 
-    let mv_dependencies = managed_mv_dependencies_for_target(state, target)?;
+    let mv_dependencies = starrocks_mv_dependencies_for_target(state, target)?;
     reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &mv_dependencies)
 }
 
-fn managed_mv_dependencies_for_target(
+fn starrocks_mv_dependencies_for_target(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-) -> Result<Vec<ManagedMvDependency>, String> {
+) -> Result<Vec<StarRocksMvDependency>, String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(Vec::new());
     };
@@ -3849,7 +3855,7 @@ fn managed_mv_dependencies_for_target(
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
     let target_key_lower = target_key.to_ascii_lowercase();
-    let target = ManagedMvTarget::from_backend(target)?;
+    let target = StarRocksMvTarget::from_backend(target)?;
     Ok(definitions
         .into_iter()
         .filter(|mv| {
@@ -3861,7 +3867,7 @@ fn managed_mv_dependencies_for_target(
                     .to_ascii_lowercase()
                     .contains(&target_key_lower)
         })
-        .map(|mv| ManagedMvDependency {
+        .map(|mv| StarRocksMvDependency {
             select_sql: mv.select_sql,
             target: target.clone(),
         })
@@ -3890,7 +3896,7 @@ fn is_reserved_property_key(key: &str) -> Option<&'static str> {
         return Some("Iceberg internal metadata key, not user-settable");
     }
     if key.starts_with("novarocks.") {
-        return Some("novarocks.* namespace is reserved for engine-managed properties");
+        return Some("novarocks.* namespace is reserved for engine-owned properties");
     }
     None
 }

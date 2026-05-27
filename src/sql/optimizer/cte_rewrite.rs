@@ -52,6 +52,7 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
             LogicalPlan::CTEConsume(node) => {
                 *ctx.consume_count.entry(node.cte_id).or_insert(0) += 1;
             }
+            LogicalPlan::Decode(node) => visit(&node.input, ctx),
         }
     }
 
@@ -169,6 +170,11 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 })
             }
         }
+        LogicalPlan::Decode(node) => LogicalPlan::Decode(DecodeNode {
+            input: Box::new(inline_single_use_ctes(*node.input, ctx)),
+            mappings: node.mappings,
+            output_columns: node.output_columns,
+        }),
     }
 }
 
@@ -270,6 +276,11 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             produce: Box::new(replace_cte_consume(*node.produce, cte_id, replacement)),
             consumer: Box::new(replace_cte_consume(*node.consumer, cte_id, replacement)),
         }),
+        LogicalPlan::Decode(node) => LogicalPlan::Decode(DecodeNode {
+            input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
+            mappings: node.mappings,
+            output_columns: node.output_columns,
+        }),
     }
 }
 
@@ -295,7 +306,6 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: ScanSource::StarRocks,
             },
             alias: None,
@@ -307,6 +317,7 @@ mod tests {
             }],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

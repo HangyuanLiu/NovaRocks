@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::connector::starrocks::managed::model::IcebergTableRef;
-use crate::connector::starrocks::managed::mv_ddl::ResolvedTableRef;
+use crate::connector::starrocks::table::model::IcebergTableRef;
+use crate::connector::starrocks::table::mv_ddl::ResolvedTableRef;
 use crate::engine::StandaloneState;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
@@ -37,7 +37,7 @@ pub(crate) fn iceberg_mv_dependency_ref(
     }
 }
 
-pub(crate) fn managed_mv_dependency_ref(database: &str, table: &str) -> MvDependencyObjectRef {
+pub(crate) fn starrocks_mv_dependency_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,
         database_or_namespace: database.to_string(),
@@ -61,7 +61,7 @@ pub(crate) fn iceberg_table_object_ref(
     }
 }
 
-pub(crate) fn managed_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
+pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,
         database_or_namespace: database.to_string(),
@@ -89,7 +89,7 @@ pub(crate) fn ensure_no_downstream_dependencies(
 
 pub(crate) fn stored_definition_dependency_ref(
     definition: &StoredMvDefinition,
-    managed_name: Option<(&str, &str)>,
+    starrocks_name: Option<(&str, &str)>,
 ) -> Result<MvDependencyObjectRef, String> {
     if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
         let catalog = definition
@@ -106,10 +106,10 @@ pub(crate) fn stored_definition_dependency_ref(
             .ok_or_else(|| "iceberg MV definition missing target table".to_string())?;
         return Ok(iceberg_mv_dependency_ref(catalog, namespace, table));
     }
-    let (database, table) = managed_name.ok_or_else(|| {
-        "managed-lake MV definition requires database/table name for dependency ref".to_string()
+    let (database, table) = starrocks_name.ok_or_else(|| {
+        "StarRocks table MV definition requires database/table name for dependency ref".to_string()
     })?;
-    Ok(managed_mv_dependency_ref(database, table))
+    Ok(starrocks_mv_dependency_ref(database, table))
 }
 
 pub(crate) fn resolve_create_mv_dependencies(
@@ -157,22 +157,24 @@ pub(crate) fn resolve_create_mv_dependencies(
                 });
             }
             ResolvedTableRef::StarRocks { database, table } => {
-                let managed = state
-                    .managed_lake
+                let starrocks = state
+                    .starrocks_table
                     .read()
-                    .expect("standalone managed lake read lock");
-                let runtime = managed.table(database, table).map_err(|err| {
-                    format!("resolve managed-lake MV dependency {database}.{table} failed: {err}")
+                    .expect("standalone StarRocks table read lock");
+                let runtime = starrocks.table(database, table).map_err(|err| {
+                    format!(
+                        "resolve StarRocks table MV dependency {database}.{table} failed: {err}"
+                    )
                 })?;
                 if runtime.table.kind
-                    != crate::connector::starrocks::managed::model::ManagedTableKind::MaterializedView
+                    != crate::connector::starrocks::table::model::StarRocksTableKind::MaterializedView
                 {
                     return Err(format!(
-                        "materialized view base tables must be Iceberg tables or materialized views; found managed lake table `{database}.{table}`"
+                        "materialized view base tables must be Iceberg tables or materialized views; found StarRocks table `{database}.{table}`"
                     ));
                 }
                 return Err(format!(
-                    "managed-lake MV-on-MV dependency `{database}.{table}` is recognized but cannot be used as an incremental Iceberg base in this release"
+                    "StarRocks table MV-on-MV dependency `{database}.{table}` is recognized but cannot be used as an incremental Iceberg base in this release"
                 ));
             }
         }
@@ -498,29 +500,29 @@ fn stored_definition_dependency_ref_from_state(
     if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
         return stored_definition_dependency_ref(definition, None);
     }
-    let managed = state
-        .managed_lake
+    let starrocks = state
+        .starrocks_table
         .read()
-        .expect("standalone managed lake read lock");
-    let table = managed
+        .expect("standalone StarRocks table read lock");
+    let table = starrocks
         .snapshot
         .tables
         .iter()
         .find(|table| table.table_id == definition.mv_id)
         .ok_or_else(|| {
             format!(
-                "managed-lake MV definition {} is missing runtime table metadata",
+                "StarRocks table MV definition {} is missing runtime table metadata",
                 definition.mv_id
             )
         })?;
-    let database = managed
+    let database = starrocks
         .snapshot
         .databases
         .iter()
         .find(|database| database.db_id == table.db_id)
         .ok_or_else(|| {
             format!(
-                "managed-lake MV definition {} is missing runtime database metadata",
+                "StarRocks table MV definition {} is missing runtime database metadata",
                 definition.mv_id
             )
         })?;
@@ -641,10 +643,10 @@ mod tests {
 
     #[test]
     fn external_dependents_scope_ignores_non_iceberg_upstreams() {
-        // Managed-lake upstreams are never in an Iceberg scope, even if the
+        // StarRocks table upstreams are never in an Iceberg scope, even if the
         // catalog/namespace strings happen to match.
         let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
-        let upstream = managed_table_object_ref("cat1", "orders");
+        let upstream = starrocks_table_object_ref("cat1", "orders");
         let edges = vec![(mv_target, vec![upstream])];
 
         validate_no_external_dependents_for_scope("cat1", Some("orders"), &edges)

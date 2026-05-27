@@ -35,17 +35,10 @@ pub(crate) fn derive_statistics(
             output_row_count: vals.rows.len() as f64,
             column_statistics: HashMap::new(),
         },
-        Operator::LogicalGenerateSeries(gs) => {
-            let rows = if gs.step != 0 {
-                ((gs.end - gs.start) / gs.step + 1).max(0) as f64
-            } else {
-                1.0
-            };
-            Statistics {
-                output_row_count: rows,
-                column_statistics: HashMap::new(),
-            }
-        }
+        Operator::LogicalGenerateSeries(gs) => Statistics {
+            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            column_statistics: HashMap::new(),
+        },
         Operator::LogicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
         }
@@ -180,6 +173,11 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalCTEProduce(_) => {
             // Passthrough child stats.
+            child_statistics(memo, &expr.children, 0)
+        }
+
+        Operator::LogicalDecode(_) => {
+            // Decode preserves row count and column stats.
             child_statistics(memo, &expr.children, 0)
         }
 
@@ -582,19 +580,17 @@ pub(crate) fn derive_statistics(
             column_statistics: HashMap::new(),
         },
 
-        Operator::PhysicalGenerateSeries(gs) => {
-            let rows = if gs.step != 0 {
-                ((gs.end - gs.start) / gs.step + 1).max(0) as f64
-            } else {
-                1.0
-            };
-            Statistics {
-                output_row_count: rows,
-                column_statistics: HashMap::new(),
-            }
-        }
+        Operator::PhysicalGenerateSeries(gs) => Statistics {
+            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            column_statistics: HashMap::new(),
+        },
         Operator::PhysicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
+        }
+
+        Operator::PhysicalDecode(_) => {
+            // Decode preserves row count and column stats.
+            child_statistics(memo, &expr.children, 0)
         }
     }
 }
@@ -1004,6 +1000,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
         Operator::LogicalSubqueryAlias(s) => s.output_columns.clone(),
+        // Decode renames dict->string and therefore breaks the
+        // child-passthrough invariant the rest of the rename-free
+        // operators rely on. Return the operator's stored output_columns
+        // so consumers see the post-rename string names.
+        Operator::LogicalDecode(d) => d.output_columns.clone(),
         Operator::LogicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
@@ -1096,6 +1097,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         Operator::PhysicalSubqueryAlias(s) => s.output_columns.clone(),
+        // Decode renames dict->string; see the LogicalDecode arm above.
+        Operator::PhysicalDecode(d) => d.output_columns.clone(),
         Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
@@ -1393,11 +1396,27 @@ fn child_output_columns(
 mod tests {
     use super::*;
     use crate::sql::analysis::{JoinKind, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
 
     fn make_table_stats(
         name: &str,
@@ -1452,9 +1471,9 @@ mod tests {
                 name: name.to_string(),
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
-                source: ScanSource::S3ParquetFiles {
-                    files: vec![S3FileInfo {
+                source: ScanSource::IcebergDataFiles {
+                    table: test_iceberg_table_info(),
+                    files: vec![IcebergDataFileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
                         size: 1000,
                         row_count: Some(1000),
@@ -1475,6 +1494,7 @@ mod tests {
             columns,
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 
@@ -1747,6 +1767,44 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
         assert_eq!(props.output_columns.len(), 1);
+    }
+
+    #[test]
+    fn decode_group_surfaces_string_output_columns() {
+        // Decode wraps a scan that exposes `a` (the dict-encoded slot).
+        // The Decode group itself must surface `a_str` (the renamed
+        // string output) — passing the child's `a` through would let
+        // downstream consumers fail to resolve the post-rename name.
+        let (name, ts) = make_table_stats("t", 100, &[("a", 10.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("t", &["a"]);
+        let plan = LogicalPlan::Decode(DecodeNode {
+            input: Box::new(scan),
+            mappings: vec![DecodeMapping {
+                dict_column: "a".to_string(),
+                string_column: "a_str".to_string(),
+            }],
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "a_str".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            }],
+        });
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // Group 0 is the scan; group 1 is Decode.
+        let decode_props = memo.groups[1].logical_props.as_ref().unwrap();
+        assert_eq!(decode_props.output_columns.len(), 1);
+        assert_eq!(
+            decode_props.output_columns[0].name, "a_str",
+            "Decode must surface string_column, not the child's dict_column"
+        );
     }
 }
 

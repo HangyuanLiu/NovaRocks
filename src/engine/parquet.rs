@@ -1,9 +1,9 @@
-//! Parquet I/O for local (on-disk) tables: read a column-set from a parquet
-//! file, cast/normalize batches to match the table schema, and write batches
-//! back to disk.
+//! Parquet I/O helpers: read a column-set from a parquet file,
+//! cast/normalize batches to match the table schema, and write batches back
+//! to disk.
 //!
 //! This module also owns the small string-to-date/datetime parsing helpers
-//! used while coercing literal rows into typed arrow arrays for local-parquet
+//! used while coercing literal rows into typed arrow arrays for parquet
 //! writes.
 
 use std::path::Path;

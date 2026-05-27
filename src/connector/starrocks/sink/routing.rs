@@ -383,9 +383,9 @@ fn build_row_routing_plan(
     })
 }
 
-/// Build a `RowRoutingPlan` for unpartitioned managed-lake tables where the
+/// Build a `RowRoutingPlan` for unpartitioned StarRocks tables where the
 /// caller already knows the tablet ids and which slot ids carry distribution
-/// keys. Used by the standalone managed-lake insert path which bypasses the
+/// keys. Used by the standalone StarRocks table insert path which bypasses the
 /// normal OLAP_TABLE_SINK partition/location metadata.
 pub(crate) fn build_unpartitioned_hash_routing(
     tablet_ids: Vec<i64>,
@@ -393,7 +393,7 @@ pub(crate) fn build_unpartitioned_hash_routing(
     partition_id: i64,
 ) -> Result<RowRoutingPlan, String> {
     if tablet_ids.is_empty() {
-        return Err("managed-lake insert routing requires at least one tablet".to_string());
+        return Err("StarRocks table insert routing requires at least one tablet".to_string());
     }
     let mut tablet_idx_by_id = HashMap::with_capacity(tablet_ids.len());
     for (idx, tablet_id) in tablet_ids.iter().enumerate() {

@@ -2411,9 +2411,26 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, Relation};
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
 
     struct TestCatalog;
+
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
+
     impl crate::sql::catalog::CatalogProvider for TestCatalog {
         fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
             match table {
@@ -2464,7 +2481,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "lineitem" => Ok(TableDef {
@@ -2535,7 +2551,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "supplier" => Ok(TableDef {
@@ -2564,7 +2579,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "part" => Ok(TableDef {
@@ -2593,7 +2607,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "partsupp" => Ok(TableDef {
@@ -2629,7 +2642,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "customer" => Ok(TableDef {
@@ -2658,7 +2670,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 "nation" => Ok(TableDef {
@@ -2680,7 +2691,6 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 }),
                 // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
@@ -2721,8 +2731,8 @@ mod tests {
                             logical_type: None,
                         },
                     ],
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
                         files: vec![],
                         cloud_properties: Default::default(),
                     },

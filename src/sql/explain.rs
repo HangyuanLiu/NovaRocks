@@ -1,12 +1,8 @@
 //! EXPLAIN plan formatter — produces text from LogicalPlan or PhysicalPlan.
 
-use std::collections::HashSet;
 use std::fmt::Write;
-use std::fs::File;
 
-use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::catalog::ScanSource;
@@ -262,6 +258,15 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
         }
         LogicalPlan::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
+        }
+        LogicalPlan::Decode(node) => {
+            let pairs: Vec<String> = node
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect();
+            out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
+            format_node(&node.input, level, indent + 1, out);
         }
     }
 }
@@ -648,6 +653,20 @@ fn format_physical_node(
                 format_physical_node(child, level, indent + 1, out);
             }
         }
+        Operator::PhysicalDecode(op) => {
+            let pairs: Vec<String> = op
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect();
+            out.push(format!(
+                "{pad}DECODE [{}]{costs_suffix}{stats_suffix}",
+                pairs.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
         // Logical operators should not appear in physical plan
         _ => {
             out.push(format!(
@@ -805,7 +824,7 @@ fn scan_supports_decode_hint(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks => {
             required_columns.iter().any(|required| {
                 table
                     .columns
@@ -828,7 +847,7 @@ fn scan_supports_min_max_stats(
     required_columns: &[String],
 ) -> bool {
     match &table.source {
-        ScanSource::S3ParquetFiles { .. } | ScanSource::StarRocks => {}
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         ScanSource::IcebergMetadataTable { .. } => return false,
         // IVM delta-scan is a synthetic placeholder; no parquet stats.
@@ -1033,7 +1052,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Fields};
@@ -1048,7 +1067,7 @@ mod tests {
     use crate::sql::optimizer::statistics::Statistics;
 
     #[test]
-    fn s3_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {
+    fn starrocks_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {
         let column = ColumnDef {
             name: "c_2_0".to_string(),
             data_type: DataType::FixedSizeBinary(16),
@@ -1063,11 +1082,7 @@ mod tests {
                     name: "t3".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1078,6 +1093,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1096,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_scan_costs_explain_reports_decode_for_string_required_columns() {
+    fn starrocks_scan_costs_explain_reports_decode_for_string_required_columns() {
         let column = ColumnDef {
             name: "c8".to_string(),
             data_type: DataType::Utf8,
@@ -1111,11 +1127,7 @@ mod tests {
                     name: "all_t0".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1126,6 +1138,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1140,6 +1153,57 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Decode")),
             "costs explain lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn physical_decode_explain_prints_dict_to_string_mapping() {
+        use crate::sql::optimizer::operator::PhysicalDecodeOp;
+        use crate::sql::planner::plan::DecodeMapping;
+
+        let scan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db1".to_string(),
+                table: TableDef {
+                    name: "t1".to_string(),
+                    columns: Vec::new(),
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::StarRocks,
+                },
+                alias: None,
+                columns: Vec::new(),
+                predicates: Vec::new(),
+                required_columns: None,
+                dict_columns: vec![],
+            }),
+            children: Vec::new(),
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+        let decode = PhysicalPlanNode {
+            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: vec![DecodeMapping {
+                    dict_column: "d".to_string(),
+                    string_column: "s".to_string(),
+                }],
+                output_columns: Vec::new(),
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: HashMap::new(),
+            },
+            output_columns: Vec::new(),
+        };
+
+        let lines = explain_physical_plan(&decode, ExplainLevel::Normal);
+        let output = lines.join("\n");
+        assert!(
+            output.contains("DECODE [d->s]"),
+            "expected DECODE [d->s] line, got:\n{output}"
         );
     }
 
@@ -1181,11 +1245,7 @@ mod tests {
                     name: "t1".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1196,6 +1256,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1248,11 +1309,7 @@ mod tests {
                     name: "ice_tbl".to_string(),
                     columns: vec![column.clone()],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    iceberg_table: None,
-                    source: ScanSource::S3ParquetFiles {
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                    },
+                    source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -1263,6 +1320,7 @@ mod tests {
                 }],
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
             }),
             children: Vec::new(),
             stats: Statistics {

@@ -302,6 +302,27 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 grouping_fn_args: node.grouping_fn_args,
             })
         }
+
+        LogicalPlan::Decode(node) => {
+            // Decode renames dict_column -> string_column. The child does not
+            // produce `string_column`, so we must remove it from the needed
+            // set before recursing, and add `dict_column` in its place. If
+            // we left `string_column` in `child_needed` the scan-side pruner
+            // would be told to retain a name that doesn't exist downstream
+            // of Decode's child — a contract violation once Task 7 starts
+            // emitting Decode and column pruning re-runs over it.
+            let mut child_needed = needed.cloned().unwrap_or_default();
+            for mapping in &node.mappings {
+                child_needed.remove(&mapping.string_column.to_lowercase());
+                child_needed.insert(mapping.dict_column.to_lowercase());
+            }
+            let input = prune_inner(*node.input, Some(&child_needed));
+            LogicalPlan::Decode(DecodeNode {
+                input: Box::new(input),
+                mappings: node.mappings,
+                output_columns: node.output_columns,
+            })
+        }
     }
 }
 
@@ -342,7 +363,6 @@ mod tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
             source: ScanSource::StarRocks,
         }
     }
@@ -364,6 +384,7 @@ mod tests {
                 .collect(),
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         }
     }
 

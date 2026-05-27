@@ -316,11 +316,8 @@ fn foreign_key_constraints(scan: &ScanNode) -> Vec<ForeignKeyConstraint> {
 }
 
 fn table_properties(scan: &ScanNode) -> HashMap<String, String> {
-    let Some(serialized_metadata) = scan
-        .table
-        .iceberg_table
-        .as_ref()
-        .and_then(|table| table.serialized_metadata.as_ref())
+    let Some(serialized_metadata) =
+        iceberg_table_info(&scan.table.source).and_then(|table| table.serialized_metadata.as_ref())
     else {
         return HashMap::new();
     };
@@ -333,6 +330,17 @@ fn table_properties(scan: &ScanNode) -> HashMap<String, String> {
         .iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
         .collect()
+}
+
+fn iceberg_table_info(
+    source: &crate::sql::catalog::ScanSource,
+) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    match source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
+        crate::sql::catalog::ScanSource::StarRocks => None,
+    }
 }
 
 fn parse_foreign_key_constraint(raw: &str) -> Option<ForeignKeyConstraint> {

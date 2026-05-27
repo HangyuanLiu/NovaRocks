@@ -21,16 +21,16 @@ use crate::connector::iceberg::commit::{
     snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
-use crate::connector::starrocks::managed::model::{IcebergTableRef, ManagedMvStorageEngine};
-use crate::connector::starrocks::managed::mv_ddl::{
+use crate::connector::starrocks::table::model::{IcebergTableRef, StarRocksMvStorageEngine};
+use crate::connector::starrocks::table::mv_ddl::{
     analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms, output_column_to_table_column,
     resolve_mv_name, validate_mv_partition_columns,
 };
-use crate::connector::starrocks::managed::mv_refresh::{
+use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
-use crate::connector::starrocks::managed::mv_shape::{
+use crate::connector::starrocks::table::mv_shape::{
     AggregateMvShape, IncrementalMvShape, JoinAggregateMvShape, classify_incremental_mv_query,
 };
 use crate::engine::mv::iceberg_target_apply::{
@@ -192,16 +192,15 @@ pub(crate) fn create_iceberg_mv(
 
     // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
     // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
-    // unchanged. Reuses the same descriptor + validator as the managed-
+    // unchanged. Reuses the same descriptor + validator as the StarRocks table
     // lake-stored path in mv_ddl::create_mv.
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
         match &shape {
             IncrementalMvShape::ProjectionFilter(_) => {
-                let descriptor =
-                    crate::connector::starrocks::managed::mv_ddl::descriptor_from_loaded(
-                        &loaded_bases[0].1,
-                    );
-                crate::connector::starrocks::managed::mv_ddl::validate_ivm_primary_key(
+                let descriptor = crate::connector::starrocks::table::mv_ddl::descriptor_from_loaded(
+                    &loaded_bases[0].1,
+                );
+                crate::connector::starrocks::table::mv_ddl::validate_ivm_primary_key(
                     pk_cols,
                     &descriptor,
                 )
@@ -275,7 +274,7 @@ pub(crate) fn create_iceberg_mv(
         })?;
     let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
     let aggregate_state_hidden_columns = if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        let layout = crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+        let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
             aggregate_shape,
             &analysis.output_columns,
         )?;
@@ -360,7 +359,7 @@ pub(crate) fn create_iceberg_mv(
                     select_sql: canonical_select_query.to_string(),
                     base_table_refs: base_refs.iter().map(IcebergTableRef::fqn).collect(),
                     primary_key_columns: primary_key_columns.clone(),
-                    storage_engine: ManagedMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
@@ -464,7 +463,7 @@ fn iceberg_mv_target_exists(
 }
 
 fn validate_join_shape_base_refs(
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
     for name in [
@@ -499,15 +498,15 @@ fn iceberg_aggregate_target_columns(
     shape: &AggregateMvShape,
     output_columns: &[crate::sql::analysis::OutputColumn],
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+    let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
         shape,
         output_columns,
     )?;
-    crate::connector::starrocks::managed::mv_ddl::validate_unique_aggregate_physical_column_names(
+    crate::connector::starrocks::table::mv_ddl::validate_unique_aggregate_physical_column_names(
         &layout.physical_columns,
     )?;
     Ok(
-        crate::connector::starrocks::managed::ddl::table_columns_from_physical_columns(
+        crate::connector::starrocks::table::ddl::table_columns_from_physical_columns(
             &layout.physical_columns,
         ),
     )
@@ -515,7 +514,7 @@ fn iceberg_aggregate_target_columns(
 
 fn build_iceberg_mv_schema_contract(
     shape: &IncrementalMvShape,
-    analysis: &crate::connector::starrocks::managed::mv_ddl::MvAnalysis,
+    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -626,7 +625,7 @@ fn build_iceberg_mv_schema_contract(
                 loaded_base.table.metadata().current_schema(),
             )?;
             let layout =
-                crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+                crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
                     aggregate_shape,
                     &analysis.output_columns,
                 )?;
@@ -692,7 +691,7 @@ fn build_iceberg_mv_schema_contract(
             );
             let aggregate_shape = join_aggregate_shape.as_aggregate_shape_for_layout();
             let layout =
-                crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+                crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
                     &aggregate_shape,
                     &analysis.output_columns,
                 )?;
@@ -759,7 +758,7 @@ fn base_contract(
 }
 
 fn target_contract(
-    analysis: &crate::connector::starrocks::managed::mv_ddl::MvAnalysis,
+    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
     target: &IcebergMvTarget,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
@@ -874,7 +873,7 @@ fn mv_partition_transform_contract(
 }
 
 fn aggregate_contract(
-    layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
 ) -> Result<crate::meta::repository::mv_contract::AggregateStateContract, String> {
     let fields = target_loaded
@@ -917,13 +916,13 @@ fn aggregate_contract(
 }
 
 fn aggregate_state_role_contract(
-    role: crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole,
+    role: crate::connector::starrocks::table::mv_agg_state::AggregateStateRole,
 ) -> crate::meta::repository::mv_contract::AggregateStateRoleContract {
     match role {
-        crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::Single => {
+        crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
         }
-        crate::connector::starrocks::managed::mv_agg_state::AggregateStateRole::RetractionCount => {
+        crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
         }
     }
@@ -960,6 +959,7 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     let has_data_files = !files.is_empty();
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry,
+        &target.catalog,
         &target.namespace,
         &target.table,
         loaded,
@@ -991,7 +991,7 @@ pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result
         .into_iter()
         .filter(|mv| {
             mv.storage_engine
-                .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+                .eq_ignore_ascii_case(StarRocksMvStorageEngine::Iceberg.as_sql_str())
         })
     {
         let target = IcebergMvTarget {
@@ -1137,7 +1137,7 @@ fn recorded_target_snapshot_id(
 
 fn rewrite_full_refresh_select_with_pin(
     select_sql: &str,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     base_ref: &IcebergTableRef,
 ) -> Result<String, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
@@ -1147,7 +1147,7 @@ fn rewrite_full_refresh_select_with_pin(
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("iceberg MV full refresh pin SELECT expects a SELECT query".to_string());
     };
-    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
         query,
         pin,
         &HashSet::new(),
@@ -1159,17 +1159,17 @@ fn rewrite_full_refresh_select_with_pin(
 
 fn iceberg_aggregate_first_refresh_select_sql(
     select_sql: &str,
-    shape: &crate::connector::starrocks::managed::mv_shape::AggregateMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
 ) -> Result<String, String> {
-    crate::connector::starrocks::managed::mv_shape::rewrite_select_sql_for_state(select_sql, shape)
+    crate::connector::starrocks::table::mv_shape::rewrite_select_sql_for_state(select_sql, shape)
 }
 
 fn iceberg_aggregate_incremental_delta_select_sql(
     select_sql: &str,
-    shape: &crate::connector::starrocks::managed::mv_shape::AggregateMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
     change_op_qualifier: Option<&str>,
 ) -> Result<String, String> {
-    crate::connector::starrocks::managed::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
+    crate::connector::starrocks::table::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
         select_sql,
         shape,
         change_op_qualifier,
@@ -1325,7 +1325,7 @@ pub(crate) fn refresh_iceberg_mv(
         return Ok(StatementResult::Ok);
     }
 
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, &base_refs,
     )?;
     let current_snapshot_id = pin.get(base_ref);
@@ -1615,7 +1615,7 @@ fn refresh_single_aggregate_iceberg_mv(
         _ => {}
     }
 
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, base_refs,
     )?;
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
@@ -1666,7 +1666,7 @@ fn refresh_single_aggregate_iceberg_mv(
     // current base column names.
     let reclassified_aggregate_shape = if rebind_happened {
         let new_shape =
-            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
                 &canonical_select_query,
             )?;
         aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
@@ -1817,8 +1817,8 @@ fn incremental_refresh_iceberg_aggregate_mv(
     }
 
     let source_files =
-        crate::connector::starrocks::managed::ivm_delta_source::build_delta_source_files(
-            crate::connector::starrocks::managed::ivm_delta_source::IvmDeltaSourceInput {
+        crate::connector::starrocks::table::ivm_delta_source::build_delta_source_files(
+            crate::connector::starrocks::table::ivm_delta_source::IvmDeltaSourceInput {
                 state,
                 current_database,
                 base_ref,
@@ -1866,8 +1866,8 @@ fn incremental_refresh_iceberg_aggregate_mv(
         None,
     )?;
     let delta_result =
-        crate::connector::starrocks::managed::ivm_delta_source::execute_delta_source_query(
-            crate::connector::starrocks::managed::ivm_delta_source::IvmDeltaSourceInput {
+        crate::connector::starrocks::table::ivm_delta_source::execute_delta_source_query(
+            crate::connector::starrocks::table::ivm_delta_source::IvmDeltaSourceInput {
                 state,
                 current_database,
                 base_ref,
@@ -1877,7 +1877,7 @@ fn incremental_refresh_iceberg_aggregate_mv(
             source_files,
         )?;
     let delta_chunks =
-        crate::connector::starrocks::managed::mv_agg_state::materialize_aggregate_result_chunks(
+        crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
             delta_result,
             &layout,
             aggregate_shape,
@@ -1981,7 +1981,7 @@ fn emit_aggregate_apply_event(event: &AggregateApplyEvent<'_>) {
 }
 
 fn build_aggregate_target_partition_filter(
-    layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     delta_chunks: &[crate::exec::chunk::Chunk],
 ) -> Result<
@@ -2014,7 +2014,7 @@ fn build_aggregate_target_partition_filter(
 }
 
 fn aggregate_delta_touched_row_ids(
-    layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     delta_chunks: &[crate::exec::chunk::Chunk],
 ) -> Result<std::collections::BTreeSet<String>, String> {
     use arrow::array::{Array, StringArray};
@@ -2056,7 +2056,7 @@ fn apply_iceberg_aggregate_delta_chunks(
     expected_main_snapshot_id: Option<i64>,
     mv_definition: &StoredMvDefinition,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     delta_chunks: &[crate::exec::chunk::Chunk],
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
@@ -2362,7 +2362,7 @@ fn refresh_join_aggregate_iceberg_mv(
         _ => {}
     }
 
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, base_refs,
     )?;
     if pin.len() != 2 {
@@ -2401,7 +2401,7 @@ fn refresh_join_aggregate_iceberg_mv(
     // names (join key and group key).
     let reclassified_join_aggregate_shape = if rebind_happened {
         let new_shape =
-            crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
                 &canonical_select_query,
             )?;
         match new_shape {
@@ -2681,7 +2681,7 @@ fn execute_join_aggregate_delta_branch(
     branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
     join_aggregate_shape: &JoinAggregateMvShape,
     aggregate_shape: &AggregateMvShape,
-    layout: &crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
         base_query,
@@ -2712,7 +2712,7 @@ fn execute_join_aggregate_delta_branch(
     );
     drop(catalogs_guard);
     let result = result?;
-    crate::connector::starrocks::managed::mv_agg_state::materialize_aggregate_result_chunks(
+    crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
         result,
         layout,
         aggregate_shape,
@@ -3037,7 +3037,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
         });
     }
 
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, &base_refs,
     )
     .map_err(RefreshError::user)?;
@@ -4381,12 +4381,12 @@ fn prepare_aggregate_first_refresh_chunks(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     aggregate_shape: &AggregateMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     let state_sql =
         iceberg_aggregate_first_refresh_select_sql(&mv_definition.select_sql, aggregate_shape)?;
     let mut state_query = parse_mv_select_query(&state_sql)?;
-    crate::connector::starrocks::managed::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
         &mut state_query,
         pin,
         &HashSet::new(),
@@ -4401,7 +4401,7 @@ fn prepare_aggregate_first_refresh_chunks(
         aggregate_shape,
     )?;
     let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
-    crate::connector::starrocks::managed::mv_agg_state::materialize_aggregate_result_chunks(
+    crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
         result,
         &layout,
         aggregate_shape,
@@ -4414,11 +4414,11 @@ fn build_aggregate_layout_for_refresh(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     aggregate_shape: &AggregateMvShape,
-) -> Result<crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout, String> {
+) -> Result<crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let visible_analysis =
         analyze_mv_select(state, current_catalog, current_database, &visible_query)?;
-    crate::connector::starrocks::managed::mv_agg_state::build_aggregate_mv_layout(
+    crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
         aggregate_shape,
         &visible_analysis.output_columns,
     )
@@ -5329,7 +5329,7 @@ fn refresh_iceberg_join_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV refresh requires exactly two base tables".to_string());
@@ -5407,7 +5407,7 @@ fn refresh_iceberg_join_mv(
         _ => {}
     }
 
-    let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, base_refs,
     )?;
     if pin.len() != 2 {
@@ -5522,7 +5522,7 @@ fn refresh_iceberg_join_mv(
 }
 
 fn join_base_refs_for_shape<'a>(
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
     base_refs: &'a [IcebergTableRef],
 ) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
     let left_name = shape.left_table.to_string();
@@ -5540,7 +5540,7 @@ fn join_base_refs_for_shape<'a>(
 
 fn validate_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
     for base_ref in base_refs {
@@ -5733,7 +5733,7 @@ fn first_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<StatementResult, String> {
@@ -6189,29 +6189,34 @@ fn build_iceberg_table_def_for_snapshot_scan(
     if data_files.is_empty() {
         let mut table_def =
             crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
+                &base.catalog,
                 &base.namespace,
-                &synthetic_name,
+                &base.table,
                 loaded,
             )?;
+        table_def.name = synthetic_name;
         table_def
             .iceberg_row_lineage_metadata_columns
             .retain(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN);
         return Ok(table_def);
     }
-    crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         &entry,
+        &base.catalog,
         &base.namespace,
-        &synthetic_name,
+        &base.table,
         loaded,
         data_files,
-    )
+    )?;
+    table_def.name = synthetic_name;
+    Ok(table_def)
 }
 
 fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
 ) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
@@ -6321,8 +6326,8 @@ fn execute_join_delta_branches(
     expected_main_snapshot_id: Option<i64>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    shape: &crate::connector::starrocks::managed::mv_shape::JoinProjectionFilterMvShape,
-    pin: &crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin,
+    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, String> {
     let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
@@ -9292,7 +9297,7 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_mv_uses_current_catalog_target_without_managed_table_row() {
+    fn create_iceberg_mv_uses_current_catalog_target_without_starrocks_table_row() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
 
@@ -9445,7 +9450,7 @@ mod tests {
         let [base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin::capture(
+        let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
             &env.state, &base_refs,
         )
         .expect("capture pin");
@@ -9836,7 +9841,7 @@ mod tests {
                     select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
                     base_table_refs: vec!["ice.sales.orders".to_string()],
                     primary_key_columns: Vec::new(),
-                    storage_engine: ManagedMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
                     target_catalog: Some("ice".to_string()),
                     target_namespace: Some("analytics".to_string()),
                     target_table: Some("mv_orders".to_string()),
@@ -11248,11 +11253,11 @@ mod tests {
     }
 
     mod aggregate_apply_test_helpers {
-        use crate::connector::starrocks::managed::ddl::managed_physical_column;
-        use crate::connector::starrocks::managed::mv_agg_state::{
+        use crate::connector::starrocks::table::ddl::starrocks_physical_column;
+        use crate::connector::starrocks::table::mv_agg_state::{
             AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
         };
-        use crate::connector::starrocks::managed::mv_shape::AggregateFunctionKind;
+        use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
         use crate::exec::chunk::Chunk;
         use crate::meta::repository::mv_contract::{
             ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -11267,18 +11272,23 @@ mod tests {
         use std::sync::Arc;
 
         pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {
-            let row_id = managed_physical_column(
+            let row_id = starrocks_physical_column(
                 "__row_id__".to_string(),
                 SqlType::String,
                 false,
                 false,
                 true,
             );
-            let group =
-                managed_physical_column(group_key.to_string(), SqlType::String, true, true, false);
+            let group = starrocks_physical_column(
+                group_key.to_string(),
+                SqlType::String,
+                true,
+                true,
+                false,
+            );
             let counter =
-                managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-            let state = managed_physical_column(
+                starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+            let state = starrocks_physical_column(
                 "__agg_state_c".to_string(),
                 SqlType::BigInt,
                 false,

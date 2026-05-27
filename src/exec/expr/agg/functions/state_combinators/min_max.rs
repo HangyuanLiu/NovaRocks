@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, StructArray};
 use arrow::datatypes::DataType;
 
-use crate::connector::starrocks::managed::state_codec::{
+use crate::connector::starrocks::table::state_codec::{
     MultisetEntry, decode_multiset_with_key_type, encode_multiset, write_key_at,
 };
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -585,7 +585,7 @@ mod tests {
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use crate::connector::starrocks::managed::state_codec::{
+    use crate::connector::starrocks::table::state_codec::{
         MultisetEntry, decode_multiset_with_key_type, encode_multiset,
     };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};

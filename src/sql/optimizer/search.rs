@@ -282,13 +282,13 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: crate::sql::catalog::ScanSource::StarRocks,
             },
             alias: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let expr = MExpr {
             id: 0,
@@ -348,13 +348,13 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: crate::sql::catalog::ScanSource::StarRocks,
             },
             alias: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let expr = MExpr {
             id: 0,
@@ -412,13 +412,13 @@ mod cascaded_derivation_tests {
                 name: table.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: crate::sql::catalog::ScanSource::StarRocks,
             },
             alias: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         })
     }
 

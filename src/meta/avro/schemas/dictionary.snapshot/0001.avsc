@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "DictionarySnapshot",
+  "namespace": "novarocks.meta.dictionary",
+  "fields": [
+    { "name": "dictionary_id", "type": "long" },
+    { "name": "owner_kind", "type": "string" },
+    { "name": "owner_key", "type": "string" },
+    { "name": "column_id", "type": [ "null", "long" ], "default": null },
+    { "name": "column_name", "type": "string" },
+    { "name": "data_type", "type": "string" },
+    { "name": "version", "type": "long" },
+    { "name": "watermark", "type": "string" },
+    { "name": "values", "type": { "type": "array", "items": {
+      "type": "record",
+      "name": "DictionaryValue",
+      "fields": [
+        { "name": "id", "type": "int" },
+        { "name": "bytes", "type": "bytes" }
+      ]
+    }}},
+    { "name": "null_id", "type": "int", "default": 0 },
+    { "name": "state", "type": "string" },
+    { "name": "order_preserving", "type": "boolean", "default": false },
+    { "name": "created_at_ms", "type": "long" },
+    { "name": "updated_at_ms", "type": "long" }
+  ]
+}

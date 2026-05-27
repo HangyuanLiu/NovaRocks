@@ -84,27 +84,12 @@ pub(crate) struct FragmentBuildResult {
     /// Exchange node IDs in this fragment that consume from CTE fragments:
     /// `(cte_id, exchange_node_id)`.
     pub cte_exchange_nodes: Vec<(CteId, i32)>,
-}
-
-// ---------------------------------------------------------------------------
-// Parquet write utility (used by generate_series emission)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn write_parquet_to_path(
-    path: &std::path::Path,
-    batch: &arrow::record_batch::RecordBatch,
-) -> Result<(), String> {
-    use parquet::arrow::ArrowWriter;
-
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("create local parquet file failed: {e}"))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
-        .map_err(|e| format!("create local parquet writer failed: {e}"))?;
-    writer
-        .write(batch)
-        .map_err(|e| format!("write local parquet batch failed: {e}"))?;
-    writer
-        .close()
-        .map_err(|e| format!("close local parquet writer failed: {e}"))?;
-    Ok(())
+    /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
+    /// Populated by the fragment builder when a scan exposes a dict-encoded slot.
+    /// `None` when this fragment has no dictionary-encoded slots.
+    pub query_global_dicts: Option<Vec<crate::data::TGlobalDict>>,
+    /// Per-fragment dictionary expressions emitted to
+    /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;
+    /// today this stays `None` because no codegen path populates it.
+    pub query_global_dict_exprs: Option<std::collections::BTreeMap<i32, crate::exprs::TExpr>>,
 }

@@ -1,6 +1,6 @@
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=write_path,managed_lake,iceberg,optimize,row_lineage
+-- @tags=write_path,starrocks_table,iceberg,optimize,row_lineage
 -- Test Point:
 --   Iceberg v3 ALTER TABLE OPTIMIZE compacts visible rows from data + DV files
 --   into a fresh data file set and reports FINISHED.
@@ -18,7 +18,7 @@ CREATE EXTERNAL CATALOG opt_ice_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${managed_lake_warehouse}/opt_ice_${uuid0}",
+  "iceberg.catalog.warehouse" = "${starrocks_table_warehouse}/opt_ice_${uuid0}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",

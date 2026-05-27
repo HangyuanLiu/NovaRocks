@@ -3,7 +3,7 @@
 //! `reorder_insert_rows` maps user-supplied `Literal` rows onto the target
 //! table's column order, filling missing columns with NULL. `build_local_insert_batch`
 //! then materialises the reordered rows into an Arrow `RecordBatch` with the
-//! types the managed-lake write path expects.
+//! types the StarRocks table write path expects.
 
 use std::collections::HashMap;
 use std::sync::Arc;

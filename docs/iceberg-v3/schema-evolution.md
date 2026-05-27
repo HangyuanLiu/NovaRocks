@@ -45,7 +45,7 @@ ALTER TABLE t DROP COLUMN c;
 ALTER TABLE t DROP COLUMN address.street;
 ```
 
-DROP 是逻辑删除：新 schema 中移除字段，老 data file 中的对应列被读端忽略。Equality-delete 文件引用该列时会 reject（避免读路径无法解释 delete 行）；managed MV 引用该列时也 reject。
+DROP 是逻辑删除：新 schema 中移除字段，老 data file 中的对应列被读端忽略。Equality-delete 文件引用该列时会 reject（避免读路径无法解释 delete 行）；StarRocks MV 引用该列时也 reject。
 
 ## ✅ RENAME COLUMN
 

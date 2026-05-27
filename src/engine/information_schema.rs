@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::connector::starrocks::managed::model::{ManagedTableKind, ManagedTableState};
+use crate::connector::starrocks::table::model::{StarRocksTableKind, StarRocksTableState};
 use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 use crate::sql::catalog::ColumnDef;
@@ -147,9 +147,9 @@ fn materialized_view_rows(
         .list_definitions(read.as_ref())
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let snapshot = state
-        .managed_lake
+        .starrocks_table
         .read()
-        .expect("standalone managed lake read lock")
+        .expect("standalone StarRocks table read lock")
         .snapshot
         .clone();
     let mut rows = Vec::new();
@@ -169,7 +169,7 @@ fn materialized_view_rows(
             continue;
         }
         let Some(table) = snapshot.tables.iter().find(|table| {
-            table.table_id == mv.mv_id && table.kind == ManagedTableKind::MaterializedView
+            table.table_id == mv.mv_id && table.kind == StarRocksTableKind::MaterializedView
         }) else {
             continue;
         };
@@ -180,7 +180,7 @@ fn materialized_view_rows(
         else {
             continue;
         };
-        let is_active = table.state == ManagedTableState::Active;
+        let is_active = table.state == StarRocksTableState::Active;
         rows.push(MaterializedViewInfoRow {
             table_schema: database.name.clone(),
             table_name: table.name.clone(),
@@ -470,8 +470,8 @@ impl VirtualTableProvider for SchemataProvider {
 
     fn scan(&self, state: &StandaloneState) -> Result<Vec<RecordBatch>, String> {
         // Mirror StarRocks: list databases visible under default_catalog
-        // (the local in-memory catalog includes managed-lake databases
-        // that CREATE DATABASE registers via the managed connector backend,
+        // (the local in-memory catalog includes StarRocks table databases
+        // that CREATE DATABASE registers via the StarRocks connector backend,
         // so a single enumeration covers both the synthetic info_schema
         // entry and every user-created namespace).
         let catalog = state.catalog.read().expect("standalone catalog read lock");

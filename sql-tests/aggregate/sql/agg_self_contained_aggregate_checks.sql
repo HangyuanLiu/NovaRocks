@@ -2,7 +2,7 @@
 -- @tags=aggregate,regression,self_contained
 -- Test Objective:
 -- 1. Validate mixed aggregate metrics over customer and lineorder-like data.
--- 2. Prevent regressions where this case depends on preloaded SSB tables.
+-- 2. Prevent regressions where this case depends on shared SSB fixture tables.
 -- Test Flow:
 -- 1. Create/reset minimal source tables for customer and lineorder metrics.
 -- 2. Insert deterministic rows that include both filter-hit and filter-miss branches.

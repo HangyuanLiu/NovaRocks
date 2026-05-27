@@ -1,8 +1,8 @@
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=iceberg_rest,managed_lake,mv,ivm,change_op,projection,aggregate,overwrite
+-- @tags=iceberg_rest,starrocks_table,mv,ivm,change_op,projection,aggregate,overwrite
 -- Test Point:
---   Validate managed-lake MV refresh over an Iceberg REST v3 row-lineage table
+--   Validate StarRocks table MV refresh over an Iceberg REST v3 row-lineage table
 --   uses tagged delta source semantics for both projection and signed aggregate
 --   SUM overwrite changes, including full aggregate-group retraction.
 

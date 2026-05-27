@@ -470,6 +470,9 @@ impl Rule for ScanToPhysical {
                 columns: op.columns.clone(),
                 predicates: op.predicates.clone(),
                 required_columns: op.required_columns.clone(),
+                // Propagated from the logical scan. Populated by Task 7
+                // `LowCardinalityDictionaryRewrite`; empty otherwise.
+                dict_columns: op.dict_columns.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1264,7 +1267,37 @@ impl Rule for TableFunctionToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 19. SubqueryAliasToPhysical
+// 19. DecodeToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct DecodeToPhysical;
+
+impl Rule for DecodeToPhysical {
+    fn name(&self) -> &str {
+        "DecodeToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalDecode(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalDecode(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: op.mappings.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 20. SubqueryAliasToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SubqueryAliasToPhysical;
@@ -1290,6 +1323,103 @@ impl Rule for SubqueryAliasToPhysical {
             }),
             children: expr.children.clone(),
         }]
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{LogicalDecodeOp, LogicalValuesOp};
+    use crate::sql::planner::plan::DecodeMapping;
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn decode_to_physical_emits_physical_decode_with_same_mappings() {
+        let mut memo = Memo::new();
+        // Dummy child group so the rule has a valid child slot to forward.
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let mappings = vec![DecodeMapping {
+            dict_column: "a".into(),
+            string_column: "a_str".into(),
+        }];
+        let logical_decode = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalDecode(LogicalDecodeOp {
+                mappings: mappings.clone(),
+                output_columns: vec![],
+            }),
+            children: vec![child_group],
+        };
+
+        let rule = DecodeToPhysical;
+        assert!(rule.matches(&logical_decode.op));
+        let out = rule.apply(&logical_decode, &mut memo);
+
+        assert_eq!(out.len(), 1);
+        match &out[0].op {
+            Operator::PhysicalDecode(p) => assert_eq!(p.mappings, mappings),
+            other => panic!("expected PhysicalDecode, got {:?}", other),
+        }
+        assert_eq!(out[0].children, vec![child_group]);
+    }
+
+    #[test]
+    fn decode_to_physical_preserves_output_columns() {
+        let mut memo = Memo::new();
+        let child_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        };
+        let child_group = memo.new_group(child_mexpr);
+
+        let mappings = vec![DecodeMapping {
+            dict_column: "dict_col".into(),
+            string_column: "string_col".into(),
+        }];
+        // Logical output_columns reflects the post-rename names — i.e.
+        // string_col, not dict_col. The physical operator must surface
+        // the same set verbatim.
+        let logical_outputs = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: "string_col".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        }];
+        let logical_decode = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalDecode(LogicalDecodeOp {
+                mappings,
+                output_columns: logical_outputs.clone(),
+            }),
+            children: vec![child_group],
+        };
+
+        let out = DecodeToPhysical.apply(&logical_decode, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::PhysicalDecode(p) = &out[0].op else {
+            panic!("expected PhysicalDecode");
+        };
+        assert_eq!(p.output_columns.len(), logical_outputs.len());
+        assert_eq!(p.output_columns[0].name, logical_outputs[0].name);
+        assert_eq!(p.output_columns[0].column_id, logical_outputs[0].column_id);
+        assert_eq!(p.output_columns[0].data_type, logical_outputs[0].data_type);
+        assert_eq!(p.output_columns[0].nullable, logical_outputs[0].nullable);
     }
 }
 
@@ -1448,13 +1578,13 @@ mod join_demotion_tests {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    iceberg_table: None,
                     source: ScanSource::StarRocks,
                 },
                 alias: None,
                 columns: output_columns.clone(),
                 predicates: vec![],
                 required_columns: None,
+                dict_columns: vec![],
             }),
             children: vec![],
         };

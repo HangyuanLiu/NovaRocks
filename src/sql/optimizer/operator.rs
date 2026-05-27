@@ -7,7 +7,9 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
-use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
+
+pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -57,6 +59,10 @@ pub(crate) struct LogicalScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule on the logical side and
+    /// propagated to `PhysicalScanOp` by `ScanToPhysical`.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +191,22 @@ pub(crate) struct LogicalCTEConsumeOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
+/// Logical dictionary-decode operator. Maps dictionary-encoded child columns
+/// back to their string form. Produced exclusively by the dictionary-rewrite
+/// rule (Task 7); the implementation rule `DecodeToPhysical` lowers it to
+/// `PhysicalDecodeOp`.
+///
+/// `output_columns` mirrors the input group's output columns with each
+/// `dict_column` swapped for its `string_column`. Without it
+/// `derive_output_columns` would surface the child's pre-decode names
+/// (the dict columns) to consumers, and parent lookups for the
+/// string column would fail to resolve.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalDecodeOp {
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
 // ---------------------------------------------------------------------------
 // Physical operator structs
 // ---------------------------------------------------------------------------
@@ -197,6 +219,15 @@ pub(crate) struct PhysicalScanOp {
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule when a string column on this
+    /// scan is eligible for low-cardinality rewriting. Codegen reads this to
+    /// emit a hidden INT dict slot, a `TGlobalDict` payload on the owning
+    /// fragment, and (for StarRocks scans) the
+    /// `TLakeScanNode.dict_string_id_to_int_ids` mapping. Empty in all
+    /// production paths today.
+    #[allow(dead_code)] // Read by codegen when Task 7 populates it.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
 }
 
 #[derive(Clone, Debug)]
@@ -346,6 +377,18 @@ pub(crate) struct PhysicalSubqueryAliasOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
+/// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
+/// turns this into a dictionary-decode execution node; Task 5 only routes
+/// the operator through the optimizer.
+///
+/// `output_columns` is propagated verbatim from `LogicalDecodeOp` by the
+/// `DecodeToPhysical` implementation rule.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalDecodeOp {
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
 // ---------------------------------------------------------------------------
 // Operator enum
 // ---------------------------------------------------------------------------
@@ -373,6 +416,7 @@ pub(crate) enum Operator {
     LogicalCTEAnchor(LogicalCTEAnchorOp),
     LogicalCTEProduce(LogicalCTEProduceOp),
     LogicalCTEConsume(LogicalCTEConsumeOp),
+    LogicalDecode(LogicalDecodeOp),
 
     // Physical operators
     PhysicalScan(PhysicalScanOp),
@@ -397,6 +441,7 @@ pub(crate) enum Operator {
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
     PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalSubqueryAlias(PhysicalSubqueryAliasOp),
+    PhysicalDecode(PhysicalDecodeOp),
 }
 
 impl Operator {
@@ -423,6 +468,7 @@ impl Operator {
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
+                | Operator::LogicalDecode(_)
         )
     }
 

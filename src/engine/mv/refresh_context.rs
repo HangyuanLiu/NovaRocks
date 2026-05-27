@@ -15,8 +15,8 @@ use std::sync::Arc;
 use iceberg::spec::Schema;
 
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
-use crate::connector::starrocks::managed::model::IcebergTableRef;
-use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
+use crate::connector::starrocks::table::model::IcebergTableRef;
+use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 
@@ -307,8 +307,8 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::managed::model::IcebergTableRef;
-    use crate::connector::starrocks::managed::refresh_pin::RefreshSnapshotPin;
+    use crate::connector::starrocks::table::model::IcebergTableRef;
+    use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,

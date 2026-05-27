@@ -148,13 +148,13 @@ mod tests {
                 name: "t".to_string(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
                 source: crate::sql::catalog::ScanSource::StarRocks,
             },
             alias: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
+            dict_columns: vec![],
         });
         let cost = estimate_operator_cost(&scan_plan, &stats, &[]);
         // cpu = rows * avg_size = 1000 * 100 = 100_000

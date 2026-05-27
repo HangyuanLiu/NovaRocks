@@ -43,6 +43,36 @@ pub(crate) enum LogicalPlan {
     CTEProduce(CTEProduceNode),
     /// Reference to a CTE definition. Leaf node.
     CTEConsume(CTEConsumeNode),
+    /// Low-cardinality dictionary decode: rewrites string columns to their
+    /// dictionary-encoded form upstream and decodes back to strings before
+    /// emission. Inserted by the dictionary-rewrite optimizer rule (Task 7);
+    /// today no optimizer pass produces this variant — Task 5 only adds the
+    /// type-system plumbing.
+    Decode(DecodeNode),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodeNode {
+    pub input: Box<LogicalPlan>,
+    pub mappings: Vec<DecodeMapping>,
+    /// Output columns this Decode exposes upward. Mirrors the input's
+    /// output columns with each `dict_column` swapped for its
+    /// `string_column`. Populated by the rewrite rule that inserts
+    /// Decode (Task 7) and preserved by every downstream pass. The
+    /// optimizer's `derive_output_columns` returns this verbatim — without
+    /// it the parent group would observe the child's `dict_column` name
+    /// rather than `string_column`.
+    pub output_columns: Vec<OutputColumn>,
+}
+
+/// Per-column mapping from the dictionary-encoded slot back to the original
+/// string slot. `dict_column` is the input column produced by the upstream
+/// dict-encoded plan; `string_column` is the string output exposed to the
+/// rest of the plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeMapping {
+    pub dict_column: String,
+    pub string_column: String,
 }
 
 /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
@@ -113,7 +143,7 @@ pub(crate) struct WindowExpr {
 }
 
 /// Inline table function: `TABLE(generate_series(start, end, step))`.
-/// Materialized to a temporary parquet file at emission time.
+/// Emitted as a TABLE_FUNCTION_NODE over a one-row parameter input.
 #[derive(Clone, Debug)]
 pub(crate) struct GenerateSeriesNode {
     pub start: i64,
@@ -149,6 +179,25 @@ pub(crate) struct ScanNode {
     /// Columns actually required by upstream operators (set by column pruning).
     /// `None` means all columns are required (no pruning applied).
     pub required_columns: Option<Vec<String>>,
+    /// Per-scan dictionary plan hints. Populated by the Task 7
+    /// `LowCardinalityDictionaryRewrite` rule when a string column on
+    /// this scan is eligible for low-cardinality rewriting. Empty
+    /// everywhere else. Mirrored onto `LogicalScanOp` and
+    /// `PhysicalScanOp` by memo conversion and the `ScanToPhysical`
+    /// implementation rule.
+    pub dict_columns: Vec<ScanDictionaryColumn>,
+}
+
+/// Plan hint for a single dict-encoded string column on a scan.
+/// `source_column` is the original string column name in the scan
+/// output; `dict_column` is the synthetic `Int32` slot name introduced
+/// by the rewrite rule; `dictionary` is the snapshot whose `(id, bytes)`
+/// pairs become a `TGlobalDict` payload at codegen time.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanDictionaryColumn {
+    pub source_column: String,
+    pub dict_column: String,
+    pub dictionary: std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
 }
 
 #[derive(Clone, Debug)]

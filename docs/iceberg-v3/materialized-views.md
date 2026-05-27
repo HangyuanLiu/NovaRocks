@@ -4,7 +4,7 @@
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| Iceberg-backed MV 定义 | ✅ | `src/connector/starrocks/managed/mv_*.rs` |
+| Iceberg-backed MV 定义 | ✅ | `src/connector/starrocks/table/mv_*.rs` |
 | MV 全量刷新 | ✅ | |
 | IVM —— Insert | ✅ | |
 | IVM —— V2 position-delete | ✅ | |
@@ -25,7 +25,7 @@
 | Window 函数 MV | ❌ | |
 | 含 DISTINCT / 子查询的 MV | ❌ | |
 | 跨 catalog 的 MV | ❌ | |
-| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks managed lake |
+| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks table |
 
 ---
 
@@ -45,7 +45,7 @@ FROM ice.demo.orders
 GROUP BY date_trunc('day', ts), user_id;
 ```
 
-> 当前 MV 物化在 StarRocks managed lake；让 MV 自身也作为 Iceberg 表对外暴露还在路线图上。
+> 当前 MV 物化在 StarRocks table；让 MV 自身也作为 Iceberg 表对外暴露还在路线图上。
 
 ## ✅ 增量刷新（IVM）覆盖范围
 
@@ -117,6 +117,6 @@ Window 函数（`ROW_NUMBER` / `LAG` / 滑动聚合等）的 IVM 算法复杂度
 
 ## ❌ MV 物化结果存到 Iceberg
 
-当前 MV 物化在 StarRocks managed lake 内部表。让 MV 自身也作为 Iceberg 表对外可读（被 Spark / Trino / PyIceberg 消费）能更好融入湖仓生态。
+当前 MV 物化在 StarRocks table 内部表。让 MV 自身也作为 Iceberg 表对外可读（被 Spark / Trino / PyIceberg 消费）能更好融入湖仓生态。
 
 **TODO**：未实现。

@@ -489,6 +489,21 @@ fn handle_analyze_statement(
         columns.join(",")
     };
     add_analyze_status(state, &key, &status_columns, "FULL", false);
+    // Dictionary rebuild only applies to `ANALYZE FULL TABLE`. Plain
+    // `ANALYZE TABLE` and `ANALYZE SAMPLE TABLE` paths must not rebuild
+    // dictionaries — the SAMPLE branch already returned above and the plain
+    // ANALYZE TABLE path reaches here but only the FULL prefix should drive
+    // a rebuild.
+    if lower.starts_with("analyze full table ") {
+        let analyze_columns = analyze_column_list(sql)?;
+        let rebuilt = crate::engine::dictionary::rebuild::rebuild_for_analyze_full(
+            state,
+            &key.db,
+            &key.table,
+            analyze_columns.as_deref(),
+        )?;
+        tracing::debug!("rebuilt {rebuilt} dictionary snapshots for ANALYZE FULL");
+    }
     Ok(())
 }
 
@@ -994,7 +1009,7 @@ fn estimate_insert_source_stats(
     source: &InsertSource,
 ) -> Result<Option<Vec<ColumnStatRow>>, String> {
     // Stats estimation is only meaningful for tables registered in the
-    // in-memory local catalog (managed-lake tables register themselves on
+    // in-memory local catalog (StarRocks tables register themselves on
     // CREATE; iceberg external tables register themselves at query-prep
     // time per SELECT). For INSERTs that target an iceberg table without
     // any prior SELECT, the local catalog has no entry — silently skip
@@ -1247,7 +1262,7 @@ fn add_analyze_status(
 
 fn ensure_normal_usage(state: &Arc<StandaloneState>, key: &TableKey) -> Result<(), String> {
     // Column-usage tracking is only meaningful for tables registered in the
-    // in-memory local catalog (managed-lake tables register on CREATE;
+    // in-memory local catalog (StarRocks tables register on CREATE;
     // iceberg external tables register at query-prep time). For SELECTs
     // against iceberg tables that haven't been seen yet — e.g. the very
     // first SELECT after CREATE TABLE — observe_query runs before
@@ -1965,12 +1980,22 @@ fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
 fn generate_series_row_count(start: i64, end: i64, step: i64) -> i64 {
     if step == 0 {
         0
-    } else if step > 0 && start <= end {
-        ((end - start) / step) + 1
-    } else if step < 0 && start >= end {
-        ((start - end) / step.abs()) + 1
     } else {
-        0
+        let start = i128::from(start);
+        let end = i128::from(end);
+        let step = i128::from(step);
+        let count = if step > 0 {
+            if start > end {
+                0
+            } else {
+                (end - start) / step + 1
+            }
+        } else if start < end {
+            0
+        } else {
+            (start - end) / step.abs() + 1
+        };
+        i64::try_from(count).unwrap_or(i64::MAX)
     }
 }
 
@@ -2360,6 +2385,14 @@ mod tests {
         assert_eq!(
             estimate_column_min_max(&source, 0, &DataType::Int64),
             ("2".to_string(), "10".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_series_row_count_saturates_wide_range() {
+        assert_eq!(
+            super::generate_series_row_count(i64::MIN, i64::MAX, 1),
+            i64::MAX
         );
     }
 }

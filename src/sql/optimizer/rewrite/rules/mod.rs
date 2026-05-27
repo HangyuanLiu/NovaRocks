@@ -9,9 +9,16 @@ use crate::sql::optimizer::statistics::TableStatistics;
 pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
 pub(crate) mod join_reorder;
+pub(crate) mod low_cardinality_dict;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ukfk;
 pub(crate) mod utils;
+
+pub(crate) fn low_cardinality_dictionary_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    vec![Box::new(
+        low_cardinality_dict::LowCardinalityDictionaryRewriteRule,
+    )]
+}
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
@@ -58,6 +65,7 @@ pub(crate) fn all_query_rewrite_rules(
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
+    all.extend(low_cardinality_dictionary_rules());
     all
 }
 
@@ -68,7 +76,7 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 11);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -77,6 +85,7 @@ mod tests {
                 "AggregatePushdown",
                 "EliminateUniqueAggregate",
                 "JoinReorder",
+                "LowCardinalityDictionaryRewrite",
                 "PruneColumns",
                 "PruneUkFkJoin",
                 "PushDownPredicateAggregate",

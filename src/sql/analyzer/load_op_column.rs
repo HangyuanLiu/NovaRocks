@@ -3,7 +3,7 @@
 // distributed with this work for additional information
 // regarding copyright ownership.
 
-//! Helpers for the `__op` control column used by managed-lake PK
+//! Helpers for the `__op` control column used by StarRocks table PK
 //! tables to distinguish UPSERT (0) from DELETE (1) rows.
 //!
 //! StarRocks-aligned: matches the wire-format constant `LOAD_OP_COLUMN`
@@ -12,7 +12,7 @@
 //! The optimizer / analyzer must NOT prune, push-down, or otherwise
 //! mangle `__op` projections. These helpers centralize the name and
 //! op-code values that previously lived as duplicate private constants
-//! in `connector/starrocks/{sink,managed,lake}` — re-export from those
+//! in `connector/starrocks/{sink,starrocks,lake}` — re-export from those
 //! sites if you need them at a non-FE layer.
 
 pub const LOAD_OP_COLUMN: &str = "__op";

@@ -230,10 +230,10 @@ analyze full table t5;
 -- query 45
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=Decode
+-- @result_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
-EXPLAIN COSTS SELECT DISTINCT c2 FROM t5;
+EXPLAIN VERBOSE SELECT DISTINCT c2 FROM t5;
 
 -- query 46
 USE ${case_db};

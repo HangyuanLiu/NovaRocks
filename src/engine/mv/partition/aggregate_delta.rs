@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::connector::starrocks::managed::mv_agg_state::AggregateMvLayout;
+use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
 use crate::engine::mv::partition::MvPartitionKey;
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
@@ -644,11 +644,11 @@ mod tests {
 
     // --- Task 4 tests: derive_from_aggregate_delta ---
 
-    use crate::connector::starrocks::managed::ddl::managed_physical_column;
-    use crate::connector::starrocks::managed::mv_agg_state::{
+    use crate::connector::starrocks::table::ddl::starrocks_physical_column;
+    use crate::connector::starrocks::table::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::managed::mv_shape::AggregateFunctionKind;
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
     use crate::exec::chunk::Chunk;
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -664,16 +664,18 @@ mod tests {
         data_type: DataType,
         sql_type: SqlType,
     ) -> AggregateMvLayout {
-        let row_id = managed_physical_column(
+        let row_id = starrocks_physical_column(
             "__row_id__".to_string(),
             SqlType::String,
             false,
             false,
             true,
         );
-        let group = managed_physical_column(name.to_string(), sql_type.clone(), true, true, false);
-        let counter = managed_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-        let state = managed_physical_column(
+        let group =
+            starrocks_physical_column(name.to_string(), sql_type.clone(), true, true, false);
+        let counter =
+            starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+        let state = starrocks_physical_column(
             "__agg_state_c".to_string(),
             SqlType::BigInt,
             false,

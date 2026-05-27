@@ -17,9 +17,9 @@ use crate::runtime::global_async_runtime::data_block_on;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
-    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, create_iceberg_namespace,
-    iceberg_namespace_exists, register_existing_iceberg_table, register_managed_tables_in_catalog,
-    runtime_registered,
+    IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, create_iceberg_namespace,
+    iceberg_namespace_exists, register_existing_iceberg_table,
+    register_starrocks_tables_in_catalog, runtime_registered,
 };
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
@@ -28,19 +28,19 @@ use crate::meta::repository::job::{
     CreateIcebergOptimizeJobRequest, IcebergOptimizeJobState, JobMetaRepository,
     StoredIcebergOptimizeJob,
 };
-use crate::meta::repository::managed_lake::ManagedLakeMetaRepository;
-use crate::meta::repository::managed_txn::ManagedLakeTxnRepository;
 use crate::meta::repository::mv::MvMetaRepository;
+use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
+use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
+pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
-pub(crate) mod managed_ctas;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
@@ -49,6 +49,7 @@ pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod query_prep;
 pub(crate) mod sql_expr;
+pub(crate) mod starrocks_table_ctas;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub(crate) mod stream_load;
@@ -109,7 +110,7 @@ pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneManagedTabletInfo {
+pub struct StandaloneStarRocksTabletInfo {
     pub tablet_id: i64,
     pub bucket_seq: i64,
     pub tablet_root_path: String,
@@ -118,7 +119,7 @@ pub struct StandaloneManagedTabletInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneManagedTableInfo {
+pub struct StandaloneStarRocksTableInfo {
     pub database_name: String,
     pub table_name: String,
     pub table_id: i64,
@@ -126,7 +127,7 @@ pub struct StandaloneManagedTableInfo {
     pub keys_type: String,
     pub bucket_num: i64,
     pub visible_version: i64,
-    pub tablets: Vec<StandaloneManagedTabletInfo>,
+    pub tablets: Vec<StandaloneStarRocksTabletInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,16 +190,17 @@ pub(crate) fn build_string_query_result(
 pub(crate) struct StandaloneState {
     pub(crate) catalog: RwLock<InMemoryCatalog>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
-    pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
-    pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
+    pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
-    pub(crate) managed_repo: ManagedLakeMetaRepository,
-    pub(crate) managed_txn_repo: ManagedLakeTxnRepository,
+    pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
+    pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     pub(crate) mv_repo: MvMetaRepository,
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
     pub(crate) job_repo: JobMetaRepository,
+    pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
     /// In-memory registry of user-defined views, keyed by lowercase
     /// (database, view-name). Each entry stores the analysed `Query` AST
@@ -220,16 +222,17 @@ impl Default for StandaloneState {
         Self {
             catalog: RwLock::new(InMemoryCatalog::default()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
-            managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
-            managed_lake_config: None,
+            starrocks_table_config: None,
             metadata_provider: None,
-            managed_repo: ManagedLakeMetaRepository,
-            managed_txn_repo: ManagedLakeTxnRepository,
+            starrocks_table_repo: StarRocksTableMetaRepository,
+            starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
+            dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,
             views: RwLock::new(std::collections::HashMap::new()),
             virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
@@ -298,13 +301,15 @@ impl StandaloneNovaRocks {
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
-        let managed_lake_config = resolve_managed_lake_config()?;
+        let starrocks_table_config = resolve_starrocks_table_config()?;
         let inner = Arc::new(StandaloneState {
-            managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
-            managed_lake_config,
+            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
+                starrocks_table_config.clone(),
+            )),
+            starrocks_table_config,
             metadata_provider,
-            managed_repo: ManagedLakeMetaRepository,
-            managed_txn_repo: ManagedLakeTxnRepository,
+            starrocks_table_repo: StarRocksTableMetaRepository,
+            starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
@@ -315,8 +320,8 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
-        if inner.managed_lake_config.is_some() && inner.metadata_provider.is_some() {
-            crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
+        if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
+            crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
         #[cfg(not(test))]
         if inner.metadata_provider.is_some() {
@@ -336,24 +341,24 @@ impl StandaloneNovaRocks {
         crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
     }
 
-    pub fn managed_table_info(
+    pub fn starrocks_table_info(
         &self,
         database_name: &str,
         table_name: &str,
-    ) -> Result<StandaloneManagedTableInfo, String> {
-        let managed = self
+    ) -> Result<StandaloneStarRocksTableInfo, String> {
+        let starrocks = self
             .inner
-            .managed_lake
+            .starrocks_table
             .read()
-            .expect("standalone managed lake read lock");
-        let runtime = managed.table(database_name, table_name)?;
+            .expect("standalone StarRocks table read lock");
+        let runtime = starrocks.table(database_name, table_name)?;
         let visible_version = runtime
             .partitions
             .iter()
             .map(|partition| partition.visible_version)
             .max()
             .unwrap_or(1);
-        let object_store_profile = managed
+        let object_store_profile = starrocks
             .config
             .as_ref()
             .map(|config| {
@@ -374,7 +379,7 @@ impl StandaloneNovaRocks {
                     .ok()
                     .map(|snapshot| snapshot.version)
                 });
-                StandaloneManagedTabletInfo {
+                StandaloneStarRocksTabletInfo {
                     tablet_id: tablet.tablet_id,
                     bucket_seq: tablet.bucket_seq,
                     tablet_root_path: tablet.tablet_root_path.clone(),
@@ -383,7 +388,7 @@ impl StandaloneNovaRocks {
                 }
             })
             .collect();
-        Ok(StandaloneManagedTableInfo {
+        Ok(StandaloneStarRocksTableInfo {
             database_name: runtime.database_name.clone(),
             table_name: runtime.table.name.clone(),
             table_id: runtime.table.table_id,
@@ -442,11 +447,11 @@ impl StandaloneNovaRocks {
         guard.get(&database_name, &table_name).is_ok()
     }
 
-    pub(crate) fn stream_load_managed_lake_table(
+    pub(crate) fn stream_load_starrocks_table(
         &self,
         request: StandaloneStreamLoadRequest,
     ) -> Result<StandaloneStreamLoadResult, String> {
-        stream_load_managed_lake_table(&self.inner, request)
+        stream_load_starrocks_table(&self.inner, request)
     }
 }
 
@@ -478,6 +483,28 @@ impl StandaloneSession {
     }
 
     pub(crate) fn execute_in_context(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<crate::internal_service::TQueryOptions>,
+    ) -> Result<StatementResult, String> {
+        // Install the per-statement dictionary provider so optimizer
+        // calls reached through nested engine entry points (insert,
+        // delete, MV refresh, statistics, etc.) can resolve active
+        // dictionary snapshots without each entry point having to
+        // thread the provider through its signature.
+        let provider: std::sync::Arc<
+            dyn crate::sql::optimizer::rewrite::context::QueryDictionaryProvider,
+        > = std::sync::Arc::new(crate::engine::dictionary::DictionaryQueryProvider::new(
+            self.inner.clone(),
+        ));
+        crate::sql::optimizer::rewrite::context::with_dictionary_provider(provider, || {
+            self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
+        })
+    }
+
+    fn execute_in_context_inner(
         &self,
         sql: &str,
         current_catalog: Option<&str>,
@@ -968,7 +995,9 @@ impl StandaloneSession {
             current_database,
         )?;
         if target.backend_name == "iceberg" {
-            return Err("ALTER TABLE ADD PARTITION only supports standalone managed tables".into());
+            return Err(
+                "ALTER TABLE ADD PARTITION only supports standalone StarRocks tables".into(),
+            );
         }
         let mut catalog = self
             .inner
@@ -1489,8 +1518,7 @@ impl StandaloneSession {
 
     /// Consolidated INSERT handler using sqlparser AST. All INSERT targets
     /// flow through the custom parser so the shared dispatch in
-    /// `execute_insert_statement` chooses between managed-lake and iceberg
-    /// backends. The retired local-parquet backend is no longer consulted.
+    /// `execute_insert_statement` chooses between standalone table backends.
     fn handle_sqlparser_insert(
         &self,
         insert: &sqlparser::ast::Insert,
@@ -1901,13 +1929,15 @@ fn open_metadata_provider(
     }
 }
 
-fn resolve_managed_lake_config() -> Result<Option<ManagedLakeConfig>, String> {
+fn resolve_starrocks_table_config() -> Result<Option<StarRocksTableConfig>, String> {
     let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
     let Some(standalone) = cfg.standalone_server.as_ref() else {
         return Ok(None);
     };
-    let app_cfg = standalone.managed_lake_config()?;
-    app_cfg.map(ManagedLakeConfig::from_app_config).transpose()
+    let app_cfg = standalone.starrocks_table_config()?;
+    app_cfg
+        .map(StarRocksTableConfig::from_app_config)
+        .transpose()
 }
 
 fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
@@ -1925,7 +1955,7 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    restore_managed_lake(state)?;
+    restore_starrocks_table(state)?;
     restore_iceberg_catalogs(state)?;
     crate::engine::mv::iceberg_refresh::recover_iceberg_mv_refreshes(state)?;
     crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
@@ -1979,42 +2009,42 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     Ok(())
 }
 
-fn restore_managed_lake(state: &Arc<StandaloneState>) -> Result<(), String> {
+fn restore_starrocks_table(state: &Arc<StandaloneState>) -> Result<(), String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(());
     };
-    reconcile_managed_lake_on_open_from_repositories(state)?;
+    reconcile_starrocks_table_on_open_from_repositories(state)?;
     let read = provider
         .begin_read()
-        .map_err(|e| format!("open managed lake metadata read transaction failed: {e}"))?;
-    let managed_snapshot = state
-        .managed_repo
+        .map_err(|e| format!("open StarRocks table metadata read transaction failed: {e}"))?;
+    let starrocks_table_snapshot = state
+        .starrocks_table_repo
         .load_snapshot(read.as_ref())
-        .map_err(|e| format!("load managed lake metadata failed: {e}"))?;
-    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(
-        state.managed_lake_config.clone(),
-        managed_snapshot.clone(),
+        .map_err(|e| format!("load StarRocks table metadata failed: {e}"))?;
+    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
+        state.starrocks_table_config.clone(),
+        starrocks_table_snapshot.clone(),
     )?;
     {
         let mut catalog = state
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        for database in &managed_snapshot.databases {
+        for database in &starrocks_table_snapshot.databases {
             catalog.create_database(&database.name)?;
         }
-        register_managed_tables_in_catalog(&mut catalog, &rebuilt)?;
+        register_starrocks_tables_in_catalog(&mut catalog, &rebuilt)?;
     }
     rebuilt.re_register_active_tablet_runtimes()?;
     let mut guard = state
-        .managed_lake
+        .starrocks_table
         .write()
-        .expect("standalone managed lake write lock");
+        .expect("standalone StarRocks table write lock");
     *guard = rebuilt;
     Ok(())
 }
 
-fn reconcile_managed_lake_on_open_from_repositories(
+fn reconcile_starrocks_table_on_open_from_repositories(
     state: &Arc<StandaloneState>,
 ) -> Result<(), String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
@@ -2022,64 +2052,66 @@ fn reconcile_managed_lake_on_open_from_repositories(
     };
     {
         let mut txn = provider
-            .begin_write("reconcile managed lake open metadata")
-            .map_err(|e| format!("open managed lake reconcile write transaction failed: {e}"))?;
+            .begin_write("reconcile StarRocks table open metadata")
+            .map_err(|e| format!("open StarRocks table reconcile write transaction failed: {e}"))?;
         state
-            .managed_repo
+            .starrocks_table_repo
             .fail_creating_tables(txn.as_mut())
-            .map_err(|e| format!("fail creating managed tables during open failed: {e}"))?;
+            .map_err(|e| format!("fail creating StarRocks tables during open failed: {e}"))?;
         state
-            .managed_repo
+            .starrocks_table_repo
             .delete_all_creating_partitions(txn.as_mut())
-            .map_err(|e| format!("delete creating managed partitions during open failed: {e}"))?;
+            .map_err(|e| format!("delete creating StarRocks partitions during open failed: {e}"))?;
         txn.commit()
-            .map_err(|e| format!("commit managed lake open reconciliation failed: {e}"))?;
+            .map_err(|e| format!("commit StarRocks table open reconciliation failed: {e}"))?;
     }
 
     let read = provider
         .begin_read()
-        .map_err(|e| format!("open managed lake txn read transaction failed: {e}"))?;
+        .map_err(|e| format!("open StarRocks table txn read transaction failed: {e}"))?;
     let txns = state
-        .managed_txn_repo
+        .starrocks_txn_repo
         .list_all(read.as_ref())
-        .map_err(|e| format!("load managed lake txns during open failed: {e}"))?;
+        .map_err(|e| format!("load StarRocks table txns during open failed: {e}"))?;
     drop(read);
 
-    for managed_txn in txns {
-        match managed_txn.state {
-            crate::meta::repository::managed_txn::ManagedTxnState::Prepared => {
+    for starrocks_txn in txns {
+        match starrocks_txn.state {
+            crate::meta::repository::starrocks_txn::StarRocksTxnState::Prepared => {
                 let mut write = provider
-                    .begin_write("abort prepared managed lake txn on open")
-                    .map_err(|e| format!("open managed txn abort write transaction failed: {e}"))?;
+                    .begin_write("abort prepared StarRocks table txn on open")
+                    .map_err(|e| {
+                        format!("open StarRocks txn abort write transaction failed: {e}")
+                    })?;
                 state
-                    .managed_txn_repo
-                    .mark_aborted(write.as_mut(), managed_txn.txn_id)
+                    .starrocks_txn_repo
+                    .mark_aborted(write.as_mut(), starrocks_txn.txn_id)
                     .map_err(|e| {
                         format!(
-                            "abort prepared managed txn {} during open failed: {e}",
-                            managed_txn.txn_id
+                            "abort prepared StarRocks txn {} during open failed: {e}",
+                            starrocks_txn.txn_id
                         )
                     })?;
                 write
                     .commit()
-                    .map_err(|e| format!("commit managed txn abort failed: {e}"))?;
+                    .map_err(|e| format!("commit StarRocks txn abort failed: {e}"))?;
             }
-            crate::meta::repository::managed_txn::ManagedTxnState::Written => {
+            crate::meta::repository::starrocks_txn::StarRocksTxnState::Written => {
                 let read = provider.begin_read().map_err(|e| {
-                    format!("open managed lake replay read transaction failed: {e}")
+                    format!("open StarRocks table replay read transaction failed: {e}")
                 })?;
                 let snapshot = state
-                    .managed_repo
+                    .starrocks_table_repo
                     .load_snapshot(read.as_ref())
-                    .map_err(|e| format!("load managed lake replay snapshot failed: {e}"))?;
+                    .map_err(|e| format!("load StarRocks table replay snapshot failed: {e}"))?;
                 let tablet_ids = snapshot
                     .tablets
                     .iter()
                     .filter(|tablet| {
                         snapshot.indexes.iter().any(|index| {
                             index.index_id == tablet.index_id
-                                && index.table_id == managed_txn.table_id
-                                && index.partition_id == managed_txn.partition_id
+                                && index.table_id == starrocks_txn.table_id
+                                && index.partition_id == starrocks_txn.partition_id
                         })
                     })
                     .map(|tablet| tablet.tablet_id)
@@ -2087,30 +2119,34 @@ fn reconcile_managed_lake_on_open_from_repositories(
                 drop(read);
                 crate::connector::publish_tablets_at_version(
                     tablet_ids,
-                    managed_txn.txn_id,
-                    managed_txn.base_version,
-                    managed_txn.commit_version,
+                    starrocks_txn.txn_id,
+                    starrocks_txn.base_version,
+                    starrocks_txn.commit_version,
                 )?;
                 let mut write = provider
-                    .begin_write("mark replayed managed lake txn visible")
+                    .begin_write("mark replayed StarRocks table txn visible")
                     .map_err(|e| {
-                        format!("open managed txn visible write transaction failed: {e}")
+                        format!("open StarRocks txn visible write transaction failed: {e}")
                     })?;
                 state
-                    .managed_txn_repo
-                    .mark_visible(&state.managed_repo, write.as_mut(), managed_txn.txn_id)
+                    .starrocks_txn_repo
+                    .mark_visible(
+                        &state.starrocks_table_repo,
+                        write.as_mut(),
+                        starrocks_txn.txn_id,
+                    )
                     .map_err(|e| {
                         format!(
-                            "mark replayed managed txn {} visible during open failed: {e}",
-                            managed_txn.txn_id
+                            "mark replayed StarRocks txn {} visible during open failed: {e}",
+                            starrocks_txn.txn_id
                         )
                     })?;
                 write
                     .commit()
-                    .map_err(|e| format!("commit replayed managed txn visible failed: {e}"))?;
+                    .map_err(|e| format!("commit replayed StarRocks txn visible failed: {e}"))?;
             }
-            crate::meta::repository::managed_txn::ManagedTxnState::Visible
-            | crate::meta::repository::managed_txn::ManagedTxnState::Aborted => {}
+            crate::meta::repository::starrocks_txn::StarRocksTxnState::Visible
+            | crate::meta::repository::starrocks_txn::StarRocksTxnState::Aborted => {}
         }
     }
     Ok(())
@@ -2487,7 +2523,8 @@ fn explain_analyze_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2517,7 +2554,8 @@ fn explain_query(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2573,7 +2611,8 @@ pub(crate) fn execute_query_with_options(
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory)?;
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -2691,7 +2730,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 }
 
 /// Walk the logical plan tree and collect table-level statistics for all scan
-/// nodes that reference S3ParquetFiles storage.
+/// nodes that reference IcebergDataFiles storage.
 fn build_table_stats_from_plan(
     plan: &crate::sql::planner::plan::LogicalPlan,
 ) -> std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics> {
@@ -2709,7 +2748,8 @@ fn collect_scan_stats(
 
     match plan {
         LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::ScanSource::S3ParquetFiles {
+            if let crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table,
                 files,
                 cloud_properties,
             } = &s.table.source
@@ -2718,7 +2758,7 @@ fn collect_scan_stats(
                 // the table's current snapshot. Any failure quietly degrades
                 // to manifest heuristics (see StatsLoader contract).
                 let (ndv_by_name, name_to_field_id) =
-                    load_iceberg_puffin_ndv(s.table.iceberg_table.as_ref(), cloud_properties);
+                    load_iceberg_puffin_ndv(Some(table), cloud_properties);
                 if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
                     files,
                     &s.table.columns,
@@ -2767,6 +2807,7 @@ fn collect_scan_stats(
             }
         }
         LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Decode(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
     }
 }
@@ -3291,27 +3332,27 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
 }
 
 // ---------------------------------------------------------------------------
-// Managed-lake stream-load entrypoint
+// StarRocks table stream-load entrypoint
 // ---------------------------------------------------------------------------
 
-/// HTTP stream-load entrypoint for managed-lake tables. Parses CSV / JSON
+/// HTTP stream-load entrypoint for StarRocks tables. Parses CSV / JSON
 /// payloads via the neutral helpers in `engine::stream_load` and hands the
-/// resulting rows to `insert_into_managed_lake_table`, so every stream-load
+/// resulting rows to `insert_into_starrocks_table`, so every stream-load
 /// target goes through the same path as a plain `INSERT INTO ... VALUES`.
-fn stream_load_managed_lake_table(
+fn stream_load_starrocks_table(
     state: &Arc<StandaloneState>,
     request: StandaloneStreamLoadRequest,
 ) -> Result<StandaloneStreamLoadResult, String> {
     let database = normalize_identifier(&request.database)?;
     let table = normalize_identifier(&request.table)?;
-    let is_managed = state
-        .managed_lake
+    let is_starrocks_table = state
+        .starrocks_table
         .read()
-        .expect("standalone managed lake read lock")
+        .expect("standalone StarRocks table read lock")
         .contains_table(&database, &table)?;
-    if !is_managed {
+    if !is_starrocks_table {
         return Err(format!(
-            "standalone stream load only supports managed-lake tables, got {}.{}",
+            "standalone stream load only supports StarRocks tables, got {}.{}",
             database, table
         ));
     }
@@ -3350,7 +3391,7 @@ fn stream_load_managed_lake_table(
     };
     let loaded_rows = rows.len() as i64;
     let loaded_bytes = request.payload.len() as i64;
-    crate::connector::insert_into_managed_lake_table(
+    crate::connector::insert_into_starrocks_table(
         state,
         &object_name,
         &insert_columns,
@@ -3905,7 +3946,7 @@ path = "meta/catalog.db"
         })
     }
 
-    fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+    fn starrocks_table_endpoint_reachable(endpoint: &str) -> bool {
         let stripped = endpoint
             .split_once("://")
             .map(|(_, rest)| rest)
@@ -3928,18 +3969,18 @@ path = "meta/catalog.db"
         std::net::TcpStream::connect_timeout(
             &format!("{host}:{port}")
                 .parse()
-                .expect("managed lake endpoint socket addr"),
+                .expect("StarRocks table endpoint socket addr"),
             std::time::Duration::from_secs(1),
         )
         .is_ok()
     }
 
-    fn maybe_managed_lake_config() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
+    fn maybe_starrocks_table_config() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
         let endpoint = std::env::var("AWS_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
-        if !managed_lake_endpoint_reachable(&endpoint) {
+        if !starrocks_table_endpoint_reachable(&endpoint) {
             eprintln!(
-                "skipping managed lake test: object store endpoint is unreachable: {endpoint}"
+                "skipping StarRocks table test: object store endpoint is unreachable: {endpoint}"
             );
             return None;
         }
@@ -3951,8 +3992,8 @@ path = "meta/catalog.db"
             .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
             .unwrap_or_else(|_| "admin123".to_string());
         let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
-        let root_prefix =
-            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let root_prefix = std::env::var("AWS_S3_ROOT")
+            .unwrap_or_else(|_| "codex-starrocks-table-tests".to_string());
         let run_id = format!(
             "engine_{}_{}",
             std::process::id(),
@@ -3968,7 +4009,7 @@ path = "meta/catalog.db"
             format!("s3://{bucket}/{root_prefix}/{run_id}")
         };
 
-        let dir = TempDir::new().expect("create managed lake config dir");
+        let dir = TempDir::new().expect("create StarRocks table config dir");
         let metadata_dir = dir.path().join("meta");
         std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
         let metadata_path = metadata_dir.join("standalone.sqlite");
@@ -3992,17 +4033,16 @@ enable_path_style_access = true
 "#
             ),
         )
-        .expect("write managed lake config");
+        .expect("write StarRocks table config");
         Some((dir, config_path, metadata_path))
     }
 
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
-        use crate::sql::catalog::{ColumnDef, S3FileInfo, ScanSource, TableDef};
+        use crate::sql::catalog::{
+            ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
+        };
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
-        // Build a synthetic `tbl(id int, name varchar)` table-def directly.
-        // The fragment builder only consults columns + storage shape; no
-        // parquet bytes are ever read on this code path.
         let mut catalog = super::InMemoryCatalog::default();
         let table = TableDef {
             name: "tbl".to_string(),
@@ -4023,15 +4063,21 @@ enable_path_style_access = true
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            iceberg_table: None,
-            source: ScanSource::S3ParquetFiles {
-                files: Vec::<S3FileInfo>::new(),
-                cloud_properties: Default::default(),
-            },
+            source: ScanSource::StarRocks,
+        };
+        let layout = PhysicalTableLayout {
+            db_id: 1,
+            table_id: 2,
+            schema_id: 3,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 4,
+                partition_id: 5,
+                version: 6,
+            }],
         };
         catalog
-            .register("default", table)
-            .expect("register synthetic tbl");
+            .register_starrocks_table("default", table, layout)
+            .expect("register StarRocks tbl");
 
         let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
@@ -4047,8 +4093,8 @@ enable_path_style_access = true
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical =
-            crate::sql::optimizer::optimize(logical, &table_stats, factory).expect("optimize");
+        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
+            .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, "default",
         )
@@ -4943,13 +4989,13 @@ enable_path_style_access = true
                 .as_ref()
                 .expect("metadata provider");
             let read = provider.begin_read().expect("open read txn");
-            let managed_snapshot = engine
+            let starrocks_table_snapshot = engine
                 .inner
-                .managed_repo
+                .starrocks_table_repo
                 .load_snapshot(read.as_ref())
-                .expect("load managed snapshot");
+                .expect("load StarRocks snapshot");
             assert!(
-                !managed_snapshot
+                !starrocks_table_snapshot
                     .tables
                     .iter()
                     .any(|table| table.name == "mv_orders")
@@ -5011,13 +5057,13 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
+    fn embedded_session_reopen_cleans_incomplete_starrocks_truncate_stage_partition() {
         let _runtime_guard = lock_runtime_test_state();
-        use crate::meta::repository::managed_lake::{
-            ManagedIndexState, ManagedPartitionState, StageManagedTruncateRequest,
+        use crate::meta::repository::starrocks_table::{
+            StageStarRocksTruncateRequest, StarRocksIndexState, StarRocksPartitionState,
         };
 
-        let Some((_dir, config_path, metadata_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, metadata_path)) = maybe_starrocks_table_config() else {
             return;
         };
 
@@ -5031,7 +5077,7 @@ enable_path_style_access = true
                 .execute(
                     "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
                 )
-                .expect("create managed table");
+                .expect("create StarRocks table");
         }
 
         let provider =
@@ -5041,9 +5087,9 @@ enable_path_style_access = true
                 .begin_write("seed incomplete truncate stage")
                 .expect("open write txn");
             let snapshot =
-                crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+                crate::meta::repository::starrocks_table::StarRocksTableMetaRepository::default()
                     .load_snapshot(txn.as_ref())
-                    .expect("load managed snapshot");
+                    .expect("load StarRocks snapshot");
             let table = snapshot
                 .tables
                 .iter()
@@ -5051,10 +5097,10 @@ enable_path_style_access = true
                 .cloned()
                 .expect("orders table");
             let staged =
-                crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+                crate::meta::repository::starrocks_table::StarRocksTableMetaRepository::default()
                     .stage_truncate_partition(
                         txn.as_mut(),
-                        StageManagedTruncateRequest {
+                        StageStarRocksTruncateRequest {
                             table_id: table.table_id,
                             db_id: table.db_id,
                             bucket_num: table.bucket_num,
@@ -5074,26 +5120,26 @@ enable_path_style_access = true
         let result = reopened
             .session()
             .query("select * from orders")
-            .expect("query reopened managed table");
+            .expect("query reopened StarRocks table");
         assert_eq!(result.row_count(), 0);
 
         let reloaded = {
             let read = provider.begin_read().expect("open read txn");
-            crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default()
+            crate::meta::repository::starrocks_table::StarRocksTableMetaRepository::default()
                 .load_snapshot(read.as_ref())
-                .expect("reload managed snapshot")
+                .expect("reload StarRocks snapshot")
         };
         assert!(
             !reloaded
                 .partitions
                 .iter()
-                .any(|partition| partition.state == ManagedPartitionState::Creating)
+                .any(|partition| partition.state == StarRocksPartitionState::Creating)
         );
         assert!(
             !reloaded
                 .indexes
                 .iter()
-                .any(|index| index.state == ManagedIndexState::Creating)
+                .any(|index| index.state == StarRocksIndexState::Creating)
         );
         assert!(
             !reloaded
@@ -5104,9 +5150,9 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn embedded_session_reopen_keeps_truncated_managed_table_empty() {
+    fn embedded_session_reopen_keeps_truncated_starrocks_table_empty() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_path)) = maybe_starrocks_table_config() else {
             return;
         };
 
@@ -5120,10 +5166,10 @@ enable_path_style_access = true
                 .execute(
                     "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
                 )
-                .expect("create managed table");
+                .expect("create StarRocks table");
             session
                 .execute("insert into orders values (1, 'a'), (2, 'b')")
-                .expect("insert managed rows");
+                .expect("insert StarRocks rows");
             session
                 .execute("truncate table orders")
                 .expect("truncate table");
@@ -5136,14 +5182,14 @@ enable_path_style_access = true
         let result = reopened
             .session()
             .query("select * from orders")
-            .expect("query truncated managed table");
+            .expect("query truncated StarRocks table");
         assert_eq!(result.row_count(), 0);
     }
 
     #[test]
-    fn managed_pk_delete_via_op_column_path() {
+    fn starrocks_pk_delete_via_op_column_path() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
@@ -5172,9 +5218,9 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn managed_pk_delete_complex_where() {
+    fn starrocks_pk_delete_complex_where() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
@@ -5201,9 +5247,9 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn managed_pk_delete_then_insert_same_pk_visible() {
+    fn starrocks_pk_delete_then_insert_same_pk_visible() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
@@ -5237,9 +5283,9 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn managed_dup_delete_via_delete_predicate_path() {
+    fn starrocks_dup_delete_via_delete_predicate_path() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {
@@ -5273,8 +5319,8 @@ enable_path_style_access = true
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
         let _runtime_guard = lock_runtime_test_state();
         use crate::meta::repository::job::{CreateEraseJobRequest, JobState};
-        use crate::meta::repository::managed_lake::{
-            CreateManagedTableLayoutRequest, ManagedLakeMetaRepository, ManagedTableKind,
+        use crate::meta::repository::starrocks_table::{
+            CreateStarRocksTableLayoutRequest, StarRocksTableKind, StarRocksTableMetaRepository,
         };
         use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
         use prost::Message;
@@ -5309,19 +5355,19 @@ enable_path_style_access = true
             let mut txn = provider
                 .begin_write("seed pending erase job")
                 .expect("write");
-            let managed_repo = ManagedLakeMetaRepository::default();
-            let database = managed_repo
+            let starrocks_table_repo = StarRocksTableMetaRepository::default();
+            let database = starrocks_table_repo
                 .get_or_create_database(txn.as_mut(), "analytics")
                 .expect("create database");
-            let created = managed_repo
+            let created = starrocks_table_repo
                 .create_table_layout(
                     txn.as_mut(),
-                    CreateManagedTableLayoutRequest {
+                    CreateStarRocksTableLayoutRequest {
                         db_id: database.db_id,
                         table_name: "orders".to_string(),
                         keys_type: "DUP_KEYS".to_string(),
                         bucket_num: 1,
-                        kind: ManagedTableKind::Table,
+                        kind: StarRocksTableKind::Table,
                         schema_version: 0,
                         tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
                         columns: Vec::new(),
@@ -5329,8 +5375,8 @@ enable_path_style_access = true
                         warehouse_uri: "s3://test/warehouse".to_string(),
                     },
                 )
-                .expect("create managed layout");
-            managed_repo
+                .expect("create StarRocks layout");
+            starrocks_table_repo
                 .mark_table_dropping(txn.as_mut(), created.table.table_id)
                 .expect("mark table dropping");
             let erase_job = crate::meta::repository::job::JobMetaRepository::default()
@@ -5366,7 +5412,7 @@ enable_path_style_access = true
                 assert!(
                     job.last_error
                         .as_deref()
-                        .is_some_and(|msg| msg.contains("empty managed lake root")),
+                        .is_some_and(|msg| msg.contains("empty StarRocks table root")),
                     "job should record root validation failure, got {:?}",
                     job.last_error
                 );
@@ -5388,10 +5434,10 @@ enable_path_style_access = true
         // This test's only goal is to confirm `Statement::RefreshMaterializedView`
         // is routed to the materialized-view dispatch path (not, say, an iceberg
         // flow or a generic statement handler). The specific error message is
-        // incidental — any error surfaced from inside the managed-lake MV
+        // incidental — any error surfaced from inside the StarRocks table MV
         // refresh handler proves correct routing. Accept several signposts
         // because the exact failure point depends on which precondition is
-        // checked first (catalog lookup vs. managed-lake config presence vs.
+        // checked first (catalog lookup vs. StarRocks table config presence vs.
         // metadata-store availability) and that order has shifted over time.
         let state = Arc::new(StandaloneState::default());
         register_connector_backends(&state);
@@ -5408,12 +5454,12 @@ enable_path_style_access = true
                 },
             ),
         )
-        .expect_err("refresh should fail without managed lake config");
+        .expect_err("refresh should fail without StarRocks table config");
         assert!(
-            err.contains("managed lake config is missing")
+            err.contains("StarRocks table config is missing")
                 || err.contains("sqlite metadata store")
                 || err.contains("materialized view")
-                || err.contains("managed table"),
+                || err.contains("StarRocks table"),
             "unexpected dispatch error: {err}"
         );
     }
@@ -6260,7 +6306,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_v3_update_from_source_table() {
         // Use a second iceberg table (in the same catalog/namespace) as the
-        // source so the test does not depend on managed-lake configuration.
+        // source so the test does not depend on StarRocks table configuration.
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
@@ -6573,7 +6619,7 @@ enable_path_style_access = true
     fn select_last_updated_sequence_number_fails_on_non_row_lineage_iceberg_table() {
         // Tests that _last_updated_sequence_number fails on a regular V3 iceberg
         // table without write.row-lineage=true (same fail-fast path as non-iceberg
-        // tables, verified without needing managed lake config).
+        // tables, verified without needing StarRocks table config).
         let warehouse = TempDir::new().expect("warehouse tempdir");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default())
             .expect("open standalone engine");
@@ -6612,7 +6658,7 @@ enable_path_style_access = true
     #[test]
     fn select_with_datetime_literal_matches_microsecond_precision() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
 
@@ -6646,7 +6692,7 @@ enable_path_style_access = true
     #[test]
     fn select_with_datetime_literal_in_list_matches() {
         let _runtime_guard = lock_runtime_test_state();
-        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_starrocks_table_config() else {
             return;
         };
         let engine = StandaloneNovaRocks::open(StandaloneOptions {

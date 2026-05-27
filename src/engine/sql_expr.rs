@@ -606,7 +606,7 @@ pub(crate) fn sqlparser_function_to_literal(
                     Err(_) => return Ok(Literal::Null),
                 };
             // Use the EXTERNAL (storage / SeriV1-style) encoding here —
-            // that's the format the StarRocks managed-lake bitmap column
+            // that's the format the StarRocks table bitmap column
             // reader expects, matching `bitmap_empty` / `to_bitmap`'s
             // const-fold output. The internal varint format only round-
             // trips through the runtime expression layer.

@@ -320,7 +320,7 @@ impl Default for StandaloneServerConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneManagedLakeConfig {
+pub struct StandaloneStarRocksTableConfig {
     pub warehouse_uri: String,
     pub endpoint: String,
     pub access_key_id: String,
@@ -331,9 +331,9 @@ pub struct StandaloneManagedLakeConfig {
 }
 
 impl StandaloneServerConfig {
-    pub fn managed_lake_config(
+    pub fn starrocks_table_config(
         &self,
-    ) -> std::result::Result<Option<StandaloneManagedLakeConfig>, String> {
+    ) -> std::result::Result<Option<StandaloneStarRocksTableConfig>, String> {
         let Some(warehouse_uri) = self
             .warehouse_uri
             .as_ref()
@@ -344,21 +344,23 @@ impl StandaloneServerConfig {
         };
 
         let object_store = self.object_store.as_ref().ok_or_else(|| {
-            "standalone managed lake requires [standalone_server.object_store]".to_string()
+            "standalone StarRocks table requires [standalone_server.object_store]".to_string()
         })?;
         let endpoint = object_store
             .endpoint
             .as_ref()
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| "standalone managed lake requires object_store.endpoint".to_string())?;
+            .ok_or_else(|| {
+                "standalone StarRocks table requires object_store.endpoint".to_string()
+            })?;
         let access_key_id = object_store
             .access_key_id
             .as_ref()
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                "standalone managed lake requires object_store.access_key_id".to_string()
+                "standalone StarRocks table requires object_store.access_key_id".to_string()
             })?;
         let access_key_secret = object_store
             .access_key_secret
@@ -366,10 +368,10 @@ impl StandaloneServerConfig {
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                "standalone managed lake requires object_store.access_key_secret".to_string()
+                "standalone StarRocks table requires object_store.access_key_secret".to_string()
             })?;
 
-        Ok(Some(StandaloneManagedLakeConfig {
+        Ok(Some(StandaloneStarRocksTableConfig {
             warehouse_uri: warehouse_uri.to_string(),
             endpoint: endpoint.to_string(),
             access_key_id: access_key_id.to_string(),
@@ -1075,8 +1077,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig,
+        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneObjectStoreConfig,
+        StandaloneServerConfig, StandaloneStarRocksTableConfig,
     };
 
     #[test]
@@ -1183,7 +1185,7 @@ mysql_port = 19030
     }
 
     #[test]
-    fn test_standalone_server_parses_managed_lake_object_store() {
+    fn test_standalone_server_parses_starrocks_table_object_store() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [standalone_server]
@@ -1215,7 +1217,27 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn test_standalone_server_defaults_without_managed_lake_section() {
+    fn test_standalone_starrocks_table_fixture_loads() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/sql-test-runner/conf/standalone_starrocks_table.toml");
+        let cfg = NovaRocksConfig::load_from_file(&path).expect("load fixture config");
+        let metadata = cfg.metadata.expect("metadata config");
+        assert_eq!(
+            metadata.path,
+            PathBuf::from("tmp/standalone-starrocks-table.sqlite")
+        );
+
+        let standalone = cfg.standalone_server.expect("standalone config");
+        assert_eq!(
+            standalone.warehouse_uri.as_deref(),
+            Some("s3://novarocks/sql-tests-starrocks-table")
+        );
+        assert_eq!(standalone.mysql_port, 9030);
+        assert!(standalone.object_store.is_some());
+    }
+
+    #[test]
+    fn test_standalone_server_defaults_without_starrocks_table_section() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
 [standalone_server]
@@ -1231,7 +1253,7 @@ user = "root"
     }
 
     #[test]
-    fn test_standalone_server_managed_lake_config_normalizes_required_fields() {
+    fn test_standalone_server_starrocks_table_config_normalizes_required_fields() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1246,9 +1268,9 @@ user = "root"
 
         assert_eq!(
             standalone
-                .managed_lake_config()
-                .expect("managed lake config"),
-            Some(StandaloneManagedLakeConfig {
+                .starrocks_table_config()
+                .expect("StarRocks table config"),
+            Some(StandaloneStarRocksTableConfig {
                 warehouse_uri: "s3://novarocks/standalone".to_string(),
                 endpoint: "http://127.0.0.1:9000".to_string(),
                 access_key_id: "admin".to_string(),
@@ -1261,7 +1283,7 @@ user = "root"
     }
 
     #[test]
-    fn test_standalone_server_managed_lake_config_propagates_mv_default_storage_engine() {
+    fn test_standalone_server_starrocks_table_config_propagates_mv_default_storage_engine() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some("s3://bucket/wh".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1274,17 +1296,20 @@ user = "root"
             mv_default_storage_engine: Some("iceberg".to_string()),
             ..StandaloneServerConfig::default()
         };
-        let cfg = standalone.managed_lake_config().expect("ok").expect("some");
+        let cfg = standalone
+            .starrocks_table_config()
+            .expect("ok")
+            .expect("some");
         assert_eq!(cfg.mv_default_storage_engine.as_deref(), Some("iceberg"));
     }
 
     #[test]
-    fn test_standalone_server_managed_lake_config_returns_none_without_warehouse_uri() {
+    fn test_standalone_server_starrocks_table_config_returns_none_without_warehouse_uri() {
         let standalone = StandaloneServerConfig::default();
         assert_eq!(
             standalone
-                .managed_lake_config()
-                .expect("managed lake config"),
+                .starrocks_table_config()
+                .expect("StarRocks table config"),
             None
         );
 
@@ -1294,14 +1319,14 @@ user = "root"
         };
         assert_eq!(
             standalone
-                .managed_lake_config()
-                .expect("managed lake config"),
+                .starrocks_table_config()
+                .expect("StarRocks table config"),
             None
         );
     }
 
     #[test]
-    fn test_standalone_server_managed_lake_config_validates_required_object_store_fields() {
+    fn test_standalone_server_starrocks_table_config_validates_required_object_store_fields() {
         let base = StandaloneServerConfig {
             warehouse_uri: Some("s3://novarocks/standalone".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1320,7 +1345,7 @@ user = "root"
                     object_store: None,
                     ..base.clone()
                 },
-                "standalone managed lake requires [standalone_server.object_store]",
+                "standalone StarRocks table requires [standalone_server.object_store]",
             ),
             (
                 StandaloneServerConfig {
@@ -1330,7 +1355,7 @@ user = "root"
                     }),
                     ..base.clone()
                 },
-                "standalone managed lake requires object_store.endpoint",
+                "standalone StarRocks table requires object_store.endpoint",
             ),
             (
                 StandaloneServerConfig {
@@ -1340,7 +1365,7 @@ user = "root"
                     }),
                     ..base.clone()
                 },
-                "standalone managed lake requires object_store.access_key_id",
+                "standalone StarRocks table requires object_store.access_key_id",
             ),
             (
                 StandaloneServerConfig {
@@ -1350,15 +1375,15 @@ user = "root"
                     }),
                     ..base
                 },
-                "standalone managed lake requires object_store.access_key_secret",
+                "standalone StarRocks table requires object_store.access_key_secret",
             ),
         ];
 
         for (standalone, expected) in cases {
             assert_eq!(
                 standalone
-                    .managed_lake_config()
-                    .expect_err("managed lake error"),
+                    .starrocks_table_config()
+                    .expect_err("StarRocks table error"),
                 expected
             );
         }

@@ -52,14 +52,14 @@ pub(crate) fn resolve_table_target(
 
     if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
         let resolved = resolve_local_table_name(effective_name, current_database)?;
-        let managed_exists = state
-            .managed_lake
+        let starrocks_exists = state
+            .starrocks_table
             .read()
-            .expect("standalone managed lake read lock")
+            .expect("standalone StarRocks table read lock")
             .contains_table(&resolved.database, &resolved.table)?;
-        if managed_exists || state.managed_lake_config.is_some() || stripped.is_some() {
+        if starrocks_exists || state.starrocks_table_config.is_some() || stripped.is_some() {
             return Ok(TargetBackend {
-                backend_name: "managed",
+                backend_name: "starrocks",
                 catalog: String::new(),
                 namespace: resolved.database,
                 table: resolved.table,
@@ -93,14 +93,14 @@ pub(crate) fn resolve_existing_table_target(
 
     if effective_catalog.is_none() && effective_name.parts.len() <= 2 {
         let resolved = resolve_local_table_name(effective_name, current_database)?;
-        let managed_exists = state
-            .managed_lake
+        let starrocks_exists = state
+            .starrocks_table
             .read()
-            .expect("standalone managed lake read lock")
+            .expect("standalone StarRocks table read lock")
             .contains_table(&resolved.database, &resolved.table)?;
-        if managed_exists || stripped.is_some() {
+        if starrocks_exists || stripped.is_some() {
             return Ok(TargetBackend {
-                backend_name: "managed",
+                backend_name: "starrocks",
                 catalog: String::new(),
                 namespace: resolved.database,
                 table: resolved.table,
@@ -125,7 +125,7 @@ pub(crate) fn resolve_namespace_target(
 ) -> Result<TargetBackend, String> {
     if current_catalog.is_none() && name.parts.len() == 1 {
         return Ok(TargetBackend {
-            backend_name: "managed",
+            backend_name: "starrocks",
             catalog: String::new(),
             namespace: crate::engine::catalog::normalize_identifier(name.leaf())?,
             table: String::new(),

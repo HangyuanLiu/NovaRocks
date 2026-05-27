@@ -3,7 +3,7 @@
 // distributed with this work for additional information
 // regarding copyright ownership.
 
-//! Translate a managed-lake DELETE's WHERE clause into
+//! Translate a StarRocks table DELETE's WHERE clause into
 //! `DeletePredicateTerms` — a conjunctive list of column-op-literal /
 //! IN / IS NULL predicates with StarRocks-compatible string-encoded
 //! literal values. Mirrors StarRocks DeleteAnalyzer restrictions:

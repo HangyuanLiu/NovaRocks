@@ -160,7 +160,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field};
 
-    use crate::connector::starrocks::managed::state_codec::encode_sum_decimal128;
+    use crate::connector::starrocks::table::state_codec::encode_sum_decimal128;
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 

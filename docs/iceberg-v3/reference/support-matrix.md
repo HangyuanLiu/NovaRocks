@@ -285,7 +285,7 @@
 | Window 函数 MV | ❌ | |
 | 含 DISTINCT / 子查询的 MV | ❌ | |
 | 跨 catalog 的 MV | ❌ | |
-| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks managed lake |
+| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks table |
 
 ## 15. SQL 语言特性（与 Iceberg 协同的部分）
 
