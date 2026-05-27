@@ -477,4 +477,33 @@ mod tests {
             .expect("plain plan must pass validation");
         assert!(matches!(out, LogicalPlan::Values(_)));
     }
+
+    #[test]
+    fn regular_query_pipeline_does_not_produce_markers() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::pipeline::RewritePipeline;
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+
+        // RewritePipeline::new is the constructor used by the query
+        // rewrite path. With no rules, it must leave the plan unchanged
+        // and never introduce a marker.
+        let pipeline = RewritePipeline::new(
+            vec![
+                RewritePhase::LogicalNormalize,
+                RewritePhase::StructuralRewrite,
+                RewritePhase::SemanticRewrite,
+                RewritePhase::Validation,
+            ],
+            Vec::new(),
+        );
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+
+        let out = pipeline
+            .rewrite(empty_values_plan(), &mut ctx)
+            .expect("query pipeline must not error on plain plan");
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "non-IMV pipeline must not emit markers, got {out:?}"
+        );
+    }
 }
