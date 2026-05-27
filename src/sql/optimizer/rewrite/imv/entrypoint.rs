@@ -123,10 +123,13 @@ mod tests {
 
     #[test]
     fn annotation_is_default_initialized_in_extension_slot() {
+        // Disable WrapRootInImvDelta so the pipeline succeeds and we can
+        // inspect the annotation; annotation initialization is independent
+        // of whether wrapping occurs.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
         })
         .unwrap();
@@ -229,10 +232,16 @@ mod tests {
 
     #[test]
     fn unknown_disabled_rule_name_is_ignored() {
+        // An unknown name in disabled_rules must not crash or produce a
+        // pipeline-internal error. Disable WrapRootInImvDelta too so that
+        // the pipeline can succeed and we can inspect the trace count.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: vec!["NoSuchRule".to_string()],
+            disabled_rules: vec![
+                "NoSuchRule".to_string(),
+                "WrapRootInImvDelta".to_string(),
+            ],
             deadline: None,
         })
         .expect("unknown disabled rule must not break the pipeline");
@@ -304,30 +313,71 @@ mod tests {
     // ── Pre-existing tests ──────────────────────────────────────────────────
 
     #[test]
-    fn empty_imv_pipeline_returns_input_plan_verbatim() {
-        let plan = empty_values_plan();
-        let before = format!("{plan:?}");
-
-        let outcome = run_imv_rewrite(ImvRewriteInput {
-            plan,
-            mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
-            deadline: None,
-        })
-        .expect("no-op IMV pipeline must succeed");
-
-        assert_eq!(format!("{:?}", outcome.plan), before);
-    }
-
-    #[test]
-    fn empty_pipeline_traces_all_four_stage_names() {
-        let outcome = run_imv_rewrite(ImvRewriteInput {
+    fn imv_pipeline_returns_err_on_plain_plan_in_pr_beta() {
+        // PR-α: pipeline was identity. PR-β: wrap+validation rejects.
+        // This test preserves the spirit of the original
+        // empty_imv_pipeline_returns_input_plan_verbatim test by checking
+        // the marker-rejection contract rather than identity.
+        let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
         })
-        .expect("no-op IMV pipeline must succeed");
+        .expect_err("PR-β pipeline rejects plain plans");
+        assert!(err.starts_with("IVM rewrite failed to resolve incremental markers:"));
+    }
+
+    // ── PR-β tests (Task 7) ─────────────────────────────────────────────────
+
+    #[test]
+    fn pr_beta_pipeline_runs_wrap_and_validation_against_plain_plan() {
+        // End-to-end through run_imv_rewrite. Plain plan → wrap → validation
+        // rejects → Err propagated to caller. This is PR-β's headline
+        // behavior; iceberg-ivm continues to pass because
+        // try_run_imv_rewrite_pipeline swallows the Err.
+        let err = run_imv_rewrite(ImvRewriteInput {
+            plan: empty_values_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+        })
+        .expect_err("PR-β pipeline must Reject on plain plan");
+        assert!(
+            err.starts_with("IVM rewrite failed to resolve incremental markers:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_beta_pipeline_passes_when_wrap_rule_disabled() {
+        // If the user disables WrapRootInImvDelta, no marker is produced,
+        // and Validation has nothing to reject. Confirms the disable
+        // wire-up reaches the new rule.
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: empty_values_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            deadline: None,
+        })
+        .expect("disabled wrap rule must let the pipeline succeed");
+
+        // outcome.plan must still be the original (no marker added).
+        assert!(matches!(outcome.plan, LogicalPlan::Values(_)));
+    }
+
+    #[test]
+    fn empty_pipeline_traces_all_four_stage_names() {
+        // Disable WrapRootInImvDelta so the pipeline succeeds and we can
+        // inspect the trace's stage list (the stage names are unchanged from
+        // PR-α; only the rule registrations changed).
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: empty_values_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+            deadline: None,
+        })
+        .expect("pipeline must succeed when wrap rule is disabled");
 
         assert_eq!(
             outcome.trace.stage_names(),
