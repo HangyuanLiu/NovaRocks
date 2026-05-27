@@ -990,8 +990,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "array_min" | "array_max" => array_item_type(arg_types.first()).unwrap_or(DataType::Null),
         "all_match" | "any_match" | "array_contains" | "array_contains_all"
         | "array_contains_seq" | "arrays_overlap" => DataType::Boolean,
-        "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
-        | "array_filter" | "array_map" | "array_top_n" | "array_distinct" => {
+        "null_or_empty" => DataType::Boolean,
+        "array_sort" | "array_sort_lambda" | "array_sortby" | "array_reverse" | "array_slice"
+        | "array_remove" | "array_filter" | "array_map" | "array_top_n" | "array_distinct" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
         "array_append" => infer_array_append_return_type(arg_types),
@@ -1183,7 +1184,9 @@ fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
             | DataType::Int32
             | DataType::Int64,
         ) => DataType::Int64,
-        Some(DataType::Float32 | DataType::Float64) => DataType::Float64,
+        Some(DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8) => {
+            DataType::Float64
+        }
         Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
         Some(DataType::FixedSizeBinary(width))
             if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>

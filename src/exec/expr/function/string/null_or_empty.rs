@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, NullArray, StringArray};
 use std::sync::Arc;
 
 pub fn eval_null_or_empty(
@@ -28,6 +28,11 @@ pub fn eval_null_or_empty(
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
     let len = input.len();
+
+    if input.as_any().downcast_ref::<NullArray>().is_some() {
+        let out: Vec<Option<bool>> = vec![Some(true); len];
+        return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
+    }
 
     // Try StringArray first
     if let Some(s_arr) = input.as_any().downcast_ref::<StringArray>() {

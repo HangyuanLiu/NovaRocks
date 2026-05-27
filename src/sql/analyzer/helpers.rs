@@ -249,12 +249,22 @@ fn split_custom_struct_field(field_spec: &str) -> Result<(Option<String>, &str),
     let Some(split_idx) = find_top_level_type_whitespace(trimmed) else {
         return Ok((None, trimmed));
     };
-    let name = trimmed[..split_idx].trim();
+    let name = strip_identifier_quotes(trimmed[..split_idx].trim());
     let field_type = trimmed[split_idx..].trim();
     if field_type.is_empty() {
         return Err(format!("STRUCT field missing type: {field_spec}"));
     }
     Ok((Some(name.to_string()), field_type))
+}
+
+fn strip_identifier_quotes(name: &str) -> &str {
+    name.strip_prefix('`')
+        .and_then(|inner| inner.strip_suffix('`'))
+        .or_else(|| {
+            name.strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+        })
+        .unwrap_or(name)
 }
 
 fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
@@ -650,6 +660,24 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 _ => format!("{op}"),
             };
             format!("{left_str} {op_str} {right_str}")
+        }
+        sqlast::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let not = if *negated { " NOT" } else { "" };
+            let items = list
+                .iter()
+                .map(expr_display_name_with_parens)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{}{} IN ({})",
+                expr_display_name_with_parens(expr),
+                not,
+                items
+            )
         }
         // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
         // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.

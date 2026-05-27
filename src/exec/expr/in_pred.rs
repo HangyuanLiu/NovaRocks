@@ -16,15 +16,18 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::function::compare_values_with_null;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::variant::VariantValue;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Int64Array, LargeBinaryArray, ListArray, MapArray, StringArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::{DataType, TimeUnit};
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 // IN predicate for Arrow arrays
@@ -37,24 +40,36 @@ pub fn eval_in(
 ) -> Result<ArrayRef, String> {
     let array = arena.eval(child, chunk)?;
     let len = array.len();
+    let lhs_is_literal_like = !expr_contains_slot(arena, child);
+    let single_candidate = values.len() == 1;
 
     if len == 0 {
         return Ok(Arc::new(BooleanArray::from(Vec::<bool>::new())));
     }
 
-    let mut has_null_literal = false;
+    let mut has_null = vec![false; len];
     let mut matched = vec![false; len];
-    let dummy_chunk = empty_chunk_with_rows(1)?;
 
     for value_id in values {
-        let scalar_array = arena.eval(*value_id, &dummy_chunk)?;
-        if scalar_array.is_null(0) {
-            has_null_literal = true;
-            continue;
+        let candidate = arena.eval(*value_id, chunk)?;
+        if candidate.len() != 1 && candidate.len() != len {
+            return Err(format!(
+                "IN predicate value length mismatch: input has {}, value has {}",
+                len,
+                candidate.len()
+            ));
         }
-        let eq_array = eq_with_scalar(&array, &scalar_array)?;
+        for (row, has_null_row) in has_null.iter_mut().enumerate() {
+            if candidate.is_null(row_index(row, candidate.len())) {
+                *has_null_row = true;
+            }
+        }
+        let eq_array =
+            eq_with_candidate(&array, &candidate, lhs_is_literal_like, single_candidate)?;
         for (row, matched_row) in matched.iter_mut().enumerate() {
-            if !eq_array.is_null(row) && eq_array.value(row) {
+            if eq_array.is_null(row) {
+                has_null[row] = true;
+            } else if eq_array.value(row) {
                 *matched_row = true;
             }
         }
@@ -67,7 +82,7 @@ pub fn eval_in(
     // 4) otherwise => FALSE for IN / TRUE for NOT IN
     let mut builder = BooleanBuilder::with_capacity(len);
     for (row, matched_row) in matched.iter().enumerate() {
-        if array.is_null(row) {
+        if array.is_null(row) || matches!(array.data_type(), DataType::Null) {
             builder.append_null();
             continue;
         }
@@ -75,7 +90,7 @@ pub fn eval_in(
             builder.append_value(!is_not_in);
             continue;
         }
-        if has_null_literal {
+        if has_null[row] {
             builder.append_null();
             continue;
         }
@@ -84,77 +99,162 @@ pub fn eval_in(
     Ok(Arc::new(builder.finish()))
 }
 
-fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, String> {
+fn row_index(row: usize, len: usize) -> usize {
+    if len == 1 { 0 } else { row }
+}
+
+fn eq_with_candidate(
+    array: &ArrayRef,
+    candidate: &ArrayRef,
+    lhs_is_literal_like: bool,
+    single_candidate: bool,
+) -> Result<BooleanArray, String> {
     if matches!(
-        scalar.data_type(),
+        candidate.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        if array.data_type() != scalar.data_type() {
+        if array.data_type() != candidate.data_type() {
             return Err(format!(
                 "IN nested type mismatch: {:?} vs {:?}",
                 array.data_type(),
-                scalar.data_type()
+                candidate.data_type()
             ));
         }
         let mut builder = BooleanBuilder::with_capacity(array.len());
         for i in 0..array.len() {
             if array.is_null(i) {
                 builder.append_null();
+            } else if candidate.is_null(row_index(i, candidate.len())) {
+                builder.append_null();
             } else {
-                builder.append_value(compare_values_with_null(array, i, scalar, 0, true)?);
+                match compare_values_for_in(
+                    array,
+                    i,
+                    candidate,
+                    row_index(i, candidate.len()),
+                    lhs_is_literal_like,
+                    single_candidate,
+                )? {
+                    Some(equal) => builder.append_value(equal),
+                    None => builder.append_null(),
+                }
             }
         }
         return Ok(builder.finish());
     }
-    match scalar.data_type() {
+    if candidate.len() == array.len()
+        && array.data_type() == candidate.data_type()
+        && !matches!(
+            candidate.data_type(),
+            DataType::Utf8
+                | DataType::LargeBinary
+                | DataType::Timestamp(_, _)
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::FixedSizeBinary(_)
+        )
+    {
+        return eq(
+            &array.as_ref() as &dyn arrow::array::Datum,
+            &candidate.as_ref() as &dyn arrow::array::Datum,
+        )
+        .map_err(|e| e.to_string());
+    }
+    match candidate.data_type() {
         DataType::Int8 => {
-            let arr = scalar.as_any().downcast_ref::<Int8Array>().unwrap();
-            let scalar = Int8Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Int8Array>().unwrap();
+            let scalar = Int8Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Int16 => {
-            let arr = scalar.as_any().downcast_ref::<Int16Array>().unwrap();
-            let scalar = Int16Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Int16Array>().unwrap();
+            let scalar = Int16Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Int32 => {
-            let arr = scalar.as_any().downcast_ref::<Int32Array>().unwrap();
-            let scalar = Int32Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Int32Array>().unwrap();
+            let scalar = Int32Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Int64 => {
-            let arr = scalar.as_any().downcast_ref::<Int64Array>().unwrap();
-            let scalar = Int64Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Int64Array>().unwrap();
+            let scalar = Int64Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Float32 => {
-            let arr = scalar.as_any().downcast_ref::<Float32Array>().unwrap();
-            let scalar = Float32Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Float32Array>().unwrap();
+            let scalar = Float32Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Float64 => {
-            let arr = scalar.as_any().downcast_ref::<Float64Array>().unwrap();
-            let scalar = Float64Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Float64Array>().unwrap();
+            let scalar = Float64Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Boolean => {
-            let arr = scalar.as_any().downcast_ref::<BooleanArray>().unwrap();
-            let scalar = BooleanArray::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let scalar = BooleanArray::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Utf8 => {
-            let arr = scalar.as_any().downcast_ref::<StringArray>().unwrap();
-            let scalar = StringArray::new_scalar(arr.value(0));
-            eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
+            let values = candidate.as_any().downcast_ref::<StringArray>().unwrap();
+            let input = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast IN input to StringArray".to_string())?;
+            let mut builder = BooleanBuilder::with_capacity(input.len());
+            for i in 0..input.len() {
+                let value_idx = row_index(i, values.len());
+                if input.is_null(i) || values.is_null(value_idx) {
+                    builder.append_null();
+                    continue;
+                }
+                let lhs = input.value(i);
+                let rhs = values.value(value_idx);
+                if let (Some(lhs_json), Some(rhs_json)) = (
+                    json_value_from_text_or_variant(lhs),
+                    json_value_from_text_or_variant(rhs),
+                ) {
+                    builder.append_value(lhs_json == rhs_json);
+                } else {
+                    builder.append_value(lhs == rhs);
+                }
+            }
+            Ok(builder.finish())
+        }
+        DataType::LargeBinary => {
+            let values = candidate
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast IN scalar to LargeBinaryArray".to_string())?;
+            let input = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast IN input to LargeBinaryArray".to_string())?;
+            let mut builder = BooleanBuilder::with_capacity(input.len());
+            for i in 0..input.len() {
+                let value_idx = row_index(i, values.len());
+                if input.is_null(i) || values.is_null(value_idx) {
+                    builder.append_null();
+                } else if let (Some(input_json), Some(scalar_json)) = (
+                    variant_json_value(input.value(i)),
+                    variant_json_value(values.value(value_idx)),
+                ) {
+                    builder.append_value(input_json == scalar_json);
+                } else {
+                    builder.append_value(input.value(i) == values.value(value_idx));
+                }
+            }
+            Ok(builder.finish())
         }
         DataType::Date32 => {
-            let arr = scalar.as_any().downcast_ref::<Date32Array>().unwrap();
-            let scalar = Date32Array::new_scalar(arr.value(0));
+            let arr = candidate.as_any().downcast_ref::<Date32Array>().unwrap();
+            let scalar = Date32Array::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => {
-                let arr = scalar
+                let arr = candidate
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
@@ -166,19 +266,19 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                     .ok_or_else(|| {
                         "failed to downcast IN input to TimestampSecondArray".to_string()
                     })?;
-                let scalar_value = arr.value(0);
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
-                    if input.is_null(i) {
+                    let value_idx = row_index(i, arr.len());
+                    if input.is_null(i) || arr.is_null(value_idx) {
                         builder.append_null();
                     } else {
-                        builder.append_value(input.value(i) == scalar_value);
+                        builder.append_value(input.value(i) == arr.value(value_idx));
                     }
                 }
                 Ok(builder.finish())
             }
             TimeUnit::Millisecond => {
-                let arr = scalar
+                let arr = candidate
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
@@ -190,19 +290,19 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                     .ok_or_else(|| {
                         "failed to downcast IN input to TimestampMillisecondArray".to_string()
                     })?;
-                let scalar_value = arr.value(0);
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
-                    if input.is_null(i) {
+                    let value_idx = row_index(i, arr.len());
+                    if input.is_null(i) || arr.is_null(value_idx) {
                         builder.append_null();
                     } else {
-                        builder.append_value(input.value(i) == scalar_value);
+                        builder.append_value(input.value(i) == arr.value(value_idx));
                     }
                 }
                 Ok(builder.finish())
             }
             TimeUnit::Microsecond => {
-                let arr = scalar
+                let arr = candidate
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
@@ -214,19 +314,19 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                     .ok_or_else(|| {
                         "failed to downcast IN input to TimestampMicrosecondArray".to_string()
                     })?;
-                let scalar_value = arr.value(0);
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
-                    if input.is_null(i) {
+                    let value_idx = row_index(i, arr.len());
+                    if input.is_null(i) || arr.is_null(value_idx) {
                         builder.append_null();
                     } else {
-                        builder.append_value(input.value(i) == scalar_value);
+                        builder.append_value(input.value(i) == arr.value(value_idx));
                     }
                 }
                 Ok(builder.finish())
             }
             TimeUnit::Nanosecond => {
-                let arr = scalar
+                let arr = candidate
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
@@ -238,20 +338,20 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                     .ok_or_else(|| {
                         "failed to downcast IN input to TimestampNanosecondArray".to_string()
                     })?;
-                let scalar_value = arr.value(0);
                 let mut builder = BooleanBuilder::with_capacity(input.len());
                 for i in 0..input.len() {
-                    if input.is_null(i) {
+                    let value_idx = row_index(i, arr.len());
+                    if input.is_null(i) || arr.is_null(value_idx) {
                         builder.append_null();
                     } else {
-                        builder.append_value(input.value(i) == scalar_value);
+                        builder.append_value(input.value(i) == arr.value(value_idx));
                     }
                 }
                 Ok(builder.finish())
             }
         },
         DataType::Decimal128(_, _) => {
-            let arr = scalar
+            let arr = candidate
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| "failed to downcast IN scalar to Decimal128Array".to_string())?;
@@ -259,19 +359,19 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| "failed to downcast IN input to Decimal128Array".to_string())?;
-            let scalar_value = arr.value(0);
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
-                if input.is_null(i) {
+                let value_idx = row_index(i, arr.len());
+                if input.is_null(i) || arr.is_null(value_idx) {
                     builder.append_null();
                 } else {
-                    builder.append_value(input.value(i) == scalar_value);
+                    builder.append_value(input.value(i) == arr.value(value_idx));
                 }
             }
             Ok(builder.finish())
         }
         DataType::Decimal256(_, _) => {
-            let arr = scalar
+            let arr = candidate
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| "failed to downcast IN scalar to Decimal256Array".to_string())?;
@@ -279,19 +379,19 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| "failed to downcast IN input to Decimal256Array".to_string())?;
-            let scalar_value = arr.value(0);
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
-                if input.is_null(i) {
+                let value_idx = row_index(i, arr.len());
+                if input.is_null(i) || arr.is_null(value_idx) {
                     builder.append_null();
                 } else {
-                    builder.append_value(input.value(i) == scalar_value);
+                    builder.append_value(input.value(i) == arr.value(value_idx));
                 }
             }
             Ok(builder.finish())
         }
         DataType::FixedSizeBinary(width) if *width == 16 => {
-            let arr = scalar
+            let arr = candidate
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
@@ -301,13 +401,13 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "failed to downcast IN input to FixedSizeBinaryArray".to_string())?;
-            let scalar_value = arr.value(0);
             let mut builder = BooleanBuilder::with_capacity(input.len());
             for i in 0..input.len() {
-                if input.is_null(i) {
+                let value_idx = row_index(i, arr.len());
+                if input.is_null(i) || arr.is_null(value_idx) {
                     builder.append_null();
                 } else {
-                    builder.append_value(input.value(i) == scalar_value);
+                    builder.append_value(input.value(i) == arr.value(value_idx));
                 }
             }
             Ok(builder.finish())
@@ -316,19 +416,303 @@ fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, S
     }
 }
 
-fn empty_chunk_with_rows(row_count: usize) -> Result<Chunk, String> {
-    use arrow::array::RecordBatchOptions;
-    use arrow::datatypes::Schema;
-    use std::sync::Arc;
+fn compare_values_for_in(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+    lhs_is_literal_like: bool,
+    single_candidate: bool,
+) -> Result<Option<bool>, String> {
+    if left.data_type() != right.data_type() {
+        return Err(format!(
+            "IN nested type mismatch: {:?} vs {:?}",
+            left.data_type(),
+            right.data_type()
+        ));
+    }
+    if left.is_null(left_idx) || right.is_null(right_idx) {
+        return Ok(match left.data_type() {
+            DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
+                if lhs_is_literal_like {
+                    None
+                } else if left.is_null(left_idx)
+                    && right.is_null(right_idx)
+                    && matches!(left.data_type(), DataType::Struct(_))
+                    && single_candidate
+                {
+                    None
+                } else if left.is_null(left_idx) && right.is_null(right_idx) {
+                    Some(true)
+                } else if left.is_null(left_idx) {
+                    Some(false)
+                } else if matches!(left.data_type(), DataType::Struct(_)) && single_candidate {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            _ => Some(left.is_null(left_idx) && right.is_null(right_idx)),
+        });
+    }
+    match left.data_type() {
+        DataType::List(_) => compare_list_values_for_in(
+            left,
+            left_idx,
+            right,
+            right_idx,
+            lhs_is_literal_like,
+            single_candidate,
+        ),
+        DataType::Struct(_) => compare_struct_values_for_in(
+            left,
+            left_idx,
+            right,
+            right_idx,
+            lhs_is_literal_like,
+            single_candidate,
+        ),
+        DataType::Map(_, _) => compare_map_values_for_in(
+            left,
+            left_idx,
+            right,
+            right_idx,
+            lhs_is_literal_like,
+            single_candidate,
+        ),
+        _ => compare_values_with_null(left, left_idx, right, right_idx, true).map(Some),
+    }
+}
 
-    let schema = Arc::new(Schema::empty());
-    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-    let batch = arrow::array::RecordBatch::try_new_with_options(schema, vec![], &options)
-        .map_err(|e| e.to_string())?;
-    Ok(Chunk::new_with_chunk_schema(
-        batch,
-        Arc::new(crate::exec::chunk::ChunkSchema::empty()),
-    ))
+fn merge_nested_compare(acc: &mut Option<bool>, next: Option<bool>) {
+    match next {
+        Some(false) => *acc = Some(false),
+        None if !matches!(acc, Some(false)) => *acc = None,
+        _ => {}
+    }
+}
+
+fn compare_list_values_for_in(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+    lhs_is_literal_like: bool,
+    single_candidate: bool,
+) -> Result<Option<bool>, String> {
+    let l = left
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+    let r = right
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+
+    let l_offsets = l.value_offsets();
+    let r_offsets = r.value_offsets();
+    let l_start = l_offsets[left_idx] as usize;
+    let l_end = l_offsets[left_idx + 1] as usize;
+    let r_start = r_offsets[right_idx] as usize;
+    let r_end = r_offsets[right_idx + 1] as usize;
+    let l_len = l_end.saturating_sub(l_start);
+    let r_len = r_end.saturating_sub(r_start);
+    if l_len != r_len {
+        return Ok(Some(false));
+    }
+
+    let l_values = l.values();
+    let r_values = r.values();
+    let mut result = Some(true);
+    for offset in 0..l_len {
+        let item = compare_values_for_in(
+            &l_values,
+            l_start + offset,
+            &r_values,
+            r_start + offset,
+            lhs_is_literal_like,
+            single_candidate,
+        )?;
+        merge_nested_compare(&mut result, item);
+        if matches!(result, Some(false)) {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn compare_struct_values_for_in(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+    lhs_is_literal_like: bool,
+    single_candidate: bool,
+) -> Result<Option<bool>, String> {
+    let l = left
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+    let r = right
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+    if l.num_columns() != r.num_columns() {
+        return Ok(Some(false));
+    }
+    let mut result = Some(true);
+    for col_idx in 0..l.num_columns() {
+        let item = compare_values_for_in(
+            l.column(col_idx),
+            left_idx,
+            r.column(col_idx),
+            right_idx,
+            lhs_is_literal_like,
+            single_candidate,
+        )?;
+        merge_nested_compare(&mut result, item);
+        if matches!(result, Some(false)) {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn compare_map_values_for_in(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+    lhs_is_literal_like: bool,
+    single_candidate: bool,
+) -> Result<Option<bool>, String> {
+    let l = left
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+    let r = right
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+
+    let l_offsets = l.value_offsets();
+    let r_offsets = r.value_offsets();
+    let l_start = l_offsets[left_idx] as usize;
+    let l_end = l_offsets[left_idx + 1] as usize;
+    let r_start = r_offsets[right_idx] as usize;
+    let r_end = r_offsets[right_idx + 1] as usize;
+    let l_len = l_end.saturating_sub(l_start);
+    let r_len = r_end.saturating_sub(r_start);
+    if l_len != r_len {
+        return Ok(Some(false));
+    }
+
+    let l_keys = l.keys();
+    let r_keys = r.keys();
+    let l_values = l.values();
+    let r_values = r.values();
+    let mut result = Some(true);
+    for offset in 0..l_len {
+        let li = l_start + offset;
+        let ri = r_start + offset;
+        merge_nested_compare(
+            &mut result,
+            compare_values_for_in(
+                l_keys,
+                li,
+                r_keys,
+                ri,
+                lhs_is_literal_like,
+                single_candidate,
+            )?,
+        );
+        merge_nested_compare(
+            &mut result,
+            compare_values_for_in(
+                l_values,
+                li,
+                r_values,
+                ri,
+                lhs_is_literal_like,
+                single_candidate,
+            )?,
+        );
+        if matches!(result, Some(false)) {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn expr_contains_slot(arena: &ExprArena, id: ExprId) -> bool {
+    match arena.node(id) {
+        Some(ExprNode::SlotId(_)) => true,
+        Some(ExprNode::ArrayExpr { elements }) => elements
+            .iter()
+            .any(|child| expr_contains_slot(arena, *child)),
+        Some(ExprNode::StructExpr { fields }) => {
+            fields.iter().any(|child| expr_contains_slot(arena, *child))
+        }
+        Some(ExprNode::Cast(child))
+        | Some(ExprNode::CastTime(child))
+        | Some(ExprNode::CastTimeFromDatetime(child))
+        | Some(ExprNode::DictDecode { child, .. })
+        | Some(ExprNode::Clone(child))
+        | Some(ExprNode::Not(child))
+        | Some(ExprNode::IsNull(child))
+        | Some(ExprNode::IsNotNull(child)) => expr_contains_slot(arena, *child),
+        Some(ExprNode::Add(left, right))
+        | Some(ExprNode::Sub(left, right))
+        | Some(ExprNode::Mul(left, right))
+        | Some(ExprNode::Div(left, right))
+        | Some(ExprNode::Mod(left, right))
+        | Some(ExprNode::Eq(left, right))
+        | Some(ExprNode::EqForNull(left, right))
+        | Some(ExprNode::Ne(left, right))
+        | Some(ExprNode::Lt(left, right))
+        | Some(ExprNode::Le(left, right))
+        | Some(ExprNode::Gt(left, right))
+        | Some(ExprNode::Ge(left, right))
+        | Some(ExprNode::And(left, right))
+        | Some(ExprNode::Or(left, right)) => {
+            expr_contains_slot(arena, *left) || expr_contains_slot(arena, *right)
+        }
+        Some(ExprNode::In { child, values, .. }) => {
+            expr_contains_slot(arena, *child)
+                || values.iter().any(|value| expr_contains_slot(arena, *value))
+        }
+        Some(ExprNode::Case { children, .. }) => children
+            .iter()
+            .any(|child| expr_contains_slot(arena, *child)),
+        Some(ExprNode::FunctionCall { args, .. }) => {
+            args.iter().any(|arg| expr_contains_slot(arena, *arg))
+        }
+        Some(ExprNode::LambdaFunction {
+            body,
+            common_sub_exprs,
+            ..
+        }) => {
+            expr_contains_slot(arena, *body)
+                || common_sub_exprs
+                    .iter()
+                    .any(|(_, expr)| expr_contains_slot(arena, *expr))
+        }
+        Some(ExprNode::Literal(_)) | None => false,
+    }
+}
+
+fn variant_json_value(bytes: &[u8]) -> Option<JsonValue> {
+    let text = VariantValue::from_serialized(bytes)
+        .ok()?
+        .to_json_local()
+        .ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
+    serde_json::from_str(text)
+        .ok()
+        .or_else(|| variant_json_value(text.as_bytes()))
 }
 
 #[cfg(test)]

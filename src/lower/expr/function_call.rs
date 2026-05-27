@@ -450,10 +450,8 @@ pub(crate) fn lower_function_call(
                             | DataType::Int64
                             | DataType::Boolean
                     );
-                    let input_is_numeric_float = matches!(
-                        item0.data_type(),
-                        DataType::Float32 | DataType::Float64
-                    );
+                    let input_is_numeric_float =
+                        matches!(item0.data_type(), DataType::Float32 | DataType::Float64);
                     match item1.data_type() {
                         DataType::Int64 if input_is_numeric_int => {}
                         DataType::Float64 if input_is_numeric_float || input_is_numeric_int => {}
@@ -1037,6 +1035,13 @@ pub(crate) fn lower_function_call(
                                 return Err(
                                     "array_sum over FLOAT/DOUBLE arrays must return DOUBLE"
                                         .to_string(),
+                                );
+                            }
+                        }
+                        DataType::Utf8 | DataType::LargeUtf8 => {
+                            if !matches!(data_type, DataType::Float64) {
+                                return Err(
+                                    "array_sum over VARCHAR arrays must return DOUBLE".to_string()
                                 );
                             }
                         }

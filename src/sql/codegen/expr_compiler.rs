@@ -1709,9 +1709,7 @@ fn semantic_function_type_desc(
     arrow_type_to_type_desc(return_type)
 }
 
-fn struct_type_desc(
-    fields: &[(String, types::TTypeDesc)],
-) -> Result<types::TTypeDesc, String> {
+fn struct_type_desc(fields: &[(String, types::TTypeDesc)]) -> Result<types::TTypeDesc, String> {
     let total_child = fields
         .iter()
         .map(|(_, td)| td.types.as_ref().map_or(0, |v| v.len()))
@@ -2280,10 +2278,10 @@ fn infer_scalar_function_return_type(
         }
         "all_match" | "any_match" | "array_contains" | "array_contains_all"
         | "array_contains_seq" | "arrays_overlap" => Ok(DataType::Boolean),
-        "array_distinct" | "array_sort" | "array_sortby" | "array_reverse" | "array_slice"
-        | "array_remove" | "array_filter" | "array_map" | "array_top_n" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
-        }
+        "null_or_empty" => Ok(DataType::Boolean),
+        "array_distinct" | "array_sort" | "array_sort_lambda" | "array_sortby"
+        | "array_reverse" | "array_slice" | "array_remove" | "array_filter" | "array_map"
+        | "array_top_n" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_append" => Ok(infer_array_append_return_type(arg_types)),
         "array_concat" => Ok(infer_array_concat_return_type(arg_types)),
         "array_flatten" => Ok(infer_array_flatten_return_type(arg_types)),
@@ -2474,7 +2472,9 @@ fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
             | DataType::Int32
             | DataType::Int64,
         ) => DataType::Int64,
-        Some(DataType::Float32 | DataType::Float64) => DataType::Float64,
+        Some(DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8) => {
+            DataType::Float64
+        }
         Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
         Some(DataType::FixedSizeBinary(width))
             if width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>

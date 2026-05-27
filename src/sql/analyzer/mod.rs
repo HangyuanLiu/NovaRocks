@@ -495,7 +495,7 @@ impl<'a> AnalyzerContext<'a> {
         // have no comparable scalar identity. Reject upfront so the user
         // sees a clear error before lowering / codegen.
         for gb in &group_by {
-            if let Some(logical) = scope.logical_type_of_expr(gb) {
+            if let Some(logical) = scope.logical_type_of_expr(gb).filter(is_bitmap_or_hll_type) {
                 return Err(format!(
                     "BITMAP/HLL columns cannot appear in GROUP BY (column has type {logical:?})"
                 ));
@@ -1915,10 +1915,12 @@ impl<'a> AnalyzerContext<'a> {
         for item in &sort_items {
             let logical = projection_scope
                 .logical_type_of_expr(&item.expr)
+                .filter(is_bitmap_or_hll_type)
                 .or_else(|| {
                     from_scope_for_check
                         .as_ref()
                         .and_then(|s| s.logical_type_of_expr(&item.expr))
+                        .filter(is_bitmap_or_hll_type)
                 });
             if let Some(logical) = logical {
                 return Err(format!(
@@ -2393,6 +2395,13 @@ fn replace_grouping_markers_in_typed_expr(
         },
         _ => expr.clone(),
     }
+}
+
+fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
+    matches!(
+        sql_type,
+        crate::sql::SqlType::Bitmap | crate::sql::SqlType::Hll
+    )
 }
 
 #[cfg(test)]

@@ -243,6 +243,7 @@ pub(crate) fn compare_values_with_null(
     }
 
     match left.data_type() {
+        DataType::Null => Ok(null_equals_null),
         DataType::Int8 => {
             let l = left.as_any().downcast_ref::<Int8Array>().unwrap();
             let r = right.as_any().downcast_ref::<Int8Array>().unwrap();
