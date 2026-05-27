@@ -1,4 +1,4 @@
--- @tags=optimizer,dictionary
+-- @tags=low-cardinality,dictionary,disable
 -- Verify SET disable_optimizer_rules = 'LowCardinalityDictionaryRewrite'
 -- suppresses the rewrite: the plan must not contain a DECODE node even with
 -- fresh ANALYZE FULL statistics.
