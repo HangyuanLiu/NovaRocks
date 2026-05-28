@@ -36,18 +36,53 @@ const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;
 const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 
 pub(crate) fn build_scan_node(
+    connectors: &crate::connector::ConnectorRegistry,
     node_id: i32,
     scan_tuple_id: i32,
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
-) -> plan_nodes::TPlanNode {
-    if matches!(resolved.table.source, ScanSource::StarRocks { .. }) {
-        return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
+) -> Result<plan_nodes::TPlanNode, String> {
+    match &resolved.table.source {
+        ScanSource::StarRocks { .. } => {
+            let planned = resolved.planned_scan.as_ref().ok_or_else(|| {
+                format!(
+                    "StarRocks scan {}.{} reached build_scan_node without planned connector scan",
+                    resolved.database, resolved.table.name
+                )
+            })?;
+            let planner = connectors.scan_planner("starrocks")?;
+            let plan = planner.to_thrift_scan(
+                &planned.scan,
+                &planned.splits,
+                ThriftScanContext {
+                    database: resolved.database.clone(),
+                    table: resolved.table.name.clone(),
+                    node_id,
+                    scan_tuple_id,
+                    conjuncts,
+                    ..ThriftScanContext::default()
+                },
+            )?;
+            plan.node.ok_or_else(|| {
+                format!(
+                    "StarRocks to_thrift_scan returned no node for {}.{}",
+                    resolved.database, resolved.table.name
+                )
+            })
+        }
+        ScanSource::IcebergDeltaTable { .. } => Ok(build_iceberg_delta_scan_node(
+            node_id,
+            scan_tuple_id,
+            resolved,
+            conjuncts,
+        )),
+        _ => Ok(build_hdfs_scan_node(
+            node_id,
+            scan_tuple_id,
+            resolved,
+            conjuncts,
+        )),
     }
-    if matches!(resolved.table.source, ScanSource::IcebergDeltaTable { .. }) {
-        return build_iceberg_delta_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
-    }
-    build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
 }
 
 /// Emit `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` for an IVM-A1 delta scan.
@@ -234,76 +269,6 @@ pub(crate) fn append_hdfs_scan_min_max_conjuncts(
     if hdfs.min_max_tuple_id.is_none() {
         hdfs.min_max_tuple_id = hdfs.tuple_id;
     }
-}
-
-fn build_lake_scan_node(
-    node_id: i32,
-    scan_tuple_id: i32,
-    resolved: &ResolvedTable,
-    conjuncts: Vec<exprs::TExpr>,
-) -> plan_nodes::TPlanNode {
-    let planned = resolved.planned_scan.as_ref().unwrap_or_else(|| {
-        panic!(
-            "StarRocks scan {}.{} requires planned connector scan",
-            resolved.database, resolved.table.name
-        )
-    });
-    let scan_handle =
-        crate::connector::starrocks::table::scan_planner::starrocks_scan_handle(&planned.scan)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "StarRocks lake scan {}.{} must have StarRocksScanHandle: {err}",
-                    resolved.database, resolved.table.name
-                )
-            });
-    let mut node = default_plan_node();
-    node.node_id = node_id;
-    node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
-    node.num_children = 0;
-    node.limit = -1;
-    node.row_tuples = vec![scan_tuple_id];
-    node.nullable_tuples = vec![];
-    node.conjuncts = if conjuncts.is_empty() {
-        None
-    } else {
-        Some(conjuncts)
-    };
-    node.compact_data = true;
-    node.lake_scan_node = Some(plan_nodes::TLakeScanNode {
-        tuple_id: scan_tuple_id,
-        key_column_name: vec![],
-        key_column_type: vec![],
-        is_preaggregation: false,
-        sort_column: None,
-        rollup_name: None,
-        sql_predicates: None,
-        enable_column_expr_predicate: None,
-        dict_string_id_to_int_ids: None,
-        unused_output_column_name: None,
-        sort_key_column_names: None,
-        bucket_exprs: None,
-        column_access_paths: None,
-        sorted_by_keys_per_tablet: None,
-        output_chunk_by_bucket: None,
-        output_asc_hint: None,
-        partition_order_hint: None,
-        enable_topn_filter_back_pressure: None,
-        back_pressure_max_rounds: None,
-        back_pressure_throttle_time: None,
-        back_pressure_throttle_time_upper_bound: None,
-        back_pressure_num_rows: None,
-        schema_key: Some(descriptors::TTableSchemaKey::new(
-            Some(scan_handle.table.db_id),
-            Some(scan_handle.table.table_id),
-            Some(scan_handle.schema_id),
-        )),
-        enable_prune_column_after_index_filter: None,
-        enable_gin_filter: None,
-        next_uniq_id: None,
-        enable_global_late_materialization: None,
-    });
-
-    node
 }
 
 // ---------------------------------------------------------------------------

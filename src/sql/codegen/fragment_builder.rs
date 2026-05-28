@@ -784,11 +784,12 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
         let mut scan_plan_node = nodes::build_scan_node(
+            self.connectors,
             scan_node_id,
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
-        );
+        )?;
 
         // Patch the StarRocks lake-scan payload with the dict slot mapping so
         // the BE side reads the column as dict-encoded INT instead of UTF8.
@@ -4096,11 +4097,15 @@ mod tests {
 
         fn to_thrift_scan(
             &self,
-            _scan: &crate::connector::scan_planning::ScanHandle,
-            _splits: &[crate::connector::scan_planning::Split],
-            _ctx: crate::connector::scan_planning::ThriftScanContext,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
-            Err("MockScanPlanner::to_thrift_scan is not exercised by tests".to_string())
+            let planner =
+                crate::connector::starrocks::table::StarRocksTableScanPlanner::stateless_for_codegen();
+            <crate::connector::starrocks::table::StarRocksTableScanPlanner as crate::connector::scan_planning::ConnectorScanPlanner>::to_thrift_scan(
+                &planner, scan, splits, ctx,
+            )
         }
     }
 
