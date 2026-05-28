@@ -20,7 +20,6 @@ use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
 
-use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
 use crate::connector::starrocks::table::StarRocksTableScanPlanner;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;

@@ -75,6 +75,11 @@ impl StarRocksTableScanPlanner {
         }
     }
 
+    /// Construct a planner instance that does not reference any
+    /// `StandaloneState`. Safe to use ONLY from call sites that invoke
+    /// methods which never call `self.state()` — currently `to_thrift_scan`.
+    /// Adding a state-reading method without also updating call sites here
+    /// would panic at the upgrade in `state()`.
     pub(crate) fn stateless_for_codegen() -> Self {
         Self { state: Weak::new() }
     }
