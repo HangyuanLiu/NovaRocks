@@ -4132,6 +4132,24 @@ mod tests {
         registry
     }
 
+    fn mock_iceberg_registry() -> crate::connector::ConnectorRegistry {
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
+        registry
+    }
+
+    fn mock_starrocks_and_iceberg_registry(
+        layout: &crate::sql::catalog::PhysicalTableLayout,
+    ) -> crate::connector::ConnectorRegistry {
+        let mut registry = mock_starrocks_registry(layout);
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
+        registry
+    }
+
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
             column_id: crate::sql::column_id::ColumnId::UNSET,
@@ -5222,7 +5240,7 @@ mod tests {
                 version: 7,
             }],
         };
-        let registry = mock_starrocks_registry(&starrocks_layout);
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
         let catalog = MixedCatalog { starrocks_layout };
 
         let build = PlanFragmentBuilder::build(

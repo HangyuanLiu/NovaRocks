@@ -4233,6 +4233,9 @@ enable_path_style_access = true
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
+        registry.register_scan_planner(std::sync::Arc::new(
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        ));
         registry
     }
 
