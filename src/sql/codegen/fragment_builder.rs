@@ -5827,4 +5827,39 @@ mod tests {
             err,
         );
     }
+
+    #[test]
+    fn starrocks_fragment_exec_params_are_generated_from_planned_connector_scan() {
+        let layout = starrocks_layout();
+        let plan = starrocks_scan_plan();
+        let catalog = StarRocksCatalog { layout };
+
+        let build = PlanFragmentBuilder::build(&plan, &catalog, "default")
+            .expect("build StarRocks fragment");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let exec_params = &root.exec_params;
+        let per_node = &exec_params.per_node_scan_ranges;
+        let ranges = per_node
+            .values()
+            .next()
+            .expect("one scan node should have ranges");
+
+        assert_eq!(ranges.len(), 1);
+        let tablet_ids = ranges
+            .iter()
+            .map(|range| {
+                range
+                    .scan_range
+                    .internal_scan_range
+                    .as_ref()
+                    .map(|internal| internal.tablet_id)
+                    .expect("internal scan range")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tablet_ids, vec![101]);
+    }
 }
