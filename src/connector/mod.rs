@@ -127,6 +127,17 @@ mod scan_planning_registry_tests {
 
         assert_eq!(err, "unknown scan planner: missing");
     }
+
+    #[test]
+    fn default_registry_does_not_register_standalone_scan_planners() {
+        let registry = ConnectorRegistry::default();
+
+        let err = registry
+            .scan_planner("starrocks")
+            .expect_err("standalone planners are registered with state, not Default");
+
+        assert_eq!(err, "unknown scan planner: starrocks");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +279,9 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     )));
     connectors.register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
     connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
+    connectors.register_scan_planner(Arc::new(
+        starrocks::table::StarRocksTableScanPlanner::new(state),
+    ));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));
