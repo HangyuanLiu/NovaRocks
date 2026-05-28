@@ -141,6 +141,10 @@ fn add_iceberg_equality_delete_required_columns(
 // ---------------------------------------------------------------------------
 
 pub(crate) struct PlanFragmentBuilder<'a> {
+    // Retained for Stage 5 cleanup that also drops `CatalogProvider::get_physical_layout`.
+    // Codegen no longer reads `self.catalog`; the field stays so the builder can keep
+    // its existing constructor shape during the transition.
+    #[allow(dead_code)]
     catalog: &'a dyn CatalogProvider,
     connectors: &'a crate::connector::ConnectorRegistry,
     desc_builder: DescriptorTableBuilder,
