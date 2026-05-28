@@ -195,6 +195,7 @@ pub(crate) fn create_mv(
         &mv_shape,
         distribution,
         &analysis.output_columns,
+        Some(&analysis.resolved_query),
         stmt.primary_key.as_deref().unwrap_or(&[]),
         primary_key_base_descriptor.as_ref(),
     )?;
@@ -427,6 +428,7 @@ fn build_mv_storage_layout(
     mv_shape: &IncrementalMvShape,
     distribution: &MaterializedViewDistribution,
     output_columns: &[OutputColumn],
+    resolved_query: Option<&ResolvedQuery>,
     primary_key_columns: &[String],
     base_descriptor: Option<&BaseTableDescriptor>,
 ) -> Result<MvStorageLayout, String> {
@@ -482,7 +484,19 @@ fn build_mv_storage_layout(
         }
         IncrementalMvShape::Aggregate(shape) => {
             validate_aggregate_distribution_columns(distribution, shape)?;
-            let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, output_columns)?;
+            let aggregate_input_types = if let Some(resolved_query) = resolved_query {
+                super::mv_agg_state::aggregate_input_types_from_resolved_query(
+                    shape,
+                    resolved_query,
+                )?
+            } else {
+                vec![None; shape.aggregates.len()]
+            };
+            let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+                shape,
+                output_columns,
+                &aggregate_input_types,
+            )?;
             validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
             Ok(MvStorageLayout {
                 key_desc: TableKeyDesc {
@@ -670,7 +684,11 @@ fn validate_avg_mv_input_type(
         .ok_or_else(|| "AVG aggregate requires a column expression argument".to_string())?;
     if matches!(
         input_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal128(_, _)
     ) {
         return Ok(());
     }
@@ -2726,13 +2744,17 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_mv_analyzed_types_accepts_avg_decimal_input() {
+        let shape = avg_shape();
+        let resolved = resolved_avg_query(DataType::Decimal128(18, 2));
+        validate_incremental_mv_analyzed_types(&shape, &resolved)
+            .expect("AVG(Decimal128) is supported");
+    }
+
+    #[test]
     fn aggregate_mv_analyzed_types_rejects_avg_float_and_string_inputs() {
         let shape = avg_shape();
-        for data_type in [
-            DataType::Float64,
-            DataType::Decimal128(18, 2),
-            DataType::Utf8,
-        ] {
+        for data_type in [DataType::Float64, DataType::Utf8] {
             let resolved = resolved_avg_query(data_type.clone());
             let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
                 .expect_err("unsupported AVG input should be rejected");
@@ -2897,6 +2919,7 @@ WHERE amount > 0",
             &mv_shape,
             stmt.distribution.as_ref().expect("distribution"),
             &output_columns,
+            None,
             stmt.primary_key.as_deref().expect("primary key"),
             Some(&descriptor(
                 2,
@@ -2955,6 +2978,7 @@ WHERE amount > 0",
             &mv_shape,
             stmt.distribution.as_ref().expect("distribution"),
             &output_columns,
+            None,
             stmt.primary_key.as_deref().expect("primary key"),
             Some(&descriptor(
                 2,
@@ -3011,7 +3035,7 @@ GROUP BY k1",
         ];
         let distribution = stmt.distribution.as_ref().expect("distribution");
         let storage_layout =
-            build_mv_storage_layout(&mv_shape, distribution, &output_columns, &[], None)
+            build_mv_storage_layout(&mv_shape, distribution, &output_columns, None, &[], None)
                 .expect("layout");
 
         assert_eq!(storage_layout.key_desc.kind, TableKeyKind::Primary);
@@ -3134,6 +3158,7 @@ GROUP BY k1",
             &mv_shape,
             stmt.distribution.as_ref().expect("distribution"),
             &output_columns,
+            None,
             &[],
             None,
         )

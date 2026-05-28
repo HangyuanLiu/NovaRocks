@@ -660,6 +660,14 @@ pub(crate) fn analyze_visible_output_types(
     current_database: &str,
     sql: &str,
 ) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
+    Ok(analyze_visible_query(state, current_database, sql)?.output_columns)
+}
+
+pub(crate) fn analyze_visible_query(
+    state: &Arc<StandaloneState>,
+    current_database: &str,
+    sql: &str,
+) -> Result<crate::sql::analysis::ResolvedQuery, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("sql parser error: {e}"))?;
@@ -720,7 +728,7 @@ pub(crate) fn analyze_visible_output_types(
     let (resolved, _cte_registry, _factory) =
         crate::sql::analyzer::analyze(&analyzable, &*catalog, current_database)
             .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
-    Ok(resolved.output_columns)
+    Ok(resolved)
 }
 
 pub(crate) fn execute_query_for_mv_refresh(

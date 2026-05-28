@@ -582,6 +582,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: true,
             }],
+            aggregate_input_types: vec![None],
             group_key_source_indexes: vec![0],
             physical_columns: vec![
                 row_id_column,
@@ -1403,6 +1404,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: false,
             }],
+            aggregate_input_types: vec![Some(DataType::Int64)],
             group_key_source_indexes: vec![0],
             physical_columns: vec![row_id_column, region_column, mn_column, state_column],
         };

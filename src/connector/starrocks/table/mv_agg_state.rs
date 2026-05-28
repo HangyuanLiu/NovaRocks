@@ -20,11 +20,13 @@ use crate::connector::starrocks::table::mv_shape::{
     AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
 };
 use crate::connector::starrocks::table::state_codec::{
-    KeyValue, decode_avg_int64, decode_count_state, decode_sum_decimal128, decode_sum_int64,
+    KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
+    decode_sum_int64,
 };
 use crate::engine::{QueryResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
+use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
 use crate::exec::expr::function::mv_state::{
     approx_count_distinct_state_union, approx_count_distinct_state_visible, avg_state_union,
     bool_and_state_union, bool_and_state_visible, bool_or_state_union, bool_or_state_visible,
@@ -44,6 +46,7 @@ pub(crate) struct AggregateMvLayout {
     pub(crate) row_id_column: StarRocksPhysicalColumn,
     pub(crate) visible_columns: Vec<AggregateVisibleColumn>,
     pub(crate) state_columns: Vec<AggregateStateColumn>,
+    pub(crate) aggregate_input_types: Vec<Option<DataType>>,
     pub(crate) group_key_source_indexes: Vec<usize>,
     pub(crate) physical_columns: Vec<StarRocksPhysicalColumn>,
 }
@@ -99,6 +102,22 @@ pub(crate) fn build_aggregate_mv_layout(
     shape: &AggregateMvShape,
     output_columns: &[OutputColumn],
 ) -> Result<AggregateMvLayout, String> {
+    let aggregate_input_types = vec![None; shape.aggregates.len()];
+    build_aggregate_mv_layout_with_input_types(shape, output_columns, &aggregate_input_types)
+}
+
+pub(crate) fn build_aggregate_mv_layout_with_input_types(
+    shape: &AggregateMvShape,
+    output_columns: &[OutputColumn],
+    aggregate_input_types: &[Option<DataType>],
+) -> Result<AggregateMvLayout, String> {
+    if aggregate_input_types.len() != shape.aggregates.len() {
+        return Err(format!(
+            "aggregate MV input type metadata count mismatch: inputs={} aggregates={}",
+            aggregate_input_types.len(),
+            shape.aggregates.len()
+        ));
+    }
     if output_columns.len() != shape.visible_outputs.len() {
         return Err(format!(
             "aggregate MV output count mismatch: shape_outputs={} analyzed_outputs={}",
@@ -150,6 +169,9 @@ pub(crate) fn build_aggregate_mv_layout(
         validate_aggregate_state_visible_type(
             aggregate.function,
             &visible.data_type,
+            aggregate_input_types
+                .get(aggregate_index)
+                .and_then(Option::as_ref),
             &aggregate.output_name,
         )?;
         let sanitized = sanitize_state_column_name(&aggregate.output_name);
@@ -214,9 +236,46 @@ pub(crate) fn build_aggregate_mv_layout(
         row_id_column,
         visible_columns,
         state_columns,
+        aggregate_input_types: aggregate_input_types.to_vec(),
         group_key_source_indexes,
         physical_columns,
     })
+}
+
+pub(crate) fn aggregate_input_types_from_resolved_query(
+    shape: &AggregateMvShape,
+    resolved: &crate::sql::analysis::ResolvedQuery,
+) -> Result<Vec<Option<DataType>>, String> {
+    let crate::sql::analysis::QueryBody::Select(select) = &resolved.body else {
+        return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
+    };
+    if select.projection.len() != shape.visible_outputs.len() {
+        return Err(format!(
+            "aggregate MV input type projection count mismatch: analyzed_projection={} shape_outputs={}",
+            select.projection.len(),
+            shape.visible_outputs.len()
+        ));
+    }
+
+    let mut input_types = vec![None; shape.aggregates.len()];
+    for (projection_index, visible_output) in shape.visible_outputs.iter().enumerate() {
+        let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
+            continue;
+        };
+        let projection = &select.projection[projection_index];
+        let crate::sql::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind
+        else {
+            return Err(format!(
+                "aggregate MV analyzed projection `{}` is not an aggregate expression",
+                projection.output_name
+            ));
+        };
+        let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
+            format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
+        })?;
+        *slot = args.first().map(|arg| arg.data_type.clone());
+    }
+    Ok(input_types)
 }
 
 pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvShape) -> bool {
@@ -921,15 +980,22 @@ fn is_varbinary_arrow_type(data_type: &DataType) -> bool {
 fn validate_aggregate_state_visible_type(
     function: AggregateFunctionKind,
     visible_data_type: &DataType,
+    input_data_type: Option<&DataType>,
     output_name: &str,
 ) -> Result<(), String> {
     match (function, visible_data_type) {
         (AggregateFunctionKind::Sum, DataType::Float32 | DataType::Float64) => Err(format!(
             "SUM state type is unsupported for aggregate `{output_name}` output: {visible_data_type:?}; FLOAT/DOUBLE inputs are not supported by SUM state"
         )),
-        (AggregateFunctionKind::Avg, DataType::Decimal128(_, _)) => Err(format!(
-            "AVG state type is unsupported for aggregate `{output_name}` output: {visible_data_type:?}; DECIMAL AVG requires input scale metadata"
-        )),
+        (AggregateFunctionKind::Avg, DataType::Decimal128(_, _)) => match input_data_type {
+            Some(DataType::Decimal128(_, _)) => Ok(()),
+            Some(other) => Err(format!(
+                "AVG state type is unsupported for aggregate `{output_name}` input: {other:?}; DECIMAL AVG requires Decimal128 input scale metadata"
+            )),
+            None => Err(format!(
+                "AVG state type is unsupported for aggregate `{output_name}` output: {visible_data_type:?}; DECIMAL AVG requires input scale metadata"
+            )),
+        },
         _ => Ok(()),
     }
 }
@@ -1111,10 +1177,15 @@ fn update_visible_values_from_state(
                 ));
             }
         };
+        let aggregate_input_type = layout
+            .aggregate_input_types
+            .get(state_column.aggregate_index)
+            .and_then(Option::as_ref);
         row.visible_values[visible_idx] = derive_visible_from_binary_state(
             state_column.function,
             state_bytes,
             visible_dt,
+            aggregate_input_type,
             &state_column.name,
         )?;
     }
@@ -1125,6 +1196,7 @@ fn derive_visible_from_binary_state(
     function: AggregateFunctionKind,
     state: &[u8],
     visible_dt: &DataType,
+    input_dt: Option<&DataType>,
     state_name: &str,
 ) -> Result<Option<AggScalarValue>, String> {
     match function {
@@ -1132,7 +1204,9 @@ fn derive_visible_from_binary_state(
             Ok(Some(AggScalarValue::Int64(count_state_visible(state)?)))
         }
         AggregateFunctionKind::Sum => derive_sum_visible_from_binary_state(state, visible_dt),
-        AggregateFunctionKind::Avg => derive_avg_visible_from_binary_state(state, visible_dt),
+        AggregateFunctionKind::Avg => {
+            derive_avg_visible_from_binary_state(state, visible_dt, input_dt)
+        }
         AggregateFunctionKind::Min => min_state_visible_key_value(state, visible_dt)
             .map(|value| value.map(key_value_to_agg_scalar))
             .map_err(|err| format!("derive visible for column `{state_name}` failed: {err}")),
@@ -1173,6 +1247,7 @@ fn derive_sum_visible_from_binary_state(
 fn derive_avg_visible_from_binary_state(
     state: &[u8],
     visible_dt: &DataType,
+    input_dt: Option<&DataType>,
 ) -> Result<Option<AggScalarValue>, String> {
     match visible_dt {
         DataType::Float64 => {
@@ -1183,9 +1258,34 @@ fn derive_avg_visible_from_binary_state(
                 Ok(Some(AggScalarValue::Float64(sum as f64 / row_count as f64)))
             }
         }
-        DataType::Decimal128(_, _) => Err(
-            "AVG Decimal128 visible derivation requires input decimal scale metadata".to_string(),
-        ),
+        DataType::Decimal128(_, output_scale) => {
+            let Some(DataType::Decimal128(_, input_scale)) = input_dt else {
+                return Err(
+                    "AVG Decimal128 visible derivation requires input decimal scale metadata"
+                        .to_string(),
+                );
+            };
+            let (row_count, sum) = decode_avg_decimal128(state)?;
+            if row_count == 0 {
+                return Ok(None);
+            }
+            let scale_diff = i32::from(*output_scale) - i32::from(*input_scale);
+            let scaled_sum = if scale_diff == 0 {
+                sum
+            } else {
+                let factor = pow10_i128(scale_diff.unsigned_abs() as usize)?;
+                if scale_diff > 0 {
+                    sum.checked_mul(factor)
+                        .ok_or_else(|| "decimal overflow".to_string())?
+                } else {
+                    sum / factor
+                }
+            };
+            Ok(Some(AggScalarValue::Decimal128(div_round_i128(
+                scaled_sum,
+                row_count as i128,
+            ))))
+        }
         other => Err(format!(
             "AVG visible derivation unsupported for output type {other:?}"
         )),
@@ -2248,6 +2348,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: true,
             }],
+            aggregate_input_types: vec![None],
             group_key_source_indexes: Vec::new(),
             physical_columns: Vec::new(),
         };
@@ -2364,6 +2465,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: false,
             }],
+            aggregate_input_types: vec![Some(DataType::Int64)],
             group_key_source_indexes: Vec::new(),
             physical_columns: Vec::new(),
         }
@@ -2400,6 +2502,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: false,
             }],
+            aggregate_input_types: vec![Some(DataType::Decimal128(20, 2))],
             group_key_source_indexes: Vec::new(),
             physical_columns: Vec::new(),
         }
@@ -2446,11 +2549,21 @@ mod tests {
             },
         ];
         let err = build_aggregate_mv_layout(&shape, &outputs)
-            .expect_err("AVG Decimal128 visible output should be rejected");
+            .expect_err("AVG Decimal128 visible output without input metadata should be rejected");
         assert!(err.contains("AVG state type is unsupported"), "err={err}");
         assert!(
             err.contains("DECIMAL AVG requires input scale"),
             "err={err}"
+        );
+        let decimal_layout = build_aggregate_mv_layout_with_input_types(
+            &shape,
+            &outputs,
+            &[Some(DataType::Decimal128(20, 4))],
+        )
+        .expect("Decimal128 AVG visible layout with input scale metadata");
+        assert_eq!(
+            decimal_layout.state_columns[0].data_type,
+            DataType::LargeBinary
         );
 
         let float_outputs = vec![
@@ -2479,15 +2592,51 @@ mod tests {
     // ---- AVG visible derivation tests ----
 
     #[test]
-    fn materialize_visible_value_avg_decimal_requires_input_scale_metadata() {
+    fn materialize_visible_value_avg_decimal_uses_input_scale_metadata() {
         let layout = make_avg_layout_decimal();
         let mut row = AggregatePhysicalRow {
             row_id: "g".to_string(),
             visible_values: vec![None],
+            state_values: vec![Some(AggScalarValue::Binary(encode_sum_decimal128(2, 300)))],
+        };
+        update_visible_values_from_state(&mut row, &layout).expect("derive AVG decimal visible");
+        assert!(matches!(
+            row.visible_values[0],
+            Some(AggScalarValue::Decimal128(150_000_000))
+        ));
+    }
+
+    #[test]
+    fn materialize_visible_value_avg_decimal_rounds_fractional_scale_tail() {
+        let mut layout = make_avg_layout_decimal();
+        layout.visible_columns[0].data_type = DataType::Decimal128(38, 10);
+        layout.visible_columns[0].sql_type = SqlType::Decimal {
+            precision: 38,
+            scale: 10,
+        };
+        layout.aggregate_input_types = vec![Some(DataType::Decimal128(20, 4))];
+        let mut row = AggregatePhysicalRow {
+            row_id: "g".to_string(),
+            visible_values: vec![None],
             state_values: vec![Some(AggScalarValue::Binary(encode_sum_decimal128(
-                4,
-                3_000_000_000_i128,
+                3, 6_012_500,
             )))],
+        };
+        update_visible_values_from_state(&mut row, &layout).expect("derive AVG decimal visible");
+        assert!(matches!(
+            row.visible_values[0],
+            Some(AggScalarValue::Decimal128(2_004_166_666_667))
+        ));
+    }
+
+    #[test]
+    fn materialize_visible_value_avg_decimal_requires_input_scale_metadata() {
+        let mut layout = make_avg_layout_decimal();
+        layout.aggregate_input_types = vec![None];
+        let mut row = AggregatePhysicalRow {
+            row_id: "g".to_string(),
+            visible_values: vec![None],
+            state_values: vec![Some(AggScalarValue::Binary(encode_sum_decimal128(2, 300)))],
         };
         let err = update_visible_values_from_state(&mut row, &layout)
             .expect_err("AVG Decimal128 cannot safely derive visible value without input scale");
@@ -2495,16 +2644,15 @@ mod tests {
     }
 
     #[test]
-    fn materialize_visible_value_avg_decimal_empty_state_requires_input_scale_metadata() {
+    fn materialize_visible_value_avg_decimal_empty_state_returns_null() {
         let layout = make_avg_layout_decimal();
         let mut row = AggregatePhysicalRow {
             row_id: "g".to_string(),
             visible_values: vec![Some(AggScalarValue::Decimal128(0))],
             state_values: vec![Some(AggScalarValue::Binary(Vec::new()))],
         };
-        let err = update_visible_values_from_state(&mut row, &layout)
-            .expect_err("AVG Decimal128 cannot safely derive empty visible value without scale");
-        assert!(err.contains("input decimal scale metadata"), "err={err}");
+        update_visible_values_from_state(&mut row, &layout).expect("derive empty AVG decimal");
+        assert!(row.visible_values[0].is_none());
     }
 
     // ---- AVG merge tests ----
