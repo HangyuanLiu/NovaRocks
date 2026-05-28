@@ -8,6 +8,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod catalog;
+pub(crate) mod scan_planner;
 pub(crate) mod config;
 pub(crate) mod ddl;
 pub(crate) mod erase;
@@ -28,6 +29,9 @@ pub(crate) mod txn;
 
 pub(crate) use backend::{
     StarRocksTableBackend, StarRocksTableMvBackend, StarRocksTableSink, StarRocksTableSource,
+};
+pub(crate) use scan_planner::{
+    StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle, StarRocksTableScanPlanner,
 };
 pub(crate) use catalog::{
     StarRocksTableCatalog, register_starrocks_tables_in_catalog, runtime_registered,
