@@ -1032,6 +1032,7 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
         ThriftScanContext {
             database: resolved.database.clone(),
             table: resolved.table.name.clone(),
+            ..ThriftScanContext::default()
         },
     )?;
     Ok(thrift.scan_ranges)
