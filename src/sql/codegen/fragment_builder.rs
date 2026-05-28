@@ -4050,6 +4050,81 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MockScanPlanner {
+        schema_id: i64,
+        splits: Vec<crate::connector::starrocks::table::StarRocksSplit>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for MockScanPlanner {
+        fn name(&self) -> &'static str {
+            "starrocks"
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            let inner = table
+                .downcast_ref::<crate::connector::starrocks::table::StarRocksTableHandle>()
+                .ok_or_else(|| "MockScanPlanner expected StarRocksTableHandle".to_string())?
+                .clone();
+            Ok(crate::connector::scan_planning::ScanHandle::new(
+                "starrocks",
+                crate::connector::starrocks::table::StarRocksScanHandle {
+                    table: inner,
+                    schema_id: self.schema_id,
+                },
+            ))
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            Ok(self
+                .splits
+                .iter()
+                .map(|split| {
+                    crate::connector::scan_planning::Split::new("starrocks", split.clone())
+                })
+                .collect())
+        }
+
+        fn to_thrift_scan(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _splits: &[crate::connector::scan_planning::Split],
+            _ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            Err("MockScanPlanner::to_thrift_scan is not exercised by tests".to_string())
+        }
+    }
+
+    fn mock_starrocks_registry(
+        layout: &crate::sql::catalog::PhysicalTableLayout,
+    ) -> crate::connector::ConnectorRegistry {
+        use crate::connector::starrocks::table::StarRocksSplit;
+        let splits = layout
+            .tablets
+            .iter()
+            .map(|tablet| StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            })
+            .collect();
+        let planner = std::sync::Arc::new(MockScanPlanner {
+            schema_id: layout.schema_id,
+            splits,
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+        registry
+    }
+
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
             column_id: crate::sql::column_id::ColumnId::UNSET,
@@ -4960,9 +5035,10 @@ mod tests {
             }],
         };
         let plan = starrocks_scan_plan();
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
 
-        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
         let scan_node = root
@@ -5065,21 +5141,23 @@ mod tests {
 
     #[test]
     fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let registry = mock_starrocks_registry(&starrocks_layout);
         let catalog = MixedCatalog {
-            starrocks_layout: PhysicalTableLayout {
-                db_id: 11,
-                table_id: 22,
-                schema_id: 33,
-                tablets: vec![StarRocksTabletRef {
-                    tablet_id: 101,
-                    partition_id: 201,
-                    version: 7,
-                }],
-            },
+            starrocks_layout,
         };
 
         let build =
-            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, &crate::connector::ConnectorRegistry::new(), "default")
+            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, &registry, "default")
                 .expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         let tuple_descs = &root.desc_tbl.tuple_descriptors;
@@ -5313,8 +5391,9 @@ mod tests {
             }],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
+        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, &registry, "default").expect("build");
 
         let root = build
             .fragment_results
@@ -5455,8 +5534,9 @@ mod tests {
             ],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
 
         let root = build
             .fragment_results
@@ -5656,8 +5736,9 @@ mod tests {
             }],
         };
 
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -5827,9 +5908,10 @@ mod tests {
     fn starrocks_fragment_exec_params_are_generated_from_planned_connector_scan() {
         let layout = starrocks_layout();
         let plan = starrocks_scan_plan();
+        let registry = mock_starrocks_registry(&layout);
         let catalog = StarRocksCatalog { layout };
 
-        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default")
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
             .expect("build StarRocks fragment");
         let root = build
             .fragment_results
