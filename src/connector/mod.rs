@@ -138,6 +138,17 @@ mod scan_planning_registry_tests {
 
         assert_eq!(err, "unknown scan planner: starrocks");
     }
+
+    #[test]
+    fn default_registry_does_not_register_standalone_iceberg_scan_planner() {
+        let registry = ConnectorRegistry::default();
+
+        let err = registry
+            .scan_planner("iceberg")
+            .expect_err("standalone planners are registered with state, not Default");
+
+        assert_eq!(err, "unknown scan planner: iceberg");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +290,9 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
         state,
     )));
+    connectors.register_scan_planner(Arc::new(
+        iceberg::IcebergConnectorScanPlanner::new(),
+    ));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));
