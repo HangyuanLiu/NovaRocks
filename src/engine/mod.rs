@@ -2559,8 +2559,14 @@ fn explain_analyze_query(
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let executed =
-        execute_query(query, catalog, connectors, current_database, exchange_port, query_opts)?;
+    let executed = execute_query(
+        query,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+    )?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
@@ -4141,10 +4147,7 @@ enable_path_style_access = true
         let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
             .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            &physical,
-            &catalog,
-            &registry,
-            "default",
+            &physical, &catalog, &registry, "default",
         )
         .expect("build fragments")
     }
@@ -4201,9 +4204,7 @@ enable_path_style_access = true
                 Ok(self
                     .splits
                     .iter()
-                    .map(|s| {
-                        crate::connector::scan_planning::Split::new("starrocks", s.clone())
-                    })
+                    .map(|s| crate::connector::scan_planning::Split::new("starrocks", s.clone()))
                     .collect())
             }
 

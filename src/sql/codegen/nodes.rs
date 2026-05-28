@@ -1007,7 +1007,6 @@ fn validate_iceberg_delete_apply_cost(
     Ok(())
 }
 
-
 pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
     resolved: &ResolvedTable,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
