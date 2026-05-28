@@ -4717,13 +4717,9 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4766,13 +4762,9 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4807,13 +4799,9 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4922,13 +4910,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
 
         assert_eq!(build.fragment_results.len(), 2);
         assert_eq!(build.edges.len(), 1);
@@ -4983,13 +4967,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         assert_eq!(build.fragment_results.len(), 3);
         assert_eq!(build.edges.len(), 2);
 
@@ -5027,13 +5007,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         let edge = build.edges.first().expect("stream edge");
         assert_eq!(
             edge.output_partition.type_,
@@ -5060,12 +5036,8 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let result = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        );
+        let result =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default");
         let err = result.err().expect("distribution any must fail");
         assert!(err.contains("PhysicalDistribution(Any)"));
     }
@@ -5082,13 +5054,9 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(
-            &plan,
-            &DummyCatalog,
-            &mock_iceberg_registry(),
-            "default",
-        )
-        .expect("build");
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         assert!(build.edges.is_empty());
     }
@@ -6168,16 +6136,12 @@ mod tests {
             .expect("build Iceberg fragment");
 
         assert_eq!(
-            counts
-                .begin_scan
-                .load(std::sync::atomic::Ordering::SeqCst),
+            counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "begin_scan must be invoked exactly once for the Iceberg scan"
         );
         assert_eq!(
-            counts
-                .plan_splits
-                .load(std::sync::atomic::Ordering::SeqCst),
+            counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "plan_splits must be invoked exactly once for the Iceberg scan"
         );

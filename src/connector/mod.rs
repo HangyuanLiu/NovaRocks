@@ -290,9 +290,7 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
         state,
     )));
-    connectors.register_scan_planner(Arc::new(
-        iceberg::IcebergConnectorScanPlanner::new(),
-    ));
+    connectors.register_scan_planner(Arc::new(iceberg::IcebergConnectorScanPlanner::new()));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));

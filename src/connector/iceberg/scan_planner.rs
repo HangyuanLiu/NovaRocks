@@ -57,8 +57,8 @@ pub(crate) fn iceberg_split(split: &Split) -> Result<&IcebergSplit, String> {
 }
 
 use crate::connector::scan_planning::{
-    validate_split_connectors, BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
-    TableHandle, ThriftScanContext, ThriftScanPlan,
+    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle, ThriftScanContext,
+    ThriftScanPlan, validate_split_connectors,
 };
 
 #[derive(Debug, Default)]
@@ -96,11 +96,7 @@ impl ConnectorScanPlanner for IcebergConnectorScanPlanner {
         CONNECTOR_ID
     }
 
-    fn begin_scan(
-        &self,
-        table: TableHandle,
-        _ctx: BeginScanContext,
-    ) -> Result<ScanHandle, String> {
+    fn begin_scan(&self, table: TableHandle, _ctx: BeginScanContext) -> Result<ScanHandle, String> {
         let inner = table
             .downcast_ref::<IcebergTableHandle>()
             .ok_or_else(|| "expected IcebergTableHandle for iceberg scan".to_string())?
@@ -150,7 +146,7 @@ impl ConnectorScanPlanner for IcebergConnectorScanPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::scan_planning::{validate_split_connectors, ScanHandle, Split};
+    use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
     use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
@@ -208,7 +204,10 @@ mod tests {
         )];
 
         validate_split_connectors(&scan, &splits).expect("same connector");
-        assert_eq!(iceberg_scan_handle(&scan).expect("scan").table.table, "orders");
+        assert_eq!(
+            iceberg_scan_handle(&scan).expect("scan").table.table,
+            "orders"
+        );
         assert_eq!(
             iceberg_split(&splits[0]).expect("split").data_file.path,
             "s3://bucket/data/file.parquet"
