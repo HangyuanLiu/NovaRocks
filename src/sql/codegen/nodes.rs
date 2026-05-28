@@ -242,13 +242,20 @@ fn build_lake_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
-    let planned = resolved
-        .planned_scan
-        .as_ref()
-        .expect("StarRocks scan requires planned connector scan");
+    let planned = resolved.planned_scan.as_ref().unwrap_or_else(|| {
+        panic!(
+            "StarRocks scan {}.{} requires planned connector scan",
+            resolved.database, resolved.table.name
+        )
+    });
     let scan_handle =
         crate::connector::starrocks::table::scan_planner::starrocks_scan_handle(&planned.scan)
-            .expect("StarRocks lake scan must have StarRocksScanHandle");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "StarRocks lake scan {}.{} must have StarRocksScanHandle: {err}",
+                    resolved.database, resolved.table.name
+                )
+            });
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
