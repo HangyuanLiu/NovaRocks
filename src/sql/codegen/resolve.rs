@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::connector::scan_planning::{ScanHandle, Split};
-use crate::sql::catalog::{PhysicalTableLayout, TableDef};
+use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::types;
 
@@ -18,10 +18,9 @@ pub(crate) struct ResolvedTable {
     #[allow(dead_code)]
     pub database: String,
     pub table: TableDef,
-    pub physical_layout: Option<PhysicalTableLayout>,
+    pub planned_scan: Option<PlannedConnectorScan>,
     #[allow(dead_code)]
     pub alias: Option<String>,
-    pub planned_scan: Option<PlannedConnectorScan>,
 }
 
 #[derive(Clone, Debug)]

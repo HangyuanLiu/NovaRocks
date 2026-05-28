@@ -41,7 +41,7 @@ pub(crate) fn build_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
-    if resolved.physical_layout.is_some() {
+    if matches!(resolved.table.source, ScanSource::StarRocks { .. }) {
         return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
     }
     if matches!(resolved.table.source, ScanSource::IcebergDeltaTable { .. }) {
@@ -242,10 +242,13 @@ fn build_lake_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
-    let layout = resolved
-        .physical_layout
+    let planned = resolved
+        .planned_scan
         .as_ref()
-        .expect("StarRocks scan requires physical layout");
+        .expect("StarRocks scan requires planned connector scan");
+    let scan_handle =
+        crate::connector::starrocks::table::scan_planner::starrocks_scan_handle(&planned.scan)
+            .expect("StarRocks lake scan must have StarRocksScanHandle");
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
@@ -283,9 +286,9 @@ fn build_lake_scan_node(
         back_pressure_throttle_time_upper_bound: None,
         back_pressure_num_rows: None,
         schema_key: Some(descriptors::TTableSchemaKey::new(
-            Some(layout.db_id),
-            Some(layout.table_id),
-            Some(layout.schema_id),
+            Some(scan_handle.table.db_id),
+            Some(scan_handle.table.table_id),
+            Some(scan_handle.schema_id),
         )),
         enable_prune_column_after_index_filter: None,
         enable_gin_filter: None,
@@ -588,22 +591,6 @@ pub(crate) fn build_exec_params_multi(
                 ));
             }
             ranges
-        } else if let Some(layout) = resolved.physical_layout.as_ref() {
-            // Non-StarRocks layout path retained per plan; current callers do not
-            // populate physical_layout for non-StarRocks sources, so this arm is
-            // effectively unreachable today and exists only as a bridge before
-            // the follow-up cleanup plan removes physical_layout entirely.
-            if layout.tablets.is_empty() {
-                return Err(format!(
-                    "StarRocks table {}.{} has no active tablets",
-                    resolved.database, resolved.table.name
-                ));
-            }
-            layout
-                .tablets
-                .iter()
-                .map(|tablet| build_internal_scan_range_params(resolved, layout, tablet))
-                .collect()
         } else {
             match &resolved.table.source {
                 ScanSource::IcebergDataFiles { files, .. } => {
@@ -1013,45 +1000,6 @@ fn validate_iceberg_delete_apply_cost(
     Ok(())
 }
 
-fn build_internal_scan_range_params(
-    resolved: &ResolvedTable,
-    layout: &crate::sql::catalog::PhysicalTableLayout,
-    tablet: &crate::sql::catalog::StarRocksTabletRef,
-) -> internal_service::TScanRangeParams {
-    let internal_scan_range = plan_nodes::TInternalScanRange::new(
-        vec![],
-        layout.schema_id.to_string(),
-        tablet.version.to_string(),
-        tablet.version.to_string(),
-        tablet.tablet_id,
-        resolved.database.clone(),
-        None::<Vec<plan_nodes::TKeyRange>>,
-        None::<String>,
-        Some(resolved.table.name.clone()),
-        Some(tablet.partition_id),
-        None::<i64>,
-        Some(true),
-        None::<i32>,
-        Some(false),
-        Some(false),
-        None::<i64>,
-    );
-
-    internal_service::TScanRangeParams::new(
-        plan_nodes::TScanRange::new(
-            Some(internal_scan_range),
-            None::<Vec<u8>>,
-            None::<plan_nodes::TBrokerScanRange>,
-            None::<plan_nodes::TEsScanRange>,
-            None::<plan_nodes::THdfsScanRange>,
-            None::<plan_nodes::TBinlogScanRange>,
-            None::<plan_nodes::TBenchmarkScanRange>,
-        ),
-        None::<i32>,
-        Some(false),
-        Some(false),
-    )
-}
 
 pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
     resolved: &ResolvedTable,
@@ -1386,7 +1334,6 @@ mod tests {
                         cloud_properties: BTreeMap::new(),
                     },
                 },
-                physical_layout: None,
                 alias: None,
                 planned_scan: None,
             },
@@ -1458,7 +1405,6 @@ mod tests {
         let resolved = ResolvedTable {
             database: "default".to_string(),
             table,
-            physical_layout: None,
             planned_scan: Some(planned_scan),
             alias: None,
         };
@@ -1513,7 +1459,6 @@ mod tests {
                         cloud_properties: BTreeMap::new(),
                     },
                 },
-                physical_layout: None,
                 alias: None,
                 planned_scan: None,
             },
