@@ -28,13 +28,12 @@ use std::time::{Duration, Instant};
 use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
-use novarocks::server::{StandaloneServerOptions, run_standalone_server};
-use std::eprintln;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
     mysql_port: Option<u16>,
     config_path: Option<String>,
+    role: Option<novarocks::common::app_config::ClusterRole>,
 }
 
 fn print_main_usage() {
@@ -47,9 +46,12 @@ fn print_main_usage() {
 }
 
 fn print_standalone_server_usage() {
-    eprintln!("Usage: novarocks standalone-server [--port <port>] [--config <path>]");
+    eprintln!(
+        "Usage: novarocks standalone-server [--port <port>] [--config <path>] [--role <fe|be|all-in-one>]"
+    );
     eprintln!("Example:");
     eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
+    eprintln!("  novarocks standalone-server --role be --config /etc/novarocks/novarocks.toml");
 }
 
 fn parse_standalone_server_args(
@@ -58,6 +60,7 @@ fn parse_standalone_server_args(
     let mut idx = 0usize;
     let mut mysql_port: Option<u16> = None;
     let mut config_path: Option<String> = None;
+    let mut role: Option<novarocks::common::app_config::ClusterRole> = None;
 
     while let Some(arg) = args.get(idx) {
         match arg.as_str() {
@@ -80,6 +83,17 @@ fn parse_standalone_server_args(
                 }
                 idx += 1;
             }
+            "--role" => {
+                idx += 1;
+                let raw = args
+                    .get(idx)
+                    .ok_or_else(|| "missing value for --role".to_string())?;
+                role = Some(
+                    parse_cluster_role(raw)
+                        .map_err(|e| format!("invalid --role value `{raw}`; {e}"))?,
+                );
+                idx += 1;
+            }
             "--help" | "-h" => return Ok(None),
             other => {
                 return Err(format!(
@@ -92,13 +106,190 @@ fn parse_standalone_server_args(
     Ok(Some(StandaloneServerCliArgs {
         mysql_port,
         config_path,
+        role,
     }))
 }
 
-fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> Result<(), String> {
-    run_standalone_server(StandaloneServerOptions {
-        config_path: cli.config_path.map(PathBuf::from),
-        mysql_port: cli.mysql_port,
+fn parse_cluster_role(value: &str) -> Result<novarocks::common::app_config::ClusterRole, String> {
+    match value {
+        "fe" => Ok(novarocks::common::app_config::ClusterRole::Fe),
+        "be" => Ok(novarocks::common::app_config::ClusterRole::Be),
+        "all-in-one" => Ok(novarocks::common::app_config::ClusterRole::AllInOne),
+        other => Err(format!(
+            "invalid cluster role '{}'; expected one of: fe, be, all-in-one",
+            other
+        )),
+    }
+}
+
+fn resolve_cluster_role(
+    cfg: &novarocks::common::app_config::NovaRocksConfig,
+    role_override: Option<novarocks::common::app_config::ClusterRole>,
+) -> novarocks::common::app_config::ClusterRole {
+    role_override.unwrap_or(cfg.cluster.role)
+}
+
+fn wait_for_tcp_ready(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+    label: &str,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = remaining.min(Duration::from_millis(100));
+        match TcpStream::connect_timeout(&addr, attempt_timeout) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+
+    match last_error {
+        Some(e) => Err(anyhow::anyhow!(
+            "{label} at {addr} did not become ready within {}ms: {e}",
+            timeout.as_millis()
+        )),
+        None => Err(anyhow::anyhow!(
+            "{label} at {addr} did not become ready within {}ms",
+            timeout.as_millis()
+        )),
+    }
+}
+
+/// Load config from `cli.config_path` (or use defaults when absent), resolve
+/// the effective cluster role (CLI override wins over config), and validate the
+/// loaded cluster section.  Returns the owned config, the resolved role, and
+/// the resolved config file path so callers can thread the pre-loaded config
+/// into the execution path without a second file read (I1 fix).
+fn load_config_and_resolve_role(
+    cli: &StandaloneServerCliArgs,
+) -> anyhow::Result<(
+    novarocks::common::app_config::NovaRocksConfig,
+    novarocks::common::app_config::ClusterRole,
+    Option<PathBuf>,
+)> {
+    // C2: honour NOVAROCKS_CONFIG env var and ./novarocks.toml fallback, not
+    // just the explicit --config path.
+    let config_path = novarocks::common::app_config::resolve_config_path(
+        cli.config_path.as_deref().map(std::path::Path::new),
+    );
+    let cfg = match config_path.as_ref() {
+        Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(p)
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
+        None => novarocks::common::app_config::NovaRocksConfig::default(),
+    };
+
+    let role_override = cli.role;
+
+    let role = resolve_cluster_role(&cfg, role_override);
+
+    // C1: validate using the *effective* (CLI-overridden) role, not the
+    // config-file role.  Cloning only the small ClusterConfig struct avoids
+    // mutating the returned cfg.
+    let mut effective_cluster = cfg.cluster.clone();
+    effective_cluster.role = role;
+    effective_cluster
+        .validate()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok((cfg, role, config_path))
+}
+
+/// Returns a human-readable warning string when `--port` is supplied together
+/// with `role=be`.  The BE starts a gRPC server, not a MySQL server, so the
+/// MySQL port override has no effect.
+fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
+    port_override.map(|p| {
+        format!(
+            "role=be: --port {p} is ignored; the BE role starts a gRPC server, not a MySQL server"
+        )
+    })
+}
+
+fn dispatch_standalone_role(
+    role: novarocks::common::app_config::ClusterRole,
+    cfg: novarocks::common::app_config::NovaRocksConfig,
+    port_override: Option<u16>,
+    run_all_in_one: impl FnOnce(
+        novarocks::common::app_config::NovaRocksConfig,
+        Option<u16>,
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match role {
+        novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
+        novarocks::common::app_config::ClusterRole::Fe => {
+            let n = cfg.cluster.backends.len();
+            if n != 1 {
+                return Err(anyhow::anyhow!(
+                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
+                ));
+            }
+            let backend_str = cfg
+                .cluster
+                .backends
+                .first()
+                .expect("length already checked above");
+            let backend_addr: std::net::SocketAddr = backend_str.parse().map_err(|e| {
+                anyhow::anyhow!("role=fe: invalid backend addr '{backend_str}': {e}")
+            })?;
+            std::net::TcpStream::connect_timeout(&backend_addr, std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    anyhow::anyhow!("role=fe: cannot reach backend {backend_addr}: {e}")
+                })?;
+            run_all_in_one(cfg, port_override)
+        }
+        novarocks::common::app_config::ClusterRole::Be => {
+            if let Some(warn) = be_role_start_warning(port_override) {
+                eprintln!("WARN: {warn}");
+            }
+            let host = cfg.server.host.clone();
+            let starlet_port = cfg.server.starlet_port;
+            let pid = std::process::id();
+            let starlet_addr: std::net::SocketAddr =
+                be_readiness_probe_addr(&host, starlet_port)
+                    .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+            novarocks::common::app_config::install_preloaded_config(cfg);
+            // Spec (PR-4): standalone BE exposes NovaRocksGrpc
+            // (SubmitFragment/FetchResult/CancelFragment/Exchange) on starlet_port.
+            // FE cluster.backends must point to this port.
+            novarocks::start_grpc_exchange_server(&host, starlet_port).map_err(|e| {
+                anyhow::anyhow!(
+                    "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
+                )
+            })?;
+            wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "novarocks grpc")
+                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+            println!("NOVAROCKS_READY role=be starlet_port={starlet_port} pid={pid}");
+            let (_tx, rx) = std::sync::mpsc::channel::<()>();
+            rx.recv().ok();
+            Ok(())
+        }
+    }
+}
+
+fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
+    // I1: load_config_and_resolve_role returns the resolved path so we thread
+    // it — along with the already-validated cfg — into the execution path
+    // without a second file read.
+    let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
+
+    // Spec (PR-4): role=fe must NOT start a local gRPC/exchange server.
+    // Use a role-specific server entry point so the closure below routes to
+    // the right variant without changing dispatch_standalone_role's signature.
+    let is_fe = role == novarocks::common::app_config::ClusterRole::Fe;
+    dispatch_standalone_role(role, cfg, cli.mysql_port, move |cfg, port| {
+        if is_fe {
+            novarocks::server::run_standalone_fe_server_with_config(cfg, resolved_config_path, port)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        } else {
+            novarocks::server::run_standalone_server_with_config(cfg, resolved_config_path, port)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
     })
 }
 
@@ -175,6 +366,29 @@ fn health_check_host(bind_host: &str) -> String {
         "::" | "[::]" => "::1".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Builds a `SocketAddr` for the BE readiness probe, correctly handling IPv6
+/// hosts by using `SocketAddr` construction via `IpAddr` rather than string
+/// concatenation, which produces invalid `::1:PORT` for IPv6.
+fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let probe_host = health_check_host(bind_host);
+    // Strip brackets so bare IPv6 addresses can be parsed as IpAddr.
+    let stripped = probe_host.trim_matches(|c| c == '[' || c == ']');
+    stripped
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .or_else(|_| {
+            // Hostname fallback: use bracketed form for `format!`-style parsing.
+            let bracketed = if probe_host.contains(':') && !probe_host.starts_with('[') {
+                format!("[{probe_host}]:{port}")
+            } else {
+                format!("{probe_host}:{port}")
+            };
+            bracketed
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("invalid BE readiness probe addr '{bracketed}': {e}"))
+        })
 }
 
 fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
@@ -721,7 +935,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{StandaloneServerCliArgs, parse_standalone_server_args};
+    use super::{
+        StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
+        parse_standalone_server_args, resolve_cluster_role, wait_for_tcp_ready,
+    };
 
     #[test]
     fn parse_standalone_server_args_accepts_port_and_config() {
@@ -729,7 +946,7 @@ mod tests {
             "--port".to_string(),
             "19030".to_string(),
             "--config".to_string(),
-            "/tmp/novarocks.toml".to_string(),
+            "novarocks.toml".to_string(),
         ];
         let parsed = parse_standalone_server_args(&args)
             .expect("parse standalone-server args")
@@ -738,7 +955,8 @@ mod tests {
             parsed,
             StandaloneServerCliArgs {
                 mysql_port: Some(19030),
-                config_path: Some("/tmp/novarocks.toml".to_string()),
+                config_path: Some("novarocks.toml".to_string()),
+                role: None,
             }
         );
     }
@@ -753,6 +971,7 @@ mod tests {
             StandaloneServerCliArgs {
                 mysql_port: None,
                 config_path: None,
+                role: None,
             }
         );
     }
@@ -762,5 +981,454 @@ mod tests {
         let args = vec!["--unknown".to_string()];
         let err = parse_standalone_server_args(&args).expect_err("unknown flag must fail");
         assert!(err.contains("unknown standalone-server arg"));
+    }
+
+    #[test]
+    fn test_standalone_server_role_arg_parses_fe() {
+        let args = vec![
+            "--role".to_string(),
+            "fe".to_string(),
+            "--config".to_string(),
+            "fe.toml".to_string(),
+        ];
+        let parsed = parse_standalone_server_args(&args)
+            .expect("parse args")
+            .expect("args");
+        assert_eq!(
+            parsed.role,
+            Some(novarocks::common::app_config::ClusterRole::Fe)
+        );
+        assert_eq!(parsed.config_path.as_deref(), Some("fe.toml"));
+    }
+
+    #[test]
+    fn test_standalone_server_role_arg_parses_all_in_one() {
+        let args = vec!["--role".to_string(), "all-in-one".to_string()];
+        let parsed = parse_standalone_server_args(&args)
+            .expect("parse args")
+            .expect("args");
+        assert_eq!(
+            parsed.role,
+            Some(novarocks::common::app_config::ClusterRole::AllInOne)
+        );
+    }
+
+    #[test]
+    fn test_standalone_server_role_invalid_rejected() {
+        let args = vec!["--role".to_string(), "master".to_string()];
+        let err = parse_standalone_server_args(&args).expect_err("invalid role must fail");
+        assert!(err.contains("invalid --role value"));
+    }
+
+    #[test]
+    fn test_role_override_wins_over_config() {
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        let role = resolve_cluster_role(&cfg, Some(novarocks::common::app_config::ClusterRole::Fe));
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    #[test]
+    fn test_dispatch_role_fe_with_no_backend_errors() {
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends.clear();
+        let err = dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Fe,
+            cfg,
+            None,
+            |_, _| unreachable!("all-in-one should not be called"),
+        )
+        .expect_err("fe with no backend should error");
+        assert!(err.to_string().contains("role=fe"));
+    }
+
+    // --- PR-4 spec compliance tests ---
+
+    /// Issue 3: be_role_start_warning emits a message that mentions both
+    /// "role=be" and "--port" when a port override is supplied.
+    #[test]
+    fn dispatch_be_role_with_port_override_warns_message() {
+        let msg = super::be_role_start_warning(Some(9030));
+        assert!(msg.is_some(), "expected warning when port_override is Some");
+        let s = msg.unwrap();
+        assert!(s.contains("role=be"), "must mention role=be: {s}");
+        assert!(s.contains("--port"), "must mention --port: {s}");
+        assert!(s.contains("9030"), "must include port value: {s}");
+    }
+
+    /// Issue 3: no warning is emitted when port_override is None.
+    #[test]
+    fn dispatch_be_role_without_port_override_no_warning() {
+        let msg = super::be_role_start_warning(None);
+        assert!(
+            msg.is_none(),
+            "no warning expected when port_override is None"
+        );
+    }
+
+    /// Issue 4: dispatch_standalone_role returns an error that includes the
+    /// backend count when more than one backend is configured for role=fe.
+    /// Without the exactly-one guard, the first backend would be silently
+    /// accepted even though validation should reject it.
+    #[test]
+    fn dispatch_fe_multiple_backends_returns_error_with_count() {
+        // Open a TCP listener so the first backend IS reachable.  Without the
+        // guard, dispatch_standalone_role would reach run_all_in_one and hit
+        // unreachable!().  With the guard it must fail before the TCP probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends = vec![addr.to_string(), "127.0.0.1:19999".to_string()];
+        let err = dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Fe,
+            cfg,
+            None,
+            |_, _| unreachable!("must not reach run_all_in_one with multiple backends"),
+        )
+        .expect_err("fe with multiple backends must error");
+        let msg = err.to_string();
+        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
+        assert!(msg.contains('2'), "must include backend count: {msg}");
+    }
+
+    #[test]
+    fn test_wait_for_tcp_ready_returns_ok_for_listening_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        wait_for_tcp_ready(addr, std::time::Duration::from_millis(100), "test")
+            .expect("listening socket should be ready");
+    }
+
+    #[test]
+    fn test_wait_for_tcp_ready_errors_for_unbound_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+        let err = wait_for_tcp_ready(addr, std::time::Duration::from_millis(10), "test")
+            .expect_err("unbound socket should not be ready");
+        assert!(err.to_string().contains("test"));
+    }
+
+    // Serialize tests that mutate process-wide state (env vars, CWD) so they
+    // don't interfere when the test harness runs tests in parallel threads.
+    static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    // --- PR-1 spec compliance gap tests ---
+    // These three tests fail on the current production code and drive the fixes:
+    // 1. Config file role must be used when no CLI --role is given.
+    // 2. ClusterConfig::validate() must run before dispatch.
+    // 3. CLI --role override must still win over the config file role.
+
+    fn write_toml_tempfile(toml: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        f.write_all(toml.as_bytes())
+            .expect("write toml to tempfile");
+        f
+    }
+
+    #[test]
+    fn test_config_file_role_fe_used_when_no_cli_override() {
+        // Config declares role=fe with exactly one backend (valid). No CLI --role.
+        // load_config_and_resolve_role must read the file and return ClusterRole::Fe,
+        // after which dispatch_standalone_role must validate reachability and enter
+        // the standalone coordinator path.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend probe");
+        let backend_addr = listener.local_addr().expect("backend probe addr");
+        let toml = format!(
+            r#"
+[cluster]
+role = "fe"
+backends = ["{backend_addr}"]
+"#
+        );
+        let f = write_toml_tempfile(&toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: None,
+            mysql_port: None,
+        };
+        let (cfg, role, _) =
+            load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        dispatch_standalone_role(role, cfg, None, |_, _| Ok(()))
+            .expect("fe with reachable backend must enter coordinator path");
+    }
+
+    #[test]
+    fn test_config_file_fe_zero_backends_fails_validation_before_dispatch() {
+        // Config declares role=fe with zero backends — invalid. Startup must fail
+        // with the D1 v1 validation message before any dispatch happens.
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = []
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("fe with zero backends must fail validation"),
+        };
+        assert!(
+            err.to_string()
+                .contains("D1 v1 only supports exactly one backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_role_override_be_wins_over_config_all_in_one() {
+        // Config says all-in-one (no backends — valid for both all-in-one and be).
+        // CLI --role be must win: load_config_and_resolve_role returns ClusterRole::Be.
+        // BE startup binds sockets and blocks, so this unit test stops at role
+        // resolution; the cluster MVP smoke test covers BE startup.
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8 path").to_string()),
+            role: Some(novarocks::common::app_config::ClusterRole::Be),
+            mysql_port: None,
+        };
+        let (cfg, role, _) = load_config_and_resolve_role(&cli)
+            .expect("load and resolve must succeed (be with no backends is valid)");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Be);
+        assert!(cfg.cluster.backends.is_empty());
+    }
+
+    // C1: validate against the *effective* (CLI-overridden) role, not the config-file role.
+    #[test]
+    fn test_c1_cli_role_be_rejects_backends_from_config_file() {
+        // Config says role=fe with 1 backend (valid for fe).
+        // CLI says --role be. Effective role is BE, which must reject backends.
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let f = write_toml_tempfile(toml);
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(f.path().to_str().expect("utf-8").to_string()),
+            role: Some(novarocks::common::app_config::ClusterRole::Be),
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("be with backends must fail validation"),
+        };
+        assert!(
+            err.to_string()
+                .contains("role=be must not configure [cluster].backends"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // C2: NOVAROCKS_CONFIG env var must be honoured when no explicit --config is given.
+    #[test]
+    fn test_c2_novarocks_config_env_var_used_when_no_cli_config() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let f = write_toml_tempfile(toml);
+        let path = f.path().to_str().expect("utf-8").to_string();
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("NOVAROCKS_CONFIG").ok();
+        // SAFETY: single-threaded thanks to ENV_MUTEX held above.
+        unsafe { std::env::set_var("NOVAROCKS_CONFIG", &path) };
+        let cli = StandaloneServerCliArgs {
+            config_path: None,
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+        match prev {
+            // SAFETY: single-threaded thanks to ENV_MUTEX.
+            Some(v) => unsafe { std::env::set_var("NOVAROCKS_CONFIG", v) },
+            None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
+        }
+
+        let (_, role, _) = result.expect("NOVAROCKS_CONFIG must be picked up");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    // C2: ./novarocks.toml in CWD must be discovered when no --config and no env var.
+    #[test]
+    fn test_c2_default_novarocks_toml_in_cwd_used() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        std::fs::write(dir.path().join("novarocks.toml"), toml).expect("write novarocks.toml");
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_env = std::env::var("NOVAROCKS_CONFIG").ok();
+        let prev_dir = std::env::current_dir().expect("current dir");
+        // SAFETY: single-threaded thanks to ENV_MUTEX.
+        unsafe { std::env::remove_var("NOVAROCKS_CONFIG") };
+        std::env::set_current_dir(dir.path()).expect("change to tempdir");
+
+        let cli = StandaloneServerCliArgs {
+            config_path: None,
+            role: None,
+            mysql_port: None,
+        };
+        let result = load_config_and_resolve_role(&cli);
+
+        std::env::set_current_dir(&prev_dir).expect("restore cwd");
+        match prev_env {
+            // SAFETY: single-threaded thanks to ENV_MUTEX.
+            Some(v) => unsafe { std::env::set_var("NOVAROCKS_CONFIG", v) },
+            None => unsafe { std::env::remove_var("NOVAROCKS_CONFIG") },
+        }
+
+        let (_, role, _) = result.expect("./novarocks.toml in CWD must be picked up");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+    }
+
+    // I1: dispatch_standalone_role must pass the pre-loaded cfg to the
+    // all-in-one closure, not drop it.
+    #[test]
+    fn test_i1_all_in_one_closure_receives_validated_config() {
+        use novarocks::common::app_config::StandaloneServerConfig;
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        // Plant a sentinel mysql_port in the config that can only come from the
+        // pre-loaded instance — it's never the default 9030.
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 23456,
+            ..StandaloneServerConfig::default()
+        });
+        let captured_port: std::cell::Cell<u16> = std::cell::Cell::new(0);
+        dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::AllInOne,
+            cfg,
+            None,
+            |cfg, _port| {
+                // The closure must receive the sentinel config (not a freshly
+                // defaulted one).
+                captured_port.set(
+                    cfg.standalone_server
+                        .as_ref()
+                        .map(|s| s.mysql_port)
+                        .unwrap_or(0),
+                );
+                Ok(())
+            },
+        )
+        .expect("all-in-one dispatch must succeed");
+        assert_eq!(
+            captured_port.get(),
+            23456,
+            "all-in-one runner must receive the pre-loaded cfg with the sentinel mysql_port"
+        );
+    }
+
+    // D1 PR-4: BE readiness probe must use loopback when bind host is a wildcard.
+    // The probe address is built via `health_check_host(bind_host)` so that
+    // `0.0.0.0` / `::` never appear in `wait_for_tcp_ready`.
+    #[test]
+    fn be_readiness_probe_addr_uses_loopback_for_wildcard_bind() {
+        // `health_check_host` is the shared helper used by both the daemon path
+        // and the BE path.  Assert its mapping is correct for every wildcard form.
+        assert_eq!(
+            super::health_check_host("0.0.0.0"),
+            "127.0.0.1",
+            "IPv4 wildcard must map to IPv4 loopback"
+        );
+        assert_eq!(
+            super::health_check_host("::"),
+            "::1",
+            "IPv6 wildcard :: must map to IPv6 loopback"
+        );
+        assert_eq!(
+            super::health_check_host("[::]"),
+            "::1",
+            "IPv6 wildcard [::] must map to IPv6 loopback"
+        );
+        assert_eq!(
+            super::health_check_host("192.168.1.10"),
+            "192.168.1.10",
+            "non-wildcard host must pass through unchanged"
+        );
+    }
+
+    // D1b PR-4: BE readiness probe address construction must produce a valid
+    // SocketAddr for all bind host variants, including IPv6.
+    #[test]
+    fn be_readiness_probe_addr_produces_valid_socket_addr() {
+        // IPv4 wildcard -> 127.0.0.1:port
+        let addr = super::be_readiness_probe_addr("0.0.0.0", 9020)
+            .expect("IPv4 wildcard must build valid SocketAddr");
+        assert_eq!(addr.to_string(), "127.0.0.1:9020");
+
+        // IPv6 wildcard :: -> [::1]:port
+        let addr = super::be_readiness_probe_addr("::", 9020)
+            .expect("IPv6 wildcard :: must build valid SocketAddr");
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(addr.port(), 9020);
+
+        // IPv6 wildcard [::] -> [::1]:port
+        let addr = super::be_readiness_probe_addr("[::]", 9020)
+            .expect("IPv6 wildcard [::] must build valid SocketAddr");
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(addr.port(), 9020);
+
+        // specific IPv4 host -> unchanged
+        let addr = super::be_readiness_probe_addr("192.168.1.10", 9020)
+            .expect("specific IPv4 host must build valid SocketAddr");
+        assert_eq!(addr.to_string(), "192.168.1.10:9020");
+
+        // specific IPv6 host -> valid SocketAddr
+        let addr = super::be_readiness_probe_addr("2001:db8::1", 9020)
+            .expect("specific IPv6 host must build valid SocketAddr");
+        assert_eq!(addr.ip().to_string(), "2001:db8::1");
+        assert_eq!(addr.port(), 9020);
+    }
+
+    // I1: load_config_and_resolve_role returns the resolved config path so the
+    // caller can pass it to the server without a second resolve call.
+    #[test]
+    fn test_i1_load_config_returns_resolved_path() {
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+"#;
+        let f = write_toml_tempfile(toml);
+        let explicit_path = f.path().to_str().expect("utf-8").to_string();
+        let cli = StandaloneServerCliArgs {
+            config_path: Some(explicit_path.clone()),
+            role: None,
+            mysql_port: None,
+        };
+        let (_, _, resolved_path) = load_config_and_resolve_role(&cli).expect("load must succeed");
+        assert!(
+            resolved_path.is_some(),
+            "resolved_path must be Some when --config was provided"
+        );
+        assert_eq!(
+            resolved_path.unwrap().to_str().unwrap(),
+            explicit_path,
+            "resolved path must match the explicit --config path"
+        );
     }
 }

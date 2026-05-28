@@ -44,6 +44,86 @@ fn default_sys_log_roll_num() -> usize {
     10
 }
 
+/// Cluster role for distributed deployments.
+/// The default is `AllInOne`, which preserves existing single-process behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterRole {
+    Fe,
+    Be,
+    AllInOne,
+}
+
+impl Default for ClusterRole {
+    fn default() -> Self {
+        ClusterRole::AllInOne
+    }
+}
+
+/// Configuration for the `[cluster]` TOML section.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    pub role: ClusterRole,
+    pub backends: Vec<String>,
+    pub advertise_host: String,
+    pub advertise_port: u16,
+}
+
+impl ClusterConfig {
+    /// Validate cluster config consistency. Called at startup after parsing.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.role {
+            ClusterRole::Fe => {
+                if self.backends.len() != 1 {
+                    return Err(format!(
+                        "D1 v1 only supports exactly one backend, got {}",
+                        self.backends.len()
+                    ));
+                }
+            }
+            ClusterRole::Be => {
+                if !self.backends.is_empty() {
+                    return Err(format!(
+                        "role=be must not configure [cluster].backends (got {} entries)",
+                        self.backends.len()
+                    ));
+                }
+            }
+            ClusterRole::AllInOne => {
+                if !self.backends.is_empty() {
+                    return Err(format!(
+                        "role=all-in-one must not configure [cluster].backends (got {} entries)",
+                        self.backends.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the config file path using the standard search order:
+/// 1. `explicit` – a path supplied directly by the caller (e.g. `--config`).
+/// 2. `NOVAROCKS_CONFIG` environment variable.
+/// 3. `./novarocks.toml` in the current working directory (only if the file exists).
+/// 4. `None` – the caller should fall back to built-in defaults.
+pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var("NOVAROCKS_CONFIG")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let default_path = PathBuf::from("novarocks.toml");
+            default_path.exists().then_some(default_path)
+        })
+}
+
 pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
     let path = path.as_ref().to_path_buf();
     let cfg = if !path.exists() {
@@ -77,6 +157,14 @@ pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
 
     eprintln!("WARNING: config file 'novarocks.toml' not found, using built-in defaults");
     Ok(install_config(NovaRocksConfig::default()))
+}
+
+/// Install an already-loaded config as the process-wide active config, replacing
+/// any existing global config.  Use this when the caller has already loaded and
+/// validated a [`NovaRocksConfig`] and wants to guarantee that the engine uses
+/// exactly that instance rather than performing a second disk read.
+pub fn install_preloaded_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
+    install_config(cfg)
 }
 
 /// Force-install the built-in default config, replacing any existing global config.
@@ -136,6 +224,9 @@ pub struct NovaRocksConfig {
 
     #[serde(default)]
     pub starrocks: StarRocksConfig,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl NovaRocksConfig {
@@ -168,6 +259,7 @@ impl Default for NovaRocksConfig {
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -1040,14 +1132,113 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default)]
 pub struct DebugConfig {
-    #[serde(default)]
     pub exec_node_output: bool,
-    #[serde(default)]
     /// Dump RPC inputs as "named_json" for `exec_plan_fragment` / `exec_batch_plan_fragments`.
     /// This is config-only (no env var fallback).
     pub exec_batch_plan_json: bool,
+    #[cfg(debug_assertions)]
+    pub fault_inject_submit_fail_after: Option<usize>,
+    #[cfg(debug_assertions)]
+    pub fault_inject_fetch_not_ready_count: Option<usize>,
+    #[cfg(debug_assertions)]
+    pub emit_cancel_marker: bool,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DebugConfigToml {
+    exec_node_output: bool,
+    exec_batch_plan_json: bool,
+    fault_inject_submit_fail_after: Option<usize>,
+    fault_inject_fetch_not_ready_count: Option<usize>,
+    emit_cancel_marker: bool,
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DebugConfigToml {
+    exec_node_output: bool,
+    exec_batch_plan_json: bool,
+    fault_inject_submit_fail_after: Option<usize>,
+    fault_inject_fetch_not_ready_count: Option<usize>,
+    emit_cancel_marker: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for DebugConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = DebugConfigToml::deserialize(deserializer)?;
+        #[cfg(debug_assertions)]
+        {
+            Ok(Self {
+                exec_node_output: raw.exec_node_output,
+                exec_batch_plan_json: raw.exec_batch_plan_json,
+                fault_inject_submit_fail_after: raw.fault_inject_submit_fail_after,
+                fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
+                emit_cancel_marker: raw.emit_cancel_marker,
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            if raw.fault_inject_submit_fail_after.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.fault_inject_submit_fail_after is only available in debug builds",
+                ));
+            }
+            if raw.fault_inject_fetch_not_ready_count.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.fault_inject_fetch_not_ready_count is only available in debug builds",
+                ));
+            }
+            if raw.emit_cancel_marker.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.emit_cancel_marker is only available in debug builds",
+                ));
+            }
+            Ok(Self {
+                exec_node_output: raw.exec_node_output,
+                exec_batch_plan_json: raw.exec_batch_plan_json,
+            })
+        }
+    }
+}
+
+impl DebugConfig {
+    #[cfg(debug_assertions)]
+    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
+        self.fault_inject_submit_fail_after
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn fault_inject_submit_fail_after(&self) -> Option<usize> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
+        self.fault_inject_fetch_not_ready_count
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn fault_inject_fetch_not_ready_count(&self) -> Option<usize> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn emit_cancel_marker(&self) -> bool {
+        self.emit_cancel_marker
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn emit_cancel_marker(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1234,6 +1425,57 @@ enable_path_style_access = true
         );
         assert_eq!(standalone.mysql_port, 9030);
         assert!(standalone.object_store.is_some());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_debug_fault_injection_knobs_parse_in_debug_builds() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[debug]
+fault_inject_submit_fail_after = 1
+fault_inject_fetch_not_ready_count = 2
+emit_cancel_marker = true
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.debug.fault_inject_submit_fail_after, Some(1));
+        assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
+        assert!(cfg.debug.emit_cancel_marker);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn test_debug_fault_injection_knobs_are_rejected_in_release_builds() {
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+fault_inject_submit_fail_after = 1
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject fault injection knobs"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("fault_inject_submit_fail_after"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+emit_cancel_marker = false
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject emit_cancel_marker knob"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("emit_cancel_marker"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
@@ -1499,5 +1741,127 @@ internal_service_query_rpc_thread_num = 7
         );
         runtime.internal_service_query_rpc_thread_num = 5;
         assert_eq!(runtime.actual_internal_service_query_rpc_threads(), 5);
+    }
+
+    #[test]
+    fn test_cluster_default_is_all_in_one() {
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
+        assert_eq!(cfg.cluster.role, super::ClusterRole::AllInOne);
+        assert!(cfg.cluster.backends.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_role_fe_with_single_backend() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe");
+        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
+        assert_eq!(cfg.cluster.backends, vec!["127.0.0.1:9070".to_string()]);
+    }
+
+    #[test]
+    fn test_cluster_role_be_rejects_backends() {
+        let toml = r#"
+[cluster]
+role = "be"
+backends = ["127.0.0.1:9070"]
+"#;
+        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be with backends");
+        let err = parsed
+            .cluster
+            .validate()
+            .expect_err("be with backends should fail");
+        assert!(err.contains("backends"));
+    }
+
+    #[test]
+    fn test_cluster_role_fe_requires_exactly_one_backend_v1() {
+        let toml_empty = r#"
+[cluster]
+role = "fe"
+backends = []
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml_empty).expect("parse");
+        let err = cfg.cluster.validate().expect_err("fe with 0 backends");
+        assert!(err.contains("D1 v1 only supports exactly one backend"));
+
+        let toml_two = r#"
+[cluster]
+role = "fe"
+backends = ["a:1", "b:2"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml_two).expect("parse");
+        let err = cfg.cluster.validate().expect_err("fe with 2 backends");
+        assert!(err.contains("D1 v1 only supports exactly one backend"));
+    }
+
+    #[test]
+    fn test_cluster_role_invalid_rejected() {
+        let toml = r#"
+[cluster]
+role = "leader"
+"#;
+        let result: Result<NovaRocksConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "invalid role string should fail parse");
+    }
+
+    #[test]
+    fn test_all_in_one_rejects_non_empty_backends() {
+        // I2: role=all-in-one with non-empty backends must be rejected.
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+backends = ["127.0.0.1:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one with backends");
+        let err = cfg
+            .cluster
+            .validate()
+            .expect_err("all-in-one with backends should fail");
+        assert!(
+            err.contains("all-in-one") && err.contains("backends"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_all_in_one_with_no_backends_passes_validation() {
+        // Default all-in-one with no backends must still pass.
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one");
+        cfg.cluster
+            .validate()
+            .expect("all-in-one with no backends should pass");
+    }
+
+    #[test]
+    fn test_all_in_one_rejects_multiple_backends() {
+        // I2: multiple backends should also be rejected for all-in-one.
+        let toml = r#"
+[cluster]
+role = "all-in-one"
+backends = ["127.0.0.1:9070", "127.0.0.1:9071"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        let err = cfg
+            .cluster
+            .validate()
+            .expect_err("all-in-one with 2 backends should fail");
+        assert!(
+            err.contains("all-in-one") && err.contains("backends"),
+            "unexpected error: {err}"
+        );
+        // Error message should contain the count.
+        assert!(err.contains('2'), "expected count 2 in error: {err}");
     }
 }

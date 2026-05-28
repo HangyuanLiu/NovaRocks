@@ -3,8 +3,11 @@ mod encoding;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use mysql_common::scramble::scramble_native;
@@ -36,25 +39,102 @@ const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
+struct ClientDisconnectWatcher {
+    join_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ClientDisconnectWatcher {
+    fn drop(&mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneServerOptions {
     pub config_path: Option<PathBuf>,
     pub mysql_port: Option<u16>,
 }
 
-#[derive(Clone, Debug)]
 struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
     mysql_port: u16,
     user: String,
     refresh_coordinator: RefreshCoordinatorConfig,
+    /// Pre-loaded config to pass directly to engine open, bypassing a second
+    /// disk read.  `None` falls back to the legacy disk/env load path.
+    preloaded_config: Option<NovaRocksConfig>,
+    /// Whether to start the local gRPC/exchange server.
+    /// `true` for all-in-one (exchange runs in-process); `false` for role=fe
+    /// (all fragments execute on the remote BE, no local exchange needed).
+    start_grpc_exchange: bool,
 }
 
+/// Legacy standalone server entrypoint that loads config from disk/env inside
+/// [`StandaloneNovaRocks::open`].  New callers that already hold a validated
+/// config should prefer [`run_standalone_server_with_config`].
+#[deprecated(
+    note = "prefer run_standalone_server_with_config when a validated config is available"
+)]
 pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String> {
     let resolved = resolve_server_options(&opts)?;
-    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+    run_with_resolved_options(resolved)
+}
+
+/// Run the standalone server using an already-loaded, validated [`NovaRocksConfig`].
+///
+/// `cfg` is installed as the process-wide active config before the engine
+/// opens — no second disk read occurs.  `config_path` is preserved only for
+/// resolving relative paths (e.g. SQLite metadata DB paths); pass `None` to
+/// use built-in path defaults.
+///
+/// This variant starts the local gRPC/exchange server (all-in-one mode).
+/// For `role=fe` use [`run_standalone_fe_server_with_config`] instead.
+pub fn run_standalone_server_with_config(
+    cfg: NovaRocksConfig,
+    config_path: Option<PathBuf>,
+    port_override: Option<u16>,
+) -> Result<(), String> {
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path,
+        preloaded_config: Some(cfg),
+        start_grpc_exchange: true,
+        ..resolved
+    };
+    run_with_resolved_options(resolved)
+}
+
+/// Run the standalone server for `role=fe`.
+///
+/// Identical to [`run_standalone_server_with_config`] except the local
+/// gRPC/exchange server is **not** started.  In role=fe all fragments
+/// (including root) run on the remote BE; the FE only runs MySQL, the
+/// optimizer, and the coordinator which uses `RemoteDispatcher`.
+pub fn run_standalone_fe_server_with_config(
+    cfg: NovaRocksConfig,
+    config_path: Option<PathBuf>,
+    port_override: Option<u16>,
+) -> Result<(), String> {
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path,
+        preloaded_config: Some(cfg),
+        start_grpc_exchange: false,
+        ..resolved
+    };
+    run_with_resolved_options(resolved)
+}
+
+fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
+    let opts = StandaloneOptions {
         config_path: resolved.config_path.clone(),
-    })?;
+    };
+    let engine = match resolved.preloaded_config {
+        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg)?,
+        None => StandaloneNovaRocks::open(opts)?,
+    };
     crate::engine::register_stream_load_engine(engine.clone());
     let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
         &engine,
@@ -71,6 +151,7 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
         engine,
         resolved.mysql_port,
         resolved.user.clone(),
+        resolved.start_grpc_exchange,
     ))
 }
 
@@ -79,51 +160,72 @@ fn resolve_server_options(
 ) -> Result<ResolvedStandaloneServerOptions, String> {
     let active_config_path = resolve_active_config_path(opts.config_path.as_deref());
     let file_cfg = load_active_config(active_config_path.as_deref())?;
-
-    let mut mysql_port = DEFAULT_MYSQL_PORT;
-    let mut user = ROOT_USER.to_string();
-    let mut refresh_coordinator = RefreshCoordinatorConfig::default();
-
-    if let Some(app_cfg) = file_cfg.as_ref()
-        && let Some(standalone) = app_cfg.standalone_server.as_ref()
-    {
-        mysql_port = standalone.mysql_port;
-        if standalone.user != ROOT_USER {
-            return Err(format!(
-                "standalone server only supports user `{ROOT_USER}`, got `{}`",
-                standalone.user
-            ));
-        }
-        user = standalone.user.clone();
-        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(standalone);
-    }
-
-    if let Some(port) = opts.mysql_port {
-        mysql_port = port;
-    }
-
+    let standalone = file_cfg.as_ref().and_then(|c| c.standalone_server.as_ref());
+    let (mysql_port, user, refresh_coordinator) =
+        extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
         refresh_coordinator,
+        preloaded_config: None,
+        start_grpc_exchange: true,
     })
 }
 
 fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            std::env::var("NOVAROCKS_CONFIG")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            let default_path = PathBuf::from("novarocks.toml");
-            default_path.exists().then_some(default_path)
-        })
+    crate::common::app_config::resolve_config_path(explicit)
+}
+
+/// Extract server-layer settings (port, user, refresh coordinator) from an
+/// optional [`StandaloneServerConfig`], applying `port_override` last.
+/// Shared by both the disk-load path and the pre-loaded-config path to keep
+/// validation logic in one place.
+fn extract_server_settings(
+    standalone: Option<&crate::common::app_config::StandaloneServerConfig>,
+    port_override: Option<u16>,
+) -> Result<(u16, String, RefreshCoordinatorConfig), String> {
+    let mut mysql_port = DEFAULT_MYSQL_PORT;
+    let mut user = ROOT_USER.to_string();
+    let mut refresh_coordinator = RefreshCoordinatorConfig::default();
+
+    if let Some(sc) = standalone {
+        mysql_port = sc.mysql_port;
+        if sc.user != ROOT_USER {
+            return Err(format!(
+                "standalone server only supports user `{ROOT_USER}`, got `{}`",
+                sc.user
+            ));
+        }
+        user = sc.user.clone();
+        refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(sc);
+    }
+
+    if let Some(port) = port_override {
+        mysql_port = port;
+    }
+
+    Ok((mysql_port, user, refresh_coordinator))
+}
+
+/// Extract server-layer settings directly from a pre-loaded [`NovaRocksConfig`].
+fn resolve_server_options_from_config(
+    cfg: &NovaRocksConfig,
+    port_override: Option<u16>,
+) -> Result<ResolvedStandaloneServerOptions, String> {
+    let (mysql_port, user, refresh_coordinator) =
+        extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
+    Ok(ResolvedStandaloneServerOptions {
+        // config_path is intentionally None here; callers that need the path
+        // (e.g. run_standalone_server_with_config) set it after this call.
+        config_path: None,
+        mysql_port,
+        user,
+        refresh_coordinator,
+        preloaded_config: None,
+        // Callers override this; default to true (all-in-one exchange server).
+        start_grpc_exchange: true,
+    })
 }
 
 fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, String> {
@@ -139,23 +241,27 @@ async fn serve_forever(
     engine: StandaloneNovaRocks,
     mysql_port: u16,
     user: String,
+    start_grpc_exchange: bool,
 ) -> Result<(), String> {
-    // Start gRPC exchange server for multi-fragment CTE execution.
-    // Uses the configured http_port (default 8040).
-    let grpc_port = crate::common::config::http_port();
-    match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
-        Ok(()) => {
-            info!(
-                "standalone grpc exchange server started on 127.0.0.1:{}",
-                grpc_port
-            );
-        }
-        Err(e) => {
-            warn!(
-                "failed to start standalone grpc exchange server on port {}: {} \
-                 (multi-fragment CTE queries will not work)",
-                grpc_port, e
-            );
+    // Start gRPC exchange server for multi-fragment CTE execution in all-in-one
+    // mode.  Skipped for role=fe because all fragments run on the remote BE;
+    // the FE does not need a local exchange registry.
+    if start_grpc_exchange {
+        let grpc_port = crate::common::config::http_port();
+        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
+            Ok(()) => {
+                info!(
+                    "standalone grpc exchange server started on 127.0.0.1:{}",
+                    grpc_port
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "failed to start standalone grpc exchange server on port {}: {} \
+                     (multi-fragment CTE queries will not work)",
+                    grpc_port, e
+                );
+            }
         }
     }
 
@@ -186,9 +292,20 @@ async fn serve_forever(
         let user = user.clone();
         tokio::spawn(async move {
             let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            let shim = NovaRocksMysqlShim::new(engine, user, connection_id);
+            let (client_disconnect_signal, disconnect_watcher) =
+                spawn_client_disconnect_watcher(&stream);
+            let connection_disconnect_signal = Arc::clone(&client_disconnect_signal);
+            let shim = NovaRocksMysqlShim::new(
+                engine,
+                user,
+                connection_id,
+                client_disconnect_signal,
+                disconnect_watcher,
+            );
             let (reader, writer) = stream.into_split();
-            if let Err(err) = AsyncMysqlIntermediary::run_on(shim, reader, writer).await {
+            let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
+            connection_disconnect_signal.store(true, Ordering::SeqCst);
+            if let Err(err) = result {
                 warn!(
                     "standalone mysql connection failed: peer={}, connection_id={}, err={}",
                     peer_addr, connection_id, err
@@ -198,10 +315,85 @@ async fn serve_forever(
     }
 }
 
+#[cfg(unix)]
+fn spawn_client_disconnect_watcher(
+    stream: &tokio::net::TcpStream,
+) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if fd < 0 {
+        return (disconnected, ClientDisconnectWatcher { join_handle: None });
+    }
+
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    if let Err(err) = std_stream.set_nonblocking(true) {
+        warn!(
+            "failed to configure disconnect monitor fd as nonblocking: {}",
+            err
+        );
+        return (disconnected, ClientDisconnectWatcher { join_handle: None });
+    }
+    let watcher_stream = match tokio::net::TcpStream::from_std(std_stream) {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!("failed to create async disconnect monitor stream: {}", err);
+            return (disconnected, ClientDisconnectWatcher { join_handle: None });
+        }
+    };
+
+    let watcher_disconnected = Arc::clone(&disconnected);
+    let join_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        loop {
+            if watcher_disconnected.load(Ordering::SeqCst) {
+                break;
+            }
+            match watcher_stream.peek(&mut buf).await {
+                Ok(0) => {
+                    watcher_disconnected.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(err) => match err.kind() {
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {}
+                    io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected => {
+                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {
+                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                },
+            }
+        }
+    });
+    (
+        disconnected,
+        ClientDisconnectWatcher {
+            join_handle: Some(join_handle),
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn spawn_client_disconnect_watcher(
+    _stream: &tokio::net::TcpStream,
+) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
+    let disconnected = Arc::new(AtomicBool::new(false));
+    (disconnected, ClientDisconnectWatcher { join_handle: None })
+}
+
 struct NovaRocksMysqlShim {
     engine: StandaloneNovaRocks,
     user: String,
     connection_id: u32,
+    client_disconnect_signal: Arc<AtomicBool>,
+    _disconnect_watcher: ClientDisconnectWatcher,
     current_catalog: Option<String>,
     current_db: String,
     /// Per-session query timeout (in seconds). `None` means no timeout.
@@ -215,11 +407,19 @@ struct NovaRocksMysqlShim {
 }
 
 impl NovaRocksMysqlShim {
-    fn new(engine: StandaloneNovaRocks, user: String, connection_id: u32) -> Self {
+    fn new(
+        engine: StandaloneNovaRocks,
+        user: String,
+        connection_id: u32,
+        client_disconnect_signal: Arc<AtomicBool>,
+        disconnect_watcher: ClientDisconnectWatcher,
+    ) -> Self {
         Self {
             engine,
             user,
             connection_id,
+            client_disconnect_signal,
+            _disconnect_watcher: disconnect_watcher,
             current_catalog: None,
             current_db: DEFAULT_DATABASE.to_string(),
             query_timeout_secs: None,
@@ -785,6 +985,7 @@ async fn execute_sql_in_worker(
         crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
     let query_options = crate::internal_service::TQueryOptions {
         group_concat_max_len: Some(shim.group_concat_max_len),
+        query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
         allow_throw_exception: if allow_throw_exception {
             Some(true)
         } else {
@@ -792,32 +993,27 @@ async fn execute_sql_in_worker(
         },
         ..Default::default()
     };
+    let client_disconnect_signal = Arc::clone(&shim.client_disconnect_signal);
 
     let join_handle = task::spawn_blocking(move || {
-        crate::sql::optimizer::options::with_session_optimizer_settings(optimizer_settings, || {
-            session.execute_in_context(
-                &sql,
-                current_catalog.as_deref(),
-                &current_db,
-                Some(query_options),
-            )
-        })
+        crate::runtime::query_cancel::with_client_disconnect_signal(
+            client_disconnect_signal,
+            || {
+                crate::sql::optimizer::options::with_session_optimizer_settings(
+                    optimizer_settings,
+                    || {
+                        session.execute_in_context(
+                            &sql,
+                            current_catalog.as_deref(),
+                            &current_db,
+                            Some(query_options),
+                        )
+                    },
+                )
+            },
+        )
     });
-
-    let result = match query_timeout {
-        Some(secs) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
-                Ok(join_result) => join_result,
-                Err(_elapsed) => {
-                    return Err((
-                        ErrorKind::ER_QUERY_INTERRUPTED,
-                        format!("Query exceeded timeout of {secs}s"),
-                    ));
-                }
-            }
-        }
-        None => join_handle.await,
-    };
+    let result = join_handle.await;
 
     match result {
         Ok(Ok(result)) => Ok(result),
@@ -1087,6 +1283,17 @@ fn strip_string_quotes(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_disconnect_watcher_treats_unexpected_peek_errors_as_disconnects() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(
+                "_ => {\n                        watcher_disconnected.store(true, Ordering::SeqCst);\n                        break;\n                    }"
+            ),
+            "unexpected peek errors should conservatively mark the client disconnected"
+        );
+    }
 
     #[test]
     fn parse_set_query_timeout_accepts_common_forms() {
@@ -1374,5 +1581,61 @@ mod tests {
         assert!(!crate::sql::optimizer::is_known_rule_name(
             "TotallyNotARealRule"
         ));
+    }
+
+    // I1: resolve_server_options_from_config must extract settings from a
+    // pre-loaded NovaRocksConfig without touching the filesystem.
+    #[test]
+    fn resolve_settings_from_cfg_uses_sentinel_mysql_port() {
+        use crate::common::app_config::StandaloneServerConfig;
+        let mut cfg = NovaRocksConfig::default();
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 12345,
+            ..StandaloneServerConfig::default()
+        });
+        let resolved =
+            resolve_server_options_from_config(&cfg, None).expect("extract settings from cfg");
+        assert_eq!(
+            resolved.mysql_port, 12345,
+            "mysql_port must come from the pre-loaded cfg, not from a fresh file load"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_from_cfg_port_override_wins() {
+        use crate::common::app_config::StandaloneServerConfig;
+        let mut cfg = NovaRocksConfig::default();
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            mysql_port: 12345,
+            ..StandaloneServerConfig::default()
+        });
+        let resolved = resolve_server_options_from_config(&cfg, Some(19030))
+            .expect("extract settings with port override");
+        assert_eq!(
+            resolved.mysql_port, 19030,
+            "explicit port override must win over config"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_from_cfg_defaults_when_no_standalone_section() {
+        // I1: When standalone_server section is absent, DEFAULT_MYSQL_PORT is used.
+        let cfg = NovaRocksConfig::default();
+        let resolved =
+            resolve_server_options_from_config(&cfg, None).expect("defaults from empty cfg");
+        assert_eq!(
+            resolved.mysql_port, DEFAULT_MYSQL_PORT,
+            "default port when no [standalone_server] section"
+        );
+    }
+
+    #[test]
+    fn standalone_server_source_has_no_native_disconnect_watcher_thread() {
+        let source = include_str!("mod.rs");
+        let needle = ["std::thread", "::JoinHandle<()>"].concat();
+        assert!(
+            !source.contains(&needle),
+            "standalone server should not keep a native disconnect watcher thread per session"
+        );
     }
 }

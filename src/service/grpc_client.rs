@@ -15,16 +15,134 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use tonic::Request;
 use tonic::transport::Channel;
 
+use crate::common::network::format_host_for_url;
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
 pub use crate::service::grpc_proto as proto;
+
+/// gRPC client for the three D1 distributed-execution RPCs.
+///
+/// Wraps the tonic async client with blocking wrappers so that PR-4's
+/// `RemoteDispatcher` can drive it from a non-async context.  One
+/// `NovaRocksGrpcRemoteClient` per remote BE address; callers are
+/// responsible for caching instances.
+pub struct NovaRocksGrpcRemoteClient {
+    host: String,
+    port: u16,
+}
+
+impl NovaRocksGrpcRemoteClient {
+    /// Create a client for `addr`.
+    ///
+    /// The underlying HTTP/2 channel is established lazily via the shared
+    /// channel cache, so construction itself is cheap.
+    pub fn new(addr: SocketAddr) -> Result<Self, String> {
+        let host = addr.ip().to_string();
+        let port = addr.port();
+        // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
+        grpc_endpoint(&host, port)
+            .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
+        Ok(Self { host, port })
+    }
+
+    /// Connect to `addr` and return a ready client.
+    ///
+    /// The underlying HTTP/2 channel is established lazily via the shared
+    /// channel cache, so the connect itself is cheap.
+    pub fn connect_blocking(addr: SocketAddr) -> Result<Self, String> {
+        Self::new(addr)
+    }
+
+    fn make_client(
+        &self,
+    ) -> Result<proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>, String>
+    {
+        let host = self.host.clone();
+        let port = self.port;
+        let ch = data_block_on(async move { get_or_create_channel(&host, port).await })??;
+        Ok(Self::client_from_channel(ch))
+    }
+
+    async fn make_async_client(
+        &self,
+    ) -> Result<proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>, String>
+    {
+        let ch = get_or_create_channel(&self.host, self.port).await?;
+        Ok(Self::client_from_channel(ch))
+    }
+
+    fn client_from_channel(
+        ch: Channel,
+    ) -> proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel> {
+        proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
+            .max_encoding_message_size(GRPC_MAX_ENCODING_BYTES)
+            .max_decoding_message_size(GRPC_MAX_DECODING_BYTES)
+    }
+
+    pub fn blocking_submit_fragment(
+        &self,
+        req: proto::novarocks::SubmitFragmentRequest,
+    ) -> Result<proto::novarocks::SubmitFragmentResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.submit_fragment(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("submit_fragment rpc failed: {e}"))
+        })?
+    }
+
+    pub fn blocking_fetch_result(
+        &self,
+        req: proto::novarocks::FetchResultRequest,
+    ) -> Result<proto::novarocks::FetchResultResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.fetch_result(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("fetch_result rpc failed: {e}"))
+        })?
+    }
+
+    pub fn blocking_cancel_fragment(
+        &self,
+        req: proto::novarocks::CancelFragmentRequest,
+    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            cli.cancel_fragment(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
+        })?
+    }
+
+    pub async fn cancel_fragment_async(
+        &self,
+        req: proto::novarocks::CancelFragmentRequest,
+    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
+        let mut cli = self.make_async_client().await?;
+        let mut req = Request::new(req);
+        req.set_timeout(Duration::from_secs(3));
+        cli.cancel_fragment(req)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
+    }
+}
+
+const GRPC_MAX_ENCODING_BYTES: usize = 64 * 1024 * 1024;
+const GRPC_MAX_DECODING_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct ChannelCache {
@@ -39,6 +157,17 @@ fn channels() -> &'static ChannelCache {
     })
 }
 
+fn grpc_endpoint_uri(host: &str, port: u16) -> String {
+    format!("http://{}:{port}", format_host_for_url(host))
+}
+
+fn grpc_endpoint(
+    host: &str,
+    port: u16,
+) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
+    grpc_endpoint_uri(host, port).parse::<tonic::transport::Endpoint>()
+}
+
 /// Return a cached channel for the given endpoint, creating one if needed.
 ///
 /// Must be called from within an async Tokio context (inside data_block_on or
@@ -46,15 +175,14 @@ fn channels() -> &'static ChannelCache {
 /// One channel per (host, port) is sufficient — HTTP/2 multiplexes all
 /// concurrent RPCs over the single connection.
 async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String> {
-    let key = format!("{host}:{port}");
+    let key = format!("{}:{port}", format_host_for_url(host));
     {
         let guard = channels().mu.lock().expect("channel cache lock");
         if let Some(ch) = guard.get(&key).cloned() {
             return Ok(ch);
         }
     }
-    let ch = format!("http://{host}:{port}")
-        .parse::<tonic::transport::Endpoint>()
+    let ch = grpc_endpoint(host, port)
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
@@ -71,6 +199,38 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
         .expect("channel cache lock")
         .insert(key, ch.clone());
     Ok(ch)
+}
+
+#[cfg(test)]
+mod pr3_tests {
+    use super::*;
+
+    #[test]
+    fn remote_client_connect_accepts_socket_addr() {
+        let addr: SocketAddr = "127.0.0.1:19030".parse().expect("valid addr");
+        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)
+            .expect("connect wrapper should accept SocketAddr");
+        assert_eq!(client.host, "127.0.0.1");
+        assert_eq!(client.port, 19030);
+    }
+
+    #[test]
+    fn grpc_endpoint_uri_formats_ipv4_and_ipv6_hosts() {
+        assert_eq!(
+            grpc_endpoint_uri("127.0.0.1", 9070),
+            "http://127.0.0.1:9070"
+        );
+        assert_eq!(grpc_endpoint_uri("::1", 9070), "http://[::1]:9070");
+    }
+
+    #[test]
+    fn remote_client_connect_accepts_ipv6_socket_addr() {
+        let addr: SocketAddr = "[::1]:19030".parse().expect("valid ipv6 addr");
+        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)
+            .expect("connect wrapper should accept IPv6 SocketAddr");
+        assert_eq!(client.host, "::1");
+        assert_eq!(client.port, 19030);
+    }
 }
 
 /// Synchronous exchange send — blocks until the server acknowledges receipt.

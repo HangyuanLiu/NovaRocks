@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -44,6 +45,9 @@ use crate::service::{load_tracking_http, stream_load_http};
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct GrpcServerState {
@@ -227,6 +231,148 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(internal_rpc::handle_lookup(
             request.into_inner(),
         )))
+    }
+
+    async fn submit_fragment(
+        &self,
+        request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
+        let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_submit_fail_after()
+            .is_some_and(|successes| call_index > successes)
+        {
+            return Err(tonic::Status::unavailable(format!(
+                "debug submit fault injected on call {call_index}"
+            )));
+        }
+        let bytes = request.into_inner().exec_plan_fragment_params_thrift;
+        // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
+        // which is CPU-bound. Offload to the blocking thread pool so tonic worker
+        // threads remain free for I/O.
+        let result = tokio::task::spawn_blocking(move || crate::submit_exec_plan_fragment(&bytes))
+            .await
+            .map_err(|e| {
+                tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
+            })?;
+        match result {
+            Ok(()) => Ok(tonic::Response::new(
+                proto::novarocks::SubmitFragmentResponse {
+                    status_code: 0,
+                    message: String::new(),
+                },
+            )),
+            Err(e) => Ok(tonic::Response::new(
+                proto::novarocks::SubmitFragmentResponse {
+                    status_code: 1,
+                    message: e,
+                },
+            )),
+        }
+    }
+
+    async fn fetch_result(
+        &self,
+        request: tonic::Request<proto::novarocks::FetchResultRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::FetchResultResponse>, tonic::Status> {
+        use proto::novarocks::fetch_result_response::Status as FetchStatus;
+
+        let req = request.into_inner();
+        let finst_id = match req.finst_id {
+            Some(id) => crate::UniqueId {
+                hi: id.hi,
+                lo: id.lo,
+            },
+            None => {
+                return Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: FetchStatus::Error as i32,
+                        result_batch_thrift: vec![],
+                        message: "missing finst_id in FetchResultRequest".to_string(),
+                    },
+                ));
+            }
+        };
+        let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_fault_inject_fetch_not_ready_count()
+            .is_some_and(|limit| call_index <= limit)
+        {
+            return Ok(tonic::Response::new(
+                proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::NotReady as i32,
+                    result_batch_thrift: vec![],
+                    message: String::new(),
+                },
+            ));
+        }
+
+        // wait_fetch uses std::sync::Condvar::wait_timeout, which blocks the OS
+        // thread for up to max_wait_ms. Offload to the blocking thread pool so
+        // tonic worker threads remain free for I/O.
+        use crate::runtime::result_buffer::{TryFetchResult, wait_fetch};
+        let max_wait_ms = req.max_wait_ms;
+        let fetch_result = tokio::task::spawn_blocking(move || wait_fetch(finst_id, max_wait_ms))
+            .await
+            .map_err(|e| tonic::Status::internal(format!("fetch_result handler panicked: {e}")))?;
+        match fetch_result {
+            TryFetchResult::Ready(result) => {
+                let status = if result.eos {
+                    FetchStatus::Eof
+                } else {
+                    FetchStatus::Ready
+                };
+                // Thrift-binary-encode the TResultBatch for transport.
+                // The receiver (PR-4 RemoteDispatcher) deserializes the same bytes.
+                let batch_bytes =
+                    crate::common::thrift::thrift_serialize_result_batch(&result.result_batch);
+                Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: status as i32,
+                        result_batch_thrift: batch_bytes,
+                        message: String::new(),
+                    },
+                ))
+            }
+            TryFetchResult::NotReady => Ok(tonic::Response::new(
+                proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::NotReady as i32,
+                    result_batch_thrift: vec![],
+                    message: String::new(),
+                },
+            )),
+            TryFetchResult::Error(err) => Ok(tonic::Response::new(
+                proto::novarocks::FetchResultResponse {
+                    status: FetchStatus::Error as i32,
+                    result_batch_thrift: vec![],
+                    message: err.message,
+                },
+            )),
+        }
+    }
+
+    async fn cancel_fragment(
+        &self,
+        request: tonic::Request<proto::novarocks::CancelFragmentRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
+        let req = request.into_inner();
+        for id in &req.finst_ids {
+            crate::cancel(crate::UniqueId {
+                hi: id.hi,
+                lo: id.lo,
+            });
+        }
+        if crate::common::config::debug_emit_cancel_marker() {
+            let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            println!(
+                "NOVAROCKS_CANCEL count={} finsts={} reason={}",
+                count,
+                req.finst_ids.len(),
+                req.reason
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        Ok(tonic::Response::new(
+            proto::novarocks::CancelFragmentResponse { status_code: 0 },
+        ))
     }
 }
 
@@ -521,12 +667,9 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             .expect("build grpc server runtime");
 
         rt.block_on(async move {
-            let http_addr: SocketAddr = format!("{host}:{grpc_http_port}")
-                .parse()
-                .expect("parse grpc/http bind addr");
-            let starlet_addr: SocketAddr = format!("{host}:{grpc_starlet_port}")
-                .parse()
-                .expect("parse starlet bind addr");
+            let (http_addr, starlet_addr) =
+                grpc_server_bind_addrs(&host, grpc_http_port, grpc_starlet_port)
+                    .expect("parse grpc server bind addrs");
             let mut http_shutdown = shutdown_rx.clone();
             let mut starlet_shutdown = shutdown_rx.clone();
 
@@ -629,9 +772,55 @@ fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> 
     Ok(())
 }
 
+/// Parse a gRPC bind address from a host string and port.
+///
+/// Handles bare IPv6 addresses (`::`, `::1`), bracketed IPv6 (`[::]`, `[::1]`),
+/// and IPv4/hostname strings.  Bare and bracketed IPv6 forms are parsed via
+/// `IpAddr` to avoid the `:::PORT` ambiguity that arises from naive
+/// `format!("{host}:{port}")` string concatenation.
+/// Build both gRPC server bind addresses from a single host string and two ports.
+///
+/// Uses [`parse_grpc_bind_addr`] for each port so bare IPv6 addresses like `::` and
+/// `::1` are handled correctly, avoiding the `:::PORT` ambiguity produced by naive
+/// `format!("{host}:{port}")` string concatenation.
+pub(crate) fn grpc_server_bind_addrs(
+    host: &str,
+    http_port: u16,
+    starlet_port: u16,
+) -> Result<(SocketAddr, SocketAddr), String> {
+    let http_addr = parse_grpc_bind_addr(host, http_port)
+        .map_err(|e| format!("parse grpc/http bind addr failed: {e}"))?;
+    let starlet_addr = parse_grpc_bind_addr(host, starlet_port)
+        .map_err(|e| format!("parse starlet bind addr failed: {e}"))?;
+    Ok((http_addr, starlet_addr))
+}
+
+pub(crate) fn parse_grpc_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    // Strip brackets from bracketed IPv6 literals, e.g. `[::1]` -> `::1`.
+    let bare = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+
+    // If the bare string is a valid IP literal, build SocketAddr directly.
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    // Fallback for hostnames: use bracketed form for any host containing `:`.
+    let formatted = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    formatted
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("parse gRPC bind addr '{formatted}' failed: {e}"))
+}
+
 fn ensure_bindable(host: &str, port: u16, role: &str) -> Result<(), String> {
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
+    let addr = parse_grpc_bind_addr(host, port)
         .map_err(|e| format!("parse {role} bind addr failed: {e}"))?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| format!("failed to bind {role} listener on {addr}: {e}"))?;
@@ -674,8 +863,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
             .expect("build standalone grpc server runtime");
 
         rt.block_on(async move {
-            let addr: SocketAddr = format!("{host}:{port}")
-                .parse()
+            let addr = parse_grpc_bind_addr(&host, port)
                 .expect("parse standalone grpc bind addr");
             let mut shutdown = shutdown_rx.clone();
 
@@ -746,8 +934,8 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_bindable, validate_grpc_ports};
-    use std::net::TcpListener;
+    use super::{ensure_bindable, parse_grpc_bind_addr, validate_grpc_ports};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 
     #[test]
     fn test_validate_grpc_ports_accept_distinct_ports() {
@@ -768,5 +956,273 @@ mod tests {
             .expect_err("expected bind failure");
         assert!(err.contains("failed to bind"));
         drop(occupied);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bare_ipv6_wildcard() {
+        let addr = parse_grpc_bind_addr("::", 9070).expect("parse :: wildcard");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bracketed_ipv6_wildcard() {
+        let addr = parse_grpc_bind_addr("[::]", 9070).expect("parse [::] wildcard");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bracketed_ipv6_loopback() {
+        let addr = parse_grpc_bind_addr("[::1]", 9070).expect("parse [::1]");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_bare_ipv6_loopback() {
+        let addr = parse_grpc_bind_addr("::1", 9070).expect("parse ::1");
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_ipv4() {
+        let addr = parse_grpc_bind_addr("127.0.0.1", 9070).expect("parse 127.0.0.1");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    #[test]
+    fn parse_grpc_bind_addr_ipv4_wildcard() {
+        let addr = parse_grpc_bind_addr("0.0.0.0", 9070).expect("parse 0.0.0.0");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 9070);
+    }
+
+    // --- PR-4 regression: grpc_server_bind_addrs must use safe addr construction ---
+
+    #[test]
+    fn grpc_server_bind_addrs_bare_ipv6_wildcard_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("::", 8040, 9070).expect("bare :: two ports");
+        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(starlet.port(), 9070);
+    }
+
+    #[test]
+    fn grpc_server_bind_addrs_bare_ipv6_loopback_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("::1", 8040, 9070).expect("bare ::1 two ports");
+        assert_eq!(http.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(starlet.port(), 9070);
+    }
+
+    #[test]
+    fn grpc_server_bind_addrs_ipv4_two_ports() {
+        let (http, starlet) =
+            super::grpc_server_bind_addrs("127.0.0.1", 8040, 9070).expect("ipv4 two ports");
+        assert_eq!(http.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(http.port(), 8040);
+        assert_eq!(starlet.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(starlet.port(), 9070);
+    }
+}
+
+#[cfg(test)]
+mod pr3_tests {
+    use super::GrpcService;
+    use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
+    use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
+    use super::proto::novarocks::{
+        CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
+    };
+    use tonic::Request;
+
+    #[tokio::test]
+    async fn submit_fragment_thrift_decode_error_returns_business_error() {
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff], // illegal thrift
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(
+            body.status_code, 0,
+            "should return business error for bad thrift"
+        );
+        assert!(!body.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_fragment_is_idempotent() {
+        let svc = GrpcService::default();
+        let req = Request::new(CancelFragmentRequest {
+            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            reason: "test".to_string(),
+        });
+        let resp = svc.cancel_fragment(req).await.expect("RPC success");
+        assert_eq!(resp.into_inner().status_code, 0);
+
+        let req2 = Request::new(CancelFragmentRequest {
+            finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
+            reason: "test-2".to_string(),
+        });
+        let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
+        assert_eq!(resp2.into_inner().status_code, 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_result_missing_finst_id_returns_error_status() {
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: None,
+            max_wait_ms: 0,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::Error as i32,
+            "missing finst_id must return ERROR status"
+        );
+        assert!(!body.message.is_empty(), "error message must be non-empty");
+        assert!(
+            body.result_batch_thrift.is_empty(),
+            "payload must be empty on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_empty_open_buffer_returns_not_ready_without_wait() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::create_sender;
+
+        let finst_id = UniqueId { hi: 8801, lo: 8802 };
+        create_sender(finst_id);
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 0,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::NotReady as i32,
+            "empty open buffer with max_wait_ms=0 must return NOT_READY"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_waits_for_ready_result() {
+        use crate::common::types::{FetchResult, UniqueId};
+        use crate::runtime::result_buffer::{create_sender, insert};
+
+        let finst_id = UniqueId { hi: 8803, lo: 8804 };
+        create_sender(finst_id);
+
+        // Insert a result from a background thread after 20 ms.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            insert(
+                finst_id,
+                FetchResult {
+                    packet_seq: 0,
+                    eos: false,
+                    result_batch: crate::data::TResultBatch::new(
+                        vec![b"hello".to_vec()],
+                        false,
+                        0,
+                        None,
+                    ),
+                },
+            );
+        });
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 1000,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::Ready as i32,
+            "should return READY after delayed insert with max_wait_ms=1000"
+        );
+        assert!(
+            !body.result_batch_thrift.is_empty(),
+            "result_batch_thrift payload must be non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_buffer_error_returns_error_status() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{close_error, create_sender};
+
+        let finst_id = UniqueId { hi: 8807, lo: 8808 };
+        create_sender(finst_id);
+        close_error(finst_id, "boom".to_string());
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 0,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::Error as i32,
+            "close_error buffer must return ERROR status"
+        );
+        assert_eq!(body.message, "boom", "error message must match");
+        assert!(
+            body.result_batch_thrift.is_empty(),
+            "payload must be empty on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_closed_buffer_returns_eof() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{close_ok, create_sender};
+
+        let finst_id = UniqueId { hi: 8805, lo: 8806 };
+        create_sender(finst_id);
+        close_ok(finst_id);
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 0,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(
+            body.status,
+            FetchStatus::Eof as i32,
+            "closed buffer must return EOF"
+        );
     }
 }

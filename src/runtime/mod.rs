@@ -16,15 +16,18 @@
 // under the License.
 pub mod backend_id;
 pub(crate) mod coordinator;
+pub(crate) mod dispatcher;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;
+pub(crate) mod exec_params;
 pub mod global_async_runtime;
 pub mod io;
 pub mod load_tracking;
 pub mod lookup;
 pub mod mem_tracker;
 pub mod profile;
+pub(crate) mod query_cancel;
 pub mod query_context;
 pub mod query_result;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.

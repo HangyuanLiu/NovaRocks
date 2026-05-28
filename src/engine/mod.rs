@@ -295,7 +295,51 @@ impl StandaloneNovaRocks {
                 }
             }
         }
-        let exchange_port = ensure_standalone_exchange_server()?;
+        #[cfg(test)]
+        return Self::open_body(opts, _test_guard);
+        #[cfg(not(test))]
+        Self::open_body(opts)
+    }
+
+    /// Open the engine using an already-loaded, validated config.
+    ///
+    /// Installs `cfg` as the process-wide active config (replacing any prior
+    /// global config) and then proceeds with the normal engine-open body.
+    /// `opts.config_path` is preserved for resolving relative paths (e.g.
+    /// SQLite metadata DB paths) but is **not** re-read from disk.
+    pub fn open_with_config(
+        opts: StandaloneOptions,
+        cfg: novarocks_config::NovaRocksConfig,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        let _test_guard = Some(acquire_standalone_test_guard());
+        novarocks_config::install_preloaded_config(cfg);
+        #[cfg(test)]
+        return Self::open_body(opts, _test_guard);
+        #[cfg(not(test))]
+        Self::open_body(opts)
+    }
+
+    /// Common engine-open body.  Called after the process-wide config has
+    /// already been installed by the caller.
+    fn open_body(
+        opts: StandaloneOptions,
+        #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
+    ) -> Result<Self, String> {
+        // Spec (PR-4): role=fe dispatches all fragments to the remote BE via
+        // RemoteDispatcher and must NOT start a local gRPC/exchange server.
+        // exchange_port is only used by InProcessDispatcher (AllInOne); for Fe
+        // it is unused by dispatcher_for_role so a non-zero sentinel avoids
+        // the force_single_fragment=true short-circuit in execute_query_inner.
+        let role = crate::novarocks_config::config()
+            .map(|c| c.cluster.role)
+            .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
+        let exchange_port = if role == crate::common::app_config::ClusterRole::Fe {
+            // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
+            u16::MAX
+        } else {
+            ensure_standalone_exchange_server()?
+        };
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
@@ -2651,14 +2695,57 @@ pub(crate) fn execute_query_with_options(
                         .to_string(),
                 );
             }
+            let role = crate::novarocks_config::config()
+                .map(|c| c.cluster.role)
+                .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
+            let dispatcher = dispatcher_for_role(role, "127.0.0.1", exchange_port)?;
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
-                "127.0.0.1".to_string(),
-                exchange_port,
+                dispatcher,
                 query_opts,
             )
             .execute()
         }
+    }
+}
+
+/// Select a `FragmentDispatcher` implementation based on the effective cluster role.
+///
+/// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
+/// - `Fe`: uses `RemoteDispatcher` bound to the first configured backend.
+/// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
+pub(crate) fn dispatcher_for_role(
+    role: crate::common::app_config::ClusterRole,
+    exchange_host: &str,
+    exchange_port: u16,
+) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
+    use crate::common::app_config::ClusterRole;
+    match role {
+        ClusterRole::AllInOne => Ok(Arc::new(
+            crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
+        )),
+        ClusterRole::Fe => {
+            let cfg = crate::novarocks_config::config()
+                .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
+            let n = cfg.cluster.backends.len();
+            if n != 1 {
+                return Err(format!(
+                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
+                ));
+            }
+            let backend_str = cfg
+                .cluster
+                .backends
+                .first()
+                .expect("length already checked above");
+            let backend: std::net::SocketAddr = backend_str
+                .parse()
+                .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+            Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
+                backend,
+            )))
+        }
+        ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
 }
 
@@ -3689,6 +3776,51 @@ path = "meta/catalog.db"
                 .expect("metadata provider")
                 .provider_name(),
             "sqlite"
+        );
+    }
+
+    // I1: open_with_config must use the supplied NovaRocksConfig instead of
+    // re-reading from disk.  If the file is overwritten with invalid TOML after
+    // load but before open_with_config, the call must still succeed.
+    #[test]
+    fn open_with_config_does_not_reread_config_file() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+
+        // Write a valid config to disk.
+        std::fs::write(
+            &config_path,
+            r#"[standalone_server]
+mysql_port = 47892
+"#,
+        )
+        .expect("write sentinel config");
+
+        // Load the config before corrupting the file.
+        let cfg = crate::novarocks_config::NovaRocksConfig::load_from_file(&config_path)
+            .expect("load sentinel config");
+        assert_eq!(
+            cfg.standalone_server.as_ref().map(|s| s.mysql_port),
+            Some(47892),
+            "preloaded config must contain sentinel port"
+        );
+
+        // Overwrite the file with invalid TOML — a reload from disk would fail.
+        std::fs::write(&config_path, "NOT VALID TOML !!!").expect("corrupt config file");
+
+        // open_with_config must use the preloaded cfg, not re-read the corrupted file.
+        let result = StandaloneNovaRocks::open_with_config(
+            StandaloneOptions {
+                config_path: Some(config_path),
+            },
+            cfg,
+        );
+        assert!(
+            result.is_ok(),
+            "open_with_config must succeed with preloaded config even when the config file is \
+             invalid; got: {:?}",
+            result.err()
         );
     }
 
@@ -6735,5 +6867,100 @@ enable_path_style_access = true
             )
             .expect("in list query");
         assert_eq!(r.row_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // I1: dispatcher_for_role role-guard tests
+    // -----------------------------------------------------------------------
+
+    /// AllInOne role produces a dispatcher without error.
+    #[test]
+    fn dispatcher_for_role_all_in_one_ok() {
+        use crate::common::app_config::ClusterRole;
+        let result = super::dispatcher_for_role(ClusterRole::AllInOne, "127.0.0.1", 0);
+        assert!(result.is_ok(), "AllInOne should produce a dispatcher");
+    }
+
+    #[test]
+    fn dispatcher_for_role_fe_no_backend_configured_returns_error() {
+        let _guard = super::acquire_standalone_test_guard();
+        use crate::common::app_config::ClusterRole;
+        crate::common::app_config::install_default_for_test();
+        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        assert!(
+            result.is_err(),
+            "Fe role with no backends must return an error"
+        );
+        let msg = result.err().expect("expected error");
+        assert!(
+            msg.contains("role=fe"),
+            "error must mention role=fe, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_for_role_be_returns_error_instead_of_panicking() {
+        use crate::common::app_config::ClusterRole;
+        let result = super::dispatcher_for_role(ClusterRole::Be, "127.0.0.1", 0);
+        assert!(result.is_err(), "Be role must return a recoverable error");
+        let msg = result.err().expect("expected error");
+        assert!(
+            msg.contains("role=be") && msg.contains("coordinator"),
+            "error must mention role=be and coordinator, got: {msg}"
+        );
+    }
+
+    // --- PR-4 spec compliance tests ---
+
+    /// Issue 2: FE role with a valid backend address returns a dispatcher.
+    #[test]
+    fn dispatcher_for_role_fe_valid_backend_returns_dispatcher() {
+        let _guard = super::acquire_standalone_test_guard();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.backends = vec!["127.0.0.1:9070".to_string()];
+        crate::common::app_config::install_preloaded_config(cfg);
+        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        assert!(
+            result.is_ok(),
+            "Fe with valid backend must return a dispatcher, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Issue 2: FE role with a malformed backend address returns an error that
+    /// names both the role and the bad address value.
+    #[test]
+    fn dispatcher_for_role_fe_malformed_backend_returns_error_with_role_and_value() {
+        let _guard = super::acquire_standalone_test_guard();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.backends = vec!["not-an-addr".to_string()];
+        crate::common::app_config::install_preloaded_config(cfg);
+        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        assert!(result.is_err(), "malformed backend must return an error");
+        let msg = result.err().expect("error");
+        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
+        assert!(
+            msg.contains("not-an-addr"),
+            "must include the bad value: {msg}"
+        );
+    }
+
+    /// Issue 4: FE role with more than one backend returns an error that
+    /// includes the backend count.  Without the exactly-one guard the first
+    /// backend would be silently accepted.
+    #[test]
+    fn dispatcher_for_role_fe_multiple_backends_returns_error_with_count() {
+        let _guard = super::acquire_standalone_test_guard();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.backends = vec!["127.0.0.1:9070".to_string(), "127.0.0.1:9071".to_string()];
+        crate::common::app_config::install_preloaded_config(cfg);
+        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        assert!(result.is_err(), "Fe with multiple backends must error");
+        let msg = result.err().expect("expected error");
+        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
+        assert!(msg.contains('2'), "must include count: {msg}");
     }
 }
