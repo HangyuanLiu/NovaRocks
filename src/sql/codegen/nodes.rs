@@ -1342,6 +1342,7 @@ mod tests {
                 iceberg_table_info.current_snapshot_id,
                 iceberg_table_info.clone(),
                 iceberg_files.clone(),
+                vec![crate::exec::change_op::CHANGE_OP_COLUMN.to_string()],
             );
         let scan = planner
             .begin_scan(
@@ -1494,6 +1495,7 @@ mod tests {
                 iceberg_table_info.current_snapshot_id,
                 iceberg_table_info.clone(),
                 iceberg_files.clone(),
+                vec![crate::exec::change_op::CHANGE_OP_COLUMN.to_string()],
             );
         let scan = planner
             .begin_scan(

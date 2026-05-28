@@ -15,6 +15,7 @@ pub(crate) struct IcebergTableHandle {
     pub(crate) snapshot_id: Option<i64>,
     pub(crate) table_info: IcebergTableInfo,
     pub(crate) files: Vec<IcebergDataFileInfo>,
+    pub(crate) column_names: Vec<String>,
 }
 
 impl ConnectorTableHandle for IcebergTableHandle {
@@ -76,6 +77,7 @@ impl IcebergConnectorScanPlanner {
         snapshot_id: Option<i64>,
         table_info: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,
+        column_names: Vec<String>,
     ) -> TableHandle {
         TableHandle::new(
             CONNECTOR_ID,
@@ -86,6 +88,7 @@ impl IcebergConnectorScanPlanner {
                 snapshot_id,
                 table_info,
                 files,
+                column_names,
             },
         )
     }
@@ -189,6 +192,7 @@ mod tests {
             snapshot_id: Some(42),
             table_info: dummy_iceberg_table_info(),
             files: vec![dummy_iceberg_file()],
+            column_names: vec!["id".to_string()],
         };
         let scan = ScanHandle::new(
             CONNECTOR_ID,

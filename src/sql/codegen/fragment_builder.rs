@@ -511,6 +511,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 ..
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
+                let column_names = op
+                    .table
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>();
                 let table_handle =
                     crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
                         &iceberg_table.catalog,
@@ -519,6 +525,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         iceberg_table.current_snapshot_id,
                         iceberg_table.clone(),
                         files.clone(),
+                        column_names,
                     );
                 let scan = planner.begin_scan(
                     table_handle,
