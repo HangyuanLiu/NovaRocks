@@ -143,6 +143,10 @@ fn rewrite_node(
         // Decode is the rewrite's own output; do not recurse into it
         // again. The decoded output is all strings — no dict scope.
         LogicalPlan::Decode(_) => Ok((plan, DictScope::new())),
+
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 
@@ -1277,5 +1281,8 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             nullable: false,
         }],
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }

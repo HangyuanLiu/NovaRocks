@@ -53,6 +53,9 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
                 *ctx.consume_count.entry(node.cte_id).or_insert(0) += 1;
             }
             LogicalPlan::Decode(node) => visit(&node.input, ctx),
+            LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+                panic!("imv marker leaked into non-IMV plan");
+            }
         }
     }
 
@@ -175,6 +178,9 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             mappings: node.mappings,
             output_columns: node.output_columns,
         }),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 
@@ -281,6 +287,9 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             mappings: node.mappings,
             output_columns: node.output_columns,
         }),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 

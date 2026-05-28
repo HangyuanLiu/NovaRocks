@@ -253,6 +253,9 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             }
             cols
         }
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 
@@ -507,6 +510,9 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
             for mapping in &d.mappings {
                 out.insert((None, mapping.string_column.to_lowercase()));
             }
+        }
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
         }
     }
 }

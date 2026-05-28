@@ -7,4 +7,5 @@
 
 pub(crate) mod annotation;
 pub(crate) mod entrypoint;
+pub(crate) mod marker;
 pub(crate) mod pipeline;

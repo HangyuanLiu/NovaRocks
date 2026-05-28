@@ -49,6 +49,18 @@ pub(crate) enum LogicalPlan {
     /// today no optimizer pass produces this variant — Task 5 only adds the
     /// type-system plumbing.
     Decode(DecodeNode),
+    /// IMV marker: "compute the incremental of input". Emitted by the
+    /// `imv-delta-marker` stage; rejected by `imv-validation` if not
+    /// consumed. Must never reach physical lowering. See
+    /// `src/sql/optimizer/rewrite/imv/marker.rs`.
+    ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode),
+    /// IMV marker: "scan input over a snapshot window". Emitted by task 4
+    /// scan-binding rules; consumed before lowering. Same panic-on-leak
+    /// rule as `ImvDelta`.
+    // PR-β scaffolding: task 4 constructs ImvVersion during scan-binding;
+    // the variant exists here so the type is wired through the plan tree.
+    #[allow(dead_code)]
+    ImvVersion(crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode),
 }
 
 #[derive(Clone, Debug)]

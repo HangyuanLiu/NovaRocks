@@ -69,6 +69,9 @@ pub(crate) fn estimate_statistics(
             column_statistics: HashMap::new(),
         },
         LogicalPlan::Decode(d) => estimate_statistics(&d.input, table_stats),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker leaked into non-IMV plan");
+        }
     }
 }
 

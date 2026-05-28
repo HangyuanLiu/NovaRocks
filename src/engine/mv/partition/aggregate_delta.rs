@@ -711,6 +711,7 @@ mod tests {
                 state_role: AggregateStateRole::Single,
                 count_star: true,
             }],
+            aggregate_input_types: vec![None],
             group_key_source_indexes: vec![0],
             physical_columns: vec![row_id, group, counter, state],
         }

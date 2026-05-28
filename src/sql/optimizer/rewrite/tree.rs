@@ -236,6 +236,28 @@ fn rewrite_children(
                 changed,
             ))
         }
+        LogicalPlan::ImvDelta(node) => {
+            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
+            Ok((
+                LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                    input: Box::new(input),
+                    ..node
+                }),
+                changed,
+            ))
+        }
+        LogicalPlan::ImvVersion(node) => {
+            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
+            Ok((
+                LogicalPlan::ImvVersion(
+                    crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode {
+                        input: Box::new(input),
+                        ..node
+                    },
+                ),
+                changed,
+            ))
+        }
     }
 }
 
@@ -426,6 +448,40 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_traverses_into_imv_delta_child() {
+        use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
+        use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+
+        let inner = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: table_def("before"),
+            alias: None,
+            columns: vec![output_column("c1")],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        });
+
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(inner),
+            is_root: true,
+            action_column: None,
+        });
+
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
+
+        assert!(changed, "RenameScanRule should rewrite the wrapped Scan");
+        let LogicalPlan::ImvDelta(delta) = rewritten else {
+            panic!("expected ImvDelta to remain at root after child rewrite");
+        };
+        let LogicalPlan::Scan(scan) = *delta.input else {
+            panic!("expected Scan inside ImvDelta");
+        };
+        assert_eq!(scan.table.name, "after");
+    }
+
+    #[test]
     fn rewrite_visits_all_logical_plan_variants() {
         use crate::sql::optimizer::rewrite::context::RewriteContext;
         use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -490,7 +546,9 @@ mod tests {
                 | LogicalPlan::CTEAnchor(_)
                 | LogicalPlan::CTEProduce(_)
                 | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::Decode(_) => {}
+                | LogicalPlan::Decode(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => {}
             }
         }
         assert_variant_handled(&leaf);

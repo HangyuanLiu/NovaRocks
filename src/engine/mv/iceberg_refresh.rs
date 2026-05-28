@@ -23,8 +23,8 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::table::model::{IcebergTableRef, StarRocksMvStorageEngine};
 use crate::connector::starrocks::table::mv_ddl::{
-    analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms, output_column_to_table_column,
-    resolve_mv_name, validate_mv_partition_columns,
+    MvAnalysis, analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms,
+    output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
@@ -246,7 +246,7 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
     let mut columns = if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        iceberg_aggregate_target_columns(aggregate_shape, &analysis.output_columns)?
+        iceberg_aggregate_target_columns(aggregate_shape, &analysis)?
     } else {
         analysis
             .output_columns
@@ -274,10 +274,7 @@ pub(crate) fn create_iceberg_mv(
         })?;
     let partition_fields = stmt.partition_by.as_deref().unwrap_or(&[]);
     let aggregate_state_hidden_columns = if let Some(aggregate_shape) = aggregate_shape.as_ref() {
-        let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
-            aggregate_shape,
-            &analysis.output_columns,
-        )?;
+        let layout = build_aggregate_layout_from_analysis(aggregate_shape, &analysis)?;
         layout
             .state_columns
             .iter()
@@ -496,12 +493,9 @@ fn aggregate_shape_for_layout(shape: &IncrementalMvShape) -> Option<AggregateMvS
 
 fn iceberg_aggregate_target_columns(
     shape: &AggregateMvShape,
-    output_columns: &[crate::sql::analysis::OutputColumn],
+    analysis: &MvAnalysis,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
-        shape,
-        output_columns,
-    )?;
+    let layout = build_aggregate_layout_from_analysis(shape, analysis)?;
     crate::connector::starrocks::table::mv_ddl::validate_unique_aggregate_physical_column_names(
         &layout.physical_columns,
     )?;
@@ -509,6 +503,22 @@ fn iceberg_aggregate_target_columns(
         crate::connector::starrocks::table::ddl::table_columns_from_physical_columns(
             &layout.physical_columns,
         ),
+    )
+}
+
+fn build_aggregate_layout_from_analysis(
+    shape: &AggregateMvShape,
+    analysis: &MvAnalysis,
+) -> Result<crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout, String> {
+    let aggregate_input_types =
+        crate::connector::starrocks::table::mv_agg_state::aggregate_input_types_from_resolved_query(
+            shape,
+            &analysis.resolved_query,
+        )?;
+    crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+        shape,
+        &analysis.output_columns,
+        &aggregate_input_types,
     )
 }
 
@@ -624,11 +634,7 @@ fn build_iceberg_mv_schema_contract(
                 &analysis.resolved_query,
                 loaded_base.table.metadata().current_schema(),
             )?;
-            let layout =
-                crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
-                    aggregate_shape,
-                    &analysis.output_columns,
-                )?;
+            let layout = build_aggregate_layout_from_analysis(aggregate_shape, analysis)?;
             crate::meta::repository::mv_contract::MvSchemaContract {
                 contract_version: 3,
                 base: base_contract(base_ref, loaded_base, None, lineage.base_fields.clone()),
@@ -690,11 +696,7 @@ fn build_iceberg_mv_schema_contract(
                 right_fields,
             );
             let aggregate_shape = join_aggregate_shape.as_aggregate_shape_for_layout();
-            let layout =
-                crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
-                    &aggregate_shape,
-                    &analysis.output_columns,
-                )?;
+            let layout = build_aggregate_layout_from_analysis(&aggregate_shape, analysis)?;
             crate::meta::repository::mv_contract::MvSchemaContract {
                 contract_version: 3,
                 base: left_contract.clone(),
@@ -1409,7 +1411,7 @@ pub(crate) fn refresh_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (previous_snapshot_id, current_snapshot_id) {
@@ -1697,7 +1699,7 @@ fn refresh_single_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match previous {
@@ -2447,7 +2449,7 @@ fn refresh_join_aggregate_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     let left_current = pin
@@ -4427,10 +4429,7 @@ fn build_aggregate_layout_for_refresh(
     let visible_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let visible_analysis =
         analyze_mv_select(state, current_catalog, current_database, &visible_query)?;
-    crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
-        aggregate_shape,
-        &visible_analysis.output_columns,
-    )
+    build_aggregate_layout_from_analysis(aggregate_shape, &visible_analysis)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5475,7 +5474,7 @@ fn refresh_iceberg_join_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-α: exercise the (no-op) IMV optimizer pipeline; outcome discarded.
+    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
     try_run_imv_rewrite_pipeline(state, &ctx);
 
     match (left_previous, right_previous) {
@@ -6274,18 +6273,24 @@ fn plan_canonical_select_for_imv(
     })
 }
 
-/// Run the (PR-α no-op) IMV optimizer pipeline against `ctx`, discarding the
-/// outcome. Logs a structured summary on success and a warning on failure.
+/// Run the IMV optimizer pipeline against `ctx`, discarding the outcome.
+/// Logs a structured summary on success and a warning on failure.
 ///
-/// Failures are non-fatal in PR-α: the rewrite outcome is discarded anyway,
-/// so an IMV-pipeline error must not break a base-table refresh. The plan's
-/// original `?`-fail-fast wiring (PR-α tasks 10-12) was tightened to
-/// log-and-continue after the iceberg-ivm suite exposed an A11
-/// schema-evolution case (renamed referenced column) where re-planning the
-/// canonical select against the latest base schema fails by design even
-/// though the hand-built refresh path handles the rename correctly.
-/// Surface the gap as a warn-level log so PR-β consumers can audit it,
-/// without breaking refresh behavior in PR-α.
+/// PR-β state: the pipeline now actively wraps the root in `ImvDelta`
+/// (imv-delta-marker stage) and rejects unresolved markers in
+/// imv-validation. Until task 4+ adds rules that consume the marker,
+/// every refresh attempt produces a `Validation` Reject — that is
+/// expected and non-fatal here. Refresh continues with the hand-built
+/// path; this function only logs the failure as a warning so a future
+/// task can audit IMV-pipeline progress without breaking refresh
+/// behavior.
+///
+/// The original `?`-fail-fast wiring was tightened to log-and-continue
+/// in PR-α after the iceberg-ivm suite exposed an A11 schema-evolution
+/// case (renamed referenced column) where re-planning the canonical
+/// select against the latest base schema fails by design even though
+/// the hand-built refresh path handles the rename correctly. PR-β
+/// inherits that swallow.
 fn try_run_imv_rewrite_pipeline(state: &Arc<StandaloneState>, ctx: &IcebergMvRefreshContext) {
     let result = (|| -> Result<
         crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome,
@@ -11491,6 +11496,7 @@ mod tests {
                     state_role: AggregateStateRole::Single,
                     count_star: true,
                 }],
+                aggregate_input_types: vec![None],
                 group_key_source_indexes: vec![0],
                 physical_columns: vec![row_id, group, counter, state],
             }

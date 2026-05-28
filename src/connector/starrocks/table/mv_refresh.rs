@@ -18,7 +18,9 @@ use crate::connector::starrocks::table::mv_apply_policy::{MvApplyPolicy, apply_p
 use crate::connector::starrocks::table::mv_refresh_strategy::{
     FullRefreshReason, MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
 };
-use crate::engine::mv_flow::{analyze_visible_output_types, execute_query_for_mv_refresh};
+#[cfg(test)]
+use crate::engine::mv_flow::analyze_visible_output_types;
+use crate::engine::mv_flow::{analyze_visible_query, execute_query_for_mv_refresh};
 use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
@@ -547,11 +549,17 @@ fn execute_aggregate_mv_full_refresh(
     // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
     // (one column per visible_output), not state-shaped types (which expand AVG into
     // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
-    let visible_output_columns =
-        analyze_visible_output_types(&ctx.state, &ctx.database, &ctx.select_sql)?;
+    let visible_analysis = analyze_visible_query(&ctx.state, &ctx.database, &ctx.select_sql)?;
+    let aggregate_input_types =
+        super::mv_agg_state::aggregate_input_types_from_resolved_query(shape, &visible_analysis)?;
+    let visible_output_columns = visible_analysis.output_columns;
 
     // Step 2: build the layout from visible types.
-    let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &visible_output_columns)?;
+    let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+        shape,
+        &visible_output_columns,
+        &aggregate_input_types,
+    )?;
 
     // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
     // it to obtain the actual state-shaped data.
@@ -698,10 +706,16 @@ fn refresh_aggregate_mv_incremental(
     // The rewritten state SQL (AVG -> SUM + COUNT) produces state-shaped columns whose
     // count does not match shape.visible_outputs. Sourcing types from the analyzer
     // avoids this mismatch before materializing state chunks.
-    let visible_output_columns =
-        analyze_visible_output_types(ctx.state, ctx.database, ctx.select_sql)?;
-    let layout =
-        super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
+    let visible_analysis = analyze_visible_query(ctx.state, ctx.database, ctx.select_sql)?;
+    let aggregate_input_types = super::mv_agg_state::aggregate_input_types_from_resolved_query(
+        ctx.shape,
+        &visible_analysis,
+    )?;
+    let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+        ctx.shape,
+        &visible_analysis.output_columns,
+        &aggregate_input_types,
+    )?;
 
     // The signed-delta rewriter emits VARBINARY state combinators for every
     // aggregate, so any error from the rewriter is now a real error.

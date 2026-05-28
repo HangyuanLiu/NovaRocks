@@ -270,15 +270,7 @@ fn parse_refresh_async_tail(
         // sqlparser can absorb compound expressions (`idx * 37`) without
         // tripping over `<UNIT>`. We have to peel that wrapper back off
         // before we can read the literal int.
-        let saw_lparen = parser.consume_token(&Token::LParen);
-        let value = parser
-            .parse_literal_uint()
-            .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
-        if saw_lparen {
-            parser
-                .expect_token(&Token::RParen)
-                .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
-        }
+        let value = parse_refresh_interval_value(parser)?;
         let unit = parser.next_token();
         let unit = match &unit.token {
             Token::Word(word) => word.value.as_str(),
@@ -292,6 +284,21 @@ fn parse_refresh_async_tail(
         return Ok(MaterializedViewRefreshPolicy::AsyncInterval { interval_ms });
     }
     Err("REFRESH ASYNC requires ON CHANGE or EVERY INTERVAL <n> <unit>".to_string())
+}
+
+fn parse_refresh_interval_value(parser: &mut Parser<'_>) -> Result<u64, String> {
+    if parser.consume_token(&Token::LParen) {
+        let value = parser
+            .parse_literal_uint()
+            .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
+        parser
+            .expect_token(&Token::RParen)
+            .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))?;
+        return Ok(value);
+    }
+    parser
+        .parse_literal_uint()
+        .map_err(|e| format!("parse REFRESH ASYNC interval failed: {e}"))
 }
 
 fn refresh_interval_ms(value: u64, unit: &str) -> Result<i64, String> {
