@@ -113,10 +113,7 @@ impl Split {
     }
 }
 
-pub(crate) fn validate_split_connectors(
-    scan: &ScanHandle,
-    splits: &[Split],
-) -> Result<(), String> {
+pub(crate) fn validate_split_connectors(scan: &ScanHandle, splits: &[Split]) -> Result<(), String> {
     for split in splits {
         if split.connector_id() != scan.connector_id() {
             return Err(format!(
@@ -150,11 +147,7 @@ pub(crate) struct ThriftScanPlan {
 pub(crate) trait ConnectorScanPlanner: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn begin_scan(
-        &self,
-        table: TableHandle,
-        ctx: BeginScanContext,
-    ) -> Result<ScanHandle, String>;
+    fn begin_scan(&self, table: TableHandle, ctx: BeginScanContext) -> Result<ScanHandle, String>;
 
     fn plan_splits(
         &self,

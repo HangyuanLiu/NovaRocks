@@ -1056,15 +1056,12 @@ fn build_internal_scan_range_params(
 pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
     resolved: &ResolvedTable,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
-    let planned = resolved
-        .planned_scan
-        .as_ref()
-        .ok_or_else(|| {
-            format!(
-                "StarRocks table {}.{} reached scan-range builder without planned connector scan",
-                resolved.database, resolved.table.name
-            )
-        })?;
+    let planned = resolved.planned_scan.as_ref().ok_or_else(|| {
+        format!(
+            "StarRocks table {}.{} reached scan-range builder without planned connector scan",
+            resolved.database, resolved.table.name
+        )
+    })?;
     let planner = StarRocksTableScanPlanner::stateless_for_codegen();
     let thrift = planner.to_thrift_scan(
         &planned.scan,

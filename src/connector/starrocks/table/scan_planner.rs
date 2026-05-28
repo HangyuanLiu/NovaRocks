@@ -57,8 +57,8 @@ pub(crate) fn starrocks_split(split: &Split) -> Result<&StarRocksSplit, String> 
 use std::sync::{Arc, Weak};
 
 use crate::connector::scan_planning::{
-    validate_split_connectors, BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
-    TableHandle, ThriftScanContext, ThriftScanPlan,
+    BeginScanContext, ConnectorScanPlanner, SplitPlanningContext, TableHandle, ThriftScanContext,
+    ThriftScanPlan, validate_split_connectors,
 };
 use crate::engine::StandaloneState;
 use crate::{internal_service, plan_nodes};
@@ -149,11 +149,7 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
         CONNECTOR_ID
     }
 
-    fn begin_scan(
-        &self,
-        table: TableHandle,
-        _ctx: BeginScanContext,
-    ) -> Result<ScanHandle, String> {
+    fn begin_scan(&self, table: TableHandle, _ctx: BeginScanContext) -> Result<ScanHandle, String> {
         let table = table
             .downcast_ref::<StarRocksTableHandle>()
             .ok_or_else(|| "expected StarRocksTableHandle for starrocks scan".to_string())?
@@ -232,7 +228,7 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::scan_planning::{validate_split_connectors, ScanHandle, Split};
+    use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 
     #[test]
     fn downcasts_starrocks_scan_and_split() {

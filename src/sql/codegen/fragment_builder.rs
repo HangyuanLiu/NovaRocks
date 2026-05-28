@@ -20,9 +20,7 @@ use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
 
-use crate::connector::scan_planning::{
-    BeginScanContext, SplitPlanningContext, TableHandle,
-};
+use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
 use crate::connector::starrocks::table::StarRocksTableScanPlanner;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
@@ -114,12 +112,7 @@ fn plan_starrocks_connector_scan(
     if *db_id != physical_layout.db_id || *table_id != physical_layout.table_id {
         return Err(format!(
             "StarRocks scan identity mismatch for {}.{}: source=(db_id={}, table_id={}) layout=(db_id={}, table_id={})",
-            database,
-            table.name,
-            db_id,
-            table_id,
-            physical_layout.db_id,
-            physical_layout.table_id
+            database, table.name, db_id, table_id, physical_layout.db_id, physical_layout.table_id
         ));
     }
 
@@ -784,9 +777,9 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
 
         let planned_scan = match (&op.table.source, physical_layout.as_ref()) {
-            (crate::sql::catalog::ScanSource::StarRocks { .. }, Some(layout)) => {
-                Some(plan_starrocks_connector_scan(&op.database, &op.table, layout)?)
-            }
+            (crate::sql::catalog::ScanSource::StarRocks { .. }, Some(layout)) => Some(
+                plan_starrocks_connector_scan(&op.database, &op.table, layout)?,
+            ),
             _ => None,
         };
         let resolved = ResolvedTable {

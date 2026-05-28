@@ -67,11 +67,11 @@ mod backend_test;
 mod scan_planning_registry_tests {
     use std::sync::Arc;
 
+    use super::ConnectorRegistry;
     use super::scan_planning::{
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
         TableHandle, ThriftScanContext, ThriftScanPlan,
     };
-    use super::ConnectorRegistry;
 
     #[derive(Debug)]
     struct NoopPlanner;
@@ -236,10 +236,7 @@ impl ConnectorRegistry {
         self.scan_planners.insert(planner.name(), planner);
     }
 
-    pub(crate) fn scan_planner(
-        &self,
-        name: &str,
-    ) -> Result<Arc<dyn ConnectorScanPlanner>, String> {
+    pub(crate) fn scan_planner(&self, name: &str) -> Result<Arc<dyn ConnectorScanPlanner>, String> {
         self.scan_planners
             .get(name)
             .cloned()
@@ -279,9 +276,9 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     )));
     connectors.register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
     connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
-    connectors.register_scan_planner(Arc::new(
-        starrocks::table::StarRocksTableScanPlanner::new(state),
-    ));
+    connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
+        state,
+    )));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));
