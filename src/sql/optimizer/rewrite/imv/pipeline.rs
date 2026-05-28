@@ -1,9 +1,13 @@
-//! IMV rewrite pipeline construction. PR-α: four named no-op stages.
-//! PR-β: register marker rules in `imv-delta-marker` and `imv-validation`.
+//! IMV rewrite pipeline construction.
+//!
+//! Stages run in order: logical normalize, delta marker, scan binding, marker
+//! cleanup, validation. Each stage's name is part of the trace contract and is
+//! asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
+use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
@@ -19,6 +23,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-delta-marker",
             RewritePhase::StructuralRewrite,
             vec![Box::new(WrapRootInImvDeltaRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-scan-binding",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(BindIcebergScanRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-marker-cleanup",
