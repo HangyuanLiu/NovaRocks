@@ -4058,6 +4058,55 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct ScanPlannerCallCounts {
+        begin_scan: std::sync::atomic::AtomicUsize,
+        plan_splits: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct CountingScanPlanner {
+        inner: MockScanPlanner,
+        counts: std::sync::Arc<ScanPlannerCallCounts>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingScanPlanner {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            self.counts
+                .begin_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.begin_scan(table, ctx)
+        }
+
+        fn plan_splits(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            self.counts
+                .plan_splits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.plan_splits(scan, ctx)
+        }
+
+        fn to_thrift_scan(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.inner.to_thrift_scan(scan, splits, ctx)
+        }
+    }
+
     fn mock_starrocks_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
@@ -5893,5 +5942,53 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tablet_ids, vec![101]);
+    }
+
+    #[test]
+    fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
+        use crate::connector::starrocks::table::StarRocksSplit;
+        let layout = starrocks_layout();
+        let plan = starrocks_scan_plan();
+        let catalog = StarRocksCatalog {
+            layout: layout.clone(),
+        };
+
+        let splits: Vec<StarRocksSplit> = layout
+            .tablets
+            .iter()
+            .map(|tablet| StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            })
+            .collect();
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CountingScanPlanner {
+            inner: MockScanPlanner {
+                schema_id: layout.schema_id,
+                splits,
+            },
+            counts: counts.clone(),
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build StarRocks fragment");
+
+        assert_eq!(
+            counts
+                .begin_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "begin_scan must be invoked exactly once for the StarRocks scan"
+        );
+        assert_eq!(
+            counts
+                .plan_splits
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "plan_splits must be invoked exactly once for the StarRocks scan"
+        );
     }
 }
