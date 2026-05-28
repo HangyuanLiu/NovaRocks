@@ -248,7 +248,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let desc_tbl =
             std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new()).build();
 
-        let exec_params = nodes::build_exec_params_multi(&builder.scan_tables)?;
+        let exec_params = nodes::build_exec_params_multi(builder.connectors, &builder.scan_tables)?;
 
         let output_columns = plan
             .output_columns
@@ -783,12 +783,20 @@ impl<'a> PlanFragmentBuilder<'a> {
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 
+        let min_max_predicates =
+            nodes::scan_file_min_max_predicates_from_state(&pushed_conjuncts, &slot_to_column);
+        let change_op_slot = nodes::planned_change_op_slot_from_state(
+            &iceberg_metadata_pseudo_column_slots,
+            &slot_to_column,
+        );
         let mut scan_plan_node = nodes::build_scan_node(
             self.connectors,
             scan_node_id,
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
+            min_max_predicates,
+            change_op_slot,
         )?;
 
         // Patch the StarRocks lake-scan payload with the dict slot mapping so
@@ -854,6 +862,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         self.scan_tables.push(nodes::PlannedScanTable {
             scan_node_id,
+            scan_tuple_id,
             resolved,
             min_max_conjuncts: pushed_conjuncts,
             slot_to_column,
@@ -1959,7 +1968,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -2079,7 +2088,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(child_plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -3405,7 +3414,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: child_fragment_id,
             plan: plan_nodes::TPlan::new(plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: node.children[0]
                 .output_columns
@@ -3760,7 +3769,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
             desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
             output_columns: op
                 .output_columns
@@ -4113,6 +4122,8 @@ mod tests {
     struct ScanPlannerCallCounts {
         begin_scan: std::sync::atomic::AtomicUsize,
         plan_splits: std::sync::atomic::AtomicUsize,
+        to_thrift_scan: std::sync::atomic::AtomicUsize,
+        thrift_contexts: std::sync::Mutex<Vec<crate::connector::scan_planning::ThriftScanContext>>,
     }
 
     #[derive(Debug)]
@@ -4154,6 +4165,14 @@ mod tests {
             splits: &[crate::connector::scan_planning::Split],
             ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.counts
+                .to_thrift_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts
+                .thrift_contexts
+                .lock()
+                .expect("thrift contexts")
+                .push(ctx.clone());
             self.inner.to_thrift_scan(scan, splits, ctx)
         }
     }
@@ -4197,6 +4216,14 @@ mod tests {
             splits: &[crate::connector::scan_planning::Split],
             ctx: crate::connector::scan_planning::ThriftScanContext,
         ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.counts
+                .to_thrift_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts
+                .thrift_contexts
+                .lock()
+                .expect("thrift contexts")
+                .push(ctx.clone());
             self.inner.to_thrift_scan(scan, splits, ctx)
         }
     }
@@ -6127,7 +6154,7 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+        let built = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
             .expect("build StarRocks fragment");
 
         assert_eq!(
@@ -6139,6 +6166,33 @@ mod tests {
             counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "plan_splits must be invoked exactly once for the StarRocks scan"
+        );
+        assert_eq!(
+            counts
+                .to_thrift_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "to_thrift_scan must be invoked for both scan node and scan ranges"
+        );
+        let root = built
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == built.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
+                .collect::<Vec<_>>(),
+            vec![(scan.node_id, scan.row_tuples[0]); 2],
+            "both to_thrift_scan calls must carry the real scan node and tuple ids"
         );
     }
 
@@ -6155,7 +6209,7 @@ mod tests {
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
 
-        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+        let built = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
             .expect("build Iceberg fragment");
 
         assert_eq!(
@@ -6167,6 +6221,33 @@ mod tests {
             counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "plan_splits must be invoked exactly once for the Iceberg scan"
+        );
+        assert_eq!(
+            counts
+                .to_thrift_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "to_thrift_scan must be invoked for both scan node and scan ranges"
+        );
+        let root = built
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == built.root_fragment_id)
+            .expect("root fragment");
+        let scan = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("hdfs scan node");
+        let contexts = counts.thrift_contexts.lock().expect("thrift contexts");
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|ctx| (ctx.node_id, ctx.scan_tuple_id))
+                .collect::<Vec<_>>(),
+            vec![(scan.node_id, scan.row_tuples[0]); 2],
+            "both to_thrift_scan calls must carry the real scan node and tuple ids"
         );
     }
 }
