@@ -4135,6 +4135,49 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountingIcebergScanPlanner {
+        inner: crate::connector::iceberg::IcebergConnectorScanPlanner,
+        counts: std::sync::Arc<ScanPlannerCallCounts>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingIcebergScanPlanner {
+        fn name(&self) -> &'static str {
+            crate::connector::scan_planning::ConnectorScanPlanner::name(&self.inner)
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            self.counts
+                .begin_scan
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.begin_scan(table, ctx)
+        }
+
+        fn plan_splits(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            self.counts
+                .plan_splits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.plan_splits(scan, ctx)
+        }
+
+        fn to_thrift_scan(
+            &self,
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+            ctx: crate::connector::scan_planning::ThriftScanContext,
+        ) -> Result<crate::connector::scan_planning::ThriftScanPlan, String> {
+            self.inner.to_thrift_scan(scan, splits, ctx)
+        }
+    }
+
     fn mock_starrocks_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
@@ -6105,6 +6148,38 @@ mod tests {
             counts.plan_splits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "plan_splits must be invoked exactly once for the StarRocks scan"
+        );
+    }
+
+    #[test]
+    fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_iceberg() {
+        let plan = iceberg_scan_plan();
+        let catalog = DummyCatalog;
+
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CountingIcebergScanPlanner {
+            inner: crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+            counts: counts.clone(),
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        let _ = PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build Iceberg fragment");
+
+        assert_eq!(
+            counts
+                .begin_scan
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "begin_scan must be invoked exactly once for the Iceberg scan"
+        );
+        assert_eq!(
+            counts
+                .plan_splits
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "plan_splits must be invoked exactly once for the Iceberg scan"
         );
     }
 }
