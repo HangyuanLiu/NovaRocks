@@ -4305,6 +4305,14 @@ mod tests {
         }
     }
 
+    fn with_id_predicate(mut plan: PhysicalPlanNode, value: i64) -> PhysicalPlanNode {
+        let Operator::PhysicalScan(scan) = &mut plan.op else {
+            panic!("expected scan plan");
+        };
+        scan.predicates = vec![id_eq_literal(value)];
+        plan
+    }
+
     fn iceberg_i32_file(path: &str, min: i32, max: i32) -> IcebergDataFileInfo {
         IcebergDataFileInfo {
             path: path.to_string(),
@@ -6129,7 +6137,7 @@ mod tests {
     fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
         use crate::connector::starrocks::table::StarRocksSplit;
         let layout = starrocks_layout();
-        let plan = starrocks_scan_plan();
+        let plan = with_id_predicate(starrocks_scan_plan(), 7);
         let catalog = StarRocksCatalog {
             layout: layout.clone(),
         };
@@ -6194,11 +6202,19 @@ mod tests {
             vec![(scan.node_id, scan.row_tuples[0]); 2],
             "both to_thrift_scan calls must carry the real scan node and tuple ids"
         );
+        let contexts_with_conjuncts = contexts
+            .iter()
+            .filter(|ctx| !ctx.conjuncts.is_empty())
+            .count();
+        assert_eq!(
+            contexts_with_conjuncts, 1,
+            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+        );
     }
 
     #[test]
     fn visit_scan_calls_connector_begin_scan_and_plan_splits_for_iceberg() {
-        let plan = iceberg_scan_plan();
+        let plan = with_id_predicate(iceberg_scan_plan(), 7);
         let catalog = DummyCatalog;
 
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
@@ -6248,6 +6264,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(scan.node_id, scan.row_tuples[0]); 2],
             "both to_thrift_scan calls must carry the real scan node and tuple ids"
+        );
+        let contexts_with_conjuncts = contexts
+            .iter()
+            .filter(|ctx| !ctx.conjuncts.is_empty())
+            .count();
+        assert_eq!(
+            contexts_with_conjuncts, 1,
+            "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
         );
     }
 }
