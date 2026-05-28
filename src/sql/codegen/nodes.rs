@@ -600,14 +600,23 @@ pub(crate) fn build_exec_params_multi(
             ranges
         } else {
             match &resolved.table.source {
-                ScanSource::IcebergDataFiles { files, .. } => {
+                ScanSource::IcebergDataFiles { .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
                     let change_op_slot = planned_change_op_slot(planned);
+                    let planned_scan = resolved.planned_scan.as_ref().ok_or_else(|| {
+                        format!(
+                            "Iceberg scan {}.{} reached scan-range builder without planned connector scan",
+                            resolved.database, resolved.table.name
+                        )
+                    })?;
                     let mut ranges = Vec::new();
-                    for file in files
-                        .iter()
-                        .filter(|f| file_may_satisfy_min_max(f, &file_predicates))
-                    {
+                    for split in &planned_scan.splits {
+                        let iceberg_split =
+                            crate::connector::iceberg::scan_planner::iceberg_split(split)?;
+                        let file = &iceberg_split.data_file;
+                        if !file_may_satisfy_min_max(file, &file_predicates) {
+                            continue;
+                        }
                         ranges.extend(build_hdfs_scan_range_params_for_file(file, change_op_slot)?);
                     }
                     ranges
@@ -1235,6 +1244,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
+    use crate::connector::scan_planning::ConnectorScanPlanner;
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -1307,6 +1317,43 @@ mod tests {
 
     #[test]
     fn physical_change_op_column_does_not_emit_extended_columns() {
+        let iceberg_files = vec![IcebergDataFileInfo {
+            path: "s3://bucket/path/file.parquet".to_string(),
+            size: 1024,
+            row_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        }];
+        let iceberg_table_info = test_iceberg_table_info();
+        let planner = crate::connector::iceberg::IcebergConnectorScanPlanner::new();
+        let table_handle =
+            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                &iceberg_table_info.catalog,
+                &iceberg_table_info.namespace,
+                &iceberg_table_info.table,
+                iceberg_table_info.current_snapshot_id,
+                iceberg_table_info.clone(),
+                iceberg_files.clone(),
+            );
+        let scan = planner
+            .begin_scan(
+                table_handle,
+                crate::connector::scan_planning::BeginScanContext::default(),
+            )
+            .expect("begin_scan");
+        let splits = planner
+            .plan_splits(
+                &scan,
+                crate::connector::scan_planning::SplitPlanningContext::default(),
+            )
+            .expect("plan_splits");
         let planned = PlannedScanTable {
             scan_node_id: 3,
             resolved: ResolvedTable {
@@ -1322,26 +1369,16 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::IcebergDataFiles {
-                        table: test_iceberg_table_info(),
-                        files: vec![IcebergDataFileInfo {
-                            path: "s3://bucket/path/file.parquet".to_string(),
-                            size: 1024,
-                            row_count: Some(1),
-                            column_stats: None,
-                            partition_spec_id: None,
-                            partition_key: None,
-                            first_row_id: None,
-                            data_sequence_number: None,
-                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
-                            delete_files: vec![],
-                            manifest_path: None,
-                            partition_values: vec![],
-                        }],
+                        table: iceberg_table_info,
+                        files: iceberg_files,
                         cloud_properties: BTreeMap::new(),
                     },
                 },
                 alias: None,
-                planned_scan: None,
+                planned_scan: Some(crate::sql::codegen::resolve::PlannedConnectorScan {
+                    scan,
+                    splits,
+                }),
             },
             min_max_conjuncts: vec![],
             slot_to_column: HashMap::from([(
@@ -1432,6 +1469,43 @@ mod tests {
 
     #[test]
     fn metadata_change_op_column_emits_extended_columns() {
+        let iceberg_files = vec![IcebergDataFileInfo {
+            path: "s3://bucket/path/file.parquet".to_string(),
+            size: 1024,
+            row_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        }];
+        let iceberg_table_info = test_iceberg_table_info();
+        let planner = crate::connector::iceberg::IcebergConnectorScanPlanner::new();
+        let table_handle =
+            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                &iceberg_table_info.catalog,
+                &iceberg_table_info.namespace,
+                &iceberg_table_info.table,
+                iceberg_table_info.current_snapshot_id,
+                iceberg_table_info.clone(),
+                iceberg_files.clone(),
+            );
+        let scan = planner
+            .begin_scan(
+                table_handle,
+                crate::connector::scan_planning::BeginScanContext::default(),
+            )
+            .expect("begin_scan");
+        let splits = planner
+            .plan_splits(
+                &scan,
+                crate::connector::scan_planning::SplitPlanningContext::default(),
+            )
+            .expect("plan_splits");
         let planned = PlannedScanTable {
             scan_node_id: 3,
             resolved: ResolvedTable {
@@ -1447,26 +1521,16 @@ mod tests {
                         logical_type: None,
                     }],
                     source: ScanSource::IcebergDataFiles {
-                        table: test_iceberg_table_info(),
-                        files: vec![IcebergDataFileInfo {
-                            path: "s3://bucket/path/file.parquet".to_string(),
-                            size: 1024,
-                            row_count: Some(1),
-                            column_stats: None,
-                            partition_spec_id: None,
-                            partition_key: None,
-                            first_row_id: None,
-                            data_sequence_number: None,
-                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
-                            delete_files: vec![],
-                            manifest_path: None,
-                            partition_values: vec![],
-                        }],
+                        table: iceberg_table_info,
+                        files: iceberg_files,
                         cloud_properties: BTreeMap::new(),
                     },
                 },
                 alias: None,
-                planned_scan: None,
+                planned_scan: Some(crate::sql::codegen::resolve::PlannedConnectorScan {
+                    scan,
+                    splits,
+                }),
             },
             min_max_conjuncts: vec![],
             slot_to_column: HashMap::from([(

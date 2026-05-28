@@ -505,6 +505,31 @@ impl<'a> PlanFragmentBuilder<'a> {
                 )?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
             }
+            crate::sql::catalog::ScanSource::IcebergDataFiles {
+                table: iceberg_table,
+                files,
+                ..
+            } => {
+                let planner = self.connectors.scan_planner("iceberg")?;
+                let table_handle =
+                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                        &iceberg_table.catalog,
+                        &iceberg_table.namespace,
+                        &iceberg_table.table,
+                        iceberg_table.current_snapshot_id,
+                        iceberg_table.clone(),
+                        files.clone(),
+                    );
+                let scan = planner.begin_scan(
+                    table_handle,
+                    crate::connector::scan_planning::BeginScanContext::default(),
+                )?;
+                let splits = planner.plan_splits(
+                    &scan,
+                    crate::connector::scan_planning::SplitPlanningContext::default(),
+                )?;
+                Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
+            }
             _ => None,
         };
         let scan_table_id = match &op.table.source {
@@ -4652,7 +4677,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4701,7 +4726,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4742,7 +4767,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4783,7 +4808,7 @@ mod tests {
         let err = match PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         ) {
             Ok(_) => panic!("delete-heavy scan should fail fast"),
@@ -4857,7 +4882,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4918,7 +4943,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4962,7 +4987,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -4995,7 +5020,7 @@ mod tests {
         let result = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         );
         let err = result.err().expect("distribution any must fail");
@@ -5017,7 +5042,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -5183,7 +5208,7 @@ mod tests {
         let build = PlanFragmentBuilder::build(
             &iceberg_scan_plan(),
             &DummyCatalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         )
         .expect("build");
@@ -5990,7 +6015,7 @@ mod tests {
         let err = match PlanFragmentBuilder::build(
             &plan,
             &catalog,
-            &crate::connector::ConnectorRegistry::new(),
+            &mock_iceberg_registry(),
             "default",
         ) {
             Ok(_) => panic!("non-StarRocks scan with dict_columns must error"),
