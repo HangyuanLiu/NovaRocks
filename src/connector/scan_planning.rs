@@ -147,7 +147,7 @@ pub(crate) struct ThriftScanPlan {
     pub(crate) scan_ranges: Vec<internal_service::TScanRangeParams>,
 }
 
-pub(crate) trait ConnectorScanPlanner: Send + Sync {
+pub(crate) trait ConnectorScanPlanner: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
     fn begin_scan(
