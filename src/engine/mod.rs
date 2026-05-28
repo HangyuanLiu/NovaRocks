@@ -744,9 +744,16 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
                 let result = explain_analyze_query(
                     &prepared,
                     &catalog,
+                    &connectors_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     None,
@@ -830,10 +837,17 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    let connectors_snapshot = self
+                        .inner
+                        .connectors
+                        .read()
+                        .expect("standalone connector registry read lock")
+                        .clone();
                     self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
+                        &connectors_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
@@ -880,10 +894,17 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    let connectors_snapshot = self
+                        .inner
+                        .connectors
+                        .read()
+                        .expect("standalone connector registry read lock")
+                        .clone();
                     self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
+                        &connectors_snapshot,
                         current_database,
                         self.inner.exchange_port,
                         query_opts.clone(),
@@ -900,10 +921,17 @@ impl StandaloneSession {
                     .read()
                     .expect("standalone catalog read lock")
                     .clone();
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
                 self::statistics::observe_query(&self.inner, query, current_database)?;
                 let result = execute_query(
                     query,
                     &catalog_snapshot,
+                    &connectors_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
@@ -2509,6 +2537,7 @@ fn prepare_explain_query(
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2530,7 +2559,8 @@ fn explain_analyze_query(
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let executed = execute_query(query, catalog, current_database, exchange_port, query_opts)?;
+    let executed =
+        execute_query(query, catalog, connectors, current_database, exchange_port, query_opts)?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
@@ -2576,6 +2606,7 @@ fn explain_query(
 pub(crate) fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2583,6 +2614,7 @@ pub(crate) fn execute_query(
     execute_query_with_options(
         query,
         catalog,
+        connectors,
         current_database,
         exchange_port,
         query_opts,
@@ -2603,6 +2635,7 @@ pub(crate) fn execute_query(
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
@@ -2628,6 +2661,7 @@ pub(crate) fn execute_query_with_options(
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         &physical,
         catalog,
+        connectors,
         current_database,
     )?;
 
@@ -4105,7 +4139,10 @@ enable_path_style_access = true
         let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
             .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            &physical, &catalog, "default",
+            &physical,
+            &catalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
         )
         .expect("build fragments")
     }

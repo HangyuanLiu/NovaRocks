@@ -198,6 +198,7 @@ fn add_iceberg_equality_delete_required_columns(
 
 pub(crate) struct PlanFragmentBuilder<'a> {
     catalog: &'a dyn CatalogProvider,
+    connectors: &'a crate::connector::ConnectorRegistry,
     desc_builder: DescriptorTableBuilder,
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
@@ -250,10 +251,12 @@ impl<'a> PlanFragmentBuilder<'a> {
     pub(crate) fn build(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         let mut builder = PlanFragmentBuilder {
             catalog,
+            connectors,
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_node_id: 1,
@@ -4546,7 +4549,7 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4589,7 +4592,7 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4624,7 +4627,7 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -4659,7 +4662,7 @@ mod tests {
     fn iceberg_delete_apply_cost_rejects_too_many_delete_files() {
         let plan = iceberg_scan_plan_with_many_delete_files(1025);
 
-        let err = match PlanFragmentBuilder::build(&plan, &DummyCatalog, "default") {
+        let err = match PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default") {
             Ok(_) => panic!("delete-heavy scan should fail fast"),
             Err(err) => err,
         };
@@ -4728,7 +4731,7 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
 
         assert_eq!(build.fragment_results.len(), 2);
         assert_eq!(build.edges.len(), 1);
@@ -4783,7 +4786,7 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         assert_eq!(build.fragment_results.len(), 3);
         assert_eq!(build.edges.len(), 2);
 
@@ -4821,7 +4824,7 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let edge = build.edges.first().expect("stream edge");
         assert_eq!(
             edge.output_partition.type_,
@@ -4848,7 +4851,7 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let result = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default");
+        let result = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default");
         let err = result.err().expect("distribution any must fail");
         assert!(err.contains("PhysicalDistribution(Any)"));
     }
@@ -4865,7 +4868,7 @@ mod tests {
             output_columns: output_columns(),
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         assert!(build.edges.is_empty());
     }
@@ -4893,7 +4896,7 @@ mod tests {
             }],
         };
 
-        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         assert!(root.exec_params.per_node_scan_ranges.is_empty());
         assert!(
@@ -4959,7 +4962,7 @@ mod tests {
         let plan = starrocks_scan_plan();
         let catalog = StarRocksCatalog { layout };
 
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
         let scan_node = root
@@ -5017,7 +5020,7 @@ mod tests {
 
     #[test]
     fn iceberg_scan_without_starrocks_layout_uses_synthetic_descriptor_table_id() {
-        let build = PlanFragmentBuilder::build(&iceberg_scan_plan(), &DummyCatalog, "default")
+        let build = PlanFragmentBuilder::build(&iceberg_scan_plan(), &DummyCatalog, &crate::connector::ConnectorRegistry::new(), "default")
             .expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         let root = build.fragment_results.first().expect("root fragment");
@@ -5076,7 +5079,7 @@ mod tests {
         };
 
         let build =
-            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, "default")
+            PlanFragmentBuilder::build(&mixed_starrocks_iceberg_join_plan(), &catalog, &crate::connector::ConnectorRegistry::new(), "default")
                 .expect("build");
         let root = build.fragment_results.first().expect("root fragment");
         let tuple_descs = &root.desc_tbl.tuple_descriptors;
@@ -5311,7 +5314,7 @@ mod tests {
         };
 
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&decode_plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
 
         let root = build
             .fragment_results
@@ -5453,7 +5456,7 @@ mod tests {
         };
 
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
 
         let root = build
             .fragment_results
@@ -5654,7 +5657,7 @@ mod tests {
         };
 
         let catalog = StarRocksCatalog { layout };
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default").expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -5809,7 +5812,7 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        let err = match PlanFragmentBuilder::build(&plan, &catalog, "default") {
+        let err = match PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default") {
             Ok(_) => panic!("non-StarRocks scan with dict_columns must error"),
             Err(e) => e,
         };
@@ -5826,7 +5829,7 @@ mod tests {
         let plan = starrocks_scan_plan();
         let catalog = StarRocksCatalog { layout };
 
-        let build = PlanFragmentBuilder::build(&plan, &catalog, "default")
+        let build = PlanFragmentBuilder::build(&plan, &catalog, &crate::connector::ConnectorRegistry::new(), "default")
             .expect("build StarRocks fragment");
         let root = build
             .fragment_results
