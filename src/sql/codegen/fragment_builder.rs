@@ -4362,8 +4362,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5073,7 +5073,7 @@ mod tests {
         let catalog = MixedCatalog {
             starrocks_layout: PhysicalTableLayout {
                 db_id: 11,
-                table_id: 1,
+                table_id: 22,
                 schema_id: 33,
                 tablets: vec![StarRocksTabletRef {
                     tablet_id: 101,
@@ -5099,7 +5099,7 @@ mod tests {
             .and_then(|tuple| tuple.table_id)
             .expect("StarRocks tuple table id");
         assert_ne!(iceberg_table_id, starrocks_table_id);
-        assert_eq!(starrocks_table_id, 1);
+        assert_eq!(starrocks_table_id, 22);
 
         let table_descs = root
             .desc_tbl
@@ -5266,8 +5266,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5408,8 +5408,8 @@ mod tests {
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,
@@ -5632,8 +5632,8 @@ mod tests {
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
                     source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+                        db_id: 11,
+                        table_id: 22,
                     },
                 },
                 alias: None,

@@ -75,6 +75,10 @@ impl StarRocksTableScanPlanner {
         }
     }
 
+    pub(crate) fn stateless_for_codegen() -> Self {
+        Self { state: Weak::new() }
+    }
+
     fn state(&self) -> Result<Arc<StandaloneState>, String> {
         self.state
             .upgrade()

@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::scan_planning::{ConnectorScanPlanner, ThriftScanContext};
+use crate::connector::starrocks::table::StarRocksTableScanPlanner;
 use crate::descriptors;
 use crate::exprs;
 use crate::internal_service;
@@ -574,7 +576,23 @@ pub(crate) fn build_exec_params_multi(
     for planned in scan_tables {
         let scan_node_id = planned.scan_node_id;
         let resolved = &planned.resolved;
-        let ranges = if let Some(layout) = resolved.physical_layout.as_ref() {
+        let ranges = if matches!(
+            resolved.table.source,
+            crate::sql::catalog::ScanSource::StarRocks { .. }
+        ) {
+            let ranges = build_starrocks_scan_ranges_from_planned_scan(resolved)?;
+            if ranges.is_empty() {
+                return Err(format!(
+                    "StarRocks table {}.{} has no selected tablet splits",
+                    resolved.database, resolved.table.name
+                ));
+            }
+            ranges
+        } else if let Some(layout) = resolved.physical_layout.as_ref() {
+            // Non-StarRocks layout path retained per plan; current callers do not
+            // populate physical_layout for non-StarRocks sources, so this arm is
+            // effectively unreachable today and exists only as a bridge before
+            // the follow-up cleanup plan removes physical_layout entirely.
             if layout.tablets.is_empty() {
                 return Err(format!(
                     "StarRocks table {}.{} has no active tablets",
@@ -615,18 +633,9 @@ pub(crate) fn build_exec_params_multi(
                     // morsel for the runtime to dispatch on.
                     vec![build_iceberg_metadata_scan_range_params()]
                 }
-                ScanSource::StarRocks { .. } => {
-                    // StarRocks tables reach this builder via the
-                    // outer `if let Some(layout)` branch above; falling
-                    // through to here means the planner produced a
-                    // `StarRocks` TableDef without a populated
-                    // `PhysicalTableLayout`, which is a bug.
-                    return Err(format!(
-                        "StarRocks table {}.{} reached scan-range builder \
-                         without a physical layout",
-                        resolved.database, resolved.table.name
-                    ));
-                }
+                ScanSource::StarRocks { .. } => unreachable!(
+                    "StarRocks scan source is handled by the planned-connector branch above"
+                ),
             }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);
@@ -1044,6 +1053,30 @@ fn build_internal_scan_range_params(
     )
 }
 
+pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
+    resolved: &ResolvedTable,
+) -> Result<Vec<internal_service::TScanRangeParams>, String> {
+    let planned = resolved
+        .planned_scan
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "StarRocks table {}.{} reached scan-range builder without planned connector scan",
+                resolved.database, resolved.table.name
+            )
+        })?;
+    let planner = StarRocksTableScanPlanner::stateless_for_codegen();
+    let thrift = planner.to_thrift_scan(
+        &planned.scan,
+        &planned.splits,
+        ThriftScanContext {
+            database: resolved.database.clone(),
+            table: resolved.table.name.clone(),
+        },
+    )?;
+    Ok(thrift.scan_ranges)
+}
+
 // ---------------------------------------------------------------------------
 // Scan range helper
 // ---------------------------------------------------------------------------
@@ -1376,6 +1409,76 @@ mod tests {
 
         assert_eq!(ranges.len(), 1);
         assert!(hdfs_range(&ranges[0]).extended_columns.is_none());
+    }
+
+    #[test]
+    fn starrocks_scan_ranges_use_planned_connector_scan_without_physical_layout() {
+        use crate::connector::scan_planning::{ScanHandle, Split};
+        use crate::connector::starrocks::table::{
+            StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
+        };
+        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+        use crate::sql::codegen::resolve::{PlannedConnectorScan, ResolvedTable};
+        use arrow::datatypes::DataType;
+
+        let table = TableDef {
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 10,
+                table_id: 20,
+            },
+        };
+        let planned_scan = PlannedConnectorScan {
+            scan: ScanHandle::new(
+                "starrocks",
+                StarRocksScanHandle {
+                    table: StarRocksTableHandle {
+                        database: "default".to_string(),
+                        table: "orders".to_string(),
+                        db_id: 10,
+                        table_id: 20,
+                    },
+                    schema_id: 30,
+                },
+            ),
+            splits: vec![Split::new(
+                "starrocks",
+                StarRocksSplit {
+                    tablet_id: 300,
+                    partition_id: 100,
+                    version: 7,
+                },
+            )],
+        };
+        let resolved = ResolvedTable {
+            database: "default".to_string(),
+            table,
+            physical_layout: None,
+            planned_scan: Some(planned_scan),
+            alias: None,
+        };
+
+        let ranges = super::build_starrocks_scan_ranges_from_planned_scan(&resolved)
+            .expect("planned scan ranges");
+
+        assert_eq!(ranges.len(), 1);
+        let internal = ranges[0]
+            .scan_range
+            .internal_scan_range
+            .as_ref()
+            .expect("internal scan range");
+        assert_eq!(internal.tablet_id, 300);
+        assert_eq!(internal.partition_id, Some(100));
+        assert_eq!(internal.version, "7");
+        assert_eq!(internal.schema_hash, "30");
     }
 
     #[test]
