@@ -20,6 +20,10 @@ use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
 
+use crate::connector::scan_planning::{
+    BeginScanContext, SplitPlanningContext, TableHandle,
+};
+use crate::connector::starrocks::table::StarRocksTableScanPlanner;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::codegen::FragmentId;
@@ -91,6 +95,66 @@ fn iceberg_table_info(
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. } => Some(table),
         crate::sql::catalog::ScanSource::StarRocks { .. } => None,
     }
+}
+
+/// Bootstrap adapter that converts an already-fetched `PhysicalTableLayout`
+/// snapshot into connector-owned `StarRocksScanHandle` + `StarRocksSplit`
+/// state without acquiring an additional catalog lock in codegen.
+fn plan_starrocks_connector_scan(
+    database: &str,
+    table: &crate::sql::catalog::TableDef,
+    physical_layout: &crate::sql::catalog::PhysicalTableLayout,
+) -> Result<crate::sql::codegen::resolve::PlannedConnectorScan, String> {
+    let crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } = &table.source else {
+        return Err(format!(
+            "expected StarRocks ScanSource while planning connector scan for {}.{}",
+            database, table.name
+        ));
+    };
+    if *db_id != physical_layout.db_id || *table_id != physical_layout.table_id {
+        return Err(format!(
+            "StarRocks scan identity mismatch for {}.{}: source=(db_id={}, table_id={}) layout=(db_id={}, table_id={})",
+            database,
+            table.name,
+            db_id,
+            table_id,
+            physical_layout.db_id,
+            physical_layout.table_id
+        ));
+    }
+
+    let table_handle = StarRocksTableScanPlanner::table_handle_from_source(
+        database,
+        &table.name,
+        *db_id,
+        *table_id,
+    );
+    let scan = crate::connector::scan_planning::ScanHandle::new(
+        "starrocks",
+        crate::connector::starrocks::table::StarRocksScanHandle {
+            table: table_handle
+                .downcast_ref::<crate::connector::starrocks::table::StarRocksTableHandle>()
+                .expect("table_handle_from_source returns StarRocksTableHandle")
+                .clone(),
+            schema_id: physical_layout.schema_id,
+        },
+    );
+    let splits = physical_layout
+        .tablets
+        .iter()
+        .map(|tablet| {
+            crate::connector::scan_planning::Split::new(
+                "starrocks",
+                crate::connector::starrocks::table::StarRocksSplit {
+                    tablet_id: tablet.tablet_id,
+                    partition_id: tablet.partition_id,
+                    version: tablet.version,
+                },
+            )
+        })
+        .collect();
+
+    Ok(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
 }
 
 fn add_iceberg_equality_delete_required_columns(
@@ -719,11 +783,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             string_to_dict_slot.insert(dict_slot_id, dict_slot_id);
         }
 
+        let planned_scan = match (&op.table.source, physical_layout.as_ref()) {
+            (crate::sql::catalog::ScanSource::StarRocks { .. }, Some(layout)) => {
+                Some(plan_starrocks_connector_scan(&op.database, &op.table, layout)?)
+            }
+            _ => None,
+        };
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: op.table.clone(),
             physical_layout,
             alias: op.alias.clone(),
+            planned_scan,
         };
         self.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
 

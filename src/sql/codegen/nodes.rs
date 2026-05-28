@@ -1358,6 +1358,7 @@ mod tests {
                 },
                 physical_layout: None,
                 alias: None,
+                planned_scan: None,
             },
             min_max_conjuncts: vec![],
             slot_to_column: HashMap::from([(
@@ -1414,6 +1415,7 @@ mod tests {
                 },
                 physical_layout: None,
                 alias: None,
+                planned_scan: None,
             },
             min_max_conjuncts: vec![],
             slot_to_column: HashMap::from([(
