@@ -513,24 +513,43 @@ impl<'a> super::AnalyzerContext<'a> {
                 subquery,
                 negated,
             } => {
-                // BITMAP / HLL operands cannot participate in IN subquery
-                // because they have no scalar identity. Reject upfront by
-                // resolving the LHS to detect a logical-type tag; the LHS
-                // is dropped before the subquery is planned so we cannot
-                // wait until later.
-                let in_expr_typed = self.analyze_expr(in_expr, scope)?;
-                if is_json_in_subquery_operand(&in_expr_typed, scope) {
-                    return Err("In predicate of JSON does not support subquery".to_string());
-                }
-                if let Some(logical) = scope
-                    .logical_type_of_expr(&in_expr_typed)
-                    .filter(is_bitmap_or_hll_type)
-                {
-                    let col = column_name_of_expr(&in_expr_typed);
-                    let kw = if *negated { "NOT IN" } else { "IN" };
-                    return Err(format!(
-                        "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
-                    ));
+                // Multi-column LHS `(a, b) IN (SELECT c, d FROM ...)` arrives
+                // here wrapped as `Expr::Tuple(...)` (or `Expr::Nested(Tuple(...))`).
+                // The whole tuple is not a single scalar expression — the
+                // analyzer's catch-all rejects it as "unsupported expression".
+                // `subquery_rewrite::rewrite_in_subquery` handles the
+                // decomposition (per-column equi-join) downstream, so just
+                // skip the BITMAP / JSON / HLL precheck here: those checks
+                // are per-column and only meaningful for a single-column LHS.
+                let lhs_is_tuple = match in_expr.as_ref() {
+                    sqlast::Expr::Tuple(_) => true,
+                    sqlast::Expr::Nested(inner) => {
+                        matches!(inner.as_ref(), sqlast::Expr::Tuple(_))
+                    }
+                    _ => false,
+                };
+                if !lhs_is_tuple {
+                    // BITMAP / HLL operands cannot participate in IN subquery
+                    // because they have no scalar identity. Reject upfront by
+                    // resolving the LHS to detect a logical-type tag; the LHS
+                    // is dropped before the subquery is planned so we cannot
+                    // wait until later.
+                    let in_expr_typed = self.analyze_expr(in_expr, scope)?;
+                    if is_json_in_subquery_operand(&in_expr_typed, scope) {
+                        return Err(
+                            "In predicate of JSON does not support subquery".to_string(),
+                        );
+                    }
+                    if let Some(logical) = scope
+                        .logical_type_of_expr(&in_expr_typed)
+                        .filter(is_bitmap_or_hll_type)
+                    {
+                        let col = column_name_of_expr(&in_expr_typed);
+                        let kw = if *negated { "NOT IN" } else { "IN" };
+                        return Err(format!(
+                            "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                        ));
+                    }
                 }
                 let id = self.alloc_subquery_id();
                 let kind = SubqueryKind::InSubquery { negated: *negated };
@@ -1164,6 +1183,34 @@ impl<'a> super::AnalyzerContext<'a> {
                     return Err(format!(
                         "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
                     ));
+                }
+                // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
+                // composite types — ARRAY / MAP / STRUCT have no canonical
+                // total order. Same-type `=` / `!=` / `<=>` are still fine
+                // (element-wise equality is well-defined). NovaRocks used to
+                // accept `STRUCT < STRUCT`, run it, and silently return zero
+                // rows; reject up front instead.
+                let is_ordering_op = matches!(
+                    op,
+                    sqlast::BinaryOperator::Lt
+                        | sqlast::BinaryOperator::LtEq
+                        | sqlast::BinaryOperator::Gt
+                        | sqlast::BinaryOperator::GtEq
+                );
+                if is_ordering_op {
+                    let complex_kind = |dt: &DataType| match dt {
+                        DataType::List(_) | DataType::LargeList(_) => Some("ARRAY"),
+                        DataType::Map(_, _) => Some("MAP"),
+                        DataType::Struct(_) => Some("STRUCT"),
+                        _ => None,
+                    };
+                    if let Some(kind) =
+                        complex_kind(&left_typed.data_type).or_else(|| complex_kind(&right_typed.data_type))
+                    {
+                        return Err(format!(
+                            "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
+                        ));
+                    }
                 }
                 // Reject comparisons between complex types whose element /
                 // entry / field layouts are fundamentally incompatible.
@@ -4684,6 +4731,19 @@ fn session_variable_default(name: &str) -> String {
 /// scalar (handled by literal coercion), compatible container shapes (let
 /// `cast_with_special_rules` widen at runtime), or one-side-only complex
 /// types (rare; let the downstream layer surface its own error).
+/// Module-visible wrapper around `incompatible_complex_compare` so the
+/// IN-subquery rewriter (`subquery_rewrite::rewrite_in_subquery`) can
+/// apply the same shape compatibility check before it synthesises an
+/// EQ join condition. Without this, `x IN (SELECT y …)` where `x` and
+/// `y` are STRUCT / MAP / ARRAY of incompatible element types would
+/// silently produce zero rows instead of erroring at analyzer time.
+pub(super) fn incompatible_complex_compare_pub(
+    left: &DataType,
+    right: &DataType,
+) -> Option<String> {
+    incompatible_complex_compare(left, right)
+}
+
 fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<String> {
     fn is_complex(dt: &DataType) -> bool {
         matches!(

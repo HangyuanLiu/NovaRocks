@@ -930,17 +930,48 @@ impl<'a> AnalyzerContext<'a> {
                 resolved_sub.output_columns.len()
             ));
         }
+        // Per-pair shape check: `x IN (SELECT y …)` is rewritten into an
+        // EQ-join on (x, y). For composite types the two sides must have a
+        // compatible shape — same outer kind, recursively compatible fields
+        // / element types. The downstream `BinaryOp::Eq` we build here
+        // does NOT run through the analyzer's compare-type guard, so we
+        // duplicate the check up front and surface the standard
+        // "does not support binary predicate operation" diagnostic
+        // (matching the bare-`=` rejection path).
+        for (lhs_i, sub_col) in lhs_typed_list.iter().zip(resolved_sub.output_columns.iter()) {
+            if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
+                &lhs_i.data_type,
+                &sub_col.data_type,
+            ) {
+                let op_sym = if negated { "NOT IN" } else { "IN" };
+                return Err(format!(
+                    "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                ));
+            }
+        }
         let lhs_typed = lhs_typed_list[0].clone();
         let sub_output_col = resolved_sub.output_columns[0].clone();
 
         // Check if the IN placeholder is inside an OR expression.
         // If so, SEMI JOIN semantics are wrong — we need LEFT OUTER JOIN
         // + IS [NOT] NULL replacement (matching StarRocks FE approach).
+        //
+        // The same LEFT-OUTER-JOIN-with-match-indicator shape is also the
+        // only sensible rewrite when the IN placeholder lives in a SELECT
+        // projection (`SELECT x IN (SELECT y FROM …) FROM t`): the
+        // expression must evaluate to a boolean column per outer row.
+        // A SEMI JOIN would drop non-matching rows; the indicator form
+        // keeps them with a `FALSE` value.
+        let in_projection = select
+            .projection
+            .iter()
+            .any(|p| expr_contains_placeholder(&p.expr, sq_info.id));
         let inside_or = select
             .filter
             .as_ref()
             .map(|f| is_placeholder_inside_or(f, sq_info.id))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || in_projection;
 
         // Correlated subquery: if any predicate in the subquery WHERE references
         // an outer-scope column (e.g. `WHERE t.x = outer.y`), the wrapped
@@ -1003,8 +1034,13 @@ impl<'a> AnalyzerContext<'a> {
             // null-aware equality so the LEFT ANTI join matches whenever
             // either operand is NULL, matching SQL's
             // "x NOT IN S returns UNKNOWN if x is NULL or S contains NULL"
-            // semantics.
-            let eq = if negated && !inside_or {
+            // semantics — but only when nulls are actually possible. When
+            // both operands are statically non-nullable, the OR-with-IsNull
+            // branches are dead code that prevent the downstream optimizer
+            // from extracting an equi-key and falls back to a NestLoopJoin
+            // (turning a typical `c0 NOT IN (subq)` into a quadratic scan).
+            let either_nullable = lhs_i.nullable || sub_col.nullable;
+            let eq = if negated && !inside_or && either_nullable {
                 null_aware_eq(lhs_i.clone(), rhs_ref)
             } else {
                 TypedExpr {
@@ -1131,6 +1167,11 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &is_null_expr);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &is_null_expr);
+            Self::replace_placeholder_in_projection(
+                &mut select.projection,
+                sq_info.id,
+                &is_null_expr,
+            );
         } else {
             // Standard case: SEMI / ANTI JOIN. NULL handling for NOT IN is
             // baked into `eq_cond` above (null-aware equality), so the
@@ -1939,23 +1980,93 @@ fn extract_corr_preds_inner(
     }
 }
 
-/// Check if an expression is a reference to a column that exists in the outer scope
-/// but NOT in the inner scope. This identifies true correlation references.
+/// Check if an expression is "outer-only" from the subquery's point of view:
+/// every column reference in the expression resolves in the outer scope and
+/// does NOT resolve in the inner scope, AND the expression itself contains
+/// at least one column reference (i.e. it's not a pure constant).
+///
+/// This is the test used by `extract_correlation_predicates` to decide
+/// which side of a comparison is the outer ("correlation") side. We must
+/// recurse into function calls / arithmetic / nested expressions so a
+/// correlation hidden behind a wrapper like `r.k3 = coalesce(l.k3, 2)`
+/// is still recognised — otherwise the inner query is analysed without
+/// outer-column visibility and the `l.k3` reference fails to resolve.
 fn is_outer_only_ref(
     expr: &TypedExpr,
     inner_scope: &AnalyzerScope,
     outer_scope: &AnalyzerScope,
 ) -> bool {
+    let mut saw_column = false;
+    let mut all_outer_only = true;
+    collect_column_outer_status(expr, inner_scope, outer_scope, &mut saw_column, &mut all_outer_only);
+    saw_column && all_outer_only
+}
+
+fn collect_column_outer_status(
+    expr: &TypedExpr,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+    saw_column: &mut bool,
+    all_outer_only: &mut bool,
+) {
     match &expr.kind {
         ExprKind::ColumnRef {
             qualifier, column, ..
         } => {
+            *saw_column = true;
             let in_inner = inner_scope.resolve(qualifier.as_deref(), column).is_ok();
             let in_outer = outer_scope.resolve(qualifier.as_deref(), column).is_ok();
-            // Outer-only: in outer but not in inner
-            !in_inner && in_outer
+            if !(in_outer && !in_inner) {
+                *all_outer_only = false;
+            }
         }
-        _ => false,
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_outer_status(left, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(right, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Nested(inner) => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                collect_column_outer_status(a, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        ExprKind::InList { expr: inner, list, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            for item in list {
+                collect_column_outer_status(item, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        ExprKind::Between { expr: inner, low, high, .. } => {
+            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(low, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(high, inner_scope, outer_scope, saw_column, all_outer_only);
+        }
+        ExprKind::Case { operand, when_then, else_expr } => {
+            if let Some(op) = operand {
+                collect_column_outer_status(op, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+            for (when, then) in when_then {
+                collect_column_outer_status(when, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(then, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+            if let Some(else_) = else_expr {
+                collect_column_outer_status(else_, inner_scope, outer_scope, saw_column, all_outer_only);
+            }
+        }
+        // Literals / placeholders / lambda params: no column refs, leave
+        // saw_column / all_outer_only unchanged.
+        _ => {}
     }
 }
 
