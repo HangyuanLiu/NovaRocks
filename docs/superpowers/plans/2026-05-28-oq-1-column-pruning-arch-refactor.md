@@ -245,18 +245,18 @@ pub(crate) struct ExceptNode {
 
 - [ ] **Step 2.3: Update all UnionNode construction sites**
 
-For each site found in step 2.1, populate `output_columns`. Typical pattern when constructing a Union from a list of inputs sharing schema:
+**CRITICAL CORRECTNESS REQUIREMENT (corrected after investigation — do NOT use first-branch IDs).**
 
-```rust
-let output_columns = inputs[0].schema_output_columns();  // helper to derive from inputs[0]
-LogicalPlan::Union(UnionNode {
-    inputs,
-    all,
-    output_columns,
-})
-```
+A set-op node's `output_columns` MUST carry the **fresh set-op output ColumnIds** that the analyzer allocated for the set-op result — i.e. the `ResolvedQuery.output_columns` of the set-op query itself. These are the IDs the parent scope registers and the IDs that any parent operator's expressions reference. They are **distinct** from both the left and right branch ColumnIds.
 
-Add helper `LogicalPlan::schema_output_columns(&self) -> Vec<OutputColumn>` if not already present (locate the existing function that returns plan output schema; many places already call it). If only one site exists in `src/sql/planner/mod.rs`, inline the derivation.
+Why this matters: Gap-4 pruning (Task 11 `tag_union`, Task 20 `PruneUnionColumns`) maps `required_output_columns` (parent-referenced IDs) to branch positions via `UnionNode.output_columns[i].column_id`. If `output_columns` carried left-branch IDs instead, that ID-based lookup would match nothing and prune everything. (An earlier draft of this plan wrongly said "use `inputs[0]` schema" — that is the bug; the parent references fresh set-op IDs, verified by tracing `analyze_set_expr` → scope registration in `resolve_from.rs` → `plan_set_operation_scoped`.)
+
+Implementation:
+- The fresh IDs live in the enclosing `ResolvedQuery.output_columns`, which `plan_scoped_query` already has in scope (it destructures the query into body + output_columns + modifiers). Thread those `output_columns` down so the set-op node stamps them onto its `output_columns` field — OR, more simply, in `plan_scoped_query`, after the body is planned, if the resulting node is a `Union`/`Intersect`/`Except`, overwrite its `output_columns` with the query's fresh `output_columns`. Recursion then handles nested set-ops correctly: each `ResolvedQuery` (including nested-union branches) stamps ITS own fresh output IDs onto ITS set-op node.
+- Branch-internal IDs are NOT lost — they remain on the branch child nodes and are recovered positionally at prune time via `collect_output_ids_ordered(child)` (Task 4 / Task 11). The set-op node declares the fresh IDs; each branch keeps its own.
+- For passthrough sites (cte_rewrite, tree.rs, the soon-to-be-deleted column_pruning.rs): propagate the existing `node.output_columns` unchanged. For test-only sites: `vec![]` is fine.
+
+**Regression guard (add as a test in Step 2.5):** for `SELECT x, y FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub`, the planned `SubqueryAlias.output_columns` ColumnIds (fresh IDs) MUST equal the child `Union.output_columns` ColumnIds, position by position. Before the fix they differ; after the fix they match. This is the canonical proof the set-op node now carries parent-referenced IDs.
 
 - [ ] **Step 2.4: Build to find missed sites**
 
