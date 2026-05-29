@@ -32,6 +32,12 @@ impl ColumnId {
     /// Sentinel value used only during bootstrapping or when a real id is not
     /// yet available. Production code should never compare against this.
     pub const UNSET: ColumnId = ColumnId(0);
+
+    /// Construct a `ColumnId` from a raw u32 for use in tests only.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(id: u32) -> ColumnId {
+        ColumnId(id)
+    }
 }
 
 impl fmt::Debug for ColumnId {
