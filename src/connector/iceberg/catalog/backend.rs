@@ -226,6 +226,13 @@ pub(crate) fn build_iceberg_table_def_with_files(
 /// before analysis runs. That append is what makes the slot load-bearing;
 /// declaring the column on the `TableDef` only ensures it resolves.
 ///
+/// The `IcebergDeltaScanOperator` projects its internal superset (all data
+/// columns + all virtual columns) onto the codegen tuple by name via
+/// `iceberg_delta_scan::project_superset_to_tuple`, so the set of virtual
+/// columns exposed here and the operator's output are decoupled: the TableDef
+/// may expose the full five-column set while the codegen tuple requests only
+/// a subset (e.g. `{data, _row_id, __change_op}` for projection/filter MVs).
+///
 /// Returns Err if the table metadata does not declare v3 row-lineage; A1
 /// requires v3 row-lineage to compute the apply key.
 pub(crate) fn build_iceberg_table_def_for_delta_scan(
