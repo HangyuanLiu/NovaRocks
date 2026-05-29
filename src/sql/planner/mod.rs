@@ -371,10 +371,18 @@ fn rewrite_sort_items_to_projection_refs(
             let display =
                 crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase();
             if let Some(extra) = extra_names.get(&display) {
+                // Preserve the extra item's output_column_id so that the
+                // Phase-1 tagging pass (tag_sort → collect_column_id_refs)
+                // can see this sort key's ColumnId and include it in the
+                // child's required_output_columns.  Using UNSET here caused
+                // tag_sort to silently omit the extra column from the inner
+                // project's needed set, which then made PruneProjectColumns
+                // drop the extra item → the sort's input no longer had the
+                // column → "Column cannot be resolved" at codegen time.
                 SortItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: ColumnId::UNSET,
+                            column_id: extra.output_column_id,
                             qualifier: None,
                             column: extra.output_name.clone(),
                         },

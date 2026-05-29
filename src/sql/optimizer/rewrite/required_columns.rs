@@ -477,36 +477,26 @@ fn tag_cte_anchor(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -
     let LogicalPlan::CTEAnchor(mut node) = plan else {
         unreachable!()
     };
-    let cte_id = node.cte_id;
 
     // --- Walk 1: tag the consumer subtree with parent_needed. ---
     // This stamps required_output_columns on every CTEConsume for this cte_id.
     let consumer = tag_required_columns(*node.consumer, parent_needed.clone());
 
-    // --- Walk 2: collect all CTEConsume needed ids for this cte_id. ---
-    let mut consume_needs: HashSet<ColumnId> = HashSet::new();
-    collect_cte_consumer_needs(&consumer, cte_id, &mut consume_needs);
-
-    // Build consume_id -> position map from any CTEConsume with matching cte_id.
-    let consume_pos_map = find_consume_position_map(&consumer, cte_id);
-
-    // Translate consume-side ids to produce-side output ids via position.
-    let produce_output_ids: Vec<ColumnId> = match &*node.produce {
-        LogicalPlan::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
-        _ => panic!("CTEAnchor.produce must be a CTEProduce node"),
-    };
-
-    let produce_needed: HashSet<ColumnId> = consume_needs
-        .iter()
-        .filter_map(|cid| {
-            consume_pos_map
-                .get(cid)
-                .and_then(|&pos| produce_output_ids.get(pos).copied())
-        })
-        .collect();
-
-    // --- Tag the producer subtree with the translated needed set. ---
-    let produce = tag_required_columns(*node.produce, Some(produce_needed));
+    // --- Tag the producer subtree with None (keep all). ---
+    //
+    // Conservative choice: pass None to the CTEProduce body so all produce
+    // columns survive, rather than computing a narrowed produce_needed set.
+    //
+    // Why conservative: PruneCTEProduceColumns and PruneCTEConsumeColumns are
+    // no-ops (Gap-3 deferred).  The CTE multicast protocol sends ALL produce
+    // columns to every consumer exchange node; each consumer reads them by
+    // positional index.  A narrowed produce_needed set could prune leaf nodes
+    // (e.g. Scan) below the produce correctly in isolation, but since the
+    // produce's output_columns list is not pruned (no-op rule), the scan must
+    // still produce ALL columns that the produce's output_columns list names.
+    // Passing None ensures the scan's required_output_columns == all columns,
+    // which is the safe invariant until Gap-3 is implemented.
+    let produce = tag_required_columns(*node.produce, None);
 
     node.consumer = Box::new(consumer);
     node.produce = Box::new(produce);
@@ -1246,11 +1236,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tag_cte_anchor_two_walk_translates_consumer_needs_to_producer() {
+    fn tag_cte_anchor_produce_body_gets_keep_all_none() {
+        // tag_cte_anchor passes None to the produce body (keep-all) to avoid
+        // mis-aligning consumer positional slot assignments (Gap-3 conservative).
+        //
         // CTEProduce[cte=7, output: c0@10, c1@20, c2@30] <- Scan[a@10,b@20,c@30]
         // CTEConsume[cte=7, output: k0@101, k1@102, k2@103]
         // parent_needed of anchor = {102}  (k1 @ position 1)
-        // Expected: produce scan gets {20}  (position 1 = b@20)
+        // Expected (conservative): produce scan gets ALL columns {10, 20, 30}
+        // because tag_cte_anchor passes None to the produce body.
         let cte_id: CteId = 7;
 
         let scan = make_scan_with_ids(10, 20, 30);
@@ -1296,26 +1290,22 @@ mod tests {
             panic!()
         };
         let req = s.required_output_columns.unwrap();
-        assert!(
-            req.contains(&ColumnId::new_for_test(20)),
-            "b@20 needed (position 1 of producer)"
-        );
-        assert!(
-            !req.contains(&ColumnId::new_for_test(10)),
-            "a@10 not needed"
-        );
-        assert!(
-            !req.contains(&ColumnId::new_for_test(30)),
-            "c@30 not needed"
-        );
+        // Conservative keep-all: produce body scan keeps all 3 columns.
+        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
+        assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
+        assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
     }
 
     #[test]
-    fn tag_cte_anchor_union_of_multi_consumer_needs() {
-        // Two CTEConsumers each referencing a different column.
+    fn tag_cte_anchor_multi_consumer_produce_body_gets_keep_all_none() {
+        // Two CTEConsumers — tag_cte_anchor passes None to the produce body
+        // (keep-all) in the conservative no-op approach (Gap-3 deferred).
+        //
         // consumer1 needs k1@102 (position 1)
         // consumer2 needs m2@203 (position 2)
-        // Expected: produce scan gets {20, 30}
+        // Expected (conservative): produce scan gets ALL columns {10, 20, 30}
+        // because tag_cte_anchor passes None to the produce body.
         let cte_id: CteId = 42;
 
         let scan = make_scan_with_ids(10, 20, 30);
@@ -1380,18 +1370,11 @@ mod tests {
             panic!()
         };
         let req = s.required_output_columns.unwrap();
-        assert!(
-            req.contains(&ColumnId::new_for_test(20)),
-            "b@20 from k1 (position 1)"
-        );
-        assert!(
-            req.contains(&ColumnId::new_for_test(30)),
-            "c@30 from m2 (position 2)"
-        );
-        assert!(
-            !req.contains(&ColumnId::new_for_test(10)),
-            "a@10 not needed"
-        );
+        // Conservative keep-all: produce body scan keeps all 3 columns.
+        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
+        assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
+        assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
     }
 
     // -----------------------------------------------------------------------

@@ -1,18 +1,12 @@
 //! PruneCTEConsumeColumns — Phase 2 rule for CTEConsume nodes.
 //!
-//! Filters `CTEConsumeNode.output_columns` to only those whose `column_id` is
-//! in `required_output_columns`. Keeps at least one column (the first original).
-//!
-//! Unchanged when `output_columns.len()` is the same as before.
+//! Intentionally a no-op: CTE consume output columns are NOT pruned here.
+//! See the `apply` comment for the rationale (Gap-3 deferred).
 
-use std::collections::HashSet;
-
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneCTEConsumeColumns;
@@ -30,44 +24,23 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         matches!(plan, LogicalPlan::CTEConsume(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::CTEConsume(mut node) = plan else {
-            unreachable!()
-        };
-
-        // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
-            return Ok(RewriteResult::Unchanged);
-        };
-
-        let original_len = node.output_columns.len();
-
-        let filtered_ids: HashSet<ColumnId> = node
-            .output_columns
-            .iter()
-            .map(|c| c.column_id)
-            .filter(|id| needed.contains(id))
-            .collect();
-
-        let fallback = node
-            .output_columns
-            .first()
-            .map(|c| c.column_id)
-            .unwrap_or(ColumnId::UNSET);
-        let keep_ids = keep_at_least_one(filtered_ids, fallback);
-
-        let new_output_columns: Vec<_> = node
-            .output_columns
-            .into_iter()
-            .filter(|c| keep_ids.contains(&c.column_id))
-            .collect();
-
-        if new_output_columns.len() == original_len {
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::CTEConsume(node)))
+    fn apply(&self, _plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        // Conservative no-op: do not prune CTE consume output columns.
+        //
+        // CTE column pruning (Gap-3) is deferred because the consume↔produce
+        // positional mapping is fragile with multiple consumers: each consumer
+        // has distinct ColumnIds but the same positional schema as the produce.
+        // The coordinator sends ALL produce columns; each consumer's exchange
+        // node reads them by position (idx 0, 1, ...).  If we trim a consumer
+        // to fewer columns, its idx-based slot assignments no longer align with
+        // the produce's column order, and the wrong data ends up in each slot
+        // — causing incorrect filter evaluation or silent wrong results.
+        //
+        // The Phase-1 tag still helps the body below CTEProduce (via the
+        // keep-all pass in tag_cte_anchor → tag_cte_produce → body), so leaf
+        // scans still benefit from column pruning.  CTE node pruning is a
+        // follow-up optimization (Gap-3).
+        Ok(RewriteResult::Unchanged)
     }
 }
 
@@ -94,8 +67,12 @@ mod tests {
         }
     }
 
+    /// PruneCTEConsumeColumns is a conservative no-op (Gap-3 deferred).
+    /// Even when required_output_columns is set to a strict subset, the rule
+    /// must return Unchanged so the produce/consume positional alignment is
+    /// preserved.
     #[test]
-    fn prune_cte_consume_filters_to_needed_subset() {
+    fn prune_cte_consume_is_noop_even_when_subset_tagged() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
@@ -118,16 +95,11 @@ mod tests {
         let rule = PruneCTEConsumeColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::CTEConsume(pruned) = changed else {
-            panic!("expected CTEConsume");
-        };
-
-        assert_eq!(pruned.output_columns.len(), 1);
-        assert_eq!(pruned.output_columns[0].column_id, id_b);
+        // Must be Unchanged — CTE consume pruning is a no-op (Gap-3).
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "CTE consume must not be pruned (positional alignment with produce must be preserved)"
+        );
     }
 
     #[test]
@@ -151,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_cte_consume_keeps_at_least_one_when_needed_empty() {
+    fn prune_cte_consume_noop_when_needed_empty() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
@@ -166,15 +138,10 @@ mod tests {
         let rule = PruneCTEConsumeColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::CTEConsume(pruned) = changed else {
-            panic!("expected CTEConsume");
-        };
-
-        assert_eq!(pruned.output_columns.len(), 1);
-        assert_eq!(pruned.output_columns[0].column_id, id_a, "first col kept");
+        // Even with an empty needed set, the no-op rule returns Unchanged.
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "CTE consume must not be pruned even with empty needed set (Gap-3 no-op)"
+        );
     }
 }
