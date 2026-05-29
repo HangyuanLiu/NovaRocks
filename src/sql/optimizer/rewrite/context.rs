@@ -375,9 +375,6 @@ mod tests {
 
     #[test]
     fn column_ref_factory_can_be_set_and_read() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        use crate::sql::column_id::ColumnRefFactory;
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         assert!(ctx.column_ref_factory().is_none());
         let factory = Rc::new(RefCell::new(ColumnRefFactory::default()));

@@ -94,12 +94,20 @@ pub(crate) fn optimize(
     let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
-    //    is done so there must be exactly two references: the one we kept in
-    //    `factory` and the one stored in `rewrite_ctx`. Drop the context's
-    //    reference first, then unwrap.
+    //    is done so the only two references at this call site are the local
+    //    `factory` binding and the clone stored in `rewrite_ctx`. Drop the
+    //    context's reference first, then unwrap the local one.
+    debug_assert_eq!(
+        Rc::strong_count(&factory), 2,
+        "expected exactly 2 Rc references (factory + rewrite_ctx) before drop; \
+         a rewrite rule stored an extra clone of the context — check column_ref_factory() call sites"
+    );
     drop(rewrite_ctx);
     let factory = Rc::try_unwrap(factory)
-        .expect("factory should have no other references after rewrite")
+        .expect(
+            "ColumnRefFactory Rc must be uniquely owned after rewrite; \
+             a rule cloned the context and did not drop the clone",
+        )
         .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
