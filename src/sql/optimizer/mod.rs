@@ -98,7 +98,8 @@ pub(crate) fn optimize(
     //    `factory` binding and the clone stored in `rewrite_ctx`. Drop the
     //    context's reference first, then unwrap the local one.
     debug_assert_eq!(
-        Rc::strong_count(&factory), 2,
+        Rc::strong_count(&factory),
+        2,
         "expected exactly 2 Rc references (factory + rewrite_ctx) before drop; \
          a rewrite rule stored an extra clone of the context — check column_ref_factory() call sites"
     );

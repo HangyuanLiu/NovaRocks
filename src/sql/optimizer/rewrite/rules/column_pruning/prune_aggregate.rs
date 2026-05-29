@@ -48,6 +48,32 @@ impl LogicalRewriteRule for PruneAggregateColumns {
             "PruneAggregateColumns: expected output_columns = group_by ++ aggregates layout"
         );
 
+        // Safety guard: if `needed` is non-empty but NONE of the aggregate output
+        // column ids appear in `needed`, do not prune any aggregates. This handles
+        // the Project-over-Aggregate pattern where the Project items contain raw
+        // AggregateCall expressions (not ColumnRefs). In that case the Phase-1
+        // tagging pass propagates scan-level column ids (args' ids) as `needed`,
+        // not the aggregate's output ids — because `collect_column_id_refs` on an
+        // AggregateCall walks into the args, not the result. Pruning would
+        // incorrectly drop all aggregate calls and break codegen. When no aggregate
+        // output id appears in `needed`, we conservatively keep all aggregates.
+        //
+        // The UNSET check handles AggregatePushdown synthetic partial-aggregate
+        // outputs: their column_id = UNSET and UNSET is never in `needed` even
+        // though the top-level aggregate's args reference them by name.
+        let any_agg_output_in_needed = node.output_columns[group_by_len..].iter().any(|col| {
+            col.column_id != crate::sql::column_id::ColumnId::UNSET
+                && needed.contains(&col.column_id)
+        });
+        let has_unset_agg_outputs = node.output_columns[group_by_len..]
+            .iter()
+            .any(|col| col.column_id == crate::sql::column_id::ColumnId::UNSET);
+
+        if !needed.is_empty() && !any_agg_output_in_needed && !has_unset_agg_outputs {
+            // No aggregate output is recognized as needed — cannot safely prune.
+            return Ok(RewriteResult::Unchanged);
+        }
+
         // Group-key output_columns are always kept — semantically required.
         // Filter aggregate output_columns[group_by_len + i] and aggregates[i]
         // together based on whether the output id is in `needed`.
@@ -56,7 +82,16 @@ impl LogicalRewriteRule for PruneAggregateColumns {
 
         for (i, agg) in node.aggregates.into_iter().enumerate() {
             let out_col = &node.output_columns[group_by_len + i];
-            if needed.contains(&out_col.column_id) {
+            // Keep the aggregate if its output id is needed OR if the output id is
+            // UNSET (meaning the AggregatePushdown rule created a synthetic partial-
+            // aggregate output that has not yet been assigned a real ColumnId). We
+            // cannot safely prune an UNSET-id output because the tagging pass skips
+            // UNSET column refs when building `child_needed`, so these synthetic
+            // columns will never appear in `needed` even though they are referenced
+            // by the top-level aggregate's args.
+            let keep = needed.contains(&out_col.column_id)
+                || out_col.column_id == crate::sql::column_id::ColumnId::UNSET;
+            if keep {
                 new_agg_output_columns.push(out_col.clone());
                 new_aggregates.push(agg);
             }

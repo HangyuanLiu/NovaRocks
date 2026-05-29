@@ -78,7 +78,8 @@ fn plan_scoped_query(
         _ => {}
     }
 
-    let mut root = apply_query_modifiers(body_plan, order_by, output_columns, limit, offset, factory);
+    let mut root =
+        apply_query_modifiers(body_plan, order_by, output_columns, limit, offset, factory);
 
     for cte_id in local_cte_ids.into_iter().rev() {
         let entry = cte_registry
@@ -686,7 +687,9 @@ fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[(String, Type
                 substitute_expr_in_place(e, substitutions);
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
             substitute_expr_in_place(inner, substitutions);
             for v in list {
                 substitute_expr_in_place(v, substitutions);
@@ -1761,10 +1764,18 @@ fn plan_iceberg_metadata_scan(
             logical_type: None,
         })
         .collect();
+    // Reuse the ColumnIds that the analyzer already minted for this metadata
+    // table's columns (carried on `rel.column_ids`). Creating fresh ids here
+    // would desync the `ColumnRef` ids in the rest of the plan (SELECT list,
+    // WHERE, etc.) from the scan's output_columns, causing Phase-2 column
+    // pruning to incorrectly prune needed columns (same pattern as Relation::Scan).
     let output_columns: Vec<OutputColumn> = cols
         .iter()
-        .map(|c| OutputColumn {
-            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
+        .enumerate()
+        .map(|(idx, c)| OutputColumn {
+            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
+            }),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
@@ -1942,26 +1953,42 @@ fn plan_iceberg_delta_scan(
     // The delta scan emits both: scanner-side projection re-uses the same
     // column ordering as the base scan, plus the row-lineage virtual columns
     // for downstream row-identity matching.
+    //
+    // Reuse the ColumnIds that the analyzer already minted for this delta scan's
+    // columns (carried on `rel.column_ids`). Creating fresh ids here would desync
+    // the `ColumnRef` ids in the rest of the plan from the scan's output columns,
+    // causing Phase-2 column pruning to incorrectly prune needed scan columns.
+    let base_col_count = rel.table.columns.len();
     let mut output_columns: Vec<OutputColumn> = rel
         .table
         .columns
         .iter()
-        .map(|c| OutputColumn {
-            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
+        .enumerate()
+        .map(|(idx, c)| OutputColumn {
+            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
+            }),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
         })
         .collect();
-    for col in &rel.table.iceberg_row_lineage_metadata_columns {
+    for (meta_idx, col) in rel
+        .table
+        .iceberg_row_lineage_metadata_columns
+        .iter()
+        .enumerate()
+    {
+        let col_id_idx = base_col_count + meta_idx;
         output_columns.push(OutputColumn {
-            column_id: factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable),
+            column_id: rel.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
+                factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable)
+            }),
             name: col.name.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
         });
     }
-
     let table_info = iceberg_table_info(&rel.table.source)
         .ok_or_else(|| {
             format!(

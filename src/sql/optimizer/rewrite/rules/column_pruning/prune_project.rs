@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning_v2::auto_fill_column_id;
+use crate::sql::optimizer::rewrite::rules::column_pruning::auto_fill_column_id;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneProjectColumns;

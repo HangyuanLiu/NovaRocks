@@ -1,8 +1,9 @@
-//! PruneSubqueryAliasColumns — Phase 2 rule for SubqueryAlias nodes.
+//! PruneCTEProduceColumns — Phase 2 rule for CTEProduce nodes.
 //!
-//! Filters `SubqueryAliasNode.output_columns` to only those whose `column_id`
-//! is in `required_output_columns`. Keeps at least one column (the first
-//! original) to preserve a valid output schema (Gap 1).
+//! Filters `CTEProduceNode.output_columns` to only those whose `column_id` is
+//! in `required_output_columns`. Keeps at least one column (the first original).
+//!
+//! Unchanged when `output_columns.len()` is the same as before.
 
 use std::collections::HashSet;
 
@@ -11,14 +12,14 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning_v2::keep_at_least_one;
+use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
-pub(crate) struct PruneSubqueryAliasColumns;
+pub(crate) struct PruneCTEProduceColumns;
 
-impl LogicalRewriteRule for PruneSubqueryAliasColumns {
+impl LogicalRewriteRule for PruneCTEProduceColumns {
     fn name(&self) -> &'static str {
-        "PruneSubqueryAliasColumns"
+        "PruneCTEProduceColumns"
     }
 
     fn phase(&self) -> RewritePhase {
@@ -26,11 +27,11 @@ impl LogicalRewriteRule for PruneSubqueryAliasColumns {
     }
 
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::SubqueryAlias(_))
+        matches!(plan, LogicalPlan::CTEProduce(_))
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::SubqueryAlias(mut node) = plan else {
+        let LogicalPlan::CTEProduce(mut node) = plan else {
             unreachable!()
         };
 
@@ -41,21 +42,19 @@ impl LogicalRewriteRule for PruneSubqueryAliasColumns {
 
         let original_len = node.output_columns.len();
 
-        // Determine which ids to keep.
-        let filtered: HashSet<ColumnId> = node
+        let filtered_ids: HashSet<ColumnId> = node
             .output_columns
             .iter()
             .map(|c| c.column_id)
             .filter(|id| needed.contains(id))
             .collect();
 
-        // Ensure at least one column survives.
         let fallback = node
             .output_columns
             .first()
             .map(|c| c.column_id)
             .unwrap_or(ColumnId::UNSET);
-        let keep_ids = keep_at_least_one(filtered, fallback);
+        let keep_ids = keep_at_least_one(filtered_ids, fallback);
 
         let new_output_columns: Vec<_> = node
             .output_columns
@@ -68,7 +67,7 @@ impl LogicalRewriteRule for PruneSubqueryAliasColumns {
         }
 
         node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::SubqueryAlias(node)))
+        Ok(RewriteResult::Changed(LogicalPlan::CTEProduce(node)))
     }
 }
 
@@ -78,8 +77,9 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{SubqueryAliasNode, ValuesNode};
+    use crate::sql::planner::plan::{CTEProduceNode, ValuesNode};
     use arrow::datatypes::DataType;
+    use std::collections::HashSet;
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -103,17 +103,18 @@ mod tests {
     }
 
     #[test]
-    fn prune_subquery_alias_filters_to_needed_subset() {
+    fn prune_cte_produce_filters_to_needed_subset() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
         let mut needed = HashSet::new();
-        needed.insert(id_b);
+        needed.insert(id_a);
+        needed.insert(id_c);
 
-        let node = SubqueryAliasNode {
+        let node = CTEProduceNode {
+            cte_id: 42,
             input: dummy_input(),
-            alias: "t".to_string(),
             output_columns: vec![
                 make_output_column(id_a, "a"),
                 make_output_column(id_b, "b"),
@@ -122,34 +123,38 @@ mod tests {
             required_output_columns: Some(needed),
         };
 
-        let plan = LogicalPlan::SubqueryAlias(node);
-        let rule = PruneSubqueryAliasColumns;
+        let plan = LogicalPlan::CTEProduce(node);
+        let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::SubqueryAlias(pruned) = changed else {
-            panic!("expected SubqueryAlias");
+        let LogicalPlan::CTEProduce(pruned) = changed else {
+            panic!("expected CTEProduce");
         };
 
-        assert_eq!(pruned.output_columns.len(), 1);
-        assert_eq!(pruned.output_columns[0].column_id, id_b);
+        assert_eq!(pruned.output_columns.len(), 2);
+        let col_ids: HashSet<ColumnId> =
+            pruned.output_columns.iter().map(|c| c.column_id).collect();
+        assert!(col_ids.contains(&id_a));
+        assert!(col_ids.contains(&id_c));
+        assert!(!col_ids.contains(&id_b));
     }
 
     #[test]
-    fn prune_subquery_alias_noop_when_required_output_columns_is_none() {
+    fn prune_cte_produce_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let node = SubqueryAliasNode {
+        let node = CTEProduceNode {
+            cte_id: 5,
             input: dummy_input(),
-            alias: "t".to_string(),
             output_columns: vec![make_output_column(id_a, "a")],
             required_output_columns: None, // not tagged
         };
 
-        let plan = LogicalPlan::SubqueryAlias(node);
-        let rule = PruneSubqueryAliasColumns;
+        let plan = LogicalPlan::CTEProduce(node);
+        let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         assert!(
@@ -159,28 +164,27 @@ mod tests {
     }
 
     #[test]
-    fn prune_subquery_alias_keeps_at_least_one_when_needed_empty() {
+    fn prune_cte_produce_keeps_at_least_one_when_needed_empty() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        // needed is empty — must keep first column.
-        let node = SubqueryAliasNode {
+        let node = CTEProduceNode {
+            cte_id: 7,
             input: dummy_input(),
-            alias: "t".to_string(),
             output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
             required_output_columns: Some(HashSet::new()),
         };
 
-        let plan = LogicalPlan::SubqueryAlias(node);
-        let rule = PruneSubqueryAliasColumns;
+        let plan = LogicalPlan::CTEProduce(node);
+        let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::SubqueryAlias(pruned) = changed else {
-            panic!("expected SubqueryAlias");
+        let LogicalPlan::CTEProduce(pruned) = changed else {
+            panic!("expected CTEProduce");
         };
 
         assert_eq!(pruned.output_columns.len(), 1);

@@ -191,13 +191,34 @@ fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
 
     // For each aggregate, include its input columns only if its output id is
     // in parent_needed (or always when parent_needed is None).
+    //
+    // Safety guard: when parent_needed is Some(non-empty) but NONE of this
+    // aggregate's output column ids appear in it, fall back to treating all
+    // aggregates as needed (same as parent_needed = None). This handles the
+    // Project-over-Aggregate pattern where the Project items contain raw
+    // AggregateCall expressions — in that case Phase-1 tag_project propagates
+    // scan-level arg ids instead of the aggregate's output ids. Without this
+    // guard, the aggregate args (e.g. `amount` for `sum_state(amount)`) would
+    // not be included in child_needed, causing PruneScanColumns to drop them
+    // and breaking aggregate execution.
     let group_by_len = node.group_by.len();
+    let any_agg_output_in_needed = match &parent_needed {
+        None => true, // N/A when parent_needed is None (all are needed)
+        Some(n) => node.output_columns[group_by_len..].iter().any(|col| {
+            col.column_id != ColumnId::UNSET && n.contains(&col.column_id)
+        }),
+    };
+    // When there are aggregates and none of their output ids appear in
+    // parent_needed, treat all aggregates as needed for child_needed computation.
+    let treat_all_needed = !any_agg_output_in_needed && !node.aggregates.is_empty();
+
     for (i, agg) in node.aggregates.iter().enumerate() {
         let agg_output_id = node.output_columns[group_by_len + i].column_id;
-        let is_needed = match &parent_needed {
-            None => true,
-            Some(n) => n.contains(&agg_output_id),
-        };
+        let is_needed = treat_all_needed
+            || match &parent_needed {
+                None => true,
+                Some(n) => n.contains(&agg_output_id),
+            };
         if is_needed {
             for arg in &agg.args {
                 child_needed.extend(collect_column_id_refs(arg));

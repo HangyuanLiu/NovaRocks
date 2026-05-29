@@ -1,6 +1,6 @@
-//! PruneExceptColumns — Phase 2 rule for Except nodes.
+//! PruneUnionColumns — Phase 2 rule for Union nodes.
 //!
-//! Filters `ExceptNode.output_columns` to only those whose `column_id`
+//! Filters `UnionNode.output_columns` to only those whose `column_id`
 //! is in `required_output_columns`. Keeps at least one column to preserve
 //! a valid output schema (Gap 4).
 //!
@@ -18,14 +18,14 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning_v2::keep_at_least_one;
+use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
-pub(crate) struct PruneExceptColumns;
+pub(crate) struct PruneUnionColumns;
 
-impl LogicalRewriteRule for PruneExceptColumns {
+impl LogicalRewriteRule for PruneUnionColumns {
     fn name(&self) -> &'static str {
-        "PruneExceptColumns"
+        "PruneUnionColumns"
     }
 
     fn phase(&self) -> RewritePhase {
@@ -33,11 +33,11 @@ impl LogicalRewriteRule for PruneExceptColumns {
     }
 
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Except(_))
+        matches!(plan, LogicalPlan::Union(_))
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Except(mut node) = plan else {
+        let LogicalPlan::Union(mut node) = plan else {
             unreachable!()
         };
 
@@ -75,7 +75,7 @@ impl LogicalRewriteRule for PruneExceptColumns {
         }
 
         node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::Except(node)))
+        Ok(RewriteResult::Changed(LogicalPlan::Union(node)))
     }
 }
 
@@ -85,7 +85,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{ExceptNode, ValuesNode};
+    use crate::sql::planner::plan::{UnionNode, ValuesNode};
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_except_filters_to_needed_subset() {
+    fn prune_union_filters_to_needed_subset() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
@@ -118,8 +118,9 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let node = ExceptNode {
+        let node = UnionNode {
             inputs: vec![dummy_input(), dummy_input()],
+            all: true,
             output_columns: vec![
                 make_output_column(id_a, "a"),
                 make_output_column(id_b, "b"),
@@ -128,16 +129,16 @@ mod tests {
             required_output_columns: Some(needed),
         };
 
-        let plan = LogicalPlan::Except(node);
-        let rule = PruneExceptColumns;
+        let plan = LogicalPlan::Union(node);
+        let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Except(pruned) = changed else {
-            panic!("expected Except");
+        let LogicalPlan::Union(pruned) = changed else {
+            panic!("expected Union");
         };
 
         assert_eq!(pruned.output_columns.len(), 1);
@@ -147,17 +148,18 @@ mod tests {
     }
 
     #[test]
-    fn prune_except_noop_when_required_output_columns_is_none() {
+    fn prune_union_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
 
-        let node = ExceptNode {
+        let node = UnionNode {
             inputs: vec![dummy_input()],
+            all: false,
             output_columns: vec![make_output_column(id_a, "a")],
             required_output_columns: None, // not tagged
         };
 
-        let plan = LogicalPlan::Except(node);
-        let rule = PruneExceptColumns;
+        let plan = LogicalPlan::Union(node);
+        let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         assert!(
@@ -167,27 +169,28 @@ mod tests {
     }
 
     #[test]
-    fn prune_except_keeps_at_least_one_when_needed_empty() {
+    fn prune_union_keeps_at_least_one_when_needed_empty() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
         // needed is empty — must keep first column.
-        let node = ExceptNode {
+        let node = UnionNode {
             inputs: vec![dummy_input()],
+            all: true,
             output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
             required_output_columns: Some(HashSet::new()),
         };
 
-        let plan = LogicalPlan::Except(node);
-        let rule = PruneExceptColumns;
+        let plan = LogicalPlan::Union(node);
+        let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Except(pruned) = changed else {
-            panic!("expected Except");
+        let LogicalPlan::Union(pruned) = changed else {
+            panic!("expected Union");
         };
 
         assert_eq!(pruned.output_columns.len(), 1);

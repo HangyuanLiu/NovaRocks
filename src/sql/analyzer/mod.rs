@@ -1812,16 +1812,11 @@ impl<'a> AnalyzerContext<'a> {
                         // for plain identifiers; AST-text matching is still
                         // useful for `ORDER BY a.c` echoing `SELECT a.c`,
                         // where preserving qualifiers matters.
-                        let ob_is_bare_ident = matches!(
-                            ob.expr,
-                            sqlast::Expr::Identifier(_)
-                        );
+                        let ob_is_bare_ident = matches!(ob.expr, sqlast::Expr::Identifier(_));
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
-                            if ob_is_bare_ident
-                                && ir_item.output_name.to_lowercase() == ob_text
-                            {
+                            if ob_is_bare_ident && ir_item.output_name.to_lowercase() == ob_text {
                                 let col_id = match &ir_item.expr.kind {
                                     ExprKind::ColumnRef { column_id, .. } => *column_id,
                                     _ => self.alloc_column_id(
@@ -4146,11 +4141,7 @@ mod tests {
             panic!("expected Select body");
         };
 
-        assert_eq!(
-            select.projection.len(),
-            2,
-            "expected two projection items"
-        );
+        assert_eq!(select.projection.len(), 2, "expected two projection items");
         assert_eq!(
             resolved.output_columns.len(),
             2,
@@ -4166,8 +4157,7 @@ mod tests {
             "computed item must not have UNSET output_column_id"
         );
         assert_eq!(
-            computed_item.output_column_id,
-            computed_out_col.column_id,
+            computed_item.output_column_id, computed_out_col.column_id,
             "computed item output_column_id must match the output_columns entry"
         );
 
@@ -4180,15 +4170,13 @@ mod tests {
             "passthrough item must not have UNSET output_column_id"
         );
         assert_eq!(
-            passthrough_item.output_column_id,
-            passthrough_out_col.column_id,
+            passthrough_item.output_column_id, passthrough_out_col.column_id,
             "passthrough item output_column_id must match the output_columns entry"
         );
 
         // The two items must have distinct ids.
         assert_ne!(
-            computed_item.output_column_id,
-            passthrough_item.output_column_id,
+            computed_item.output_column_id, passthrough_item.output_column_id,
             "each projection item must receive a distinct output_column_id"
         );
     }

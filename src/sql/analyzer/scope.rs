@@ -313,8 +313,9 @@ impl AnalyzerScope {
         &mut self,
         qualifier: &str,
         columns: &[crate::sql::catalog::ColumnDef],
-    ) {
+    ) -> Vec<crate::sql::column_id::ColumnId> {
         let q_lower = qualifier.to_lowercase();
+        let mut ids = Vec::with_capacity(columns.len());
         for col in columns {
             let name_lower = col.name.to_lowercase();
             let id = self.factory.borrow_mut().create(
@@ -329,7 +330,9 @@ impl AnalyzerScope {
             );
             self.unqualified
                 .insert(name_lower, (id, col.data_type.clone(), col.nullable));
+            ids.push(id);
         }
+        ids
     }
 
     /// Merge another scope into this one (for JOINs).

@@ -1,6 +1,6 @@
-//! PruneCTEProduceColumns — Phase 2 rule for CTEProduce nodes.
+//! PruneCTEConsumeColumns — Phase 2 rule for CTEConsume nodes.
 //!
-//! Filters `CTEProduceNode.output_columns` to only those whose `column_id` is
+//! Filters `CTEConsumeNode.output_columns` to only those whose `column_id` is
 //! in `required_output_columns`. Keeps at least one column (the first original).
 //!
 //! Unchanged when `output_columns.len()` is the same as before.
@@ -12,14 +12,14 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning_v2::keep_at_least_one;
+use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
-pub(crate) struct PruneCTEProduceColumns;
+pub(crate) struct PruneCTEConsumeColumns;
 
-impl LogicalRewriteRule for PruneCTEProduceColumns {
+impl LogicalRewriteRule for PruneCTEConsumeColumns {
     fn name(&self) -> &'static str {
-        "PruneCTEProduceColumns"
+        "PruneCTEConsumeColumns"
     }
 
     fn phase(&self) -> RewritePhase {
@@ -27,11 +27,11 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
     }
 
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::CTEProduce(_))
+        matches!(plan, LogicalPlan::CTEConsume(_))
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::CTEProduce(mut node) = plan else {
+        let LogicalPlan::CTEConsume(mut node) = plan else {
             unreachable!()
         };
 
@@ -67,7 +67,7 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
         }
 
         node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::CTEProduce(node)))
+        Ok(RewriteResult::Changed(LogicalPlan::CTEConsume(node)))
     }
 }
 
@@ -77,7 +77,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{CTEProduceNode, ValuesNode};
+    use crate::sql::planner::plan::CTEConsumeNode;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -94,27 +94,18 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> Box<LogicalPlan> {
-        Box::new(LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        }))
-    }
-
     #[test]
-    fn prune_cte_produce_filters_to_needed_subset() {
+    fn prune_cte_consume_filters_to_needed_subset() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
         let mut needed = HashSet::new();
-        needed.insert(id_a);
-        needed.insert(id_c);
+        needed.insert(id_b);
 
-        let node = CTEProduceNode {
-            cte_id: 42,
-            input: dummy_input(),
+        let node = CTEConsumeNode {
+            cte_id: 1,
+            alias: "cte1".to_string(),
             output_columns: vec![
                 make_output_column(id_a, "a"),
                 make_output_column(id_b, "b"),
@@ -123,38 +114,34 @@ mod tests {
             required_output_columns: Some(needed),
         };
 
-        let plan = LogicalPlan::CTEProduce(node);
-        let rule = PruneCTEProduceColumns;
+        let plan = LogicalPlan::CTEConsume(node);
+        let rule = PruneCTEConsumeColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::CTEProduce(pruned) = changed else {
-            panic!("expected CTEProduce");
+        let LogicalPlan::CTEConsume(pruned) = changed else {
+            panic!("expected CTEConsume");
         };
 
-        assert_eq!(pruned.output_columns.len(), 2);
-        let col_ids: HashSet<ColumnId> =
-            pruned.output_columns.iter().map(|c| c.column_id).collect();
-        assert!(col_ids.contains(&id_a));
-        assert!(col_ids.contains(&id_c));
-        assert!(!col_ids.contains(&id_b));
+        assert_eq!(pruned.output_columns.len(), 1);
+        assert_eq!(pruned.output_columns[0].column_id, id_b);
     }
 
     #[test]
-    fn prune_cte_produce_noop_when_required_output_columns_is_none() {
+    fn prune_cte_consume_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let node = CTEProduceNode {
-            cte_id: 5,
-            input: dummy_input(),
+        let node = CTEConsumeNode {
+            cte_id: 2,
+            alias: "cte2".to_string(),
             output_columns: vec![make_output_column(id_a, "a")],
             required_output_columns: None, // not tagged
         };
 
-        let plan = LogicalPlan::CTEProduce(node);
-        let rule = PruneCTEProduceColumns;
+        let plan = LogicalPlan::CTEConsume(node);
+        let rule = PruneCTEConsumeColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         assert!(
@@ -164,27 +151,27 @@ mod tests {
     }
 
     #[test]
-    fn prune_cte_produce_keeps_at_least_one_when_needed_empty() {
+    fn prune_cte_consume_keeps_at_least_one_when_needed_empty() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        let node = CTEProduceNode {
-            cte_id: 7,
-            input: dummy_input(),
+        let node = CTEConsumeNode {
+            cte_id: 3,
+            alias: "cte3".to_string(),
             output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
             required_output_columns: Some(HashSet::new()),
         };
 
-        let plan = LogicalPlan::CTEProduce(node);
-        let rule = PruneCTEProduceColumns;
+        let plan = LogicalPlan::CTEConsume(node);
+        let rule = PruneCTEConsumeColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::CTEProduce(pruned) = changed else {
-            panic!("expected CTEProduce");
+        let LogicalPlan::CTEConsume(pruned) = changed else {
+            panic!("expected CTEConsume");
         };
 
         assert_eq!(pruned.output_columns.len(), 1);

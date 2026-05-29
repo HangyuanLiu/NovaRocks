@@ -171,6 +171,10 @@ pub(crate) struct IcebergMetadataScanRelation {
     pub metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     /// FROM-clause alias (e.g., `t$snapshots AS s` → `Some("s")`).
     pub alias: Option<String>,
+    /// Analyzer-allocated ColumnIds for each metadata column, in schema order.
+    /// The planner reuses these to keep ColumnRef ids in the rest of the plan
+    /// consistent with the scan's output column ids (same pattern as `Relation::Scan`).
+    pub column_ids: Vec<crate::sql::column_id::ColumnId>,
 }
 
 /// IVM-A1 plan-time delta-scan reference: the analyzer's output for a
@@ -193,6 +197,12 @@ pub(crate) struct IcebergDeltaScanRelation {
     pub to_snapshot_id: i64,
     /// Optional FROM-clause alias (`__nr_ivm_delta(...) AS t` → `Some("t")`).
     pub alias: Option<String>,
+    /// Analyzer-allocated ColumnIds for base table columns + row-lineage metadata
+    /// columns, in schema order (base columns first, then metadata columns). The
+    /// planner reuses these instead of minting fresh ids so ColumnRef ids in the
+    /// rest of the plan (SELECT list, WHERE, GROUP BY, etc.) match the scan's
+    /// output column ids (same pattern as `Relation::Scan`).
+    pub column_ids: Vec<crate::sql::column_id::ColumnId>,
 }
 
 #[derive(Clone, Debug)]
