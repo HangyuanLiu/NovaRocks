@@ -336,16 +336,27 @@ impl<'a> AnalyzerContext<'a> {
             QueryBody::Select(sel) => (sel.from, sel.filter),
             _ => return Err("correlated EXISTS subquery must be a SELECT".into()),
         };
-        // Pick the first projection column as the match indicator. For
-        // EXISTS with arbitrary projection this is fine — we just need a
-        // non-null indicator when a matching row exists.
-        let indicator = resolved_sub
-            .output_columns
-            .first()
-            .ok_or("EXISTS subquery must produce at least one column")?
-            .clone();
         let sub_rel =
             sub_from.ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
+
+        // Pick the first output column of the FROM relation as the match indicator.
+        //
+        // We intentionally do NOT use `resolved_sub.output_columns.first()` here.
+        // When the EXISTS subquery is `SELECT 1 FROM rel WHERE <corr>`, the
+        // first projection output is the literal `1` — a freshly-allocated
+        // ColumnId that is only present in the SELECT projection, which is
+        // *discarded* when we deconstruct the subquery into `(FROM, WHERE)`.
+        // Referencing that ColumnId in the IS NOT NULL replacement expression
+        // would produce "Column '1' cannot be resolved" at codegen time because
+        // the column never materialises in the physical plan.
+        //
+        // Instead, use the first column of `sub_rel` (the FROM relation). This
+        // column IS in the plan (it is attached via `attach_aux_join`) and its
+        // value is non-NULL whenever the correlated subquery matches a row,
+        // which is exactly the semantics we need for the EXISTS IS NOT NULL check.
+        let indicator = relation_first_output_column(&sub_rel).ok_or(
+            "correlated EXISTS subquery: FROM relation has no output column for indicator"
+        )?;
 
         let side = match sub_filter.as_ref() {
             Some(f) => choose_aux_join_side(join, std::slice::from_ref(f)),
@@ -2326,6 +2337,65 @@ fn dummy_relation() -> Relation {
         column_name: "__nr_dummy".to_string(),
         alias: None,
     })
+}
+
+/// Return the first output column from `rel` that is actually produced by the
+/// physical plan when `rel` is attached as an auxiliary join.
+///
+/// Used by `rewrite_join_on_exists_correlated` to pick an indicator column
+/// for the `IS NOT NULL` check.  The indicator MUST come from the relation
+/// that is attached to the plan (i.e. `sub_rel`), NOT from the subquery's
+/// SELECT projection — the projection is discarded when the EXISTS subquery
+/// is deconstructed into `(FROM, WHERE)` and the `SELECT <projection>` is
+/// not materialised.
+///
+/// For `CTEConsume` and `Subquery` relations the output_columns are
+/// authoritative.  For `Scan`-family relations we pair the first table column
+/// with its analyzer-allocated ColumnId.  For `Join` we recurse left.  If no
+/// column can be determined, return `None` and let the caller fall back.
+fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
+    match rel {
+        Relation::CTEConsume { output_columns, .. } => output_columns.first().cloned(),
+        Relation::Subquery { output_columns, .. } => output_columns.first().cloned(),
+        Relation::Unnest(u) => u.output_columns.first().cloned(),
+        Relation::Scan(s) => {
+            // Pair the first table column definition with its analyzer ColumnId.
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+            })
+        }
+        Relation::IcebergMetadataScan(s) => {
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+            })
+        }
+        Relation::IcebergDeltaScan(s) => {
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+            })
+        }
+        Relation::Join(j) => relation_first_output_column(&j.left),
+        Relation::GenerateSeries(_) => {
+            // GenerateSeries has no ColumnId on its output (only a column_name string).
+            // Cannot produce a ColumnId-addressable indicator from it.
+            None
+        }
+    }
 }
 
 /// Wrap `join.left` (or `join.right`) with a LEFT OUTER JOIN against the

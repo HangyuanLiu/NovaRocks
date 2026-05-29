@@ -1,35 +1,27 @@
 //! PruneWindowColumns — Phase 2 rule for Window nodes.
 //!
-//! ## Window node layout
+//! ## Gap-5: Window output pruning is intentionally deferred (NO-OP)
 //!
-//! `WindowNode.output_columns` is built from `original_projection` — the full
-//! SELECT-list in declaration order, containing both passthrough columns (no
-//! window call in their expr) and window-result columns (have a window call).
+//! `WindowNode.output_columns` is built by `build_window_and_project` in the
+//! planner using **fresh factory-allocated ColumnIds** (`factory.create(...)`),
+//! one per item in the original SELECT projection.  These fresh ids are
+//! distinct from the ColumnIds carried by the child scan/project items, and
+//! the name-based `output_name` ↔ `window_exprs[i].output_name` matching used
+//! by the old pruning strategy is fragile: in some query shapes the name
+//! match over-prunes and leaves `window_exprs` empty, which codegen rejects
+//! with "empty window_exprs".
 //!
-//! `WindowNode.window_exprs` contains only the extracted window calls. Each
-//! `WindowExpr.output_name` matches the `output_columns[j].name` of the
-//! SELECT-list item that contained it.
+//! Safe pruning of Window output_columns requires a correct ColumnId contract
+//! between the Window node's `output_columns` entries and the window function
+//! output slots — equivalent to the `output_column_id` fix applied to
+//! `ProjectItem` (Gap 2).  Until that contract is established, this rule is a
+//! documented NO-OP.
 //!
-//! Pruning strategy:
-//! 1. Build a set of `window_expr.output_name` → presence, for quick lookup.
-//! 2. For each `output_columns[i]`:
-//!    a. If it is a passthrough column (no matching window_expr name), keep it
-//!       iff its id is in `needed`.
-//!    b. If it is a window-result column (matches a window_expr by name), keep
-//!       both the output_column and the window_expr iff its id is in `needed`.
-//! 3. Keep at least one output column.
+//! `tag_window` already passes `None` (keep-all) to the child, so the child
+//! keeps all its input columns as well.  This is consistent and safe.
 //!
-//! Unchanged when both `window_exprs.len()` and `output_columns.len()` are
-//! the same as before (nothing pruned).
-//!
-//! **Safety**: the name-based matching is deterministic because the planner
-//! builds `output_columns` from `original_projection` items and sets
-//! `window_expr.output_name = item.output_name`. If any ambiguity arises in
-//! future (e.g. duplicate output names), the rule is conservative: a name
-//! that appears in multiple window_exprs will match multiple output_columns,
-//! and both will be treated as window-result columns.
-
-use std::collections::{HashMap, HashSet};
+//! Follow-up: re-enable pruning here once `WindowExpr` carries a stable
+//! `output_column_id` that the parent can address without name matching.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -52,91 +44,19 @@ impl LogicalRewriteRule for PruneWindowColumns {
         matches!(plan, LogicalPlan::Window(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Window(mut node) = plan else {
-            unreachable!()
-        };
-
-        // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
-            return Ok(RewriteResult::Unchanged);
-        };
-
-        let original_output_len = node.output_columns.len();
-        let original_window_len = node.window_exprs.len();
-
-        // Build a map: window_expr_output_name → window_expr index.
-        // Multiple window_exprs may share a name if items have the same
-        // output_name (unusual but handle conservatively).
-        let mut window_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, we) in node.window_exprs.iter().enumerate() {
-            window_by_name
-                .entry(we.output_name.as_str())
-                .or_default()
-                .push(i);
-        }
-
-        // Walk output_columns, deciding which to keep and which window_exprs to retain.
-        // We track which window_expr indices survive.
-        let mut kept_output_columns = Vec::new();
-        let mut kept_window_expr_indices: HashSet<usize> = HashSet::new();
-
-        for col in &node.output_columns {
-            if let Some(indices) = window_by_name.get(col.name.as_str()) {
-                // Window-result column: keep iff in needed.
-                if needed.contains(&col.column_id) {
-                    kept_output_columns.push(col.clone());
-                    for &idx in indices {
-                        kept_window_expr_indices.insert(idx);
-                    }
-                }
-            } else {
-                // Passthrough column: keep iff in needed.
-                if needed.contains(&col.column_id) {
-                    kept_output_columns.push(col.clone());
-                }
-            }
-        }
-
-        // Ensure at least one output column survives.
-        if kept_output_columns.is_empty() {
-            // Keep the first output column (passthrough preferred, otherwise first overall).
-            if let Some(first) = node.output_columns.first() {
-                kept_output_columns.push(first.clone());
-                // If the first column is a window result, also keep its window_expr(s).
-                if let Some(indices) = window_by_name.get(first.name.as_str()) {
-                    for &idx in indices {
-                        kept_window_expr_indices.insert(idx);
-                    }
-                }
-            }
-        }
-
-        // Build new window_exprs in original index order, keeping only those with a
-        // surviving index.
-        let new_window_exprs: Vec<WindowExpr> = node
-            .window_exprs
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, we)| {
-                if kept_window_expr_indices.contains(&i) {
-                    Some(we)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Unchanged check: nothing pruned if both lens are the same.
-        if kept_output_columns.len() == original_output_len
-            && new_window_exprs.len() == original_window_len
-        {
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        node.output_columns = kept_output_columns;
-        node.window_exprs = new_window_exprs;
-        Ok(RewriteResult::Changed(LogicalPlan::Window(node)))
+    fn apply(
+        &self,
+        _plan: LogicalPlan,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        // NO-OP: Window output pruning is deferred (Gap-5).
+        // Window.output_columns use fresh planner-allocated ColumnIds that
+        // don't correlate cleanly with the parent's required_output_columns set.
+        // Name-based pruning (matching output_column.name to window_expr.output_name)
+        // over-prunes in some query shapes, leaving window_exprs empty and
+        // causing a codegen error. Return Unchanged always until a proper
+        // ColumnId contract is established for WindowExpr outputs.
+        Ok(RewriteResult::Unchanged)
     }
 }
 
@@ -210,17 +130,15 @@ mod tests {
         }))
     }
 
+    /// PruneWindowColumns is always a NO-OP regardless of required_output_columns.
+    /// Window output_columns use fresh planner-allocated ColumnIds (Gap-5 deferred).
     #[test]
-    fn prune_window_drops_unneeded_window_exprs_and_output_columns() {
-        // Window node with 2 passthrough cols and 2 window result cols.
-        // output_columns: [a@1(passthrough), b@2(passthrough), rn1@101(window "rn1"), rn2@102(window "rn2")]
-        // window_exprs: [row_number→"rn1", rank→"rn2"]
-        // needed = {1, 101}  (a + rn1; b and rn2 not needed)
+    fn prune_window_is_always_noop() {
         let id_a = ColumnId::new_for_test(1);
-        let id_b = ColumnId::new_for_test(2);
         let id_rn1 = ColumnId::new_for_test(101);
         let id_rn2 = ColumnId::new_for_test(102);
 
+        // Only id_a and id_rn1 are needed — but the rule must still be a NO-OP.
         let mut needed = HashSet::new();
         needed.insert(id_a);
         needed.insert(id_rn1);
@@ -230,7 +148,6 @@ mod tests {
             window_exprs: vec![make_window_expr("rn1"), make_window_expr("rn2")],
             output_columns: vec![
                 make_output_column(id_a, "a"),
-                make_output_column(id_b, "b"),
                 make_output_column(id_rn1, "rn1"),
                 make_output_column(id_rn2, "rn2"),
             ],
@@ -241,26 +158,10 @@ mod tests {
         let rule = PruneWindowColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Window(pruned) = changed else {
-            panic!("expected Window");
-        };
-
-        // output_columns: a + rn1 (2 columns).
-        assert_eq!(pruned.output_columns.len(), 2);
-        let col_ids: HashSet<ColumnId> =
-            pruned.output_columns.iter().map(|c| c.column_id).collect();
-        assert!(col_ids.contains(&id_a));
-        assert!(col_ids.contains(&id_rn1));
-        assert!(!col_ids.contains(&id_b));
-        assert!(!col_ids.contains(&id_rn2));
-
-        // window_exprs: only "rn1" survives.
-        assert_eq!(pruned.window_exprs.len(), 1);
-        assert_eq!(pruned.window_exprs[0].output_name, "rn1");
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "PruneWindowColumns must always return Unchanged (Gap-5 no-op)"
+        );
     }
 
     #[test]
@@ -275,7 +176,7 @@ mod tests {
                 make_output_column(id_a, "a"),
                 make_output_column(id_rn, "rn"),
             ],
-            required_output_columns: None, // not tagged
+            required_output_columns: None,
         };
 
         let plan = LogicalPlan::Window(node);
@@ -288,9 +189,9 @@ mod tests {
         );
     }
 
+    /// Even with an empty needed set, PruneWindowColumns must be a NO-OP.
     #[test]
-    fn prune_window_keeps_at_least_one_col() {
-        // needed is empty — must keep at least one column and its window_expr if applicable.
+    fn prune_window_noop_even_with_empty_needed() {
         let id_a = ColumnId::new_for_test(1);
         let id_rn = ColumnId::new_for_test(101);
 
@@ -308,17 +209,9 @@ mod tests {
         let rule = PruneWindowColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Window(pruned) = changed else {
-            panic!("expected Window");
-        };
-
         assert!(
-            !pruned.output_columns.is_empty(),
-            "must keep at least one output column"
+            matches!(result, RewriteResult::Unchanged),
+            "PruneWindowColumns must always be a NO-OP (Gap-5 deferred)"
         );
     }
 }
