@@ -31,12 +31,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning_v2::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneWindowColumns;
@@ -112,19 +110,6 @@ impl LogicalRewriteRule for PruneWindowColumns {
                     }
                 }
             }
-        } else {
-            // Also apply keep_at_least_one logic via ids for safety.
-            let kept_ids: HashSet<ColumnId> =
-                kept_output_columns.iter().map(|c| c.column_id).collect();
-            let fallback = node
-                .output_columns
-                .first()
-                .map(|c| c.column_id)
-                .unwrap_or(ColumnId::UNSET);
-            let safe_ids = keep_at_least_one(kept_ids, fallback);
-            // If keep_at_least_one added back the fallback, add it to kept_output_columns.
-            // (This only fires when kept_output_columns was empty, already handled above.)
-            let _ = safe_ids; // used implicitly via kept_output_columns being non-empty
         }
 
         // Build new window_exprs in original index order, keeping only those with a

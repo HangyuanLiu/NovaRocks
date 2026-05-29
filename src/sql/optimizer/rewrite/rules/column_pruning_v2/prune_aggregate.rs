@@ -42,6 +42,12 @@ impl LogicalRewriteRule for PruneAggregateColumns {
         let group_by_len = node.group_by.len();
         let original_agg_len = node.aggregates.len();
 
+        debug_assert_eq!(
+            node.output_columns.len(),
+            group_by_len + node.aggregates.len(),
+            "PruneAggregateColumns: expected output_columns = group_by ++ aggregates layout"
+        );
+
         // Group-key output_columns are always kept — semantically required.
         // Filter aggregate output_columns[group_by_len + i] and aggregates[i]
         // together based on whether the output id is in `needed`.

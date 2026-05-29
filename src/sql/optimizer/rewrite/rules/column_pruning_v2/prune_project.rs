@@ -56,7 +56,8 @@ impl LogicalRewriteRule for PruneProjectColumns {
             .collect();
 
         // If all items were filtered out, insert one auto-fill placeholder.
-        if new_items.is_empty() {
+        let was_auto_filled = new_items.is_empty();
+        if was_auto_filled {
             let fill_id = auto_fill_column_id(ctx).unwrap_or(ColumnId::UNSET);
             let fill_name = format!("auto_fill_{}", fill_id.0);
             new_items.push(ProjectItem {
@@ -71,7 +72,10 @@ impl LogicalRewriteRule for PruneProjectColumns {
         }
 
         // Unchanged check: same number of items as before means nothing was pruned.
-        if new_items.len() == original_len {
+        // BUT: if auto-fill fired, we must return Changed even when lengths coincidentally
+        // match (e.g. single-item Project whose only item was dropped and replaced by the
+        // auto-fill const).
+        if !was_auto_filled && new_items.len() == original_len {
             return Ok(RewriteResult::Unchanged);
         }
 
@@ -282,6 +286,64 @@ mod tests {
         assert!(
             matches!(pruned.items[0].expr.kind, ExprKind::Literal(_)),
             "auto-fill expr must be a literal"
+        );
+    }
+
+    /// Regression test for the false-Unchanged bug: a Project with exactly ONE item
+    /// whose `output_column_id` is NOT in `needed`. Auto-fill fires and replaces the
+    /// single item — lengths coincidentally match (1 == 1) but the result must be
+    /// `Changed` and the surviving item must be the auto-fill const, not the original.
+    #[test]
+    fn prune_project_single_item_dropped_auto_fill_is_changed() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_unknown = ColumnId::new_for_test(999);
+
+        let id_b = ColumnId::new_for_test(2);
+        let id_c = ColumnId::new_for_test(3);
+
+        let mut node = ProjectNode {
+            input: Box::new(make_scan(id_a, id_b, id_c)),
+            items: vec![col_ref_item(id_a, "a")], // single item, NOT in needed
+            required_output_columns: None,
+        };
+
+        // needed = {999} — not present in the single item's output_column_id.
+        let mut needed = HashSet::new();
+        needed.insert(id_unknown);
+        node.required_output_columns = Some(needed);
+
+        let plan = LogicalPlan::Project(node);
+        let rule = PruneProjectColumns;
+        let mut ctx = ctx_with_factory();
+        let result = rule.apply(plan, &mut ctx).unwrap();
+
+        // Must be Changed — not Unchanged — even though original_len == new_items.len() == 1.
+        let changed = match result {
+            RewriteResult::Changed(p) => p,
+            other => panic!(
+                "expected Changed but got {:?} — auto-fill false-Unchanged bug is present",
+                other
+            ),
+        };
+        let LogicalPlan::Project(pruned) = changed else {
+            panic!("expected Project");
+        };
+
+        assert_eq!(
+            pruned.items.len(),
+            1,
+            "must have exactly one item (auto-fill)"
+        );
+        // The surviving item must be the auto-fill const literal, not the original column ref.
+        assert!(
+            matches!(pruned.items[0].expr.kind, ExprKind::Literal(_)),
+            "surviving item must be the auto-fill literal, not the original ColumnRef"
+        );
+        // The output name must follow the auto_fill_ convention, not the original "a".
+        assert!(
+            pruned.items[0].output_name.starts_with("auto_fill_"),
+            "auto-fill item name must start with 'auto_fill_', got: {}",
+            pruned.items[0].output_name
         );
     }
 }
