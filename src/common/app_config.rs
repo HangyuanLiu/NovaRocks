@@ -80,13 +80,13 @@ impl ClusterConfig {
                         "role=fe requires at least one backend in [cluster].backends".into(),
                     );
                 }
-                for b in &self.backends {
-                    b.parse::<std::net::SocketAddr>()
-                        .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?;
-                }
                 let mut seen = std::collections::HashSet::new();
                 for b in &self.backends {
-                    if !seen.insert(b.clone()) {
+                    let canonical = b
+                        .parse::<std::net::SocketAddr>()
+                        .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?
+                        .to_string();
+                    if !seen.insert(canonical) {
                         return Err(format!("duplicate backend in [cluster].backends: {}", b));
                     }
                 }

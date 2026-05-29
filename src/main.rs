@@ -1119,22 +1119,28 @@ mod tests {
 
     #[test]
     fn test_fe_startup_dials_all_backends() {
-        let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let p1 = l1.local_addr().unwrap().port();
-        let p2 = l2.local_addr().unwrap().port();
-        drop(l1);
-        drop(l2);
-        let backends = vec![format!("127.0.0.1:{}", p1), format!("127.0.0.1:{}", p2)];
-        let err = probe_all_backends(&backends).expect_err("all backends down should fail");
+        // Keep the first backend live so probe_all_backends must successfully dial
+        // it, then fail on the second (dead) one. This proves the probe walks past
+        // a reachable backend rather than short-circuiting on the first entry.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let backends = vec![
+            format!("127.0.0.1:{live_port}"),
+            format!("127.0.0.1:{dead_port}"),
+        ];
+        let err = probe_all_backends(&backends).expect_err("second backend down should fail");
         assert!(
-            err.contains("127.0.0.1")
-                && (err.contains(&p1.to_string()) || err.contains(&p2.to_string()))
+            err.contains("backend 1") && err.contains(&dead_port.to_string()),
+            "error must name backend index 1 and the dead port: {err}"
         );
+        drop(live);
     }
 
     #[test]
-    fn test_fe_startup_reports_unreachable_backend() {
+    fn test_fe_startup_reports_first_unreachable_backend() {
         let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let live_port = live.local_addr().unwrap().port();
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
