@@ -2726,6 +2726,7 @@ fn execute_join_aggregate_delta_branch(
         None,
         None,
         Some(&*catalogs_guard),
+        None,
     );
     drop(catalogs_guard);
     let result = result?;
@@ -5888,6 +5889,7 @@ fn first_refresh_iceberg_join_mv(
             None,
             Some(Box::new(sink)),
             Some(&*catalogs_guard),
+            None,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
@@ -6633,6 +6635,7 @@ fn execute_join_delta_branches(
             None,
             Some(Box::new(sink)),
             Some(&*catalogs_guard),
+            None,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
@@ -7268,6 +7271,7 @@ fn incremental_refresh_iceberg_mv(
             None,
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
+            None,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
