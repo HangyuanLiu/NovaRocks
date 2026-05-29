@@ -205,11 +205,16 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
 fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::CTEConsume(node) if node.cte_id == cte_id => {
+            // Carry the CTEConsume's column-pruning tag onto the replacement
+            // SubqueryAlias for consistency with every other reconstruction site.
+            // Harmless today (CTE inline runs after Phase-2 pruning, so the tag is
+            // no longer read), but avoids silently dropping it if the pipeline
+            // order ever changes.
             LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Box::new(replacement.clone()),
                 alias: node.alias,
                 output_columns: node.output_columns,
-                required_output_columns: None,
+                required_output_columns: node.required_output_columns,
             })
         }
         LogicalPlan::Scan(_)
