@@ -16,7 +16,7 @@ use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ProjectNode};
+use crate::sql::planner::plan::LogicalPlan;
 
 pub(crate) struct InjectApplyKeyProjectRule {
     fired: AtomicBool,
@@ -39,7 +39,10 @@ fn root_row_id_ref(plan: &LogicalPlan) -> Option<(ColumnId, String)> {
             .iter()
             .find(|i| i.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
         {
-            if let ExprKind::ColumnRef { column_id, column, .. } = &item.expr.kind {
+            if let ExprKind::ColumnRef {
+                column_id, column, ..
+            } = &item.expr.kind
+            {
                 return Some((*column_id, column.clone()));
             }
         }
@@ -52,10 +55,10 @@ fn root_row_id_ref(plan: &LogicalPlan) -> Option<(ColumnId, String)> {
 
 fn output_has_apply_key(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Project(p) => p
-            .items
-            .iter()
-            .any(|i| i.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)),
+        LogicalPlan::Project(p) => p.items.iter().any(|i| {
+            i.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+        }),
         _ => false,
     }
 }
@@ -102,14 +105,38 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                 p.items.push(apply_item);
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
-            // Defensive wrap for non-Project roots. Projection/filter MVs always
-            // plan a root Project; if a future shape reaches this arm it will lose
-            // visible output and V6/V4 validation will reject it with a clear error.
-            other => Ok(RewriteResult::Changed(LogicalPlan::Project(ProjectNode {
-                input: Box::new(other),
-                items: vec![apply_item],
-            }))),
+            other => Err(format!(
+                "InjectApplyKeyProject expected root Project for PF MV rewrite, got {}",
+                plan_kind(&other)
+            )),
         }
+    }
+}
+
+fn plan_kind(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan(_) => "Scan",
+        LogicalPlan::Filter(_) => "Filter",
+        LogicalPlan::Project(_) => "Project",
+        LogicalPlan::Aggregate(_) => "Aggregate",
+        LogicalPlan::Join(_) => "Join",
+        LogicalPlan::Sort(_) => "Sort",
+        LogicalPlan::Limit(_) => "Limit",
+        LogicalPlan::Union(_) => "Union",
+        LogicalPlan::Intersect(_) => "Intersect",
+        LogicalPlan::Except(_) => "Except",
+        LogicalPlan::Values(_) => "Values",
+        LogicalPlan::GenerateSeries(_) => "GenerateSeries",
+        LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Window(_) => "Window",
+        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
+        LogicalPlan::Repeat(_) => "Repeat",
+        LogicalPlan::CTEAnchor(_) => "CTEAnchor",
+        LogicalPlan::CTEProduce(_) => "CTEProduce",
+        LogicalPlan::CTEConsume(_) => "CTEConsume",
+        LogicalPlan::Decode(_) => "Decode",
+        LogicalPlan::ImvDelta(_) => "ImvDelta",
+        LogicalPlan::ImvVersion(_) => "ImvVersion",
     }
 }
 
@@ -123,15 +150,17 @@ mod tests {
     use super::*;
     use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-    use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode};
+    use crate::sql::planner::plan::{FilterNode, LogicalPlan, ProjectNode, ScanNode};
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -233,10 +262,10 @@ mod tests {
         else {
             panic!("expected Changed(Project)");
         };
-        assert!(root
-            .items
-            .iter()
-            .any(|i| i.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)));
+        assert!(root.items.iter().any(|i| {
+            i.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+        }));
     }
 
     #[test]
@@ -259,5 +288,27 @@ mod tests {
             });
         }
         assert!(!rule.matches(&plan, &ctx));
+    }
+
+    #[test]
+    fn rejects_non_project_root_instead_of_dropping_visible_output() {
+        let rule = InjectApplyKeyProjectRule::new();
+        let mut ctx = build_ctx();
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(LogicalPlan::Scan(delta_scan_with_row_id(ColumnId(101)))),
+            predicate: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+        });
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule
+            .apply(plan, &mut ctx)
+            .expect_err("non-Project root must fail fast");
+        assert!(
+            err.contains("expected root Project"),
+            "unexpected error: {err}"
+        );
     }
 }
