@@ -339,22 +339,41 @@ fn partition_chunk_by_change_op(
 }
 
 fn strip_change_op(batch: RecordBatch) -> Result<RecordBatch, String> {
+    // The IMV rewrite pipeline propagates every internal column from the
+    // delta-bound scan to the root projection: `__change_op` (consumed by
+    // `partition_chunk_by_change_op` above) and `_row_id` (consumed by
+    // `InjectApplyKeyProjectRule` to derive `__nova_base_row_id`). Both are
+    // optimizer-internal and must not flow into the iceberg target file.
+    // `__nova_base_row_id` is the only IMV-added column the target schema
+    // expects, so it is preserved.
+    let internal_names = [CHANGE_OP_COLUMN, crate::exec::row_position::ICEBERG_ROW_ID_COL];
     let schema = batch.schema();
-    let Some(idx) = schema
+    let drop_indices: Vec<usize> = schema
         .fields()
         .iter()
-        .position(|f| f.name() == CHANGE_OP_COLUMN)
-    else {
+        .enumerate()
+        .filter_map(|(idx, f)| {
+            if internal_names.iter().any(|n| f.name() == *n) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if drop_indices.is_empty() {
         return Ok(batch);
-    };
+    }
     let mut fields: Vec<arrow::datatypes::Field> =
         schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.remove(idx);
     let mut columns: Vec<arrow::array::ArrayRef> = batch.columns().to_vec();
-    columns.remove(idx);
+    // Remove from highest index to lowest to keep remaining indices valid.
+    for idx in drop_indices.iter().rev() {
+        fields.remove(*idx);
+        columns.remove(*idx);
+    }
     let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
     RecordBatch::try_new(new_schema, columns)
-        .map_err(|e| format!("merge sink strip __change_op: {e}"))
+        .map_err(|e| format!("merge sink strip internal columns: {e}"))
 }
 
 fn extract_i64_apply_key_values_from_record_batch(

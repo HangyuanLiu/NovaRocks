@@ -1411,8 +1411,10 @@ pub(crate) fn refresh_iceberg_mv(
         "iceberg MV refresh context constructed"
     );
 
-    // PR-β: exercise the IMV optimizer pipeline; Validation rejection is expected and non-fatal, outcome discarded.
-    try_run_imv_rewrite_pipeline(state, &ctx);
+    // Single-table projection/filter MVs are cut over to the IMV rewrite
+    // pipeline (invoked inline by `execute_query_with_options` once the
+    // incremental path passes `Some(&ctx)`); aggregate/join paths still
+    // probe `try_run_imv_rewrite_pipeline` for telemetry.
 
     match (previous_snapshot_id, current_snapshot_id) {
         // Base table has no snapshot yet — nothing to refresh.
@@ -6813,6 +6815,41 @@ fn execute_join_delta_branches(
     Ok(StatementResult::Ok)
 }
 
+/// Build a one-shot `InMemoryCatalog` for the single-table projection/filter
+/// IMV incremental refresh path.
+///
+/// The catalog registers the base table as a *normal* Iceberg table whose
+/// `ScanSource` is `IcebergDataFiles` and whose `IcebergTableInfo` carries
+/// the same catalog/namespace/table identity as `ctx.rewrite.base_refs`, so
+/// the analyzer plans a normal Iceberg scan that the IMV rewrite pipeline
+/// can then rebind into `IcebergDeltaTable` via `BindIcebergScanRule`
+/// (`find_base_ref` matches by case-insensitive catalog/namespace/table).
+/// `build_iceberg_table_def_for_delta_scan` is the right factory here even
+/// though the source it publishes is `IcebergDataFiles`: the file list is
+/// intentionally empty (the runtime `IcebergDeltaScan` operator obtains its
+/// per-snapshot files from the iceberg catalog registry passed to
+/// `execute_query_with_options`), and the v3 row-lineage metadata columns
+/// (`_row_id`, `__change_op`, ...) it advertises are what gives codegen the
+/// slot bindings the IMV rewrite rules (`InjectRowIdRule`,
+/// `InjectActionColumnRule`) reference by name.
+fn build_pf_refresh_catalog(
+    state: &Arc<StandaloneState>,
+    base_ref: &IcebergTableRef,
+) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
+    let table_def = crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
+        state,
+        &base_ref.catalog,
+        &base_ref.namespace,
+        &base_ref.table,
+    )?;
+    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+    catalog.create_database(&base_ref.namespace)?;
+    catalog
+        .register(&base_ref.namespace, table_def)
+        .map_err(|e| format!("register PF base table {}: {e}", base_ref.fqn()))?;
+    Ok(catalog)
+}
+
 fn build_join_branch_catalog(
     state: &Arc<StandaloneState>,
     branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
@@ -7049,18 +7086,19 @@ fn incremental_refresh_iceberg_mv(
         }
     };
 
-    // 4. Build the one-shot InMemoryCatalog with the base table registered
-    // via the IVM-A1 delta-scan TableDef factory (empty storage + v3
-    // row-lineage virtual cols). The analyzer / planner / codegen chain
-    // produces an `ICEBERG_DELTA_SCAN_NODE`, which lower_plan turns into
-    // `IcebergDeltaScan` using the runtime registry passed below.
-    let base_table_def = match crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
-        state,
-        &base_ref.catalog,
-        &base_ref.namespace,
-        &base_ref.table,
-    ) {
-        Ok(def) => def,
+    // 4. Build a one-shot `InMemoryCatalog` exposing the base table as a
+    // *normal* Iceberg table (i.e. `ScanSource::IcebergDataFiles` whose
+    // `IcebergTableInfo` carries the same catalog/namespace/table identity
+    // as `ctx.rewrite.base_refs`). The IMV rewrite pipeline — invoked
+    // inside `execute_query_with_options` when `mv_refresh_ctx` is `Some`
+    // — wraps the root in `ImvDelta`, pushes the marker down to the leaf
+    // scan, then `BindIcebergScanRule` rebinds the scan source to
+    // `ScanSource::IcebergDeltaTable` using `find_base_ref` on the
+    // `IcebergTableInfo` we publish here. `data_files = vec![]` is
+    // intentional: the runtime `IcebergDeltaScan` operator obtains its
+    // per-snapshot file list from the catalog at execution time.
+    let catalog = match build_pf_refresh_catalog(state, base_ref) {
+        Ok(c) => c,
         Err(err) => {
             return Err(handle_iceberg_mv_commit_error(
                 state,
@@ -7072,44 +7110,25 @@ fn incremental_refresh_iceberg_mv(
             ));
         }
     };
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
-    if let Err(err) = catalog.create_database(&base_ref.namespace) {
-        return Err(handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        ));
-    }
-    if let Err(err) = catalog.register(&base_ref.namespace, base_table_def) {
-        return Err(handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            format!("register base table for IVM-A1 SELECT: {err}"),
-        ));
-    }
 
-    // 5. Parse the MV physical SELECT to AST and mutate the unique base-table
-    // reference into `__nr_ivm_delta(...)`.
-    let physical_sql = iceberg_mv_physical_select_sql(&mv_definition.select_sql)?;
-    let normalized = match crate::sql::parser::dialect::normalize_for_raw_parse(&physical_sql) {
-        Ok(s) => s,
-        Err(err) => {
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    };
+    // 5. Parse the stored MV SELECT verbatim. No AST mutation: the IMV
+    // rewrite pipeline owns delta/version binding and synthetic column
+    // injection (`_row_id`, `__nova_action`, `__nova_base_row_id`,
+    // `__change_op`).
+    let normalized =
+        match crate::sql::parser::dialect::normalize_for_raw_parse(&mv_definition.select_sql) {
+            Ok(s) => s,
+            Err(err) => {
+                return Err(handle_iceberg_mv_commit_error(
+                    state,
+                    target,
+                    target_entry,
+                    &staging_branch,
+                    refresh_id,
+                    err,
+                ));
+            }
+        };
     let statement = match crate::sql::parser::parse_normalized_sql_raw(&normalized) {
         Ok(s) => s,
         Err(err) => {
@@ -7134,70 +7153,9 @@ fn incremental_refresh_iceberg_mv(
         ));
     };
     let mut query = *query_box;
-    match mutate_query_for_ivm_delta_scan(
-        &mut query,
-        base_ref,
-        previous_snapshot_id,
-        current_snapshot_id,
-    ) {
-        Ok(1) => {}
-        Ok(n) => {
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                format!(
-                    "IVM-A1 AST mutate for MV {}.{}.{} (mv_id={}): expected exactly 1 reference \
-                     to base table {}.{}.{} in physical SELECT, found {} (incremental refresh \
-                     only supports single-base MVs)",
-                    target.catalog,
-                    target.namespace,
-                    target.table,
-                    mv_definition.mv_id,
-                    base_ref.catalog,
-                    base_ref.namespace,
-                    base_ref.table,
-                    n,
-                ),
-            ));
-        }
-        Err(err) => {
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    }
-    // Drop any leftover catalog-qualified 3-part names (the analyzer's
-    // `InMemoryCatalog` view exposes <db>.<table>, not <cat>.<db>.<table>).
+    // The analyzer view exposes <db>.<table>, not <cat>.<db>.<table>; strip
+    // any catalog qualifier before binding.
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-
-    // Append the IVM `__change_op` transparent pseudo-column to the top-level
-    // projection. The `IcebergDeltaScan` operator synthesizes per-row values
-    // (`+1` for DataFile / `-1` for delete roles); the merge sink reads the
-    // column by name to partition each chunk into INSERT and DELETE batches.
-    // We append it only on the incremental refresh path because the
-    // `build_iceberg_table_def_for_delta_scan` `TableDef` exposes
-    // `__change_op` as a row-lineage virtual column; full-rebuild / first
-    // refresh use a regular base scan whose `TableDef` does not advertise it,
-    // so the same augmentation in `iceberg_mv_physical_select_sql` would
-    // fail to resolve `__change_op` there.
-    if let Err(err) = append_change_op_to_projection(&mut query) {
-        return Err(handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        ));
-    }
 
     // 6. Pre-load the A9 target locator inputs only when the change batch
     // carries DELETE-side rows. The merge sink consumes these when it sees
@@ -7271,7 +7229,7 @@ fn incremental_refresh_iceberg_mv(
             None,
             Some(Box::new(merge_sink)),
             Some(&*catalogs_guard),
-            None,
+            Some(&ctx),
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
