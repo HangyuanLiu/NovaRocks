@@ -47,6 +47,11 @@
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
 
+// The scheduler is a pure decision layer with no caller yet; the coordinator
+// wires it in PR-4. Until then its public-to-the-crate API reads as dead code.
+// Remove this allow when PR-4 lands the coordinator integration.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
@@ -64,31 +69,31 @@ use crate::types::{TNetworkAddress, TUniqueId};
 
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
-pub struct FragmentInstancePlacement {
-    pub fragment_id: FragmentId,
-    pub instance_index: usize,
-    pub finst_id: TUniqueId,
+pub(crate) struct FragmentInstancePlacement {
+    pub(crate) fragment_id: FragmentId,
+    pub(crate) instance_index: usize,
+    pub(crate) finst_id: TUniqueId,
     /// Index into `FragmentScheduler::backends`.
-    pub backend_idx: usize,
+    pub(crate) backend_idx: usize,
     /// Scan ranges for this instance, keyed by plan node id.
-    pub scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
+    pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
     /// Destinations this instance should push its output to.
-    pub destinations: Vec<TPlanFragmentDestination>,
+    pub(crate) destinations: Vec<TPlanFragmentDestination>,
     /// Runtime filter prober params, keyed by filter_id.
-    pub runtime_filter_prober_params: BTreeMap<i32, Vec<TRuntimeFilterProberParams>>,
+    pub(crate) runtime_filter_prober_params: BTreeMap<i32, Vec<TRuntimeFilterProberParams>>,
     /// Number of upstream senders per exchange node id.
-    pub per_exch_num_senders: BTreeMap<i32, i32>,
+    pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
 }
 
 /// The result of scheduling a multi-fragment plan.
 #[derive(Debug)]
-pub struct SchedulingPlan {
+pub(crate) struct SchedulingPlan {
     /// All instance placements, indexed by fragment id.
-    pub by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+    pub(crate) by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
     /// The finst id of the root fragment's (single) instance.
-    pub root_finst_id: TUniqueId,
+    pub(crate) root_finst_id: TUniqueId,
     /// Which backend index the root instance is assigned to.
-    pub root_backend_idx: usize,
+    pub(crate) root_backend_idx: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,18 +101,18 @@ pub struct SchedulingPlan {
 // ---------------------------------------------------------------------------
 
 /// Decides which backend each fragment instance lands on.
-pub struct FragmentScheduler {
+pub(crate) struct FragmentScheduler {
     backends: Vec<SocketAddr>,
 }
 
 impl FragmentScheduler {
     /// Create a new scheduler with the given backends.
-    pub fn new(backends: Vec<SocketAddr>) -> Self {
+    pub(crate) fn new(backends: Vec<SocketAddr>) -> Self {
         Self { backends }
     }
 
     /// Return the configured backends.
-    pub fn backends(&self) -> &[SocketAddr] {
+    pub(crate) fn backends(&self) -> &[SocketAddr] {
         &self.backends
     }
 
@@ -117,7 +122,7 @@ impl FragmentScheduler {
     /// each instance. `destinations`, `runtime_filter_prober_params`, and
     /// `per_exch_num_senders` are empty at this point; call the corresponding
     /// `fill_*` methods to populate them.
-    pub fn assign(
+    pub(crate) fn assign(
         &self,
         fragments: &[FragmentBuildResult],
         edges: &[FragmentEdge],
@@ -201,6 +206,13 @@ impl FragmentScheduler {
                     } else {
                         instance_index
                     };
+                    // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
+                    // Unique within a query as long as instance_index < 65536 (always true:
+                    // instance_count <= backends.len(), far below 65536).
+                    debug_assert!(
+                        instance_index < (1 << 16),
+                        "instance_index {instance_index} overflows finst_id encoding"
+                    );
                     let finst_id =
                         TUniqueId::new(query_id.hi, ((fid as i64) << 16) | (instance_index as i64));
                     FragmentInstancePlacement {
@@ -249,7 +261,7 @@ impl FragmentScheduler {
     /// For each edge, the target fragment's instances are collected, their
     /// `TPlanFragmentDestination` entries are built, and the full list is
     /// appended to every source-fragment instance's `destinations` vec.
-    pub fn fill_destinations(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
+    pub(crate) fn fill_destinations(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
         for e in edges {
             // Snapshot target placements to avoid borrow conflict.
             let target_placements: Vec<(TUniqueId, usize)> = plan
@@ -291,7 +303,7 @@ impl FragmentScheduler {
     ///
     /// For each filter_id, all instances of every probe fragment are collected
     /// and attached to every build-fragment instance as its list of probers.
-    pub fn fill_runtime_filter_params(
+    pub(crate) fn fill_runtime_filter_params(
         &self,
         plan: &mut SchedulingPlan,
         rf_plan: &RuntimeFilterPlanResult,
@@ -347,7 +359,11 @@ impl FragmentScheduler {
     ///
     /// For each edge, every target instance learns that `upstream_n` senders
     /// will push data to exchange node `edge.target_exchange_node_id`.
-    pub fn fill_per_exch_num_senders(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
+    pub(crate) fn fill_per_exch_num_senders(
+        &self,
+        plan: &mut SchedulingPlan,
+        edges: &[FragmentEdge],
+    ) {
         for e in edges {
             // Snapshot upstream count first.
             let upstream_n = plan
@@ -648,7 +664,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn scan_fragment_gets_n_instances() {
+    fn scan_root_fragment_forced_to_one_instance() {
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends);
         // Single scan fragment (is also the root: no outgoing edges).
@@ -657,10 +673,8 @@ mod tests {
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
             .expect("assign");
-        // Root is forced to 1 instance. With a scan-only root it loses the
-        // scan=N count: the root override wins.
-        // Actually per spec: scan -> N, then root override -> 1.
-        // So root scan fragment -> 1 instance.
+        // A lone scan fragment is also the root, so the root override (1 instance)
+        // wins over the scan=N rule.
         assert_eq!(plan.by_fragment[&0].len(), 1);
     }
 
@@ -713,6 +727,75 @@ mod tests {
             "hash consumer inherits 2 from upstream scan"
         );
         assert_eq!(plan.by_fragment[&2].len(), 1, "root: forced to 1");
+    }
+
+    #[test]
+    fn bucket_shuffle_consumer_inherits_upstream_n() {
+        // Topology: F0(scan) -> BUCKET_SHUFFLE_HASH -> F1(non-root consumer) -> UNPARTITIONED -> F2(root)
+        // F0 has 2 backends so F1 should inherit 2 instances.
+        let backends = two_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, Some(1), 4), // scan producer
+            fake_fragment(1, None, 0),    // bucket-shuffle consumer (non-root)
+            fake_fragment(2, None, 0),    // root gather
+        ];
+        let edges = vec![
+            fake_edge(
+                0,
+                1,
+                partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED,
+                10,
+            ),
+            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+        ];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 2, "scan: 2 instances");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            2,
+            "bucket-shuffle consumer inherits 2 from upstream scan"
+        );
+        assert_eq!(plan.by_fragment[&2].len(), 1, "root: forced to 1");
+    }
+
+    #[test]
+    fn mixed_partition_edges_hash_wins_over_unpartitioned() {
+        // Topology:
+        //   F0(scan, N=2) -> HASH_PARTITIONED     -> F2(consumer, non-root)
+        //   F1(non-scan)  -> UNPARTITIONED         -> F2
+        //   F2            -> UNPARTITIONED         -> F3(root)
+        // F2 should get N=2 instances (HASH edge determines count; UNPARTITIONED is ignored).
+        let backends = two_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, Some(1), 4), // scan producer: 2 instances
+            fake_fragment(1, None, 0),    // non-scan producer: 1 instance (UNPARTITIONED into F2)
+            fake_fragment(2, None, 0),    // mixed consumer (non-root)
+            fake_fragment(3, None, 0),    // root gather
+        ];
+        let edges = vec![
+            fake_edge(0, 2, partitions::TPartitionType::HASH_PARTITIONED, 10),
+            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(2, 3, partitions::TPartitionType::UNPARTITIONED, 30),
+        ];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 2, "scan producer: 2 instances");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            1,
+            "unpartitioned producer: 1 instance"
+        );
+        assert_eq!(
+            plan.by_fragment[&2].len(),
+            2,
+            "HASH edge wins: consumer gets 2 instances"
+        );
+        assert_eq!(plan.by_fragment[&3].len(), 1, "root: forced to 1");
     }
 
     #[test]
