@@ -826,6 +826,16 @@ EOF
 
 **范围**：新建 `src/runtime/scheduler.rs`，含 `FragmentScheduler` + `FragmentInstancePlacement` + `SchedulingPlan` + `assign` / `fill_destinations` / `fill_runtime_filter_params` / `fill_per_exch_num_senders` 4 个 stage。
 
+> **⚠️ 真实类型更正（执行时以此为准，下方任务里的代码草图基于一个不准确的心智模型，已被以下事实取代）：**
+> - `FragmentBuildResult` / `FragmentEdge` / `FragmentId` 在 **`src/sql/codegen/mod.rs`**（不是 `coordinator.rs`），均为 `pub(crate)`，**不 derive Clone/Default**。`FragmentId = u32`。
+> - `FragmentBuildResult` 字段：`fragment_id`、`plan: plan_nodes::TPlan`（**非 Option**，flat `.nodes: Vec<TPlanNode>`）、`exec_params: TPlanFragmentExecParams`（含 `per_node_scan_ranges: BTreeMap<TPlanNodeId, Vec<TScanRangeParams>>`）、`desc_tbl`、`output_sink`、`output_columns`、`cte_id`、`cte_exchange_nodes`、`query_global_dicts*`。**不含** `ResolvedTable`/`PlannedConnectorScan`。
+> - `FragmentEdge` **没有** `partition_type` 字段；用 `edge.output_partition.type_`（`TDataPartition.type_: TPartitionType`）。还有 `edge_kind: FragmentEdgeKind { Stream, CteMulticast{cte_id} }`。
+> - scan 节点类型：**没有 `ICEBERG_SCAN_NODE`**；用 `FILE_SCAN_NODE | HDFS_SCAN_NODE | LAKE_SCAN_NODE`（`ICEBERG_DELTA_SCAN_NODE=1000` 是 IVM delta，scan 切分不涉及）。
+> - `TPlanFragmentDestination` / `TRuntimeFilterProberParams` **不 derive Default**（字段须显式构造）；后者两个字段都是 `Option<_>`。
+> - runtime filter plan 真实类型 `RuntimeFilterPlanResult { all_filters: HashMap<i32,TRuntimeFilterDescription>, build_side_filters: HashMap<FragmentId,Vec<i32>>, probe_side_filters: HashMap<FragmentId,Vec<(i32 filter_id, i32 scan_node_id)>> }`。
+>
+> **⚠️ scan 切分定案：方案 C（partition 已建好的 ranges）。** scheduler **不** 重新调 `to_thrift_scan`、**不** 伪造 `ThriftScanContext`、**不** 给 `FragmentBuildResult` 加 plumbing 字段。改为把 codegen 已构造正确的 `fr.exec_params.per_node_scan_ranges[node]` 里的 `Vec<TScanRangeParams>` 按 `i % count` round-robin 切给 N 个 instance（无重无漏；单 instance 时全部进唯一 instance，与 all-in-one 完全一致）。因此 `assign` **不收** `ConnectorRegistry` 参数。理由：scan ranges 的正确构造依赖 `min_max_predicates`/`change_op_slot`/`cloud_properties`，这些只有 codegen 阶段有；scheduler 重算会丢失它们产出错误 ranges。任务 3.4 的"重调 to_thrift_scan"代码作废，以方案 C 取代。
+
 **输入**：PR-2 已合并。
 
 **输出**：
