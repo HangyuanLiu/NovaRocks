@@ -1,11 +1,11 @@
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=optimizer,iceberg,ivm,imv,projection_filter,cutover
+-- @tags=iceberg,ivm,imv,projection_filter,cutover
 -- Test Objective:
--- Plan-shape golden for the single-table projection/filter IMV
--- incremental-refresh cutover (Phase 3, Task 11). After the cutover the
--- refresh executor stops mutating the MV AST into a
--- `__nr_ivm_delta(...)` table-function call; instead the verbatim MV
+-- Correctness and plan-shape validation for the single-table
+-- projection/filter IMV incremental-refresh cutover (Phase 3, Task 11).
+-- After the cutover the refresh executor stops mutating the MV AST into
+-- a `__nr_ivm_delta(...)` table-function call; instead the verbatim MV
 -- SELECT is run through the IMV rewrite pipeline, which rebinds the
 -- single base scan to an `IcebergDeltaTable` source. This case asserts
 -- the *shape* of that delta-scan plan via the user-facing
@@ -32,8 +32,8 @@
 --     SCAN line and the EXPLAIN dump captured on failure would make
 --     this obvious.
 --
--- Internal-column hygiene (positive, via `@result_not_contains` on
--- query 5):
+-- Row correctness and internal-column hygiene (positive
+-- `@result_contains` and negative `@result_not_contains` on query 5):
 --   * `__change_op`, `_row_id`, and `__nova_base_row_id` must NOT be
 --     visible from `SELECT * FROM proj_mv`. The PF refresh merge sink
 --     strips `__change_op` and `_row_id` from the INSERT batch (see
@@ -77,14 +77,14 @@ AS SELECT k1, v2 FROM orders WHERE v2 > 0;
 -- query 3
 -- First (full) REFRESH.
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW proj_mv;
+REFRESH MATERIALIZED VIEW proj_mv WITH SYNC MODE;
 
 -- query 4
 -- Delta + incremental REFRESH (the PF cutover path).
 -- @skip_result_check=true
 INSERT INTO ice_pfcut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 70), (4, 5), (5, -1);
-REFRESH MATERIALIZED VIEW proj_mv;
+REFRESH MATERIALIZED VIEW proj_mv WITH SYNC MODE;
 
 -- query 5
 -- Correctness + internal-column hygiene. The PF cutover must yield
@@ -94,6 +94,11 @@ REFRESH MATERIALIZED VIEW proj_mv;
 -- @result_not_contains=__change_op
 -- @result_not_contains=_row_id
 -- @result_not_contains=__nova_base_row_id
+-- @result_contains=1	10
+-- @result_contains=1	20
+-- @result_contains=1	70
+-- @result_contains=2	40
+-- @result_contains=4	5
 SELECT * FROM proj_mv ORDER BY k1, v2;
 
 -- query 6
