@@ -72,8 +72,8 @@ fn tag_scan(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
     let LogicalPlan::Scan(mut scan) = plan else {
         unreachable!()
     };
-    let needed = parent_needed
-        .unwrap_or_else(|| scan.columns.iter().map(|c| c.column_id).collect());
+    let needed =
+        parent_needed.unwrap_or_else(|| scan.columns.iter().map(|c| c.column_id).collect());
     scan.required_output_columns = Some(needed);
     LogicalPlan::Scan(scan)
 }
@@ -82,8 +82,8 @@ fn tag_values(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     let LogicalPlan::Values(mut node) = plan else {
         unreachable!()
     };
-    let needed = parent_needed
-        .unwrap_or_else(|| node.columns.iter().map(|c| c.column_id).collect());
+    let needed =
+        parent_needed.unwrap_or_else(|| node.columns.iter().map(|c| c.column_id).collect());
     node.required_output_columns = Some(needed);
     LogicalPlan::Values(node)
 }
@@ -91,10 +91,7 @@ fn tag_values(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
 /// GenerateSeries has no ColumnId on its output slot (only a `column_name:
 /// String`).  We write `parent_needed` (or an empty set when None, meaning
 /// all-required) onto the field so Phase-2 no-ops cleanly.
-fn tag_generate_series(
-    plan: LogicalPlan,
-    parent_needed: Option<HashSet<ColumnId>>,
-) -> LogicalPlan {
+fn tag_generate_series(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
     let LogicalPlan::GenerateSeries(mut node) = plan else {
         unreachable!()
     };
@@ -282,10 +279,7 @@ fn tag_decode(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     LogicalPlan::Decode(node)
 }
 
-fn tag_table_function(
-    plan: LogicalPlan,
-    parent_needed: Option<HashSet<ColumnId>>,
-) -> LogicalPlan {
+fn tag_table_function(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
     let LogicalPlan::TableFunction(mut node) = plan else {
         unreachable!()
     };
@@ -507,11 +501,7 @@ fn tag_cte_anchor(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -
 
 /// Recursively traverse `plan` and union all `required_output_columns` sets
 /// from `CTEConsume` nodes whose `cte_id` matches `target_id` into `acc`.
-fn collect_cte_consumer_needs(
-    plan: &LogicalPlan,
-    target_id: CteId,
-    acc: &mut HashSet<ColumnId>,
-) {
+fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut HashSet<ColumnId>) {
     match plan {
         LogicalPlan::CTEConsume(c) if c.cte_id == target_id => {
             if let Some(req) = &c.required_output_columns {
@@ -571,10 +561,7 @@ fn collect_cte_consumer_needs(
 /// All consumers with the same `cte_id` share the same positional schema, so
 /// we stop at the first match.  The position is the index into
 /// `CTEConsume.output_columns`, which aligns with `CTEProduce.output_columns`.
-fn find_consume_position_map(
-    plan: &LogicalPlan,
-    target_id: CteId,
-) -> HashMap<ColumnId, usize> {
+fn find_consume_position_map(plan: &LogicalPlan, target_id: CteId) -> HashMap<ColumnId, usize> {
     let mut map = HashMap::new();
     walk_consume_position_map(plan, target_id, &mut map);
     map
@@ -881,7 +868,10 @@ mod tests {
             panic!()
         };
         let req = s.required_output_columns.unwrap();
-        assert!(req.contains(&ColumnId::new_for_test(1)), "a needed by parent");
+        assert!(
+            req.contains(&ColumnId::new_for_test(1)),
+            "a needed by parent"
+        );
         assert!(
             req.contains(&ColumnId::new_for_test(3)),
             "c needed by predicate"
@@ -1056,9 +1046,15 @@ mod tests {
         let a_req = a.required_output_columns.as_ref().unwrap();
         let b_req = b.required_output_columns.as_ref().unwrap();
         assert_eq!(a_req.len(), 1);
-        assert!(a_req.contains(&ColumnId::new_for_test(2)), "position 1 = b@2");
+        assert!(
+            a_req.contains(&ColumnId::new_for_test(2)),
+            "position 1 = b@2"
+        );
         assert_eq!(b_req.len(), 1);
-        assert!(b_req.contains(&ColumnId::new_for_test(5)), "position 1 = e@5");
+        assert!(
+            b_req.contains(&ColumnId::new_for_test(5)),
+            "position 1 = e@5"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1208,7 +1204,10 @@ mod tests {
             req.contains(&ColumnId::new_for_test(30)),
             "c@30 from m2 (position 2)"
         );
-        assert!(!req.contains(&ColumnId::new_for_test(10)), "a@10 not needed");
+        assert!(
+            !req.contains(&ColumnId::new_for_test(10)),
+            "a@10 not needed"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1256,7 +1255,10 @@ mod tests {
             panic!()
         };
         // The window node itself records the parent's request.
-        assert_eq!(w.required_output_columns.as_ref().unwrap(), &needed_set(&[1]));
+        assert_eq!(
+            w.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[1])
+        );
         let LogicalPlan::Scan(s) = *w.input else {
             panic!()
         };
@@ -1423,7 +1425,11 @@ mod tests {
         };
         // None propagated → Scan expands to all columns.
         let req = s.required_output_columns.unwrap();
-        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just predicate ref c");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just predicate ref c"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
         assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
         assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
@@ -1458,7 +1464,11 @@ mod tests {
         };
         // None propagated → Scan expands to all columns.
         let req = scan.required_output_columns.unwrap();
-        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just sort/partition refs");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just sort/partition refs"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
         assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
         assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
@@ -1539,13 +1549,20 @@ mod tests {
             panic!()
         };
         // Repeat records parent_needed on itself.
-        assert_eq!(r.required_output_columns.as_ref().unwrap(), &needed_set(&[1]));
+        assert_eq!(
+            r.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[1])
+        );
         let LogicalPlan::Scan(s) = *r.input else {
             panic!()
         };
         // Child got None → Scan expands to all columns.
         let req = s.required_output_columns.unwrap();
-        assert_eq!(req.len(), 3, "scan keeps all 3 columns, including b@2 needed by rollup");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan keeps all 3 columns, including b@2 needed by rollup"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
         assert!(req.contains(&ColumnId::new_for_test(3)));
@@ -1574,15 +1591,25 @@ mod tests {
             panic!()
         };
         // TableFunction records parent_needed on itself.
-        assert_eq!(t.required_output_columns.as_ref().unwrap(), &needed_set(&[401]));
+        assert_eq!(
+            t.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[401])
+        );
         let LogicalPlan::Scan(s) = *t.input else {
             panic!()
         };
         // Child got None → Scan expands to all columns, including arr@2.
         let req = s.required_output_columns.unwrap();
-        assert_eq!(req.len(), 3, "scan keeps all 3 columns, including arr@2 needed by function arg");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan keeps all 3 columns, including arr@2 needed by function arg"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)));
-        assert!(req.contains(&ColumnId::new_for_test(2)), "arr@2 must be kept for UNNEST arg");
+        assert!(
+            req.contains(&ColumnId::new_for_test(2)),
+            "arr@2 must be kept for UNNEST arg"
+        );
         assert!(req.contains(&ColumnId::new_for_test(3)));
     }
 }
