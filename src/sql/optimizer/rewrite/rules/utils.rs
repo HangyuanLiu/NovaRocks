@@ -357,8 +357,10 @@ fn collect_column_id_refs_inner(
         // but handle gracefully as a no-op.
         ExprKind::SubqueryPlaceholder { .. } => {}
         ExprKind::Lambda { body, .. } => {
-            // Lambda-bound parameter names are opaque to column-id tracking;
-            // walk the body so outer column refs inside the lambda are captured.
+            // Lambda-bound parameters are emitted as the distinct `LambdaParamRef`
+            // variant (a no-op above), NOT as `ColumnRef`, so they never enter the
+            // id set — no filtering needed here. Walk the body to capture outer
+            // column refs the closure captures.
             collect_column_id_refs_inner(body, out);
         }
     }
@@ -419,9 +421,7 @@ pub(crate) fn collect_output_ids_ordered(
 /// Return the set of [`ColumnId`]s in the output schema of a plan node.
 ///
 /// `collect_output_ids(plan) = collect_output_ids_ordered(plan).into_iter().collect()`.
-pub(crate) fn collect_output_ids(
-    plan: &LogicalPlan,
-) -> HashSet<crate::sql::column_id::ColumnId> {
+pub(crate) fn collect_output_ids(plan: &LogicalPlan) -> HashSet<crate::sql::column_id::ColumnId> {
     collect_output_ids_ordered(plan).into_iter().collect()
 }
 
@@ -866,7 +866,11 @@ mod column_id_helper_tests {
         let pass_id = ColumnId::new_for_test(10);
         let comp_id = ColumnId::new_for_test(20);
 
-        let scan = three_col_scan([pass_id, ColumnId::new_for_test(11), ColumnId::new_for_test(12)]);
+        let scan = three_col_scan([
+            pass_id,
+            ColumnId::new_for_test(11),
+            ColumnId::new_for_test(12),
+        ]);
 
         // Passthrough item: expr is a ColumnRef with pass_id.
         let passthrough_item = ProjectItem {
@@ -911,7 +915,11 @@ mod column_id_helper_tests {
         use crate::sql::analysis::ProjectItem;
 
         let real_id = ColumnId::new_for_test(5);
-        let scan = three_col_scan([real_id, ColumnId::new_for_test(6), ColumnId::new_for_test(7)]);
+        let scan = three_col_scan([
+            real_id,
+            ColumnId::new_for_test(6),
+            ColumnId::new_for_test(7),
+        ]);
 
         let real_item = ProjectItem {
             expr: col_ref_expr(real_id),

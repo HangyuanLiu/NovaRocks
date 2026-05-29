@@ -708,22 +708,20 @@ fn collect_repeat_input_refs(
 ) {
     match &expr.kind {
         ExprKind::ColumnRef {
-            qualifier, column, ..
+            qualifier,
+            column,
+            column_id,
+            ..
         } => {
             if qualifier.is_none() && column.starts_with("__grouping_") {
                 return;
             }
             let key = (qualifier.clone(), column.to_lowercase());
             if seen.insert(key) {
-                let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-                    *column_id
-                } else {
-                    ColumnId::UNSET
-                };
                 out.push(ProjectItem {
                     expr: expr.clone(),
                     output_name: column.clone(),
-                    output_column_id,
+                    output_column_id: *column_id,
                 });
             }
         }
