@@ -24,7 +24,9 @@ pub(crate) use operator::Operator;
 pub(crate) use physical_plan::PhysicalPlanNode;
 pub(crate) use property::PhysicalPropertySet;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::sql::column_id::ColumnRefFactory;
@@ -63,6 +65,12 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
+    // Wrap factory in Rc<RefCell<...>> so it can be shared with RewriteContext
+    // for the duration of the rewrite phase (needed for auto-fill column minting
+    // in per-operator column-pruning rules). The Rc is unwrapped back to a plain
+    // ColumnRefFactory before the Memo build step.
+    let factory = Rc::new(RefCell::new(factory));
+
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
     //    aggregate pushdown → column pruning → low-cardinality dict rewrite.
@@ -76,6 +84,7 @@ pub(crate) fn optimize(
     if let Some(provider) = resolve_dictionary_provider(dictionary_provider) {
         rewrite_ctx.set_dictionary_provider(provider);
     }
+    rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
     let rewritten =
         rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
 
@@ -84,7 +93,14 @@ pub(crate) fn optimize(
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
     let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 
-    // 5. Convert to Memo.
+    // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
+    //    is done so there must be exactly two references: the one we kept in
+    //    `factory` and the one stored in `rewrite_ctx`. Drop the context's
+    //    reference first, then unwrap.
+    drop(rewrite_ctx);
+    let factory = Rc::try_unwrap(factory)
+        .expect("factory should have no other references after rewrite")
+        .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
     let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
