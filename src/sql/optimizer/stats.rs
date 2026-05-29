@@ -1501,6 +1501,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -1564,6 +1565,7 @@ mod tests {
         let plan = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1599,6 +1601,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: Some(cond),
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1630,6 +1633,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1656,6 +1660,7 @@ mod tests {
             input: Box::new(scan),
             limit: Some(10),
             offset: None,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1685,6 +1690,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            required_output_columns: None,
         });
         let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
             cte_id: 1,
@@ -1695,11 +1701,13 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            required_output_columns: None,
         });
         let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id: 1,
             produce: Box::new(produce),
             consumer: Box::new(consume),
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1764,6 +1772,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1798,6 +1807,7 @@ mod tests {
                 data_type: DataType::Utf8,
                 nullable: false,
             }],
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();

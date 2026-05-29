@@ -192,6 +192,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -213,6 +214,7 @@ mod tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
@@ -260,6 +262,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let sort = LogicalPlan::Sort(SortNode {
             input: Box::new(scan),
@@ -269,6 +272,7 @@ mod tests {
                 nulls_first: false,
             }],
             analytic_partition_by: vec![],
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         // Non-order-preserving snapshot — sort must decode first.
@@ -297,6 +301,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -318,6 +323,7 @@ mod tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx =
             RewriteContext::for_query(vec!["LowCardinalityDictionaryRewrite".to_string()]);
@@ -415,6 +421,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -424,12 +431,14 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
             left: Box::new(scan_t1),
             right: Box::new(scan_t2),
             join_type: crate::sql::analysis::JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(PerTableProvider {
@@ -484,6 +493,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         // Project: SELECT s AS t.
         let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
@@ -492,6 +502,7 @@ mod tests {
                 expr: s_column_ref(),
                 output_name: "t".to_string(),
             }],
+            required_output_columns: None,
         });
         // Right side: a no-dict scan over a different table.
         let scan_right = LogicalPlan::Scan(ScanNode {
@@ -502,12 +513,14 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
             left: Box::new(project),
             right: Box::new(scan_right),
             join_type: crate::sql::analysis::JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
@@ -549,6 +562,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
             input: Box::new(scan),
@@ -556,6 +570,7 @@ mod tests {
                 expr: s_column_ref(),
                 output_name: "s".to_string(),
             }],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(project),
@@ -563,6 +578,7 @@ mod tests {
             aggregates: vec![],
             output_columns: vec![s_output_column()],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
@@ -699,6 +715,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -708,12 +725,14 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(scan_t1),
             right: Box::new(scan_t2),
             join_type: crate::sql::analysis::JoinKind::Inner,
             condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
@@ -770,6 +789,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -779,12 +799,14 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(scan_t1),
             right: Box::new(scan_t2),
             join_type: kind,
             condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
@@ -865,6 +887,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -874,12 +897,14 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let join = LogicalPlan::Join(JoinNode {
             left: Box::new(scan_t1),
             right: Box::new(scan_t2),
             join_type: crate::sql::analysis::JoinKind::Inner,
             condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(PerTableVersionProvider {
@@ -921,6 +946,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -930,11 +956,13 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let union = LogicalPlan::Union(UnionNode {
             inputs: vec![scan_t1, scan_t2],
             all: true,
             output_columns: vec![],
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
@@ -974,6 +1002,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let scan_t2 = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
@@ -983,11 +1012,13 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let union = LogicalPlan::Union(UnionNode {
             inputs: vec![scan_t1, scan_t2],
             all: false,
             output_columns: vec![],
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
@@ -1022,6 +1053,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -1040,6 +1072,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
@@ -1084,6 +1117,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -1102,6 +1136,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, false); // non-order-preserving
@@ -1142,6 +1177,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -1160,6 +1196,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true); // order-preserving
@@ -1198,6 +1235,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let aggregate = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan),
@@ -1216,6 +1254,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
@@ -1271,22 +1310,26 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let cte_id: crate::sql::analysis::cte::CteId = 7;
         let produce = LogicalPlan::CTEProduce(CTEProduceNode {
             cte_id,
             input: Box::new(scan),
             output_columns: vec![s_output_column()],
+            required_output_columns: None,
         });
         let consumer = LogicalPlan::CTEConsume(CTEConsumeNode {
             cte_id,
             alias: "c".to_string(),
             output_columns: vec![s_output_column()],
+            required_output_columns: None,
         });
         let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id,
             produce: Box::new(produce),
             consumer: Box::new(consumer),
+            required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);

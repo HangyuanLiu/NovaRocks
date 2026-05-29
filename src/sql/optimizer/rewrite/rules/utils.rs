@@ -276,6 +276,7 @@ pub(crate) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>
         LogicalPlan::Filter(FilterNode {
             input: Box::new(plan),
             predicate: combine_and(remaining),
+            required_output_columns: None,
         })
     }
 }

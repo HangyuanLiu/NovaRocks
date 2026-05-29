@@ -89,11 +89,13 @@ fn plan_scoped_query(
             cte_id: entry.id,
             input: Box::new(produce_input),
             output_columns: entry.output_columns.clone(),
+            required_output_columns: None,
         });
         root = LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id: entry.id,
             produce: Box::new(produce),
             consumer: Box::new(root),
+            required_output_columns: None,
         });
     }
 
@@ -188,6 +190,7 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                required_output_columns: None,
             });
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
@@ -235,6 +238,7 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                required_output_columns: None,
             });
         }
     }
@@ -245,6 +249,7 @@ fn apply_query_modifiers(
             input: Box::new(body_plan),
             limit,
             offset,
+            required_output_columns: None,
         });
     }
 
@@ -252,6 +257,7 @@ fn apply_query_modifiers(
         body_plan = LogicalPlan::Project(ProjectNode {
             input: Box::new(body_plan),
             items,
+            required_output_columns: None,
         });
     }
 
@@ -397,6 +403,7 @@ fn plan_select_scoped(
         None => LogicalPlan::Values(ValuesNode {
             rows: vec![vec![]],
             columns: vec![],
+            required_output_columns: None,
         }),
     };
 
@@ -404,6 +411,7 @@ fn plan_select_scoped(
         current = LogicalPlan::Filter(FilterNode {
             input: Box::new(current),
             predicate,
+            required_output_columns: None,
         });
     }
 
@@ -421,6 +429,7 @@ fn plan_select_scoped(
             all_rollup_columns: repeat_info.all_rollup_columns,
             grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
+            required_output_columns: None,
         });
     }
 
@@ -445,11 +454,13 @@ fn plan_select_scoped(
             aggregates: agg_calls,
             output_columns,
             already_pushed: false,
+            required_output_columns: None,
         });
         if let Some(having) = select.having {
             current = LogicalPlan::Filter(FilterNode {
                 input: Box::new(current),
                 predicate: having,
+                required_output_columns: None,
             });
         }
 
@@ -564,6 +575,7 @@ fn prepare_repeat_input(
     *current = LogicalPlan::Project(ProjectNode {
         input: Box::new(current.clone()),
         items: project_items,
+        required_output_columns: None,
     });
 
     // Apply substitutions to group_by, projection, having so that every
@@ -788,6 +800,7 @@ fn build_distinct(
         aggregates: vec![],
         output_columns,
         already_pushed: false,
+        required_output_columns: None,
     })
 }
 
@@ -847,6 +860,7 @@ fn build_window_and_project(
                 input: Box::new(input),
                 items: sort_items,
                 analytic_partition_by,
+                required_output_columns: None,
             })
         };
 
@@ -854,15 +868,18 @@ fn build_window_and_project(
             input: Box::new(sorted_input),
             window_exprs,
             output_columns,
+            required_output_columns: None,
         });
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(windowed),
             items: rewritten_items,
+            required_output_columns: None,
         }))
     } else if !project_items.is_empty() {
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
             items: project_items,
+            required_output_columns: None,
         }))
     } else {
         Ok(input)
@@ -1594,6 +1611,7 @@ fn plan_relation_scoped(
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                required_output_columns: None,
             }))
         }
         Relation::Subquery {
@@ -1608,6 +1626,7 @@ fn plan_relation_scoped(
                 input: Box::new(inner_plan),
                 alias,
                 output_columns,
+                required_output_columns: None,
             }))
         }
         Relation::Join(join_rel) => {
@@ -1641,6 +1660,7 @@ fn plan_relation_scoped(
                         output_columns: unnest.output_columns,
                         alias: unnest.alias,
                         is_left_join,
+                        required_output_columns: None,
                     }))
                 }
                 right => {
@@ -1651,6 +1671,7 @@ fn plan_relation_scoped(
                         right: Box::new(right),
                         join_type,
                         condition,
+                        required_output_columns: None,
                     }))
                 }
             }
@@ -1661,6 +1682,7 @@ fn plan_relation_scoped(
             step: gs.step,
             column_name: gs.column_name,
             alias: gs.alias,
+            required_output_columns: None,
         })),
         Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
         Relation::CTEConsume {
@@ -1671,6 +1693,7 @@ fn plan_relation_scoped(
             cte_id,
             alias,
             output_columns,
+            required_output_columns: None,
         })),
         Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel, factory),
         Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel, factory),
@@ -1772,6 +1795,7 @@ fn plan_iceberg_metadata_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        required_output_columns: None,
     }))
 }
 
@@ -1947,6 +1971,7 @@ fn plan_iceberg_delta_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        required_output_columns: None,
     }))
 }
 
@@ -1999,14 +2024,17 @@ fn plan_set_operation_scoped(
             inputs: vec![left, right],
             all: set_op.all,
             output_columns,
+            required_output_columns: None,
         })),
         SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
             inputs: vec![left, right],
             output_columns,
+            required_output_columns: None,
         })),
         SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
             inputs: vec![left, right],
             output_columns,
+            required_output_columns: None,
         })),
     }
 }
@@ -2036,6 +2064,7 @@ fn plan_values(
     Ok(LogicalPlan::Values(ValuesNode {
         rows: values.rows,
         columns,
+        required_output_columns: None,
     }))
 }
 

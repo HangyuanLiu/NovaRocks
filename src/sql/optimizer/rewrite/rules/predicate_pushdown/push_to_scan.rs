@@ -140,6 +140,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -149,6 +150,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: eq(col("a"), int_lit(1)),
+            required_output_columns: None,
         });
         let rule = PushDownPredicateScan;
         assert!(rule.matches(&filter));
@@ -177,6 +179,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: eq(col("zz"), int_lit(1)),
+            required_output_columns: None,
         });
         let rule = PushDownPredicateScan;
         assert!(rule.apply(filter).is_none());
@@ -204,6 +207,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,
+            required_output_columns: None,
         });
         let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
         match out {

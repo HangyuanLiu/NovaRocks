@@ -215,6 +215,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 }

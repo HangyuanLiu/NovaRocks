@@ -3,11 +3,14 @@
 //! This is the layer where a future optimizer would operate.
 //! Expressions use [`TypedExpr`] from [`crate::sql::analysis`].
 
+use std::collections::HashSet;
+
 use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
 
 // ---------------------------------------------------------------------------
 // Logical plan tree
@@ -75,6 +78,8 @@ pub(crate) struct DecodeNode {
     /// it the parent group would observe the child's `dict_column` name
     /// rather than `string_column`.
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Per-column mapping from the dictionary-encoded slot back to the original
@@ -97,6 +102,8 @@ pub(crate) struct RepeatPlanNode {
     pub all_rollup_columns: Vec<String>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Subquery alias node: wraps an inlined subquery (CTE or derived table)
@@ -106,6 +113,8 @@ pub(crate) struct SubqueryAliasNode {
     pub input: Box<LogicalPlan>,
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +122,8 @@ pub(crate) struct CTEAnchorNode {
     pub cte_id: crate::sql::analysis::cte::CteId,
     pub produce: Box<LogicalPlan>,
     pub consumer: Box<LogicalPlan>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +131,8 @@ pub(crate) struct CTEProduceNode {
     pub cte_id: crate::sql::analysis::cte::CteId,
     pub input: Box<LogicalPlan>,
     pub output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +140,8 @@ pub(crate) struct CTEConsumeNode {
     pub cte_id: crate::sql::analysis::cte::CteId,
     pub alias: String,
     pub output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Analytic/window function evaluation node.
@@ -136,6 +151,8 @@ pub(crate) struct WindowNode {
     pub window_exprs: Vec<WindowExpr>,
     /// All output columns: base columns from input + window function results.
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// A single window function expression with its OVER specification.
@@ -163,6 +180,8 @@ pub(crate) struct GenerateSeriesNode {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Lateral table function evaluation over each input row.
@@ -174,6 +193,8 @@ pub(crate) struct TableFunctionNode {
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +219,8 @@ pub(crate) struct ScanNode {
     /// `PhysicalScanOp` by memo conversion and the `ScanToPhysical`
     /// implementation rule.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Plan hint for a single dict-encoded string column on a scan.
@@ -216,6 +239,8 @@ pub(crate) struct ScanDictionaryColumn {
 pub(crate) struct ValuesNode {
     pub rows: Vec<Vec<TypedExpr>>,
     pub columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,12 +251,16 @@ pub(crate) struct ValuesNode {
 pub(crate) struct FilterNode {
     pub input: Box<LogicalPlan>,
     pub predicate: TypedExpr,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectNode {
     pub input: Box<LogicalPlan>,
     pub items: Vec<ProjectItem>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +276,8 @@ pub(crate) struct AggregateNode {
     /// Other rules (predicate pushdown, column pruning, cte rewrite,
     /// etc.) MUST preserve this flag when cloning `AggregateNode`.
     pub already_pushed: bool,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +299,8 @@ pub(crate) struct SortNode {
     /// tag on the downstream LogicalSortOp / PhysicalSortOp / TSortNode.
     /// Empty for top-level `ORDER BY` sorts.
     pub analytic_partition_by: Vec<TypedExpr>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +308,8 @@ pub(crate) struct LimitNode {
     pub input: Box<LogicalPlan>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +323,8 @@ pub(crate) struct JoinNode {
     pub join_type: JoinKind,
     /// `None` for CROSS JOIN.
     pub condition: Option<TypedExpr>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +342,8 @@ pub(crate) struct UnionNode {
     /// column-pruning passes (Gap 4) can map parent ColumnId requests to
     /// branch positions without descending into inputs.
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +351,8 @@ pub(crate) struct IntersectNode {
     pub inputs: Vec<LogicalPlan>,
     /// Position-aligned output schema. Same semantics as `UnionNode::output_columns`.
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +360,8 @@ pub(crate) struct ExceptNode {
     pub inputs: Vec<LogicalPlan>,
     /// Position-aligned output schema. Same semantics as `UnionNode::output_columns`.
     pub output_columns: Vec<OutputColumn>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 #[cfg(test)]
@@ -331,13 +374,31 @@ mod plan_tests {
             input: Box::new(LogicalPlan::Values(ValuesNode {
                 rows: vec![],
                 columns: vec![],
+                required_output_columns: None,
             })),
             group_by: vec![],
             aggregates: vec![],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(!node.already_pushed);
+    }
+
+    #[test]
+    fn project_node_required_output_columns_defaults_none() {
+        // Construct a ProjectNode with a minimal Values input and assert
+        // that required_output_columns is None on a freshly-built node.
+        let node = ProjectNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })),
+            items: vec![],
+            required_output_columns: None,
+        };
+        assert!(node.required_output_columns.is_none());
     }
 
     #[test]
@@ -354,6 +415,7 @@ mod plan_tests {
             inputs: vec![],
             all: true,
             output_columns: cols.clone(),
+            required_output_columns: None,
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "x");
@@ -374,6 +436,7 @@ mod plan_tests {
         let node = IntersectNode {
             inputs: vec![],
             output_columns: cols,
+            required_output_columns: None,
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "y");
@@ -392,6 +455,7 @@ mod plan_tests {
         let node = ExceptNode {
             inputs: vec![],
             output_columns: cols,
+            required_output_columns: None,
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "z");

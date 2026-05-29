@@ -532,11 +532,13 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
             LogicalPlan::Values(crate::sql::planner::plan::ValuesNode {
                 rows: vec![],
                 columns: vec![],
+                required_output_columns: None,
             }),
         );
         relations[idx] = LogicalPlan::Filter(crate::sql::planner::plan::FilterNode {
             input: Box::new(original),
             predicate: combined,
+            required_output_columns: None,
         });
     }
 
@@ -726,6 +728,7 @@ fn try_join_orientation(
         right: Box::new(right_plan.clone()),
         join_type: JoinKind::Inner,
         condition: Some(condition.clone()),
+        required_output_columns: None,
     });
 
     let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
@@ -736,6 +739,7 @@ fn try_join_orientation(
         right: Box::new(right_plan.clone()),
         join_type: join_type_for_cost,
         condition: Some(condition.clone()),
+        required_output_columns: None,
     });
     let join_self_cost =
         cost::estimate_operator_cost(&cost_plan, &join_stats, &[left_stats, right_stats]);
@@ -918,6 +922,7 @@ fn greedy_join_reorder(
                     right: Box::new(right_plan.clone()),
                     join_type,
                     condition: condition.clone(),
+                    required_output_columns: None,
                 });
 
                 let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
@@ -934,6 +939,7 @@ fn greedy_join_reorder(
                     right: Box::new(right_plan.clone()),
                     join_type: join_type_for_cost,
                     condition: condition.clone(),
+                    required_output_columns: None,
                 });
                 let join_self_cost = cost::estimate_operator_cost(
                     &cost_plan,
@@ -1078,6 +1084,7 @@ fn left_deep_join_reorder(
             right: Box::new(graph.relations[next_idx].clone()),
             join_type,
             condition,
+            required_output_columns: None,
         });
 
         current_mask |= next_mask;
@@ -1385,6 +1392,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -1427,6 +1435,7 @@ mod tests {
             right: Box::new(scan_for(&large)),
             join_type: JoinKind::Inner,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1460,6 +1469,7 @@ mod tests {
             right: Box::new(scan_for(&small)),
             join_type: JoinKind::Inner,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1490,6 +1500,7 @@ mod tests {
             right: Box::new(scan_for(&large)),
             join_type: JoinKind::LeftOuter,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1516,6 +1527,7 @@ mod tests {
             right: Box::new(scan_for(&large)),
             join_type: JoinKind::LeftSemi,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1542,6 +1554,7 @@ mod tests {
             right: Box::new(scan_for(&large)),
             join_type: JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1572,6 +1585,7 @@ mod tests {
             right: Box::new(scan_for(&orders)),
             join_type: JoinKind::Inner,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let outer_join = LogicalPlan::Join(JoinNode {
@@ -1579,6 +1593,7 @@ mod tests {
             right: Box::new(scan_for(&lineitem)),
             join_type: JoinKind::Inner,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(outer_join);
@@ -1683,6 +1698,7 @@ mod tests {
             right: Box::new(scan_for(&fact)),
             join_type: JoinKind::Inner,
             condition: eq_condition(),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_heuristic(plan);
@@ -1744,6 +1760,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -1810,6 +1827,7 @@ mod tests {
             right: Box::new(scan_with_alias(&fact, "fact")),
             join_type: JoinKind::Inner,
             condition: Some(qualified_eq("dim", "fact")),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_cbo(plan, &table_stats);
@@ -1852,6 +1870,7 @@ mod tests {
             right: Box::new(scan_with_alias(&orders, "orders")),
             join_type: JoinKind::Inner,
             condition: Some(qualified_eq("lineitem", "orders")),
+            required_output_columns: None,
         });
 
         let plan = LogicalPlan::Join(JoinNode {
@@ -1859,6 +1878,7 @@ mod tests {
             right: Box::new(scan_with_alias(&customer, "customer")),
             join_type: JoinKind::Inner,
             condition: Some(qualified_eq("orders", "customer")),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_cbo(plan, &table_stats);
@@ -1902,6 +1922,7 @@ mod tests {
             right: Box::new(scan_with_alias(&large, "large")),
             join_type: JoinKind::LeftOuter,
             condition: Some(qualified_eq("small", "large")),
+            required_output_columns: None,
         });
 
         let reordered = reorder_joins_cbo(plan, &table_stats);

@@ -73,10 +73,12 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                required_output_columns: None,
             })),
             group_by: vec![],
             aggregates: vec![],
             output_columns: vec![],
+            required_output_columns: None,
             already_pushed: false,
         })
     }
@@ -131,6 +133,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                required_output_columns: None,
             })
         }
 
@@ -149,6 +152,7 @@ mod tests {
                     data_type: DataType::Boolean,
                     nullable: false,
                 }),
+                required_output_columns: None,
             })),
             group_by: vec![col("k")],
             aggregates: vec![AggregateCall {
@@ -159,6 +163,7 @@ mod tests {
                 order_by: vec![],
             }],
             output_columns: vec![],
+            required_output_columns: None,
             already_pushed: true, // <- key invariant
         });
 

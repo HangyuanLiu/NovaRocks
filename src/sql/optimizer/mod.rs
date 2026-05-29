@@ -325,6 +325,7 @@ mod is_known_rule_name_tests {
         let plan = LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
         let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
@@ -444,6 +445,7 @@ mod is_known_rule_name_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let s_ref = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -474,6 +476,7 @@ mod is_known_rule_name_tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         })
     }
 

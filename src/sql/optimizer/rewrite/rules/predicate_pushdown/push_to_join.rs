@@ -250,6 +250,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
         LogicalPlan::Filter(FilterNode {
             input: join.left,
             predicate: pushed,
+            required_output_columns: None,
         })
     };
 
@@ -261,6 +262,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
         LogicalPlan::Filter(FilterNode {
             input: join.right,
             predicate: pushed,
+            required_output_columns: None,
         })
     };
 
@@ -280,6 +282,7 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
         right: Box::new(new_right),
         join_type: new_join_type,
         condition: new_condition,
+        required_output_columns: join.required_output_columns,
     });
 
     (wrap_remaining_filter(new_join, remaining), pushed_any)
@@ -530,6 +533,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -543,6 +547,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition,
+            required_output_columns: None,
         })
     }
 
@@ -552,6 +557,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         })
     }
 
@@ -566,6 +572,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(join),
             predicate: eq(col("x"), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateJoin;
@@ -601,6 +608,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(join),
             predicate: eq(col("a"), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateJoin;
@@ -635,6 +643,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(join),
             predicate: eq(col("x"), col("a")),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateJoin;
@@ -672,10 +681,12 @@ mod tests {
             right: Box::new(t2),
             join_type: JoinKind::RightOuter,
             condition: None,
+            required_output_columns: None,
         });
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(join),
             predicate: eq(col("x"), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateJoin;

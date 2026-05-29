@@ -109,6 +109,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             LogicalPlan::Filter(FilterNode {
                 input: Box::new(input),
                 predicate: node.predicate,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -130,6 +131,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             LogicalPlan::Project(ProjectNode {
                 input: Box::new(input),
                 items: node.items,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -180,6 +182,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 right: Box::new(right),
                 join_type: node.join_type,
                 condition: node.condition,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -202,6 +205,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 input: Box::new(input),
                 items: node.items,
                 analytic_partition_by: node.analytic_partition_by,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -211,6 +215,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 input: Box::new(input),
                 limit: node.limit,
                 offset: node.offset,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -224,6 +229,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .collect(),
             all: node.all,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -232,6 +238,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .map(|i| prune_inner(i, None))
                 .collect(),
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -240,6 +247,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .map(|i| prune_inner(i, None))
                 .collect(),
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),
@@ -258,6 +266,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 cte_id: node.cte_id,
                 produce: Box::new(produce),
                 consumer: Box::new(consumer),
+                required_output_columns: node.required_output_columns,
             })
         }
         LogicalPlan::CTEProduce(node) => {
@@ -266,6 +275,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 cte_id: node.cte_id,
                 input: Box::new(input),
                 output_columns: node.output_columns,
+                required_output_columns: node.required_output_columns,
             })
         }
         LogicalPlan::CTEConsume(node) => LogicalPlan::CTEConsume(node),
@@ -290,6 +300,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 input: Box::new(input),
                 alias: node.alias,
                 output_columns: node.output_columns,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -303,6 +314,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 all_rollup_columns: node.all_rollup_columns,
                 grouping_key_aliases: node.grouping_key_aliases,
                 grouping_fn_args: node.grouping_fn_args,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -324,6 +336,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 input: Box::new(input),
                 mappings: node.mappings,
                 output_columns: node.output_columns,
+                required_output_columns: node.required_output_columns,
             })
         }
 
@@ -395,6 +408,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         }
     }
 
@@ -441,6 +455,7 @@ mod tests {
                 expr: col_ref("a", DataType::Int32),
                 output_name: "a".to_string(),
             }],
+            required_output_columns: None,
         });
 
         let rule = PruneColumns;
@@ -480,6 +495,7 @@ mod tests {
                 data_type: DataType::Boolean,
                 nullable: false,
             },
+            required_output_columns: None,
         });
         let project = LogicalPlan::Project(ProjectNode {
             input: Box::new(filter),
@@ -487,6 +503,7 @@ mod tests {
                 expr: col_ref("a", DataType::Int32),
                 output_name: "a".to_string(),
             }],
+            required_output_columns: None,
         });
 
         let rule = PruneColumns;
@@ -543,6 +560,7 @@ mod tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         });
 
         let rule = PruneColumns;

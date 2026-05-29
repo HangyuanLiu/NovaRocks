@@ -502,6 +502,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -593,6 +594,7 @@ mod tests {
         let plan = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
@@ -704,6 +706,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: Some(cond),
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
@@ -729,6 +732,7 @@ mod tests {
                 nullable: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
@@ -747,6 +751,7 @@ mod tests {
             input: Box::new(scan),
             limit: Some(10),
             offset: None,
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
@@ -768,6 +773,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
@@ -789,6 +795,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::LeftAnti,
             condition: Some(eq_expr(col_ref("id"), col_ref("id"))),
+            required_output_columns: None,
         });
 
         let stats = estimate_statistics(&plan, &table_stats);

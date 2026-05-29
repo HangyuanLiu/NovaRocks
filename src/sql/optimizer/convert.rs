@@ -365,6 +365,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -391,6 +392,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
 
         let predicate = TypedExpr {
@@ -402,6 +404,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -438,24 +441,28 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
 
         let produce = LogicalPlan::CTEProduce(crate::sql::planner::plan::CTEProduceNode {
             cte_id: 7,
             input: Box::new(scan.clone()),
             output_columns: dummy_output_columns(),
+            required_output_columns: None,
         });
 
         let consume = LogicalPlan::CTEConsume(crate::sql::planner::plan::CTEConsumeNode {
             cte_id: 7,
             alias: "t".to_string(),
             output_columns: dummy_output_columns(),
+            required_output_columns: None,
         });
 
         let anchor = LogicalPlan::CTEAnchor(crate::sql::planner::plan::CTEAnchorNode {
             cte_id: 7,
             produce: Box::new(produce),
             consumer: Box::new(consume),
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();

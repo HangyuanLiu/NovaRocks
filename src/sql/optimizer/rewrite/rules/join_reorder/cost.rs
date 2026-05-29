@@ -134,6 +134,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -158,6 +159,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let cost = estimate_operator_cost(&scan_plan, &stats, &[]);
         // cpu = rows * avg_size = 1000 * 100 = 100_000
@@ -179,6 +181,7 @@ mod tests {
                 data_type: DataType::Boolean,
                 nullable: false,
             },
+            required_output_columns: None,
         });
 
         let cost = estimate_operator_cost(&plan, &own_stats, &[&input_stats]);
@@ -197,6 +200,7 @@ mod tests {
             aggregates: vec![],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         });
 
         let cost = estimate_operator_cost(&plan, &own_stats, &[&input_stats]);
@@ -215,6 +219,7 @@ mod tests {
             input: Box::new(dummy_values()),
             items: vec![],
             analytic_partition_by: Vec::new(),
+            required_output_columns: None,
         });
 
         let cost = estimate_operator_cost(&plan, &own_stats, &[&input_stats]);
@@ -234,6 +239,7 @@ mod tests {
             right: Box::new(dummy_values()),
             join_type: JoinKind::Inner,
             condition: None,
+            required_output_columns: None,
         };
 
         // Small on right (build side): lower cost.
@@ -260,6 +266,7 @@ mod tests {
             right: Box::new(dummy_values()),
             join_type: JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         };
 
         let hash = JoinNode {
@@ -267,6 +274,7 @@ mod tests {
             right: Box::new(dummy_values()),
             join_type: JoinKind::Inner,
             condition: None,
+            required_output_columns: None,
         };
 
         let cross_cost = estimate_join_cost(&cross, &left, &right, &output);
