@@ -21,8 +21,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::common::network;
@@ -52,6 +52,20 @@ fn print_standalone_server_usage() {
     eprintln!("Example:");
     eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
     eprintln!("  novarocks standalone-server --role be --config /etc/novarocks/novarocks.toml");
+}
+
+/// Build the tracing EnvFilter expression from config: prefer the explicit
+/// `log_filter`, else map `log_level` (keeping deps at info for debug/trace).
+fn resolve_log_filter(cfg: &novarocks::common::app_config::NovaRocksConfig) -> String {
+    if let Some(ref f) = cfg.log_filter {
+        f.clone()
+    } else {
+        match cfg.log_level.as_str() {
+            "debug" => "info,novarocks=debug".to_string(),
+            "trace" => "info,novarocks=trace".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 fn parse_standalone_server_args(
@@ -280,6 +294,13 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // it — along with the already-validated cfg — into the execution path
     // without a second file read.
     let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
+
+    // Install the global config and initialize the tracing subscriber before
+    // starting the server. Without this, standalone-server runs with no logging
+    // (init_with_level is otherwise only called on the FE-compatible run/start
+    // path), so log_filter/log_level/sys_log_dir from the config are ignored.
+    novarocks::common::app_config::install_preloaded_config(cfg.clone());
+    novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
 
     // Spec (PR-4): role=fe must NOT start a local gRPC/exchange server.
     // Use a role-specific server entry point so the closure below routes to
@@ -677,19 +698,7 @@ fn main() {
             // Otherwise, treat `log_level` as the level for our own crate (`novarocks`)
             // and keep a sane default (global `info`) for dependencies, so that
             // noisy system libraries do not spam debug/trace logs.
-            let filter = if let Some(ref f) = cfg.log_filter {
-                f.as_str()
-            } else {
-                match cfg.log_level.as_str() {
-                    // High-verbosity levels: enable for our crate, keep deps at info.
-                    "debug" => "info,novarocks=debug",
-                    "trace" => "info,novarocks=trace",
-                    // Other levels: apply globally.
-                    other => other,
-                }
-            };
-
-            novarocks_logging::init_with_level(filter);
+            novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
 
             eprintln!("NovaRocks {}", novarocks::version::full_version());
 
@@ -939,8 +948,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
-        parse_standalone_server_args, probe_all_backends, resolve_cluster_role, wait_for_tcp_ready,
+        dispatch_standalone_role, load_config_and_resolve_role, parse_standalone_server_args,
+        probe_all_backends, resolve_cluster_role, wait_for_tcp_ready, StandaloneServerCliArgs,
     };
 
     #[test]
