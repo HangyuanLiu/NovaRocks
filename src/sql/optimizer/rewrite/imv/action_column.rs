@@ -9,11 +9,13 @@ use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
+use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::first_delta_base_fqn;
+use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -104,6 +106,14 @@ fn validate(plan: &LogicalPlan) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // V6: if a delta subtree exists, root output must carry the apply key.
+    if subtree_has_delta(plan) && !output_has_apply_key(plan) {
+        let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
+        return Err(format!(
+            "plan above delta-bound scan {fqn} is missing apply key column \
+             {ICEBERG_MV_APPLY_KEY_COLUMN}"
+        ));
+    }
     Ok(())
 }
 
@@ -191,6 +201,12 @@ fn validate_scan(scan: &ScanNode) -> Result<(), String> {
                 if col.nullable {
                     return Err(format!("Delta-bound scan {fqn} has nullable action column"));
                 }
+                // V7: _row_id must be present so the apply-key projection can reference it.
+                if !scan.columns.iter().any(ImvRowIdColumn::matches) {
+                    return Err(format!(
+                        "Delta-bound scan {fqn} missing _row_id column"
+                    ));
+                }
                 Ok(())
             }
             _ => Err(format!(
@@ -206,6 +222,17 @@ fn validate_scan(scan: &ScanNode) -> Result<(), String> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn output_has_apply_key(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project(p) => p
+            .items
+            .iter()
+            .any(|i| i.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)),
+        LogicalPlan::Filter(node) => output_has_apply_key(&node.input),
+        _ => false,
     }
 }
 
@@ -232,7 +259,11 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
         LogicalPlan::Project(node) => node
             .items
             .iter()
-            .any(|item| !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            .any(|item| {
+                !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                    && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+                    && !item.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+            }),
         LogicalPlan::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
         LogicalPlan::Join(node) => {
             has_visible_output(&node.left) || has_visible_output(&node.right)
@@ -343,10 +374,64 @@ mod tests {
 
     #[test]
     fn validation_passes_on_well_formed_delta_scan() {
-        let plan = LogicalPlan::Scan(delta_scan_with(Some(ImvActionColumn::output_column(
-            ColumnId(100),
-        ))));
-        validate(&plan).expect("must validate");
+        // Scan with k + action + _row_id, root Project carrying all three plus
+        // the apply key. This is the shape the IMV pipeline produces.
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
+        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            items: vec![
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: "k".to_string(),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(100),
+                            qualifier: None,
+                            column: ImvActionColumn::NAME.to_string(),
+                        },
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    output_name: ImvActionColumn::NAME.to_string(),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(101),
+                            qualifier: None,
+                            column: ImvRowIdColumn::NAME.to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: ImvRowIdColumn::NAME.to_string(),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(101),
+                            qualifier: None,
+                            column: ImvRowIdColumn::NAME.to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                },
+            ],
+        });
+        validate(&project).expect("must validate");
     }
 
     #[test]
@@ -387,11 +472,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_dropped_action_above_project() {
-        let scan = LogicalPlan::Scan(delta_scan_with(Some(ImvActionColumn::output_column(
-            ColumnId(100),
-        ))));
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
+        // Add _row_id so V7 passes; V3 fires because the Project below drops action.
+        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
+            input: Box::new(LogicalPlan::Scan(scan)),
             items: vec![ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -478,5 +563,75 @@ mod tests {
         });
         let err = validate(&plan).expect_err("union above delta must fail");
         assert!(err.contains("Phase 6"), "got: {err}");
+    }
+
+    // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
+
+    /// Helper: delta scan with both a valid action column and `_row_id`.
+    fn delta_scan_with_action_and_row_id() -> ScanNode {
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
+        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        scan
+    }
+
+    #[test]
+    fn validation_rejects_missing_apply_key_above_delta() {
+        // Project carries k + __change_op + _row_id but NOT __nova_base_row_id.
+        let scan = delta_scan_with_action_and_row_id();
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            items: vec![
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: "k".to_string(),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(100),
+                            qualifier: None,
+                            column: ImvActionColumn::NAME.to_string(),
+                        },
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    output_name: ImvActionColumn::NAME.to_string(),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(101),
+                            qualifier: None,
+                            column: ImvRowIdColumn::NAME.to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: ImvRowIdColumn::NAME.to_string(),
+                },
+                // __nova_base_row_id is intentionally absent.
+            ],
+        });
+        let err = validate(&project).expect_err("missing apply key must fail");
+        assert!(err.contains("apply key"), "got: {err}");
+        assert!(err.contains("ice.db.b"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_delta_scan_missing_row_id() {
+        // Scan has action column but NOT _row_id.
+        let plan = LogicalPlan::Scan(delta_scan_with(Some(ImvActionColumn::output_column(
+            ColumnId(100),
+        ))));
+        let err = validate(&plan).expect_err("missing _row_id must fail");
+        assert!(err.contains("_row_id"), "got: {err}");
     }
 }
