@@ -1,13 +1,31 @@
 # OQ-1 Column Pruning Refactor — Current Status (2026-05-29)
 
-> **⚠️ DO NOT MERGE.** This branch's new column pruning is **ACTIVE but produces wrong
-> results on several real query shapes** (see §3). It is a WIP checkpoint preserving the
-> architecture + investigation. Either finish §4 (make per-operator rules production-correct)
-> or revert the atomic switch (commit `4ece15a5`) to re-enable the old `PruneColumns` before
-> any merge.
+> **⚠️ DO NOT MERGE.** This branch's new column pruning is **ACTIVE**. After the
+> fix rounds (latest commit `95cc47f7`) the picture is much better than §3's initial
+> findings — see **§6 (latest suite run)**: cte is 3/3, and the remaining join failures all
+> map to **pre-existing** failing cases (not OQ-1 regressions). Still WIP: the failure
+> *modes* of two pre-existing cases changed and need confirmation, and Gap-3/Gap-5 pruning
+> are intentionally no-op'd. Either finish §4 + confirm §6, or revert the atomic switch
+> (`4ece15a5`) before merge.
 
 Spec: `docs/superpowers/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md`
 Plan: `docs/superpowers/plans/2026-05-28-oq-1-column-pruning-arch-refactor.md`
+
+## 0. TL;DR (latest, 2026-05-29 post-`95cc47f7`)
+
+- **cte suite: 3/3 PASS** (`cte_in_where_subquery` fixed — EXISTS indicator id).
+- **join suite: 38/60 run before manual stop, 34 pass / 4 fail.** The 4 failing cases are
+  **ALL pre-existing** (failed before OQ-1 too): `array_type`, `eliminate_with_constant`
+  (proven a pre-existing SplitTopN+BROADCAST exec bug, not pruning), `force_partition_hash`
+  (pre-existing 180s NLJ timeout), `full_outer_with_using`. **No NEW failing join CASES from OQ-1.**
+- **Open question (not yet confirmed):** `array_type` (`actual=2 expected=0`) and
+  `full_outer_with_using` (`actual=0 expected=10`) fail with a *different mode* than baseline
+  (baseline: array_type=header mismatch @step36; full_outer_with_using=value mismatch). Could
+  be OQ-1 worsened cosmetic→wrong-result, OR fail-fast stops at a different step. **Must diff
+  the failing step vs baseline to confirm OQ-1 didn't worsen these two.**
+- Suite was manually stopped at join 38/60 (had not reached the heavy wide-table tail:
+  `join_one_key`, `join_partition`, etc.) so the 22 remaining cases + the wall_time-vs-1996s
+  improvement number are **not yet measured**.
 
 ## 1. Goal (unchanged)
 
