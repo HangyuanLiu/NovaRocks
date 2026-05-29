@@ -112,6 +112,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
             all: node.all,
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -119,6 +120,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .into_iter()
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -126,6 +128,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .into_iter()
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
@@ -239,6 +242,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
             all: node.all,
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -246,6 +250,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .into_iter()
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -253,6 +258,7 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .into_iter()
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
@@ -432,6 +438,7 @@ mod tests {
             consumer: Box::new(LogicalPlan::Union(UnionNode {
                 inputs: vec![consume_plan(1, "t1"), consume_plan(1, "t2")],
                 all: true,
+                output_columns: vec![],
             })),
         });
 
@@ -469,6 +476,7 @@ mod tests {
                 consumer: Box::new(LogicalPlan::Union(UnionNode {
                     inputs: vec![consume_plan(2, "b1"), consume_plan(2, "b2")],
                     all: true,
+                    output_columns: vec![],
                 })),
             })),
         });
@@ -510,6 +518,7 @@ mod tests {
             consumer: Box::new(LogicalPlan::Union(UnionNode {
                 inputs: vec![consume_plan(1, "target"), consume_plan(2, "shadow")],
                 all: true,
+                output_columns: vec![],
             })),
         });
 

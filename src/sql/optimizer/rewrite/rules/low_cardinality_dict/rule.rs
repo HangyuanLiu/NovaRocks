@@ -934,6 +934,7 @@ mod tests {
         let union = LogicalPlan::Union(UnionNode {
             inputs: vec![scan_t1, scan_t2],
             all: true,
+            output_columns: vec![],
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
@@ -986,6 +987,7 @@ mod tests {
         let union = LogicalPlan::Union(UnionNode {
             inputs: vec![scan_t1, scan_t2],
             all: false,
+            output_columns: vec![],
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {

@@ -215,16 +215,38 @@ fn rewrite_children(
         }
         LogicalPlan::Union(node) => {
             let all = node.all;
+            let output_columns = node.output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Union(UnionNode { inputs, all }), changed))
+            Ok((
+                LogicalPlan::Union(UnionNode {
+                    inputs,
+                    all,
+                    output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Intersect(node) => {
+            let output_columns = node.output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Intersect(IntersectNode { inputs }), changed))
+            Ok((
+                LogicalPlan::Intersect(IntersectNode {
+                    inputs,
+                    output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Except(node) => {
+            let output_columns = node.output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Except(ExceptNode { inputs }), changed))
+            Ok((
+                LogicalPlan::Except(ExceptNode {
+                    inputs,
+                    output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Decode(node) => {
             let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;

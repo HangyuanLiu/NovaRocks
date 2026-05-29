@@ -223,6 +223,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .map(|i| prune_inner(i, None))
                 .collect(),
             all: node.all,
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -230,6 +231,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .into_iter()
                 .map(|i| prune_inner(i, None))
                 .collect(),
+            output_columns: node.output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -237,6 +239,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 .into_iter()
                 .map(|i| prune_inner(i, None))
                 .collect(),
+            output_columns: node.output_columns,
         }),
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),

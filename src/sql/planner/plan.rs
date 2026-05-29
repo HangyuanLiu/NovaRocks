@@ -299,16 +299,26 @@ pub(crate) struct UnionNode {
     pub inputs: Vec<LogicalPlan>,
     /// `true` = UNION ALL, `false` = UNION DISTINCT.
     pub all: bool,
+    /// Position-aligned output schema. Column at index `i` describes the
+    /// union's output slot at position `i`, using the first branch's
+    /// ColumnId. Populated at planner construction time so that future
+    /// column-pruning passes (Gap 4) can map parent ColumnId requests to
+    /// branch positions without descending into inputs.
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct IntersectNode {
     pub inputs: Vec<LogicalPlan>,
+    /// Position-aligned output schema. Same semantics as `UnionNode::output_columns`.
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExceptNode {
     pub inputs: Vec<LogicalPlan>,
+    /// Position-aligned output schema. Same semantics as `UnionNode::output_columns`.
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[cfg(test)]
@@ -328,5 +338,62 @@ mod plan_tests {
             already_pushed: false,
         };
         assert!(!node.already_pushed);
+    }
+
+    #[test]
+    fn union_node_carries_explicit_output_columns() {
+        use crate::sql::column_id::ColumnId;
+        use arrow::datatypes::DataType;
+        let cols = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: "x".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }];
+        let node = UnionNode {
+            inputs: vec![],
+            all: true,
+            output_columns: cols.clone(),
+        };
+        assert_eq!(node.output_columns.len(), 1);
+        assert_eq!(node.output_columns[0].name, "x");
+        assert_eq!(node.output_columns[0].data_type, DataType::Int32);
+        assert!(!node.output_columns[0].nullable);
+    }
+
+    #[test]
+    fn intersect_node_carries_explicit_output_columns() {
+        use crate::sql::column_id::ColumnId;
+        use arrow::datatypes::DataType;
+        let cols = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: "y".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        }];
+        let node = IntersectNode {
+            inputs: vec![],
+            output_columns: cols,
+        };
+        assert_eq!(node.output_columns.len(), 1);
+        assert_eq!(node.output_columns[0].name, "y");
+    }
+
+    #[test]
+    fn except_node_carries_explicit_output_columns() {
+        use crate::sql::column_id::ColumnId;
+        use arrow::datatypes::DataType;
+        let cols = vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: "z".to_string(),
+            data_type: DataType::Boolean,
+            nullable: false,
+        }];
+        let node = ExceptNode {
+            inputs: vec![],
+            output_columns: cols,
+        };
+        assert_eq!(node.output_columns.len(), 1);
+        assert_eq!(node.output_columns[0].name, "z");
     }
 }

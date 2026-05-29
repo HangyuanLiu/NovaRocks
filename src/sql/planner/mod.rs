@@ -1953,6 +1953,27 @@ fn plan_set_operation_scoped(
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
+    // Build position-aligned output schema before consuming the branches.
+    // For each position we widen the type across left/right (matching
+    // the analyzer's wider_type logic), keep the left branch ColumnId and
+    // name, and union the nullable flags. This mirrors what derive_output_columns
+    // and visit_set_op_common use as the canonical union output schema.
+    let output_columns: Vec<OutputColumn> = set_op
+        .left
+        .output_columns
+        .iter()
+        .zip(set_op.right.output_columns.iter())
+        .map(|(lc, rc)| {
+            let dt = crate::sql::types::wider_type(&lc.data_type, &rc.data_type);
+            OutputColumn {
+                column_id: lc.column_id,
+                name: lc.name.clone(),
+                data_type: dt,
+                nullable: lc.nullable || rc.nullable,
+            }
+        })
+        .collect();
+
     let left = plan_scoped_query(*set_op.left, cte_registry, factory)?;
     let right = plan_scoped_query(*set_op.right, cte_registry, factory)?;
 
@@ -1960,12 +1981,15 @@ fn plan_set_operation_scoped(
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
             inputs: vec![left, right],
             all: set_op.all,
+            output_columns,
         })),
         SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
             inputs: vec![left, right],
+            output_columns,
         })),
         SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
             inputs: vec![left, right],
+            output_columns,
         })),
     }
 }
