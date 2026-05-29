@@ -80,7 +80,10 @@ impl ExecutionCoordinator {
         use std::sync::atomic::{AtomicI64, Ordering};
         static NEXT_QUERY_BASE: AtomicI64 = AtomicI64::new(100);
         let query_base = NEXT_QUERY_BASE.fetch_add(1000, Ordering::Relaxed);
-        let query_id = types::TUniqueId::new(query_base, 1);
+        // Use query_base for both hi and lo so the scheduler's
+        // `root_backend_idx = query_id.lo % n` scatters across backends per
+        // query instead of always landing on backend 1 % n.
+        let query_id = types::TUniqueId::new(query_base, query_base);
 
         debug!(
             "coordinator topology: fragments={} edges={} root={} backends={}",
@@ -127,7 +130,8 @@ impl ExecutionCoordinator {
                         .is_some()
                     {
                         return Err(format!(
-                            "fragment {} has multiple outgoing Stream edges",
+                            "fragment {} has multiple outgoing Stream edges; \
+                             stream fan-out is not supported",
                             e.source_fragment_id
                         ));
                     }
@@ -162,8 +166,8 @@ impl ExecutionCoordinator {
         // At one backend this equals the local exchange address, matching the
         // prior `dispatcher.exchange_addr()` behavior exactly.
         let merge_addr = backend_to_network_addr(scheduler.backends(), plan.root_backend_idx)?;
-        if let Some(rf) = rf_plan.as_ref() {
-            inject_runtime_filter_merge_nodes(rf, &mut fragment_results, &merge_addr);
+        if rf_plan.is_some() {
+            inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
         }
 
         // ---------------------------------------------------------------
@@ -177,11 +181,17 @@ impl ExecutionCoordinator {
             .by_fragment
             .iter()
             .map(|(fid, insts)| {
-                let dests = insts
+                let dests: Result<Vec<_>, String> = insts
                     .iter()
                     .map(|inst| {
-                        let addr = scheduler.backends()[inst.backend_idx];
-                        data_sinks::TPlanFragmentDestination::new(
+                        let addr = scheduler.backends().get(inst.backend_idx).ok_or_else(|| {
+                            format!(
+                                "backend idx {} out of range ({} backends)",
+                                inst.backend_idx,
+                                scheduler.backends().len()
+                            )
+                        })?;
+                        Ok(data_sinks::TPlanFragmentDestination::new(
                             inst.finst_id.clone(),
                             None::<types::TNetworkAddress>,
                             Some(types::TNetworkAddress::new(
@@ -189,18 +199,28 @@ impl ExecutionCoordinator {
                                 addr.port() as i32,
                             )),
                             None::<i32>,
-                        )
+                        ))
                     })
                     .collect();
-                (*fid, dests)
+                dests.map(|d| (*fid, d))
             })
-            .collect();
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         let fr_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentBuildResult> =
             fragment_results
                 .iter()
                 .map(|fr| (fr.fragment_id, fr))
                 .collect();
+
+        // Build a fragment-id -> instance count map from the scheduling plan.
+        // This is used by build_instance_runtime_filter_params to set the correct
+        // builder_number for each runtime filter id (must equal the number of
+        // build-side instances, not a hardcoded 1).
+        let instance_counts: BTreeMap<FragmentId, usize> = plan
+            .by_fragment
+            .iter()
+            .map(|(&fid, insts)| (fid, insts.len()))
+            .collect();
 
         let mut tracker = InFlightTracker::default();
         // Collect all (backend_idx, params) so submission order is deterministic
@@ -222,7 +242,7 @@ impl ExecutionCoordinator {
             if !is_root && fr.cte_id.is_none() && stream_edge.is_none() {
                 return Err(format!(
                     "fragment {fragment_id} is neither root, CTE producer, nor stream producer; \
-                     multi-hop stream exchange is not supported in standalone coordinator"
+                     stream fan-out is not supported in standalone coordinator"
                 ));
             }
 
@@ -309,6 +329,7 @@ impl ExecutionCoordinator {
                     exec_params.runtime_filter_params = Some(build_instance_runtime_filter_params(
                         rf,
                         &placement.runtime_filter_prober_params,
+                        &instance_counts,
                     ));
                 }
 
@@ -443,14 +464,26 @@ fn backend_to_network_addr(
 
 /// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided
 /// prober params plus the global builder-number map.
+///
+/// `instance_counts` maps fragment id to the number of instances the scheduler
+/// assigned to it. For each build fragment, every filter id it produces must
+/// wait for exactly that many partial filters before the merge node broadcasts.
+/// Hardcoding 1 here would cause the merge to broadcast after the first
+/// partial, silently dropping N-1 partials and producing an incomplete bloom
+/// filter at N > 1 instances (wrong join results).
 fn build_instance_runtime_filter_params(
     rf_plan: &RuntimeFilterPlanResult,
     id_to_prober_params: &BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>>,
+    instance_counts: &BTreeMap<FragmentId, usize>,
 ) -> runtime_filter::TRuntimeFilterParams {
     let mut builder_number: BTreeMap<i32, i32> = BTreeMap::new();
-    for filter_ids in rf_plan.build_side_filters.values() {
+    for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
+        let n_builders = instance_counts
+            .get(build_frag_id)
+            .map(|&n| n as i32)
+            .unwrap_or(1);
         for fid in filter_ids {
-            builder_number.insert(*fid, 1);
+            builder_number.insert(*fid, n_builders);
         }
     }
     runtime_filter::TRuntimeFilterParams::new(
@@ -469,13 +502,9 @@ fn build_instance_runtime_filter_params(
 /// node is the backend hosting the root instance; at one backend it equals the
 /// local exchange address (prior behavior).
 fn inject_runtime_filter_merge_nodes(
-    rf_plan: &RuntimeFilterPlanResult,
     fragment_results: &mut [crate::sql::codegen::FragmentBuildResult],
     merge_addr: &types::TNetworkAddress,
 ) {
-    // `rf_plan` is borrowed immutably here; only the on-the-wire descriptors in
-    // each fragment's plan need the merge node, so we mutate those.
-    let _ = rf_plan;
     for fr in fragment_results.iter_mut() {
         for node in fr.plan.nodes.iter_mut() {
             if let Some(ref mut hj) = node.hash_join_node
