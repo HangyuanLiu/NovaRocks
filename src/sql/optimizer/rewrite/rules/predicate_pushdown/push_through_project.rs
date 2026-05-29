@@ -189,6 +189,7 @@ mod tests {
                 .map(|n| ProjectItem {
                     expr: col(n),
                     output_name: (*n).into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 })
                 .collect(),
             required_output_columns: None,
@@ -245,6 +246,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: computed_expr,
                 output_name: "x".into(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });
@@ -315,10 +317,12 @@ mod tests {
                 ProjectItem {
                     expr: col("a"),
                     output_name: "a".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 },
                 ProjectItem {
                     expr: computed_expr,
                     output_name: "x".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 },
             ],
             required_output_columns: None,

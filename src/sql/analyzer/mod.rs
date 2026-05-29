@@ -1408,6 +1408,7 @@ impl<'a> AnalyzerContext<'a> {
                     projection.push(ProjectItem {
                         expr: typed,
                         output_name: name,
+                        output_column_id: column_id,
                     });
                 }
                 sqlast::SelectItem::ExprWithAlias { expr, alias } => {
@@ -1447,6 +1448,7 @@ impl<'a> AnalyzerContext<'a> {
                     projection.push(ProjectItem {
                         expr: typed,
                         output_name: name,
+                        output_column_id: column_id,
                     });
                 }
                 sqlast::SelectItem::Wildcard(_) => {
@@ -1478,6 +1480,7 @@ impl<'a> AnalyzerContext<'a> {
                         projection.push(ProjectItem {
                             expr: typed,
                             output_name: col_name.clone(),
+                            output_column_id: *col_id,
                         });
                     }
                 }
@@ -1530,6 +1533,7 @@ impl<'a> AnalyzerContext<'a> {
                         projection.push(ProjectItem {
                             expr: typed,
                             output_name: col_name.clone(),
+                            output_column_id: *col_id,
                         });
                     }
                     if !found {
@@ -1579,6 +1583,7 @@ impl<'a> AnalyzerContext<'a> {
                         projection.push(ProjectItem {
                             expr: typed,
                             output_name: col_name.clone(),
+                            output_column_id: *col_id,
                         });
                     }
                 }
@@ -4121,6 +4126,70 @@ mod tests {
         assert!(
             err.contains("write.row-lineage") || err.contains("row-lineage metadata"),
             "expected row-lineage rebuild diagnostic, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // output_column_id on ProjectItem
+    // -----------------------------------------------------------------------
+
+    /// A computed SELECT item (`a + b AS c`) must receive a non-UNSET
+    /// `output_column_id` that matches the corresponding entry in
+    /// `output_columns`.  A passthrough ColumnRef item reuses the
+    /// source column's id.
+    #[test]
+    fn computed_project_item_gets_non_unset_output_column_id() {
+        // `orders` has o_orderkey (Int64) and o_custkey (Int64).
+        let sql = "SELECT o_orderkey + o_custkey AS sum_keys, o_orderkey FROM orders";
+        let resolved = parse_raw_and_analyze(sql).expect("analysis should succeed");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected Select body");
+        };
+
+        assert_eq!(
+            select.projection.len(),
+            2,
+            "expected two projection items"
+        );
+        assert_eq!(
+            resolved.output_columns.len(),
+            2,
+            "expected two output columns"
+        );
+
+        // First item: computed expression (o_orderkey + o_custkey).
+        let computed_item = &select.projection[0];
+        let computed_out_col = &resolved.output_columns[0];
+        assert_ne!(
+            computed_item.output_column_id,
+            crate::sql::column_id::ColumnId::UNSET,
+            "computed item must not have UNSET output_column_id"
+        );
+        assert_eq!(
+            computed_item.output_column_id,
+            computed_out_col.column_id,
+            "computed item output_column_id must match the output_columns entry"
+        );
+
+        // Second item: passthrough ColumnRef (o_orderkey).
+        let passthrough_item = &select.projection[1];
+        let passthrough_out_col = &resolved.output_columns[1];
+        assert_ne!(
+            passthrough_item.output_column_id,
+            crate::sql::column_id::ColumnId::UNSET,
+            "passthrough item must not have UNSET output_column_id"
+        );
+        assert_eq!(
+            passthrough_item.output_column_id,
+            passthrough_out_col.column_id,
+            "passthrough item output_column_id must match the output_columns entry"
+        );
+
+        // The two items must have distinct ids.
+        assert_ne!(
+            computed_item.output_column_id,
+            passthrough_item.output_column_id,
+            "each projection item must receive a distinct output_column_id"
         );
     }
 }

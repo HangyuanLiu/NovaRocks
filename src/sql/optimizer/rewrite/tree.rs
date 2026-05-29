@@ -433,6 +433,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: column_ref(output.column_id, "c1"),
                 output_name: "c1".to_string(),
+                output_column_id: output.column_id,
             }],
             required_output_columns: None,
         })

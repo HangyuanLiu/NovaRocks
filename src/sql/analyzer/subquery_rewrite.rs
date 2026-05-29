@@ -494,6 +494,12 @@ impl<'a> AnalyzerContext<'a> {
         // lookup entirely and produces the same boolean indicator semantics.
         let mut modified_sub = resolved_sub;
         let indicator_dtype = DataType::Int32;
+        let match_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            indicator_dtype.clone(),
+            true,
+        );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
@@ -503,14 +509,9 @@ impl<'a> AnalyzerContext<'a> {
                     nullable: false,
                 },
                 output_name: match_col.clone(),
+                output_column_id: match_col_id,
             });
         }
-        let match_col_id = self.alloc_column_id(
-            Some(sq_alias.clone()),
-            match_col.clone(),
-            indicator_dtype.clone(),
-            true,
-        );
         modified_sub.output_columns.push(OutputColumn {
             column_id: match_col_id,
             name: match_col.clone(),
@@ -593,6 +594,12 @@ impl<'a> AnalyzerContext<'a> {
         // `__sq_alias` yields a row with `__exists IS NOT NULL` iff the
         // subquery has any rows.
         let mut modified_sub = resolved_sub;
+        let exists_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            DataType::Int64,
+            true,
+        );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = false;
             sel.projection.clear();
@@ -603,15 +610,10 @@ impl<'a> AnalyzerContext<'a> {
                     nullable: false,
                 },
                 output_name: match_col.clone(),
+                output_column_id: exists_col_id,
             });
             sel.has_aggregation = false;
         }
-        let exists_col_id = self.alloc_column_id(
-            Some(sq_alias.clone()),
-            match_col.clone(),
-            DataType::Int64,
-            true,
-        );
         modified_sub.output_columns = vec![OutputColumn {
             column_id: exists_col_id,
             name: match_col.clone(),
@@ -1141,6 +1143,7 @@ impl<'a> AnalyzerContext<'a> {
                         nullable: sub_output_col.nullable,
                     },
                     output_name: match_col_name.clone(),
+                    output_column_id: in_match_col_id,
                 });
             }
 
@@ -1755,6 +1758,7 @@ impl<'a> AnalyzerContext<'a> {
             extra_projection.push(ProjectItem {
                 expr: inner_col.clone(),
                 output_name: col_name.clone(),
+                output_column_id: corr_col_id,
             });
 
             // Use unqualified column ref for the right side of the join condition.

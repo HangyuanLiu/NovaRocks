@@ -88,6 +88,12 @@ pub(crate) struct RepeatInfo {
 pub(crate) struct ProjectItem {
     pub expr: TypedExpr,
     pub output_name: String,
+    /// The [`ColumnId`] that the analyzer minted for this output column.
+    /// Always equals the corresponding entry in the parallel `output_columns`
+    /// vec so that parent plans can address this output by `ColumnId`.
+    /// Set to [`ColumnId::UNSET`] only at optimizer/planner construction sites
+    /// that are never reached by the column-pruning pass.
+    pub output_column_id: ColumnId,
 }
 
 // ---------------------------------------------------------------------------

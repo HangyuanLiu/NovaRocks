@@ -454,6 +454,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: col_ref("a", DataType::Int32),
                 output_name: "a".to_string(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });
@@ -502,6 +503,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: col_ref("a", DataType::Int32),
                 output_name: "a".to_string(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });

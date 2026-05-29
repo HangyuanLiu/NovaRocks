@@ -212,6 +212,7 @@ fn apply_query_modifiers(
                                 nullable,
                             },
                             output_name: name,
+                            output_column_id: cid,
                         }
                     })
                     .collect()
@@ -229,6 +230,7 @@ fn apply_query_modifiers(
                             nullable: col.nullable,
                         },
                         output_name: col.name.clone(),
+                        output_column_id: col.column_id,
                     })
                     .collect()
             });
@@ -273,9 +275,15 @@ fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> V
         let output_name = crate::sql::codegen::helpers::typed_expr_display_name(&item.expr);
         let output_name_lower = output_name.to_lowercase();
         if !output_names.contains(&output_name_lower) && added.insert(output_name_lower) {
+            let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                *column_id
+            } else {
+                ColumnId::UNSET
+            };
             extra.push(ProjectItem {
                 expr: item.expr.clone(),
                 output_name,
+                output_column_id,
             });
         }
     }
@@ -566,9 +574,15 @@ fn prepare_repeat_input(
         };
         substitutions.push((original_display, replacement));
 
+        let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
+            *column_id
+        } else {
+            ColumnId::UNSET
+        };
         project_items.push(ProjectItem {
             expr: source_expr,
             output_name: alias_name.clone(),
+            output_column_id,
         });
     }
 
@@ -701,9 +715,15 @@ fn collect_repeat_input_refs(
             }
             let key = (qualifier.clone(), column.to_lowercase());
             if seen.insert(key) {
+                let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+                    *column_id
+                } else {
+                    ColumnId::UNSET
+                };
                 out.push(ProjectItem {
                     expr: expr.clone(),
                     output_name: column.clone(),
+                    output_column_id,
                 });
             }
         }
@@ -1007,6 +1027,7 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
             rewritten.push(ProjectItem {
                 expr: new_expr,
                 output_name: item.output_name.clone(),
+                output_column_id: item.output_column_id,
             });
         } else {
             rewritten.push(item.clone());
@@ -1336,6 +1357,7 @@ fn split_projection_for_aggregate(
         project_items.push(ProjectItem {
             expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
             output_name: item.output_name.clone(),
+            output_column_id: item.output_column_id,
         });
     }
 

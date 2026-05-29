@@ -377,14 +377,8 @@ pub(crate) fn collect_output_ids_ordered(
         LogicalPlan::Project(p) => p
             .items
             .iter()
-            .filter_map(|item| {
-                if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
-                    if *column_id != crate::sql::column_id::ColumnId::UNSET {
-                        return Some(*column_id);
-                    }
-                }
-                None
-            })
+            .map(|item| item.output_column_id)
+            .filter(|id| *id != crate::sql::column_id::ColumnId::UNSET)
             .collect(),
         LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
@@ -859,5 +853,84 @@ mod column_id_helper_tests {
         let ordered = collect_output_ids_ordered(&plan);
         let expected: Vec<ColumnId> = left_ids.iter().chain(right_ids.iter()).copied().collect();
         assert_eq!(ordered, expected);
+    }
+
+    /// A Project with one passthrough ColumnRef item and one computed item
+    /// (whose output_column_id is explicitly set) must return both ids.
+    /// This validates that `collect_output_ids_ordered` now reads
+    /// `output_column_id` instead of peeking at the expr's ColumnRef.
+    #[test]
+    fn project_passthrough_and_computed_both_collected() {
+        use crate::sql::analysis::{BinOp, ProjectItem, TypedExpr};
+
+        let pass_id = ColumnId::new_for_test(10);
+        let comp_id = ColumnId::new_for_test(20);
+
+        let scan = three_col_scan([pass_id, ColumnId::new_for_test(11), ColumnId::new_for_test(12)]);
+
+        // Passthrough item: expr is a ColumnRef with pass_id.
+        let passthrough_item = ProjectItem {
+            expr: col_ref_expr(pass_id),
+            output_name: "a".to_string(),
+            output_column_id: pass_id,
+        };
+
+        // Computed item: expr is a BinaryOp (not a ColumnRef), but output_column_id is set.
+        let computed_item = ProjectItem {
+            expr: TypedExpr {
+                kind: crate::sql::analysis::ExprKind::BinaryOp {
+                    left: Box::new(col_ref_expr(pass_id)),
+                    op: BinOp::Add,
+                    right: Box::new(col_ref_expr(ColumnId::new_for_test(11))),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: "computed".to_string(),
+            output_column_id: comp_id,
+        };
+
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![passthrough_item, computed_item],
+            required_output_columns: None,
+        });
+
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(
+            ordered,
+            vec![pass_id, comp_id],
+            "both passthrough and computed output_column_ids must be returned"
+        );
+    }
+
+    /// A Project item with UNSET output_column_id must be excluded
+    /// (synthetic dict-slot items that are never addressed by pruning).
+    #[test]
+    fn project_unset_output_column_id_excluded() {
+        use crate::sql::analysis::ProjectItem;
+
+        let real_id = ColumnId::new_for_test(5);
+        let scan = three_col_scan([real_id, ColumnId::new_for_test(6), ColumnId::new_for_test(7)]);
+
+        let real_item = ProjectItem {
+            expr: col_ref_expr(real_id),
+            output_name: "c".to_string(),
+            output_column_id: real_id,
+        };
+        let unset_item = ProjectItem {
+            expr: col_ref_expr(ColumnId::UNSET),
+            output_name: "__synthetic".to_string(),
+            output_column_id: ColumnId::UNSET,
+        };
+
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![real_item, unset_item],
+            required_output_columns: None,
+        });
+
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(ordered, vec![real_id], "UNSET items must be filtered out");
     }
 }

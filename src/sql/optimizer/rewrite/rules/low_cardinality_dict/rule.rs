@@ -501,6 +501,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: s_column_ref(),
                 output_name: "t".to_string(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });
@@ -569,6 +570,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: s_column_ref(),
                 output_name: "s".to_string(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });

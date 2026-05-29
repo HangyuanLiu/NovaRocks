@@ -268,6 +268,7 @@ fn rewrite_project(
             items.push(crate::sql::analysis::ProjectItem {
                 expr: rewritten,
                 output_name: item.output_name,
+                output_column_id: item.output_column_id,
             });
             continue;
         }
@@ -320,6 +321,8 @@ fn rewrite_project(
                 nullable,
             },
             output_name: dict_name,
+            // Synthetic dict-slot pass-through; not addressed by the pruning pass.
+            output_column_id: ColumnId::UNSET,
         });
     }
     Ok((

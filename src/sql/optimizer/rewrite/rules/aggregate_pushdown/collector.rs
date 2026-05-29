@@ -531,6 +531,7 @@ mod tests {
             items: vec![ProjectItem {
                 expr: col_ref("k", DataType::Int64),
                 output_name: "k".into(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
             required_output_columns: None,
         });
