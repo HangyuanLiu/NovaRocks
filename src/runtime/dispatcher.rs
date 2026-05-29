@@ -19,8 +19,9 @@
 //!
 //! `FragmentDispatcher` decouples coordinator from where fragments actually
 //! run. `InProcessDispatcher` keeps the all-in-one mode using
-//! `std::thread::spawn`; `RemoteDispatcher` (PR-4) will talk to a remote BE
-//! over gRPC.
+//! `std::thread::spawn`; `RemoteDispatcher` talks to one or more remote BEs
+//! over gRPC by index; `FragmentScheduler` (PR-3/PR-4) will choose which
+//! backend each fragment instance lands on.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -511,10 +512,11 @@ impl FragmentDispatcher for InProcessDispatcher {
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
-        debug_assert_eq!(
-            backend_idx, 0,
-            "InProcessDispatcher only supports backend_idx=0"
-        );
+        if backend_idx != 0 {
+            return Err(format!(
+                "InProcessDispatcher only supports backend_idx=0, got {backend_idx}"
+            ));
+        }
         let key = (finst_id.hi, finst_id.lo);
         let slot = {
             let slots = self.state.root_slots.lock().expect("root_slots lock");
@@ -596,8 +598,11 @@ impl RemoteDispatcher {
         })
     }
 
-    /// The address of `backend_idx`, if in range. Useful for PR-4 destination
-    /// wiring.
+    /// The address of `backend_idx`, if in range.
+    ///
+    /// PR-4 destination wiring: `FragmentScheduler` calls this to embed the
+    /// correct backend address into `TPlanFragmentDestination` entries when
+    /// assigning fragment instances to specific backends.
     pub fn addr_of(&self, backend_idx: usize) -> Option<SocketAddr> {
         self.addrs.get(backend_idx).copied()
     }
@@ -635,6 +640,8 @@ impl FragmentDispatcher for RemoteDispatcher {
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
         self.check_idx(backend_idx)?;
+        // Counter increments only after a successful check_idx, so only valid-index
+        // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_SUBMIT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_submit_fail_after()
             .is_some_and(|successes| call_index > successes)
@@ -645,9 +652,11 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let payload = serialize_thrift_binary(&params)
             .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
-        let resp = self.clients[backend_idx].blocking_submit_fragment(SubmitFragmentRequest {
-            exec_plan_fragment_params_thrift: payload,
-        })?;
+        let resp = self.clients[backend_idx]
+            .blocking_submit_fragment(SubmitFragmentRequest {
+                exec_plan_fragment_params_thrift: payload,
+            })
+            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
         if resp.status_code != 0 {
             return Err(format!(
                 "remote submit_fragment failed on {}: {}",
@@ -664,6 +673,8 @@ impl FragmentDispatcher for RemoteDispatcher {
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
         self.check_idx(backend_idx)?;
+        // Counter increments only after a successful check_idx, so only valid-index
+        // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_FETCH_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)
@@ -672,17 +683,19 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Ok(FetchOutcome::NotReady);
         }
-        let resp = self.clients[backend_idx].blocking_fetch_result(FetchResultRequest {
-            finst_id: Some(PUniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            }),
-            max_wait_ms,
-        })?;
+        let resp = self.clients[backend_idx]
+            .blocking_fetch_result(FetchResultRequest {
+                finst_id: Some(PUniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                }),
+                max_wait_ms,
+            })
+            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
             format!(
-                "remote fetch_result returned unknown status {}",
-                resp.status
+                "BE[{backend_idx}] ({}): remote fetch_result returned unknown status {}",
+                self.addrs[backend_idx], resp.status
             )
         })?;
         match status {
