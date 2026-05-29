@@ -1,12 +1,19 @@
 //! PruneAggregateColumns — Phase 2 rule for Aggregate nodes.
 //!
-//! Output layout: `output_columns[0..group_by.len()]` are group-key outputs,
-//! `output_columns[group_by.len()..]` are aggregate results in 1:1 order with
-//! `aggregates`. Group-by output columns are always kept (they are semantically
-//! required). Aggregate result columns are dropped when their output id is not
-//! in `required_output_columns` (Gap 5).
+//! **Currently a no-op.**
 //!
-//! Unchanged when no aggregates are pruned (aggregates.len() same before/after).
+//! `AggregateNode.output_columns` is built by `split_projection_for_aggregate`
+//! in SELECT order (1:1 with the SELECT list), NOT in `[group_by ++ aggregates]`
+//! order.  The `aggregates` list is extracted separately from the projection
+//! expressions and has NO positional correspondence to `output_columns`.
+//! Indexing `output_columns[group_by.len() + i]` to find the output id of
+//! `aggregates[i]` is therefore incorrect and can panic or silently drop the
+//! wrong aggregate.
+//!
+//! Per-aggregate output pruning (Gap 5) requires an explicit `output_column_id`
+//! field on `AggregateCall` so that each aggregate result can be addressed by
+//! id independently of `output_columns` position.  Until that is implemented,
+//! this rule returns `Unchanged` unconditionally.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -30,85 +37,14 @@ impl LogicalRewriteRule for PruneAggregateColumns {
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Aggregate(mut node) = plan else {
-            unreachable!()
-        };
-
-        // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
-            return Ok(RewriteResult::Unchanged);
-        };
-
-        let group_by_len = node.group_by.len();
-        let original_agg_len = node.aggregates.len();
-
-        debug_assert_eq!(
-            node.output_columns.len(),
-            group_by_len + node.aggregates.len(),
-            "PruneAggregateColumns: expected output_columns = group_by ++ aggregates layout"
-        );
-
-        // Safety guard: if `needed` is non-empty but NONE of the aggregate output
-        // column ids appear in `needed`, do not prune any aggregates. This handles
-        // the Project-over-Aggregate pattern where the Project items contain raw
-        // AggregateCall expressions (not ColumnRefs). In that case the Phase-1
-        // tagging pass propagates scan-level column ids (args' ids) as `needed`,
-        // not the aggregate's output ids — because `collect_column_id_refs` on an
-        // AggregateCall walks into the args, not the result. Pruning would
-        // incorrectly drop all aggregate calls and break codegen. When no aggregate
-        // output id appears in `needed`, we conservatively keep all aggregates.
+        // No-op: see module-level doc comment.
         //
-        // The UNSET check handles AggregatePushdown synthetic partial-aggregate
-        // outputs: their column_id = UNSET and UNSET is never in `needed` even
-        // though the top-level aggregate's args reference them by name.
-        let any_agg_output_in_needed = node.output_columns[group_by_len..].iter().any(|col| {
-            col.column_id != crate::sql::column_id::ColumnId::UNSET
-                && needed.contains(&col.column_id)
-        });
-        let has_unset_agg_outputs = node.output_columns[group_by_len..]
-            .iter()
-            .any(|col| col.column_id == crate::sql::column_id::ColumnId::UNSET);
-
-        if !needed.is_empty() && !any_agg_output_in_needed && !has_unset_agg_outputs {
-            // No aggregate output is recognized as needed — cannot safely prune.
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        // Group-key output_columns are always kept — semantically required.
-        // Filter aggregate output_columns[group_by_len + i] and aggregates[i]
-        // together based on whether the output id is in `needed`.
-        let mut new_agg_output_columns = Vec::new();
-        let mut new_aggregates = Vec::new();
-
-        for (i, agg) in node.aggregates.into_iter().enumerate() {
-            let out_col = &node.output_columns[group_by_len + i];
-            // Keep the aggregate if its output id is needed OR if the output id is
-            // UNSET (meaning the AggregatePushdown rule created a synthetic partial-
-            // aggregate output that has not yet been assigned a real ColumnId). We
-            // cannot safely prune an UNSET-id output because the tagging pass skips
-            // UNSET column refs when building `child_needed`, so these synthetic
-            // columns will never appear in `needed` even though they are referenced
-            // by the top-level aggregate's args.
-            let keep = needed.contains(&out_col.column_id)
-                || out_col.column_id == crate::sql::column_id::ColumnId::UNSET;
-            if keep {
-                new_agg_output_columns.push(out_col.clone());
-                new_aggregates.push(agg);
-            }
-        }
-
-        // Unchanged check: if no aggregates were dropped, return Unchanged.
-        if new_aggregates.len() == original_agg_len {
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        // Rebuild output_columns: group-key cols ++ surviving aggregate cols.
-        let mut new_output_columns = node.output_columns[..group_by_len].to_vec();
-        new_output_columns.extend(new_agg_output_columns);
-
-        node.output_columns = new_output_columns;
-        node.aggregates = new_aggregates;
-        Ok(RewriteResult::Changed(LogicalPlan::Aggregate(node)))
+        // Per-aggregate output pruning (Gap 5) requires an explicit
+        // output_column_id on AggregateCall.  Until that is added, this rule
+        // always returns Unchanged to avoid incorrect positional indexing into
+        // output_columns.
+        let _ = plan; // suppress unused-variable warning
+        Ok(RewriteResult::Unchanged)
     }
 }
 
@@ -180,44 +116,65 @@ mod tests {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Bug A regression: PruneAggregateColumns must be a no-op.
+    //
+    // AggregateNode.output_columns is SELECT-ordered (built by
+    // split_projection_for_aggregate), NOT [group_by ++ aggregates].
+    // Indexing output_columns[group_by.len() + i] to find aggregates[i]'s
+    // output id is incorrect and can panic or drop the wrong aggregate.
+    // Until Gap 5 (per-aggregate output_column_id) is implemented, the rule
+    // must always return Unchanged regardless of what required_output_columns
+    // contains.
+    // -----------------------------------------------------------------------
+
+    /// Rule is a no-op even when needed contains only some aggregate output ids.
+    /// Previously this would have returned Changed and incorrectly dropped avg.
     #[test]
-    fn prune_aggregate_drops_unneeded_aggregate_results() {
-        // Aggregate[group_by=[k@1], sum(a)→201, avg(b)→202]
-        // needed = {1, 201}  (group key + sum; avg not needed)
-        // Expected: aggregates shrinks to [sum], output_columns = [k@1, sum@201]
-        let id_k = ColumnId::new_for_test(1);
-        let id_sum = ColumnId::new_for_test(201);
-        let id_avg = ColumnId::new_for_test(202);
-        let id_a = ColumnId::new_for_test(10);
-        let id_b = ColumnId::new_for_test(20);
+    fn prune_aggregate_is_noop_regardless_of_needed_set() {
+        // output_columns is SELECT-ordered: [count_oc@301, sum_oc@302]
+        // group_by = [y@1],  aggregates = [count, sum(x)]
+        // This layout does NOT match [group_by ++ aggregates].
+        // The old code would have tried output_columns[1+0]=count_oc and
+        // output_columns[1+1]=sum_oc but those are wrong positions given the
+        // SELECT-ordered layout — here they happen to line up by accident, but
+        // in a query like SELECT count(*), sum(x) GROUP BY y the positions
+        // would be output_columns[0]=count, [1]=sum, group_by.len()=1, so
+        // output_columns[1+0]=sum and output_columns[1+1] would panic.
+        //
+        // Regardless: the rule must be Unchanged.
+        let id_y = ColumnId::new_for_test(1);
+        let id_x = ColumnId::new_for_test(10);
+        let id_count_oc = ColumnId::new_for_test(301);
+        let id_sum_oc = ColumnId::new_for_test(302);
 
         let mut needed = HashSet::new();
-        needed.insert(id_k);
-        needed.insert(id_sum);
+        needed.insert(id_count_oc); // only count needed, not sum
 
         let node = AggregateNode {
             input: Box::new(dummy_input()),
-            group_by: vec![col_ref_expr(id_k, "k")],
+            group_by: vec![col_ref_expr(id_y, "y")],
             aggregates: vec![
                 AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![col_ref_expr(id_a, "a")],
+                    name: "count".to_string(),
+                    args: vec![],
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
                 },
                 AggregateCall {
-                    name: "avg".to_string(),
-                    args: vec![col_ref_expr(id_b, "b")],
+                    name: "sum".to_string(),
+                    args: vec![col_ref_expr(id_x, "x")],
                     distinct: false,
-                    result_type: DataType::Float64,
+                    result_type: DataType::Int64,
                     order_by: vec![],
                 },
             ],
+            // SELECT-ordered output_columns: [count_oc, sum_oc]
+            // group_by key y is NOT in output_columns (it's in group_by only).
             output_columns: vec![
-                make_output_column(id_k, "k"),
-                make_output_column(id_sum, "sum_a"),
-                make_output_column(id_avg, "avg_b"),
+                make_output_column(id_count_oc, "count"),
+                make_output_column(id_sum_oc, "sum_x"),
             ],
             already_pushed: false,
             required_output_columns: Some(needed),
@@ -227,21 +184,13 @@ mod tests {
         let rule = PruneAggregateColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Aggregate(pruned) = changed else {
-            panic!("expected Aggregate");
-        };
-
-        assert_eq!(pruned.aggregates.len(), 1);
-        assert_eq!(pruned.aggregates[0].name, "sum");
-        assert_eq!(pruned.output_columns.len(), 2);
-        assert_eq!(pruned.output_columns[0].column_id, id_k);
-        assert_eq!(pruned.output_columns[1].column_id, id_sum);
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "PruneAggregateColumns must be a no-op (Gap 5 not yet implemented); got {result:?}"
+        );
     }
 
+    /// Rule is also a no-op when required_output_columns is None (untagged).
     #[test]
     fn prune_aggregate_noop_when_required_output_columns_is_none() {
         let id_k = ColumnId::new_for_test(1);
@@ -273,65 +222,6 @@ mod tests {
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "must be no-op when required_output_columns is None"
-        );
-    }
-
-    #[test]
-    fn prune_aggregate_preserves_already_pushed_flag() {
-        // Verify that already_pushed is preserved on the output node.
-        let id_k = ColumnId::new_for_test(1);
-        let id_sum = ColumnId::new_for_test(201);
-        let id_avg = ColumnId::new_for_test(202);
-        let id_a = ColumnId::new_for_test(10);
-        let id_b = ColumnId::new_for_test(20);
-
-        let mut needed = HashSet::new();
-        needed.insert(id_k);
-        needed.insert(id_sum);
-
-        let node = AggregateNode {
-            input: Box::new(dummy_input()),
-            group_by: vec![col_ref_expr(id_k, "k")],
-            aggregates: vec![
-                AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![col_ref_expr(id_a, "a")],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![],
-                },
-                AggregateCall {
-                    name: "avg".to_string(),
-                    args: vec![col_ref_expr(id_b, "b")],
-                    distinct: false,
-                    result_type: DataType::Float64,
-                    order_by: vec![],
-                },
-            ],
-            output_columns: vec![
-                make_output_column(id_k, "k"),
-                make_output_column(id_sum, "sum_a"),
-                make_output_column(id_avg, "avg_b"),
-            ],
-            already_pushed: true, // must be preserved
-            required_output_columns: Some(needed),
-        };
-
-        let plan = LogicalPlan::Aggregate(node);
-        let rule = PruneAggregateColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
-
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Aggregate(pruned) = changed else {
-            panic!("expected Aggregate");
-        };
-
-        assert!(
-            pruned.already_pushed,
-            "already_pushed flag must be preserved"
         );
     }
 }

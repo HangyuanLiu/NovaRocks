@@ -137,14 +137,18 @@ fn apply_query_modifiers(
             // would otherwise fail to resolve after the rename, so we
             // remap any `ColumnRef(<select_output_name>)` to the matching
             // `__nr_sel_<idx>` below.
-            let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool)>> =
+            // Each tuple: (user-visible output name, data type, nullable, inner output_column_id).
+            // The inner output_column_id is captured here so the outer strip-project can
+            // reference the same ColumnId that the inner Project produces, preserving id
+            // continuity through the double-Project barrier for the Phase-1 tagging pass.
+            let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool, ColumnId)>> =
                 if let LogicalPlan::Project(ref mut proj) = body_plan {
                     if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates);
                         }
                     }
-                    let user: Vec<(String, arrow::datatypes::DataType, bool)> = proj
+                    let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
                         .items
                         .iter()
                         .map(|it| {
@@ -152,6 +156,7 @@ fn apply_query_modifiers(
                                 it.output_name.clone(),
                                 it.expr.data_type.clone(),
                                 it.expr.nullable,
+                                it.output_column_id,
                             )
                         })
                         .collect();
@@ -175,7 +180,7 @@ fn apply_query_modifiers(
                 let name_to_idx: std::collections::HashMap<String, usize> = user
                     .iter()
                     .enumerate()
-                    .map(|(idx, (name, _, _))| (name.to_lowercase(), idx))
+                    .map(|(idx, (name, _, _, _))| (name.to_lowercase(), idx))
                     .collect();
                 sort_items
                     .into_iter()
@@ -199,9 +204,15 @@ fn apply_query_modifiers(
             final_projection = Some(if let Some(user) = user_select {
                 user.into_iter()
                     .enumerate()
-                    .map(|(idx, (name, dt, nullable))| {
+                    .map(|(idx, (name, dt, nullable, inner_cid))| {
                         let syn_name = format!("__nr_sel_{idx}");
-                        let cid = factory.create(None, syn_name.clone(), dt.clone(), nullable);
+                        // Reuse the inner project item's existing ColumnId so
+                        // that the Phase-1 tagging pass can thread required
+                        // columns through the double-Project barrier without
+                        // encountering an id discontinuity. Minting a fresh id
+                        // here would make the outer Project's output invisible
+                        // to the inner Project's pruning tag.
+                        let cid = inner_cid;
                         ProjectItem {
                             expr: TypedExpr {
                                 kind: ExprKind::ColumnRef {
@@ -798,7 +809,15 @@ fn build_distinct(
     let mut group_by = Vec::new();
     let mut output_columns = Vec::new();
     for item in projection {
-        let cid = expr_column_id(&item.expr, &item.output_name, factory);
+        // Prefer the pre-assigned output_column_id (e.g. synthetic __match_N
+        // columns from IN/EXISTS subquery rewrites). Falling back to
+        // expr_column_id would mint a fresh id, disconnecting the column from
+        // any downstream reference that already holds the original id.
+        let cid = if item.output_column_id != ColumnId::UNSET {
+            item.output_column_id
+        } else {
+            expr_column_id(&item.expr, &item.output_name, factory)
+        };
         group_by.push(TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: cid,
@@ -2516,5 +2535,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug B regression: build_distinct must preserve item.output_column_id
+    // -----------------------------------------------------------------------
+
+    /// Bug B: build_distinct previously called expr_column_id() for every item
+    /// in the projection, minting a fresh ColumnId for non-ColumnRef exprs (e.g.
+    /// the synthetic `Literal(1)` produced by IN/EXISTS subquery rewriting when
+    /// the item had a meaningful pre-assigned `output_column_id`). This broke
+    /// downstream references that already held the original id.
+    ///
+    /// Fix: when item.output_column_id != UNSET, use it directly instead of
+    /// calling expr_column_id.
+    ///
+    /// This test verifies that SELECT DISTINCT over a query with pre-assigned
+    /// output ids produces an Aggregate whose group-by ColumnRefs carry the same
+    /// ids as the inner projection's output_column_ids.
+    #[test]
+    fn build_distinct_preserves_output_column_id_from_projection() {
+        // Use build_distinct indirectly via the planner: SELECT DISTINCT
+        // o_orderkey FROM orders.  The inner Project item will have a
+        // non-UNSET output_column_id (assigned by the analyzer), and the outer
+        // DISTINCT Aggregate's group-by ColumnRef must carry the same id.
+        let plan = parse_analyze_and_plan("SELECT DISTINCT o_orderkey FROM orders")
+            .expect("planner should succeed");
+
+        // Expected shape: Aggregate(group_by=[ColumnRef(cid)]) <- Project(item.output_column_id=cid)
+        let (agg_group_by_cid, inner_proj_output_cid) = match &plan {
+            LogicalPlan::Aggregate(agg) => {
+                let gb_cid = match &agg.group_by[0].kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    other => panic!("expected ColumnRef group_by, got {other:?}"),
+                };
+                let inner_proj = match agg.input.as_ref() {
+                    LogicalPlan::Project(p) => p,
+                    other => panic!("expected Project under Aggregate, got {other:?}"),
+                };
+                let item_cid = inner_proj.items[0].output_column_id;
+                (gb_cid, item_cid)
+            }
+            other => panic!("expected Aggregate root for SELECT DISTINCT, got {other:?}"),
+        };
+
+        assert_ne!(
+            agg_group_by_cid,
+            ColumnId::UNSET,
+            "Aggregate group-by ColumnRef must not be UNSET"
+        );
+        assert_eq!(
+            agg_group_by_cid, inner_proj_output_cid,
+            "build_distinct must reuse inner Project item's output_column_id, \
+             not mint a fresh id (Bug B)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug C regression: apply_query_modifiers strip-project must reuse inner ids
+    // -----------------------------------------------------------------------
+
+    /// Bug C: apply_query_modifiers built a strip-projection by calling
+    /// factory.create(...) for each item, minting fresh ColumnIds that
+    /// disconnected the outer Project from the inner Project's output ids.
+    /// The Phase-1 tagging pass then saw a double-Project barrier where the
+    /// outer Project's items used ids that didn't match anything the inner
+    /// Project produced, causing it to compute child_needed = {} and drop all
+    /// inner columns.
+    ///
+    /// Fix: reuse the inner project item's existing output_column_id for the
+    /// strip-project item instead of minting a fresh one.
+    ///
+    /// This test uses a query with an ORDER BY column that is NOT in the SELECT
+    /// output (triggering extra_items and the strip-projection path), then
+    /// verifies that the outer Project's items carry the same ColumnIds as the
+    /// inner Project's items at the corresponding positions.
+    #[test]
+    fn apply_query_modifiers_strip_project_reuses_inner_output_column_ids() {
+        // ORDER BY o_custkey is not in the SELECT output (only o_orderkey is),
+        // so collect_extra_sort_items returns o_custkey as an extra.
+        // apply_query_modifiers then builds:
+        //   outer strip-Project (items: [o_orderkey]) <-- Sort <-- inner Project (items: [o_orderkey__nr_sel_0, o_custkey_extra])
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey FROM orders ORDER BY o_custkey",
+        )
+        .expect("planner should succeed");
+
+        // Walk down to find the outer and inner Projects.
+        // Shape: outer-Project? <- Sort <- inner-Project <- Scan
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => {
+                // If there is no outer Project (no extra items triggered), skip.
+                // The test is only meaningful when the strip-projection was built.
+                let shape = format!("{other:?}");
+                if shape.contains("Sort") {
+                    return; // no extra items path — test not applicable
+                }
+                panic!("expected Project or Sort root, got {shape}");
+            }
+        };
+
+        let inner_proj = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => match s.input.as_ref() {
+                LogicalPlan::Project(p) => p,
+                other => panic!("expected inner Project under Sort, got {other:?}"),
+            },
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+
+        // The outer strip-project has one user-visible item (o_orderkey).
+        // Its output_column_id and expr ColumnRef column_id must match the
+        // corresponding inner project item's output_column_id.
+        assert!(
+            !outer_proj.items.is_empty(),
+            "outer strip-project must have at least one item"
+        );
+        let outer_item = &outer_proj.items[0];
+        let outer_expr_cid = match &outer_item.expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("outer strip-project item must be ColumnRef, got {other:?}"),
+        };
+
+        // Find the inner project item that was renamed to __nr_sel_0 and
+        // corresponds to position 0.
+        let inner_item_0 = &inner_proj.items[0];
+        let inner_output_cid = inner_item_0.output_column_id;
+
+        assert_ne!(
+            outer_expr_cid,
+            ColumnId::UNSET,
+            "outer strip-project ColumnRef must not be UNSET"
+        );
+        assert_eq!(
+            outer_expr_cid, inner_output_cid,
+            "outer strip-project item's ColumnRef column_id must equal inner project item's \
+             output_column_id at the same position (Bug C: no fresh id minting)"
+        );
+        assert_eq!(
+            outer_item.output_column_id, inner_output_cid,
+            "outer strip-project item's output_column_id must equal inner project item's \
+             output_column_id at the same position (Bug C: no fresh id minting)"
+        );
     }
 }

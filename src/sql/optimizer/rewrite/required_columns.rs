@@ -183,53 +183,42 @@ fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
     };
     node.required_output_columns = parent_needed.clone();
 
-    // Always include group-by column refs in child_needed.
-    let mut child_needed: HashSet<ColumnId> = HashSet::new();
-    for gb in &node.group_by {
-        child_needed.extend(collect_column_id_refs(gb));
-    }
-
-    // For each aggregate, include its input columns only if its output id is
-    // in parent_needed (or always when parent_needed is None).
+    // Conservative keep-all-aggregate-inputs strategy.
     //
-    // Safety guard: when parent_needed is Some(non-empty) but NONE of this
-    // aggregate's output column ids appear in it, fall back to treating all
-    // aggregates as needed (same as parent_needed = None). This handles the
-    // Project-over-Aggregate pattern where the Project items contain raw
-    // AggregateCall expressions — in that case Phase-1 tag_project propagates
-    // scan-level arg ids instead of the aggregate's output ids. Without this
-    // guard, the aggregate args (e.g. `amount` for `sum_state(amount)`) would
-    // not be included in child_needed, causing PruneScanColumns to drop them
-    // and breaking aggregate execution.
-    let group_by_len = node.group_by.len();
-    let any_agg_output_in_needed = match &parent_needed {
-        None => true, // N/A when parent_needed is None (all are needed)
-        Some(n) => node.output_columns[group_by_len..].iter().any(|col| {
-            col.column_id != ColumnId::UNSET && n.contains(&col.column_id)
-        }),
-    };
-    // When there are aggregates and none of their output ids appear in
-    // parent_needed, treat all aggregates as needed for child_needed computation.
-    let treat_all_needed = !any_agg_output_in_needed && !node.aggregates.is_empty();
-
-    for (i, agg) in node.aggregates.iter().enumerate() {
-        let agg_output_id = node.output_columns[group_by_len + i].column_id;
-        let is_needed = treat_all_needed
-            || match &parent_needed {
-                None => true,
-                Some(n) => n.contains(&agg_output_id),
-            };
-        if is_needed {
+    // `output_columns` is built by `split_projection_for_aggregate` in SELECT
+    // order (1:1 with the SELECT list), NOT as [group_by cols ++ aggregate
+    // result cols].  The `aggregates` list is extracted separately from the
+    // projection expressions and has NO positional correspondence to
+    // `output_columns`.  Attempting `output_columns[group_by.len() + i]` to
+    // find the output id of `aggregates[i]` is therefore WRONG and can panic
+    // or silently drop the wrong aggregate.
+    //
+    // Conservative fix: child always needs ALL group-by column refs PLUS ALL
+    // aggregate args and order-by column refs, regardless of parent_needed.
+    // This matches the semantics of the old name-based PruneColumns pass and
+    // is correct: if the aggregate node is live at all, every input column it
+    // consumes is required.  Per-aggregate output pruning (Gap 5) is a
+    // follow-up that requires an explicit output_column_id on AggregateCall.
+    //
+    // None-propagation discipline: when parent_needed is None (root / keep-all),
+    // pass None to the child so it also keeps all its columns.
+    let child_needed: Option<HashSet<ColumnId>> = parent_needed.map(|_| {
+        let mut needed: HashSet<ColumnId> = HashSet::new();
+        for gb in &node.group_by {
+            needed.extend(collect_column_id_refs(gb));
+        }
+        for agg in &node.aggregates {
             for arg in &agg.args {
-                child_needed.extend(collect_column_id_refs(arg));
+                needed.extend(collect_column_id_refs(arg));
             }
             for item in &agg.order_by {
-                child_needed.extend(collect_column_id_refs(&item.expr));
+                needed.extend(collect_column_id_refs(&item.expr));
             }
         }
-    }
+        needed
+    });
 
-    node.input = Box::new(tag_required_columns(*node.input, Some(child_needed)));
+    node.input = Box::new(tag_required_columns(*node.input, child_needed));
     LogicalPlan::Aggregate(node)
 }
 
@@ -1021,15 +1010,44 @@ mod tests {
     // Aggregate test
     // -----------------------------------------------------------------------
 
+    /// Bug A regression: tag_aggregate must use the conservative keep-all
+    /// strategy for aggregate args.
+    ///
+    /// `AggregateNode.output_columns` is SELECT-ordered (built by
+    /// `split_projection_for_aggregate`), NOT [group_by ++ aggregates].
+    /// Using `output_columns[group_by.len() + i]` to find `aggregates[i]`'s
+    /// output id is incorrect and can panic or silently drop the wrong
+    /// aggregate's args from child_needed.
+    ///
+    /// Conservative fix: child_needed always includes ALL group_by column refs
+    /// PLUS ALL aggregate args and order_by column refs, regardless of
+    /// parent_needed.  This matches the semantics of the old PruneColumns pass
+    /// and prevents input columns from being spuriously dropped by PruneScan.
     #[test]
-    fn tag_aggregate_only_requests_needed_aggregate_args() {
-        // Aggregate[group_by=[a@1], sum(b@2)→201, avg(c@3)→202] <- Scan[a@1,b@2,c@3]
-        // parent_needed = {201}  (only sum(b) needed, not avg(c))
-        // Expected: child_needed = {1, 2}  (group_by a + sum arg b; NOT c)
+    fn tag_aggregate_conservative_keeps_all_aggregate_args_in_child_needed() {
+        // Aggregate[group_by=[y@1], count(*)→301, sum(x@10)→302]
+        // output_columns is SELECT-ordered: [count_oc@301, sum_oc@302]
+        // (y is NOT in output_columns — it is only in group_by)
+        // parent_needed = {301}  (only count needed)
+        //
+        // Expected (conservative fix):
+        //   child_needed = {1, 10}  (group_by y@1 + ALL aggregate args: x@10)
+        //   c@3 (not referenced by any group_by or agg arg) is NOT needed.
+        //
+        // A positional approach would have tried output_columns[group_by.len()+0]
+        // = output_columns[1] = sum_oc@302 (WRONG — positions don't align), then
+        // possibly panicked on output_columns[1+1] (out of bounds for 2-elem vec).
         let agg = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan_with_3_cols()),
             group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
             aggregates: vec![
+                AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                },
                 AggregateCall {
                     name: "sum".to_string(),
                     args: vec![col_ref_expr(ColumnId::new_for_test(2))],
@@ -1037,23 +1055,16 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                 },
-                AggregateCall {
-                    name: "avg".to_string(),
-                    args: vec![col_ref_expr(ColumnId::new_for_test(3))],
-                    distinct: false,
-                    result_type: DataType::Float64,
-                    order_by: vec![],
-                },
             ],
+            // SELECT-ordered: [count_oc@301, sum_oc@302] — y is NOT here.
             output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "a"),
-                make_output_column(ColumnId::new_for_test(201), "sum_b"),
-                make_output_column(ColumnId::new_for_test(202), "avg_c"),
+                make_output_column(ColumnId::new_for_test(301), "count"),
+                make_output_column(ColumnId::new_for_test(302), "sum_x"),
             ],
             already_pushed: false,
             required_output_columns: None,
         });
-        let tagged = tag_required_columns(agg, Some(needed_set(&[201])));
+        let tagged = tag_required_columns(agg, Some(needed_set(&[301])));
         let LogicalPlan::Aggregate(a) = tagged else {
             panic!()
         };
@@ -1061,12 +1072,47 @@ mod tests {
             panic!()
         };
         let req = s.required_output_columns.unwrap();
-        assert!(req.contains(&ColumnId::new_for_test(1)), "group_by a");
-        assert!(req.contains(&ColumnId::new_for_test(2)), "sum(b) arg");
+        // group_by y@1 must always be in child_needed.
+        assert!(req.contains(&ColumnId::new_for_test(1)), "group_by y@1");
+        // sum(x) arg x@2 must be in child_needed even though parent only needs count.
         assert!(
-            !req.contains(&ColumnId::new_for_test(3)),
-            "avg(c) not needed"
+            req.contains(&ColumnId::new_for_test(2)),
+            "sum(x@2) arg must be kept (conservative keep-all)"
         );
+        // c@3 is not referenced by group_by or any agg arg — may be absent.
+        // (We do not assert it is absent; correctness only requires the above.)
+    }
+
+    /// tag_aggregate with parent_needed=None propagates None to the child
+    /// (None-propagation discipline — child keeps all its columns).
+    #[test]
+    fn tag_aggregate_none_parent_propagates_none_to_child() {
+        let agg = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan_with_3_cols()),
+            group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+            }],
+            output_columns: vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(agg, None);
+        let LogicalPlan::Aggregate(a) = tagged else {
+            panic!()
+        };
+        // Aggregate receives None → keeps None on itself.
+        assert!(a.required_output_columns.is_none());
+        let LogicalPlan::Scan(s) = *a.input else {
+            panic!()
+        };
+        // Child got None → Scan expands to all columns.
+        let req = s.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "scan keeps all 3 columns");
     }
 
     // -----------------------------------------------------------------------

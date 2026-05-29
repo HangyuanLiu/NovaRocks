@@ -310,7 +310,17 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 4 (ported from old column_pruning.rs):
     //   Aggregate[group_by=[b], sum(c)] → Scan[a,b,c]
-    //   After pipeline: Scan.required_columns contains "b" and "c", not "a"
+    //   After pipeline:
+    //   - When Aggregate is the root (parent_needed=None), the conservative
+    //     tag_aggregate propagates None to the child, so Scan keeps all columns
+    //     (required_columns=None) — pruning is not possible without a parent
+    //     constraint.
+    //   - When a Project wraps the Aggregate and selects only some outputs,
+    //     the Project provides a non-None parent_needed which tag_aggregate
+    //     receives as Some(_).  In that case the conservative strategy still
+    //     passes child_needed = ALL group-by + ALL agg args, so the Scan gets
+    //     required_output_columns = Some({b, c}) and PruneScanColumns sets
+    //     required_columns = ["b", "c"].
     // -----------------------------------------------------------------------
 
     #[test]
@@ -351,7 +361,20 @@ mod tests {
             required_output_columns: None,
         });
 
-        let result = run_pipeline(agg);
+        // Wrap in a Project that selects only out_b (b) so tag_project provides
+        // a non-None parent_needed to tag_aggregate. tag_aggregate then passes
+        // child_needed = ALL group-by ∪ ALL agg args = {b@2, c@3} to the Scan.
+        let proj = LogicalPlan::Project(ProjectNode {
+            input: Box::new(agg),
+            items: vec![ProjectItem {
+                output_column_id: ColumnId::new_for_test(901),
+                output_name: "b".to_string(),
+                expr: col_ref(out_b, "b"),
+            }],
+            required_output_columns: None,
+        });
+
+        let result = run_pipeline(proj);
         let scan_node = extract_scan(&result);
         let req = scan_node
             .required_columns
@@ -359,7 +382,7 @@ mod tests {
             .expect("required_columns must be set");
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("b"), "b must be kept (group_by)");
-        assert!(req_set.contains("c"), "c must be kept (agg arg)");
-        assert!(!req_set.contains("a"), "a must be pruned (not referenced)");
+        assert!(req_set.contains("c"), "c must be kept (agg arg, conservative keep-all)");
+        assert!(!req_set.contains("a"), "a must be pruned (not referenced by group_by or agg args)");
     }
 }
