@@ -1726,13 +1726,14 @@ fn run() -> Result<i32> {
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
-    ensure_starrocks_table_prereqs(&runner_config)?;
-    ensure_managed_lake_prereqs(&runner_config)?;
 
     if let Err(e) = validate_cluster_args(cli.cluster_mode, cli.cluster_size) {
         println!("❌ ERROR: {}", e);
         return Ok(1);
     }
+
+    ensure_starrocks_table_prereqs(&runner_config)?;
+    ensure_managed_lake_prereqs(&runner_config)?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
@@ -2861,11 +2862,19 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn cli_cluster_size_2() {
-        let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb", "--cluster-size", "2"])
-            .expect("parse cli");
+    fn cli_cluster_size_2_cross_process() {
+        let cli = Cli::try_parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "cross-process",
+            "--cluster-size",
+            "2",
+        ])
+        .expect("parse cli");
         assert_eq!(cli.cluster_size, 2);
-        assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::AllInOne);
+        assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::CrossProcess);
     }
 
     #[test]
