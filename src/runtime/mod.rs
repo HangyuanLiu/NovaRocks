@@ -37,6 +37,7 @@ pub mod runtime_filter_hub;
 pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
+pub mod scheduler;
 pub mod sink_commit;
 pub mod starlet_shard_registry;
 pub mod thread_cpu_time;
