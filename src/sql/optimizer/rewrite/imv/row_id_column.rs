@@ -37,9 +37,9 @@ impl ImvRowIdColumn {
     }
 }
 
-/// Intended for registration into the `imv-action-propagation` stage alongside
-/// `InjectActionColumnRule` (Phase 5). Adds the `_row_id` internal column to
-/// Delta-bound scans (idempotent).
+/// Rule to add the `_row_id` internal column to Delta-bound scans (idempotent).
+/// Will be registered into the `imv-action-propagation` stage alongside
+/// `InjectActionColumnRule` by the pipeline wiring task.
 pub(crate) struct InjectRowIdRule;
 
 impl LogicalRewriteRule for InjectRowIdRule {
