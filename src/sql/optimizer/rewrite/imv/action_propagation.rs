@@ -7,8 +7,6 @@
 //! Join/UnionAll/Aggregate above a Delta scan are unsupported in Phase 2 and
 //! fail-fast.
 
-use arrow::datatypes::DataType;
-
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
