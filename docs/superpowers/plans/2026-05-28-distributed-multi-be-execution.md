@@ -12,7 +12,7 @@
 
 **Roadmap 任务 brief:** [NovaRocks TODO/distributed-multi-be-execution.md](file:///Users/harbor/Documents/Obsidian/NovaRocks%20TODO/distributed-multi-be-execution.md)
 
-**前置 commit**：D1（`fa835350`）+ connector-first 阶段 1+2+3（`14bdefdb`）已合入 main。
+**前置 commit**：D1（`fa835350`）+ connector-first 阶段 1+2+3（`14bdefdb`）+ Iceberg `to_thrift_scan` node+ranges 迁移（`f6fcfcb2` / #205，已覆盖原 PR-0 范围并 super-set）已合入 main。
 
 ---
 
@@ -21,14 +21,14 @@
 ### 通用准备
 
 ```bash
-# 当前在 feat/d2-multi-be-execution 分支，HEAD 在 14bdefdb
-git log -1 --oneline
-# 期望：14bdefdb feat(iceberg): codegen Iceberg scans via connector begin_scan/plan_splits (#202)
+# 当前在 D2 工作分支，HEAD 应已 rebase 到 f6fcfcb2 之上
+git log -1 --oneline origin/main
+# 期望：f6fcfcb2 docs(iceberg): spec + plan for to_thrift_scan node+ranges migration (#205)
 
 cargo build
 ```
 
-启动 Iceberg + MinIO 本地 fixture（PR-0 / PR-5 用）：
+启动 Iceberg + MinIO 本地 fixture（PR-5 acceptance 用，PR-1 ~ PR-4 不需要）：
 
 ```bash
 docker/iceberg-rest/up.sh
@@ -60,8 +60,8 @@ SQLT="cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests
 
 | PR | 主题 | 输入 | 输出 | 验收 |
 |---|---|---|---|---|
-| PR-0 | Iceberg `to_thrift_scan` 填实 | connector-first 阶段 3 | Iceberg planner 走 `to_thrift_scan`；nodes.rs Iceberg 路径不再绕过 | iceberg / iceberg-rest suite 不回归 |
-| PR-1 | Config 放宽 `backends.len() >= 1` | PR-0 | TOML 接受多 backend；启动期 dial 全部 BE | 单测 + all-in-one 不回归 |
+| ~~PR-0~~ | ~~Iceberg `to_thrift_scan` 填实~~ | — | **已由 main #205 (`f6fcfcb2`) 完成，且 super-set 了本计划的范围** —— 详见下方 PR-0 段落 | 已在 main 上验证 |
+| PR-1 | Config 放宽 `backends.len() >= 1` | main (post #205) | TOML 接受多 backend；启动期 dial 全部 BE | 单测 + all-in-one 不回归 |
 | PR-2 | Dispatcher trait + RemoteDispatcher 多 backend | PR-1 | trait 加 backend_idx；RemoteDispatcher 持 Vec<client>；删 exchange_addr | 单测 + D1 cross-process smoke 不回归 |
 | PR-3 | FragmentScheduler 模块 | PR-2 | scheduler 4 个 fill_* 函数 + Placement 数据类型 | 单测全通 |
 | PR-4 | Coordinator 集成 + be_number + InFlightTracker | PR-3 | coordinator 走 scheduler；data_stream_sink 不再硬编码；多 BE 实际跑通 | tests/cluster_mvp_d2 smoke 通过 |
@@ -69,260 +69,24 @@ SQLT="cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests
 
 ---
 
-# PR-0: Iceberg `ConnectorScanPlanner::to_thrift_scan` 填实
+# PR-0: Iceberg `ConnectorScanPlanner::to_thrift_scan` 填实 — **已被 main 覆盖（OBSOLETE）**
 
-**范围**：把 `src/connector/iceberg/scan_planner.rs:131-143` 的 stub 实现填实，让 Iceberg 路径走和 StarRocks 一样的 connector-first 接口（不再绕过 `to_thrift_scan`）。
-
-**输入**：当前 main 分支（HEAD = `14bdefdb`）。
-
-**输出**：
-- `IcebergConnectorScanPlanner::to_thrift_scan` 返回 `ThriftScanPlan { node: None, scan_ranges }`，scan_ranges 与现有 `build_hdfs_scan_range_params_for_file` 路径 byte-identical
-- `src/sql/codegen/nodes.rs:606-621` Iceberg 路径改为调用 planner.to_thrift_scan，不再直接调 `build_hdfs_scan_range_params_for_file`
-- 现有 iceberg / iceberg-rest / iceberg-compatibility suite 不回归
-
-**验证**：
-```bash
-source docker/iceberg-rest/runtime/current/env.sh
-docker/iceberg-rest/up.sh
-$SQLT --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
-$SQLT --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-rest --mode verify
-```
-
-**回滚**：`git revert <pr-0-commit>`。PR-1 ~ PR-5 都不依赖 PR-0 的具体实现细节，但 D2 多 instance Iceberg 路径会回到"绕过 connector API"的局面。
-
----
-
-### 任务 0.1：定位 Iceberg planner 的 stub + 参考 StarRocks 实现
-
-**Files:**
-- Read: `src/connector/iceberg/scan_planner.rs:131-143`（stub 位置）
-- Read: `src/connector/starrocks/table/scan_planner.rs:206-230`（参考实现）
-- Read: `src/sql/codegen/nodes.rs:606-621`（当前 Iceberg 绕过路径）
-
-- [ ] **Step 0.1.1：读三个位置的当前代码**
-
-```bash
-sed -n '131,143p' src/connector/iceberg/scan_planner.rs
-sed -n '206,230p' src/connector/starrocks/table/scan_planner.rs
-sed -n '606,621p' src/sql/codegen/nodes.rs
-```
-
-记录：
-- StarRocks `to_thrift_scan` 输入是 `(scan, splits, ctx)`，输出 `ThriftScanPlan { node, scan_ranges, global_dicts }`
-- StarRocks 内部对每个 `StarRocksSplit` 调 `build_internal_scan_range_params` 转 `TInternalScanRange` 再包装成 `TScanRangeParams`
-- Iceberg `build_hdfs_scan_range_params_for_file` 在 nodes.rs 中是 `Iterator::map` 一行调用
-
----
-
-### 任务 0.2：写 stub 替换的失败测试
-
-**Files:**
-- Modify: `src/connector/iceberg/scan_planner.rs`（测试模块末尾）
-
-- [ ] **Step 0.2.1：写测试**
-
-在 `src/connector/iceberg/scan_planner.rs` 末尾加入：
-
-```rust
-#[cfg(test)]
-mod to_thrift_scan_tests {
-    use super::*;
-    // 假设 mock_iceberg_handle / mock_iceberg_split / mock_thrift_scan_ctx
-    // 等 helpers 已存在于现有测试模块（参考 PR #202 的 mock_iceberg_registry helper）。
-
-    #[test]
-    fn to_thrift_scan_returns_scan_ranges_for_two_files() {
-        let planner = IcebergConnectorScanPlanner::new();
-        let scan = mock_iceberg_scan_handle(vec!["/iceberg/a.parquet", "/iceberg/b.parquet"]);
-        let splits: Vec<Split> = scan
-            .as_iceberg_scan_handle()
-            .files()
-            .iter()
-            .map(|f| Split::new(planner.connector_id().to_string(), Arc::new(IcebergSplit::new_for_test(f.clone()))))
-            .collect();
-        let ctx = mock_thrift_scan_ctx();
-        let plan = planner.to_thrift_scan(&scan, &splits, ctx).expect("ok");
-        assert!(plan.node.is_none(), "Iceberg path produces scan_ranges only, node stays None");
-        assert_eq!(plan.scan_ranges.len(), 2);
-        // 每条 scan_range 必须含 file path + length
-        for sr in &plan.scan_ranges {
-            assert!(sr.scan_range.is_some());
-            let hdfs = sr.scan_range.as_ref().unwrap().hdfs_scan_range.as_ref().expect("hdfs scan range");
-            assert!(!hdfs.full_path.is_empty());
-            assert!(hdfs.length > 0);
-        }
-    }
-
-    #[test]
-    fn to_thrift_scan_byte_identical_with_legacy_build_hdfs_scan_range_params() {
-        // 与 src/sql/codegen/nodes.rs::build_hdfs_scan_range_params_for_file
-        // 对同一组 files 的输出做 byte-identical 比对
-        let planner = IcebergConnectorScanPlanner::new();
-        let file_paths = vec!["/iceberg/a.parquet", "/iceberg/b.parquet", "/iceberg/c.parquet"];
-        let scan = mock_iceberg_scan_handle(file_paths.clone());
-        let splits: Vec<Split> = scan_to_splits(&scan, &planner);
-        let ctx = mock_thrift_scan_ctx();
-        let from_planner = planner.to_thrift_scan(&scan, &splits, ctx).expect("ok").scan_ranges;
-        let from_legacy: Vec<TScanRangeParams> = file_paths.iter()
-            .map(|p| crate::sql::codegen::nodes::build_hdfs_scan_range_params_for_file_for_test(p))
-            .collect();
-        assert_eq!(from_planner, from_legacy, "must be byte-identical with legacy path");
-    }
-}
-```
-
-注：`build_hdfs_scan_range_params_for_file_for_test` 可能不存在（现有可能叫 `build_hdfs_scan_range_params_for_file`，且是 private）；如果 private 在 nodes.rs 测试模块中 export 一份 `pub(crate) fn xxx_for_test` 给测试用。
-
-- [ ] **Step 0.2.2：运行测试确认 fail**
-
-```bash
-cargo test --lib --package novarocks -- connector::iceberg::scan_planner::to_thrift_scan_tests
-```
-
-期望：测试 fail（`to_thrift_scan` 当前返回 Err "codegen still produces HDFS scan ranges via build_hdfs_scan_range_params_for_file"）。
-
----
-
-### 任务 0.3：实现 `to_thrift_scan`
-
-**Files:**
-- Modify: `src/connector/iceberg/scan_planner.rs:131-143`
-
-- [ ] **Step 0.3.1：替换 stub**
-
-定位 `impl ConnectorScanPlanner for IcebergConnectorScanPlanner` 中 `fn to_thrift_scan`，替换：
-
-```rust
-fn to_thrift_scan(
-    &self,
-    scan: &ScanHandle,
-    splits: &[Split],
-    ctx: ThriftScanContext,
-) -> Result<ThriftScanPlan, String> {
-    let iceberg_scan = scan.as_iceberg_scan_handle()
-        .ok_or("not an iceberg scan handle")?;
-
-    let mut scan_ranges = Vec::with_capacity(splits.len());
-    for split in splits {
-        let iceberg_split = split.as_iceberg_split()
-            .ok_or("not an iceberg split")?;
-        // 把 IcebergSplit 转 TScanRangeParams（含 HDFS scan range payload）
-        // 复用 nodes.rs 中现有的 build_hdfs_scan_range_params_for_file 逻辑
-        let scan_range_params = build_hdfs_scan_range_params_for_iceberg_split(
-            iceberg_split, iceberg_scan, &ctx,
-        )?;
-        scan_ranges.push(scan_range_params);
-    }
-
-    Ok(ThriftScanPlan {
-        node: None,  // Iceberg path 不产 TPlanNode；plan tree 已由 fragment_builder 构造
-        scan_ranges,
-        global_dicts: Vec::new(),
-    })
-}
-```
-
-`build_hdfs_scan_range_params_for_iceberg_split` 是新加的辅助函数，挪到 `src/connector/iceberg/scan_planner.rs` 文件内（不再放在 nodes.rs），逻辑与现有 `build_hdfs_scan_range_params_for_file` 一致。
-
-- [ ] **Step 0.3.2：把 helper 函数从 nodes.rs 挪到 scan_planner.rs**
-
-打开 `src/sql/codegen/nodes.rs` 找到 `build_hdfs_scan_range_params_for_file`，把函数体抄到 `src/connector/iceberg/scan_planner.rs` 文件末尾，重命名 `build_hdfs_scan_range_params_for_iceberg_split`，签名调整为接受 `(split: &IcebergSplit, scan: &IcebergScanHandle, ctx: &ThriftScanContext)`。
-
-`nodes.rs` 的原 helper 不要立刻删——任务 0.4 切换调用点之后才删。
-
-- [ ] **Step 0.3.3：运行测试确认通过**
-
-```bash
-cargo test --lib --package novarocks -- connector::iceberg::scan_planner::to_thrift_scan_tests
-```
-
-期望：两个测试都通过。
-
----
-
-### 任务 0.4：切换 codegen 调用点
-
-**Files:**
-- Modify: `src/sql/codegen/nodes.rs:606-621`
-
-- [ ] **Step 0.4.1：打开 nodes.rs 定位 Iceberg scan range 构造点**
-
-```bash
-sed -n '600,625p' src/sql/codegen/nodes.rs
-```
-
-当前代码（大致）：
-```rust
-for split in &planned.splits {
-    let iceberg_split = split.as_iceberg_split().unwrap();
-    let scan_range_params = build_hdfs_scan_range_params_for_file(iceberg_split.file_path(), ...);
-    scan_ranges.push(scan_range_params);
-}
-```
-
-- [ ] **Step 0.4.2：替换为调用 planner.to_thrift_scan**
-
-```rust
-let planner = ctx.connector_registry.scan_planner("iceberg")?;
-let thrift_ctx = ThriftScanContext { /* fill from ctx */ };
-let plan = planner.to_thrift_scan(&planned.scan, &planned.splits, thrift_ctx)?;
-scan_ranges.extend(plan.scan_ranges);
-```
-
-- [ ] **Step 0.4.3：删除 `build_hdfs_scan_range_params_for_file` 在 nodes.rs 的定义**（如果它没被其他地方使用）
-
-```bash
-grep -n "build_hdfs_scan_range_params_for_file" src/
-```
-
-如果只有 nodes.rs 内部使用，删掉。如果有其他 caller，先把它们也迁移到调 `planner.to_thrift_scan`。
-
-- [ ] **Step 0.4.4：cargo build + iceberg suite 回归**
-
-```bash
-cargo build
-source docker/iceberg-rest/runtime/current/env.sh
-docker/iceberg-rest/up.sh
-$SQLT --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
-$SQLT --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-rest --mode verify
-$SQLT --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
-```
-
-期望：所有 iceberg 套件不回归。
-
----
-
-### 任务 0.5：PR-0 commit
-
-- [ ] **Step 0.5.1：commit**
-
-```bash
-git add src/connector/iceberg/scan_planner.rs src/sql/codegen/nodes.rs
-git commit -m "$(cat <<'EOF'
-feat(iceberg): implement ConnectorScanPlanner::to_thrift_scan (D2 PR-0)
-
-Iceberg connector planner now generates TScanRangeParams via to_thrift_scan
-instead of leaving codegen to call build_hdfs_scan_range_params_for_file
-directly. This brings the Iceberg path inline with the StarRocks
-connector-first path and is a prerequisite for D2's per-instance scan
-range splitting (each fragment instance will get a slice of splits and
-call to_thrift_scan once).
-
-Output is byte-identical with the legacy nodes.rs path; iceberg /
-iceberg-rest / iceberg-compatibility suites do not regress.
-
-Refs: docs/superpowers/specs/2026-05-28-distributed-multi-be-execution-design.md
-EOF
-)"
-```
-
+> **状态**：原计划 PR-0 的全部工作已在 main `f6fcfcb2`（PR #205 "to_thrift_scan node+ranges migration"）中完成，且**做得比本计划更多**。本 PR 跳过，直接从 PR-1 开始。
+>
+> **main 已具备的内容（验证锚点）**：
+> - [src/connector/iceberg/scan_planner.rs:142-156](../../../src/connector/iceberg/scan_planner.rs) — `IcebergConnectorScanPlanner::to_thrift_scan` 已实现
+> - [src/connector/iceberg/scan_planner.rs:238](../../../src/connector/iceberg/scan_planner.rs) — `build_hdfs_scan_range_params_for_file` 已从 nodes.rs 迁入
+> - [src/sql/codegen/nodes.rs:80](../../../src/sql/codegen/nodes.rs) + [:605](../../../src/sql/codegen/nodes.rs) — Iceberg codegen 全部走 `planner.to_thrift_scan`
+> - 测试：`to_thrift_scan_returns_hdfs_scan_node_and_scan_ranges` 已在 scan_planner.rs 中
+>
+> **与原 PR-0 设计的偏差（重要）**：原计划期望 Iceberg `to_thrift_scan` 返回 `ThriftScanPlan { node: None, scan_ranges }`，让 codegen 继续负责构造 `TPlanNode`。但 PR #205 把 **node 构造也搬进了 `to_thrift_scan`**，于是返回的是 `ThriftScanPlan { node: Some(THdfsScanNode), scan_ranges }`。这影响 PR-3 任务 3.4 的 scan splits 切分策略（详见任务 3.4 内的"⚠️ 设计调整"段落）。
 ---
 
 # PR-1: `ClusterConfig.backends.len() >= 1` 放宽
 
 **范围**：D1 强制 `backends.len() == 1`，D2 改为 `>= 1`。校验放宽 + 启动期 dial 全部 BE。
 
-**输入**：PR-0 已合并。
+**输入**：D2 工作分支 rebase 到 `origin/main`（HEAD ≥ `f6fcfcb2`）。原计划 PR-0 已由 #205 完成，直接从这里起跑。
 
 **输出**：
 - `[cluster].backends = ["a:1", "b:2", "c:3"]` 解析通过
@@ -1509,6 +1273,13 @@ cargo test --lib --package novarocks -- runtime::scheduler::assign_instance_coun
 
 **Files:**
 - Modify: `src/runtime/scheduler.rs`
+
+> **⚠️ 设计调整（vs. 原计划）**：原 PR-0 期望 Iceberg `to_thrift_scan` 只产 `scan_ranges`（`node: None`），node 由 codegen 单独构造。但 main #205 把 node 构造也搬进了 `to_thrift_scan`，每次调 `to_thrift_scan` 都会顺带生成一份 `TPlanNode`。本任务需明确选一种做法：
+>
+> - **方案 A**：scheduler 每个 instance 各自调一次 `to_thrift_scan(scan, splits_for_instance_i, ctx)` —— 取其 `scan_ranges` 给该 instance；`node` 在所有 instance 之间是恒等的（同 scan 同 conjuncts），用任一份即可，多余的丢弃。简单但每 instance 多算一次 node。
+> - **方案 B（推荐）**：codegen 阶段（`nodes.rs` 走 `planner.to_thrift_scan` 拿 `THdfsScanNode` 那里）保留单次 node 构造；scheduler **绕开 `to_thrift_scan` 重新调用**，从 `PlannedConnectorScan.splits` 按 `i % N` 切分后再调一个专门的轻量入口（如新增 trait 方法 `planner.splits_to_scan_ranges(scan, splits, ctx)`）；或临时复用 `to_thrift_scan` 但显式忽略其 `node` 字段并加注释说明。
+>
+> **执行前**：在 scheduler.rs 里贴一行 `// D2 scan split policy: <A or B> — chosen because <reason>`，让 review 看到决策痕迹。下方测试与代码片段先按方案 A 写（最小变更）。若选 B，需要在 `ConnectorScanPlanner` trait 加新方法，并补一个 PR-3 子任务。
 
 - [ ] **Step 3.4.1：写 scan splits 切分测试**
 
