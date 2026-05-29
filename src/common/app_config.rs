@@ -75,11 +75,20 @@ impl ClusterConfig {
     pub fn validate(&self) -> Result<(), String> {
         match self.role {
             ClusterRole::Fe => {
-                if self.backends.len() != 1 {
-                    return Err(format!(
-                        "D1 v1 only supports exactly one backend, got {}",
-                        self.backends.len()
-                    ));
+                if self.backends.is_empty() {
+                    return Err(
+                        "role=fe requires at least one backend in [cluster].backends".into(),
+                    );
+                }
+                for b in &self.backends {
+                    b.parse::<std::net::SocketAddr>()
+                        .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?;
+                }
+                let mut seen = std::collections::HashSet::new();
+                for b in &self.backends {
+                    if !seen.insert(b.clone()) {
+                        return Err(format!("duplicate backend in [cluster].backends: {}", b));
+                    }
                 }
             }
             ClusterRole::Be => {
@@ -1782,24 +1791,61 @@ backends = ["127.0.0.1:9070"]
     }
 
     #[test]
-    fn test_cluster_role_fe_requires_exactly_one_backend_v1() {
-        let toml_empty = r#"
+    fn test_cluster_role_fe_with_three_backends_passes() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["10.0.0.1:9070", "10.0.0.2:9070", "10.0.0.3:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe with 3 backends");
+        cfg.cluster
+            .validate()
+            .expect("3 backends should pass D2 validate");
+    }
+
+    #[test]
+    fn test_cluster_role_fe_rejects_duplicate_backends() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["10.0.0.1:9070", "10.0.0.1:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        let err = cfg
+            .cluster
+            .validate()
+            .expect_err("duplicate backends should fail");
+        assert!(err.contains("duplicate") || err.contains("10.0.0.1:9070"));
+    }
+
+    #[test]
+    fn test_cluster_role_fe_rejects_malformed_backend() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["not-a-socket-addr"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        let err = cfg
+            .cluster
+            .validate()
+            .expect_err("malformed addr should fail");
+        assert!(err.contains("not-a-socket-addr") || err.contains("invalid"));
+    }
+
+    #[test]
+    fn test_cluster_role_fe_empty_backends_still_rejected() {
+        let toml = r#"
 [cluster]
 role = "fe"
 backends = []
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml_empty).expect("parse");
-        let err = cfg.cluster.validate().expect_err("fe with 0 backends");
-        assert!(err.contains("D1 v1 only supports exactly one backend"));
-
-        let toml_two = r#"
-[cluster]
-role = "fe"
-backends = ["a:1", "b:2"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml_two).expect("parse");
-        let err = cfg.cluster.validate().expect_err("fe with 2 backends");
-        assert!(err.contains("D1 v1 only supports exactly one backend"));
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        let err = cfg
+            .cluster
+            .validate()
+            .expect_err("empty backends still rejected");
+        assert!(err.contains("at least one") || err.contains("backends"));
     }
 
     #[test]
