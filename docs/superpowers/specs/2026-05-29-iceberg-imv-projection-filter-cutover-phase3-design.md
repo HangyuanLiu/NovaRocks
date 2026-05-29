@@ -109,9 +109,26 @@ base delta scan 输出 chunk 里，scan 之上真正被读的内部列只有：
 
 `_file` / `_pos` **不在 base delta chunk 里被消费**：merge sink 用的 `_file`/`_pos`
 来自单独的 **target locator scan**（`iceberg_target_apply.rs:336-378`，由
-`load_target_apply_locator_inputs` 扫 target 表）。它们在全局是承重的
-（position delete 寻址、COW UPDATE、standalone DELETE），但与 base delta scan 输出无关。
+`load_target_apply_locator_inputs` 扫 target 表）。它们在全局是承重的，但**走的是
+另一条 scan 路径，不是本阶段 R1 改动的 delta scan 算子**：
+- standalone DELETE：iceberg-rust 原生 `TableScan` + `ArrowReaderBuilder`
+  （`delete_flow.rs:853` `scan_for_position_deletes_at`），既不经 NovaRocks pipeline
+  也不经 `IcebergDeltaScanOperator`。
+- COW UPDATE / target locator scan：各自独立扫 target/base 表。
+
+`IcebergDeltaScanOperator`（`ICEBERG_DELTA_SCAN_NODE`）只由 `ScanSource::IcebergDeltaTable`
+产生，而该 source 只来自 `__nr_ivm_delta` TVF 或 `BindIcebergScanRule`——均为 IMV refresh
+专属。故 R1 的 blast radius 收窄为"4 个 IMV refresh shape 共用的 delta scan 算子"，
+standalone DELETE/UPDATE 完全不受影响。
+
 `_last_updated_sequence_number` 在全仓库未发现 Rust 消费点（疑似 vestigial）。
+
+**v3 `_pos` → `_row_id` 依赖（防误改）**：`_pos` 虽不在 delta scan 输出里被消费，但它是
+v3 `_row_id` 推导的必要**内部输入**。Iceberg v3 允许写入时不物化 `_row_id`，读取时按
+`first_row_id + _pos` 推（`synthesize_row_id`，`iceberg_delta_scan.rs:573`；规则见
+`:548-553` 注释：stored 非 NULL 优先，否则 `first_row_id + position`）。NovaRocks 要求
+v3 但**不要求 `_row_id` 物化**（尤其跨引擎 Spark 写的表常不物化），故 `_pos` 不可省。
+"要求 v3"消不掉这个依赖。
 
 > 结论：base delta scan 只需注入 `{_row_id, __change_op}`。这恰好 == legacy 有效
 > 投影（legacy 顶层 SELECT 也只保留 `<user cols>, _row_id AS __nova_base_row_id,
@@ -163,7 +180,10 @@ optimize(logical, ...) → physical → codegen → execute
 - operator 内部生产**不变**：scanner 永远产全 4 lineage，`inject_change_op_column`
   永远追加 `__change_op`；内部 superset 恒为
   `[<data by field-id>, _file, _pos, _row_id, _last_updated_sequence_number,
-  __change_op]`，列名齐全。
+  __change_op]`，列名齐全。**`_pos` 必须保留在内部生产**——它是 v3 `_row_id` 推导
+  （`first_row_id + _pos`）的输入（见 §3.4）；R1 只在 `_row_id` 算出之后、于 operator
+  边界丢弃 `_pos`，不影响 v3 lineage 正确性。不要因为"输出不含 `_pos`"而去 scanner
+  里省掉 `_pos` 的计算。
 - **新增最终投影步**：以 `output_chunk_schema.slots()` 为权威，逐 slot 按名字从
   superset 取列、按 tuple 顺序排列；tuple 未列出的虚列 drop。
 - `build_data_column_projection_plan` 的 data/virtual 切分从"`len-5`"改为"按虚列名
