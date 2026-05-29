@@ -629,6 +629,70 @@ git commit -m "feat(rewrite): collect_column_id_refs + collect_output_ids[_order
 
 ---
 
+### Task 4b: Add `output_column_id: ColumnId` to `ProjectItem`
+
+**Why this task exists (discovered during Task 4 + an architectural investigation):** The whole design rests on a `HashSet<ColumnId>` "needed set". An investigation of how column references resolve across operator boundaries (cited in the spec; key facts: `column_id.rs:26-27` invariant, `resolve_from.rs:506-514` `add_column_with_id`, `analyzer/mod.rs:1418-1429`) established that the ColumnId space IS coherent across Project / SubqueryAlias / derived-table boundaries — a parent's reference to a projected column carries the SAME ColumnId the analyzer minted for that output column. The breaks are only at set-ops and CTEConsume (handled by position). BUT: that minted output ColumnId for a Project column is stored ONLY in the analyzer's separate `output_columns` list — `ProjectItem` itself (`src/sql/analysis/mod.rs`) carries only `expr` + `output_name`, NO output id. So `tag_project` / `PruneProjectColumns` / `collect_output_ids_ordered(Project)` cannot key a Project's output columns by ColumnId. This task adds that id to `ProjectItem`, making the spec's `item.output_column_id` references (§5.2, §6.2) real. Without it, Project pruning silently drops computed columns and Project output-id matching fails.
+
+**Files:**
+- Modify: `src/sql/analysis/mod.rs` (add field to `ProjectItem`; stamp it in `analyze_projection`)
+- Modify: ~12 files / 38 `ProjectItem { ... }` construction sites (analyzer, planner, optimizer rewrite rules, mv_ddl, tests)
+- Modify: `src/sql/optimizer/rewrite/rules/utils.rs` (fix `collect_output_ids_ordered` Project arm to use `output_column_id`)
+
+- [ ] **Step 4b.1: Add the field**
+
+```rust
+// src/sql/analysis/mod.rs
+pub(crate) struct ProjectItem {
+    pub expr: TypedExpr,
+    pub output_name: String,
+    pub output_column_id: crate::sql::column_id::ColumnId,  // NEW — the ColumnId parents reference for this output column
+}
+```
+
+- [ ] **Step 4b.2: Stamp the id at the analyzer site**
+
+In `analyze_projection` (`src/sql/analysis/mod.rs` ~line 1383-1451), the code already computes `column_id` for each select item (passthrough → reuse `ColumnRef`'s id; computed → `alloc_column_id`) and pushes it to `output_columns`. Carry that SAME `column_id` onto the `ProjectItem` it builds in lock-step. There are two select-item arms (`UnnamedExpr` and `ExprWithAlias`) — both compute a `column_id`; thread it into the `ProjectItem { ... }` literal. Confirm `output_columns` and the projection `Vec<ProjectItem>` stay positionally 1:1.
+
+- [ ] **Step 4b.3: Populate all other construction sites**
+
+```bash
+cargo build --lib 2>&1 | grep -E "missing field .output_column_id" | head -50
+```
+
+For each flagged site:
+- **Reconstruction sites** (predicate_pushdown `push_through_project`, `ukfk`, `tree.rs`, the old `column_pruning.rs`, `aggregate_pushdown/collector`): these transform an EXISTING item's expr but keep its output identity — carry the existing `item.output_column_id` through (`output_column_id: item.output_column_id`, or `..item` spread).
+- **New-item sites that wrap an existing column** (planner synthetic projections at `planner/mod.rs` sort/window sites, `subquery_rewrite`): the new item is typically a `ColumnRef` to an existing column — use that `ColumnRef`'s `column_id` as the `output_column_id`.
+- **New-item sites that create a genuinely new computed/decoded column** (`low_cardinality_dict/rewriter`): mint a fresh id via the `ColumnRefFactory` now available through `ctx.column_ref_factory()` (threaded in Task 1). If a site has no ctx/factory access, prefer reusing the wrapped column's id; only mint when semantically a new column.
+- **`mv_ddl.rs` + test sites**: use the wrapped expr's `ColumnRef` id where passthrough, or `ColumnId::UNSET` for test items that are never pruned. (UNSET is acceptable ONLY where the item's output id is never consumed by pruning — tests and DDL paths.)
+
+Iterate `cargo build --lib` until zero errors.
+
+- [ ] **Step 4b.4: Fix `collect_output_ids_ordered` Project arm**
+
+In `src/sql/optimizer/rewrite/rules/utils.rs`, the `LogicalPlan::Project` arm currently extracts an id only when `item.expr` is a `ColumnRef` (dropping computed columns). Replace it with:
+```rust
+LogicalPlan::Project(p) => p.items.iter()
+    .map(|item| item.output_column_id)
+    .filter(|id| *id != ColumnId::UNSET)
+    .collect(),
+```
+
+- [ ] **Step 4b.5: Tests**
+
+- Add a test that a COMPUTED project item (`a + b AS c`) gets a non-UNSET `output_column_id` after analysis, and that `collect_output_ids_ordered` on a Project with one passthrough + one computed item returns BOTH ids.
+- `cargo build --lib` clean; `cargo test --lib` — expect all passing (the existing ~3149 plus new). Some analyzer/planner tests may need `output_column_id` added to their `ProjectItem` literals — that's expected mechanical churn, not a behavior change.
+
+- [ ] **Step 4b.6: Commit**
+
+```bash
+git add -A
+git commit -m "feat(analyzer): add output_column_id to ProjectItem so Project outputs are ColumnId-addressable for pruning"
+```
+
+**Note for downstream tasks:** Task 6 (`tag_project`) and Task 16 (`PruneProjectColumns`) now key off `item.output_column_id` (as the spec already shows). The earlier Task 4 `collect_output_ids_ordered` Project arm is superseded by Step 4b.4.
+
+---
+
 ## Phase B: Tagging Pass
 
 ### Task 5: `required_columns.rs` module scaffold + Scan/Values/GenerateSeries handlers
