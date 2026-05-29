@@ -441,8 +441,13 @@ fn tag_cte_consume(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) 
     let LogicalPlan::CTEConsume(mut node) = plan else {
         unreachable!()
     };
-    // Leaf in this walk — just stamp the needed set and return.
-    node.required_output_columns = parent_needed;
+    // Leaf in this walk — always store Some(_) so that subtree_untagged
+    // returns false after tagging.  When parent_needed is None (no restriction
+    // from above), default to keeping all of this node's own output ids, which
+    // is the correct "keep-all" signal for the CTE two-walk.
+    node.required_output_columns = Some(parent_needed.unwrap_or_else(|| {
+        node.output_columns.iter().map(|c| c.column_id).collect()
+    }));
     LogicalPlan::CTEConsume(node)
 }
 
@@ -1795,5 +1800,107 @@ mod tests {
             s.required_output_columns.is_some(),
             "Scan.required_output_columns must be Some(_) after TagRequiredColumns stage ran"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // tag_cte_consume with None parent — must store Some(all output ids)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_cte_consume_with_none_parent_stores_some_all_output_ids() {
+        // When parent_needed is None (no parent restriction), tag_cte_consume
+        // must store Some(all output ids) — not None.  This ensures
+        // subtree_untagged returns false after the first tagging pass, so
+        // TagRequiredColumns terminates in one iteration for CTE plans.
+        let cte_id: CteId = 99;
+        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias: "c".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(10), "x"),
+                make_output_column(ColumnId::new_for_test(20), "y"),
+                make_output_column(ColumnId::new_for_test(30), "z"),
+            ],
+            required_output_columns: None,
+        });
+
+        let tagged = tag_cte_consume(consume, None);
+
+        let LogicalPlan::CTEConsume(n) = tagged else {
+            panic!("expected CTEConsume");
+        };
+        let req = n
+            .required_output_columns
+            .expect("required_output_columns must be Some(_) after tagging with None parent");
+        assert!(
+            req.contains(&ColumnId::new_for_test(10)),
+            "x@10 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(20)),
+            "y@20 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(30)),
+            "z@30 must be kept"
+        );
+        assert_eq!(req.len(), 3, "all 3 output ids kept");
+    }
+
+    #[test]
+    fn tag_cte_anchor_with_none_parent_consume_leaf_is_some() {
+        // A CTEAnchor tagged with parent_needed=None must end up with the
+        // CTEConsume leaf holding Some(_), proving subtree_untagged returns
+        // false (clean single-pass termination for `WITH cte AS (...) SELECT *
+        // FROM cte` style plans).
+        let cte_id: CteId = 88;
+
+        let scan = make_scan_with_ids(10, 20, 30);
+        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id,
+            input: Box::new(scan),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(10), "a"),
+                make_output_column(ColumnId::new_for_test(20), "b"),
+                make_output_column(ColumnId::new_for_test(30), "c"),
+            ],
+            required_output_columns: None,
+        });
+
+        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias: "u".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(101), "p"),
+                make_output_column(ColumnId::new_for_test(102), "q"),
+            ],
+            required_output_columns: None,
+        });
+
+        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id,
+            produce: Box::new(produce),
+            consumer: Box::new(consume),
+            required_output_columns: None,
+        });
+
+        let tagged = tag_required_columns(anchor, None);
+
+        let LogicalPlan::CTEAnchor(a) = tagged else {
+            panic!("expected CTEAnchor");
+        };
+        let LogicalPlan::CTEConsume(c) = *a.consumer else {
+            panic!("expected CTEConsume consumer");
+        };
+        // The leaf must be Some(_) — not None — so subtree_untagged is false.
+        assert!(
+            c.required_output_columns.is_some(),
+            "CTEConsume.required_output_columns must be Some(_) after tagging with None parent"
+        );
+        // All output ids must be present (keep-all semantics).
+        let req = c.required_output_columns.unwrap();
+        assert!(req.contains(&ColumnId::new_for_test(101)), "p@101 kept");
+        assert!(req.contains(&ColumnId::new_for_test(102)), "q@102 kept");
+        assert_eq!(req.len(), 2, "both output ids kept");
     }
 }
