@@ -310,7 +310,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 7);
+        assert_eq!(outcome.trace.stage_names().len(), 8);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -453,6 +453,7 @@ mod tests {
                 "imv-delta-pushdown",
                 "imv-scan-binding",
                 "imv-action-propagation",
+                "imv-apply-key",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
@@ -464,7 +465,7 @@ mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec!["InjectApplyKeyProject".to_string()],
             deadline: None,
             next_column_id: 100,
         })
@@ -543,7 +544,7 @@ mod tests {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec!["InjectApplyKeyProject".to_string()],
             deadline: None,
             next_column_id: 100,
         })

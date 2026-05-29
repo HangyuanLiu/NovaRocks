@@ -52,6 +52,10 @@ impl RewritePipeline {
         Self { stages }
     }
 
+    pub(crate) fn stage_names(&self) -> Vec<&'static str> {
+        self.stages.iter().map(|stage| stage.name()).collect()
+    }
+
     pub(crate) fn rule_names(&self) -> Vec<&'static str> {
         self.stages
             .iter()
