@@ -135,10 +135,14 @@ fn tag_filter(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     };
     node.required_output_columns = parent_needed.clone();
     // Child needs everything the parent needs PLUS all columns referenced in
-    // the predicate.
-    let mut child_needed: HashSet<ColumnId> = parent_needed.unwrap_or_default();
-    child_needed.extend(collect_column_id_refs(&node.predicate));
-    node.input = Box::new(tag_required_columns(*node.input, Some(child_needed)));
+    // the predicate.  When parent_needed is None (keep all), propagate None so
+    // the child also keeps all columns instead of collapsing to just the
+    // predicate refs.
+    let child_needed = parent_needed.map(|mut needed| {
+        needed.extend(collect_column_id_refs(&node.predicate));
+        needed
+    });
+    node.input = Box::new(tag_required_columns(*node.input, child_needed));
     LogicalPlan::Filter(node)
 }
 
@@ -147,14 +151,18 @@ fn tag_sort(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
         unreachable!()
     };
     node.required_output_columns = parent_needed.clone();
-    let mut child_needed: HashSet<ColumnId> = parent_needed.unwrap_or_default();
-    for item in &node.items {
-        child_needed.extend(collect_column_id_refs(&item.expr));
-    }
-    for expr in &node.analytic_partition_by {
-        child_needed.extend(collect_column_id_refs(expr));
-    }
-    node.input = Box::new(tag_required_columns(*node.input, Some(child_needed)));
+    // When parent_needed is None (keep all), propagate None so the child also
+    // keeps all columns instead of collapsing to just the sort-key refs.
+    let child_needed = parent_needed.map(|mut needed| {
+        for item in &node.items {
+            needed.extend(collect_column_id_refs(&item.expr));
+        }
+        for expr in &node.analytic_partition_by {
+            needed.extend(collect_column_id_refs(expr));
+        }
+        needed
+    });
+    node.input = Box::new(tag_required_columns(*node.input, child_needed));
     LogicalPlan::Sort(node)
 }
 
@@ -219,56 +227,25 @@ fn tag_window(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     let LogicalPlan::Window(mut node) = plan else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
-
-    // output_columns layout: first (len - window_exprs.len()) are input
-    // pass-throughs, then one per window_expr.
-    let input_col_count = node.output_columns.len() - node.window_exprs.len();
-
-    let mut child_needed: HashSet<ColumnId> = parent_needed.clone().unwrap_or_default();
-
-    // Include pass-through input columns referenced by parent_needed.
-    for col in node.output_columns.iter().take(input_col_count) {
-        if parent_needed.as_ref().is_none_or(|n| n.contains(&col.column_id)) {
-            child_needed.insert(col.column_id);
-        }
-    }
-
-    // For each window expression, include its args/partition_by/order_by
-    // only if its output column is in parent_needed.
-    for (i, wexpr) in node.window_exprs.iter().enumerate() {
-        let out_id = node.output_columns[input_col_count + i].column_id;
-        let is_needed = match &parent_needed {
-            None => true,
-            Some(n) => n.contains(&out_id),
-        };
-        if is_needed {
-            for arg in &wexpr.args {
-                child_needed.extend(collect_column_id_refs(arg));
-            }
-            for pb in &wexpr.partition_by {
-                child_needed.extend(collect_column_id_refs(pb));
-            }
-            for item in &wexpr.order_by {
-                child_needed.extend(collect_column_id_refs(&item.expr));
-            }
-        }
-    }
-
-    node.input = Box::new(tag_required_columns(*node.input, Some(child_needed)));
+    node.required_output_columns = parent_needed;
+    // Window output columns carry fresh ColumnIds (allocated by the planner)
+    // that are distinct from the child's ids, so we cannot reliably map
+    // parent_needed back to child column ids.  Pass None to the child so all
+    // input columns are preserved and no column is spuriously dropped.
+    node.input = Box::new(tag_required_columns(*node.input, None));
     LogicalPlan::Window(node)
 }
 
 fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
     // RepeatPlanNode.repeat_column_ref_list is Vec<Vec<String>> (column names),
-    // not ColumnIds.  We cannot directly translate names to ids here without
-    // the full output schema.  Conservative choice: pass parent_needed through
-    // so no columns are spuriously dropped from the child.
+    // not ColumnIds.  We cannot map names to ids here, so we cannot determine
+    // which child columns the rollup groups reference.  Pass None to the child
+    // (keep all input columns) to avoid under-tagging.
     let LogicalPlan::Repeat(mut node) = plan else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
+    node.required_output_columns = parent_needed;
+    node.input = Box::new(tag_required_columns(*node.input, None));
     LogicalPlan::Repeat(node)
 }
 
@@ -312,11 +289,11 @@ fn tag_table_function(
     let LogicalPlan::TableFunction(mut node) = plan else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
-    // Conservative: pass parent_needed through so no input column is
-    // spuriously dropped.  The function's own output columns are not
-    // individually addressable from the child's perspective.
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
+    node.required_output_columns = parent_needed;
+    // The function's args reference INPUT columns that may not appear in
+    // parent_needed (e.g. UNNEST(t.arr) where parent only sees the exploded
+    // output).  Pass None to the child so no input column is spuriously dropped.
+    node.input = Box::new(tag_required_columns(*node.input, None));
     LogicalPlan::TableFunction(node)
 }
 
@@ -330,28 +307,33 @@ fn tag_join(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
     };
     node.required_output_columns = parent_needed.clone();
 
-    // combined = parent_needed ∪ all column refs in the join condition.
-    let mut combined: HashSet<ColumnId> = parent_needed.unwrap_or_default();
-    if let Some(cond) = &node.condition {
-        combined.extend(collect_column_id_refs(cond));
-    }
+    // When parent_needed is None (keep all), propagate None to both children so
+    // they also keep all columns.  When Some, compute combined = parent_needed ∪
+    // condition refs, then split by which child produces each id.
+    let (left_needed, right_needed) = match parent_needed {
+        None => (None, None),
+        Some(mut combined) => {
+            if let Some(cond) = &node.condition {
+                combined.extend(collect_column_id_refs(cond));
+            }
+            let left_outputs = collect_output_ids(&node.left);
+            let right_outputs = collect_output_ids(&node.right);
+            let left: HashSet<ColumnId> = combined
+                .iter()
+                .filter(|id| left_outputs.contains(id))
+                .copied()
+                .collect();
+            let right: HashSet<ColumnId> = combined
+                .iter()
+                .filter(|id| right_outputs.contains(id))
+                .copied()
+                .collect();
+            (Some(left), Some(right))
+        }
+    };
 
-    // Split combined by which child produces each id.
-    let left_outputs = collect_output_ids(&node.left);
-    let right_outputs = collect_output_ids(&node.right);
-    let left_needed: HashSet<ColumnId> = combined
-        .iter()
-        .filter(|id| left_outputs.contains(id))
-        .copied()
-        .collect();
-    let right_needed: HashSet<ColumnId> = combined
-        .iter()
-        .filter(|id| right_outputs.contains(id))
-        .copied()
-        .collect();
-
-    node.left = Box::new(tag_required_columns(*node.left, Some(left_needed)));
-    node.right = Box::new(tag_required_columns(*node.right, Some(right_needed)));
+    node.left = Box::new(tag_required_columns(*node.left, left_needed));
+    node.right = Box::new(tag_required_columns(*node.right, right_needed));
     LogicalPlan::Join(node)
 }
 
@@ -1234,13 +1216,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tag_window_only_requests_args_for_needed_window_exprs() {
+    fn tag_window_passes_none_to_child_keeps_all_input_cols() {
+        // Window node must pass None to its child because window output_columns
+        // carry fresh ColumnIds distinct from the child's ids — any attempt to
+        // remap them risks under-tagging.  The safe fallback is None (keep all).
+        //
         // Window[passthrough: a@1, b@2; window: row_number()→301 over part(b@2) order(c@3)]
         //   output_columns = [a@1, b@2, row_number@301]
-        //   window_exprs   = [row_number (no args, partition_by=b@2, order_by=c@3)]
-        // parent_needed = {1}   (only a needed — window output NOT needed)
-        // Expected: child_needed = {1}  (only a; b@2 and c@3 NOT included because
-        //           row_number@301 is not in parent_needed)
+        // parent_needed = {1}  (only a needed)
+        // Expected: window.required_output_columns = {1}
+        //           child scan gets required_output_columns = all of {1,2,3}
+        //           because the handler passes None to the child.
         let window = LogicalPlan::Window(WindowNode {
             input: Box::new(scan_with_3_cols()),
             window_exprs: vec![WindowExpr {
@@ -1269,25 +1255,23 @@ mod tests {
         let LogicalPlan::Window(w) = tagged else {
             panic!()
         };
+        // The window node itself records the parent's request.
+        assert_eq!(w.required_output_columns.as_ref().unwrap(), &needed_set(&[1]));
         let LogicalPlan::Scan(s) = *w.input else {
             panic!()
         };
+        // Child got None → Scan expands to all its columns.
         let req = s.required_output_columns.unwrap();
-        assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 passthrough");
-        assert!(
-            !req.contains(&ColumnId::new_for_test(2)),
-            "b@2 not needed (window not requested)"
-        );
-        assert!(
-            !req.contains(&ColumnId::new_for_test(3)),
-            "c@3 not needed (order_by of unrequested window)"
-        );
+        assert_eq!(req.len(), 3, "scan keeps all 3 input columns");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
     }
 
     #[test]
-    fn tag_window_includes_args_when_window_output_is_needed() {
-        // Same Window plan but parent_needed = {301} (want the window result).
-        // Expected: child_needed = {2, 3}  (partition_by b@2 + order_by c@3)
+    fn tag_window_with_none_parent_child_also_keeps_all() {
+        // When parent_needed is None, Window propagates None to the child
+        // (no-op: child keeps all columns too).
         let window = LogicalPlan::Window(WindowNode {
             input: Box::new(scan_with_3_cols()),
             window_exprs: vec![WindowExpr {
@@ -1312,26 +1296,17 @@ mod tests {
             ],
             required_output_columns: None,
         });
-        let tagged = tag_required_columns(window, Some(needed_set(&[301])));
+        let tagged = tag_required_columns(window, None);
         let LogicalPlan::Window(w) = tagged else {
             panic!()
         };
+        assert!(w.required_output_columns.is_none());
         let LogicalPlan::Scan(s) = *w.input else {
             panic!()
         };
+        // None propagated → Scan keeps all columns.
         let req = s.required_output_columns.unwrap();
-        assert!(
-            req.contains(&ColumnId::new_for_test(2)),
-            "b@2 needed (partition_by)"
-        );
-        assert!(
-            req.contains(&ColumnId::new_for_test(3)),
-            "c@3 needed (order_by)"
-        );
-        assert!(
-            !req.contains(&ColumnId::new_for_test(1)),
-            "a@1 passthrough not in parent_needed"
-        );
+        assert_eq!(req.len(), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -1409,5 +1384,205 @@ mod tests {
         assert_eq!(req.len(), 2);
         assert!(req.contains(&ColumnId::new_for_test(5)));
         assert!(req.contains(&ColumnId::new_for_test(6)));
+    }
+
+    // -----------------------------------------------------------------------
+    // None-propagation tests (Fix 4/5/6: Filter/Sort/Join must not collapse
+    // None to an empty set — they must pass None through to children).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_filter_none_parent_propagates_none_to_child() {
+        // Filter(pred on c@3) <- Scan[a@1, b@2, c@3]
+        // parent_needed = None
+        // BUG before fix: collapsed to Some({3}), losing a@1 and b@2.
+        // Correct: child gets None → Scan keeps all {1,2,3}.
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan_with_3_cols()),
+            predicate: TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_ref_expr(ColumnId::new_for_test(3))),
+                    op: BinOp::Gt,
+                    right: Box::new(int_literal(0)),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(filter, None);
+        let LogicalPlan::Filter(f) = tagged else {
+            panic!()
+        };
+        assert!(
+            f.required_output_columns.is_none(),
+            "filter keeps None on itself"
+        );
+        let LogicalPlan::Scan(s) = *f.input else {
+            panic!()
+        };
+        // None propagated → Scan expands to all columns.
+        let req = s.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just predicate ref c");
+        assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
+        assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
+        assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
+    }
+
+    #[test]
+    fn tag_sort_none_parent_propagates_none_to_child() {
+        // Sort(order by c@3) <- Scan[a@1, b@2, c@3]
+        // parent_needed = None
+        // BUG before fix: collapsed to Some({3}), losing a@1 and b@2.
+        // Correct: child gets None → Scan keeps all {1,2,3}.
+        let sort = LogicalPlan::Sort(SortNode {
+            input: Box::new(scan_with_3_cols()),
+            items: vec![SortItem {
+                expr: col_ref_expr(ColumnId::new_for_test(3)),
+                asc: true,
+                nulls_first: false,
+            }],
+            analytic_partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(sort, None);
+        let LogicalPlan::Sort(s) = tagged else {
+            panic!()
+        };
+        assert!(
+            s.required_output_columns.is_none(),
+            "sort keeps None on itself"
+        );
+        let LogicalPlan::Scan(scan) = *s.input else {
+            panic!()
+        };
+        // None propagated → Scan expands to all columns.
+        let req = scan.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just sort/partition refs");
+        assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
+        assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
+        assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
+    }
+
+    #[test]
+    fn tag_join_none_parent_propagates_none_to_both_children() {
+        // Join[INNER, on a@1=d@4] <- {Scan_l[a@1,b@2,c@3], Scan_r[d@4,e@5,f@6]}
+        // parent_needed = None
+        // BUG before fix: collapsed to Some({1,4}), losing b,c and e,f.
+        // Correct: both children get None → each Scan keeps all its columns.
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(make_scan_with_ids(1, 2, 3)),
+            right: Box::new(make_scan_with_ids(4, 5, 6)),
+            join_type: JoinKind::Inner,
+            condition: Some(TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_ref_expr(ColumnId::new_for_test(1))),
+                    op: BinOp::Eq,
+                    right: Box::new(col_ref_expr(ColumnId::new_for_test(4))),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(join, None);
+        let LogicalPlan::Join(j) = tagged else {
+            panic!()
+        };
+        assert!(
+            j.required_output_columns.is_none(),
+            "join keeps None on itself"
+        );
+        let LogicalPlan::Scan(l) = *j.left else {
+            panic!()
+        };
+        let LogicalPlan::Scan(r) = *j.right else {
+            panic!()
+        };
+        // None propagated → each Scan expands to all its columns.
+        let lreq = l.required_output_columns.unwrap();
+        let rreq = r.required_output_columns.unwrap();
+        assert_eq!(lreq.len(), 3, "left scan keeps all 3 columns");
+        assert!(lreq.contains(&ColumnId::new_for_test(1)));
+        assert!(lreq.contains(&ColumnId::new_for_test(2)));
+        assert!(lreq.contains(&ColumnId::new_for_test(3)));
+        assert_eq!(rreq.len(), 3, "right scan keeps all 3 columns");
+        assert!(rreq.contains(&ColumnId::new_for_test(4)));
+        assert!(rreq.contains(&ColumnId::new_for_test(5)));
+        assert!(rreq.contains(&ColumnId::new_for_test(6)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Keep-all tests for Repeat and TableFunction (Fix 1/2):
+    // even when parent_needed omits a column the operator needs from its input,
+    // the child retains all columns because the handler passes None.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_repeat_passes_none_to_child_even_when_parent_needed_is_narrow() {
+        use crate::sql::planner::plan::RepeatPlanNode;
+        // Repeat node referencing rollup columns b@2 (by name, not id).
+        // parent_needed = {1}  (only a — does NOT include the rollup column b@2).
+        // The handler cannot resolve the name→id for b, so it must pass None
+        // to the child, keeping all {1,2,3}.
+        let repeat = LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(scan_with_3_cols()),
+            repeat_column_ref_list: vec![vec!["b".to_string()]],
+            grouping_ids: vec![1],
+            all_rollup_columns: vec!["b".to_string()],
+            grouping_key_aliases: vec![],
+            grouping_fn_args: vec![],
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(repeat, Some(needed_set(&[1])));
+        let LogicalPlan::Repeat(r) = tagged else {
+            panic!()
+        };
+        // Repeat records parent_needed on itself.
+        assert_eq!(r.required_output_columns.as_ref().unwrap(), &needed_set(&[1]));
+        let LogicalPlan::Scan(s) = *r.input else {
+            panic!()
+        };
+        // Child got None → Scan expands to all columns.
+        let req = s.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "scan keeps all 3 columns, including b@2 needed by rollup");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_table_function_passes_none_to_child_even_when_parent_needed_is_narrow() {
+        use crate::sql::planner::plan::TableFunctionNode;
+        // TableFunction: UNNEST(arr@2) → exploded_col@401
+        // parent_needed = {401}  (only the function output — does NOT include arr@2).
+        // The handler must pass None to the child so arr@2 (the arg) is not dropped.
+        let tf = LogicalPlan::TableFunction(TableFunctionNode {
+            input: Box::new(scan_with_3_cols()),
+            function_name: "unnest".to_string(),
+            args: vec![col_ref_expr(ColumnId::new_for_test(2))],
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(1), "a"),
+                make_output_column(ColumnId::new_for_test(401), "unnested"),
+            ],
+            alias: None,
+            is_left_join: false,
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(tf, Some(needed_set(&[401])));
+        let LogicalPlan::TableFunction(t) = tagged else {
+            panic!()
+        };
+        // TableFunction records parent_needed on itself.
+        assert_eq!(t.required_output_columns.as_ref().unwrap(), &needed_set(&[401]));
+        let LogicalPlan::Scan(s) = *t.input else {
+            panic!()
+        };
+        // Child got None → Scan expands to all columns, including arr@2.
+        let req = s.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "scan keeps all 3 columns, including arr@2 needed by function arg");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)), "arr@2 must be kept for UNNEST arg");
+        assert!(req.contains(&ColumnId::new_for_test(3)));
     }
 }
