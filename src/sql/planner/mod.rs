@@ -54,14 +54,31 @@ fn plan_scoped_query(
         output_columns,
         local_cte_ids,
     } = resolved;
-    let mut root = apply_query_modifiers(
-        plan_body_scoped(body, cte_registry, factory)?,
-        order_by,
-        output_columns,
-        limit,
-        offset,
-        factory,
-    );
+
+    // Plan the query body first so we can stamp fresh set-op ColumnIds before
+    // apply_query_modifiers consumes output_columns.
+    let mut body_plan = plan_body_scoped(body, cte_registry, factory)?;
+
+    // Strategy A: if the body produced a set-op node (Union/Intersect/Except),
+    // overwrite its output_columns with the fresh ColumnIds that the analyzer
+    // allocated for this query's output (stored in `output_columns`).  The
+    // planner previously left branch-side ColumnIds in those fields, which
+    // disagreed with the fresh IDs that the parent scope (and any wrapping
+    // SubqueryAliasNode) uses to reference the set-op output.
+    match &mut body_plan {
+        LogicalPlan::Union(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        LogicalPlan::Intersect(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        LogicalPlan::Except(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        _ => {}
+    }
+
+    let mut root = apply_query_modifiers(body_plan, order_by, output_columns, limit, offset, factory);
 
     for cte_id in local_cte_ids.into_iter().rev() {
         let entry = cte_registry
@@ -2329,5 +2346,99 @@ mod tests {
             anchor_idx > union_idx,
             "branch-local anchor should appear under union: {lines:?}"
         );
+    }
+
+    /// Regression test for the ColumnId-correctness bug where UnionNode.output_columns
+    /// carried left-branch ColumnIds instead of the fresh set-op output ColumnIds.
+    ///
+    /// After the fix, SubqueryAlias.output_columns (which carries the fresh IDs from
+    /// the analyzer's parent scope) must equal child Union.output_columns position by
+    /// position.  Before the fix these were two disjoint ID spaces.
+    #[test]
+    fn union_output_columns_carry_fresh_set_op_ids_matching_subquery_alias() {
+        // Plan a derived table that wraps a UNION ALL.  The subquery alias node
+        // receives the fresh set-op output ColumnIds from the analyzer scope; the
+        // Union node must carry the same IDs (not the left-branch scan IDs).
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey, o_custkey \
+             FROM (SELECT o_orderkey, o_custkey FROM orders \
+                   UNION ALL \
+                   SELECT o_orderkey, o_custkey FROM orders) sub",
+        )
+        .expect("planner should succeed");
+
+        // Navigate to SubqueryAlias — it is either the root or directly under a Project.
+        let alias_node = match &plan {
+            LogicalPlan::SubqueryAlias(n) => n,
+            LogicalPlan::Project(p) => match p.input.as_ref() {
+                LogicalPlan::SubqueryAlias(n) => n,
+                other => panic!("expected SubqueryAlias under Project, got {other:?}"),
+            },
+            other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+        };
+        assert_eq!(alias_node.alias, "sub");
+
+        // The direct child of SubqueryAlias must be the Union node.
+        let union_node = match alias_node.input.as_ref() {
+            LogicalPlan::Union(n) => n,
+            other => panic!("expected Union as SubqueryAlias child, got {other:?}"),
+        };
+
+        // Core assertion: fresh IDs must match position-by-position.
+        assert_eq!(
+            alias_node.output_columns.len(),
+            union_node.output_columns.len(),
+            "SubqueryAlias and Union output_columns length must match"
+        );
+        for (i, (alias_col, union_col)) in alias_node
+            .output_columns
+            .iter()
+            .zip(union_node.output_columns.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                alias_col.column_id, union_col.column_id,
+                "output_columns[{i}]: SubqueryAlias column_id {:?} != Union column_id {:?} \
+                 (Union must carry the fresh set-op IDs, not left-branch IDs)",
+                alias_col.column_id, union_col.column_id
+            );
+        }
+    }
+
+    /// Same correctness guarantee for INTERSECT and EXCEPT set operations.
+    #[test]
+    fn intersect_except_output_columns_carry_fresh_set_op_ids() {
+        for sql in [
+            "SELECT o_orderkey FROM (SELECT o_orderkey FROM orders \
+             INTERSECT SELECT o_orderkey FROM orders) sub",
+            "SELECT o_orderkey FROM (SELECT o_orderkey FROM orders \
+             EXCEPT SELECT o_orderkey FROM orders) sub",
+        ] {
+            let plan = parse_analyze_and_plan(sql).expect("planner should succeed");
+
+            let alias_node = match &plan {
+                LogicalPlan::SubqueryAlias(n) => n,
+                LogicalPlan::Project(p) => match p.input.as_ref() {
+                    LogicalPlan::SubqueryAlias(n) => n,
+                    other => panic!("expected SubqueryAlias under Project, got {other:?}"),
+                },
+                other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+            };
+
+            let (alias_cols, set_op_cols) = match alias_node.input.as_ref() {
+                LogicalPlan::Intersect(n) => (&alias_node.output_columns, &n.output_columns),
+                LogicalPlan::Except(n) => (&alias_node.output_columns, &n.output_columns),
+                other => panic!("expected Intersect/Except as child, got {other:?}"),
+            };
+
+            assert_eq!(alias_cols.len(), set_op_cols.len());
+            for (i, (ac, sc)) in alias_cols.iter().zip(set_op_cols.iter()).enumerate() {
+                assert_eq!(
+                    ac.column_id, sc.column_id,
+                    "output_columns[{i}]: SubqueryAlias {:?} != set-op {:?} for SQL: {sql}",
+                    ac.column_id, sc.column_id
+                );
+            }
+        }
     }
 }
