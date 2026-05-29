@@ -2905,7 +2905,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
 /// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
-/// - `Fe`: uses `RemoteDispatcher` bound to the first configured backend.
+/// - `Fe`: uses `RemoteDispatcher` bound to all configured backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
@@ -2920,23 +2920,19 @@ pub(crate) fn dispatcher_for_role(
         ClusterRole::Fe => {
             let cfg = crate::novarocks_config::config()
                 .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
-            let n = cfg.cluster.backends.len();
-            if n != 1 {
-                return Err(format!(
-                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
-                ));
+            if cfg.cluster.backends.is_empty() {
+                return Err("role=fe: cluster.backends must not be empty".to_string());
             }
-            let backend_str = cfg
-                .cluster
-                .backends
-                .first()
-                .expect("length already checked above");
-            let backend: std::net::SocketAddr = backend_str
-                .parse()
-                .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+            let mut addrs = Vec::with_capacity(cfg.cluster.backends.len());
+            for backend_str in &cfg.cluster.backends {
+                let backend: std::net::SocketAddr = backend_str
+                    .parse()
+                    .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+                addrs.push(backend);
+            }
             Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
-                backend,
-            )))
+                &addrs,
+            )?))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
@@ -7936,21 +7932,28 @@ enable_path_style_access = true
         );
     }
 
-    /// Issue 4: FE role with more than one backend returns an error that
-    /// includes the backend count.  Without the exactly-one guard the first
-    /// backend would be silently accepted.
+    /// D2: FE role with more than one backend builds a multi-backend
+    /// `RemoteDispatcher`. The dispatcher reports a backend count equal to the
+    /// number of configured backends.
     #[test]
-    fn dispatcher_for_role_fe_multiple_backends_returns_error_with_count() {
+    fn dispatcher_for_role_fe_multiple_backends_ok() {
         let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["127.0.0.1:9070".to_string(), "127.0.0.1:9071".to_string()];
         crate::common::app_config::install_preloaded_config(cfg);
         let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
-        assert!(result.is_err(), "Fe with multiple backends must error");
-        let msg = result.err().expect("expected error");
-        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
-        assert!(msg.contains('2'), "must include count: {msg}");
+        assert!(
+            result.is_ok(),
+            "Fe with multiple backends must build a dispatcher, got: {:?}",
+            result.err()
+        );
+        let dispatcher = result.expect("dispatcher");
+        assert_eq!(
+            dispatcher.backend_count(),
+            2,
+            "dispatcher must route to both configured backends"
+        );
     }
 
     #[test]

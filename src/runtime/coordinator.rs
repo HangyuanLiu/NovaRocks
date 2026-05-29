@@ -563,8 +563,8 @@ pub(crate) fn submit_and_fetch_loop(
             .as_ref()
             .map(|ep| types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
             .unwrap_or_else(|| types::TUniqueId::new(0, 0));
-        if let Err(e) = dispatcher.submit_fragment(p) {
-            dispatcher.cancel_fragments(&submitted);
+        if let Err(e) = dispatcher.submit_fragment(0, p) {
+            dispatcher.cancel_fragments(0, &submitted);
             return Err(e);
         }
         submitted.push(finst_id);
@@ -575,12 +575,12 @@ pub(crate) fn submit_and_fetch_loop(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if crate::runtime::query_cancel::client_disconnected() {
-            dispatcher.cancel_fragments(&submitted);
+            dispatcher.cancel_fragments(0, &submitted);
             return Err("client disconnected".to_string());
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            dispatcher.cancel_fragments(&submitted);
+            dispatcher.cancel_fragments(0, &submitted);
             return Err(format!("query timed out after {timeout_ms} ms"));
         }
         let remaining_ms = deadline
@@ -588,16 +588,16 @@ pub(crate) fn submit_and_fetch_loop(
             .as_millis()
             .min(i64::MAX as u128) as i64;
         let fetch_wait_ms = remaining_ms.clamp(1, REMOTE_FETCH_POLL_INTERVAL_MS);
-        match dispatcher.fetch_result(root_finst_id.clone(), fetch_wait_ms) {
+        match dispatcher.fetch_result(0, root_finst_id.clone(), fetch_wait_ms) {
             Err(e) => {
-                dispatcher.cancel_fragments(&submitted);
+                dispatcher.cancel_fragments(0, &submitted);
                 return Err(e);
             }
             Ok(FetchOutcome::Ready(chunk)) => chunks.push(chunk),
             Ok(FetchOutcome::NotReady) => continue,
             Ok(FetchOutcome::Eof) => break,
             Ok(FetchOutcome::Err(e)) => {
-                dispatcher.cancel_fragments(&submitted);
+                dispatcher.cancel_fragments(0, &submitted);
                 return Err(e);
             }
         }
@@ -648,6 +648,7 @@ mod tests {
 
         fn submit_fragment(
             &self,
+            _backend_idx: usize,
             params: crate::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst = params
@@ -661,13 +662,18 @@ mod tests {
 
         fn fetch_result(
             &self,
+            _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
         ) -> Result<FetchOutcome, String> {
             Ok(FetchOutcome::Eof)
         }
 
-        fn cancel_fragments(&self, _finst_ids: &[types::TUniqueId]) {}
+        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+
+        fn backend_count(&self) -> usize {
+            1
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -779,6 +785,7 @@ mod tests {
 
         fn submit_fragment(
             &self,
+            _backend_idx: usize,
             params: crate::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let n = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -798,6 +805,7 @@ mod tests {
 
         fn fetch_result(
             &self,
+            _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
         ) -> Result<FetchOutcome, String> {
@@ -809,8 +817,12 @@ mod tests {
             }
         }
 
-        fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
             self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
+
+        fn backend_count(&self) -> usize {
+            1
         }
     }
 
@@ -821,6 +833,7 @@ mod tests {
 
         fn submit_fragment(
             &self,
+            _backend_idx: usize,
             params: crate::internal_service::TExecPlanFragmentParams,
         ) -> Result<(), String> {
             let finst_id = params
@@ -836,6 +849,7 @@ mod tests {
 
         fn fetch_result(
             &self,
+            _backend_idx: usize,
             _finst_id: types::TUniqueId,
             max_wait_ms: i64,
         ) -> Result<FetchOutcome, String> {
@@ -848,7 +862,11 @@ mod tests {
             }
         }
 
-        fn cancel_fragments(&self, _finst_ids: &[types::TUniqueId]) {}
+        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+
+        fn backend_count(&self) -> usize {
+            1
+        }
     }
 
     // -----------------------------------------------------------------------
