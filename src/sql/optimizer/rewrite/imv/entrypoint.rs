@@ -2,6 +2,7 @@
 //! docs/superpowers/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
@@ -16,6 +17,10 @@ pub(crate) struct ImvRewriteInput {
     pub mv_ctx: Arc<IcebergMvRewriteContext>,
     pub disabled_rules: Vec<String>,
     pub deadline: Option<Instant>,
+    /// Next free `ColumnId` value, taken from the `ColumnRefFactory` that
+    /// produced `plan`. Seeds the IMV rewrite's internal ColumnId allocator
+    /// so new columns (e.g. the action column) never collide with existing ids.
+    pub next_column_id: u32,
 }
 
 #[derive(Debug)]
@@ -31,12 +36,17 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         mv_ctx,
         disabled_rules,
         deadline,
+        next_column_id,
     } = input;
 
     let mut ctx_rw = RewriteContext::for_mv_refresh(disabled_rules);
+    // Seed from the factory's next-free id (passed by the caller), guarding
+    // against a degenerate 0 seed which would alias ColumnId::UNSET.
+    let next_column_id = Arc::new(AtomicU32::new(next_column_id.max(1)));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         mv_ctx,
         annotation: ImvPlanAnnotation::default(),
+        next_column_id,
     });
     if let Some(deadline) = deadline {
         ctx_rw.set_deadline(deadline);
@@ -60,7 +70,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -70,7 +80,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-    use crate::sql::planner::plan::{LogicalPlan, ScanNode, ValuesNode};
+    use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode, ValuesNode};
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,6 +132,7 @@ mod tests {
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
             predicates: Vec::new(),
             required_columns: None,
@@ -183,6 +194,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .unwrap();
         assert_eq!(
@@ -213,6 +225,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx,
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
@@ -270,6 +283,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
@@ -292,10 +306,11 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 5);
+        assert_eq!(outcome.trace.stage_names().len(), 7);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -342,6 +357,7 @@ mod tests {
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
         let plan = empty_values_plan();
@@ -372,6 +388,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect_err("PR-β pipeline rejects plain plans");
         assert!(err.starts_with("IVM rewrite failed to resolve incremental markers:"));
@@ -390,6 +407,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect_err("PR-β pipeline must Reject on plain plan");
         assert!(
@@ -408,6 +426,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("disabled wrap rule must let the pipeline succeed");
 
@@ -416,12 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn imv_pipeline_traces_scan_binding_stage_name() {
+    fn imv_pipeline_traces_seven_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("pipeline must succeed when wrap rule is disabled");
 
@@ -430,7 +450,9 @@ mod tests {
             vec![
                 "imv-logical-normalize",
                 "imv-delta-marker",
+                "imv-delta-pushdown",
                 "imv-scan-binding",
+                "imv-action-propagation",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
@@ -444,6 +466,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Delta(Scan) must bind and pass validation");
 
@@ -474,6 +497,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Version(Scan, From) must bind and pass validation");
 
@@ -499,6 +523,7 @@ mod tests {
             mv_ctx: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
+            next_column_id: 100,
         })
         .expect("Version(Scan, To) must bind and pass validation");
 
@@ -511,5 +536,96 @@ mod tests {
             }
             other => panic!("expected IcebergVersionTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn imv_pipeline_injects_action_on_delta_scan() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: iceberg_scan_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("pipeline must succeed");
+
+        let LogicalPlan::Scan(scan) = outcome.plan else {
+            panic!("expected scan outcome");
+        };
+        let action = scan
+            .columns
+            .iter()
+            .find(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op"))
+            .expect("action column must be present");
+        assert_eq!(action.data_type, arrow::datatypes::DataType::Int8);
+        assert!(!action.nullable);
+    }
+
+    #[test]
+    fn imv_pipeline_propagates_action_through_project_end_to_end() {
+        // Build Project(k) over the iceberg scan. The full pipeline must:
+        // wrap → bind (DataFiles→DeltaTable) → inject __change_op on the scan
+        // → propagate it into the Project → pass validation.
+        let scan = iceberg_scan_plan();
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(1),
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "k".to_string(),
+            }],
+        });
+
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: project,
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("Project over delta scan must rewrite and pass validation");
+
+        // Outcome root is a Project that exposes the propagated action column.
+        let LogicalPlan::Project(project) = outcome.plan else {
+            panic!("expected Project outcome, got {:?}", outcome.plan);
+        };
+        assert!(
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case("__change_op")),
+            "Project must expose propagated action column; items: {:?}",
+            project
+                .items
+                .iter()
+                .map(|i| &i.output_name)
+                .collect::<Vec<_>>()
+        );
+        // The user column is still present.
+        assert!(
+            project.items.iter().any(|item| item.output_name == "k"),
+            "user column k must remain"
+        );
+        // The child scan is delta-bound and carries the internal action column.
+        let LogicalPlan::Scan(scan) = *project.input else {
+            panic!("expected Scan under Project");
+        };
+        assert!(
+            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }),
+            "child scan must be delta-bound"
+        );
+        assert!(
+            scan.columns
+                .iter()
+                .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
+            "child scan must carry the internal action column"
+        );
     }
 }

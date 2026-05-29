@@ -137,6 +137,31 @@ fn add_iceberg_equality_delete_required_columns(
     Ok(())
 }
 
+/// Phase 2 codegen guard: the IMV action column (`__change_op`, internal) must
+/// not reach code generation. Refresh execution does not consume the IMV
+/// rewrite outcome yet (Phase 3 cutover), so an internal action column in a
+/// scan's output schema indicates a logic error. For normal queries no column
+/// is internal, so this is a no-op.
+fn reject_internal_action_column(
+    columns: &[crate::sql::analysis::OutputColumn],
+    database: &str,
+    table_name: &str,
+) -> Result<(), String> {
+    for col in columns {
+        if col.is_internal
+            && col
+                .name
+                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        {
+            return Err(format!(
+                "IMV action column {} on scan {}.{} reached codegen before execution cutover",
+                col.name, database, table_name
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
@@ -469,6 +494,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalScanOp,
         _node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
+        reject_internal_action_column(&op.columns, &op.database, &op.table.name)?;
+
         let scan_tuple_id = self.alloc_tuple();
         let scan_node_id = self.alloc_node();
 
@@ -3547,6 +3574,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         name: name.clone(),
                         data_type: binding.data_type.clone(),
                         nullable: binding.nullable,
+                        is_internal: false,
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -4275,6 +4303,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
+            is_internal: false,
         }]
     }
 
@@ -5140,6 +5169,7 @@ mod tests {
                 name: "generate_series".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5535,6 +5565,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -5551,6 +5582,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5565,6 +5597,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
             }),
             children: vec![scan],
@@ -5574,6 +5607,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -5680,12 +5714,14 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                     OutputColumn {
                         column_id: crate::sql::column_id::ColumnId::UNSET,
                         name: "name".to_string(),
                         data_type: DataType::Utf8,
                         nullable: false,
+                        is_internal: false,
                     },
                 ],
                 predicates: vec![],
@@ -5711,12 +5747,14 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: crate::sql::column_id::ColumnId::UNSET,
                     name: "name".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 },
             ],
         };
@@ -5905,6 +5943,7 @@ mod tests {
                     name: "__nr_dict_t_s".to_string(),
                     data_type: DataType::Int32,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: Some(vec!["__nr_dict_t_s".to_string()]),
@@ -5921,6 +5960,7 @@ mod tests {
                 name: "__nr_dict_t_s".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -6044,6 +6084,7 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
+                    is_internal: false,
                 }],
                 predicates: vec![],
                 required_columns: None,
@@ -6060,6 +6101,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
+                is_internal: false,
             }],
         };
 
@@ -6274,5 +6316,49 @@ mod tests {
             contexts_with_conjuncts, 1,
             "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
         );
+    }
+}
+
+#[cfg(test)]
+mod action_column_guard_tests {
+    use super::*;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str, is_internal: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(1),
+            name: name.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal,
+        }
+    }
+
+    #[test]
+    fn guard_rejects_internal_action_column() {
+        let cols = vec![col("k", false), col("__change_op", true)];
+        let err = reject_internal_action_column(&cols, "db", "b")
+            .expect_err("internal action column must be rejected");
+        assert!(
+            err.contains("IMV action column __change_op on scan db.b reached codegen before execution cutover"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_allows_normal_columns() {
+        let cols = vec![col("k", false), col("v", false)];
+        reject_internal_action_column(&cols, "db", "b").expect("normal columns must pass");
+    }
+
+    #[test]
+    fn guard_ignores_non_internal_column_named_change_op() {
+        // A user column literally named __change_op but NOT internal is not the
+        // action column; the guard keys on is_internal, so it passes.
+        let cols = vec![col("__change_op", false)];
+        reject_internal_action_column(&cols, "db", "b")
+            .expect("non-internal column must not trip the guard");
     }
 }

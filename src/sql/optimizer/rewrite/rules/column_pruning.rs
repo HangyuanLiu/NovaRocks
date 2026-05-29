@@ -85,6 +85,12 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                         required.insert(col.to_lowercase());
                     }
                 }
+                // Internal columns (e.g. IMV action column) are never pruned.
+                for col in &scan.columns {
+                    if col.is_internal {
+                        required.insert(col.name.to_lowercase());
+                    }
+                }
                 let mut pruned: Vec<String> = scan
                     .columns
                     .iter()
@@ -324,8 +330,28 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             })
         }
 
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
+        LogicalPlan::ImvDelta(node) => {
+            // Defensive totality: PruneColumns is registered only in the
+            // standalone optimizer pipeline, never in build_imv_pipeline(), and
+            // the IMV pipeline rejects unresolved markers before pruning. This
+            // arm is therefore unreachable in production; it exists so the rule
+            // is total over LogicalPlan and never panics on a stray marker.
+            let input = prune_inner(*node.input, needed);
+            LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                input: Box::new(input),
+                is_root: node.is_root,
+                action_column: node.action_column,
+            })
+        }
+        LogicalPlan::ImvVersion(node) => {
+            // See ImvDelta arm.
+            let input = prune_inner(*node.input, needed);
+            LogicalPlan::ImvVersion(
+                crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode {
+                    input: Box::new(input),
+                    version_ref: node.version_ref,
+                },
+            )
         }
     }
 }
@@ -387,6 +413,7 @@ mod tests {
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
                     nullable: c.nullable,
+                    is_internal: false,
                 })
                 .collect(),
             predicates: vec![],
@@ -531,12 +558,14 @@ mod tests {
                     name: "b".to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
+                    is_internal: false,
                 },
                 OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "sum_c".to_string(),
                     data_type: DataType::Float64,
                     nullable: true,
+                    is_internal: false,
                 },
             ],
             already_pushed: false,
@@ -557,6 +586,85 @@ mod tests {
             }
         } else {
             panic!("expected Aggregate");
+        }
+    }
+
+    fn scan_with_internal_column(table: &TableDef, internal_name: &str) -> ScanNode {
+        let mut scan = scan_node(table);
+        scan.columns.push(OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: internal_name.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        });
+        scan
+    }
+
+    #[test]
+    fn pruning_preserves_internal_column_when_parent_does_not_request() {
+        let table = three_col_table();
+        let scan = LogicalPlan::Scan(scan_with_internal_column(&table, "__change_op"));
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: col_ref("a", DataType::Int32),
+                output_name: "a".to_string(),
+            }],
+        });
+        let rule = PruneColumns;
+        let out = rule
+            .apply(project)
+            .expect("rule should fire and set required_columns");
+        if let LogicalPlan::Project(p) = out {
+            if let LogicalPlan::Scan(s) = *p.input {
+                let required = s.required_columns.expect("required_columns must be set");
+                assert!(required.iter().any(|c| c == "a"), "got: {required:?}");
+                assert!(
+                    required.iter().any(|c| c == "__change_op"),
+                    "internal column must be preserved; got: {required:?}"
+                );
+            } else {
+                panic!("expected Scan under Project");
+            }
+        } else {
+            panic!("expected Project");
+        }
+    }
+
+    #[test]
+    fn pruning_passes_through_resolved_imv_delta_marker() {
+        // The passthrough arm must prune the child and re-wrap the marker
+        // without panicking, preserving the marker's fields.
+        let table = three_col_table();
+        let scan = LogicalPlan::Scan(scan_node(&table));
+        let delta =
+            LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                input: Box::new(scan),
+                is_root: true,
+                action_column: None,
+            });
+        // Drive prune_inner directly with a restriction so the child is pruned
+        // and we can observe the re-wrapped marker structure.
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("a".to_string());
+        let out = prune_inner(delta, Some(&needed));
+        match out {
+            LogicalPlan::ImvDelta(node) => {
+                assert!(node.is_root, "is_root must be preserved");
+                assert!(
+                    node.action_column.is_none(),
+                    "action_column must be preserved"
+                );
+                match *node.input {
+                    LogicalPlan::Scan(s) => {
+                        let req = s.required_columns.expect("child scan should be pruned");
+                        assert!(req.iter().any(|c| c == "a"), "got: {req:?}");
+                    }
+                    other => panic!("expected Scan under ImvDelta, got {other:?}"),
+                }
+            }
+            other => panic!("expected ImvDelta, got {other:?}"),
         }
     }
 }
