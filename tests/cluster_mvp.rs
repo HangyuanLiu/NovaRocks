@@ -269,6 +269,119 @@ backends = ["127.0.0.1:{be_starlet_port}"]
     }
 }
 
+struct MultiBeClusterHarness {
+    #[allow(dead_code)]
+    bes: Vec<ProcessGuard>,
+    _fe: ProcessGuard,
+    fe_mysql: u16,
+}
+
+impl MultiBeClusterHarness {
+    fn start_n_be(n: usize, be_debug: &str, fe_extra: &str) -> Self {
+        assert!(n >= 1, "must spawn at least one BE");
+
+        // Reserve all ports up front before releasing any of them.
+        struct BePortSet {
+            http: ReservedPort,
+            starlet: ReservedPort,
+        }
+        let mut be_port_sets: Vec<BePortSet> = (0..n)
+            .map(|_| BePortSet {
+                http: ReservedPort::new(),
+                starlet: ReservedPort::new(),
+            })
+            .collect();
+        let fe_mysql = ReservedPort::new();
+        let fe_http = ReservedPort::new();
+        let fe_starlet = ReservedPort::new();
+
+        // Collect port numbers before consuming the ReservedPort structs.
+        let be_http_ports: Vec<u16> = be_port_sets.iter().map(|s| s.http.port()).collect();
+        let be_starlet_ports: Vec<u16> = be_port_sets.iter().map(|s| s.starlet.port()).collect();
+        let fe_mysql_port = fe_mysql.port();
+        let fe_http_port = fe_http.port();
+        let fe_starlet_port = fe_starlet.port();
+
+        // Write all BE configs (while ports are still reserved).
+        let be_configs: Vec<NamedTempFile> = be_port_sets
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let http_port = be_http_ports[i];
+                let starlet_port = be_starlet_ports[i];
+                write_config(
+                    &format!("be{i}"),
+                    &format!(
+                        r#"
+[server]
+host = "127.0.0.1"
+http_port = {http_port}
+starlet_port = {starlet_port}
+
+[cluster]
+role = "be"
+{be_debug}
+"#
+                    ),
+                )
+            })
+            .collect();
+
+        // Build the backends list for the FE config.
+        let backends_list: String = be_starlet_ports
+            .iter()
+            .map(|p| format!("\"127.0.0.1:{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fe_config = write_config(
+            "fe",
+            &format!(
+                r#"
+[server]
+host = "127.0.0.1"
+http_port = {fe_http_port}
+starlet_port = {fe_starlet_port}
+
+[standalone_server]
+mysql_port = {fe_mysql_port}
+
+[cluster]
+role = "fe"
+backends = [{backends_list}]
+{fe_extra}
+"#
+            ),
+        );
+
+        // Release BE ports and spawn each BE, waiting for readiness.
+        let mut bes: Vec<ProcessGuard> = Vec::with_capacity(n);
+        for (i, port_set) in be_port_sets.drain(..).enumerate() {
+            let _ = port_set.http.release();
+            let _ = port_set.starlet.release();
+            let mut be = ProcessGuard::spawn(be_configs[i].path());
+            be.wait_for_ready("NOVAROCKS_READY role=be");
+            bes.push(be);
+        }
+
+        // Release FE ports and spawn FE.
+        let _ = fe_mysql.release();
+        let _ = fe_http.release();
+        let _ = fe_starlet.release();
+        let mut fe = ProcessGuard::spawn(fe_config.path());
+        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+
+        Self {
+            bes,
+            _fe: fe,
+            fe_mysql: fe_mysql_port,
+        }
+    }
+
+    fn fe_mysql_port(&self) -> u16 {
+        self.fe_mysql
+    }
+}
+
 fn coordinated_query_sql() -> &'static str {
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v"
 }
@@ -608,6 +721,44 @@ fault_inject_fetch_not_ready_count = 1000
     assert!(
         !err.is_empty(),
         "expected a non-empty FE error after BE crash"
+    );
+}
+
+#[test]
+fn cross_process_two_be_coordinated_query() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    let rows: Vec<i64> = conn
+        .query(coordinated_query_sql())
+        .expect("coordinated query must succeed on 2-BE cluster");
+    assert_eq!(
+        rows,
+        vec![1i64, 2i64],
+        "2-BE coordinated query must return sorted results [1, 2]"
+    );
+}
+
+#[test]
+fn cross_process_two_be_multi_fragment() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("multi-fragment CTE+JOIN query must succeed on 2-BE cluster");
+    assert_eq!(
+        rows,
+        vec![1i64, 2i64],
+        "2-BE multi-fragment query must return sorted results [1, 2]"
     );
 }
 
