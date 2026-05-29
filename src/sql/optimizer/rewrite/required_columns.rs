@@ -19,6 +19,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs, collect_output_ids, collect_output_ids_ordered,
 };
@@ -619,6 +623,114 @@ fn walk_consume_position_map(
             walk_consume_position_map(&a.produce, target_id, map);
         }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TagRequiredColumns rewrite rule
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the plan tree rooted at `plan` has not yet been tagged
+/// by the Phase-1 tagging pass.
+///
+/// **Why we check first-child rather than the root node itself**:
+/// `tag_required_columns(root, None)` stores `parent_needed = None` on the
+/// root operator (semantics: "all outputs required, no restriction from the
+/// parent"), but it ALWAYS stores `Some(_)` on every *leaf* node (Scan,
+/// Values, GenerateSeries).  Non-leaf nodes at the root that received
+/// `parent_needed = None` therefore still carry `required_output_columns = None`
+/// after being tagged.  Using the root's own field as the guard would cause
+/// the rule to re-fire on every fixed-point iteration.
+///
+/// The fix: for leaf nodes, check the node's own field (leaves always get
+/// `Some(_)` after tagging).  For non-leaf nodes, check the first child's
+/// field recursively — after tagging, the deepest leaf will have `Some(_)`.
+///
+/// `ImvDelta` / `ImvVersion` lack `required_output_columns` and must not
+/// be subject to column pruning.  Return `false` so the rule never fires.
+fn subtree_untagged(plan: &LogicalPlan) -> bool {
+    match plan {
+        // Leaves: always get `Some(_)` after tagging.
+        LogicalPlan::Scan(n) => n.required_output_columns.is_none(),
+        LogicalPlan::Values(n) => n.required_output_columns.is_none(),
+        LogicalPlan::GenerateSeries(n) => n.required_output_columns.is_none(),
+        LogicalPlan::CTEConsume(n) => n.required_output_columns.is_none(),
+        // Non-leaves: check the first child (which will itself be a leaf or
+        // recurse further until a leaf is reached).
+        LogicalPlan::Filter(n) => subtree_untagged(&n.input),
+        LogicalPlan::Project(n) => subtree_untagged(&n.input),
+        LogicalPlan::Aggregate(n) => subtree_untagged(&n.input),
+        LogicalPlan::Join(n) => subtree_untagged(&n.left),
+        LogicalPlan::Sort(n) => subtree_untagged(&n.input),
+        LogicalPlan::Limit(n) => subtree_untagged(&n.input),
+        LogicalPlan::Window(n) => subtree_untagged(&n.input),
+        LogicalPlan::SubqueryAlias(n) => subtree_untagged(&n.input),
+        LogicalPlan::Repeat(n) => subtree_untagged(&n.input),
+        LogicalPlan::CTEAnchor(n) => subtree_untagged(&n.consumer),
+        LogicalPlan::CTEProduce(n) => subtree_untagged(&n.input),
+        LogicalPlan::Decode(n) => subtree_untagged(&n.input),
+        LogicalPlan::TableFunction(n) => subtree_untagged(&n.input),
+        LogicalPlan::Union(n) => n
+            .inputs
+            .first()
+            .map_or(false, |child| subtree_untagged(child)),
+        LogicalPlan::Intersect(n) => n
+            .inputs
+            .first()
+            .map_or(false, |child| subtree_untagged(child)),
+        LogicalPlan::Except(n) => n
+            .inputs
+            .first()
+            .map_or(false, |child| subtree_untagged(child)),
+        // ImvDelta and ImvVersion are not subject to column pruning.
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => false,
+    }
+}
+
+/// Phase-1 tagging rule: walks the plan top-down via [`tag_required_columns`]
+/// and stamps `required_output_columns` on every operator node.
+///
+/// The rule fires once per subtree: `matches` uses [`subtree_untagged`] which
+/// checks the first reachable leaf rather than the root node itself.  This is
+/// necessary because `tag_required_columns(root, None)` stores `None` on the
+/// root (semantics: "no parent restriction"), but always stores `Some(_)` on
+/// leaf nodes.  After `apply` returns, all leaves carry `Some(_)`, so
+/// `subtree_untagged` returns `false` and the rule does not re-fire.
+///
+/// TopDown driver post-`apply` child walk: after the root fires and tags the
+/// whole tree, `rewrite_children` recurses into already-tagged children.
+/// `matches` returns `false` for each (their leaves are `Some(_)`), so no
+/// re-tagging occurs.
+///
+/// The pipeline's fixed-point loop re-runs the stage; on the second pass
+/// `subtree_untagged == false` everywhere, `phase_changed == false`, and the
+/// loop exits cleanly.
+///
+/// **No behavior change**: this pass only writes metadata.  Nothing reads
+/// `required_output_columns` until the per-operator prune rules are registered
+/// in a later task.
+pub(crate) struct TagRequiredColumns;
+
+impl LogicalRewriteRule for TagRequiredColumns {
+    fn name(&self) -> &'static str {
+        "TagRequiredColumns"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+        subtree_untagged(plan)
+    }
+
+    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let tagged = tag_required_columns(plan, None);
+        Ok(RewriteResult::Changed(tagged))
     }
 }
 
@@ -1611,5 +1723,77 @@ mod tests {
             "arr@2 must be kept for UNNEST arg"
         );
         assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    // -----------------------------------------------------------------------
+    // TagRequiredColumns rule end-to-end pipeline test
+    // -----------------------------------------------------------------------
+
+    /// Verify that `TagRequiredColumns` runs through the full
+    /// `query_rewrite_pipeline` and stamps `required_output_columns = Some(_)`
+    /// on both nodes of a Project → Scan plan.
+    #[test]
+    fn tag_required_columns_rule_runs_through_pipeline_and_stamps_nodes() {
+        use crate::sql::optimizer::rewrite::context::RewriteContext;
+        use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+        use std::collections::HashMap;
+
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(ScanNode {
+                database: "db".to_string(),
+                table: crate::sql::catalog::TableDef {
+                    name: "t".to_string(),
+                    columns: vec![crate::sql::catalog::ColumnDef {
+                        name: "a".to_string(),
+                        data_type: arrow::datatypes::DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                required_output_columns: None,
+            })),
+            items: vec![crate::sql::analysis::ProjectItem {
+                output_column_id: ColumnId::new_for_test(101),
+                output_name: "a".to_string(),
+                expr: col_ref_expr(ColumnId::new_for_test(1)),
+            }],
+            required_output_columns: None,
+        });
+
+        let table_stats = HashMap::new();
+        let pipeline = query_rewrite_pipeline(&table_stats);
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let result = pipeline.rewrite(plan, &mut ctx).unwrap();
+
+        // After the pipeline, the Scan leaf must have Some(_) on
+        // required_output_columns — proof that TagRequiredColumns ran and
+        // stamped the leaf.
+        //
+        // Note: the root Project carries `required_output_columns = None`
+        // because it was called as the tree root (parent_needed = None), which
+        // is the correct metadata: "no parent restriction on the root".
+        // Only leaf nodes are guaranteed to hold `Some(_)` after tagging.
+        let LogicalPlan::Project(p) = result else {
+            panic!("expected Project at root after pipeline rewrite");
+        };
+
+        let LogicalPlan::Scan(s) = *p.input else {
+            panic!("expected Scan child after pipeline rewrite");
+        };
+        assert!(
+            s.required_output_columns.is_some(),
+            "Scan.required_output_columns must be Some(_) after TagRequiredColumns stage ran"
+        );
     }
 }
