@@ -2,16 +2,22 @@
 //!
 //! Wires and runs:
 //! - CTE produce fragments (multicast to consumer exchange nodes)
-//! - `Stream` / Gather producer fragments, including chains of edges, each with a
-//!   multicast-style sink to the target fragment instance
+//! - `Stream` producer fragments, each with a `DATA_STREAM_SINK` that fans out
+//!   to every instance of the consumer fragment
 //! - The root fragment via the dispatcher (result sink)
 //!
-//! All fragments are submitted through a `FragmentDispatcher`.  `InProcessDispatcher`
-//! runs them in-process against the local exchange server; future dispatchers can
-//! route to remote BEs.
+//! All instance placement (instance counts, finst ids, backend index,
+//! scan-range splits, destinations, prober params, per-exchange sender counts)
+//! is owned by [`FragmentScheduler`]. The coordinator translates each placement
+//! into a `TExecPlanFragmentParams` and submits it through the
+//! `FragmentDispatcher`. `InProcessDispatcher` runs everything in-process;
+//! `RemoteDispatcher` routes per-instance to remote BEs.
+//!
+//! At a single backend (all-in-one / 1FE+1BE), the scheduler produces one
+//! instance per fragment and this path reproduces the prior single-instance
+//! wiring exactly.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::data_sinks;
@@ -20,25 +26,25 @@ use crate::partitions;
 use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
+use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::FragmentId;
-use crate::sql::codegen::RuntimeFilterPlanResult;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
+    FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
 };
 use crate::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
-/// Coordinates multi-fragment CTE query execution.
+/// Coordinates multi-fragment query execution across one or more backends.
 ///
-/// Assigns fragment instance IDs, wires up multicast sinks for CTE produce
-/// fragments, and submits all fragments through the `FragmentDispatcher`.
-/// Results are collected by polling the dispatcher for root fragment chunks.
+/// Drives all fragment wiring from [`FragmentScheduler`] placements and submits
+/// every instance through the `FragmentDispatcher`. Results are collected by
+/// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
     dispatcher: Arc<dyn FragmentDispatcher>,
+    scheduler: Arc<FragmentScheduler>,
     query_options: Option<crate::internal_service::TQueryOptions>,
 }
 
@@ -46,11 +52,13 @@ impl ExecutionCoordinator {
     pub(crate) fn new(
         build_result: MultiFragmentBuildResult,
         dispatcher: Arc<dyn FragmentDispatcher>,
+        scheduler: Arc<FragmentScheduler>,
         query_options: Option<crate::internal_service::TQueryOptions>,
     ) -> Self {
         Self {
             build_result,
             dispatcher,
+            scheduler,
             query_options,
         }
     }
@@ -64,406 +72,286 @@ impl ExecutionCoordinator {
         } = self.build_result;
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
+        let scheduler = self.scheduler;
 
         // ---------------------------------------------------------------
-        // 1. Assign fragment instance IDs
+        // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
         use std::sync::atomic::{AtomicI64, Ordering};
         static NEXT_QUERY_BASE: AtomicI64 = AtomicI64::new(100);
         let query_base = NEXT_QUERY_BASE.fetch_add(1000, Ordering::Relaxed);
-
-        let query_id_hi: i64 = query_base;
-        let query_id_lo: i64 = 1;
-
-        let instance_map: BTreeMap<FragmentId, (i64, i64)> = fragment_results
-            .iter()
-            .map(|fr| (fr.fragment_id, (query_base, fr.fragment_id as i64 + 1)))
-            .collect();
-
-        let root_instance_id = *instance_map
-            .get(&root_fragment_id)
-            .ok_or_else(|| "root fragment not found in instance map".to_string())?;
-
-        let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32)>> = BTreeMap::new();
-        let mut per_fragment_exch_num_senders: BTreeMap<FragmentId, BTreeMap<i32, i32>> =
-            BTreeMap::new();
-
-        for e in &edges {
-            *per_fragment_exch_num_senders
-                .entry(e.target_fragment_id)
-                .or_default()
-                .entry(e.target_exchange_node_id)
-                .or_insert(0) += 1;
-
-            if let FragmentEdgeKind::CteMulticast { cte_id } = &e.edge_kind {
-                cte_consumers
-                    .entry(*cte_id)
-                    .or_default()
-                    .push((e.target_fragment_id, e.target_exchange_node_id));
-            }
-        }
-
-        for fr in &fragment_results {
-            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
-                let consumers = cte_consumers.entry(*cte_id).or_default();
-                let entry = (fr.fragment_id, *exchange_node_id);
-                if !consumers.contains(&entry) {
-                    consumers.push(entry);
-                    *per_fragment_exch_num_senders
-                        .entry(fr.fragment_id)
-                        .or_default()
-                        .entry(*exchange_node_id)
-                        .or_insert(0) += 1;
-                }
-            }
-        }
+        let query_id = types::TUniqueId::new(query_base, 1);
 
         debug!(
-            "coordinator topology: fragments={} edges={} root={}",
+            "coordinator topology: fragments={} edges={} root={} backends={}",
             fragment_results.len(),
             edges.len(),
-            root_fragment_id
+            root_fragment_id,
+            scheduler.backends().len()
         );
         for e in &edges {
             debug!(
-                "coordinator edge: frag {} -> frag {} (exch_node={}, kind={:?})",
+                "coordinator edge: frag {} -> frag {} (exch_node={}, kind={:?}, part={:?})",
                 e.source_fragment_id,
                 e.target_fragment_id,
                 e.target_exchange_node_id,
                 match &e.edge_kind {
                     FragmentEdgeKind::Stream => "Stream",
                     FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
+                },
+                e.output_partition.type_,
+            );
+        }
+
+        let mut plan = scheduler.assign(&fragment_results, &edges, query_id.clone())?;
+        scheduler.fill_destinations(&mut plan, &edges);
+        if let Some(rf) = rf_plan.as_ref() {
+            scheduler.fill_runtime_filter_params(&mut plan, rf);
+        }
+        scheduler.fill_per_exch_num_senders(&mut plan, &edges);
+
+        // ---------------------------------------------------------------
+        // 2. Build per-edge / CTE consumer indices used for sink wiring.
+        // ---------------------------------------------------------------
+        // Stream producer fragment id -> its single outgoing edge index.
+        let mut stream_edge_by_source: BTreeMap<FragmentId, &FragmentEdge> = BTreeMap::new();
+        // CTE id -> list of (consumer_fragment_id, exchange_node_id, partition).
+        let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32, partitions::TDataPartition)>> =
+            BTreeMap::new();
+
+        for e in &edges {
+            match &e.edge_kind {
+                FragmentEdgeKind::Stream => {
+                    if stream_edge_by_source
+                        .insert(e.source_fragment_id, e)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "fragment {} has multiple outgoing Stream edges",
+                            e.source_fragment_id
+                        ));
+                    }
                 }
-            );
-        }
-
-        let stream_source_ids: BTreeSet<FragmentId> = edges
-            .iter()
-            .filter_map(|e| {
-                if matches!(e.edge_kind, FragmentEdgeKind::Stream) {
-                    Some(e.source_fragment_id)
-                } else {
-                    None
+                FragmentEdgeKind::CteMulticast { cte_id } => {
+                    cte_consumers.entry(*cte_id).or_default().push((
+                        e.target_fragment_id,
+                        e.target_exchange_node_id,
+                        e.output_partition.clone(),
+                    ));
                 }
-            })
-            .collect();
-
-        // ---------------------------------------------------------------
-        // 2. Wire multicast sinks for CTE / Stream fragments
-        // ---------------------------------------------------------------
-        let brpc_addr = dispatcher.exchange_addr();
-
-        let rf_params = rf_plan.map(|mut plan| {
-            setup_runtime_filter_params(&mut plan, &mut fragment_results, &instance_map, &brpc_addr)
-        });
-
-        let mut root_fragment: Option<FragmentBuildResult> = None;
-        let mut cte_fragments: Vec<FragmentBuildResult> = Vec::new();
-        let mut stream_producer_fragments: Vec<FragmentBuildResult> = Vec::new();
-        for fr in fragment_results {
-            if fr.fragment_id == root_fragment_id {
-                root_fragment = Some(fr);
-            } else if fr.cte_id.is_some() {
-                cte_fragments.push(fr);
-            } else if stream_source_ids.contains(&fr.fragment_id) {
-                stream_producer_fragments.push(fr);
-            } else {
-                return Err(
-                    "multi-hop stream exchange is not supported in standalone coordinator"
-                        .to_string(),
-                );
             }
         }
-        let root_fragment =
-            root_fragment.ok_or_else(|| "root fragment not found in build results".to_string())?;
-
-        let mut non_root_fragments: Vec<(
-            FragmentBuildResult,
-            planner::TPlanFragment,
-            crate::internal_service::TPlanFragmentExecParams,
-        )> = Vec::new();
-
-        for stream_fr in stream_producer_fragments {
-            let outgoing: Vec<&FragmentEdge> = edges
-                .iter()
-                .filter(|e| {
-                    matches!(e.edge_kind, FragmentEdgeKind::Stream)
-                        && e.source_fragment_id == stream_fr.fragment_id
-                })
-                .collect();
-            if outgoing.len() != 1 {
-                return Err(format!(
-                    "expected exactly one outgoing Stream edge from fragment {}, got {}",
-                    stream_fr.fragment_id,
-                    outgoing.len()
-                ));
+        // CTE consumers may also be expressed via `cte_exchange_nodes` on the
+        // consumer fragment when no explicit edge carries them.
+        for fr in &fragment_results {
+            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
+                let consumers = cte_consumers.entry(*cte_id).or_default();
+                if !consumers
+                    .iter()
+                    .any(|(fid, nid, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
+                {
+                    consumers.push((fr.fragment_id, *exchange_node_id, unpartitioned_partition()));
+                }
             }
-            let edge = outgoing[0];
-            let (consumer_fragment_id, exchange_node_id) =
-                (edge.target_fragment_id, edge.target_exchange_node_id);
-
-            let unpartitioned = partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            );
-
-            let stream_sink = data_sinks::TDataStreamSink::new(
-                exchange_node_id,
-                unpartitioned.clone(),
-                None::<bool>,
-                None::<bool>,
-                None::<i32>,
-                None::<Vec<i32>>,
-                None::<i64>,
-            );
-
-            let consumer_instance_id = *instance_map
-                .get(&consumer_fragment_id)
-                .ok_or_else(|| {
-                    format!(
-                        "consumer fragment instance ID not found for fragment_id={consumer_fragment_id}"
-                    )
-                })?;
-
-            let dest = data_sinks::TPlanFragmentDestination::new(
-                types::TUniqueId::new(consumer_instance_id.0, consumer_instance_id.1),
-                None::<types::TNetworkAddress>,
-                Some(brpc_addr.clone()),
-                None::<i32>,
-            );
-
-            let output_sink = data_sinks::TDataSink::new(
-                data_sinks::TDataSinkType::DATA_STREAM_SINK,
-                Some(stream_sink),
-                None::<data_sinks::TResultSink>,
-                None::<data_sinks::TMysqlTableSink>,
-                None::<data_sinks::TExportSink>,
-                None::<data_sinks::TOlapTableSink>,
-                None::<data_sinks::TMemoryScratchSink>,
-                None::<data_sinks::TMultiCastDataStreamSink>,
-                None::<data_sinks::TSchemaTableSink>,
-                None::<data_sinks::TIcebergTableSink>,
-                None::<data_sinks::THiveTableSink>,
-                None::<data_sinks::TTableFunctionTableSink>,
-                None::<data_sinks::TDictionaryCacheSink>,
-                None::<Vec<Box<data_sinks::TDataSink>>>,
-                None::<i64>,
-                None::<data_sinks::TSplitDataStreamSink>,
-            );
-
-            let producer_instance_id = *instance_map
-                .get(&stream_fr.fragment_id)
-                .ok_or_else(|| "Gather stream fragment instance ID not found".to_string())?;
-
-            let thrift_fragment = planner::TPlanFragment::new(
-                Some(stream_fr.plan.clone()),
-                None::<Vec<crate::exprs::TExpr>>,
-                Some(output_sink),
-                unpartitioned,
-                None::<i64>,
-                None::<i64>,
-                stream_fr.query_global_dicts.clone(),
-                None::<Vec<crate::data::TGlobalDict>>,
-                None::<planner::TCacheParam>,
-                stream_fr.query_global_dict_exprs.clone(),
-                None::<planner::TGroupExecutionParam>,
-            );
-
-            let mut stream_exec_params = stream_fr.exec_params.clone();
-            stream_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
-            stream_exec_params.fragment_instance_id =
-                types::TUniqueId::new(producer_instance_id.0, producer_instance_id.1);
-            stream_exec_params.per_exch_num_senders = per_fragment_exch_num_senders
-                .get(&stream_fr.fragment_id)
-                .cloned()
-                .unwrap_or_default();
-            stream_exec_params.destinations = Some(vec![dest]);
-            if let Some(ref rf) = rf_params {
-                stream_exec_params.runtime_filter_params = Some(rf.clone());
-            }
-
-            non_root_fragments.push((stream_fr, thrift_fragment, stream_exec_params));
-        }
-
-        for cte_fr in cte_fragments {
-            let cte_id = cte_fr
-                .cte_id
-                .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
-
-            let consumer_exchange_nodes = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-
-            if consumer_exchange_nodes.is_empty() {
-                return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
-            }
-
-            let unpartitioned = partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            );
-
-            let mut sinks = Vec::new();
-            let mut destinations = Vec::new();
-            for (consumer_fragment_id, exchange_node_id) in &consumer_exchange_nodes {
-                let stream_sink = data_sinks::TDataStreamSink::new(
-                    *exchange_node_id,
-                    unpartitioned.clone(),
-                    None::<bool>,
-                    None::<bool>,
-                    None::<i32>,
-                    None::<Vec<i32>>,
-                    None::<i64>,
-                );
-                sinks.push(stream_sink);
-
-                let consumer_instance_id = *instance_map
-                    .get(consumer_fragment_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "consumer fragment instance ID not found for fragment_id={consumer_fragment_id}"
-                        )
-                    })?;
-
-                let dest = data_sinks::TPlanFragmentDestination::new(
-                    types::TUniqueId::new(consumer_instance_id.0, consumer_instance_id.1),
-                    None::<types::TNetworkAddress>,
-                    Some(brpc_addr.clone()),
-                    None::<i32>,
-                );
-                destinations.push(vec![dest]);
-            }
-
-            let multi_cast_sink = data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
-
-            let output_sink = data_sinks::TDataSink::new(
-                data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
-                None::<data_sinks::TDataStreamSink>,
-                None::<data_sinks::TResultSink>,
-                None::<data_sinks::TMysqlTableSink>,
-                None::<data_sinks::TExportSink>,
-                None::<data_sinks::TOlapTableSink>,
-                None::<data_sinks::TMemoryScratchSink>,
-                Some(multi_cast_sink),
-                None::<data_sinks::TSchemaTableSink>,
-                None::<data_sinks::TIcebergTableSink>,
-                None::<data_sinks::THiveTableSink>,
-                None::<data_sinks::TTableFunctionTableSink>,
-                None::<data_sinks::TDictionaryCacheSink>,
-                None::<Vec<Box<data_sinks::TDataSink>>>,
-                None::<i64>,
-                None::<data_sinks::TSplitDataStreamSink>,
-            );
-
-            let cte_instance_id = *instance_map
-                .get(&cte_fr.fragment_id)
-                .ok_or_else(|| "CTE fragment instance ID not found".to_string())?;
-
-            let thrift_fragment = planner::TPlanFragment::new(
-                Some(cte_fr.plan.clone()),
-                None::<Vec<crate::exprs::TExpr>>,
-                Some(output_sink),
-                unpartitioned,
-                None::<i64>,
-                None::<i64>,
-                cte_fr.query_global_dicts.clone(),
-                None::<Vec<crate::data::TGlobalDict>>,
-                None::<planner::TCacheParam>,
-                cte_fr.query_global_dict_exprs.clone(),
-                None::<planner::TGroupExecutionParam>,
-            );
-
-            let mut cte_exec_params = cte_fr.exec_params.clone();
-            cte_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
-            cte_exec_params.fragment_instance_id =
-                types::TUniqueId::new(cte_instance_id.0, cte_instance_id.1);
-            cte_exec_params.per_exch_num_senders = per_fragment_exch_num_senders
-                .get(&cte_fr.fragment_id)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(ref rf) = rf_params {
-                cte_exec_params.runtime_filter_params = Some(rf.clone());
-            }
-
-            non_root_fragments.push((cte_fr, thrift_fragment, cte_exec_params));
         }
 
         // ---------------------------------------------------------------
-        // 3. Compute DOP and build root fragment params
+        // 3. Inject the designated runtime-filter merge node into descriptors.
+        // ---------------------------------------------------------------
+        // The merge node is the backend that hosts the (single) root instance.
+        // At one backend this equals the local exchange address, matching the
+        // prior `dispatcher.exchange_addr()` behavior exactly.
+        let merge_addr = backend_to_network_addr(scheduler.backends(), plan.root_backend_idx)?;
+        if let Some(rf) = rf_plan.as_ref() {
+            inject_runtime_filter_merge_nodes(rf, &mut fragment_results, &merge_addr);
+        }
+
+        // ---------------------------------------------------------------
+        // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
 
-        let per_exch_num_senders = per_fragment_exch_num_senders
-            .get(&root_fragment.fragment_id)
-            .cloned()
-            .unwrap_or_default();
+        // Snapshot the per-consumer-fragment instance destinations for CTE
+        // multicast sub-sinks (each consumer fans out to all of its instances).
+        let consumer_dests: BTreeMap<FragmentId, Vec<data_sinks::TPlanFragmentDestination>> = plan
+            .by_fragment
+            .iter()
+            .map(|(fid, insts)| {
+                let dests = insts
+                    .iter()
+                    .map(|inst| {
+                        let addr = scheduler.backends()[inst.backend_idx];
+                        data_sinks::TPlanFragmentDestination::new(
+                            inst.finst_id.clone(),
+                            None::<types::TNetworkAddress>,
+                            Some(types::TNetworkAddress::new(
+                                addr.ip().to_string(),
+                                addr.port() as i32,
+                            )),
+                            None::<i32>,
+                        )
+                    })
+                    .collect();
+                (*fid, dests)
+            })
+            .collect();
 
-        let unpartitioned_root = partitions::TDataPartition::new(
-            partitions::TPartitionType::UNPARTITIONED,
-            None::<Vec<crate::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
-        let root_thrift_fragment = planner::TPlanFragment::new(
-            Some(root_fragment.plan.clone()),
-            None::<Vec<crate::exprs::TExpr>>,
-            Some(root_fragment.output_sink.clone()),
-            unpartitioned_root,
-            None::<i64>,
-            None::<i64>,
-            root_fragment.query_global_dicts.clone(),
-            None::<Vec<crate::data::TGlobalDict>>,
-            None::<planner::TCacheParam>,
-            root_fragment.query_global_dict_exprs.clone(),
-            None::<planner::TGroupExecutionParam>,
-        );
+        let fr_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentBuildResult> =
+            fragment_results
+                .iter()
+                .map(|fr| (fr.fragment_id, fr))
+                .collect();
 
-        let mut root_exec_params = root_fragment.exec_params.clone();
-        root_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
-        root_exec_params.fragment_instance_id =
-            types::TUniqueId::new(root_instance_id.0, root_instance_id.1);
-        root_exec_params.per_exch_num_senders = per_exch_num_senders;
-        if let Some(ref rf) = rf_params {
-            root_exec_params.runtime_filter_params = Some(rf.clone());
+        let mut tracker = InFlightTracker::default();
+        // Collect all (backend_idx, params) so submission order is deterministic
+        // (non-root fragments first, root last) — matching prior behavior so the
+        // half-submit-failure cancel semantics are preserved.
+        let mut submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)> =
+            Vec::new();
+        let mut root_submission: Option<(usize, crate::internal_service::TExecPlanFragmentParams)> =
+            None;
+
+        for (&fragment_id, placements) in &plan.by_fragment {
+            let fr = *fr_by_id
+                .get(&fragment_id)
+                .ok_or_else(|| format!("fragment {fragment_id} missing from build results"))?;
+            let is_root = fragment_id == root_fragment_id;
+            let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
+
+            // Classify the fragment once.
+            if !is_root && fr.cte_id.is_none() && stream_edge.is_none() {
+                return Err(format!(
+                    "fragment {fragment_id} is neither root, CTE producer, nor stream producer; \
+                     multi-hop stream exchange is not supported in standalone coordinator"
+                ));
+            }
+
+            for placement in placements {
+                // Build the output sink for this fragment class.
+                let (output_sink, fragment_partition, exec_destinations) = if is_root {
+                    (fr.output_sink.clone(), unpartitioned_partition(), None)
+                } else if let Some(edge) = stream_edge {
+                    let stream_sink = data_sinks::TDataStreamSink::new(
+                        edge.target_exchange_node_id,
+                        edge.output_partition.clone(),
+                        None::<bool>,
+                        None::<bool>,
+                        None::<i32>,
+                        None::<Vec<i32>>,
+                        None::<i64>,
+                    );
+                    let output_sink = wrap_data_stream_sink(stream_sink);
+                    (
+                        output_sink,
+                        edge.output_partition.clone(),
+                        Some(placement.destinations.clone()),
+                    )
+                } else {
+                    // CTE producer.
+                    let cte_id = fr
+                        .cte_id
+                        .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
+                    let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                    if consumers.is_empty() {
+                        return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
+                    }
+                    let mut sinks = Vec::with_capacity(consumers.len());
+                    let mut destinations = Vec::with_capacity(consumers.len());
+                    for (consumer_fragment_id, exchange_node_id, partition) in &consumers {
+                        let stream_sink = data_sinks::TDataStreamSink::new(
+                            *exchange_node_id,
+                            partition.clone(),
+                            None::<bool>,
+                            None::<bool>,
+                            None::<i32>,
+                            None::<Vec<i32>>,
+                            None::<i64>,
+                        );
+                        sinks.push(stream_sink);
+                        let dests = consumer_dests
+                            .get(consumer_fragment_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "CTE consumer fragment {consumer_fragment_id} has no placements"
+                                )
+                            })?;
+                        destinations.push(dests);
+                    }
+                    let multi_cast_sink =
+                        data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
+                    let output_sink = wrap_multi_cast_sink(multi_cast_sink);
+                    // Multicast carries its own destinations on the sub-sinks.
+                    (output_sink, unpartitioned_partition(), None)
+                };
+
+                let thrift_fragment = planner::TPlanFragment::new(
+                    Some(fr.plan.clone()),
+                    None::<Vec<crate::exprs::TExpr>>,
+                    Some(output_sink),
+                    fragment_partition,
+                    None::<i64>,
+                    None::<i64>,
+                    fr.query_global_dicts.clone(),
+                    None::<Vec<crate::data::TGlobalDict>>,
+                    None::<planner::TCacheParam>,
+                    fr.query_global_dict_exprs.clone(),
+                    None::<planner::TGroupExecutionParam>,
+                );
+
+                let mut exec_params = fr.exec_params.clone();
+                exec_params.query_id = query_id.clone();
+                exec_params.fragment_instance_id = placement.finst_id.clone();
+                exec_params.per_node_scan_ranges = placement.scan_ranges.clone();
+                exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
+                exec_params.destinations = exec_destinations;
+                if let Some(rf) = rf_plan.as_ref() {
+                    exec_params.runtime_filter_params = Some(build_instance_runtime_filter_params(
+                        rf,
+                        &placement.runtime_filter_prober_params,
+                    ));
+                }
+
+                let params = build_exec_plan_fragment_params(
+                    fr,
+                    thrift_fragment,
+                    exec_params,
+                    query_options.clone(),
+                    pipeline_dop,
+                    Some(placement.instance_index as i32),
+                );
+
+                if is_root {
+                    root_submission = Some((placement.backend_idx, params));
+                } else {
+                    submissions.push((placement.backend_idx, params));
+                }
+            }
         }
 
-        // ---------------------------------------------------------------
-        // 4. Submit all fragments and collect root results
-        // ---------------------------------------------------------------
-        let mut all_params: Vec<crate::internal_service::TExecPlanFragmentParams> =
-            Vec::with_capacity(non_root_fragments.len() + 1);
+        let root_submission =
+            root_submission.ok_or_else(|| "root fragment produced no placement".to_string())?;
+        // Root last: keep prior submission ordering (producers before root).
+        submissions.push(root_submission);
 
-        for (fr, thrift_fragment, exec_params) in non_root_fragments {
-            let p = build_exec_plan_fragment_params(
-                &fr,
-                thrift_fragment,
-                exec_params,
-                query_options.clone(),
-                pipeline_dop,
-            );
-            all_params.push(p);
-        }
-
-        let root_params = build_exec_plan_fragment_params(
-            &root_fragment,
-            root_thrift_fragment,
-            root_exec_params,
-            query_options.as_ref().cloned(),
-            pipeline_dop,
-        );
-        all_params.push(root_params);
-
-        let root_finst_id = types::TUniqueId::new(root_instance_id.0, root_instance_id.1);
         let timeout_ms = query_options
             .as_ref()
             .and_then(|q| q.query_timeout)
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
 
-        let chunks = submit_and_fetch_loop(&dispatcher, all_params, root_finst_id, timeout_ms)?;
+        let chunks = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            submissions,
+            plan.root_backend_idx,
+            plan.root_finst_id.clone(),
+            timeout_ms,
+        )?;
 
+        let root_fragment = fr_by_id
+            .get(&root_fragment_id)
+            .ok_or_else(|| "root fragment not found in build results".to_string())?;
         Ok(QueryResult {
             columns: root_fragment
                 .output_columns
@@ -480,43 +368,114 @@ impl ExecutionCoordinator {
     }
 }
 
-/// Build TRuntimeFilterParams from the RF planning result.
-fn setup_runtime_filter_params(
-    rf_plan: &mut RuntimeFilterPlanResult,
-    fragment_results: &mut [FragmentBuildResult],
-    instance_map: &BTreeMap<FragmentId, (i64, i64)>,
-    exchange_addr: &types::TNetworkAddress,
+/// An `UNPARTITIONED` data partition (the common default).
+fn unpartitioned_partition() -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partitions::TPartitionType::UNPARTITIONED,
+        None::<Vec<crate::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
+
+/// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
+fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks::TDataSink {
+    data_sinks::TDataSink::new(
+        data_sinks::TDataSinkType::DATA_STREAM_SINK,
+        Some(stream_sink),
+        None::<data_sinks::TResultSink>,
+        None::<data_sinks::TMysqlTableSink>,
+        None::<data_sinks::TExportSink>,
+        None::<data_sinks::TOlapTableSink>,
+        None::<data_sinks::TMemoryScratchSink>,
+        None::<data_sinks::TMultiCastDataStreamSink>,
+        None::<data_sinks::TSchemaTableSink>,
+        None::<data_sinks::TIcebergTableSink>,
+        None::<data_sinks::THiveTableSink>,
+        None::<data_sinks::TTableFunctionTableSink>,
+        None::<data_sinks::TDictionaryCacheSink>,
+        None::<Vec<Box<data_sinks::TDataSink>>>,
+        None::<i64>,
+        None::<data_sinks::TSplitDataStreamSink>,
+    )
+}
+
+/// Wrap a `TMultiCastDataStreamSink` in a MULTI_CAST_DATA_STREAM_SINK `TDataSink`.
+fn wrap_multi_cast_sink(
+    multi_cast_sink: data_sinks::TMultiCastDataStreamSink,
+) -> data_sinks::TDataSink {
+    data_sinks::TDataSink::new(
+        data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+        None::<data_sinks::TDataStreamSink>,
+        None::<data_sinks::TResultSink>,
+        None::<data_sinks::TMysqlTableSink>,
+        None::<data_sinks::TExportSink>,
+        None::<data_sinks::TOlapTableSink>,
+        None::<data_sinks::TMemoryScratchSink>,
+        Some(multi_cast_sink),
+        None::<data_sinks::TSchemaTableSink>,
+        None::<data_sinks::TIcebergTableSink>,
+        None::<data_sinks::THiveTableSink>,
+        None::<data_sinks::TTableFunctionTableSink>,
+        None::<data_sinks::TDictionaryCacheSink>,
+        None::<Vec<Box<data_sinks::TDataSink>>>,
+        None::<i64>,
+        None::<data_sinks::TSplitDataStreamSink>,
+    )
+}
+
+/// Convert `backends[idx]` into a `TNetworkAddress`.
+fn backend_to_network_addr(
+    backends: &[std::net::SocketAddr],
+    idx: usize,
+) -> Result<types::TNetworkAddress, String> {
+    let addr = backends.get(idx).ok_or_else(|| {
+        format!(
+            "backend index {idx} out of range ({} backends)",
+            backends.len()
+        )
+    })?;
+    Ok(types::TNetworkAddress::new(
+        addr.ip().to_string(),
+        addr.port() as i32,
+    ))
+}
+
+/// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided
+/// prober params plus the global builder-number map.
+fn build_instance_runtime_filter_params(
+    rf_plan: &RuntimeFilterPlanResult,
+    id_to_prober_params: &BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>>,
 ) -> runtime_filter::TRuntimeFilterParams {
-    let mut id_to_prober_params: BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>> =
-        BTreeMap::new();
     let mut builder_number: BTreeMap<i32, i32> = BTreeMap::new();
-
-    for (frag_id, probes) in &rf_plan.probe_side_filters {
-        if let Some(&(hi, lo)) = instance_map.get(frag_id) {
-            for (filter_id, _scan_node_id) in probes {
-                let prober = runtime_filter::TRuntimeFilterProberParams::new(
-                    types::TUniqueId::new(hi, lo),
-                    exchange_addr.clone(),
-                );
-                id_to_prober_params
-                    .entry(*filter_id)
-                    .or_default()
-                    .push(prober);
-            }
-        }
-    }
-
     for filter_ids in rf_plan.build_side_filters.values() {
         for fid in filter_ids {
             builder_number.insert(*fid, 1);
         }
     }
+    runtime_filter::TRuntimeFilterParams::new(
+        id_to_prober_params.clone(),
+        builder_number,
+        16_i64 * 1024 * 1024,
+        None::<std::collections::BTreeSet<i32>>,
+    )
+}
 
-    for desc in rf_plan.all_filters.values_mut() {
-        if desc.has_remote_targets == Some(true) {
-            desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
-        }
-    }
+/// Inject the designated runtime-filter merge node into every descriptor that
+/// has remote targets.
+///
+/// This mutates the per-fragment `hash_join_node.build_runtime_filters`
+/// descriptors in place (these are what actually ship to the BE). The merge
+/// node is the backend hosting the root instance; at one backend it equals the
+/// local exchange address (prior behavior).
+fn inject_runtime_filter_merge_nodes(
+    rf_plan: &RuntimeFilterPlanResult,
+    fragment_results: &mut [crate::sql::codegen::FragmentBuildResult],
+    merge_addr: &types::TNetworkAddress,
+) {
+    // `rf_plan` is borrowed immutably here; only the on-the-wire descriptors in
+    // each fragment's plan need the merge node, so we mutate those.
+    let _ = rf_plan;
     for fr in fragment_results.iter_mut() {
         for node in fr.plan.nodes.iter_mut() {
             if let Some(ref mut hj) = node.hash_join_node
@@ -524,50 +483,72 @@ fn setup_runtime_filter_params(
             {
                 for desc in rf_descs.iter_mut() {
                     if desc.has_remote_targets == Some(true) {
-                        desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
+                        desc.runtime_filter_merge_nodes = Some(vec![merge_addr.clone()]);
                     }
                 }
             }
         }
     }
+}
 
-    runtime_filter::TRuntimeFilterParams::new(
-        id_to_prober_params,
-        builder_number,
-        16_i64 * 1024 * 1024,
-        None::<std::collections::BTreeSet<i32>>,
-    )
+// ---------------------------------------------------------------------------
+// In-flight instance tracking (per-backend cancellation)
+// ---------------------------------------------------------------------------
+
+/// Tracks submitted fragment instances grouped by backend so that, on any
+/// failure, cancellation can fan out to every backend that accepted work.
+#[derive(Default)]
+pub(crate) struct InFlightTracker {
+    pub(crate) by_backend: BTreeMap<usize, Vec<types::TUniqueId>>,
+}
+
+impl InFlightTracker {
+    /// Record that `finst_id` was submitted to `backend_idx`.
+    pub(crate) fn record_submitted(&mut self, backend_idx: usize, finst_id: types::TUniqueId) {
+        self.by_backend
+            .entry(backend_idx)
+            .or_default()
+            .push(finst_id);
+    }
+
+    /// Cancel every recorded instance on its backend. Idempotent.
+    pub(crate) fn cancel_all(&self, dispatcher: &dyn FragmentDispatcher) {
+        for (idx, ids) in &self.by_backend {
+            dispatcher.cancel_fragments(*idx, ids);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Submit-and-fetch orchestration (testable helper)
 // ---------------------------------------------------------------------------
 
-/// Submit all fragment params through the dispatcher in order, track accepted
-/// fragment instance IDs, then poll the root fragment until EOF.
+/// Submit each `(backend_idx, params)` through the dispatcher in order, tracking
+/// accepted instances per backend, then poll the root fragment until EOF.
 ///
-/// On any submit failure or fetch error, all already-submitted fragments are
-/// cancelled before the error is returned.
+/// On any submit failure or fetch error, all already-submitted instances are
+/// cancelled (fanned out per backend) before the error is returned.
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
-    all_params: Vec<crate::internal_service::TExecPlanFragmentParams>,
+    tracker: &mut InFlightTracker,
+    submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)>,
+    root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
     timeout_ms: i64,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
-    let mut submitted: Vec<types::TUniqueId> = Vec::with_capacity(all_params.len());
 
-    for p in all_params {
+    for (backend_idx, p) in submissions {
         let finst_id = p
             .params
             .as_ref()
             .map(|ep| types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
             .unwrap_or_else(|| types::TUniqueId::new(0, 0));
-        if let Err(e) = dispatcher.submit_fragment(0, p) {
-            dispatcher.cancel_fragments(0, &submitted);
+        if let Err(e) = dispatcher.submit_fragment(backend_idx, p) {
+            tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
-        submitted.push(finst_id);
+        tracker.record_submitted(backend_idx, finst_id);
     }
 
     let mut chunks = Vec::new();
@@ -575,12 +556,12 @@ pub(crate) fn submit_and_fetch_loop(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if crate::runtime::query_cancel::client_disconnected() {
-            dispatcher.cancel_fragments(0, &submitted);
+            tracker.cancel_all(dispatcher.as_ref());
             return Err("client disconnected".to_string());
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            dispatcher.cancel_fragments(0, &submitted);
+            tracker.cancel_all(dispatcher.as_ref());
             return Err(format!("query timed out after {timeout_ms} ms"));
         }
         let remaining_ms = deadline
@@ -588,16 +569,16 @@ pub(crate) fn submit_and_fetch_loop(
             .as_millis()
             .min(i64::MAX as u128) as i64;
         let fetch_wait_ms = remaining_ms.clamp(1, REMOTE_FETCH_POLL_INTERVAL_MS);
-        match dispatcher.fetch_result(0, root_finst_id.clone(), fetch_wait_ms) {
+        match dispatcher.fetch_result(root_backend_idx, root_finst_id.clone(), fetch_wait_ms) {
             Err(e) => {
-                dispatcher.cancel_fragments(0, &submitted);
+                tracker.cancel_all(dispatcher.as_ref());
                 return Err(e);
             }
             Ok(FetchOutcome::Ready(chunk)) => chunks.push(chunk),
             Ok(FetchOutcome::NotReady) => continue,
             Ok(FetchOutcome::Eof) => break,
             Ok(FetchOutcome::Err(e)) => {
-                dispatcher.cancel_fragments(0, &submitted);
+                tracker.cancel_all(dispatcher.as_ref());
                 return Err(e);
             }
         }
@@ -642,10 +623,6 @@ mod tests {
     }
 
     impl FragmentDispatcher for MockDispatcher {
-        fn exchange_addr(&self) -> types::TNetworkAddress {
-            types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
-        }
-
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -779,10 +756,6 @@ mod tests {
     }
 
     impl FragmentDispatcher for ControllableDispatcher {
-        fn exchange_addr(&self) -> types::TNetworkAddress {
-            types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
-        }
-
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -827,10 +800,6 @@ mod tests {
     }
 
     impl FragmentDispatcher for RecordingWaitDispatcher {
-        fn exchange_addr(&self) -> types::TNetworkAddress {
-            types::TNetworkAddress::new("127.0.0.1".to_string(), 9999)
-        }
-
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -968,15 +937,20 @@ mod tests {
     // Original regression tests
     // -----------------------------------------------------------------------
 
+    /// Wrap a list of params as single-backend submissions (backend_idx=0).
+    fn single_backend(
+        params: Vec<crate::internal_service::TExecPlanFragmentParams>,
+    ) -> Vec<(usize, crate::internal_service::TExecPlanFragmentParams)> {
+        params.into_iter().map(|p| (0usize, p)).collect()
+    }
+
     /// Verify that `ExecutionCoordinator::new` accepts `Arc<dyn FragmentDispatcher>`
     /// (regression guard against re-introduction of exchange_host/port parameters).
     #[test]
     fn constructor_accepts_dispatcher() {
         let dispatcher: Arc<dyn FragmentDispatcher> = MockDispatcher::new();
-        // Just verify this compiles and the dispatcher is usable.
-        let addr = dispatcher.exchange_addr();
-        assert_eq!(addr.hostname, "127.0.0.1");
-        assert_eq!(addr.port, 9999);
+        // Just verify the trait object is usable for the submit/cancel surface.
+        assert_eq!(dispatcher.backend_count(), 1);
     }
 
     /// Verify that `MockDispatcher::submitted_count` starts at zero.
@@ -984,6 +958,98 @@ mod tests {
     fn mock_dispatcher_starts_empty() {
         let d = MockDispatcher::new();
         assert_eq!(d.submitted_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // InFlightTracker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn in_flight_tracker_groups_by_backend() {
+        let mut tracker = InFlightTracker::default();
+        tracker.record_submitted(0, types::TUniqueId::new(1, 10));
+        tracker.record_submitted(1, types::TUniqueId::new(1, 20));
+        tracker.record_submitted(0, types::TUniqueId::new(1, 11));
+
+        assert_eq!(tracker.by_backend.len(), 2, "two distinct backends");
+        assert_eq!(
+            tracker.by_backend[&0].len(),
+            2,
+            "backend 0 got two instances"
+        );
+        assert_eq!(
+            tracker.by_backend[&1].len(),
+            1,
+            "backend 1 got one instance"
+        );
+    }
+
+    /// Mock dispatcher that records the (backend_idx, finst_ids) of every
+    /// cancel_fragments call so cancel fan-out can be asserted.
+    struct RecordingCancelDispatcher {
+        cancels: Mutex<Vec<(usize, Vec<types::TUniqueId>)>>,
+    }
+
+    impl RecordingCancelDispatcher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cancels: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl FragmentDispatcher for RecordingCancelDispatcher {
+        fn submit_fragment(
+            &self,
+            _backend_idx: usize,
+            _params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            _finst_id: types::TUniqueId,
+            _max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            Ok(FetchOutcome::Eof)
+        }
+
+        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+            self.cancels
+                .lock()
+                .unwrap()
+                .push((backend_idx, finst_ids.to_vec()));
+        }
+
+        fn backend_count(&self) -> usize {
+            2
+        }
+    }
+
+    #[test]
+    fn in_flight_tracker_cancel_all_fans_out_per_backend() {
+        let dispatcher = RecordingCancelDispatcher::new();
+        let mut tracker = InFlightTracker::default();
+        tracker.record_submitted(0, types::TUniqueId::new(7, 1));
+        tracker.record_submitted(1, types::TUniqueId::new(7, 2));
+        tracker.record_submitted(1, types::TUniqueId::new(7, 3));
+
+        tracker.cancel_all(dispatcher.as_ref());
+
+        let cancels = dispatcher.cancels.lock().unwrap();
+        assert_eq!(cancels.len(), 2, "one cancel call per backend");
+        let backend0 = cancels
+            .iter()
+            .find(|(idx, _)| *idx == 0)
+            .expect("backend 0");
+        let backend1 = cancels
+            .iter()
+            .find(|(idx, _)| *idx == 1)
+            .expect("backend 1");
+        assert_eq!(backend0.1.len(), 1, "backend 0 cancels 1 instance");
+        assert_eq!(backend1.1.len(), 2, "backend 1 cancels 2 instances");
     }
 
     // -----------------------------------------------------------------------
@@ -997,8 +1063,13 @@ mod tests {
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(1, 1);
-        let params = vec![make_params_with_finst(1, 10), make_params_with_finst(1, 1)];
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        let params = single_backend(vec![
+            make_params_with_finst(1, 10),
+            make_params_with_finst(1, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let result =
+            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let chunks = result.unwrap();
         assert!(chunks.is_empty(), "expected no chunks from Eof dispatcher");
@@ -1016,8 +1087,13 @@ mod tests {
         let inner = ControllableDispatcher::fails_on_submit_n(2);
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(2, 1);
-        let params = vec![make_params_with_finst(2, 10), make_params_with_finst(2, 1)];
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        let params = single_backend(vec![
+            make_params_with_finst(2, 10),
+            make_params_with_finst(2, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let result =
+            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
         assert!(result.is_err(), "expected Err on submit failure");
         let submitted = inner.submitted_ids();
         assert_eq!(
@@ -1044,8 +1120,13 @@ mod tests {
         let inner = ControllableDispatcher::fetch_returns_err("boom");
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(3, 1);
-        let params = vec![make_params_with_finst(3, 10), make_params_with_finst(3, 1)];
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100);
+        let params = single_backend(vec![
+            make_params_with_finst(3, 10),
+            make_params_with_finst(3, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let result =
+            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
         assert!(result.is_err(), "expected Err on fetch error");
         let err = result.unwrap_err();
         assert!(
@@ -1071,8 +1152,12 @@ mod tests {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(4, 1);
-        let params = vec![make_params_with_finst(4, 10), make_params_with_finst(4, 1)];
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 10);
+        let params = single_backend(vec![
+            make_params_with_finst(4, 10),
+            make_params_with_finst(4, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 10);
         assert!(result.is_err(), "expected timeout error");
         let err = result.unwrap_err();
         assert!(
@@ -1096,9 +1181,14 @@ mod tests {
         let inner = RecordingWaitDispatcher::new();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(6, 1);
-        let params = vec![make_params_with_finst(6, 10), make_params_with_finst(6, 1)];
+        let params = single_backend(vec![
+            make_params_with_finst(6, 10),
+            make_params_with_finst(6, 1),
+        ]);
 
-        let result = submit_and_fetch_loop(&dispatcher, params, root_finst_id, 300_000);
+        let mut tracker = InFlightTracker::default();
+        let result =
+            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 300_000);
 
         assert!(result.is_ok(), "expected fetch loop to finish after Eof");
         let waits = inner.fetch_waits_ms();
@@ -1118,12 +1208,16 @@ mod tests {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let root_finst_id = types::TUniqueId::new(5, 1);
-        let params = vec![make_params_with_finst(5, 10), make_params_with_finst(5, 1)];
+        let params = single_backend(vec![
+            make_params_with_finst(5, 10),
+            make_params_with_finst(5, 1),
+        ]);
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let result =
             crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
-                submit_and_fetch_loop(&dispatcher, params, root_finst_id, 100)
+                let mut tracker = InFlightTracker::default();
+                submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100)
             });
 
         let err = result.expect_err("expected client disconnect error");

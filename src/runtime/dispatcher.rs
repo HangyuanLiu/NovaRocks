@@ -76,16 +76,6 @@ pub enum FetchOutcome {
 /// calls `submit_fragment` for each fragment (non-blocking), then polls
 /// `fetch_result` for the root fragment instance until `Eof` or `Err`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
-    /// The gRPC exchange address that fragment sinks must route data to.
-    ///
-    /// The coordinator embeds this address into `TPlanFragmentDestination`
-    /// entries so CTE and stream producers know where to push exchange data.
-    ///
-    /// Retained in PR-2; PR-4 removes this once the scheduler fills
-    /// destinations. Its only consumer is the coordinator destination /
-    /// runtime-filter wiring, which PR-3/PR-4's `FragmentScheduler` takes over.
-    fn exchange_addr(&self) -> types::TNetworkAddress;
-
     /// Submit a fragment for asynchronous execution to the given backend.
     /// Returns immediately.
     fn submit_fragment(
@@ -318,9 +308,6 @@ struct RootSlotEntry {
 // ---------------------------------------------------------------------------
 
 struct InProcessState {
-    /// gRPC exchange endpoint for this process.
-    exchange_host: String,
-    exchange_port: u16,
     /// Root fragment result slots (keyed by finst (hi, lo)).
     root_slots: Mutex<HashMap<FinstKey, RootSlotEntry>>,
     /// All submitted fragment instance IDs, used for bulk cancel.
@@ -342,12 +329,14 @@ pub struct InProcessDispatcher {
 }
 
 impl InProcessDispatcher {
-    /// Create an `InProcessDispatcher` bound to the given exchange endpoint.
-    pub fn new(exchange_host: impl Into<String>, exchange_port: u16) -> Self {
+    /// Create an `InProcessDispatcher`.
+    ///
+    /// Fragments run in-process and exchange through the local gRPC server, so
+    /// no exchange endpoint is stored here: the scheduler now fills every
+    /// `TPlanFragmentDestination` with the concrete backend address.
+    pub fn new() -> Self {
         Self {
             state: Arc::new(InProcessState {
-                exchange_host: exchange_host.into(),
-                exchange_port,
                 root_slots: Mutex::new(HashMap::new()),
                 submitted_ids: Mutex::new(Vec::new()),
                 fragment_errors: Mutex::new(HashMap::new()),
@@ -358,7 +347,7 @@ impl InProcessDispatcher {
 
 impl Default for InProcessDispatcher {
     fn default() -> Self {
-        Self::new("127.0.0.1", 0)
+        Self::new()
     }
 }
 
@@ -431,13 +420,6 @@ fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
 }
 
 impl FragmentDispatcher for InProcessDispatcher {
-    fn exchange_addr(&self) -> types::TNetworkAddress {
-        types::TNetworkAddress::new(
-            self.state.exchange_host.clone(),
-            self.state.exchange_port as i32,
-        )
-    }
-
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -620,20 +602,6 @@ impl RemoteDispatcher {
 }
 
 impl FragmentDispatcher for RemoteDispatcher {
-    fn exchange_addr(&self) -> types::TNetworkAddress {
-        // All fragments dispatched through RemoteDispatcher run on the BE.
-        // Inter-fragment exchange data must flow through the BE's own gRPC
-        // server (the backend address) so that both the producer and the
-        // consumer share the same local exchange registry on the BE.  Using
-        // the FE's exchange server would send data to the FE's registry while
-        // the consumer reads from the BE's registry, causing a permanent stall.
-        //
-        // PR-4: scheduler will supply per-instance exchange addrs; exchange_addr
-        // is removed then. D1 has exactly one backend, so addrs[0] matches the
-        // single-backend behavior of prior releases.
-        types::TNetworkAddress::new(self.addrs[0].ip().to_string(), self.addrs[0].port() as i32)
-    }
-
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -824,13 +792,18 @@ fn run_root_fragment_in_process(
         lo: exec_p.fragment_instance_id.lo,
     });
 
+    // Root fragment is the FE-assigned instance whose index (backend_num) the
+    // pipeline threads into RuntimeState; the data_stream_sink derives its
+    // be_number from it. The root is always instance 0 in the scheduling plan.
+    let backend_num = params.backend_num;
+
     let runtime_state = Arc::new(RuntimeState::new(
         query_opts.cloned(),
         None, // cache_options
         query_id,
         exec_p.runtime_filter_params.clone(),
         finst_id,
-        None, // backend_num
+        backend_num,
         None, // mem_tracker
         None, // spill_config
         None, // spill_manager
@@ -849,7 +822,7 @@ fn run_root_fragment_in_process(
         runtime_state,
         query_id,
         None, // fe_addr
-        None, // backend_num
+        backend_num,
     )?;
 
     Ok(handle.take_chunks())

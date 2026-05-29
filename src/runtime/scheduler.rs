@@ -47,11 +47,6 @@
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
 
-// The scheduler is a pure decision layer with no caller yet; the coordinator
-// wires it in PR-4. Until then its public-to-the-crate API reads as dead code.
-// Remove this allow when PR-4 lands the coordinator integration.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
@@ -59,8 +54,9 @@ use crate::data_sinks::TPlanFragmentDestination;
 use crate::internal_service::TScanRangeParams;
 use crate::partitions::TPartitionType;
 use crate::runtime_filter::TRuntimeFilterProberParams;
-use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentId};
-use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
+use crate::sql::codegen::{
+    FragmentBuildResult, FragmentEdge, FragmentId, RuntimeFilterPlanResult,
+};
 use crate::types::{TNetworkAddress, TUniqueId};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +66,10 @@ use crate::types::{TNetworkAddress, TUniqueId};
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentInstancePlacement {
+    /// The fragment this instance belongs to. The coordinator iterates
+    /// `SchedulingPlan::by_fragment` by key, so this is currently only used for
+    /// diagnostics, but it keeps each placement self-describing.
+    #[allow(dead_code)]
     pub(crate) fragment_id: FragmentId,
     pub(crate) instance_index: usize,
     pub(crate) finst_id: TUniqueId,
@@ -490,7 +490,7 @@ mod tests {
     use crate::partitions;
     use crate::plan_nodes;
     use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentEdgeKind, OutputColumn};
-    use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
+    use crate::sql::codegen::RuntimeFilterPlanResult;
     use crate::types;
 
     // -----------------------------------------------------------------------

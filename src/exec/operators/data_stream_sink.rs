@@ -970,6 +970,9 @@ impl OperatorFactory for DataStreamSinkFactory {
             .exec_params
             .sender_id
             .unwrap_or((self.exec_params.fragment_instance_id.lo as i32) & 0x7fffffff);
+        // Initial value only; overwritten by bind_runtime_state /
+        // sync_be_number from RuntimeState.backend_num (the FE-assigned instance
+        // index) before the sink sends. At instance 0 this stays 0.
         let be_number = 0i32;
 
         if driver_id == 0 {

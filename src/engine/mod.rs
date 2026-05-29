@@ -2888,13 +2888,42 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                         .to_string(),
                 );
             }
+            use crate::common::app_config::ClusterRole;
+            use std::net::SocketAddr;
             let role = crate::novarocks_config::config()
                 .map(|c| c.cluster.role)
-                .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
+                .unwrap_or(ClusterRole::AllInOne);
             let dispatcher = dispatcher_for_role(role, "127.0.0.1", exchange_port)?;
+            // Backend list for the scheduler: FE reads cluster.backends; all-in-one
+            // is the local exchange endpoint; pure BE must not coordinate.
+            let backends: Vec<SocketAddr> = match role {
+                ClusterRole::Fe => {
+                    let cfg =
+                        crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
+                    cfg.cluster
+                        .backends
+                        .iter()
+                        .map(|s| {
+                            s.parse::<SocketAddr>()
+                                .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                ClusterRole::AllInOne => vec![
+                    format!("127.0.0.1:{exchange_port}")
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                ],
+                ClusterRole::Be => {
+                    return Err("role=be must not enter standalone coordinator".into());
+                }
+            };
+            let scheduler =
+                std::sync::Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 dispatcher,
+                scheduler,
                 query_opts,
             )
             .execute()
@@ -2904,18 +2933,20 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
-/// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
+/// - `AllInOne`: uses `InProcessDispatcher`. Exchange destinations are filled by
+///   the scheduler from the backend list (the local exchange endpoint), so this
+///   no longer needs the exchange host/port.
 /// - `Fe`: uses `RemoteDispatcher` bound to all configured backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
-    exchange_host: &str,
-    exchange_port: u16,
+    _exchange_host: &str,
+    _exchange_port: u16,
 ) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::AllInOne => Ok(Arc::new(
-            crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
+            crate::runtime::dispatcher::InProcessDispatcher::new(),
         )),
         ClusterRole::Fe => {
             let cfg = crate::novarocks_config::config()
