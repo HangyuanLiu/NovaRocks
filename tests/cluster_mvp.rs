@@ -274,6 +274,10 @@ struct MultiBeClusterHarness {
     bes: Vec<ProcessGuard>,
     _fe: ProcessGuard,
     fe_mysql: u16,
+    #[allow(dead_code)]
+    _be_configs: Vec<NamedTempFile>,
+    #[allow(dead_code)]
+    _fe_config: NamedTempFile,
 }
 
 impl MultiBeClusterHarness {
@@ -353,14 +357,16 @@ backends = [{backends_list}]
             ),
         );
 
-        // Release BE ports and spawn each BE, waiting for readiness.
+        // Spawn all BEs first (releasing each BE's reserved ports immediately
+        // before its own spawn), then wait for all readiness in a second pass.
         let mut bes: Vec<ProcessGuard> = Vec::with_capacity(n);
         for (i, port_set) in be_port_sets.drain(..).enumerate() {
             let _ = port_set.http.release();
             let _ = port_set.starlet.release();
-            let mut be = ProcessGuard::spawn(be_configs[i].path());
+            bes.push(ProcessGuard::spawn(be_configs[i].path()));
+        }
+        for be in &mut bes {
             be.wait_for_ready("NOVAROCKS_READY role=be");
-            bes.push(be);
         }
 
         // Release FE ports and spawn FE.
@@ -374,6 +380,8 @@ backends = [{backends_list}]
             bes,
             _fe: fe,
             fe_mysql: fe_mysql_port,
+            _be_configs: be_configs,
+            _fe_config: fe_config,
         }
     }
 
