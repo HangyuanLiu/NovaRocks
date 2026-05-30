@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_group_by_customer;
 CREATE TABLE ${case_db}.t_filter_group_by_customer (
     c_custkey INT,
     c_region VARCHAR(32)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_filter_group_by_customer VALUES
     (10000, 'AFRICA'),

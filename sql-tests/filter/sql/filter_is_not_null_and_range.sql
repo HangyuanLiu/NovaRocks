@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_filter_is_not_null_and_range (
   id INT,
   k INT,
   payload STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_is_not_null_and_range VALUES
   (1, NULL, 'n1'),
   (2, 5, 'p2'),

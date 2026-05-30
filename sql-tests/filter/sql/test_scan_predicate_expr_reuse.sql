@@ -13,9 +13,8 @@ CREATE TABLE t (
     v2 BIGINT NULL,
     v3 BIGINT NULL,
     v4 ARRAY<STRING> NULL
-) DUPLICATE KEY(v1)
-DISTRIBUTED BY RANDOM
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO t SELECT generate_series, generate_series, generate_series,
     array_repeat(CAST(generate_series AS STRING), 5)
 FROM TABLE(generate_series(1, 100));
@@ -67,9 +66,8 @@ CREATE TABLE t0 (
     v7 MAP<INT, INT> NULL,
     v8 JSON NULL,
     v9 JSON NULL
-) PRIMARY KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 3
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO t0 VALUES
 (1,[1],[1],[1],row(1,row(1)),row(1,row([1])),map{1:1},map{1:1,2:2},parse_json('{"a":{"b":1}}'),parse_json('{"a":1,"b":[1]}')),
 (2,[2],[2],[2],row(2,row(2)),row(2,row([2])),map{1:1},map{1:2,2:2},parse_json('{"a":{"b":2}}'),parse_json('{"a":1,"b":[1]}')),

@@ -11,9 +11,8 @@ CREATE TABLE t1 (
     province VARCHAR(64),
     age SMALLINT,
     dt VARCHAR(10) NOT NULL
-) DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 4
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO t1 SELECT generate_series, generate_series, generate_series % 100, "2024-07-24"
 FROM TABLE(generate_series(1, 10));
 SELECT t2.dt, unnest, sum(d1), sum(d2)

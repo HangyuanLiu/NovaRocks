@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_filter_null_or_predicate (
   id INT,
   a INT,
   b STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_null_or_predicate VALUES
   (1, 1, 'x'),
   (2, NULL, 'x'),

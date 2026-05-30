@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_filter_in_between_like (
   id INT,
   name STRING,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_in_between_like VALUES
   (1, 'apple', 12),
   (2, 'apricot', 20),

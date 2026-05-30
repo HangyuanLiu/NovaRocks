@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_filter_basic_comparison (
   id INT,
   v INT,
   name STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_basic_comparison VALUES
   (1, 10, 'a'),
   (2, 20, 'b'),
