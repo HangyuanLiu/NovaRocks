@@ -1,0 +1,15 @@
+Explain String
+GATHER EXCHANGE stats={rows=1000000000}
+  PROJECT [l.v AS v, r.v AS v] stats={rows=1000000000}
+    HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=1000000000}
+      SCAN db_sqlt_0704cbf7956491f7.t_dnn_l (alias=l) stats={rows=100000}
+           TABLE: db_sqlt_0704cbf7956491f7.t_dnn_l
+           columns: k, v
+           min-max stats
+           predicates: l.k IS NOT NULL
+      GATHER EXCHANGE stats={rows=100000}
+        SCAN db_sqlt_0704cbf7956491f7.t_dnn_r (alias=r) stats={rows=100000}
+             TABLE: db_sqlt_0704cbf7956491f7.t_dnn_r
+             columns: k, v
+             min-max stats
+             predicates: r.k IS NOT NULL
