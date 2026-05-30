@@ -687,6 +687,7 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
 /// One equi-join key pair, with operands oriented so `left` comes from the
 /// join's left child and `right` from the right child. Operands are the
 /// unwrapped inner `ColumnRef` (Cast/Nested peeled).
+#[derive(Debug)]
 pub(crate) struct JoinEquiKey {
     pub(crate) left: TypedExpr,
     pub(crate) right: TypedExpr,
@@ -720,7 +721,7 @@ fn classify_operand(
         qualifier, column, ..
     } = &inner.kind
     else {
-        return None;
+        unreachable!("unwrap_column_ref only returns a ColumnRef expression");
     };
     let key = (
         qualifier.as_ref().map(|q| q.to_lowercase()),
@@ -1179,6 +1180,36 @@ mod column_id_helper_tests {
             nullable: true,
         };
         assert!(join_equi_keys(&two_table_join(Some(gt))).is_empty());
+    }
+
+    #[test]
+    fn join_equi_keys_peels_cast_wrapper() {
+        let cast_col = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(qcol("l", "a", 1)),
+                target: DataType::Int64,
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let join = two_table_join(Some(eq_expr(cast_col, qcol("r", "b", 2))));
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
+    }
+
+    #[test]
+    fn join_equi_keys_excludes_null_safe_eq() {
+        let cond = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qcol("l", "a", 1)),
+                op: crate::sql::analysis::BinOp::EqForNull,
+                right: Box::new(qcol("r", "b", 2)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        assert!(join_equi_keys(&two_table_join(Some(cond))).is_empty());
     }
 
     #[test]
