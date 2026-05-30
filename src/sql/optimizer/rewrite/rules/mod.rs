@@ -8,6 +8,7 @@ use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
+pub(crate) mod derive_join_not_null;
 pub(crate) mod join_reorder;
 pub(crate) mod low_cardinality_dict;
 pub(crate) mod predicate_pushdown;
