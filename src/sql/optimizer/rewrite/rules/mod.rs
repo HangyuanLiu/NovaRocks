@@ -66,6 +66,7 @@ pub(crate) fn all_query_rewrite_rules(
     all.extend(join_reorder_rules(table_stats));
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
     all.extend(low_cardinality_dictionary_rules());
+    all.push(Box::new(derive_join_not_null::DeriveJoinNotNullPredicate));
     all
 }
 
@@ -77,14 +78,15 @@ mod tests {
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
         // 18 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
-        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules = 28
-        assert_eq!(rules.len(), 28);
+        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules + 1 DeriveJoinNotNullPredicate = 29
+        assert_eq!(rules.len(), 29);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
             names,
             vec![
                 "AggregatePushdown",
+                "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",

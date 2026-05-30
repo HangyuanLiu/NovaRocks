@@ -31,7 +31,13 @@ pub(crate) fn query_rewrite_pipeline(
         RewriteStage::new(
             "PredicatePushdownPostJoin",
             RewritePhase::StructuralRewrite,
-            rules::predicate_pushdown_rules(),
+            {
+                let mut rules = rules::predicate_pushdown_rules();
+                rules.push(Box::new(
+                    rules::derive_join_not_null::DeriveJoinNotNullPredicate,
+                ));
+                rules
+            },
         ),
         RewriteStage::new(
             "AggregatePushdown",
@@ -103,6 +109,7 @@ mod tests {
             names,
             vec![
                 "AggregatePushdown",
+                "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
@@ -174,6 +181,7 @@ mod tests {
         ));
         assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
+        assert!(is_known_rewrite_rule_name("DeriveJoinNotNullPredicate"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {
