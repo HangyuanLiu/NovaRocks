@@ -12,10 +12,12 @@ DROP TABLE IF EXISTS ${case_db}.t_project_projection_dates;
 CREATE TABLE ${case_db}.t_project_projection_customer (
     c_custkey INT,
     c_name VARCHAR(32)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_project_projection_dates (
     d_datekey INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_project_projection_customer VALUES
     (1, 'c1'),

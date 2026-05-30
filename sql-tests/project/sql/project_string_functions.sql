@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_project_string_functions (
   id INT,
   first_name STRING,
   last_name STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_project_string_functions VALUES
   (1, 'alice', 'smith'),
   (2, 'Bob', 'Lee'),

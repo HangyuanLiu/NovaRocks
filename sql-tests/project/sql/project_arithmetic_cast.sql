@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_project_arithmetic_cast (
   id INT,
   a INT,
   b INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_project_arithmetic_cast VALUES
   (1, 2, 3),
   (2, 5, NULL),
