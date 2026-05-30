@@ -1,11 +1,13 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::statistics::TableStatistics;
 
@@ -104,6 +106,7 @@ pub(crate) struct RewriteContext {
     query_table_stats: Option<Arc<HashMap<String, TableStatistics>>>,
     deadline: Option<Instant>,
     dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
+    column_ref_factory: Option<Rc<RefCell<ColumnRefFactory>>>,
 }
 
 impl RewriteContext {
@@ -117,6 +120,7 @@ impl RewriteContext {
             query_table_stats: None,
             deadline: None,
             dictionary_provider: None,
+            column_ref_factory: None,
         }
     }
 
@@ -189,6 +193,14 @@ impl RewriteContext {
 
     pub(crate) fn dictionary_provider(&self) -> Option<&Arc<dyn QueryDictionaryProvider>> {
         self.dictionary_provider.as_ref()
+    }
+
+    pub(crate) fn set_column_ref_factory(&mut self, factory: Rc<RefCell<ColumnRefFactory>>) {
+        self.column_ref_factory = Some(factory);
+    }
+
+    pub(crate) fn column_ref_factory(&self) -> Option<&Rc<RefCell<ColumnRefFactory>>> {
+        self.column_ref_factory.as_ref()
     }
 
     pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {
@@ -359,5 +371,14 @@ mod tests {
         ctx.set_query_table_stats(stats);
 
         assert!(ctx.query_table_stats().unwrap().contains_key("db.tbl"));
+    }
+
+    #[test]
+    fn column_ref_factory_can_be_set_and_read() {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        assert!(ctx.column_ref_factory().is_none());
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::default()));
+        ctx.set_column_ref_factory(Rc::clone(&factory));
+        assert!(ctx.column_ref_factory().is_some());
     }
 }

@@ -11,6 +11,7 @@ use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
 use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::action_propagation::descendant_internal_columns;
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -83,11 +84,15 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         root_row_id_ref(plan).is_some() && !output_has_apply_key(plan)
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, Ordering::SeqCst);
         let Some((row_id_col, row_id_name)) = root_row_id_ref(&plan) else {
             return Ok(RewriteResult::Unchanged);
         };
+        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+            "InjectApplyKeyProject requires ImvExtension in RewriteContext".to_string()
+        })?;
+        let apply_key_col = ext.allocate_column_id();
         let apply_item = ProjectItem {
             expr: TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -99,6 +104,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                 nullable: false,
             },
             output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+            output_column_id: apply_key_col,
         };
         match plan {
             LogicalPlan::Project(mut p) => {
@@ -215,6 +221,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
         }
     }
 
@@ -234,6 +241,7 @@ mod tests {
                         nullable: false,
                     },
                     output_name: "k".to_string(),
+                    output_column_id: ColumnId(1),
                 },
                 ProjectItem {
                     expr: TypedExpr {
@@ -246,8 +254,10 @@ mod tests {
                         nullable: false,
                     },
                     output_name: "_row_id".to_string(),
+                    output_column_id: row_id,
                 },
             ],
+            required_output_columns: None,
         })
     }
 
@@ -285,6 +295,7 @@ mod tests {
                     nullable: false,
                 },
                 output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                output_column_id: ColumnId(200),
             });
         }
         assert!(!rule.matches(&plan, &ctx));
@@ -301,6 +312,7 @@ mod tests {
                 data_type: DataType::Boolean,
                 nullable: false,
             },
+            required_output_columns: None,
         });
         assert!(rule.matches(&plan, &ctx));
         let err = rule

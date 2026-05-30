@@ -2494,10 +2494,12 @@ mod tests {
                     ProjectItem {
                         expr: group_key,
                         output_name: "k".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                     ProjectItem {
                         expr: avg,
                         output_name: "a".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 has_aggregation: true,
@@ -2568,10 +2570,12 @@ mod tests {
                     ProjectItem {
                         expr: group_key,
                         output_name: "k".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                     ProjectItem {
                         expr: sum,
                         output_name: "s".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 has_aggregation: true,
@@ -2637,10 +2641,12 @@ mod tests {
                     ProjectItem {
                         expr: group_key,
                         output_name: "k".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                     ProjectItem {
                         expr: count_distinct,
                         output_name: "cd".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 has_aggregation: true,
@@ -2710,10 +2716,12 @@ mod tests {
                     ProjectItem {
                         expr: group_key,
                         output_name: "k".to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                     ProjectItem {
                         expr: approx_count_distinct,
                         output_name: output_name.to_string(),
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 has_aggregation: true,

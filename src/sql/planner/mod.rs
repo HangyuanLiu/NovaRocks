@@ -54,14 +54,32 @@ fn plan_scoped_query(
         output_columns,
         local_cte_ids,
     } = resolved;
-    let mut root = apply_query_modifiers(
-        plan_body_scoped(body, cte_registry, factory)?,
-        order_by,
-        output_columns,
-        limit,
-        offset,
-        factory,
-    );
+
+    // Plan the query body first so we can stamp fresh set-op ColumnIds before
+    // apply_query_modifiers consumes output_columns.
+    let mut body_plan = plan_body_scoped(body, cte_registry, factory)?;
+
+    // Strategy A: if the body produced a set-op node (Union/Intersect/Except),
+    // overwrite its output_columns with the fresh ColumnIds that the analyzer
+    // allocated for this query's output (stored in `output_columns`).  The
+    // planner previously left branch-side ColumnIds in those fields, which
+    // disagreed with the fresh IDs that the parent scope (and any wrapping
+    // SubqueryAliasNode) uses to reference the set-op output.
+    match &mut body_plan {
+        LogicalPlan::Union(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        LogicalPlan::Intersect(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        LogicalPlan::Except(node) => {
+            node.output_columns = output_columns.clone();
+        }
+        _ => {}
+    }
+
+    let mut root =
+        apply_query_modifiers(body_plan, order_by, output_columns, limit, offset, factory);
 
     for cte_id in local_cte_ids.into_iter().rev() {
         let entry = cte_registry
@@ -72,11 +90,13 @@ fn plan_scoped_query(
             cte_id: entry.id,
             input: Box::new(produce_input),
             output_columns: entry.output_columns.clone(),
+            required_output_columns: None,
         });
         root = LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id: entry.id,
             produce: Box::new(produce),
             consumer: Box::new(root),
+            required_output_columns: None,
         });
     }
 
@@ -95,7 +115,7 @@ fn apply_query_modifiers(
 
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
-        let extra_items = collect_extra_sort_items(&order_by, &output_columns);
+        let extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
         let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
             // We're about to add extra sort-only columns to the inner Project
@@ -117,14 +137,18 @@ fn apply_query_modifiers(
             // would otherwise fail to resolve after the rename, so we
             // remap any `ColumnRef(<select_output_name>)` to the matching
             // `__nr_sel_<idx>` below.
-            let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool)>> =
+            // Each tuple: (user-visible output name, data type, nullable, inner output_column_id).
+            // The inner output_column_id is captured here so the outer strip-project can
+            // reference the same ColumnId that the inner Project produces, preserving id
+            // continuity through the double-Project barrier for the Phase-1 tagging pass.
+            let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool, ColumnId)>> =
                 if let LogicalPlan::Project(ref mut proj) = body_plan {
                     if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates);
                         }
                     }
-                    let user: Vec<(String, arrow::datatypes::DataType, bool)> = proj
+                    let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
                         .items
                         .iter()
                         .map(|it| {
@@ -132,6 +156,7 @@ fn apply_query_modifiers(
                                 it.output_name.clone(),
                                 it.expr.data_type.clone(),
                                 it.expr.nullable,
+                                it.output_column_id,
                             )
                         })
                         .collect();
@@ -155,7 +180,7 @@ fn apply_query_modifiers(
                 let name_to_idx: std::collections::HashMap<String, usize> = user
                     .iter()
                     .enumerate()
-                    .map(|(idx, (name, _, _))| (name.to_lowercase(), idx))
+                    .map(|(idx, (name, _, _, _))| (name.to_lowercase(), idx))
                     .collect();
                 sort_items
                     .into_iter()
@@ -171,6 +196,7 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                required_output_columns: None,
             });
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
@@ -178,9 +204,15 @@ fn apply_query_modifiers(
             final_projection = Some(if let Some(user) = user_select {
                 user.into_iter()
                     .enumerate()
-                    .map(|(idx, (name, dt, nullable))| {
+                    .map(|(idx, (name, dt, nullable, inner_cid))| {
                         let syn_name = format!("__nr_sel_{idx}");
-                        let cid = factory.create(None, syn_name.clone(), dt.clone(), nullable);
+                        // Reuse the inner project item's existing ColumnId so
+                        // that the Phase-1 tagging pass can thread required
+                        // columns through the double-Project barrier without
+                        // encountering an id discontinuity. Minting a fresh id
+                        // here would make the outer Project's output invisible
+                        // to the inner Project's pruning tag.
+                        let cid = inner_cid;
                         ProjectItem {
                             expr: TypedExpr {
                                 kind: ExprKind::ColumnRef {
@@ -192,6 +224,7 @@ fn apply_query_modifiers(
                                 nullable,
                             },
                             output_name: name,
+                            output_column_id: cid,
                         }
                     })
                     .collect()
@@ -209,6 +242,7 @@ fn apply_query_modifiers(
                             nullable: col.nullable,
                         },
                         output_name: col.name.clone(),
+                        output_column_id: col.column_id,
                     })
                     .collect()
             });
@@ -218,6 +252,7 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                required_output_columns: None,
             });
         }
     }
@@ -228,6 +263,7 @@ fn apply_query_modifiers(
             input: Box::new(body_plan),
             limit,
             offset,
+            required_output_columns: None,
         });
     }
 
@@ -235,13 +271,18 @@ fn apply_query_modifiers(
         body_plan = LogicalPlan::Project(ProjectNode {
             input: Box::new(body_plan),
             items,
+            required_output_columns: None,
         });
     }
 
     body_plan
 }
 
-fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> Vec<ProjectItem> {
+fn collect_extra_sort_items(
+    order_by: &[SortItem],
+    output: &[OutputColumn],
+    factory: &mut ColumnRefFactory,
+) -> Vec<ProjectItem> {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     let mut added = std::collections::HashSet::new();
@@ -250,9 +291,20 @@ fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> V
         let output_name = crate::sql::codegen::helpers::typed_expr_display_name(&item.expr);
         let output_name_lower = output_name.to_lowercase();
         if !output_names.contains(&output_name_lower) && added.insert(output_name_lower) {
+            let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
+                *column_id
+            } else {
+                factory.create(
+                    None,
+                    output_name.clone(),
+                    item.expr.data_type.clone(),
+                    item.expr.nullable,
+                )
+            };
             extra.push(ProjectItem {
                 expr: item.expr.clone(),
                 output_name,
+                output_column_id,
             });
         }
     }
@@ -328,10 +380,18 @@ fn rewrite_sort_items_to_projection_refs(
             let display =
                 crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase();
             if let Some(extra) = extra_names.get(&display) {
+                // Preserve the extra item's output_column_id so that the
+                // Phase-1 tagging pass (tag_sort → collect_column_id_refs)
+                // can see this sort key's ColumnId and include it in the
+                // child's required_output_columns.  Using UNSET here caused
+                // tag_sort to silently omit the extra column from the inner
+                // project's needed set, which then made PruneProjectColumns
+                // drop the extra item → the sort's input no longer had the
+                // column → "Column cannot be resolved" at codegen time.
                 SortItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
-                            column_id: ColumnId::UNSET,
+                            column_id: extra.output_column_id,
                             qualifier: None,
                             column: extra.output_name.clone(),
                         },
@@ -380,6 +440,7 @@ fn plan_select_scoped(
         None => LogicalPlan::Values(ValuesNode {
             rows: vec![vec![]],
             columns: vec![],
+            required_output_columns: None,
         }),
     };
 
@@ -387,6 +448,7 @@ fn plan_select_scoped(
         current = LogicalPlan::Filter(FilterNode {
             input: Box::new(current),
             predicate,
+            required_output_columns: None,
         });
     }
 
@@ -404,6 +466,7 @@ fn plan_select_scoped(
             all_rollup_columns: repeat_info.all_rollup_columns,
             grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
+            required_output_columns: None,
         });
     }
 
@@ -428,11 +491,13 @@ fn plan_select_scoped(
             aggregates: agg_calls,
             output_columns,
             already_pushed: false,
+            required_output_columns: None,
         });
         if let Some(having) = select.having {
             current = LogicalPlan::Filter(FilterNode {
                 input: Box::new(current),
                 predicate: having,
+                required_output_columns: None,
             });
         }
 
@@ -538,15 +603,22 @@ fn prepare_repeat_input(
         };
         substitutions.push((original_display, replacement));
 
+        let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
+            *column_id
+        } else {
+            ColumnId::UNSET
+        };
         project_items.push(ProjectItem {
             expr: source_expr,
             output_name: alias_name.clone(),
+            output_column_id,
         });
     }
 
     *current = LogicalPlan::Project(ProjectNode {
         input: Box::new(current.clone()),
         items: project_items,
+        required_output_columns: None,
     });
 
     // Apply substitutions to group_by, projection, having so that every
@@ -667,7 +739,10 @@ fn collect_repeat_input_refs(
 ) {
     match &expr.kind {
         ExprKind::ColumnRef {
-            qualifier, column, ..
+            qualifier,
+            column,
+            column_id,
+            ..
         } => {
             if qualifier.is_none() && column.starts_with("__grouping_") {
                 return;
@@ -677,6 +752,7 @@ fn collect_repeat_input_refs(
                 out.push(ProjectItem {
                     expr: expr.clone(),
                     output_name: column.clone(),
+                    output_column_id: *column_id,
                 });
             }
         }
@@ -750,7 +826,15 @@ fn build_distinct(
     let mut group_by = Vec::new();
     let mut output_columns = Vec::new();
     for item in projection {
-        let cid = expr_column_id(&item.expr, &item.output_name, factory);
+        // Prefer the pre-assigned output_column_id (e.g. synthetic __match_N
+        // columns from IN/EXISTS subquery rewrites). Falling back to
+        // expr_column_id would mint a fresh id, disconnecting the column from
+        // any downstream reference that already holds the original id.
+        let cid = if item.output_column_id != ColumnId::UNSET {
+            item.output_column_id
+        } else {
+            expr_column_id(&item.expr, &item.output_name, factory)
+        };
         group_by.push(TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: cid,
@@ -774,6 +858,7 @@ fn build_distinct(
         aggregates: vec![],
         output_columns,
         already_pushed: false,
+        required_output_columns: None,
     })
 }
 
@@ -834,6 +919,7 @@ fn build_window_and_project(
                 input: Box::new(input),
                 items: sort_items,
                 analytic_partition_by,
+                required_output_columns: None,
             })
         };
 
@@ -841,15 +927,18 @@ fn build_window_and_project(
             input: Box::new(sorted_input),
             window_exprs,
             output_columns,
+            required_output_columns: None,
         });
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(windowed),
             items: rewritten_items,
+            required_output_columns: None,
         }))
     } else if !project_items.is_empty() {
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
             items: project_items,
+            required_output_columns: None,
         }))
     } else {
         Ok(input)
@@ -977,6 +1066,7 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
             rewritten.push(ProjectItem {
                 expr: new_expr,
                 output_name: item.output_name.clone(),
+                output_column_id: item.output_column_id,
             });
         } else {
             rewritten.push(item.clone());
@@ -1307,6 +1397,7 @@ fn split_projection_for_aggregate(
         project_items.push(ProjectItem {
             expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
             output_name: item.output_name.clone(),
+            output_column_id: item.output_column_id,
         });
     }
 
@@ -1583,6 +1674,7 @@ fn plan_relation_scoped(
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                required_output_columns: None,
             }))
         }
         Relation::Subquery {
@@ -1597,6 +1689,7 @@ fn plan_relation_scoped(
                 input: Box::new(inner_plan),
                 alias,
                 output_columns,
+                required_output_columns: None,
             }))
         }
         Relation::Join(join_rel) => {
@@ -1630,6 +1723,7 @@ fn plan_relation_scoped(
                         output_columns: unnest.output_columns,
                         alias: unnest.alias,
                         is_left_join,
+                        required_output_columns: None,
                     }))
                 }
                 right => {
@@ -1640,6 +1734,7 @@ fn plan_relation_scoped(
                         right: Box::new(right),
                         join_type,
                         condition,
+                        required_output_columns: None,
                     }))
                 }
             }
@@ -1650,6 +1745,7 @@ fn plan_relation_scoped(
             step: gs.step,
             column_name: gs.column_name,
             alias: gs.alias,
+            required_output_columns: None,
         })),
         Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
         Relation::CTEConsume {
@@ -1660,6 +1756,7 @@ fn plan_relation_scoped(
             cte_id,
             alias,
             output_columns,
+            required_output_columns: None,
         })),
         Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel, factory),
         Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel, factory),
@@ -1707,10 +1804,18 @@ fn plan_iceberg_metadata_scan(
             logical_type: None,
         })
         .collect();
+    // Reuse the ColumnIds that the analyzer already minted for this metadata
+    // table's columns (carried on `rel.column_ids`). Creating fresh ids here
+    // would desync the `ColumnRef` ids in the rest of the plan (SELECT list,
+    // WHERE, etc.) from the scan's output_columns, causing Phase-2 column
+    // pruning to incorrectly prune needed columns (same pattern as Relation::Scan).
     let output_columns: Vec<OutputColumn> = cols
         .iter()
-        .map(|c| OutputColumn {
-            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
+        .enumerate()
+        .map(|(idx, c)| OutputColumn {
+            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
+            }),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
@@ -1762,6 +1867,7 @@ fn plan_iceberg_metadata_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        required_output_columns: None,
     }))
 }
 
@@ -1888,28 +1994,44 @@ fn plan_iceberg_delta_scan(
     // The delta scan emits both: scanner-side projection re-uses the same
     // column ordering as the base scan, plus the row-lineage virtual columns
     // for downstream row-identity matching.
+    //
+    // Reuse the ColumnIds that the analyzer already minted for this delta scan's
+    // columns (carried on `rel.column_ids`). Creating fresh ids here would desync
+    // the `ColumnRef` ids in the rest of the plan from the scan's output columns,
+    // causing Phase-2 column pruning to incorrectly prune needed scan columns.
+    let base_col_count = rel.table.columns.len();
     let mut output_columns: Vec<OutputColumn> = rel
         .table
         .columns
         .iter()
-        .map(|c| OutputColumn {
-            column_id: factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable),
+        .enumerate()
+        .map(|(idx, c)| OutputColumn {
+            column_id: rel.column_ids.get(idx).copied().unwrap_or_else(|| {
+                factory.create(None, c.name.clone(), c.data_type.clone(), c.nullable)
+            }),
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             nullable: c.nullable,
             is_internal: false,
         })
         .collect();
-    for col in &rel.table.iceberg_row_lineage_metadata_columns {
+    for (meta_idx, col) in rel
+        .table
+        .iceberg_row_lineage_metadata_columns
+        .iter()
+        .enumerate()
+    {
+        let col_id_idx = base_col_count + meta_idx;
         output_columns.push(OutputColumn {
-            column_id: factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable),
+            column_id: rel.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
+                factory.create(None, col.name.clone(), col.data_type.clone(), col.nullable)
+            }),
             name: col.name.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
             is_internal: false,
         });
     }
-
     let table_info = iceberg_table_info(&rel.table.source)
         .ok_or_else(|| {
             format!(
@@ -1939,6 +2061,7 @@ fn plan_iceberg_delta_scan(
         predicates: vec![],
         required_columns: None,
         dict_columns: vec![],
+        required_output_columns: None,
     }))
 }
 
@@ -1963,6 +2086,28 @@ fn plan_set_operation_scoped(
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
+    // Build position-aligned output schema before consuming the branches.
+    // For each position we widen the type across left/right (matching
+    // the analyzer's wider_type logic), keep the left branch ColumnId and
+    // name, and union the nullable flags. This mirrors what derive_output_columns
+    // and visit_set_op_common use as the canonical union output schema.
+    let output_columns: Vec<OutputColumn> = set_op
+        .left
+        .output_columns
+        .iter()
+        .zip(set_op.right.output_columns.iter())
+        .map(|(lc, rc)| {
+            let dt = crate::sql::types::wider_type(&lc.data_type, &rc.data_type);
+            OutputColumn {
+                column_id: lc.column_id,
+                name: lc.name.clone(),
+                data_type: dt,
+                nullable: lc.nullable || rc.nullable,
+                is_internal: lc.is_internal && rc.is_internal,
+            }
+        })
+        .collect();
+
     let left = plan_scoped_query(*set_op.left, cte_registry, factory)?;
     let right = plan_scoped_query(*set_op.right, cte_registry, factory)?;
 
@@ -1970,12 +2115,18 @@ fn plan_set_operation_scoped(
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
             inputs: vec![left, right],
             all: set_op.all,
+            output_columns,
+            required_output_columns: None,
         })),
         SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
             inputs: vec![left, right],
+            output_columns,
+            required_output_columns: None,
         })),
         SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
             inputs: vec![left, right],
+            output_columns,
+            required_output_columns: None,
         })),
     }
 }
@@ -2006,6 +2157,7 @@ fn plan_values(
     Ok(LogicalPlan::Values(ValuesNode {
         rows: values.rows,
         columns,
+        required_output_columns: None,
     }))
 }
 
@@ -2315,6 +2467,284 @@ mod tests {
         assert!(
             anchor_idx > union_idx,
             "branch-local anchor should appear under union: {lines:?}"
+        );
+    }
+
+    /// Regression test for the ColumnId-correctness bug where UnionNode.output_columns
+    /// carried left-branch ColumnIds instead of the fresh set-op output ColumnIds.
+    ///
+    /// After the fix, SubqueryAlias.output_columns (which carries the fresh IDs from
+    /// the analyzer's parent scope) must equal child Union.output_columns position by
+    /// position.  Before the fix these were two disjoint ID spaces.
+    #[test]
+    fn union_output_columns_carry_fresh_set_op_ids_matching_subquery_alias() {
+        // Plan a derived table that wraps a UNION ALL.  The subquery alias node
+        // receives the fresh set-op output ColumnIds from the analyzer scope; the
+        // Union node must carry the same IDs (not the left-branch scan IDs).
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey, o_custkey \
+             FROM (SELECT o_orderkey, o_custkey FROM orders \
+                   UNION ALL \
+                   SELECT o_orderkey, o_custkey FROM orders) sub",
+        )
+        .expect("planner should succeed");
+
+        // Navigate to SubqueryAlias — it is either the root or directly under a Project.
+        let alias_node = match &plan {
+            LogicalPlan::SubqueryAlias(n) => n,
+            LogicalPlan::Project(p) => match p.input.as_ref() {
+                LogicalPlan::SubqueryAlias(n) => n,
+                other => panic!("expected SubqueryAlias under Project, got {other:?}"),
+            },
+            other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+        };
+        assert_eq!(alias_node.alias, "sub");
+
+        // The direct child of SubqueryAlias must be the Union node.
+        let union_node = match alias_node.input.as_ref() {
+            LogicalPlan::Union(n) => n,
+            other => panic!("expected Union as SubqueryAlias child, got {other:?}"),
+        };
+
+        // Core assertion: fresh IDs must match position-by-position.
+        assert_eq!(
+            alias_node.output_columns.len(),
+            union_node.output_columns.len(),
+            "SubqueryAlias and Union output_columns length must match"
+        );
+        for (i, (alias_col, union_col)) in alias_node
+            .output_columns
+            .iter()
+            .zip(union_node.output_columns.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                alias_col.column_id, union_col.column_id,
+                "output_columns[{i}]: SubqueryAlias column_id {:?} != Union column_id {:?} \
+                 (Union must carry the fresh set-op IDs, not left-branch IDs)",
+                alias_col.column_id, union_col.column_id
+            );
+        }
+    }
+
+    /// Same correctness guarantee for INTERSECT and EXCEPT set operations.
+    #[test]
+    fn intersect_except_output_columns_carry_fresh_set_op_ids() {
+        for sql in [
+            "SELECT o_orderkey FROM (SELECT o_orderkey FROM orders \
+             INTERSECT SELECT o_orderkey FROM orders) sub",
+            "SELECT o_orderkey FROM (SELECT o_orderkey FROM orders \
+             EXCEPT SELECT o_orderkey FROM orders) sub",
+        ] {
+            let plan = parse_analyze_and_plan(sql).expect("planner should succeed");
+
+            let alias_node = match &plan {
+                LogicalPlan::SubqueryAlias(n) => n,
+                LogicalPlan::Project(p) => match p.input.as_ref() {
+                    LogicalPlan::SubqueryAlias(n) => n,
+                    other => panic!("expected SubqueryAlias under Project, got {other:?}"),
+                },
+                other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+            };
+
+            let (alias_cols, set_op_cols) = match alias_node.input.as_ref() {
+                LogicalPlan::Intersect(n) => (&alias_node.output_columns, &n.output_columns),
+                LogicalPlan::Except(n) => (&alias_node.output_columns, &n.output_columns),
+                other => panic!("expected Intersect/Except as child, got {other:?}"),
+            };
+
+            assert_eq!(alias_cols.len(), set_op_cols.len());
+            for (i, (ac, sc)) in alias_cols.iter().zip(set_op_cols.iter()).enumerate() {
+                assert_eq!(
+                    ac.column_id, sc.column_id,
+                    "output_columns[{i}]: SubqueryAlias {:?} != set-op {:?} for SQL: {sql}",
+                    ac.column_id, sc.column_id
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug B regression: build_distinct must preserve item.output_column_id
+    // -----------------------------------------------------------------------
+
+    /// Bug B: build_distinct previously called expr_column_id() for every item
+    /// in the projection, minting a fresh ColumnId for non-ColumnRef exprs (e.g.
+    /// the synthetic `Literal(1)` produced by IN/EXISTS subquery rewriting when
+    /// the item had a meaningful pre-assigned `output_column_id`). This broke
+    /// downstream references that already held the original id.
+    ///
+    /// Fix: when item.output_column_id != UNSET, use it directly instead of
+    /// calling expr_column_id.
+    ///
+    /// This test verifies that SELECT DISTINCT over a query with pre-assigned
+    /// output ids produces an Aggregate whose group-by ColumnRefs carry the same
+    /// ids as the inner projection's output_column_ids.
+    #[test]
+    fn build_distinct_preserves_output_column_id_from_projection() {
+        // Use build_distinct indirectly via the planner: SELECT DISTINCT
+        // o_orderkey FROM orders.  The inner Project item will have a
+        // non-UNSET output_column_id (assigned by the analyzer), and the outer
+        // DISTINCT Aggregate's group-by ColumnRef must carry the same id.
+        let plan = parse_analyze_and_plan("SELECT DISTINCT o_orderkey FROM orders")
+            .expect("planner should succeed");
+
+        // Expected shape: Aggregate(group_by=[ColumnRef(cid)]) <- Project(item.output_column_id=cid)
+        let (agg_group_by_cid, inner_proj_output_cid) = match &plan {
+            LogicalPlan::Aggregate(agg) => {
+                let gb_cid = match &agg.group_by[0].kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    other => panic!("expected ColumnRef group_by, got {other:?}"),
+                };
+                let inner_proj = match agg.input.as_ref() {
+                    LogicalPlan::Project(p) => p,
+                    other => panic!("expected Project under Aggregate, got {other:?}"),
+                };
+                let item_cid = inner_proj.items[0].output_column_id;
+                (gb_cid, item_cid)
+            }
+            other => panic!("expected Aggregate root for SELECT DISTINCT, got {other:?}"),
+        };
+
+        assert_ne!(
+            agg_group_by_cid,
+            ColumnId::UNSET,
+            "Aggregate group-by ColumnRef must not be UNSET"
+        );
+        assert_eq!(
+            agg_group_by_cid, inner_proj_output_cid,
+            "build_distinct must reuse inner Project item's output_column_id, \
+             not mint a fresh id (Bug B)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug C regression: apply_query_modifiers strip-project must reuse inner ids
+    // -----------------------------------------------------------------------
+
+    /// Bug C: apply_query_modifiers built a strip-projection by calling
+    /// factory.create(...) for each item, minting fresh ColumnIds that
+    /// disconnected the outer Project from the inner Project's output ids.
+    /// The Phase-1 tagging pass then saw a double-Project barrier where the
+    /// outer Project's items used ids that didn't match anything the inner
+    /// Project produced, causing it to compute child_needed = {} and drop all
+    /// inner columns.
+    ///
+    /// Fix: reuse the inner project item's existing output_column_id for the
+    /// strip-project item instead of minting a fresh one.
+    ///
+    /// This test uses a query with an ORDER BY column that is NOT in the SELECT
+    /// output (triggering extra_items and the strip-projection path), then
+    /// verifies that the outer Project's items carry the same ColumnIds as the
+    /// inner Project's items at the corresponding positions.
+    #[test]
+    fn apply_query_modifiers_strip_project_reuses_inner_output_column_ids() {
+        // ORDER BY o_custkey is not in the SELECT output (only o_orderkey is),
+        // so collect_extra_sort_items returns o_custkey as an extra.
+        // apply_query_modifiers then builds:
+        //   outer strip-Project (items: [o_orderkey]) <-- Sort <-- inner Project (items: [o_orderkey__nr_sel_0, o_custkey_extra])
+        let plan = parse_analyze_and_plan("SELECT o_orderkey FROM orders ORDER BY o_custkey")
+            .expect("planner should succeed");
+
+        // Walk down to find the outer and inner Projects.
+        // Shape: outer-Project? <- Sort <- inner-Project <- Scan
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => {
+                // If there is no outer Project (no extra items triggered), skip.
+                // The test is only meaningful when the strip-projection was built.
+                let shape = format!("{other:?}");
+                if shape.contains("Sort") {
+                    return; // no extra items path — test not applicable
+                }
+                panic!("expected Project or Sort root, got {shape}");
+            }
+        };
+
+        let inner_proj = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => match s.input.as_ref() {
+                LogicalPlan::Project(p) => p,
+                other => panic!("expected inner Project under Sort, got {other:?}"),
+            },
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+
+        // The outer strip-project has one user-visible item (o_orderkey).
+        // Its output_column_id and expr ColumnRef column_id must match the
+        // corresponding inner project item's output_column_id.
+        assert!(
+            !outer_proj.items.is_empty(),
+            "outer strip-project must have at least one item"
+        );
+        let outer_item = &outer_proj.items[0];
+        let outer_expr_cid = match &outer_item.expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("outer strip-project item must be ColumnRef, got {other:?}"),
+        };
+
+        // Find the inner project item that was renamed to __nr_sel_0 and
+        // corresponds to position 0.
+        let inner_item_0 = &inner_proj.items[0];
+        let inner_output_cid = inner_item_0.output_column_id;
+
+        assert_ne!(
+            outer_expr_cid,
+            ColumnId::UNSET,
+            "outer strip-project ColumnRef must not be UNSET"
+        );
+        assert_eq!(
+            outer_expr_cid, inner_output_cid,
+            "outer strip-project item's ColumnRef column_id must equal inner project item's \
+             output_column_id at the same position (Bug C: no fresh id minting)"
+        );
+        assert_eq!(
+            outer_item.output_column_id, inner_output_cid,
+            "outer strip-project item's output_column_id must equal inner project item's \
+             output_column_id at the same position (Bug C: no fresh id minting)"
+        );
+    }
+
+    #[test]
+    fn sort_only_expression_extra_uses_traceable_output_column_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey FROM orders ORDER BY abs(o_custkey - o_orderkey)",
+        )
+        .expect("planner should succeed");
+
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected outer strip Project, got {other:?}"),
+        };
+        let sort = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => s,
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+        let inner_proj = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected inner Project under Sort, got {other:?}"),
+        };
+
+        let extra_item = inner_proj
+            .items
+            .iter()
+            .find(|item| item.output_name.starts_with("abs("))
+            .expect("expected sort-only expression item");
+        assert_ne!(
+            extra_item.output_column_id,
+            ColumnId::UNSET,
+            "sort-only expression extra must have a real output ColumnId so pruning can track it"
+        );
+
+        let ExprKind::ColumnRef {
+            column_id: sort_key_id,
+            ..
+        } = sort.items[0].expr.kind
+        else {
+            panic!("sort key should be rewritten to a ColumnRef");
+        };
+        assert_eq!(
+            sort_key_id, extra_item.output_column_id,
+            "sort key must reference the sort-only expression extra by ColumnId"
         );
     }
 }

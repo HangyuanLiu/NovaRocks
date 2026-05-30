@@ -336,16 +336,27 @@ impl<'a> AnalyzerContext<'a> {
             QueryBody::Select(sel) => (sel.from, sel.filter),
             _ => return Err("correlated EXISTS subquery must be a SELECT".into()),
         };
-        // Pick the first projection column as the match indicator. For
-        // EXISTS with arbitrary projection this is fine — we just need a
-        // non-null indicator when a matching row exists.
-        let indicator = resolved_sub
-            .output_columns
-            .first()
-            .ok_or("EXISTS subquery must produce at least one column")?
-            .clone();
         let sub_rel =
             sub_from.ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
+
+        // Pick the first output column of the FROM relation as the match indicator.
+        //
+        // We intentionally do NOT use `resolved_sub.output_columns.first()` here.
+        // When the EXISTS subquery is `SELECT 1 FROM rel WHERE <corr>`, the
+        // first projection output is the literal `1` — a freshly-allocated
+        // ColumnId that is only present in the SELECT projection, which is
+        // *discarded* when we deconstruct the subquery into `(FROM, WHERE)`.
+        // Referencing that ColumnId in the IS NOT NULL replacement expression
+        // would produce "Column '1' cannot be resolved" at codegen time because
+        // the column never materialises in the physical plan.
+        //
+        // Instead, use the first column of `sub_rel` (the FROM relation). This
+        // column IS in the plan (it is attached via `attach_aux_join`) and its
+        // value is non-NULL whenever the correlated subquery matches a row,
+        // which is exactly the semantics we need for the EXISTS IS NOT NULL check.
+        let indicator = relation_first_output_column(&sub_rel).ok_or(
+            "correlated EXISTS subquery: FROM relation has no output column for indicator",
+        )?;
 
         let side = match sub_filter.as_ref() {
             Some(f) => choose_aux_join_side(join, std::slice::from_ref(f)),
@@ -494,6 +505,12 @@ impl<'a> AnalyzerContext<'a> {
         // lookup entirely and produces the same boolean indicator semantics.
         let mut modified_sub = resolved_sub;
         let indicator_dtype = DataType::Int32;
+        let match_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            indicator_dtype.clone(),
+            true,
+        );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
@@ -503,14 +520,9 @@ impl<'a> AnalyzerContext<'a> {
                     nullable: false,
                 },
                 output_name: match_col.clone(),
+                output_column_id: match_col_id,
             });
         }
-        let match_col_id = self.alloc_column_id(
-            Some(sq_alias.clone()),
-            match_col.clone(),
-            indicator_dtype.clone(),
-            true,
-        );
         modified_sub.output_columns.push(OutputColumn {
             column_id: match_col_id,
             name: match_col.clone(),
@@ -594,6 +606,12 @@ impl<'a> AnalyzerContext<'a> {
         // `__sq_alias` yields a row with `__exists IS NOT NULL` iff the
         // subquery has any rows.
         let mut modified_sub = resolved_sub;
+        let exists_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            DataType::Int64,
+            true,
+        );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = false;
             sel.projection.clear();
@@ -604,15 +622,10 @@ impl<'a> AnalyzerContext<'a> {
                     nullable: false,
                 },
                 output_name: match_col.clone(),
+                output_column_id: exists_col_id,
             });
             sel.has_aggregation = false;
         }
-        let exists_col_id = self.alloc_column_id(
-            Some(sq_alias.clone()),
-            match_col.clone(),
-            DataType::Int64,
-            true,
-        );
         modified_sub.output_columns = vec![OutputColumn {
             column_id: exists_col_id,
             name: match_col.clone(),
@@ -746,6 +759,21 @@ impl<'a> AnalyzerContext<'a> {
         let (resolved, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
+        let is_correlated = match &resolved.body {
+            QueryBody::Select(sel) => sel
+                .filter
+                .as_ref()
+                .map(|f| {
+                    !extract_correlation_predicates(f, &inner_scope, scope).is_empty()
+                        || expr_references_outer_scope(f, &inner_scope, scope)
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !is_correlated {
+            return self.rewrite_uncorrelated_exists(select, scope, resolved, sq_info.id, negated);
+        }
+
         let join_type = if negated {
             JoinKind::LeftAnti
         } else {
@@ -798,54 +826,78 @@ impl<'a> AnalyzerContext<'a> {
                 // the physical layer resolve them. BUT for self-joins (same
                 // bare column name on both sides), keep qualifiers to avoid
                 // producing tautologies like `col = col`.
-                let maybe_unqualify = |expr: &TypedExpr| -> TypedExpr {
-                    match &expr.kind {
-                        ExprKind::BinaryOp { left, op, right } => {
-                            let l_name = match &left.kind {
-                                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
-                                _ => None,
-                            };
-                            let r_name = match &right.kind {
-                                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
-                                _ => None,
-                            };
-                            let same_bare_name = l_name.is_some() && l_name == r_name;
-
-                            let unq = |col: &TypedExpr| -> TypedExpr {
-                                if same_bare_name {
-                                    col.clone() // Keep qualifier for self-join
-                                } else if let ExprKind::ColumnRef {
-                                    column_id, column, ..
-                                } = &col.kind
-                                {
-                                    TypedExpr {
-                                        kind: ExprKind::ColumnRef {
-                                            column_id: *column_id,
-                                            qualifier: None,
-                                            column: column.clone(),
-                                        },
-                                        data_type: col.data_type.clone(),
-                                        nullable: col.nullable,
-                                    }
-                                } else {
-                                    col.clone()
-                                }
-                            };
-                            TypedExpr {
-                                data_type: expr.data_type.clone(),
-                                nullable: expr.nullable,
-                                kind: ExprKind::BinaryOp {
-                                    left: Box::new(unq(left)),
-                                    op: *op,
-                                    right: Box::new(unq(right)),
-                                },
-                            }
+                let maybe_unqualify_col = |col: &TypedExpr, same_bare_name: bool| -> TypedExpr {
+                    if same_bare_name {
+                        col.clone()
+                    } else if let ExprKind::ColumnRef {
+                        column_id,
+                        qualifier,
+                        column,
+                    } = &col.kind
+                    {
+                        let ambiguous_between_scopes = qualifier.is_some()
+                            && inner_scope.resolve(None, column).is_ok()
+                            && scope.resolve(None, column).is_ok();
+                        if ambiguous_between_scopes {
+                            return col.clone();
                         }
-                        _ => expr.clone(),
+                        TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: *column_id,
+                                qualifier: None,
+                                column: column.clone(),
+                            },
+                            data_type: col.data_type.clone(),
+                            nullable: col.nullable,
+                        }
+                    } else {
+                        col.clone()
+                    }
+                };
+                let build_corr_cond = |pred: &CorrelationPred| -> TypedExpr {
+                    let outer_name = match &pred.outer_col.kind {
+                        ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                        _ => None,
+                    };
+                    let inner_name = match &pred.inner_col.kind {
+                        ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                        _ => None,
+                    };
+                    let same_bare_name = outer_name.is_some() && outer_name == inner_name;
+
+                    // Put the outer column on the left and the inner column
+                    // on the right. Hash join key extraction is input-side
+                    // sensitive; preserving the original inner=outer textual
+                    // order can reverse SEMI/ANTI keys.
+                    let original_left_is_inner = match &pred.full_expr.kind {
+                        ExprKind::BinaryOp { left, .. } => {
+                            exprs_structurally_equal(left, &pred.inner_col)
+                        }
+                        _ => false,
+                    };
+                    let mut outer_expr = maybe_unqualify_col(&pred.outer_col, same_bare_name);
+                    if original_left_is_inner && outer_expr.data_type != pred.inner_col.data_type {
+                        outer_expr = TypedExpr {
+                            data_type: pred.inner_col.data_type.clone(),
+                            nullable: outer_expr.nullable,
+                            kind: ExprKind::Cast {
+                                expr: Box::new(outer_expr),
+                                target: pred.inner_col.data_type.clone(),
+                            },
+                        };
+                    }
+                    TypedExpr {
+                        data_type: pred.full_expr.data_type.clone(),
+                        nullable: pred.full_expr.nullable,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(outer_expr),
+                            op: pred.op,
+                            right: Box::new(maybe_unqualify_col(&pred.inner_col, same_bare_name)),
+                        },
                     }
                 };
                 let corr_cond = {
-                    let mut c = maybe_unqualify(&corr_preds[0].full_expr);
+                    let mut c = build_corr_cond(&corr_preds[0]);
                     for pred in &corr_preds[1..] {
                         c = TypedExpr {
                             data_type: DataType::Boolean,
@@ -853,7 +905,7 @@ impl<'a> AnalyzerContext<'a> {
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(c),
                                 op: BinOp::And,
-                                right: Box::new(maybe_unqualify(&pred.full_expr)),
+                                right: Box::new(build_corr_cond(pred)),
                             },
                         };
                     }
@@ -891,6 +943,95 @@ impl<'a> AnalyzerContext<'a> {
 
         Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
         Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
+
+        Ok(())
+    }
+
+    fn rewrite_uncorrelated_exists(
+        &self,
+        select: &mut ResolvedSelect,
+        scope: &mut AnalyzerScope,
+        mut resolved_sub: ResolvedQuery,
+        sq_id: usize,
+        negated: bool,
+    ) -> Result<(), String> {
+        let sq_alias = format!("__sq_{}", sq_id);
+        let match_col = format!("__exists_{}", sq_id);
+        let exists_col_id = self.alloc_column_id(
+            Some(sq_alias.clone()),
+            match_col.clone(),
+            DataType::Int64,
+            true,
+        );
+
+        if let QueryBody::Select(ref mut sel) = resolved_sub.body {
+            sel.distinct = false;
+            sel.projection.clear();
+            sel.projection.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: match_col.clone(),
+                output_column_id: exists_col_id,
+            });
+            sel.has_aggregation = false;
+        }
+        resolved_sub.output_columns = vec![OutputColumn {
+            column_id: exists_col_id,
+            name: match_col.clone(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }];
+        resolved_sub.limit = Some(1);
+
+        let sub_rel = Relation::Subquery {
+            query: Box::new(resolved_sub),
+            alias: sq_alias.clone(),
+            output_columns: vec![OutputColumn {
+                column_id: exists_col_id,
+                name: match_col.clone(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        };
+
+        scope.add_column(Some(&sq_alias), &match_col, DataType::Int64, true);
+        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        select.from = Some(Relation::Join(Box::new(JoinRelation {
+            left: current_from,
+            right: sub_rel,
+            join_type: JoinKind::LeftOuter,
+            condition: Some(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+        })));
+
+        let replacement = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: exists_col_id,
+                        qualifier: Some(sq_alias),
+                        column: match_col,
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
+                }),
+                negated: !negated,
+            },
+        };
+
+        Self::replace_placeholder_in_filter(&mut select.filter, sq_id, &replacement);
+        Self::replace_placeholder_in_filter(&mut select.having, sq_id, &replacement);
+        Self::replace_placeholder_in_projection(&mut select.projection, sq_id, &replacement);
 
         Ok(())
     }
@@ -946,7 +1087,10 @@ impl<'a> AnalyzerContext<'a> {
         // duplicate the check up front and surface the standard
         // "does not support binary predicate operation" diagnostic
         // (matching the bare-`=` rejection path).
-        for (lhs_i, sub_col) in lhs_typed_list.iter().zip(resolved_sub.output_columns.iter()) {
+        for (lhs_i, sub_col) in lhs_typed_list
+            .iter()
+            .zip(resolved_sub.output_columns.iter())
+        {
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
                 &lhs_i.data_type,
                 &sub_col.data_type,
@@ -1144,6 +1288,7 @@ impl<'a> AnalyzerContext<'a> {
                         nullable: sub_output_col.nullable,
                     },
                     output_name: match_col_name.clone(),
+                    output_column_id: in_match_col_id,
                 });
             }
 
@@ -1161,7 +1306,10 @@ impl<'a> AnalyzerContext<'a> {
                 condition: Some(eq_cond),
             })));
 
-            // Replace the SubqueryPlaceholder with `match_col IS [NOT] NULL`
+            // Replace the SubqueryPlaceholder with `match_col IS [NOT] NULL`.
+            // In projection/OR contexts, SQL IN keeps three-valued logic:
+            // a NULL left operand produces UNKNOWN even when the join
+            // indicator itself would otherwise look like "not matched".
             let is_null_expr = TypedExpr {
                 data_type: DataType::Boolean,
                 nullable: false,
@@ -1178,12 +1326,39 @@ impl<'a> AnalyzerContext<'a> {
                     negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
                 },
             };
-            Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &is_null_expr);
-            Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &is_null_expr);
+            let replacement = if lhs_typed.nullable {
+                TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: true,
+                    kind: ExprKind::Case {
+                        operand: None,
+                        when_then: vec![(
+                            TypedExpr {
+                                data_type: DataType::Boolean,
+                                nullable: false,
+                                kind: ExprKind::IsNull {
+                                    expr: Box::new(lhs_typed.clone()),
+                                    negated: false,
+                                },
+                            },
+                            TypedExpr {
+                                data_type: DataType::Boolean,
+                                nullable: true,
+                                kind: ExprKind::Literal(LiteralValue::Null),
+                            },
+                        )],
+                        else_expr: Some(Box::new(is_null_expr)),
+                    },
+                }
+            } else {
+                is_null_expr
+            };
+            Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
+            Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
             Self::replace_placeholder_in_projection(
                 &mut select.projection,
                 sq_info.id,
-                &is_null_expr,
+                &replacement,
             );
         } else {
             // Standard case: SEMI / ANTI JOIN. For NOT IN, NULL handling now
@@ -1254,30 +1429,43 @@ impl<'a> AnalyzerContext<'a> {
         let rhs_expr = sub_projection[0].expr.clone();
         let sub_rel = sub_from.ok_or("IN subquery must have a FROM clause".to_string())?;
 
-        // For correlated NOT IN, use null-aware equality so the LEFT ANTI
-        // join matches whenever either side is NULL within the correlation
-        // group — matching SQL's "NOT IN returns UNKNOWN when NULL is
-        // present". We deliberately do NOT switch to NullAwareLeftAnti
-        // here (unlike the uncorrelated path): NullAwareLeftAnti is a
-        // global "drop all probe rows if build has any NULL key" check,
-        // but for a correlated subquery the build side varies per outer
-        // row — the correlation predicate filters NULL keys away on a
-        // row-by-row basis. Keep the slower NLJ + null_aware_eq path so
-        // semantics stay correct on cases like
-        // `WHERE l1.k1 NOT IN (SELECT l3.k1 FROM t l3 WHERE l3.k3 = l1.k3)`.
-        let key_cond = if negated {
-            null_aware_eq(lhs_typed, rhs_expr)
-        } else {
-            TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(lhs_typed),
-                    op: BinOp::Eq,
-                    right: Box::new(rhs_expr),
-                },
-            }
+        // Keep the key condition as a plain equality so the optimizer can
+        // implement it as a hash join key. For nullable NOT IN semantics,
+        // the join type carries the null-aware anti behavior and evaluates
+        // residual correlation predicates against matching/null-key build
+        // rows.
+        let either_nullable = lhs_typed.nullable || rhs_expr.nullable;
+        let key_cond = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(lhs_typed),
+                op: BinOp::Eq,
+                right: Box::new(rhs_expr),
+            },
         };
+        let sub_filter = sub_filter.map(|filter| {
+            if negated && either_nullable && filter.nullable {
+                TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::FunctionCall {
+                        name: "coalesce".to_string(),
+                        args: vec![
+                            filter,
+                            TypedExpr {
+                                kind: ExprKind::Literal(LiteralValue::Bool(false)),
+                                data_type: DataType::Boolean,
+                                nullable: false,
+                            },
+                        ],
+                        distinct: false,
+                    },
+                }
+            } else {
+                filter
+            }
+        });
 
         let join_cond = match sub_filter {
             Some(f) => Some(TypedExpr {
@@ -1293,7 +1481,11 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         let join_type = if negated {
-            JoinKind::LeftAnti
+            if either_nullable {
+                JoinKind::NullAwareLeftAnti
+            } else {
+                JoinKind::LeftAnti
+            }
         } else {
             JoinKind::LeftSemi
         };
@@ -1619,7 +1811,9 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- WHERE clause ---
         let filter = match &select.selection {
-            Some(expr) => Some(coerce_where_to_bool(self.analyze_expr(expr, &merged_scope)?)),
+            Some(expr) => Some(coerce_where_to_bool(
+                self.analyze_expr(expr, &merged_scope)?,
+            )),
             None => None,
         };
 
@@ -1759,6 +1953,7 @@ impl<'a> AnalyzerContext<'a> {
             extra_projection.push(ProjectItem {
                 expr: inner_col.clone(),
                 output_name: col_name.clone(),
+                output_column_id: corr_col_id,
             });
 
             // Use unqualified column ref for the right side of the join condition.
@@ -1899,10 +2094,6 @@ pub(super) struct CorrelationPred {
 /// A correlation predicate is an equality (or comparison) where one side
 /// references an outer-scope column (resolves in outer_scope but NOT in inner_scope)
 /// and the other side references an inner-scope column.
-/// Build `(lhs = rhs) OR (lhs IS NULL) OR (rhs IS NULL)`. Used as the join
-/// key condition for null-aware `NOT IN`: the LEFT ANTI JOIN must match
-/// (and thus exclude the outer row) whenever either operand is NULL,
-/// because SQL's NOT IN returns UNKNOWN under those conditions.
 /// Coerce a WHERE / ON / HAVING expression to BOOLEAN when its analysed
 /// type is not already boolean. MySQL/StarRocks accept `WHERE int_col`
 /// (truthy when non-zero, FALSE when zero, NULL when NULL); our analyzer
@@ -1928,48 +2119,6 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             left: Box::new(expr),
             op: BinOp::Ne,
             right: Box::new(zero),
-        },
-    }
-}
-
-fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
-    // Goal: a Boolean predicate that, when used as the ON condition of a LEFT
-    // ANTI join rewritten from `lhs NOT IN (subq)`, causes the join to drop
-    // every left row whose SQL `NOT IN` result is FALSE *or* UNKNOWN —
-    // matching SQL semantics where:
-    //   • lhs IS NULL                 → NOT IN is UNKNOWN
-    //   • the subquery contains NULL  → NOT IN is UNKNOWN
-    //   • element-level NULL inside a complex-type value makes `lhs = rhs`
-    //     evaluate to NULL (e.g. `[1, NULL] = [1, NULL]` is NULL per ARRAY
-    //     element equality propagation).
-    //
-    // `lhs = rhs` returns NULL in every one of those cases. Wrapping it in
-    // `COALESCE(eq, TRUE)` turns each NULL into TRUE so the ANTI JOIN treats
-    // those pairs as a match and discards the left row. The previous 3-OR
-    // form (`eq OR lhs IS NULL OR rhs IS NULL`) only checked whole-value
-    // IS NULL and therefore missed the element-level NULL case — see
-    // `join_array_not_in_element_null.sql`.
-    let eq = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: true,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(lhs),
-            op: BinOp::Eq,
-            right: Box::new(rhs),
-        },
-    };
-    let true_lit = TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::Literal(LiteralValue::Bool(true)),
-    };
-    TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
-        kind: ExprKind::FunctionCall {
-            name: "coalesce".to_string(),
-            args: vec![eq, true_lit],
-            distinct: false,
         },
     }
 }
@@ -2042,7 +2191,9 @@ fn walk_for_outer_ref(
                 walk_for_outer_ref(e, inner_scope, outer_scope, saw_outer);
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
             walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
             for v in list {
                 walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
@@ -2133,7 +2284,13 @@ fn is_outer_only_ref(
 ) -> bool {
     let mut saw_column = false;
     let mut all_outer_only = true;
-    collect_column_outer_status(expr, inner_scope, outer_scope, &mut saw_column, &mut all_outer_only);
+    collect_column_outer_status(
+        expr,
+        inner_scope,
+        outer_scope,
+        &mut saw_column,
+        &mut all_outer_only,
+    );
     saw_column && all_outer_only
 }
 
@@ -2157,46 +2314,135 @@ fn collect_column_outer_status(
         }
         ExprKind::BinaryOp { left, right, .. } => {
             collect_column_outer_status(left, inner_scope, outer_scope, saw_column, all_outer_only);
-            collect_column_outer_status(right, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                right,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::IsNull { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::Cast { expr: inner, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::Nested(inner) => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
             for a in args {
-                collect_column_outer_status(a, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    a,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
-        ExprKind::InList { expr: inner, list, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        ExprKind::InList {
+            expr: inner, list, ..
+        } => {
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
             for item in list {
-                collect_column_outer_status(item, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    item,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
-        ExprKind::Between { expr: inner, low, high, .. } => {
-            collect_column_outer_status(inner, inner_scope, outer_scope, saw_column, all_outer_only);
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_column_outer_status(
+                inner,
+                inner_scope,
+                outer_scope,
+                saw_column,
+                all_outer_only,
+            );
             collect_column_outer_status(low, inner_scope, outer_scope, saw_column, all_outer_only);
             collect_column_outer_status(high, inner_scope, outer_scope, saw_column, all_outer_only);
         }
-        ExprKind::Case { operand, when_then, else_expr } => {
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
             if let Some(op) = operand {
-                collect_column_outer_status(op, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    op,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
             for (when, then) in when_then {
-                collect_column_outer_status(when, inner_scope, outer_scope, saw_column, all_outer_only);
-                collect_column_outer_status(then, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    when,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
+                collect_column_outer_status(
+                    then,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
             if let Some(else_) = else_expr {
-                collect_column_outer_status(else_, inner_scope, outer_scope, saw_column, all_outer_only);
+                collect_column_outer_status(
+                    else_,
+                    inner_scope,
+                    outer_scope,
+                    saw_column,
+                    all_outer_only,
+                );
             }
         }
         // Literals / placeholders / lambda params: no column refs, leave
@@ -2224,6 +2470,68 @@ fn dummy_relation() -> Relation {
         column_name: "__nr_dummy".to_string(),
         alias: None,
     })
+}
+
+/// Return the first output column from `rel` that is actually produced by the
+/// physical plan when `rel` is attached as an auxiliary join.
+///
+/// Used by `rewrite_join_on_exists_correlated` to pick an indicator column
+/// for the `IS NOT NULL` check.  The indicator MUST come from the relation
+/// that is attached to the plan (i.e. `sub_rel`), NOT from the subquery's
+/// SELECT projection — the projection is discarded when the EXISTS subquery
+/// is deconstructed into `(FROM, WHERE)` and the `SELECT <projection>` is
+/// not materialised.
+///
+/// For `CTEConsume` and `Subquery` relations the output_columns are
+/// authoritative.  For `Scan`-family relations we pair the first table column
+/// with its analyzer-allocated ColumnId.  For `Join` we recurse left.  If no
+/// column can be determined, return `None` and let the caller fall back.
+fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
+    match rel {
+        Relation::CTEConsume { output_columns, .. } => output_columns.first().cloned(),
+        Relation::Subquery { output_columns, .. } => output_columns.first().cloned(),
+        Relation::Unnest(u) => u.output_columns.first().cloned(),
+        Relation::Scan(s) => {
+            // Pair the first table column definition with its analyzer ColumnId.
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+                is_internal: false,
+            })
+        }
+        Relation::IcebergMetadataScan(s) => {
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+                is_internal: false,
+            })
+        }
+        Relation::IcebergDeltaScan(s) => {
+            let col_def = s.table.columns.first()?;
+            let col_id = s.column_ids.first().copied()?;
+            Some(OutputColumn {
+                column_id: col_id,
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                nullable: col_def.nullable,
+                is_internal: false,
+            })
+        }
+        Relation::Join(j) => relation_first_output_column(&j.left),
+        Relation::GenerateSeries(_) => {
+            // GenerateSeries has no ColumnId on its output (only a column_name string).
+            // Cannot produce a ColumnId-addressable indicator from it.
+            None
+        }
+    }
 }
 
 /// Wrap `join.left` (or `join.right`) with a LEFT OUTER JOIN against the

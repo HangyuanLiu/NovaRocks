@@ -3,6 +3,7 @@ pub(crate) mod imv;
 pub(crate) mod phase;
 pub(crate) mod pipeline;
 pub(crate) mod registry;
+pub(crate) mod required_columns;
 pub(crate) mod result;
 pub(crate) mod rule;
 pub(crate) mod rules;

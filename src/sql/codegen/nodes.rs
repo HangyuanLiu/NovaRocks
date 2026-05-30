@@ -1446,8 +1446,8 @@ mod tests {
             iceberg_metadata_pseudo_column_slots: std::collections::BTreeSet::new(),
         };
 
-        let connectors = crate::connector::ConnectorRegistry::default();
-        let err = build_exec_params_multi(&connectors, &[planned])
+        let registry = test_connector_registry();
+        let err = build_exec_params_multi(&registry, &[planned])
             .expect_err("version table must not be executable in phase 1");
         assert!(
             err.contains("IMV version scan ice.db.b at snapshot 11 reached scan-range construction before execution cutover"),

@@ -77,10 +77,12 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
         LogicalPlan::Filter(node) => LogicalPlan::Filter(FilterNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             predicate: node.predicate,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Project(node) => LogicalPlan::Project(ProjectNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             items: node.items,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Aggregate(node) => LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
@@ -88,22 +90,26 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             aggregates: node.aggregates,
             output_columns: node.output_columns,
             already_pushed: node.already_pushed,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Join(node) => LogicalPlan::Join(JoinNode {
             left: Box::new(inline_single_use_ctes(*node.left, ctx)),
             right: Box::new(inline_single_use_ctes(*node.right, ctx)),
             join_type: node.join_type,
             condition: node.condition,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Sort(node) => LogicalPlan::Sort(SortNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             items: node.items,
             analytic_partition_by: node.analytic_partition_by,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Limit(node) => LogicalPlan::Limit(LimitNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             limit: node.limit,
             offset: node.offset,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
             inputs: node
@@ -112,6 +118,8 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
             all: node.all,
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -119,6 +127,8 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .into_iter()
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -126,16 +136,20 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                 .into_iter()
                 .map(|input| inline_single_use_ctes(input, ctx))
                 .collect(),
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             window_exprs: node.window_exprs,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::SubqueryAlias(node) => LogicalPlan::SubqueryAlias(SubqueryAliasNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             alias: node.alias,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Repeat(node) => LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
@@ -144,11 +158,13 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             all_rollup_columns: node.all_rollup_columns,
             grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::CTEProduce(node) => LogicalPlan::CTEProduce(CTEProduceNode {
             cte_id: node.cte_id,
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::CTEAnchor(node) => {
             let produce = inline_single_use_ctes(*node.produce, ctx);
@@ -170,6 +186,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
                     cte_id: node.cte_id,
                     produce: Box::new(produce),
                     consumer: Box::new(consumer),
+                    required_output_columns: node.required_output_columns,
                 })
             }
         }
@@ -177,6 +194,7 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             mappings: node.mappings,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
@@ -187,10 +205,16 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
 fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::CTEConsume(node) if node.cte_id == cte_id => {
+            // Carry the CTEConsume's column-pruning tag onto the replacement
+            // SubqueryAlias for consistency with every other reconstruction site.
+            // Harmless today (CTE inline runs after Phase-2 pruning, so the tag is
+            // no longer read), but avoids silently dropping it if the pipeline
+            // order ever changes.
             LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Box::new(replacement.clone()),
                 alias: node.alias,
                 output_columns: node.output_columns,
+                required_output_columns: node.required_output_columns,
             })
         }
         LogicalPlan::Scan(_)
@@ -204,10 +228,12 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
         LogicalPlan::Filter(node) => LogicalPlan::Filter(FilterNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             predicate: node.predicate,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Project(node) => LogicalPlan::Project(ProjectNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             items: node.items,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Aggregate(node) => LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
@@ -215,22 +241,26 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             aggregates: node.aggregates,
             output_columns: node.output_columns,
             already_pushed: node.already_pushed,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Join(node) => LogicalPlan::Join(JoinNode {
             left: Box::new(replace_cte_consume(*node.left, cte_id, replacement)),
             right: Box::new(replace_cte_consume(*node.right, cte_id, replacement)),
             join_type: node.join_type,
             condition: node.condition,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Sort(node) => LogicalPlan::Sort(SortNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             items: node.items,
             analytic_partition_by: node.analytic_partition_by,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Limit(node) => LogicalPlan::Limit(LimitNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             limit: node.limit,
             offset: node.offset,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
             inputs: node
@@ -239,6 +269,8 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
             all: node.all,
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
             inputs: node
@@ -246,6 +278,8 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .into_iter()
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
             inputs: node
@@ -253,16 +287,20 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
                 .into_iter()
                 .map(|input| replace_cte_consume(input, cte_id, replacement))
                 .collect(),
+            output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Window(node) => LogicalPlan::Window(WindowNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             window_exprs: node.window_exprs,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::SubqueryAlias(node) => LogicalPlan::SubqueryAlias(SubqueryAliasNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             alias: node.alias,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Repeat(node) => LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
@@ -271,21 +309,25 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
             all_rollup_columns: node.all_rollup_columns,
             grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::CTEProduce(node) => LogicalPlan::CTEProduce(CTEProduceNode {
             cte_id: node.cte_id,
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::CTEAnchor(node) => LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id: node.cte_id,
             produce: Box::new(replace_cte_consume(*node.produce, cte_id, replacement)),
             consumer: Box::new(replace_cte_consume(*node.consumer, cte_id, replacement)),
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::Decode(node) => LogicalPlan::Decode(DecodeNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             mappings: node.mappings,
             output_columns: node.output_columns,
+            required_output_columns: node.required_output_columns,
         }),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
@@ -331,6 +373,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -349,6 +392,7 @@ mod tests {
             cte_id,
             alias: alias.to_string(),
             output_columns: output_columns(),
+            required_output_columns: None,
         })
     }
 
@@ -367,12 +411,15 @@ mod tests {
                 cte_id: 1,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(LogicalPlan::CTEConsume(CTEConsumeNode {
                 cte_id: 1,
                 alias: "t".to_string(),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
+            required_output_columns: None,
         });
 
         let ctx = collect_cte_counts(&plan);
@@ -388,8 +435,10 @@ mod tests {
                 cte_id: 1,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(consume_plan(1, "t")),
+            required_output_columns: None,
         });
 
         let ctx = collect_cte_counts(&plan);
@@ -405,8 +454,10 @@ mod tests {
                 cte_id: 1,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(consume_plan(1, "x")),
+            required_output_columns: None,
         });
 
         let ctx = collect_cte_counts(&plan);
@@ -430,11 +481,15 @@ mod tests {
                 cte_id: 1,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(LogicalPlan::Union(UnionNode {
                 inputs: vec![consume_plan(1, "t1"), consume_plan(1, "t2")],
                 all: true,
+                output_columns: vec![],
+                required_output_columns: None,
             })),
+            required_output_columns: None,
         });
 
         let ctx = collect_cte_counts(&plan);
@@ -452,6 +507,7 @@ mod tests {
                 cte_id: 1,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(LogicalPlan::CTEAnchor(CTEAnchorNode {
                 cte_id: 2,
@@ -463,16 +519,23 @@ mod tests {
                             cte_id: 1,
                             input: Box::new(scan_plan()),
                             output_columns: output_columns(),
+                            required_output_columns: None,
                         })),
                         consumer: Box::new(consume_plan(1, "a")),
+                        required_output_columns: None,
                     })),
                     output_columns: output_columns(),
+                    required_output_columns: None,
                 })),
                 consumer: Box::new(LogicalPlan::Union(UnionNode {
                     inputs: vec![consume_plan(2, "b1"), consume_plan(2, "b2")],
                     all: true,
+                    output_columns: vec![],
+                    required_output_columns: None,
                 })),
+                required_output_columns: None,
             })),
+            required_output_columns: None,
         });
 
         let ctx = collect_cte_counts(&plan);
@@ -508,11 +571,15 @@ mod tests {
                 cte_id: 2,
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
+                required_output_columns: None,
             })),
             consumer: Box::new(LogicalPlan::Union(UnionNode {
                 inputs: vec![consume_plan(1, "target"), consume_plan(2, "shadow")],
                 all: true,
+                output_columns: vec![],
+                required_output_columns: None,
             })),
+            required_output_columns: None,
         });
 
         let rewritten = replace_cte_consume(plan, 1, &scan_plan());

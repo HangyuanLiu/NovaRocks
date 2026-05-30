@@ -93,6 +93,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -137,6 +138,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
         })
     }
 
@@ -593,7 +595,9 @@ mod tests {
                     nullable: false,
                 },
                 output_name: "k".to_string(),
+                output_column_id: ColumnId(1),
             }],
+            required_output_columns: None,
         });
 
         let outcome = run_imv_rewrite(ImvRewriteInput {

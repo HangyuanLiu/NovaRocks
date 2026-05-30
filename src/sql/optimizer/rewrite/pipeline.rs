@@ -233,6 +233,7 @@ mod tests {
                     step: 1,
                     column_name: "stage1".to_string(),
                     alias: None,
+                    required_output_columns: None,
                 },
             )))
         }
@@ -446,6 +447,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 }

@@ -68,6 +68,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         aggregates: partial_calls,
         output_columns: partial_outputs,
         already_pushed: false, // partial isn't itself a final
+        required_output_columns: None,
     };
 
     // 4. Splice partial into the chosen side of the join. v1 invariant
@@ -114,6 +115,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         aggregates: final_aggs,
         output_columns: original.output_columns.clone(),
         already_pushed: true,
+        required_output_columns: None,
     })
 }
 
@@ -174,6 +176,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -198,6 +201,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let count_call = AggregateCall {
             name: "count".into(),
@@ -218,6 +222,7 @@ mod tests {
                 is_internal: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         };
         let push = PushPlan {
             side: super::super::context::Side::Left,
@@ -250,6 +255,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let original = AggregateNode {
             input: Box::new(join),
@@ -263,6 +269,7 @@ mod tests {
             }],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         let push = PushPlan {
             side: super::super::context::Side::Left,
@@ -295,6 +302,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let original = AggregateNode {
             input: Box::new(join),
@@ -323,6 +331,7 @@ mod tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         };
         let push = PushPlan {
             side: super::super::context::Side::Left,
