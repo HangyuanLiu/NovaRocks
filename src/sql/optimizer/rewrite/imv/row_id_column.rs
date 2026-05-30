@@ -88,7 +88,9 @@ mod tests {
     use super::*;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::catalog::{
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -178,7 +180,8 @@ mod tests {
         let rule = InjectRowIdRule;
         let ctx = build_ctx();
         let mut scan = delta_scan();
-        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(9)));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(9)));
         assert!(!rule.matches(&LogicalPlan::Scan(scan), &ctx));
     }
 }

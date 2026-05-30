@@ -87,10 +87,7 @@ mod tests {
             .iter()
             .position(|n| *n == "imv-apply-key")
             .expect("imv-apply-key stage must exist");
-        let val = names
-            .iter()
-            .position(|n| *n == "imv-validation")
-            .unwrap();
+        let val = names.iter().position(|n| *n == "imv-validation").unwrap();
         assert!(ap < ak && ak < val, "stage order: {names:?}");
     }
 }

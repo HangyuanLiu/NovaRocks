@@ -346,7 +346,10 @@ fn strip_change_op(batch: RecordBatch) -> Result<RecordBatch, String> {
     // optimizer-internal and must not flow into the iceberg target file.
     // `__nova_base_row_id` is the only IMV-added column the target schema
     // expects, so it is preserved.
-    let internal_names = [CHANGE_OP_COLUMN, crate::exec::row_position::ICEBERG_ROW_ID_COL];
+    let internal_names = [
+        CHANGE_OP_COLUMN,
+        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+    ];
     let schema = batch.schema();
     let drop_indices: Vec<usize> = schema
         .fields()

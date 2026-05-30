@@ -4953,7 +4953,6 @@ async fn commit_iceberg_mv_apply_with_ref(
     Ok(outcome)
 }
 
-
 fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;

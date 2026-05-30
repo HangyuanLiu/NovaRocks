@@ -2756,9 +2756,10 @@ pub(crate) fn execute_query_with_options(
         let outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
             crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
                 plan: logical,
-                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings()
-                    .disabled_rules
-                    .clone(),
+                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
+                )
+                .disabled_rules
+                .clone(),
                 mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
                 deadline: None,
                 next_column_id: factory.peek_next_id(),

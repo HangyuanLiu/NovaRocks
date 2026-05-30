@@ -415,8 +415,7 @@ fn project_superset_to_tuple(
     RecordBatch::try_new_with_options(
         out_schema,
         columns,
-        &arrow::record_batch::RecordBatchOptions::new()
-            .with_row_count(Some(superset.num_rows())),
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(superset.num_rows())),
     )
     .map_err(|e| format!("project iceberg delta-scan superset to tuple: {e}"))
 }

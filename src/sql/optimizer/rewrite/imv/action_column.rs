@@ -203,9 +203,7 @@ fn validate_scan(scan: &ScanNode) -> Result<(), String> {
                 }
                 // V7: _row_id must be present so the apply-key projection can reference it.
                 if !scan.columns.iter().any(ImvRowIdColumn::matches) {
-                    return Err(format!(
-                        "Delta-bound scan {fqn} missing _row_id column"
-                    ));
+                    return Err(format!("Delta-bound scan {fqn} missing _row_id column"));
                 }
                 Ok(())
             }
@@ -227,10 +225,10 @@ fn validate_scan(scan: &ScanNode) -> Result<(), String> {
 
 fn output_has_apply_key(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Project(p) => p
-            .items
-            .iter()
-            .any(|i| i.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)),
+        LogicalPlan::Project(p) => p.items.iter().any(|i| {
+            i.output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+        }),
         LogicalPlan::Filter(node) => output_has_apply_key(&node.input),
         _ => false,
     }
@@ -256,14 +254,13 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Scan(scan) => scan.columns.iter().any(|c| !c.is_internal),
         LogicalPlan::Filter(node) => has_visible_output(&node.input),
-        LogicalPlan::Project(node) => node
-            .items
-            .iter()
-            .any(|item| {
-                !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-                    && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
-                    && !item.output_name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
-            }),
+        LogicalPlan::Project(node) => node.items.iter().any(|item| {
+            !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
+                && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
+                && !item
+                    .output_name
+                    .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+        }),
         LogicalPlan::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
         LogicalPlan::Join(node) => {
             has_visible_output(&node.left) || has_visible_output(&node.right)
@@ -378,7 +375,8 @@ mod tests {
         // Scan with k + action + _row_id, root Project carrying all three plus
         // the apply key. This is the shape the IMV pipeline produces.
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlan::Project(ProjectNode {
             input: Box::new(LogicalPlan::Scan(scan)),
             items: vec![
@@ -480,7 +478,8 @@ mod tests {
     fn validation_rejects_dropped_action_above_project() {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         // Add _row_id so V7 passes; V3 fires because the Project below drops action.
-        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlan::Project(ProjectNode {
             input: Box::new(LogicalPlan::Scan(scan)),
             items: vec![ProjectItem {
@@ -582,7 +581,8 @@ mod tests {
     /// Helper: delta scan with both a valid action column and `_row_id`.
     fn delta_scan_with_action_and_row_id() -> ScanNode {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
         scan
     }
 

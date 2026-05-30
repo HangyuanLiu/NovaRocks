@@ -103,9 +103,12 @@ pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
 /// column through the unary chain.
 pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
     match plan {
-        LogicalPlan::Scan(scan) => {
-            scan.columns.iter().filter(|c| c.is_internal).cloned().collect()
-        }
+        LogicalPlan::Scan(scan) => scan
+            .columns
+            .iter()
+            .filter(|c| c.is_internal)
+            .cloned()
+            .collect(),
         LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
         LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
         _ => Vec::new(),
@@ -541,7 +544,8 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
         let mut scan = delta_scan_with_action(ColumnId(100));
-        scan.columns.push(ImvRowIdColumn::output_column(ColumnId(101)));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let plan = project_over(LogicalPlan::Scan(scan), ColumnId(1));
         assert!(rule.matches(&plan, &ctx));
         let RewriteResult::Changed(LogicalPlan::Project(project)) =
