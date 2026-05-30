@@ -28,6 +28,12 @@ NATIVE_CLAUSES = [
 FV = '"format-version" = "3"'
 
 
+def _norm(s):
+    """Collapse whitespace so re-running on an already-migrated statement is a
+    no-op rather than churning formatting."""
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def find_col_list_end(s, open_idx):
     """Return index just past the matching ')' for the '(' at open_idx."""
     depth = 0
@@ -75,6 +81,8 @@ def rewrite_statement(stmt):
         props = f'TBLPROPERTIES ({FV})'
 
     new_stmt = f"{head}\n{props}"
+    if _norm(new_stmt) == _norm(stmt):
+        return stmt, False  # already in Iceberg-v3 form; no real change
     return new_stmt, True
 
 
@@ -84,7 +92,7 @@ def process_file(path):
     changed = False
     # Split on ';' but keep statements; naive split is fine for these suites.
     parts = re.split(r";", text)
-    for idx, part in enumerate(parts):
+    for part in parts:
         if re.search(r"create\s+table", part, re.I):
             new, ch = rewrite_statement(part)
             if ch:
