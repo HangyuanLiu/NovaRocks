@@ -103,6 +103,8 @@ fn eligible_not_null<'a>(
         if !operand.nullable {
             continue;
         }
+        // Keys from join_equi_keys are always bare ColumnRef (Cast/Nested
+        // already peeled); this guard is defensive.
         let ExprKind::ColumnRef {
             column_id, column, ..
         } = &operand.kind
@@ -176,6 +178,9 @@ fn spine_not_null_inner(
                 record_not_null(p, ids, names);
             }
         }
+        // Project may rename columns; descending is intentionally conservative.
+        // A post-Project name match can only cause a (safe) skip of a possibly
+        // redundant filter — never an incorrectly-omitted one.
         LogicalPlan::Project(p) => spine_not_null_inner(&p.input, ids, names),
         LogicalPlan::SubqueryAlias(s) => spine_not_null_inner(&s.input, ids, names),
         LogicalPlan::Sort(s) => spine_not_null_inner(&s.input, ids, names),
@@ -405,6 +410,37 @@ mod tests {
             .expect("first applies");
         // Second application over the already-derived plan must not change it.
         assert!(DeriveJoinNotNullPredicate.apply(once).is_none());
+    }
+
+    #[test]
+    fn idempotent_when_not_null_already_in_scan_predicates() {
+        // State B: IS NOT NULL already pushed into scan.predicates (as
+        // PushDownPredicateScan would do). The rule must NOT re-derive.
+        fn not_null(operand: TypedExpr) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::IsNull {
+                    expr: Box::new(operand),
+                    negated: true,
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }
+        }
+        let mut left = scan("l", "tl", &[("a", 1, true)]);
+        let mut right = scan("r", "tr", &[("b", 2, true)]);
+        if let LogicalPlan::Scan(s) = &mut left {
+            s.predicates.push(not_null(col("l", "a", 1, true)));
+        }
+        if let LogicalPlan::Scan(s) = &mut right {
+            s.predicates.push(not_null(col("r", "b", 2, true)));
+        }
+        let plan = join(
+            JoinKind::Inner,
+            left,
+            right,
+            Some(eq(col("l", "a", 1, true), col("r", "b", 2, true))),
+        );
+        assert!(DeriveJoinNotNullPredicate.apply(plan).is_none());
     }
 
     #[test]
