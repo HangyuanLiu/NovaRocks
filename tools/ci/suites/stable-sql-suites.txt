@@ -5,13 +5,13 @@ filter
 limit
 project
 sort
+join
 
 # The suites below are not part of default daily mode yet.
 # Benchmark suites are excluded from default daily until benchmark data bootstrap is explicitly part of this runner:
 # ssb
 # tpc-h
 # tpc-ds
-# join
 # materialized-view
 # iceberg-mv-scheduler is excluded until scheduler timing expectations are verified for unattended daily runs.
 # aggregate

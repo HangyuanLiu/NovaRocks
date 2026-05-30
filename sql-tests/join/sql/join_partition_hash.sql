@@ -1,10 +1,12 @@
 -- @tags=join,partition_hash,broadcast
 -- Test Objective:
--- Validate partition hash join correctness with broadcast hint on large self-joins.
+-- Validate broadcast self-join correctness for partition-hash-style coverage at
+-- stable correctness scale. Physical partition-hash optimization coverage
+-- belongs in dedicated optimizer/perf tests.
 -- Covers: count aggregation through broadcast join with USING clause, modulus
 -- filters on probe side, and both probe-side and build-side column references.
 -- Test Flow:
--- 1. Create a row-generator utility table to produce 5,120,000 unique rows.
+-- 1. Create a row-generator utility table to produce 40,000 unique rows.
 -- 2. Create a main table with bigint key and string column, self-join via broadcast.
 -- 3. Assert count correctness with various modulus filters on k1.
 -- 4. Assert count correctness referencing c_string from both probe and build sides.
@@ -44,34 +46,6 @@ INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_b
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 9
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 10
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 11
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 12
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 13
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 14
--- @skip_result_check=true
-INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_base;
-
--- query 15
--- @skip_result_check=true
 CREATE TABLE ${case_db}.phj_row_util (
   idx BIGINT NULL
 ) ENGINE=OLAP
@@ -79,11 +53,11 @@ DUPLICATE KEY(idx)
 DISTRIBUTED BY HASH(idx) BUCKETS 32
 PROPERTIES ("replication_num" = "1");
 
--- query 16
+-- query 9
 -- @skip_result_check=true
 INSERT INTO ${case_db}.phj_row_util SELECT row_number() OVER() AS idx FROM ${case_db}.phj_row_util_base;
 
--- query 17
+-- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.phj_t1 (
     k1 BIGINT NULL,
@@ -94,64 +68,64 @@ DUPLICATE KEY(k1)
 DISTRIBUTED BY HASH(k1) BUCKETS 96
 PROPERTIES ("replication_num" = "1");
 
--- query 18
+-- query 11
 -- @skip_result_check=true
 INSERT INTO ${case_db}.phj_t1
 SELECT idx, idx, substr(uuid(), 1, 6)
 FROM ${case_db}.phj_row_util;
 
--- query 19
+-- query 12
 -- count(k1) from probe side, no filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
--- query 20
+-- query 13
 -- count(k1) with mod 2 filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
--- query 21
+-- query 14
 -- count(k1) with mod 3 filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 3 = 0;
 
--- query 22
+-- query 15
 -- count(k1) with mod 5 filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 5 = 0;
 
--- query 23
+-- query 16
 -- count(k1) with mod 10 filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
--- query 24
+-- query 17
 -- count(k1) with mod 100 filter
 SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
 
--- query 25
+-- query 18
 -- count(c_string) from probe side, no filter
 SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
--- query 26
+-- query 19
 -- count(c_string) from probe side with mod 2 filter
 SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
--- query 27
+-- query 20
 -- count(c_string) from probe side with mod 10 filter
 SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
--- query 28
+-- query 21
 -- count(c_string) from probe side with mod 100 filter
 SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
 
--- query 29
+-- query 22
 -- count(c_string) from build side, no filter
 SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
--- query 30
+-- query 23
 -- count(c_string) from build side with mod 2 filter
 SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
--- query 31
+-- query 24
 -- count(c_string) from build side with mod 10 filter
 SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
--- query 32
+-- query 25
 -- count(c_string) from build side with mod 100 filter
 SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
