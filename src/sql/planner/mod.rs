@@ -115,7 +115,7 @@ fn apply_query_modifiers(
 
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
-        let extra_items = collect_extra_sort_items(&order_by, &output_columns);
+        let extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
         let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
             // We're about to add extra sort-only columns to the inner Project
@@ -278,7 +278,11 @@ fn apply_query_modifiers(
     body_plan
 }
 
-fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> Vec<ProjectItem> {
+fn collect_extra_sort_items(
+    order_by: &[SortItem],
+    output: &[OutputColumn],
+    factory: &mut ColumnRefFactory,
+) -> Vec<ProjectItem> {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     let mut added = std::collections::HashSet::new();
@@ -290,7 +294,12 @@ fn collect_extra_sort_items(order_by: &[SortItem], output: &[OutputColumn]) -> V
             let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
                 *column_id
             } else {
-                ColumnId::UNSET
+                factory.create(
+                    None,
+                    output_name.clone(),
+                    item.expr.data_type.clone(),
+                    item.expr.nullable,
+                )
             };
             extra.push(ProjectItem {
                 expr: item.expr.clone(),
@@ -2692,6 +2701,50 @@ mod tests {
             outer_item.output_column_id, inner_output_cid,
             "outer strip-project item's output_column_id must equal inner project item's \
              output_column_id at the same position (Bug C: no fresh id minting)"
+        );
+    }
+
+    #[test]
+    fn sort_only_expression_extra_uses_traceable_output_column_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey FROM orders ORDER BY abs(o_custkey - o_orderkey)",
+        )
+        .expect("planner should succeed");
+
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected outer strip Project, got {other:?}"),
+        };
+        let sort = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => s,
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+        let inner_proj = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected inner Project under Sort, got {other:?}"),
+        };
+
+        let extra_item = inner_proj
+            .items
+            .iter()
+            .find(|item| item.output_name.starts_with("abs("))
+            .expect("expected sort-only expression item");
+        assert_ne!(
+            extra_item.output_column_id,
+            ColumnId::UNSET,
+            "sort-only expression extra must have a real output ColumnId so pruning can track it"
+        );
+
+        let ExprKind::ColumnRef {
+            column_id: sort_key_id,
+            ..
+        } = sort.items[0].expr.kind
+        else {
+            panic!("sort key should be rewritten to a ColumnRef");
+        };
+        assert_eq!(
+            sort_key_id, extra_item.output_column_id,
+            "sort key must reference the sort-only expression extra by ColumnId"
         );
     }
 }
