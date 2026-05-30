@@ -1,16 +1,29 @@
 Explain String
-GATHER EXCHANGE stats={rows=10000000000000}
-  PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=10000000000000}
-    WINDOW [row_number()] stats={rows=10000000000000}
-      SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=10000000000000}
-        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10000000000000}
-          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=10000000000000}
-            HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=1000000000}
-              SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=100000}
-                   TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_left
-              GATHER EXCHANGE stats={rows=100000}
+GATHER EXCHANGE stats={rows=8100000000000}
+  PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=8100000000000}
+    WINDOW [row_number()] stats={rows=8100000000000}
+      SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=8100000000000}
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=8100000000000}
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=8100000000000}
+            FILTER stats={rows=810000000}
+              predicate: a.k IS NOT NULL
+              HASH JOIN (BROADCAST, INNER, eq: [s.s = a.k]) stats={rows=900000000}
                 SCAN db_sqlt_fc3e81882b2a0111.g3_bj_small (alias=s) stats={rows=100000}
                      TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_small
+                     columns: s, x
+                     min-max stats
+                     predicates: s.s IS NOT NULL
+                GATHER EXCHANGE stats={rows=90000}
+                  FILTER stats={rows=90000}
+                    predicate: a.k IS NOT NULL
+                    SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=100000}
+                         TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_left
+                         columns: k, v
+                         min-max stats
+                         predicates: a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL AND a.k IS NOT NULL
             GATHER EXCHANGE stats={rows=100000}
               SCAN db_sqlt_fc3e81882b2a0111.g3_bj_right (alias=b) stats={rows=100000}
                    TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_right
+                   columns: k, w
+                   min-max stats
+                   predicates: b.k IS NOT NULL

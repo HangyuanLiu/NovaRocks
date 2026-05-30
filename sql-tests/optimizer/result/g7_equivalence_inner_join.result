@@ -2,16 +2,18 @@
 Explain String
 GATHER EXCHANGE stats={rows=1000000000}
   PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=1000000000}
-    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=1000000000}
-      SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=100000}
-           TABLE: db_sqlt_78546de01468a3d3.g7_l
-           columns: lk
+    HASH JOIN (BROADCAST, INNER, eq: [r.rk = l.lk]) stats={rows=1000000000}
+      SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=100000}
+           TABLE: db_sqlt_78546de01468a3d3.g7_r
+           columns: rk
            min-max stats
+           predicates: r.rk IS NOT NULL
       GATHER EXCHANGE stats={rows=100000}
-        SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=100000}
-             TABLE: db_sqlt_78546de01468a3d3.g7_r
-             columns: rk
+        SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=100000}
+             TABLE: db_sqlt_78546de01468a3d3.g7_l
+             columns: lk
              min-max stats
+             predicates: l.lk = 10 AND l.lk IS NOT NULL
 
 -- query 6
 Explain String
@@ -22,8 +24,10 @@ GATHER EXCHANGE stats={rows=1000000000}
            TABLE: db_sqlt_78546de01468a3d3.g7_l
            columns: lk
            min-max stats
+           predicates: l.lk IS NOT NULL
       GATHER EXCHANGE stats={rows=100000}
         SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=100000}
              TABLE: db_sqlt_78546de01468a3d3.g7_r
              columns: rk
              min-max stats
+             predicates: r.rk = 20 AND r.rk IS NOT NULL
