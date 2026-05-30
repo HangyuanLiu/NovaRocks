@@ -24,7 +24,9 @@ pub(crate) use operator::Operator;
 pub(crate) use physical_plan::PhysicalPlanNode;
 pub(crate) use property::PhysicalPropertySet;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::sql::column_id::ColumnRefFactory;
@@ -63,6 +65,12 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
+    // Wrap factory in Rc<RefCell<...>> so it can be shared with RewriteContext
+    // for the duration of the rewrite phase (needed for auto-fill column minting
+    // in per-operator column-pruning rules). The Rc is unwrapped back to a plain
+    // ColumnRefFactory before the Memo build step.
+    let factory = Rc::new(RefCell::new(factory));
+
     // 1. Query logical rewrite pipeline. The ordered stages preserve the
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
     //    aggregate pushdown → column pruning → low-cardinality dict rewrite.
@@ -76,6 +84,7 @@ pub(crate) fn optimize(
     if let Some(provider) = resolve_dictionary_provider(dictionary_provider) {
         rewrite_ctx.set_dictionary_provider(provider);
     }
+    rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
     let rewritten =
         rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
 
@@ -84,7 +93,23 @@ pub(crate) fn optimize(
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
     let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 
-    // 5. Convert to Memo.
+    // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
+    //    is done so the only two references at this call site are the local
+    //    `factory` binding and the clone stored in `rewrite_ctx`. Drop the
+    //    context's reference first, then unwrap the local one.
+    debug_assert_eq!(
+        Rc::strong_count(&factory),
+        2,
+        "expected exactly 2 Rc references (factory + rewrite_ctx) before drop; \
+         a rewrite rule stored an extra clone of the context — check column_ref_factory() call sites"
+    );
+    drop(rewrite_ctx);
+    let factory = Rc::try_unwrap(factory)
+        .expect(
+            "ColumnRefFactory Rc must be uniquely owned after rewrite; \
+             a rule cloned the context and did not drop the clone",
+        )
+        .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
     let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
@@ -301,6 +326,7 @@ mod is_known_rule_name_tests {
         let plan = LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
         let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
@@ -421,6 +447,7 @@ mod is_known_rule_name_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
         let s_ref = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -452,6 +479,7 @@ mod is_known_rule_name_tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         })
     }
 

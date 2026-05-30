@@ -77,10 +77,12 @@ impl RewriteRule for PushDownPredicateProject {
         let new_child = LogicalPlan::Filter(FilterNode {
             input: proj.input,
             predicate: pushed,
+            required_output_columns: None,
         });
         let new_project = LogicalPlan::Project(ProjectNode {
             input: Box::new(new_child),
             items: proj.items,
+            required_output_columns: proj.required_output_columns,
         });
         Some(wrap_remaining_filter(new_project, remaining))
     }
@@ -175,6 +177,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -187,8 +190,10 @@ mod tests {
                 .map(|n| ProjectItem {
                     expr: col(n),
                     output_name: (*n).into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 })
                 .collect(),
+            required_output_columns: None,
         })
     }
 
@@ -201,6 +206,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(project),
             predicate: eq(col("a"), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateProject;
@@ -241,11 +247,14 @@ mod tests {
             items: vec![ProjectItem {
                 expr: computed_expr,
                 output_name: "x".into(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
+            required_output_columns: None,
         });
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(project),
             predicate: eq(col("x"), int_lit(5)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateProject;
@@ -271,6 +280,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(project),
             predicate: one_eq_one,
+            required_output_columns: None,
         });
         let rule = PushDownPredicateProject;
         let out = rule.apply(filter).expect("should push vacuous constant");
@@ -308,18 +318,22 @@ mod tests {
                 ProjectItem {
                     expr: col("a"),
                     output_name: "a".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 },
                 ProjectItem {
                     expr: computed_expr,
                     output_name: "x".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 },
             ],
+            required_output_columns: None,
         });
         // Filter: a=1 AND x=5
         let pred = and(eq(col("a"), int_lit(1)), eq(col("x"), int_lit(5)));
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(project),
             predicate: pred,
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateProject;

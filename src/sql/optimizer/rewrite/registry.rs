@@ -39,6 +39,13 @@ pub(crate) fn query_rewrite_pipeline(
             rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
         ),
         RewriteStage::new(
+            "TagRequiredColumns",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(
+                crate::sql::optimizer::rewrite::required_columns::TagRequiredColumns,
+            )],
+        ),
+        RewriteStage::new(
             "ColumnPruning",
             RewritePhase::StructuralRewrite,
             rules::column_pruning_rules(),
@@ -99,8 +106,25 @@ mod tests {
                 "EliminateUniqueAggregate",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
-                "PruneColumns",
+                "PruneAggregateColumns",
+                "PruneCTEAnchorColumns",
+                "PruneCTEConsumeColumns",
+                "PruneCTEProduceColumns",
+                "PruneDecodeColumns",
+                "PruneExceptColumns",
+                "PruneFilterColumns",
+                "PruneIntersectColumns",
+                "PruneJoinColumns",
+                "PruneLimitColumns",
+                "PruneProjectColumns",
+                "PruneRepeatColumns",
+                "PruneScanColumns",
+                "PruneSortColumns",
+                "PruneSubqueryAliasColumns",
+                "PruneTableFunctionColumns",
                 "PruneUkFkJoin",
+                "PruneUnionColumns",
+                "PruneWindowColumns",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateJoin",
@@ -111,6 +135,7 @@ mod tests {
                 "PushDownPredicateScan",
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
+                "TagRequiredColumns",
             ]
         );
     }
@@ -147,6 +172,7 @@ mod tests {
         assert!(is_known_rewrite_rule_name(
             "LowCardinalityDictionaryRewrite"
         ));
+        assert!(is_known_rewrite_rule_name("TagRequiredColumns"));
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
     }
 
@@ -215,6 +241,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 }

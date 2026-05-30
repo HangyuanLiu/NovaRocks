@@ -185,6 +185,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
         })
     }
 
@@ -210,7 +211,9 @@ mod tests {
                     nullable: false,
                 },
                 output_name: "k".to_string(),
+                output_column_id: ColumnId(1),
             }],
+            required_output_columns: None,
         })
     }
 
@@ -222,6 +225,7 @@ mod tests {
                 data_type: DataType::Boolean,
                 nullable: false,
             },
+            required_output_columns: None,
         })
     }
 
@@ -232,6 +236,7 @@ mod tests {
             aggregates: Vec::new(),
             output_columns: Vec::new(),
             already_pushed: false,
+            required_output_columns: None,
         })
     }
 
@@ -241,11 +246,17 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: None,
+            required_output_columns: None,
         })
     }
 
     fn union_over(inputs: Vec<LogicalPlan>) -> LogicalPlan {
-        LogicalPlan::Union(UnionNode { inputs, all: true })
+        LogicalPlan::Union(UnionNode {
+            inputs,
+            all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
+        })
     }
 
     #[test]

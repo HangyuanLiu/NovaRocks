@@ -21,11 +21,10 @@ pub(crate) fn low_cardinality_dictionary_rules() -> Vec<Box<dyn LogicalRewriteRu
 }
 
 pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
-    vec![
-        Box::new(column_pruning::PruneColumns),
-        Box::new(ukfk::PruneUkFkJoin),
-        Box::new(ukfk::EliminateUniqueAggregate),
-    ]
+    let mut rules = column_pruning::all_rules();
+    rules.push(Box::new(ukfk::PruneUkFkJoin));
+    rules.push(Box::new(ukfk::EliminateUniqueAggregate));
+    rules
 }
 
 /// Predicate pushdown rules only (no column pruning). Used in the
@@ -76,7 +75,9 @@ mod tests {
     #[test]
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
-        assert_eq!(rules.len(), 11);
+        // 18 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
+        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules = 28
+        assert_eq!(rules.len(), 28);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -86,8 +87,25 @@ mod tests {
                 "EliminateUniqueAggregate",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
-                "PruneColumns",
+                "PruneAggregateColumns",
+                "PruneCTEAnchorColumns",
+                "PruneCTEConsumeColumns",
+                "PruneCTEProduceColumns",
+                "PruneDecodeColumns",
+                "PruneExceptColumns",
+                "PruneFilterColumns",
+                "PruneIntersectColumns",
+                "PruneJoinColumns",
+                "PruneLimitColumns",
+                "PruneProjectColumns",
+                "PruneRepeatColumns",
+                "PruneScanColumns",
+                "PruneSortColumns",
+                "PruneSubqueryAliasColumns",
+                "PruneTableFunctionColumns",
                 "PruneUkFkJoin",
+                "PruneUnionColumns",
+                "PruneWindowColumns",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateJoin",
                 "PushDownPredicateProject",

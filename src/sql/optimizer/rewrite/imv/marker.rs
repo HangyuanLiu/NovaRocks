@@ -310,6 +310,7 @@ mod tests {
         LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -414,11 +415,13 @@ mod tests {
             input: Box::new(nested),
             limit: None,
             offset: None,
+            required_output_columns: None,
         });
         let outer = LogicalPlan::Limit(LimitNode {
             input: Box::new(inner),
             limit: None,
             offset: None,
+            required_output_columns: None,
         });
         assert!(plan_contains_imv_marker(&outer));
     }

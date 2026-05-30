@@ -361,20 +361,28 @@ impl<'a> super::AnalyzerContext<'a> {
                     let cols = metadata_table_schema(metadata_ty.clone());
                     let mut scope = self.new_scope();
                     let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-                    for col in &cols {
-                        scope.add_column(
-                            Some(qualifier),
-                            &col.name,
-                            col.data_type.clone(),
-                            col.nullable,
-                        );
-                    }
+                    // Collect analyzer-allocated ColumnIds so the planner can reuse
+                    // them on the scan's output_columns (keeping ColumnRef ids in the
+                    // rest of the plan consistent with the scan's output — same pattern
+                    // as `Relation::Scan`).
+                    let column_ids: Vec<crate::sql::column_id::ColumnId> = cols
+                        .iter()
+                        .map(|col| {
+                            scope.add_column(
+                                Some(qualifier),
+                                &col.name,
+                                col.data_type.clone(),
+                                col.nullable,
+                            )
+                        })
+                        .collect();
 
                     let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {
                         database: db_lower,
                         table: table_def,
                         metadata_table_type: metadata_ty,
                         alias: alias_name,
+                        column_ids,
                     });
                     return Ok((relation, scope));
                 }
@@ -936,11 +944,15 @@ impl<'a> super::AnalyzerContext<'a> {
         let alias_name = alias.map(|a| a.name.value.clone());
         let mut scope = self.new_scope();
         let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-        scope.add_table(Some(qualifier), &table_def.columns);
-        scope.add_iceberg_metadata_columns(
+        // Collect analyzer-allocated ColumnIds so the planner can reuse them on
+        // the scan's output_columns, keeping ColumnRef ids consistent throughout
+        // the plan (same pattern as `Relation::Scan`).
+        let mut column_ids = scope.add_table(Some(qualifier), &table_def.columns);
+        let meta_ids = scope.add_iceberg_metadata_columns(
             qualifier,
             &table_def.iceberg_row_lineage_metadata_columns,
         );
+        column_ids.extend(meta_ids);
 
         let relation = Relation::IcebergDeltaScan(IcebergDeltaScanRelation {
             catalog,
@@ -950,6 +962,7 @@ impl<'a> super::AnalyzerContext<'a> {
             from_snapshot_id,
             to_snapshot_id,
             alias: alias_name,
+            column_ids,
         });
         Ok((relation, scope))
     }

@@ -259,6 +259,172 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
     }
 }
 
+/// Collect every [`ColumnId`] referenced by an expression.
+///
+/// [`ColumnId::UNSET`] is deliberately excluded — an unresolved reference must
+/// not constrain column pruning.
+pub(crate) fn collect_column_id_refs(expr: &TypedExpr) -> HashSet<crate::sql::column_id::ColumnId> {
+    let mut out = HashSet::new();
+    collect_column_id_refs_inner(expr, &mut out);
+    out
+}
+
+fn collect_column_id_refs_inner(
+    expr: &TypedExpr,
+    out: &mut HashSet<crate::sql::column_id::ColumnId>,
+) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            if *column_id != crate::sql::column_id::ColumnId::UNSET {
+                out.insert(*column_id);
+            }
+        }
+        ExprKind::LambdaParamRef { .. } => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_id_refs_inner(left, out);
+            collect_column_id_refs_inner(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. } => collect_column_id_refs_inner(expr, out),
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_column_id_refs_inner(arg, out);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => collect_column_id_refs_inner(body, out),
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_column_id_refs_inner(arg, out);
+            }
+            for ob in order_by {
+                collect_column_id_refs_inner(&ob.expr, out);
+            }
+        }
+        ExprKind::Cast { expr, .. } => collect_column_id_refs_inner(expr, out),
+        ExprKind::IsNull { expr, .. } => collect_column_id_refs_inner(expr, out),
+        ExprKind::InList { expr, list, .. } => {
+            collect_column_id_refs_inner(expr, out);
+            for item in list {
+                collect_column_id_refs_inner(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_id_refs_inner(expr, out);
+            collect_column_id_refs_inner(low, out);
+            collect_column_id_refs_inner(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_column_id_refs_inner(expr, out);
+            collect_column_id_refs_inner(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_column_id_refs_inner(operand, out);
+            }
+            for (when, then) in when_then {
+                collect_column_id_refs_inner(when, out);
+                collect_column_id_refs_inner(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_column_id_refs_inner(else_expr, out);
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } => collect_column_id_refs_inner(expr, out),
+        ExprKind::Nested(inner) => collect_column_id_refs_inner(inner, out),
+        ExprKind::Literal(_) => {}
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_column_id_refs_inner(arg, out);
+            }
+            for pb in partition_by {
+                collect_column_id_refs_inner(pb, out);
+            }
+            for ob in order_by {
+                collect_column_id_refs_inner(&ob.expr, out);
+            }
+        }
+        // SubqueryPlaceholder should be rewritten before reaching here,
+        // but handle gracefully as a no-op.
+        ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Lambda { body, .. } => {
+            // Lambda-bound parameters are emitted as the distinct `LambdaParamRef`
+            // variant (a no-op above), NOT as `ColumnRef`, so they never enter the
+            // id set — no filtering needed here. Walk the body to capture outer
+            // column refs the closure captures.
+            collect_column_id_refs_inner(body, out);
+        }
+    }
+}
+
+/// Return the ordered list of [`ColumnId`]s in the output schema of a plan node.
+///
+/// This is the authoritative source for "which ColumnIds does this subtree produce",
+/// used by the Phase-1 column-pruning tagging pass to split a parent's needed set
+/// across join/set-op children.
+pub(crate) fn collect_output_ids_ordered(
+    plan: &LogicalPlan,
+) -> Vec<crate::sql::column_id::ColumnId> {
+    match plan {
+        LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Project(p) => p
+            .items
+            .iter()
+            .map(|item| item.output_column_id)
+            .filter(|id| *id != crate::sql::column_id::ColumnId::UNSET)
+            .collect(),
+        LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::SubqueryAlias(s) => s.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlan::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
+        // GenerateSeries has no ColumnId on its output slot (only a name string).
+        LogicalPlan::GenerateSeries(_) => vec![],
+        // Passthrough: the node does not add or rename output ColumnIds.
+        LogicalPlan::Filter(f) => collect_output_ids_ordered(&f.input),
+        LogicalPlan::Sort(s) => collect_output_ids_ordered(&s.input),
+        LogicalPlan::Limit(l) => collect_output_ids_ordered(&l.input),
+        LogicalPlan::Repeat(r) => collect_output_ids_ordered(&r.input),
+        LogicalPlan::TableFunction(t) => {
+            // TableFunction extends the input's output with its own output columns.
+            let mut ids = collect_output_ids_ordered(&t.input);
+            ids.extend(t.output_columns.iter().map(|c| c.column_id));
+            ids
+        }
+        LogicalPlan::Join(j) => {
+            // Join output = left output ids ++ right output ids (left first).
+            let mut ids = collect_output_ids_ordered(&j.left);
+            ids.extend(collect_output_ids_ordered(&j.right));
+            ids
+        }
+        LogicalPlan::CTEAnchor(a) => collect_output_ids_ordered(&a.consumer),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            panic!("imv marker should not appear in non-IMV pruning")
+        }
+    }
+}
+
+/// Return the set of [`ColumnId`]s in the output schema of a plan node.
+///
+/// `collect_output_ids(plan) = collect_output_ids_ordered(plan).into_iter().collect()`.
+pub(crate) fn collect_output_ids(plan: &LogicalPlan) -> HashSet<crate::sql::column_id::ColumnId> {
+    collect_output_ids_ordered(plan).into_iter().collect()
+}
+
 /// Merge a parent's needed columns with additional column names.
 pub(crate) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> HashSet<String> {
     let mut result = parent.cloned().unwrap_or_default();
@@ -276,6 +442,7 @@ pub(crate) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>
         LogicalPlan::Filter(FilterNode {
             input: Box::new(plan),
             predicate: combine_and(remaining),
+            required_output_columns: None,
         })
     }
 }
@@ -514,5 +681,265 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
+    }
+}
+
+#[cfg(test)]
+mod column_id_helper_tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, OutputColumn};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
+
+    // -----------------------------------------------------------------------
+    // collect_column_id_refs tests
+    // -----------------------------------------------------------------------
+
+    fn col_ref_expr(id: ColumnId) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: id,
+                qualifier: None,
+                column: format!("c{}", id.0),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn simple_column_ref_collects_its_id() {
+        let id = ColumnId::new_for_test(42);
+        let expr = col_ref_expr(id);
+        let result = collect_column_id_refs(&expr);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&id));
+    }
+
+    #[test]
+    fn binary_op_collects_both_ids() {
+        let id_left = ColumnId::new_for_test(1);
+        let id_right = ColumnId::new_for_test(2);
+        let expr = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref_expr(id_left)),
+                op: crate::sql::analysis::BinOp::Eq,
+                right: Box::new(col_ref_expr(id_right)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let result = collect_column_id_refs(&expr);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&id_left));
+        assert!(result.contains(&id_right));
+    }
+
+    #[test]
+    fn unset_column_ref_collects_nothing() {
+        let expr = col_ref_expr(ColumnId::UNSET);
+        let result = collect_column_id_refs(&expr);
+        assert!(result.is_empty(), "UNSET must be excluded from the result");
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_output_ids / collect_output_ids_ordered tests
+    // -----------------------------------------------------------------------
+
+    fn make_output_column(id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: id,
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn three_col_scan(ids: [ColumnId; 3]) -> LogicalPlan {
+        let table = TableDef {
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "c".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        };
+        LogicalPlan::Scan(ScanNode {
+            database: "default".to_string(),
+            table,
+            alias: None,
+            columns: vec![
+                make_output_column(ids[0], "a"),
+                make_output_column(ids[1], "b"),
+                make_output_column(ids[2], "c"),
+            ],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn scan_with_three_output_columns_returns_all_ids() {
+        let ids = [
+            ColumnId::new_for_test(1),
+            ColumnId::new_for_test(2),
+            ColumnId::new_for_test(3),
+        ];
+        let plan = three_col_scan(ids);
+        let result = collect_output_ids(&plan);
+        assert_eq!(result.len(), 3);
+        for id in &ids {
+            assert!(result.contains(id), "expected {:?} in result", id);
+        }
+    }
+
+    #[test]
+    fn scan_output_ids_ordered_preserves_column_order() {
+        let ids = [
+            ColumnId::new_for_test(10),
+            ColumnId::new_for_test(20),
+            ColumnId::new_for_test(30),
+        ];
+        let plan = three_col_scan(ids);
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(ordered, vec![ids[0], ids[1], ids[2]]);
+    }
+
+    #[test]
+    fn join_output_ids_are_left_then_right() {
+        let left_ids = [
+            ColumnId::new_for_test(1),
+            ColumnId::new_for_test(2),
+            ColumnId::new_for_test(3),
+        ];
+        let right_ids = [
+            ColumnId::new_for_test(4),
+            ColumnId::new_for_test(5),
+            ColumnId::new_for_test(6),
+        ];
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(three_col_scan(left_ids)),
+            right: Box::new(three_col_scan(right_ids)),
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            condition: None,
+            required_output_columns: None,
+        });
+        let ordered = collect_output_ids_ordered(&plan);
+        let expected: Vec<ColumnId> = left_ids.iter().chain(right_ids.iter()).copied().collect();
+        assert_eq!(ordered, expected);
+    }
+
+    /// A Project with one passthrough ColumnRef item and one computed item
+    /// (whose output_column_id is explicitly set) must return both ids.
+    /// This validates that `collect_output_ids_ordered` now reads
+    /// `output_column_id` instead of peeking at the expr's ColumnRef.
+    #[test]
+    fn project_passthrough_and_computed_both_collected() {
+        use crate::sql::analysis::{BinOp, ProjectItem, TypedExpr};
+
+        let pass_id = ColumnId::new_for_test(10);
+        let comp_id = ColumnId::new_for_test(20);
+
+        let scan = three_col_scan([
+            pass_id,
+            ColumnId::new_for_test(11),
+            ColumnId::new_for_test(12),
+        ]);
+
+        // Passthrough item: expr is a ColumnRef with pass_id.
+        let passthrough_item = ProjectItem {
+            expr: col_ref_expr(pass_id),
+            output_name: "a".to_string(),
+            output_column_id: pass_id,
+        };
+
+        // Computed item: expr is a BinaryOp (not a ColumnRef), but output_column_id is set.
+        let computed_item = ProjectItem {
+            expr: TypedExpr {
+                kind: crate::sql::analysis::ExprKind::BinaryOp {
+                    left: Box::new(col_ref_expr(pass_id)),
+                    op: BinOp::Add,
+                    right: Box::new(col_ref_expr(ColumnId::new_for_test(11))),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: "computed".to_string(),
+            output_column_id: comp_id,
+        };
+
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![passthrough_item, computed_item],
+            required_output_columns: None,
+        });
+
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(
+            ordered,
+            vec![pass_id, comp_id],
+            "both passthrough and computed output_column_ids must be returned"
+        );
+    }
+
+    /// A Project item with UNSET output_column_id must be excluded
+    /// (synthetic dict-slot items that are never addressed by pruning).
+    #[test]
+    fn project_unset_output_column_id_excluded() {
+        use crate::sql::analysis::ProjectItem;
+
+        let real_id = ColumnId::new_for_test(5);
+        let scan = three_col_scan([
+            real_id,
+            ColumnId::new_for_test(6),
+            ColumnId::new_for_test(7),
+        ]);
+
+        let real_item = ProjectItem {
+            expr: col_ref_expr(real_id),
+            output_name: "c".to_string(),
+            output_column_id: real_id,
+        };
+        let unset_item = ProjectItem {
+            expr: col_ref_expr(ColumnId::UNSET),
+            output_name: "__synthetic".to_string(),
+            output_column_id: ColumnId::UNSET,
+        };
+
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![real_item, unset_item],
+            required_output_columns: None,
+        });
+
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(ordered, vec![real_id], "UNSET items must be filtered out");
     }
 }

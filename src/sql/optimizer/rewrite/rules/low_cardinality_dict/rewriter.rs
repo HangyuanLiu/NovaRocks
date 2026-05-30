@@ -94,6 +94,7 @@ fn rewrite_node(
                 LogicalPlan::Filter(FilterNode {
                     input: Box::new(input),
                     predicate: node.predicate,
+                    required_output_columns: node.required_output_columns,
                 }),
                 scope,
             ))
@@ -108,6 +109,7 @@ fn rewrite_node(
                     input: Box::new(input),
                     limit: node.limit,
                     offset: node.offset,
+                    required_output_columns: node.required_output_columns,
                 }),
                 scope,
             ))
@@ -266,6 +268,7 @@ fn rewrite_project(
             items.push(crate::sql::analysis::ProjectItem {
                 expr: rewritten,
                 output_name: item.output_name,
+                output_column_id: item.output_column_id,
             });
             continue;
         }
@@ -318,12 +321,15 @@ fn rewrite_project(
                 nullable,
             },
             output_name: dict_name,
+            // Synthetic dict-slot pass-through; not addressed by the pruning pass.
+            output_column_id: ColumnId::UNSET,
         });
     }
     Ok((
         LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
             items,
+            required_output_columns: node.required_output_columns,
         }),
         output_scope,
     ))
@@ -413,6 +419,7 @@ fn rewrite_aggregate(
         aggregates,
         output_columns: output_columns.clone(),
         already_pushed: node.already_pushed,
+        required_output_columns: node.required_output_columns,
     });
     if decoded_group_keys.is_empty() {
         // Aggregate did not consume any dict columns from its input;
@@ -456,6 +463,7 @@ fn rewrite_aggregate(
             input: Box::new(aggregate),
             mappings,
             output_columns,
+            required_output_columns: None,
         }),
         DictScope::new(),
     ))
@@ -502,6 +510,7 @@ fn rewrite_sort(
             input: Box::new(input),
             items: sort_items,
             analytic_partition_by: node.analytic_partition_by,
+            required_output_columns: node.required_output_columns,
         }),
         output_scope,
     ))
@@ -614,6 +623,7 @@ fn rewrite_join(
                 right: Box::new(right),
                 join_type: node.join_type,
                 condition: node.condition,
+                required_output_columns: node.required_output_columns,
             }),
             DictScope::new(),
         ));
@@ -706,6 +716,7 @@ fn rewrite_join(
             right: Box::new(right),
             join_type: node.join_type,
             condition,
+            required_output_columns: node.required_output_columns,
         }),
         out_scope,
     ))
@@ -1224,6 +1235,7 @@ pub(crate) fn wrap_with_decode(
         input: Box::new(plan),
         mappings,
         output_columns: renamed_outputs,
+        required_output_columns: None,
     })
 }
 
@@ -1245,7 +1257,7 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             .items
             .iter()
             .map(|item| OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: item.output_column_id,
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,

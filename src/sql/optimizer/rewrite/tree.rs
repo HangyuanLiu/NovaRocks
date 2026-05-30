@@ -215,16 +215,44 @@ fn rewrite_children(
         }
         LogicalPlan::Union(node) => {
             let all = node.all;
+            let output_columns = node.output_columns;
+            let required_output_columns = node.required_output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Union(UnionNode { inputs, all }), changed))
+            Ok((
+                LogicalPlan::Union(UnionNode {
+                    inputs,
+                    all,
+                    output_columns,
+                    required_output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Intersect(node) => {
+            let output_columns = node.output_columns;
+            let required_output_columns = node.required_output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Intersect(IntersectNode { inputs }), changed))
+            Ok((
+                LogicalPlan::Intersect(IntersectNode {
+                    inputs,
+                    output_columns,
+                    required_output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Except(node) => {
+            let output_columns = node.output_columns;
+            let required_output_columns = node.required_output_columns;
             let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((LogicalPlan::Except(ExceptNode { inputs }), changed))
+            Ok((
+                LogicalPlan::Except(ExceptNode {
+                    inputs,
+                    output_columns,
+                    required_output_columns,
+                }),
+                changed,
+            ))
         }
         LogicalPlan::Decode(node) => {
             let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
@@ -400,11 +428,14 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                required_output_columns: None,
             })),
             items: vec![ProjectItem {
                 expr: column_ref(output.column_id, "c1"),
                 output_name: "c1".to_string(),
+                output_column_id: output.column_id,
             }],
+            required_output_columns: None,
         })
     }
 
@@ -461,6 +492,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         });
 
         let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
@@ -522,6 +554,7 @@ mod tests {
         let leaf = LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         });
 
         // Exhaustive match on &LogicalPlan. This is the intentional trip-wire:

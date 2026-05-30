@@ -334,6 +334,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
         };
         if let Some(a) = action {
             scan.columns.push(a);
@@ -403,7 +404,9 @@ mod tests {
                     nullable: false,
                 },
                 output_name: "k".to_string(),
+                output_column_id: ColumnId(1),
             }],
+            required_output_columns: None,
         });
         let err = validate(&project).expect_err("dropped action must fail");
         assert!(err.contains("dropped at Project"), "got: {err}");
@@ -443,6 +446,7 @@ mod tests {
             aggregates: Vec::new(),
             output_columns: Vec::new(),
             already_pushed: false,
+            required_output_columns: None,
         });
         let err = validate(&plan).expect_err("aggregate above delta must fail");
         assert!(err.contains("Phase 4"), "got: {err}");
@@ -462,6 +466,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: None,
+            required_output_columns: None,
         });
         let err = validate(&plan).expect_err("join above delta must fail");
         assert!(err.contains("Phase 5"), "got: {err}");
@@ -475,6 +480,8 @@ mod tests {
                 ImvActionColumn::output_column(ColumnId(100)),
             )))],
             all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
         });
         let err = validate(&plan).expect_err("union above delta must fail");
         assert!(err.contains("Phase 6"), "got: {err}");

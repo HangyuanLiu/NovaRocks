@@ -986,21 +986,12 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalProject(p) => p
             .items
             .iter()
-            .map(|item| {
-                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } =
-                    &item.expr.kind
-                {
-                    *column_id
-                } else {
-                    ColumnId::UNSET
-                };
-                crate::sql::analysis::OutputColumn {
-                    column_id: cid,
-                    name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
-                    is_internal: false,
-                }
+            .map(|item| crate::sql::analysis::OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
@@ -1405,7 +1396,9 @@ fn child_output_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{JoinKind, OutputColumn};
+    use crate::sql::analysis::{
+        ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -1506,6 +1499,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -1569,6 +1563,7 @@ mod tests {
         let plan = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1604,6 +1599,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: Some(cond),
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1636,6 +1632,7 @@ mod tests {
                 is_internal: false,
             }],
             already_pushed: false,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1662,6 +1659,7 @@ mod tests {
             input: Box::new(scan),
             limit: Some(10),
             offset: None,
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1692,6 +1690,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            required_output_columns: None,
         });
         let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
             cte_id: 1,
@@ -1703,11 +1702,13 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            required_output_columns: None,
         });
         let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
             cte_id: 1,
             produce: Box::new(produce),
             consumer: Box::new(consume),
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1773,6 +1774,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();
@@ -1782,6 +1784,36 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
         assert_eq!(props.output_columns.len(), 1);
+    }
+
+    #[test]
+    fn project_group_stats_preserve_project_item_output_column_id() {
+        let out_id = ColumnId::new_for_test(42);
+        let plan = LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![vec![]],
+                columns: vec![],
+                required_output_columns: None,
+            })),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "col1".to_string(),
+                output_column_id: out_id,
+            }],
+            required_output_columns: None,
+        });
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &HashMap::new());
+
+        let props = memo.groups[1].logical_props.as_ref().unwrap();
+        assert_eq!(props.output_columns.len(), 1);
+        assert_eq!(props.output_columns[0].column_id, out_id);
     }
 
     #[test]
@@ -1808,6 +1840,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            required_output_columns: None,
         });
 
         let mut memo = Memo::new();

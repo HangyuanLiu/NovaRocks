@@ -305,10 +305,12 @@ mod tests {
             input: Box::new(LogicalPlan::Values(ValuesNode {
                 rows: vec![],
                 columns: vec![],
+                required_output_columns: None,
             })),
             group_by,
             aggregates,
             output_columns: vec![],
+            required_output_columns: None,
             already_pushed,
         }
     }
@@ -465,6 +467,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -479,6 +482,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -494,10 +498,12 @@ mod tests {
             right: Box::new(scan_b),
             join_type: JoinKind::Inner,
             condition: Some(col_ref("k", DataType::Boolean)),
+            required_output_columns: None,
         });
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(join),
             predicate: col_ref("k", DataType::Boolean),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(filter),
@@ -505,6 +511,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -518,13 +525,16 @@ mod tests {
             right: Box::new(scan_b),
             join_type: JoinKind::Inner,
             condition: Some(col_ref("k", DataType::Boolean)),
+            required_output_columns: None,
         });
         let project = LogicalPlan::Project(ProjectNode {
             input: Box::new(join),
             items: vec![ProjectItem {
                 expr: col_ref("k", DataType::Int64),
                 output_name: "k".into(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(project),
@@ -532,6 +542,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -559,6 +570,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("lk", "rk")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -566,6 +578,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         let plan = collect_push_plan(&agg, &HashMap::new()).expect("should push to left");
         assert_eq!(plan.side, super::super::context::Side::Left);
@@ -581,6 +594,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("rk", "lk")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -588,6 +602,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         let plan = collect_push_plan(&agg, &HashMap::new()).expect("should push to left");
         let group_columns: Vec<_> = plan
@@ -609,6 +624,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::LeftOuter,
             condition: Some(eq("lk", "rk")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -616,6 +632,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -629,6 +646,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::LeftOuter,
             condition: Some(eq("rk", "lk")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -636,6 +654,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         let plan = collect_push_plan(&agg, &HashMap::new()).expect("push to preserved left");
         assert!(matches!(plan.target_subtree, LogicalPlan::Scan(_)));
@@ -650,6 +669,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Cross,
             condition: None,
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -657,6 +677,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -670,6 +691,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         // sum(v) is on left; sum(w) is on right. Required = {k, v, w}.
         // Neither side covers all required cols → reject.
@@ -679,6 +701,7 @@ mod tests {
             aggregates: vec![sum_call("v"), sum_call("w")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -692,6 +715,7 @@ mod tests {
             right: Box::new(b),
             join_type: JoinKind::LeftSemi,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(join),
@@ -699,6 +723,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }
@@ -715,12 +740,14 @@ mod tests {
             right: Box::new(dummy_scan_with_cols(&[("k", DataType::Int64)])),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let outer_join = LogicalPlan::Join(JoinNode {
             left: Box::new(inner_join),
             right: Box::new(dummy_scan_with_cols(&[("k", DataType::Int64)])),
             join_type: JoinKind::Inner,
             condition: Some(eq("k", "k")),
+            required_output_columns: None,
         });
         let agg = AggregateNode {
             input: Box::new(outer_join),
@@ -728,6 +755,7 @@ mod tests {
             aggregates: vec![sum_call("v")],
             output_columns: vec![],
             already_pushed: false,
+            required_output_columns: None,
         };
         assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
     }

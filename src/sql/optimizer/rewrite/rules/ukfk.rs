@@ -100,6 +100,7 @@ impl RewriteRule for PruneUkFkJoin {
         Some(LogicalPlan::Project(ProjectNode {
             input: Box::new(retained),
             items: project.items,
+            required_output_columns: project.required_output_columns,
         }))
     }
 }
@@ -149,6 +150,7 @@ impl RewriteRule for EliminateUniqueAggregate {
         Some(LogicalPlan::Project(ProjectNode {
             input: aggregate.input,
             items,
+            required_output_columns: project.required_output_columns,
         }))
     }
 }
@@ -452,6 +454,7 @@ fn add_not_null_filter(plan: LogicalPlan, scan: &ScanNode, columns: &[String]) -
     LogicalPlan::Filter(FilterNode {
         input: Box::new(plan),
         predicate: combine_and(predicates),
+        required_output_columns: None,
     })
 }
 

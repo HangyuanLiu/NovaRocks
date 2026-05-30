@@ -101,12 +101,14 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         let new_right = LogicalPlan::Filter(FilterNode {
             input: join.right,
             predicate: pushed,
+            required_output_columns: None,
         });
         Some(LogicalPlan::Join(JoinNode {
             left: join.left,
             right: Box::new(new_right),
             join_type: join.join_type,
             condition: new_condition,
+            required_output_columns: join.required_output_columns,
         }))
     }
 }
@@ -198,6 +200,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -211,6 +214,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::LeftSemi,
             condition,
+            required_output_columns: None,
         })
     }
 
@@ -224,6 +228,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition,
+            required_output_columns: None,
         })
     }
 

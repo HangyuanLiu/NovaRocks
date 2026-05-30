@@ -78,6 +78,7 @@ impl RewriteRule for PushDownPredicateAggregate {
         let new_child = LogicalPlan::Filter(FilterNode {
             input: agg.input,
             predicate: pushed,
+            required_output_columns: None,
         });
         let new_agg = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(new_child),
@@ -162,6 +163,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            required_output_columns: None,
         })
     }
 
@@ -194,6 +196,7 @@ mod tests {
                 },
             ],
             already_pushed: false,
+            required_output_columns: None,
         })
     }
 
@@ -207,6 +210,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(agg),
             predicate: eq(col("a"), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateAggregate;
@@ -236,6 +240,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(agg),
             predicate: eq(col("sum_b"), int_lit(100)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateAggregate;
@@ -256,6 +261,7 @@ mod tests {
         let filter = LogicalPlan::Filter(FilterNode {
             input: Box::new(agg),
             predicate: eq(int_lit(1), int_lit(1)),
+            required_output_columns: None,
         });
 
         let rule = PushDownPredicateAggregate;

@@ -202,6 +202,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                         nullable: false,
                     },
                     output_name: action.name.clone(),
+                    output_column_id: action.column_id,
                 });
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
@@ -296,6 +297,7 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
         }
     }
 
@@ -384,7 +386,9 @@ mod tests {
                     nullable: false,
                 },
                 output_name: "k".to_string(),
+                output_column_id: projected_user_col_id,
             }],
+            required_output_columns: None,
         })
     }
 
@@ -434,6 +438,7 @@ mod tests {
                     nullable: false,
                 },
                 output_name: "__change_op".to_string(),
+                output_column_id: ColumnId(100),
             });
         }
         assert!(!rule.matches(&plan, &ctx));
@@ -459,6 +464,7 @@ mod tests {
             aggregates: Vec::new(),
             output_columns: Vec::new(),
             already_pushed: false,
+            required_output_columns: None,
         });
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
@@ -477,6 +483,7 @@ mod tests {
             right: Box::new(right),
             join_type: JoinKind::Inner,
             condition: None,
+            required_output_columns: None,
         });
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
@@ -491,6 +498,8 @@ mod tests {
         let plan = LogicalPlan::Union(UnionNode {
             inputs: vec![LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)))],
             all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
         });
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
@@ -513,6 +522,7 @@ mod tests {
                 data_type: DataType::Boolean,
                 nullable: false,
             },
+            required_output_columns: None,
         });
         // Filter itself must not match (schema-passthrough, no work).
         assert!(!rule.matches(&filter, &ctx));

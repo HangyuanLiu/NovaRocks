@@ -66,6 +66,7 @@ mod tests {
         let changed = RewriteResult::Changed(LogicalPlan::Values(ValuesNode {
             rows: vec![],
             columns: vec![],
+            required_output_columns: None,
         }));
         assert!(matches!(
             changed,
