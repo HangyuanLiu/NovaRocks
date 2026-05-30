@@ -2722,6 +2722,7 @@ pub(crate) fn execute_query(
         query_opts,
         None,
         None,
+        None,
     )
 }
 
@@ -2734,6 +2735,9 @@ pub(crate) fn execute_query(
 /// `terminal_sink = None` falls back to the default `ResultSinkFactory`.
 /// `iceberg_catalogs = None` matches the legacy behaviour for non-IVM
 /// callers.
+/// `mv_refresh_ctx = Some(ctx)` runs the IMV rewrite pipeline on the
+/// logical plan before optimization. Callers that do not need IMV rewriting
+/// pass `None` (dormant until Task 9 flips the PF refresh caller).
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
@@ -2743,10 +2747,27 @@ pub(crate) fn execute_query_with_options(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    if let Some(mv_ctx) = mv_refresh_ctx {
+        let outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
+            crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
+                plan: logical,
+                disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
+                )
+                .disabled_rules
+                .clone(),
+                mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
+                deadline: None,
+                next_column_id: factory.peek_next_id(),
+            },
+        )
+        .map_err(|e| format!("imv rewrite: {e}"))?;
+        logical = outcome.plan;
+    }
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;

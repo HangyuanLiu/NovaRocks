@@ -40,21 +40,12 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
-/// Number of trailing virtual columns the scan-tuple advertises after the
-/// data columns, in fixed order: `_file`, `_pos`, `_row_id`,
-/// `_last_updated_sequence_number`, `__change_op`. The first four are
-/// synthesized per-batch by the role scanners (`DataFileScanner` appends
-/// them directly; the three delete-side scanners receive them prepended by
-/// the underlying `scan_*` helpers in `connector::iceberg`). `__change_op`
-/// is appended at the operator level by `inject_change_op_column`. Together
-/// they define the trailing layout of the operator's chunk contract; the
-/// projection logic below depends on this constant to split each scanner's
-/// returned batch into "data columns" (which need iceberg-schema-evolution
-/// projection) and "lineage columns" (which are already aligned).
-///
-/// The constant is shared with `build_iceberg_table_def_for_delta_scan`
-/// (`src/connector/iceberg/catalog/backend.rs`) — keep in lockstep.
-const ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT: usize = 5;
+/// Number of trailing lineage columns the scanner appends before
+/// `__change_op`, in fixed order: `_file`, `_pos`, `_row_id`,
+/// `_last_updated_sequence_number`. Used by `project_scanner_batch_to_contract`
+/// to split each scanner's returned batch into "data columns" and "lineage
+/// columns". `__change_op` is appended at the operator level by
+/// `inject_change_op_column`.
 const ICEBERG_DELTA_PRE_CHANGE_OP_LINEAGE_COLUMN_COUNT: usize = 4;
 
 pub struct IcebergDeltaScanFactory {
@@ -168,8 +159,18 @@ impl ProcessorOperator for IcebergDeltaScanOperator {
                     let projection = self.ensure_data_projection()?;
                     let realigned = project_scanner_batch_to_contract(&batch, &projection)?;
                     let tagged = inject_change_op_column(realigned, op)?;
+                    // R1: project the internal superset onto the codegen tuple by
+                    // name, dropping virtual columns the tuple does not request.
+                    let tuple_names: Vec<&str> = self
+                        .node
+                        .output_chunk_schema
+                        .slots()
+                        .iter()
+                        .map(|s| s.name())
+                        .collect();
+                    let projected = project_superset_to_tuple(&tagged, &tuple_names)?;
                     let chunk = Chunk::try_new_with_chunk_schema(
-                        tagged,
+                        projected,
                         self.node.output_chunk_schema.clone(),
                     )?;
                     return Ok(Some(chunk));
@@ -229,38 +230,40 @@ pub(crate) struct IcebergDataColumnProjection {
 fn build_data_column_projection_plan(
     node: &IcebergDeltaScanNode,
 ) -> Result<IcebergDataColumnProjection, String> {
-    // The chunk-schema is laid out as:
-    //   [data_columns ... (N) ][_file, _pos, _row_id, _last_updated_sequence_number, __change_op]
-    // The trailing virtual-column count is fixed (see
-    // `ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT` and
-    // `build_iceberg_table_def_for_delta_scan`).
+    use crate::exec::row_position::{
+        is_change_op, is_iceberg_file_path, is_iceberg_last_updated_sequence_number,
+        is_iceberg_row_id, is_iceberg_row_pos,
+    };
+    // Data slots are those whose names are NOT in the virtual-column set.
+    // Virtual columns (_file, _pos, _row_id, _last_updated_sequence_number,
+    // __change_op) are synthesized at the operator level; only data slots
+    // correspond to iceberg schema fields and need field-id projection.
     let slots = node.output_chunk_schema.slots();
-    if slots.len() < ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT {
-        return Err(format!(
-            "iceberg delta-scan chunk schema is too short to contain the {} \
-             trailing virtual columns: {} slots",
-            ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT,
-            slots.len(),
-        ));
-    }
-    let data_slot_count = slots.len() - ICEBERG_DELTA_TRAILING_VIRTUAL_COLUMN_COUNT;
     let current_schema = node.iceberg_runtime.base_table.metadata().current_schema();
-    let mut targets = Vec::with_capacity(data_slot_count);
-    for slot in &slots[..data_slot_count] {
-        let name = slot.name().to_string();
+    let mut targets = Vec::new();
+    for slot in slots {
+        let name = slot.name();
+        if is_iceberg_file_path(name)
+            || is_iceberg_row_pos(name)
+            || is_iceberg_row_id(name)
+            || is_iceberg_last_updated_sequence_number(name)
+            || is_change_op(name)
+        {
+            continue;
+        }
         let nested = current_schema
-            .field_by_name(slot.name())
-            .or_else(|| current_schema.field_by_name_case_insensitive(slot.name()))
+            .field_by_name(name)
+            .or_else(|| current_schema.field_by_name_case_insensitive(name))
             .ok_or_else(|| {
                 format!(
                     "iceberg delta-scan codegen tuple references column `{}` that is not in \
                      the current iceberg schema (schema_id={})",
-                    slot.name(),
+                    name,
                     current_schema.schema_id(),
                 )
             })?;
         targets.push(IcebergDataColumnTarget {
-            name,
+            name: name.to_string(),
             field_id: nested.id,
             expected_data_type: slot.data_type().clone(),
             nullable: slot.nullable(),
@@ -376,6 +379,45 @@ fn project_scanner_batch_to_contract(
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .map_err(|e| format!("project iceberg delta-scan batch to codegen contract: {e}"))
+}
+
+/// Project the operator's internal superset batch onto the codegen scan tuple
+/// by column name, in tuple order. The superset always carries the full data
+/// columns plus the four v3 lineage columns plus `__change_op`; the tuple may
+/// request only a subset (e.g. projection/filter MVs want only `_row_id` and
+/// `__change_op`). Columns the tuple does not name are dropped here, at the
+/// operator boundary — this is the only place the rigid trailing-column count
+/// used to be assumed. `_pos` is required upstream to derive `_row_id`
+/// (`first_row_id + _pos`, see `synthesize_row_id`), so it stays in the
+/// superset; it is simply not re-emitted unless the tuple asks for it.
+fn project_superset_to_tuple(
+    superset: &RecordBatch,
+    tuple_names: &[&str],
+) -> Result<RecordBatch, String> {
+    let schema = superset.schema();
+    let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(tuple_names.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(tuple_names.len());
+    for name in tuple_names {
+        let idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!(
+                    "iceberg delta-scan: codegen tuple requests column `{name}` not present in scanner output (have: {:?})",
+                    schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                )
+            })?;
+        fields.push(schema.field(idx).as_ref().clone());
+        columns.push(superset.column(idx).clone());
+    }
+    let out_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    RecordBatch::try_new_with_options(
+        out_schema,
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(superset.num_rows())),
+    )
+    .map_err(|e| format!("project iceberg delta-scan superset to tuple: {e}"))
 }
 
 fn inject_change_op_column(batch: RecordBatch, value: i8) -> Result<RecordBatch, String> {
@@ -950,6 +992,80 @@ mod tests {
             1008,
             "fallback first_row_id + position on row 1"
         );
+    }
+
+    #[test]
+    fn project_superset_to_tuple_keeps_only_requested_virtual_columns() {
+        use arrow::array::{Int8Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let superset = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, false),
+                Field::new("__change_op", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["f.parquet"])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![5])),
+                Arc::new(Int8Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+
+        let tuple_names = vec!["k", "_row_id", "__change_op"];
+        let out = project_superset_to_tuple(&superset, &tuple_names).unwrap();
+
+        assert_eq!(out.num_columns(), 3);
+        assert_eq!(out.schema().field(0).name(), "k");
+        assert_eq!(out.schema().field(1).name(), "_row_id");
+        assert_eq!(out.schema().field(2).name(), "__change_op");
+    }
+
+    #[test]
+    fn project_superset_to_tuple_is_identity_on_full_five_column_tail() {
+        use arrow::array::{Int8Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let superset = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, false),
+                Field::new("__change_op", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["f.parquet"])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![5])),
+                Arc::new(Int8Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+
+        let tuple_names = vec![
+            "k",
+            "_file",
+            "_pos",
+            "_row_id",
+            "_last_updated_sequence_number",
+            "__change_op",
+        ];
+        let out = project_superset_to_tuple(&superset, &tuple_names).unwrap();
+        assert_eq!(out.num_columns(), 6);
+        for (i, name) in tuple_names.iter().enumerate() {
+            assert_eq!(&out.schema().field(i).name().as_str(), name);
+        }
     }
 
     #[test]

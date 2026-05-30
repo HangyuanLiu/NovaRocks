@@ -1,11 +1,11 @@
 //! IMV action column injection and propagation rules.
 //!
 //! Phase 2: Delta-bound scans get an internal `__change_op` Int8
-//! non-nullable column. Project transparently carries it. Filter is a
-//! schema-passthrough node and requires no work. Join/UnionAll/Aggregate
-//! above a Delta scan are unsupported in Phase 2 and fail-fast.
-
-use arrow::datatypes::DataType;
+//! non-nullable column. Project transparently carries **all** internal columns
+//! (including `_row_id` added in Task 2, and any future internal column).
+//! Filter is a schema-passthrough node and requires no work.
+//! Join/UnionAll/Aggregate above a Delta scan are unsupported in Phase 2 and
+//! fail-fast.
 
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
@@ -97,6 +97,24 @@ pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
     }
 }
 
+/// Collect every internal (`is_internal`) output column exposed by the first
+/// descendant Scan, threaded up through Filter/Project. Used by the generalized
+/// propagation rule to carry `__change_op`, `_row_id`, and any future internal
+/// column through the unary chain.
+pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
+    match plan {
+        LogicalPlan::Scan(scan) => scan
+            .columns
+            .iter()
+            .filter(|c| c.is_internal)
+            .cloned()
+            .collect(),
+        LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
+        LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
+        _ => Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InjectActionColumnRule
 // ---------------------------------------------------------------------------
@@ -163,7 +181,13 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
         match plan {
             LogicalPlan::Project(p) => {
-                subtree_has_action_column(&p.input) && !output_has_action_column(plan)
+                let internal = descendant_internal_columns(&p.input);
+                !internal.is_empty()
+                    && internal.iter().any(|c| {
+                        !p.items
+                            .iter()
+                            .any(|item| item.output_name.eq_ignore_ascii_case(&c.name))
+                    })
             }
             // Filter is a schema-passthrough node: it exposes its child's
             // schema verbatim, so once the child has the action column the
@@ -187,23 +211,29 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         let base = first_delta_base_fqn(&plan).unwrap_or_else(|| "<unknown>".to_string());
         match plan {
             LogicalPlan::Project(mut p) => {
-                let action = find_action_column(&p.input).ok_or_else(|| {
-                    "PropagateActionColumn matched Project but child has no action column"
-                        .to_string()
-                })?;
-                p.items.push(ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: action.column_id,
-                            qualifier: None,
-                            column: action.name.clone(),
+                let internal = descendant_internal_columns(&p.input);
+                for col in internal {
+                    let already = p
+                        .items
+                        .iter()
+                        .any(|item| item.output_name.eq_ignore_ascii_case(&col.name));
+                    if already {
+                        continue;
+                    }
+                    p.items.push(ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: col.column_id,
+                                qualifier: None,
+                                column: col.name.clone(),
+                            },
+                            data_type: col.data_type.clone(),
+                            nullable: col.nullable,
                         },
-                        data_type: DataType::Int8,
-                        nullable: false,
-                    },
-                    output_name: action.name.clone(),
-                    output_column_id: action.column_id,
-                });
+                        output_name: col.name.clone(),
+                        output_column_id: col.column_id,
+                    });
+                }
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
             LogicalPlan::Aggregate(_) => Err(format!(
@@ -505,6 +535,28 @@ mod tests {
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn propagate_carries_all_internal_columns_through_project() {
+        use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let mut scan = delta_scan_with_action(ColumnId(100));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        let plan = project_over(LogicalPlan::Scan(scan), ColumnId(1));
+        assert!(rule.matches(&plan, &ctx));
+        let RewriteResult::Changed(LogicalPlan::Project(project)) =
+            rule.apply(plan, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Project)");
+        };
+        // k + __change_op + _row_id
+        assert_eq!(project.items.len(), 3);
+        assert!(project.items.iter().any(|i| i.output_name == "__change_op"));
+        assert!(project.items.iter().any(|i| i.output_name == "_row_id"));
     }
 
     #[test]

@@ -8,10 +8,12 @@ use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRu
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     InjectActionColumnRule, PropagateActionColumnRule,
 };
+use crate::sql::optimizer::rewrite::imv::apply_key::InjectApplyKeyProjectRule;
 use crate::sql::optimizer::rewrite::imv::delta_pushdown::PushDeltaThroughUnaryRule;
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
+use crate::sql::optimizer::rewrite::imv::row_id_column::InjectRowIdRule;
 use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
@@ -44,8 +46,14 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             RewritePhase::SemanticRewrite,
             vec![
                 Box::new(InjectActionColumnRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(InjectRowIdRule),
                 Box::new(PropagateActionColumnRule),
             ],
+        ),
+        RewriteStage::new(
+            "imv-apply-key",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-marker-cleanup",
@@ -61,4 +69,25 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             ],
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_has_apply_key_stage_after_action_propagation() {
+        let p = build_imv_pipeline();
+        let names = p.stage_names();
+        let ap = names
+            .iter()
+            .position(|n| *n == "imv-action-propagation")
+            .unwrap();
+        let ak = names
+            .iter()
+            .position(|n| *n == "imv-apply-key")
+            .expect("imv-apply-key stage must exist");
+        let val = names.iter().position(|n| *n == "imv-validation").unwrap();
+        assert!(ap < ak && ak < val, "stage order: {names:?}");
+    }
 }

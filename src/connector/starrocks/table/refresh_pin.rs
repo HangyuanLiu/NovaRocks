@@ -125,7 +125,7 @@ impl RefreshSnapshotPin {
 /// - Table not in pin -> unchanged (likely a CTE, a different catalog, or
 ///   an alias not addressed by base_refs).
 /// - Table in pin and in delta_bearing -> unchanged (handled by
-///   mutate_query_for_ivm_delta_scan in iceberg_refresh.rs).
+///   the rewrite-path incremental refresh in iceberg_refresh.rs).
 /// - Table in pin and not in delta_bearing -> inject version.
 ///
 /// In scope-B single-base MVs, the unique base is delta-bearing, so this

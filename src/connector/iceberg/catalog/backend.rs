@@ -220,11 +220,17 @@ pub(crate) fn build_iceberg_table_def_with_files(
 /// emission (that is HDFS_SCAN-only). The reason `__change_op` survives
 /// column pruning all the way down to the operator is not that it is
 /// listed here — column pruning would still drop a slot that no expression
-/// references — but that the refresh driver explicitly appends
-/// `__change_op` to the top-level projection via
-/// `crate::engine::mv::iceberg_refresh::append_change_op_to_projection`
-/// before analysis runs. That append is what makes the slot load-bearing;
+/// references — but that the refresh driver explicitly includes `__change_op`
+/// in the rewrite-path SELECT before analysis runs. That inclusion is what
+/// makes the slot load-bearing;
 /// declaring the column on the `TableDef` only ensures it resolves.
+///
+/// The `IcebergDeltaScanOperator` projects its internal superset (all data
+/// columns + all virtual columns) onto the codegen tuple by name via
+/// `iceberg_delta_scan::project_superset_to_tuple`, so the set of virtual
+/// columns exposed here and the operator's output are decoupled: the TableDef
+/// may expose the full five-column set while the codegen tuple requests only
+/// a subset (e.g. `{data, _row_id, __change_op}` for projection/filter MVs).
 ///
 /// Returns Err if the table metadata does not declare v3 row-lineage; A1
 /// requires v3 row-lineage to compute the apply key.

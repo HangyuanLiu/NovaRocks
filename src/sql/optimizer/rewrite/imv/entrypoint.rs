@@ -312,7 +312,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 7);
+        assert_eq!(outcome.trace.stage_names().len(), 8);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -455,6 +455,7 @@ mod tests {
                 "imv-delta-pushdown",
                 "imv-scan-binding",
                 "imv-action-propagation",
+                "imv-apply-key",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
@@ -463,14 +464,20 @@ mod tests {
 
     #[test]
     fn imv_pipeline_binds_root_delta_scan() {
+        // Disable InjectApplyKeyProject and ActionColumnValidation so this
+        // test stays focused on scan binding (snapshot-id promotion) without
+        // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec![
+                "InjectApplyKeyProject".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             next_column_id: 100,
         })
-        .expect("Delta(Scan) must bind and pass validation");
+        .expect("Delta(Scan) must bind successfully");
 
         let LogicalPlan::Scan(scan) = outcome.plan else {
             panic!("expected scan outcome");
@@ -542,10 +549,16 @@ mod tests {
 
     #[test]
     fn imv_pipeline_injects_action_on_delta_scan() {
+        // Disable InjectApplyKeyProject and ActionColumnValidation so this
+        // test stays focused on __change_op injection into the Scan without
+        // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
             mv_ctx: dummy_mv_ctx(),
-            disabled_rules: Vec::new(),
+            disabled_rules: vec![
+                "InjectApplyKeyProject".to_string(),
+                "ActionColumnValidation".to_string(),
+            ],
             deadline: None,
             next_column_id: 100,
         })
