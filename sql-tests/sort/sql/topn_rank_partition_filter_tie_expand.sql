@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_topn_rank_partition_filter_tie_expand (
   id INT,
   grp INT,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_rank_partition_filter_tie_expand VALUES
   (1, 1, 100),
   (2, 1, 95),

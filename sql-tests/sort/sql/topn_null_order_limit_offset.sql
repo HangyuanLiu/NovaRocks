@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_topn_null_order_limit_offset (
   id INT,
   k INT,
   s STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_null_order_limit_offset VALUES
   (1, NULL, 'a'),
   (2, 2, 'x'),

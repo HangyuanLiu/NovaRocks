@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_sort_hidden_expression_order (
   id INT,
   base INT,
   delta INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_sort_hidden_expression_order VALUES
   (1, 10, 1),
   (2, 8, NULL),
