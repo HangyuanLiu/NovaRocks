@@ -182,3 +182,53 @@ sql-tests。不硬编码端口。
 - 任何无法在 iceberg v3 上保持意图的用例都已显式上报并有处置结论，未被静默
   跳过或弱化。
 - 6 个 iceberg-* 套件与 `stable-sql-suites.txt` 保持不变。
+
+## 实施结果与偏差（2026-05-31 完成）
+
+### 最终结果
+全部 16 个稳定套件 `verify -j 1` 全绿：
+
+- **9 个通用套件已迁移至 Iceberg v3**：filter(15)、limit(1)、project(27)、sort(13)、
+  join(60)、cte(3)、set-op(18)、table-function(6)、runtime-filter(22)。
+- **low-cardinality(5) 保留在 StarRocks 原生存储**（见下"偏差一"）。
+- 6 个 iceberg-* 套件未改动，复验无回归（iceberg 24、iceberg-ddl 47、iceberg-dml 37、
+  iceberg-ivm 62、iceberg-rest 9、iceberg-compatibility 12）。
+- `tools/ci/suites/stable-sql-suites.txt` 未改动；`cargo test --lib` 仅 5 个**预存**失败
+  （`mv_shape`/`pipeline::builder`，源自 main 的 commit `45f6e676`，与本次无关），本次新增 0 失败。
+
+### 偏差一：low-cardinality 保留原生存储（用户决定 Option B）
+迁移中发现低基数字典重写在 iceberg 扫描上会分配 `dict_columns`，但 iceberg/HDFS 扫描
+**执行层没有字典 encode 管道**（`HdfsScanConfig` 无 dict 支持；守卫在
+`src/sql/codegen/fragment_builder.rs`）。让其在 iceberg 上"既触发又能执行 DECODE"需
+实现 iceberg 扫描字典执行（Option A，中大规模、风险中高）。用户选择 Option B：在
+`src/engine/dictionary/mod.rs::owner_for` 对 `IcebergDataFiles` 返回 `None`，把字典重写
+排除出 iceberg；low-cardinality 套件保留原生 DDL 不迁移（字典重写本质是原生存储优化，
+原生是其自然测试宿主）。Option A 留作未来专项；机制可逆。
+
+### 偏差二：原 spec 范围外的引擎修复（用户授权"全修"）
+迁移暴露出多个 iceberg 写入/解析路径与原生路径的能力差距，用户授权修复（原 spec 把 src/
+改动列为非目标，因特例上报后纳入）。共 7 个引擎 commit：
+- **标量 INSERT 隐式转换族**（3 commit）：`reannotate_array` 加 Null→任意、numeric↔numeric/
+  decimal/float、scalar/bool/temporal→Utf8，复用 `cast_with_special_rules`（与原生写入路径
+  同款 cast，是对齐非分叉），嵌套类型保留 fail-fast。
+- **#1 ANALYZE 解析 iceberg 外部表**：新增 `register_external_table_by_name`，ANALYZE 前物化
+  iceberg 表。
+- **#2 嵌套字面量转换**：`build_literal_array` 对 ARRAY 元素 / MAP 键字面量按声明类型转换。
+- **#3 MAP NULL 键**：panic→优雅报错（iceberg 规范禁止 null map 键）。
+- **#4 JOIN ON 子查询表名解析**：`query_refs` 遍历 `join.join_operator` 的 ON 约束。
+- **#5 字典重写 gate**：见偏差一。
+
+### 偏差三：测试数据调整（用户授权）
+- `join_map_type`/`join_struct_type`：含 iceberg 无法存储的 **null map 键**行（iceberg 规范禁止）。
+  按用户决定移除 null-键数据行/条目并重录 golden，保留其余 map/struct 联接覆盖。
+- `runtime_filter_push_down_grf_broadcast`：fingerprint 含 `数字+字符串列` 隐式转换，绝对值随
+  存储变化但 **GRF on==off 不变量在 iceberg 上 12 对全部成立**（已逐对核验），按 intent-preserved
+  重录。
+
+### 一次性辅助产物
+`tools/dev/migrate_suite_iceberg_v3.py`：机械化 CREATE TABLE 改写（剥原生子句 + 加
+`format-version=3`，幂等，CTAS 不动），供各套件迁移使用。
+
+### 已知遗留（非阻塞）
+- iceberg 扫描字典执行（Option A）未实现；low-cardinality 留原生。
+- `query_refs` 的 ASOF `match_condition` 子查询未遍历（ASOF 为 Snowflake 专属，套件未用）。
