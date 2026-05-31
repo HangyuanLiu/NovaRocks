@@ -29,6 +29,24 @@
 
 ---
 
+## 执行前基线（重要 — 执行的 subagent 必读）
+
+开始 Task 1 前先抓一次测试基线，**只把「新增」失败当回归**：
+
+```bash
+cargo test --lib 2>&1 | tail -5
+```
+
+已知 pre-existing lib-test 失败（来自 main commit `45f6e676`「correctness regressions documented」，**与本任务无关**）：
+- `connector::starrocks::table::mv_shape::tests::*`（2 个）
+- `exec::pipeline::builder::tests::*`（3 个）
+
+基线 = **3320 passed / 5 failed**（仅上述 5 个）。本计划各 Task 的目标单测都在 `sql::optimizer` / `explain` 模块下（不在这 5 个失败模块内），所以 `cargo test --lib sql::optimizer` 与 `cargo test --lib explain` 应全绿；全量 `cargo test --lib` 应保持「仅这 5 个 pre-existing 失败、无新增」。
+
+套件已由独立工作迁至 **Iceberg v3**（filter/limit/project/sort/join/cte/set-op/table-function/runtime-filter；`low-cardinality` 故意留在 native，原因见迁移 spec）。迁移用 hadoop catalog + `-- @catalog=` 指令 + 每套件 `init.sql`/`cleanup.sql`，建表带 `TBLPROPERTIES("format-version"="3")`。详见 `docs/superpowers/specs/2026-05-31-stable-sql-suites-iceberg-v3-migration-design.md`。Task 5 Step 6 的标杆复核即在这些 Iceberg 套件上做。
+
+---
+
 ## Task 1: 让 LogicalProperties 携带列统计（核心修复）
 
 **Files:**
@@ -650,8 +668,8 @@ cargo test --lib
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-rest --mode verify
 ```
-Expected: lib 全绿；iceberg-rest 套件无回归。
-> 若 optimizer 套件（managed-lake 表）的 golden 因 Task 2 的 fallback selectivity 而 `rows=` 变化：用 `--suite optimizer --mode record` 重生成，逐条人工确认「变小了是因为谓词现在生效」而非误伤，再提交。
+Expected: lib = **3320 passed / 5 failed**（仅「执行前基线」列出的 5 个 pre-existing 失败，**无新增**）；iceberg-rest 套件无回归。
+> 若 optimizer 套件的 golden 因 Task 2 的 fallback selectivity 而 `rows=` 变化：用 `--suite optimizer --mode record` 重生成，逐条人工确认「变小了是因为谓词现在生效」而非误伤，再提交。
 
 - [ ] **Step 6: 标杆复核（套件转 Iceberg 后，由用户准备）**
 
