@@ -36,6 +36,7 @@ use crate::lower::layout::{
     Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
     layout_from_slot_ids,
 };
+use crate::lower::node::decode::{QueryGlobalDictMap, build_scan_query_global_dicts};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::novarocks_config::config as novarocks_app_config;
@@ -351,6 +352,7 @@ pub(crate) fn lower_hdfs_scan_node(
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
     query_opts: Option<&internal_service::TQueryOptions>,
     connectors: &ConnectorRegistry,
+    query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
@@ -1150,6 +1152,7 @@ pub(crate) fn lower_hdfs_scan_node(
         &Schema::new(data_fields),
         &data_slot_ids,
     )?;
+    let query_global_dicts = build_scan_query_global_dicts(&data_slot_ids, query_global_dict_map)?;
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
         chunk_schema: parquet_chunk_schema,
@@ -1204,7 +1207,7 @@ pub(crate) fn lower_hdfs_scan_node(
         format,
         object_store_config: object_store_config.clone(),
         iceberg_table_locations,
-        query_global_dicts: Default::default(),
+        query_global_dicts,
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(

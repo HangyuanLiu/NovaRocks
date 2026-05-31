@@ -34,9 +34,50 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_lookup};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::novarocks_logging::info;
 use crate::{data, descriptors, exprs, plan_nodes, types};
 
 pub(crate) type QueryGlobalDictMap = HashMap<types::TSlotId, Arc<HashMap<i32, Vec<u8>>>>;
+
+/// Convert a fragment's `QueryGlobalDictMap` (id -> bytes) into the scan-side
+/// encode map (bytes -> id) restricted to `output_slots`. Shared by the lake
+/// and HDFS/iceberg scan lowering.
+pub(crate) fn build_scan_query_global_dicts(
+    output_slots: &[SlotId],
+    query_global_dict_map: &QueryGlobalDictMap,
+) -> Result<crate::exec::dict_encode::QueryGlobalDictEncodeMap, String> {
+    let mut out = HashMap::new();
+    for slot_id in output_slots {
+        let raw_slot_id = i32::try_from(slot_id.as_u32()).map_err(|_| {
+            format!(
+                "slot id out of i32 range for query global dict: {}",
+                slot_id
+            )
+        })?;
+        let Some(dict_values) = query_global_dict_map.get(&raw_slot_id) else {
+            continue;
+        };
+        let mut value_to_id = HashMap::with_capacity(dict_values.len());
+        for (id, value) in dict_values.iter() {
+            if let Some(existing) = value_to_id.insert(value.clone(), *id)
+                && existing != *id
+            {
+                return Err(format!(
+                    "query global dict has duplicated string with different ids: slot_id={}, existing_id={}, new_id={}",
+                    slot_id, existing, id
+                ));
+            }
+        }
+        out.insert(*slot_id, Arc::new(value_to_id));
+    }
+    if !out.is_empty() {
+        info!(
+            "SCAN query global dict enabled for slots={:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
+}
 
 pub(crate) fn build_query_global_dict_map(
     query_global_dicts: Option<&[data::TGlobalDict]>,

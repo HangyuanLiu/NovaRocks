@@ -523,6 +523,7 @@ fn lower_node_with_children(
             exec_params,
             query_opts,
             connectors,
+            query_global_dict_map,
             out_layout,
         )?,
         t if t == plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
