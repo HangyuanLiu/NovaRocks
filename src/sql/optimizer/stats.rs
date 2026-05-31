@@ -1252,8 +1252,18 @@ pub(crate) fn estimate_selectivity(
             };
             if *negated { 1.0 - sel } else { sel }
         }
-        ExprKind::Between { negated, .. } => {
-            let sel = PREDICATE_UNKNOWN_FILTER; // conservative
+        ExprKind::Between {
+            negated,
+            expr,
+            low,
+            high,
+        } => {
+            // a BETWEEN low AND high  ==  a >= low AND a <= high
+            // The ge * le product uses the same independence model as the BinOp::And arm;
+            // this slightly overestimates selectivity for narrow symmetric ranges.
+            let ge = estimate_range_selectivity(expr, low, BinOp::Ge, column_stats);
+            let le = estimate_range_selectivity(expr, high, BinOp::Le, column_stats);
+            let sel = ge * le;
             if *negated { 1.0 - sel } else { sel }
         }
         ExprKind::Like { negated, .. } => {
@@ -1888,6 +1898,59 @@ mod tests {
             decode_props.output_columns[0].name, "a_str",
             "Decode must surface string_column, not the child's dict_column"
         );
+    }
+
+    fn col_stat(min: f64, max: f64, ndv: f64) -> ColumnStatistic {
+        ColumnStatistic {
+            min_value: min,
+            max_value: max,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: ndv,
+        }
+    }
+
+    fn between_expr(expr: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::Between {
+                expr: Box::new(expr),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn between_uses_range_selectivity() {
+        let mut cs = HashMap::new();
+        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        // a BETWEEN 0 AND 50 over [0,100]: ge = clamp((100-0+1)/100) = 0.99,
+        // le = (50-0+1)/100 = 0.51, product ≈ 0.5049.
+        let pred = between_expr(col_ref("a"), int_lit(0), int_lit(50));
+        let sel = estimate_selectivity(&pred, &cs);
+        assert!(sel > 0.45 && sel < 0.56, "between selectivity was {sel}");
+    }
+
+    #[test]
+    fn not_between_is_complement_of_between() {
+        let mut cs = HashMap::new();
+        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        // NOT (a BETWEEN 0 AND 50): complement of ~0.505.
+        let pred = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::Between {
+                expr: Box::new(col_ref("a")),
+                low: Box::new(int_lit(0)),
+                high: Box::new(int_lit(50)),
+                negated: true,
+            },
+        };
+        let sel = estimate_selectivity(&pred, &cs);
+        assert!(sel > 0.44 && sel < 0.55, "not-between selectivity was {sel}");
     }
 }
 
