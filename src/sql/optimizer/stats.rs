@@ -277,8 +277,12 @@ pub(crate) fn derive_statistics(
                     .iter()
                     .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
                     .collect();
+                let mut selectivity = 1.0;
+                for pred in &scan.predicates {
+                    selectivity *= estimate_selectivity(pred, &column_statistics);
+                }
                 Statistics {
-                    output_row_count: default_rows,
+                    output_row_count: (default_rows * selectivity).max(1.0),
                     column_statistics,
                 }
             }
@@ -636,6 +640,7 @@ pub(crate) fn derive_group_statistics(
             group_idx,
             output_columns,
             stats.output_row_count,
+            stats.column_statistics,
         ));
     }
 }
@@ -652,12 +657,11 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
     let group_id = children[index];
     let group = &memo.groups[group_id];
     if let Some(ref props) = group.logical_props {
-        // Reconstruct Statistics from logical properties.
-        // Column statistics are not stored in LogicalProperties, so we
-        // return an empty map -- the row_count is the critical value.
+        // Column statistics now travel on LogicalProperties, so propagate
+        // them so parent operators estimate real selectivity / join NDV.
         Statistics {
             output_row_count: props.row_count,
-            column_statistics: HashMap::new(),
+            column_statistics: props.column_statistics.clone(),
         }
     } else {
         // Child not yet derived; use conservative default.
@@ -733,8 +737,12 @@ fn derive_scan(
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
+        let mut selectivity = 1.0;
+        for pred in &scan.predicates {
+            selectivity *= estimate_selectivity(pred, &column_statistics);
+        }
         Statistics {
-            output_row_count: default_rows,
+            output_row_count: (default_rows * selectivity).max(1.0),
             column_statistics,
         }
     }
@@ -1244,8 +1252,18 @@ pub(crate) fn estimate_selectivity(
             };
             if *negated { 1.0 - sel } else { sel }
         }
-        ExprKind::Between { negated, .. } => {
-            let sel = PREDICATE_UNKNOWN_FILTER; // conservative
+        ExprKind::Between {
+            negated,
+            expr,
+            low,
+            high,
+        } => {
+            // a BETWEEN low AND high  ==  a >= low AND a <= high
+            // The ge * le product uses the same independence model as the BinOp::And arm;
+            // this slightly overestimates selectivity for narrow symmetric ranges.
+            let ge = estimate_range_selectivity(expr, low, BinOp::Ge, column_stats);
+            let le = estimate_range_selectivity(expr, high, BinOp::Le, column_stats);
+            let sel = ge * le;
             if *negated { 1.0 - sel } else { sel }
         }
         ExprKind::Like { negated, .. } => {
@@ -1330,10 +1348,17 @@ fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
 
 /// Get the NDV for an expression from column statistics.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
+    // A column is only useful for cardinality if it carries a real NDV (> 1).
+    // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
+    // reports distinct_values_count = 1.0; treating that as a true NDV would make
+    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
+    // fall back to the default NDV for unknown/degenerate columns.
     if let Some(name) = extract_column_name(expr)
         && let Some(cs) = column_stats.get(&name.to_lowercase())
+        && cs.distinct_values_count > 1.0
     {
-        return cs.distinct_values_count.max(1.0);
+        return cs.distinct_values_count;
     }
     10.0
 }
@@ -1503,6 +1528,36 @@ mod tests {
         })
     }
 
+    fn scan_plan_with_predicates(
+        name: &str,
+        cols: &[&str],
+        predicates: Vec<TypedExpr>,
+    ) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.predicates = predicates;
+        LogicalPlan::Scan(node)
+    }
+
+    #[test]
+    fn fallback_scan_applies_predicate_selectivity() {
+        // No table stats registered -> derive_scan takes the heuristic
+        // fallback. With the fix, the predicate still reduces the row count.
+        let table_stats: HashMap<String, TableStatistics> = HashMap::new();
+        let pred = eq_expr(col_ref("a"), int_lit(42));
+        let plan = scan_plan_with_predicates("unknown_tbl", &["a"], vec![pred]);
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
+        // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
+        let props = memo.groups[0].logical_props.as_ref().unwrap();
+        assert!((props.row_count - 25_000.0).abs() < 1.0);
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -1574,12 +1629,56 @@ mod tests {
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((scan_props.row_count - 10_000.0).abs() < 1.0);
 
-        // Filter group (1): filter selectivity applied to child row_count
-        // But column stats are not propagated through child_statistics,
-        // so selectivity falls back to PREDICATE_UNKNOWN_FILTER (0.25).
+        // Filter group (1): with column stats now flowing through
+        // child_statistics, `a = 42` uses real NDV(a)=100 -> selectivity
+        // 1/100 = 0.01 -> 10000 * 0.01 = 100 rows.
         let filter_props = memo.groups[1].logical_props.as_ref().unwrap();
-        assert!(filter_props.row_count < 10_000.0);
-        assert!(filter_props.row_count >= 1.0);
+        assert!((filter_props.row_count - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn get_expr_ndv_ignores_unknown_ndv() {
+        // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
+        // for no-stats / managed-lake tables. get_expr_ndv must treat that as
+        // "no information" and return the 10.0 default, otherwise get_join_key_ndv
+        // would divide left*right by ~1 and explode joins to near cross-products.
+        let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
+        column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());
+        assert_eq!(column_stats["unknown_col"].distinct_values_count, 1.0);
+        let unknown_expr = col_ref("unknown_col");
+        assert_eq!(get_expr_ndv(&unknown_expr, &column_stats), 10.0);
+
+        // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
+        column_stats.insert(
+            "degenerate_col".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 100.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1.0,
+            },
+        );
+        let degenerate_expr = col_ref("degenerate_col");
+        assert_eq!(get_expr_ndv(&degenerate_expr, &column_stats), 10.0);
+
+        // A real NDV (> 1) is still used verbatim.
+        column_stats.insert(
+            "real_col".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 100.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 50.0,
+            },
+        );
+        let real_expr = col_ref("real_col");
+        assert_eq!(get_expr_ndv(&real_expr, &column_stats), 50.0);
+
+        // An unknown column reference (absent from the map) also defaults.
+        let missing_expr = col_ref("missing_col");
+        assert_eq!(get_expr_ndv(&missing_expr, &column_stats), 10.0);
     }
 
     #[test]
@@ -1639,13 +1738,10 @@ mod tests {
         logical_plan_to_memo(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
-        // Agg group: child_rows * UNKNOWN_GROUP_BY_CORRELATION vs NDV product.
-        // NDV = 10 (default, because child_statistics loses column stats),
-        // capped = 100000 * 0.75 = 75000.
-        // Result = min(10, 75000) = 10.
+        // Agg group: real NDV(status)=5 now flows through child_statistics,
+        // so output = min(5, 100000*0.75) = 5.
         let agg_props = memo.groups[1].logical_props.as_ref().unwrap();
-        assert!(agg_props.row_count >= 1.0);
-        assert!(agg_props.row_count <= 100_000.0);
+        assert!((agg_props.row_count - 5.0).abs() < 1.0);
     }
 
     #[test]
@@ -1853,6 +1949,68 @@ mod tests {
         assert_eq!(
             decode_props.output_columns[0].name, "a_str",
             "Decode must surface string_column, not the child's dict_column"
+        );
+    }
+
+    fn col_stat(min: f64, max: f64, ndv: f64) -> ColumnStatistic {
+        ColumnStatistic {
+            min_value: min,
+            max_value: max,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: ndv,
+        }
+    }
+
+    fn between_expr(expr: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::Between {
+                expr: Box::new(expr),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn between_uses_range_selectivity() {
+        let mut cs = HashMap::new();
+        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        // a BETWEEN 0 AND 50 over [0,100]: ge = clamp((100-0+1)/100) = 0.99,
+        // le = (50-0+1)/100 = 0.51, product ≈ 0.5049.
+        let pred = between_expr(col_ref("a"), int_lit(0), int_lit(50));
+        let sel = estimate_selectivity(&pred, &cs);
+        assert!(sel > 0.45 && sel < 0.56, "between selectivity was {sel}");
+    }
+
+    #[test]
+    fn not_between_is_complement_of_between() {
+        let mut cs = HashMap::new();
+        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        // NOT (a BETWEEN 0 AND 10) over [0,100]:
+        //   ge(a >= 0) = clamp((100-0+1)/100) = 0.99
+        //   le(a <= 10) = (10-0+1)/100 = 0.11
+        //   between sel = 0.99 * 0.11 ≈ 0.109
+        //   NOT BETWEEN sel = 1 - 0.109 ≈ 0.891
+        // The negated value (~0.89) is clearly distinct from the positive (~0.11),
+        // so this test genuinely exercises the negated branch.
+        let pred = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::Between {
+                expr: Box::new(col_ref("a")),
+                low: Box::new(int_lit(0)),
+                high: Box::new(int_lit(10)),
+                negated: true,
+            },
+        };
+        let sel = estimate_selectivity(&pred, &cs);
+        assert!(
+            sel > 0.85 && sel < 0.93,
+            "not-between selectivity was {sel}"
         );
     }
 }

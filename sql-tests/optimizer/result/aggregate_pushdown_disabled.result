@@ -6,19 +6,19 @@ GATHER EXCHANGE stats={rows=10}
       aggregations: sum(__nr_agg_pd_0)
       HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
         aggregations: sum(__nr_agg_pd_0)
-        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=100000}
+        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=90000}
           HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
             aggregations: sum(a.v)
             HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
               HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
                 aggregations: sum(a.v)
-                SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=100000}
+                SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
                      TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                      columns: k, v
                      min-max stats
                      predicates: a.k IS NOT NULL
-          GATHER EXCHANGE stats={rows=100000}
-            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
+          GATHER EXCHANGE stats={rows=90000}
+            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
                  TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                  columns: k
                  min-max stats
@@ -32,14 +32,14 @@ GATHER EXCHANGE stats={rows=10}
       aggregations: sum(a.v)
       HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
         aggregations: sum(a.v)
-        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=1000000000}
-          SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=100000}
+        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=810000000}
+          SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
                TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                columns: k, v
                min-max stats
                predicates: a.k IS NOT NULL
-          GATHER EXCHANGE stats={rows=100000}
-            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
+          GATHER EXCHANGE stats={rows=90000}
+            SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
                  TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                  columns: k
                  min-max stats

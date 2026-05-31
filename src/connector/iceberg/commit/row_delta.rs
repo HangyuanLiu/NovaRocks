@@ -411,6 +411,12 @@ fn written_file_to_iceberg_data_file_minimal(
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
     }
+    if !f.lower_bounds.is_empty() {
+        builder.lower_bounds(f.lower_bounds.clone());
+    }
+    if !f.upper_bounds.is_empty() {
+        builder.upper_bounds(f.upper_bounds.clone());
+    }
     builder
         .build()
         .map_err(|e| format!("DataFileBuilder::build failed: {e}"))
@@ -502,6 +508,8 @@ mod tests {
             column_sizes: Default::default(),
             value_counts: Default::default(),
             null_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
             key_metadata: None,
             referenced_data_file: Some("s3://bucket/data.parquet".to_string()),
             equality_ids: None,
@@ -523,6 +531,8 @@ mod tests {
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
             null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
             key_metadata: None,
             referenced_data_file: None,
             equality_ids: Some(vec![1, 2]),

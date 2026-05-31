@@ -27,6 +27,54 @@ pub(crate) fn format_stats_trailer(
     format!("stats={{rows={rows_str}}}")
 }
 
+/// Costs-only per-column statistics block. Kept separate from
+/// `format_stats_trailer` so Verbose/Analyze output (and existing golden
+/// files) stay unchanged — only `EXPLAIN COSTS` shows column stats.
+/// Unknown-stat columns (ColumnStatistic::unknown) render as min=-inf max=+inf ndv=1 null_frac=0.
+pub(crate) fn format_column_stats_costs(
+    stats: &crate::sql::optimizer::statistics::Statistics,
+) -> String {
+    if stats.column_statistics.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<&String> = stats.column_statistics.keys().collect();
+    names.sort();
+    let parts: Vec<String> = names
+        .into_iter()
+        .map(|name| {
+            let c = &stats.column_statistics[name];
+            let ndv = if c.distinct_values_count.is_finite() {
+                (c.distinct_values_count.round() as i64).to_string()
+            } else {
+                "?".to_string()
+            };
+            format!(
+                "{name}[min={} max={} ndv={ndv} null_frac={}]",
+                fmt_f64(c.min_value),
+                fmt_f64(c.max_value),
+                fmt_f64(c.nulls_fraction),
+            )
+        })
+        .collect();
+    format!("colstats={{{}}}", parts.join(", "))
+}
+
+fn fmt_f64(v: f64) -> String {
+    if v.is_nan() {
+        "?".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "+inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.4}")
+    }
+}
+
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExplainLevel {
@@ -294,7 +342,12 @@ fn format_physical_node(
 ) {
     let pad = "  ".repeat(indent);
     let costs_suffix = if matches!(level, ExplainLevel::Costs) {
-        format!(" (rows={:.0})", node.stats.output_row_count)
+        let colstats = format_column_stats_costs(&node.stats);
+        if colstats.is_empty() {
+            format!(" (rows={:.0})", node.stats.output_row_count)
+        } else {
+            format!(" (rows={:.0}) {colstats}", node.stats.output_row_count)
+        }
     } else {
         String::new()
     };
@@ -1446,5 +1499,76 @@ mod tests {
                 "Normal level must not include stats trailer: {line}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod costs_level_tests {
+    use super::*;
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use std::collections::HashMap;
+
+    #[test]
+    fn costs_column_stats_formatting() {
+        // Empty map → empty string.
+        let empty = Statistics {
+            output_row_count: 0.0,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(format_column_stats_costs(&empty), "");
+
+        // Normal column: exact format pinned.
+        let mut cs = HashMap::new();
+        cs.insert(
+            "k1".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1000.0,
+            },
+        );
+        let stats = Statistics {
+            output_row_count: 10.0,
+            column_statistics: cs,
+        };
+        let s = format_column_stats_costs(&stats);
+        assert_eq!(s, "colstats={k1[min=0 max=1000 ndv=1000 null_frac=0]}");
+    }
+
+    #[test]
+    fn fmt_f64_nan_returns_question_mark() {
+        assert_eq!(fmt_f64(f64::NAN), "?");
+    }
+
+    #[test]
+    fn fmt_f64_infinite_returns_inf_labels() {
+        assert_eq!(fmt_f64(f64::INFINITY), "+inf");
+        assert_eq!(fmt_f64(f64::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
+    fn format_column_stats_costs_non_finite_ndv_renders_question_mark() {
+        let mut cs = HashMap::new();
+        cs.insert(
+            "x".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1.0,
+                nulls_fraction: 0.0,
+                average_row_size: 4.0,
+                distinct_values_count: f64::INFINITY,
+            },
+        );
+        let stats = Statistics {
+            output_row_count: 5.0,
+            column_statistics: cs,
+        };
+        let s = format_column_stats_costs(&stats);
+        assert!(
+            s.contains("ndv=?"),
+            "expected ndv=? for infinite NDV, got: {s}"
+        );
     }
 }

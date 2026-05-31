@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 
+use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_refs, split_and, wrap_remaining_filter,
@@ -41,6 +42,16 @@ impl RewriteRule for PushDownPredicateScan {
         let scan_columns: HashSet<String> =
             scan.columns.iter().map(|c| c.name.to_lowercase()).collect();
 
+        // Canonical keys of predicates already on the scan, so we never append a
+        // structurally-identical duplicate (`P AND P == P`). `TypedExpr` does not
+        // implement `PartialEq`, so we key on the `Debug` rendering of `ExprKind`
+        // — the same canonicalization the sibling `push_to_join` rule uses.
+        // This keeps the scan's predicate list clean even when an upstream rule
+        // (e.g. OQ-2 `DeriveJoinNotNullPredicate`) re-derives the same
+        // `IS NOT NULL` across stacked joins on a shared key every fixed-point
+        // round. Only exact duplicates collapse; distinct predicates are kept.
+        let mut seen: HashSet<String> = scan.predicates.iter().map(predicate_key).collect();
+
         let mut pushed_any = false;
         let mut remaining = Vec::new();
         for conj in conjuncts {
@@ -49,7 +60,13 @@ impl RewriteRule for PushDownPredicateScan {
                 .iter()
                 .all(|r| scan_columns.contains(&r.to_lowercase()))
             {
-                scan.predicates.push(conj);
+                // Push only if no structurally-identical predicate is present.
+                if seen.insert(predicate_key(&conj)) {
+                    scan.predicates.push(conj);
+                }
+                // A conjunct that targets this scan is "handled" whether it was
+                // newly pushed or dropped as a duplicate — it must not survive as
+                // a residual filter, otherwise the rule never reaches fixed point.
                 pushed_any = true;
             } else {
                 remaining.push(conj);
@@ -64,6 +81,14 @@ impl RewriteRule for PushDownPredicateScan {
 
         Some(wrap_remaining_filter(LogicalPlan::Scan(scan), remaining))
     }
+}
+
+/// Canonical key for structural predicate equality. `TypedExpr` does not derive
+/// `PartialEq`, so we render `ExprKind` via `Debug` — identical for
+/// structurally-identical predicates and distinct otherwise. This mirrors the
+/// `expr_eq` helper in the sibling `push_to_join` rule.
+fn predicate_key(expr: &TypedExpr) -> String {
+    format!("{:?}", expr.kind)
 }
 
 #[cfg(test)]
@@ -220,6 +245,102 @@ mod tests {
                 "expected Filter(Scan) for partial pushdown, got {:?}",
                 other
             ),
+        }
+    }
+
+    fn is_not_null(e: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(e),
+                negated: true,
+            },
+        }
+    }
+
+    /// Re-pushing a structurally-identical predicate across fixed-point rounds
+    /// (as OQ-2 `DeriveJoinNotNullPredicate` does for a key shared by stacked
+    /// joins) must leave exactly ONE copy on the scan, not accumulate. This is
+    /// the regression guard for the `g3_broadcast` 31-copy blowup.
+    #[test]
+    fn repeated_identical_predicate_dedups_to_one() {
+        // Round 1: Filter(a IS NOT NULL, Scan) -> Scan with one predicate.
+        let scan = scan_with_cols(&["a", "b"]);
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: is_not_null(col("a")),
+            required_output_columns: None,
+        });
+        let after_round1 = PushDownPredicateScan
+            .apply(filter)
+            .expect("first push should rewrite");
+        let scan_after_round1 = match after_round1 {
+            LogicalPlan::Scan(s) => {
+                assert_eq!(s.predicates.len(), 1, "first push lands one predicate");
+                s
+            }
+            other => panic!("expected bare Scan after full pushdown, got {:?}", other),
+        };
+
+        // Round 2: an upstream rule re-derives the same conjunct above the scan
+        // that already carries it. The duplicate must be dropped — the scan
+        // still holds exactly one copy, and the redundant Filter is removed.
+        let filter2 = LogicalPlan::Filter(FilterNode {
+            input: Box::new(LogicalPlan::Scan(scan_after_round1)),
+            predicate: is_not_null(col("a")),
+            required_output_columns: None,
+        });
+        let after_round2 = PushDownPredicateScan
+            .apply(filter2)
+            .expect("redundant Filter removal is a structural change -> Some");
+        match after_round2 {
+            LogicalPlan::Scan(s) => assert_eq!(
+                s.predicates.len(),
+                1,
+                "re-pushing an identical predicate must not accumulate"
+            ),
+            other => panic!("expected bare Scan after dedup, got {:?}", other),
+        }
+    }
+
+    /// `P AND P` inside a single Filter collapses to one scan predicate.
+    #[test]
+    fn duplicate_conjuncts_in_one_filter_dedup() {
+        let scan = scan_with_cols(&["a"]);
+        let pred = and(is_not_null(col("a")), is_not_null(col("a")));
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: pred,
+            required_output_columns: None,
+        });
+        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
+        match out {
+            LogicalPlan::Scan(s) => assert_eq!(s.predicates.len(), 1),
+            other => panic!("expected bare Scan, got {:?}", other),
+        }
+    }
+
+    /// Distinct predicates on the same column must NOT collapse — dedup is
+    /// exact-match only.
+    #[test]
+    fn distinct_predicates_are_not_collapsed() {
+        let scan = scan_with_cols(&["a"]);
+        // a IS NOT NULL AND a = 1 -> two distinct predicates.
+        let pred = and(is_not_null(col("a")), eq(col("a"), int_lit(1)));
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: pred,
+            required_output_columns: None,
+        });
+        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
+        match out {
+            LogicalPlan::Scan(s) => assert_eq!(
+                s.predicates.len(),
+                2,
+                "distinct predicates on the same column must be preserved"
+            ),
+            other => panic!("expected bare Scan, got {:?}", other),
         }
     }
 }
