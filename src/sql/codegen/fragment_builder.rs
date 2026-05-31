@@ -800,16 +800,22 @@ impl<'a> PlanFragmentBuilder<'a> {
             change_op_slot,
         )?;
 
-        // Patch the StarRocks lake-scan payload with the dict slot mapping so
-        // the BE side reads the column as dict-encoded INT instead of UTF8.
-        // Iceberg/HDFS scans don't carry this field today; non-StarRocks
-        // dict_columns is a planning bug we should never hit.
+        // StarRocks lake scans carry the dict slot self-map on the wire via
+        // `TLakeScanNode.dict_string_id_to_int_ids`. Iceberg/HDFS scans have no
+        // such thrift field and don't need one: the dict slot is already an
+        // Int32 storage slot, and the per-fragment `TGlobalDict` payloads
+        // emitted below feed `lower_hdfs_scan_node`'s encode map directly
+        // (the parquet reader reads Utf8 and encodes to dict ids). So for an
+        // iceberg `hdfs_scan_node` we leave the thrift node untouched. Any
+        // other scan kind receiving dict_columns is a planning bug.
         if !string_to_dict_slot.is_empty() {
             if let Some(lake) = scan_plan_node.lake_scan_node.as_mut() {
                 lake.dict_string_id_to_int_ids = Some(string_to_dict_slot);
+            } else if scan_plan_node.hdfs_scan_node.is_some() {
+                // iceberg/HDFS: dicts flow via query_global_dicts in lowering.
             } else {
                 return Err(format!(
-                    "scan `{}.{}` has dict_columns but is not a StarRocks lake scan",
+                    "scan `{}.{}` has dict_columns but is neither a StarRocks lake scan nor an iceberg/HDFS scan",
                     op.database, op.table.name,
                 ));
             }
@@ -6005,13 +6011,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_dict_column_on_non_starrocks_scan_errors() {
+    fn scan_dict_column_on_iceberg_scan_is_supported() {
         use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
 
         // Build an Iceberg scan (non-StarRocks ScanSource) carrying a
-        // dict_columns entry. visit_scan must reject this in codegen rather
-        // than silently dropping the mapping, because TLakeScanNode is the
-        // only payload that carries dict_string_id_to_int_ids today.
+        // dict_columns entry. With Option A landed, iceberg/HDFS scans now
+        // support dict_columns: the dicts flow via query_global_dicts in
+        // lowering rather than via TLakeScanNode.dict_string_id_to_int_ids.
+        // visit_scan must succeed (the thrift node is left untouched).
         let iceberg_table_info = IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "ns".to_string(),
@@ -6071,9 +6078,8 @@ mod tests {
 
         // Use an iceberg-only catalog (returns None for physical_layout) so
         // codegen routes the scan through the HDFS-style scan node instead of
-        // the StarRocks lake scan path. visit_scan should then reject
-        // dict_columns because the HDFS scan payload does not carry
-        // dict_string_id_to_int_ids.
+        // the StarRocks lake scan path. visit_scan must now succeed: the HDFS
+        // node is left untouched and the dict flows via query_global_dicts.
         struct IcebergCatalog;
         impl CatalogProvider for IcebergCatalog {
             fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
@@ -6088,20 +6094,8 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        let err = match PlanFragmentBuilder::build(
-            &plan,
-            &catalog,
-            &mock_iceberg_registry(),
-            "default",
-        ) {
-            Ok(_) => panic!("non-StarRocks scan with dict_columns must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.contains("is not a StarRocks lake scan"),
-            "error must explain why dict_columns is rejected, got: {}",
-            err,
-        );
+        PlanFragmentBuilder::build(&plan, &catalog, &mock_iceberg_registry(), "default")
+            .expect("iceberg scan with dict_columns must now succeed (Option A)");
     }
 
     #[test]
