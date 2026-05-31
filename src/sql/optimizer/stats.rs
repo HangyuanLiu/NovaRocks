@@ -1938,19 +1938,25 @@ mod tests {
     fn not_between_is_complement_of_between() {
         let mut cs = HashMap::new();
         cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
-        // NOT (a BETWEEN 0 AND 50): complement of ~0.505.
+        // NOT (a BETWEEN 0 AND 10) over [0,100]:
+        //   ge(a >= 0) = clamp((100-0+1)/100) = 0.99
+        //   le(a <= 10) = (10-0+1)/100 = 0.11
+        //   between sel = 0.99 * 0.11 ≈ 0.109
+        //   NOT BETWEEN sel = 1 - 0.109 ≈ 0.891
+        // The negated value (~0.89) is clearly distinct from the positive (~0.11),
+        // so this test genuinely exercises the negated branch.
         let pred = TypedExpr {
             data_type: DataType::Boolean,
             nullable: false,
             kind: ExprKind::Between {
                 expr: Box::new(col_ref("a")),
                 low: Box::new(int_lit(0)),
-                high: Box::new(int_lit(50)),
+                high: Box::new(int_lit(10)),
                 negated: true,
             },
         };
         let sel = estimate_selectivity(&pred, &cs);
-        assert!(sel > 0.44 && sel < 0.55, "not-between selectivity was {sel}");
+        assert!(sel > 0.85 && sel < 0.93, "not-between selectivity was {sel}");
     }
 }
 
