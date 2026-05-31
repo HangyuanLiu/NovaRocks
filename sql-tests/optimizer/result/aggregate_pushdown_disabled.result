@@ -16,11 +16,13 @@ GATHER EXCHANGE stats={rows=10}
                      TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                      columns: k, v
                      min-max stats
+                     predicates: a.k IS NOT NULL
           GATHER EXCHANGE stats={rows=100000}
             SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
                  TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                  columns: k
                  min-max stats
+                 predicates: b.k IS NOT NULL
 
 -- query 11
 Explain String
@@ -35,8 +37,10 @@ GATHER EXCHANGE stats={rows=10}
                TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                columns: k, v
                min-max stats
+               predicates: a.k IS NOT NULL
           GATHER EXCHANGE stats={rows=100000}
             SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=100000}
                  TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                  columns: k
                  min-max stats
+                 predicates: b.k IS NOT NULL

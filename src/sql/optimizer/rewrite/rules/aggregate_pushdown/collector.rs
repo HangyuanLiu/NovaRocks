@@ -170,6 +170,9 @@ fn split_at_join(
         Side::Left => &left_cols,
         Side::Right => &right_cols,
     };
+    // Qualified columns of the chosen side (a bare Scan per Step 4), used to
+    // disambiguate equi-keys that share a bare name across sides (`a.k = b.k`).
+    let side_qcols = collect_qualified_output_names(side_subtree.as_ref());
 
     // Step 5: partial group-by = original group-by cols on this side
     //         + side-bound equi-keys.
@@ -183,7 +186,7 @@ fn split_at_join(
         .cloned()
         .collect();
     for (left_key, right_key) in &equi_keys {
-        let candidate = side_bound_equi_key(left_key, right_key, side_cols)?;
+        let candidate = side_bound_equi_key(left_key, right_key, &side_qcols)?;
         let already = partial_groupby
             .iter()
             .any(|gb| match (&gb.kind, &candidate.kind) {
@@ -208,12 +211,16 @@ fn split_at_join(
 fn side_bound_equi_key<'a>(
     left_key: &'a TypedExpr,
     right_key: &'a TypedExpr,
-    side_cols: &[String],
+    side_qcols: &[(Option<String>, String)],
 ) -> Option<&'a TypedExpr> {
-    let left_col = column_ref_name(left_key)?;
-    let right_col = column_ref_name(right_key)?;
-    let left_in_side = side_cols.contains(left_col);
-    let right_in_side = side_cols.contains(right_col);
+    // Disambiguate by QUALIFIED identity (qualifier + name). Bare column names
+    // are ambiguous when both join keys share a name (the common `a.k = b.k`
+    // case): both would test as "in side" and the key would be dropped. Matching
+    // on (qualifier, name) keeps the operand actually bound to the chosen side.
+    let left_q = column_ref_qualified(left_key)?;
+    let right_q = column_ref_qualified(right_key)?;
+    let left_in_side = side_qcols.contains(&left_q);
+    let right_in_side = side_qcols.contains(&right_q);
     match (left_in_side, right_in_side) {
         (true, false) => Some(left_key),
         (false, true) => Some(right_key),
@@ -221,6 +228,58 @@ fn side_bound_equi_key<'a>(
     }
 }
 
+fn column_ref_qualified(expr: &TypedExpr) -> Option<(Option<String>, String)> {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            qualifier, column, ..
+        } => Some((qualifier.clone(), column.clone())),
+        _ => None,
+    }
+}
+
+/// Qualified output column identities `(qualifier, name)` for a plan subtree.
+/// Scans contribute their alias (or table name) as the qualifier so equi-join
+/// keys that share a bare name across sides can be told apart.
+fn collect_qualified_output_names(plan: &LogicalPlan) -> Vec<(Option<String>, String)> {
+    match plan {
+        LogicalPlan::Scan(s) => {
+            // Each column is acceptable unqualified, by alias, and by table
+            // name — the equi-key operand may be written any of these ways. A
+            // `Some(qualifier)` operand only matches the side whose alias/table
+            // equals it, so `a.k` vs `b.k` are told apart; a bare operand
+            // matches by name via the unqualified entry.
+            let mut out = Vec::new();
+            for c in &s.columns {
+                let name = c.name.clone();
+                out.push((None, name.clone()));
+                if let Some(alias) = &s.alias {
+                    out.push((Some(alias.clone()), name.clone()));
+                }
+                out.push((Some(s.table.name.clone()), name));
+            }
+            out
+        }
+        LogicalPlan::Filter(f) => collect_qualified_output_names(&f.input),
+        LogicalPlan::Project(p) => p
+            .items
+            .iter()
+            .map(|i| (None, i.output_name.clone()))
+            .collect(),
+        LogicalPlan::Join(j) => {
+            let mut l = collect_qualified_output_names(&j.left);
+            l.extend(collect_qualified_output_names(&j.right));
+            l
+        }
+        LogicalPlan::Aggregate(a) => a
+            .output_columns
+            .iter()
+            .map(|c| (None, c.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
 fn column_ref_name(expr: &TypedExpr) -> Option<&String> {
     match &expr.kind {
         ExprKind::ColumnRef { column, .. } => Some(column),
