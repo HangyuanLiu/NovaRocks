@@ -399,6 +399,29 @@ fn annotate_batch(
         .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
 }
 
+/// Whether `dtype` is in the numeric allowlist used by `reannotate_array`'s
+/// implicit numeric <-> numeric coercion arm: signed/unsigned integers,
+/// floats, and Decimal128. Deliberately excludes Utf8, Boolean, temporal, and
+/// all composite types so that only clean numeric->numeric casts are coerced;
+/// everything else must fail fast in `reannotate_array`.
+fn is_numeric_dtype(dtype: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        dtype,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+    )
+}
+
 /// Rebuild `array` so its `data_type()` matches `target_dtype` exactly,
 /// preserving the underlying data buffers.
 ///
@@ -512,31 +535,28 @@ fn reannotate_array(
             Ok(Arc::new(new_list) as ArrayRef)
         }
         (a, b) if a == b => Ok(array.clone()),
-        // Decimal128 type mismatch: the SELECT produced a wider DECIMAL(sp,ss)
-        // (e.g. from an explicit CAST) but the iceberg sink expects DECIMAL(tp,ts).
-        // Narrow the array with half-up rounding using the same relaxed cast that
-        // the expression evaluator uses for DECIMAL→DECIMAL casts.
-        (
-            DataType::Decimal128(_, source_scale),
-            DataType::Decimal128(target_precision, target_scale),
-        ) => crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
-            format!(
-                "reannotate_array: coerce Decimal128(_, {source_scale}) \
-                     to Decimal128({target_precision}, {target_scale}) failed: {e}"
-            )
-        }),
-        // Integer narrowing: INSERT-SELECT may produce a wider integer type (e.g. BIGINT/Int64)
-        // when the sink column is a narrower integer (e.g. INT/Int32, SMALLINT/Int16, TINYINT/Int8).
-        // Arrow's default cast uses safe=true semantics: out-of-range values become NULL,
-        // matching the DECIMAL overflow convention used above.
-        (DataType::Int64, DataType::Int32)
-        | (DataType::Int64, DataType::Int16)
-        | (DataType::Int64, DataType::Int8)
-        | (DataType::Int32, DataType::Int16)
-        | (DataType::Int32, DataType::Int8) => {
+        // Implicit numeric <-> numeric coercion: INSERT-SELECT may feed one
+        // numeric-family source column into a different numeric-family sink
+        // column. This covers, among others:
+        //   * Decimal128 -> Decimal128 narrowing (half-up rounding via the
+        //     engine's relaxed cast, e.g. an explicit CAST widened the SELECT);
+        //   * integer narrowing (BIGINT -> INT/SMALLINT/TINYINT, etc.);
+        //   * integer -> Decimal128 (e.g. INSERT of a BIGINT expression into a
+        //     DECIMAL(18,0) column);
+        //   * integer -> float widening (INT -> DOUBLE);
+        //   * float narrowing / float -> integer (DOUBLE -> FLOAT, DOUBLE -> INT).
+        // The native (managed-lake) write path accepts these coercions, so the
+        // iceberg write path must too. We delegate to the same relaxed cast the
+        // engine uses for `CAST(... AS <type>)`, which applies safe=true
+        // semantics (out-of-range values become NULL, matching the DECIMAL
+        // overflow convention). This arm is deliberately restricted to the
+        // numeric allowlist below (Int*/UInt*/Float*/Decimal128); it does NOT
+        // accept Utf8 sources or any composite type, so structural mismatches
+        // (e.g. Struct -> Int) still hit the fail-fast catch-all below.
+        (a, b) if is_numeric_dtype(a) && is_numeric_dtype(b) => {
             crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
                 format!(
-                    "reannotate_array: narrow integer {:?} to {:?} failed: {e}",
+                    "reannotate_array: coerce numeric {:?} to {:?} failed: {e}",
                     array.data_type(),
                     target_dtype
                 )
@@ -1254,6 +1274,120 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out.value(0), "true");
         assert_eq!(out.value(1), "false");
+        assert!(out.is_null(2));
+    }
+
+    /// reannotate_array must implicitly coerce an integer column to Decimal128
+    /// when the iceberg sink column is DECIMAL, matching the native write path
+    /// (e.g. INSERT of a BIGINT expression into a DECIMAL(18,0) column).
+    #[test]
+    fn reannotate_int64_coerces_to_decimal128_scale0() {
+        use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1_i64),
+            Some(2_i64),
+            Some(3_i64),
+            None,
+        ]));
+
+        let target_dtype = DataType::Decimal128(18, 0);
+        let result = reannotate_array(&src, &target_dtype).expect("Int64->Decimal128 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+
+        assert_eq!(out.precision(), 18);
+        assert_eq!(out.scale(), 0);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 1_i128);
+        assert_eq!(out.value(1), 2_i128);
+        assert_eq!(out.value(2), 3_i128);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must scale integer values when coercing to a DECIMAL with
+    /// non-zero scale (1 -> 1.00 under DECIMAL(10,2), i.e. raw value 100).
+    #[test]
+    fn reannotate_int64_coerces_to_decimal128_scaled() {
+        use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![Some(1_i64), Some(25_i64), None]));
+
+        let target_dtype = DataType::Decimal128(10, 2);
+        let result =
+            reannotate_array(&src, &target_dtype).expect("Int64->Decimal128 scaled must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128Array");
+
+        assert_eq!(out.precision(), 10);
+        assert_eq!(out.scale(), 2);
+        assert_eq!(out.len(), 3);
+        // 1 -> 1.00 (raw 100), 25 -> 25.00 (raw 2500).
+        assert_eq!(out.value(0), 100_i128);
+        assert_eq!(out.value(1), 2500_i128);
+        assert!(out.is_null(2));
+    }
+
+    /// reannotate_array must implicitly widen an integer column to Float64 when
+    /// the iceberg sink column is DOUBLE.
+    #[test]
+    fn reannotate_int32_coerces_to_float64() {
+        use arrow::array::{ArrayRef, Float64Array, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1_i32),
+            Some(-2_i32),
+            Some(300_i32),
+            None,
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Float64).expect("Int32->Float64 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), 1.0_f64);
+        assert_eq!(out.value(1), -2.0_f64);
+        assert_eq!(out.value(2), 300.0_f64);
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must narrow Float64 -> Float32 (clean numeric->numeric).
+    #[test]
+    fn reannotate_float64_narrows_to_float32() {
+        use arrow::array::{ArrayRef, Float32Array, Float64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.5_f64),
+            Some(-2.25_f64),
+            None,
+        ]));
+
+        let result =
+            reannotate_array(&src, &DataType::Float32).expect("Float64->Float32 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Float32Array");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0), 1.5_f32);
+        assert_eq!(out.value(1), -2.25_f32);
         assert!(out.is_null(2));
     }
 
