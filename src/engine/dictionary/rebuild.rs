@@ -1,12 +1,9 @@
 //! Dictionary rebuild path used by ANALYZE FULL.
 //!
-//! ANALYZE FULL on a StarRocks table runs the per-column distinct value scan
-//! against the standalone query engine and persists the sorted, null-excluded
-//! result as an Active dictionary snapshot. ANALYZE SAMPLE does not rebuild
-//! dictionaries. Iceberg tables are skipped here: the low-cardinality
-//! dictionary rewrite is gated off iceberg scans (see
-//! `DictionaryQueryProvider::owner_for`), so an iceberg snapshot would never
-//! be consumed.
+//! ANALYZE FULL on a StarRocks or Iceberg table runs the per-column distinct
+//! value scan against the standalone query engine and persists the sorted,
+//! null-excluded result as an Active dictionary snapshot. ANALYZE SAMPLE does
+//! not rebuild dictionaries.
 
 use std::sync::Arc;
 
@@ -24,10 +21,9 @@ use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
 /// Rebuild active dictionary snapshots for `database.table`'s string-typed
-/// columns. Returns the number of snapshots that were persisted. Only the
-/// StarRocks backend is handled; iceberg tables and any other backend (or no
-/// metadata provider configured) result in `Ok(0)`, because the dictionary
-/// rewrite only targets StarRocks lake scans.
+/// columns. Returns the number of snapshots that were persisted. Both
+/// StarRocks and Iceberg backends are handled; any other backend (or no
+/// metadata provider configured) results in `Ok(0)`.
 ///
 /// This path is best-effort with respect to concurrent writes: a write that
 /// commits between the per-column `SELECT DISTINCT` scan and `upsert_snapshot`
@@ -117,13 +113,14 @@ fn build_owner(
                 table_id: runtime.table.table_id,
             }))
         }
-        // Skip iceberg tables: the low-cardinality dictionary rewrite is gated
-        // off iceberg scans (see `DictionaryQueryProvider::owner_for`), so any
-        // iceberg snapshot built here would never be consumed. Returning no
-        // owner makes `rebuild_for_analyze_full` a no-op for iceberg, avoiding
-        // an unused per-column distinct scan. Revisit if/when iceberg scan dict
-        // execution support (Option A) lands.
-        ScanSource::IcebergDataFiles { .. } => Ok(None),
+        ScanSource::IcebergDataFiles { table: info, .. } => {
+            Ok(Some(DictionaryOwner::IcebergTable {
+                catalog: info.catalog.clone(),
+                namespace: info.namespace.clone(),
+                table: info.table.clone(),
+                table_uuid: info.table_uuid.clone(),
+            }))
+        }
         _ => Ok(None),
     }
 }

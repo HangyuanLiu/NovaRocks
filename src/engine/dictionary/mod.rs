@@ -319,15 +319,14 @@ impl DictionaryQueryProvider {
                     table_id: *table_id,
                 }))
             }
-            // Iceberg scans have no execution-layer dictionary-encode
-            // support: the iceberg/HDFS scan path cannot read a column as a
-            // dict-encoded INT, and the codegen guard in
-            // `src/sql/codegen/fragment_builder.rs` rejects `dict_columns` on
-            // a non-StarRocks lake scan. Returning no owner here makes
-            // `load_active_snapshot` yield `None`, so the low-cardinality
-            // dictionary rewrite never targets iceberg tables. Revisit if/when
-            // iceberg scan dict execution support (Option A) lands.
-            ScanSource::IcebergDataFiles { .. } => Ok(None),
+            ScanSource::IcebergDataFiles { table: info, .. } => {
+                Ok(Some(DictionaryOwner::IcebergTable {
+                    catalog: info.catalog.clone(),
+                    namespace: info.namespace.clone(),
+                    table: info.table.clone(),
+                    table_uuid: info.table_uuid.clone(),
+                }))
+            }
             // Metadata tables, IVM delta scans, and IMV pinned-version
             // placeholders never participate in dictionary rewriting.
             ScanSource::IcebergMetadataTable { .. }
@@ -529,16 +528,14 @@ mod tests {
         );
     }
 
-    /// Iceberg scans must NOT participate in the low-cardinality dictionary
-    /// rewrite: the iceberg/HDFS scan execution path has no dictionary-encode
-    /// plumbing (see the guard in `src/sql/codegen/fragment_builder.rs` that
-    /// rejects `dict_columns` on a non-StarRocks lake scan). Even when an
-    /// Active iceberg dictionary snapshot exists in the metadata store,
-    /// `DictionaryQueryProvider::load_active_snapshot` must return `None` for
-    /// an `IcebergDataFiles` scan source so the rewrite collector never
-    /// registers iceberg string columns and the rewriter never fires.
+    /// Iceberg scans now participate in the low-cardinality dictionary rewrite
+    /// because Option A (iceberg scan execution-layer dictionary-encode support)
+    /// has landed. `DictionaryQueryProvider::owner_for` maps `IcebergDataFiles`
+    /// to a `DictionaryOwner::IcebergTable`, so when an Active iceberg
+    /// dictionary snapshot exists in the metadata store,
+    /// `load_active_snapshot` must return it (not `None`).
     #[test]
-    fn dictionary_provider_skips_iceberg_data_files_scan() {
+    fn dictionary_provider_loads_iceberg_data_files_snapshot() {
         use crate::sql::catalog::{
             ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
         };
@@ -614,10 +611,9 @@ mod tests {
         let loaded = provider
             .load_active_snapshot(&table, "test_db", "s")
             .expect("load_active_snapshot returns Ok");
-
-        assert!(
-            loaded.is_none(),
-            "iceberg scans have no execution-layer dictionary-encode support, so the dictionary rewrite must not target them",
-        );
+        let snapshot =
+            loaded.expect("iceberg scans support dict execution (Option A); snapshot must load");
+        assert_eq!(snapshot.column_name, "s");
+        assert_eq!(snapshot.dictionary_id, 99);
     }
 }
