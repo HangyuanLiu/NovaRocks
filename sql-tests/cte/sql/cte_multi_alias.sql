@@ -13,10 +13,8 @@ DROP TABLE IF EXISTS ${case_db}.t_cte_multi;
 CREATE TABLE ${case_db}.t_cte_multi (
     y bigint NULL,
     v bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(y)
-DISTRIBUTED BY HASH(y) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_cte_multi VALUES (2001, 10), (2002, 20), (2003, 30);
 
 -- query 2

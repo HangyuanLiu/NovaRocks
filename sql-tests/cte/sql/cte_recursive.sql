@@ -24,15 +24,8 @@ CREATE TABLE ${case_db}.employees (
   `name` varchar(100) NULL COMMENT "",
   `manager_id` int(11) NULL COMMENT "",
   `title` varchar(50) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`employee_id`)
-DISTRIBUTED BY RANDOM
-PROPERTIES (
-"compression" = "LZ4",
-"fast_schema_evolution" = "true",
-"replicated_storage" = "true",
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.employees VALUES
 (1, 'Alicia', NULL, 'CEO'),
 (2, 'Bob', 1, 'CTO'),
