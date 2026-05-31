@@ -1956,7 +1956,10 @@ mod tests {
             },
         };
         let sel = estimate_selectivity(&pred, &cs);
-        assert!(sel > 0.85 && sel < 0.93, "not-between selectivity was {sel}");
+        assert!(
+            sel > 0.85 && sel < 0.93,
+            "not-between selectivity was {sel}"
+        );
     }
 }
 

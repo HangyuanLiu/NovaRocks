@@ -1566,6 +1566,9 @@ mod costs_level_tests {
             column_statistics: cs,
         };
         let s = format_column_stats_costs(&stats);
-        assert!(s.contains("ndv=?"), "expected ndv=? for infinite NDV, got: {s}");
+        assert!(
+            s.contains("ndv=?"),
+            "expected ndv=? for infinite NDV, got: {s}"
+        );
     }
 }

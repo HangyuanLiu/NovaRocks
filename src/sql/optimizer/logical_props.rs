@@ -401,7 +401,13 @@ mod tests {
             }),
             children: vec![child],
         });
-        let props = derive_for_group(&memo, filter, vec![output(1, "a"), output(2, "b")], 50.0, std::collections::HashMap::new());
+        let props = derive_for_group(
+            &memo,
+            filter,
+            vec![output(1, "a"), output(2, "b")],
+            50.0,
+            std::collections::HashMap::new(),
+        );
         let class = props
             .equivalence_classes
             .class_containing(ColumnId(1))
@@ -428,7 +434,13 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0, std::collections::HashMap::new());
+        let props = derive_for_group(
+            &memo,
+            join,
+            vec![output(1, "lk"), output(2, "rk")],
+            10.0,
+            std::collections::HashMap::new(),
+        );
         let class = props
             .equivalence_classes
             .class_containing(ColumnId(2))
@@ -455,7 +467,13 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0, std::collections::HashMap::new());
+        let props = derive_for_group(
+            &memo,
+            join,
+            vec![output(1, "lk"), output(2, "rk")],
+            10.0,
+            std::collections::HashMap::new(),
+        );
         assert!(
             props
                 .equivalence_classes
