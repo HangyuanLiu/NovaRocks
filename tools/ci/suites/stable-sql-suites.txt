@@ -11,6 +11,7 @@ set-op
 table-function
 runtime-filter
 low-cardinality
+optimizer
 iceberg
 iceberg-compatibility
 iceberg-ddl
@@ -30,4 +31,3 @@ iceberg-rest
 # complex-type
 # decimal
 # function
-# optimizer
