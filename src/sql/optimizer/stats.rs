@@ -1348,10 +1348,17 @@ fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
 
 /// Get the NDV for an expression from column statistics.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
+    // A column is only useful for cardinality if it carries a real NDV (> 1).
+    // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
+    // reports distinct_values_count = 1.0; treating that as a true NDV would make
+    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
+    // fall back to the default NDV for unknown/degenerate columns.
     if let Some(name) = extract_column_name(expr)
         && let Some(cs) = column_stats.get(&name.to_lowercase())
+        && cs.distinct_values_count > 1.0
     {
-        return cs.distinct_values_count.max(1.0);
+        return cs.distinct_values_count;
     }
     10.0
 }
@@ -1627,6 +1634,51 @@ mod tests {
         // 1/100 = 0.01 -> 10000 * 0.01 = 100 rows.
         let filter_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((filter_props.row_count - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn get_expr_ndv_ignores_unknown_ndv() {
+        // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
+        // for no-stats / managed-lake tables. get_expr_ndv must treat that as
+        // "no information" and return the 10.0 default, otherwise get_join_key_ndv
+        // would divide left*right by ~1 and explode joins to near cross-products.
+        let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
+        column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());
+        assert_eq!(column_stats["unknown_col"].distinct_values_count, 1.0);
+        let unknown_expr = col_ref("unknown_col");
+        assert_eq!(get_expr_ndv(&unknown_expr, &column_stats), 10.0);
+
+        // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
+        column_stats.insert(
+            "degenerate_col".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 100.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1.0,
+            },
+        );
+        let degenerate_expr = col_ref("degenerate_col");
+        assert_eq!(get_expr_ndv(&degenerate_expr, &column_stats), 10.0);
+
+        // A real NDV (> 1) is still used verbatim.
+        column_stats.insert(
+            "real_col".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 100.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 50.0,
+            },
+        );
+        let real_expr = col_ref("real_col");
+        assert_eq!(get_expr_ndv(&real_expr, &column_stats), 50.0);
+
+        // An unknown column reference (absent from the map) also defaults.
+        let missing_expr = col_ref("missing_col");
+        assert_eq!(get_expr_ndv(&missing_expr, &column_stats), 10.0);
     }
 
     #[test]
