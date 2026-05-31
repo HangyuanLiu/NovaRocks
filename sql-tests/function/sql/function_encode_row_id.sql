@@ -11,9 +11,7 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (id int, v1 bigint, v2 string, v3 array<int>)
-    DUPLICATE KEY(id)
-    DISTRIBUTED BY HASH(id) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- ENCODE_ROW_ID with constant NULL args

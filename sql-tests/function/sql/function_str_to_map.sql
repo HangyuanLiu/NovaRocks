@@ -7,9 +7,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1(c1 INT, c2 STRING)
-DUPLICATE KEY(c1)
-DISTRIBUTED BY HASH(c1) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

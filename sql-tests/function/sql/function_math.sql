@@ -10,10 +10,7 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (id int, data array<float>)
-    ENGINE = olap
-    DUPLICATE KEY(id)
-    DISTRIBUTED BY HASH(id) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -50,10 +47,7 @@ SELECT round(l2_distance(array<float>[0.1, 0.2, 0.3], array<float>[0.1, 0.2, 0.3
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE test_vector (id int, data array<float>)
-    ENGINE=olap
-    DUPLICATE KEY(id)
-    DISTRIBUTED BY HASH(id) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
