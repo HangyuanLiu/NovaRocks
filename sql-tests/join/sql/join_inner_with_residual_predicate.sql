@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_join_inner_residual_r;
 CREATE TABLE ${case_db}.t_join_inner_residual_l (
   id INT,
   lv INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_inner_residual_r (
   id INT,
   rv INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_inner_residual_l VALUES
   (1, 5),
   (2, 20),

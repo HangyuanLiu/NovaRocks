@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.t_sort_multi_key (
   grp STRING,
   v INT,
   id INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_sort_multi_key VALUES
   ('B', 2, 1),
   ('A', 3, 2),

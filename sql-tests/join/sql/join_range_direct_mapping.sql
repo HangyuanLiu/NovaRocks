@@ -25,7 +25,8 @@ DROP TABLE IF EXISTS ${case_db}.t1;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
   k1 bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
@@ -43,7 +44,8 @@ INSERT INTO ${case_db}.__row_util_base SELECT * FROM ${case_db}.__row_util_base;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
   idx bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -63,7 +65,8 @@ CREATE TABLE ${case_db}.t1 (
     c_double_null double NULL,
     c_string STRING,
     c_string_null STRING NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true

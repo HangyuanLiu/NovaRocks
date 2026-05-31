@@ -569,9 +569,12 @@ impl StandaloneSession {
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
-        if let Some(result) =
-            self::statistics::try_handle_statement(&self.inner, &normalized, current_database)?
-        {
+        if let Some(result) = self::statistics::try_handle_statement(
+            &self.inner,
+            &normalized,
+            current_catalog,
+            current_database,
+        )? {
             return Ok(result);
         }
         if let Some((target, source)) = parse_create_table_like(&normalized)? {
@@ -5983,6 +5986,164 @@ enable_path_style_access = true
             snap_before, snap_after,
             "INSERT INTO ... SELECT must advance the iceberg snapshot id"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ANALYZE TABLE / ANALYZE FULL TABLE against iceberg external-catalog
+    // tables that were created + populated but never SELECTed from. Iceberg
+    // tables register into the in-memory catalog lazily per SELECT, so the
+    // statistics path must materialize the table itself before resolving its
+    // columns (regression: ANALYZE failed with "unknown table").
+    // -----------------------------------------------------------------------
+
+    fn iceberg_column_stat_row_count(session: &StandaloneSession, table_name: &str) -> usize {
+        let sql = format!(
+            "select column_name from _statistics_.column_statistics where table_name = '{table_name}'"
+        );
+        session
+            .query(&sql)
+            .expect("query column statistics")
+            .row_count()
+    }
+
+    #[test]
+    fn analyze_table_resolves_iceberg_table_via_session_catalog() {
+        // Faithful reproduction of the SQL-suite scenario: `SET catalog <ice>`
+        // (current_catalog set) followed by a 2-part `db.table` ANALYZE before
+        // any SELECT against the table.
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("seed");
+
+        // Sanity: the table is NOT in the in-memory catalog yet (never SELECTed).
+        assert!(
+            !engine.has_local_table("db1", "t"),
+            "iceberg table must not be pre-registered before ANALYZE",
+        );
+
+        session
+            .execute_in_context("analyze table db1.t", Some("ice"), "db1", None)
+            .expect("ANALYZE TABLE must resolve iceberg external table via session catalog");
+
+        // The table is now materialized and column statistics were recorded
+        // for both columns.
+        assert!(engine.has_local_table("db1", "t"));
+        assert_eq!(
+            iceberg_column_stat_row_count(&session, "db1.t"),
+            2,
+            "ANALYZE TABLE must record stats for both iceberg columns",
+        );
+    }
+
+    #[test]
+    fn analyze_full_table_resolves_iceberg_table_via_three_part_name() {
+        // The 3-part `catalog.db.table` form (current_catalog = None) must also
+        // resolve the iceberg table before stats collection.
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("seed");
+
+        assert!(!engine.has_local_table("db1", "t"));
+
+        session
+            .execute_in_database("analyze full table ice.db1.t", "default")
+            .expect("ANALYZE FULL TABLE must resolve iceberg external table via 3-part name");
+
+        assert!(engine.has_local_table("db1", "t"));
+        assert_eq!(iceberg_column_stat_row_count(&session, "db1.t"), 2);
+    }
+
+    #[test]
+    fn analyze_table_unknown_iceberg_table_errors() {
+        // A genuinely missing iceberg table named explicitly by ANALYZE must
+        // surface a hard error rather than silently succeeding.
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let err = session
+            .execute_in_context("analyze table db1.does_not_exist", Some("ice"), "db1", None)
+            .expect_err("ANALYZE of a missing iceberg table must fail");
+        assert!(
+            err.to_ascii_lowercase().contains("does_not_exist")
+                || err.to_ascii_lowercase().contains("load iceberg table"),
+            "expected a load/resolution error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn select_resolves_iceberg_table_referenced_only_in_join_on_subquery() {
+        // Engine gap #4 (join_apply_to_join q7): a table referenced ONLY inside
+        // a subquery nested in a JOIN ON predicate must be registered into the
+        // in-memory catalog at query-prep time, exactly like FROM/WHERE
+        // subqueries. Before the fix the query-prep table-reference collection
+        // did not descend into JOIN ON predicates, so `t2` was never
+        // registered and the SELECT failed with `unknown table: t2`.
+        let warehouse = TempDir::new().expect("warehouse");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create catalog");
+        session
+            .execute_in_database("create database ice.db1", "default")
+            .expect("create database");
+        for (name, col) in [("t0", "v1"), ("t1", "v5"), ("t2", "v7")] {
+            session
+                .execute_in_database(
+                    &format!(
+                        r#"create table ice.db1.{name} ({col} bigint) tblproperties("format-version"="2")"#
+                    ),
+                    "default",
+                )
+                .expect("create table");
+            session
+                .execute_in_database(
+                    &format!("insert into ice.db1.{name} values (1), (2), (3)"),
+                    "default",
+                )
+                .expect("seed table");
+        }
+
+        // `t2` is referenced ONLY inside the ON-clause IN-subquery. Sanity:
+        // it is not in the in-memory catalog before the SELECT runs.
+        assert!(
+            !engine.has_local_table("db1", "t2"),
+            "iceberg table t2 must not be pre-registered before the SELECT",
+        );
+
+        let result = session
+            .execute_in_context(
+                "select count(*) from db1.t0 \
+                 left join db1.t1 on v1 in (select v7 from db1.t2) or v1 < v5",
+                Some("ice"),
+                "db1",
+                None,
+            )
+            .expect("SELECT with ON-clause subquery table must resolve, not error unknown table");
+
+        // The ON-clause-only table is now materialized in the in-memory
+        // catalog, and the query produced a count row.
+        assert!(
+            engine.has_local_table("db1", "t2"),
+            "ON-clause-subquery table t2 must be registered during query-prep",
+        );
+        match result {
+            StatementResult::Query(query_result) => {
+                assert_eq!(
+                    query_result.row_count(),
+                    1,
+                    "count(*) over a LEFT JOIN must return exactly one row",
+                );
+            }
+            StatementResult::Ok => panic!("SELECT must return rows"),
+        }
     }
 
     fn current_iceberg_snapshot_id(

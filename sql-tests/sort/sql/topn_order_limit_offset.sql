@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_order_limit_offset;
 CREATE TABLE ${case_db}.t_topn_order_limit_offset (
   id INT,
   val INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_order_limit_offset VALUES
   (1, 100),
   (2, 90),

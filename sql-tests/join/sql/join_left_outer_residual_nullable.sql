@@ -12,12 +12,14 @@ DROP TABLE IF EXISTS ${case_db}.t_join_left_outer_residual_nullable_r;
 CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_l (
   id INT,
   lv INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_left_outer_residual_nullable_r (
   id INT,
   rv INT,
   flag STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_left_outer_residual_nullable_l VALUES
   (1, 5),
   (2, 8),

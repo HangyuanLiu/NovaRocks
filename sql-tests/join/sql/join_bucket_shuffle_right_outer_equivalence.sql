@@ -13,30 +13,22 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-  ENGINE=OLAP DUPLICATE KEY(c0)
-  DISTRIBUTED BY HASH(c0) BUCKETS 9
-  PROPERTIES('replication_num'='1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-  ENGINE=OLAP DUPLICATE KEY(c0)
-  DISTRIBUTED BY HASH(c0) BUCKETS 9
-  PROPERTIES('replication_num'='1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-  ENGINE=OLAP DUPLICATE KEY(c0)
-  DISTRIBUTED BY HASH(c0) BUCKETS 9
-  PROPERTIES('replication_num'='1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.r(fp BIGINT NULL)
-  ENGINE=OLAP DUPLICATE KEY(fp)
-  DISTRIBUTED BY HASH(fp) BUCKETS 1
-  PROPERTIES('replication_num'='1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

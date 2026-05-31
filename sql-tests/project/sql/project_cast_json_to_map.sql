@@ -10,7 +10,8 @@ DROP TABLE IF EXISTS ${case_db}.t_cast_json_to_map;
 CREATE TABLE ${case_db}.t_cast_json_to_map (
     c1 INT,
     c2 JSON
-) PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_sort_expression_distance;
 CREATE TABLE ${case_db}.t_sort_expression_distance (
   id INT,
   v INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_sort_expression_distance VALUES
   (1, 7),
   (2, 12),

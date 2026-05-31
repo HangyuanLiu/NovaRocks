@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_semi_r;
 CREATE TABLE ${case_db}.t_join_right_semi_l (
   id INT,
   lv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_right_semi_r (
   id INT,
   rv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_right_semi_l VALUES
   (2, 'L2'),
   (4, 'L4');

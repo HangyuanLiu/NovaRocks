@@ -21,10 +21,8 @@ CREATE TABLE ${case_db}.struct_test (
   s3 struct<c0 string, c1 map<int, varchar(30)>>,
   s4 struct<c0 int, c1 json>,
   s5 struct<c0 INT, c1 STRUCT<c INT, b string>>
-) ENGINE=OLAP
-DUPLICATE KEY(pk)
-DISTRIBUTED BY HASH(pk) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -41,18 +39,21 @@ INSERT INTO ${case_db}.struct_test VALUES
 
 -- query 5
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; s3 inner map '' key coerces to null int -> dropped that entry
 INSERT INTO ${case_db}.struct_test VALUES
-  (1, row(1, null), row(null,''), row(1,[]), row('11',map(1,'abc','',null)), row(null,json_object('name',null)), row(null, row(null,null)));
+  (1, row(1, null), row(null,''), row(1,[]), row('11',map(1,'abc')), row(null,json_object('name',null)), row(null, row(null,null)));
 
 -- query 6
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; s3 inner map had a single null key, dropped it (empty map)
 INSERT INTO ${case_db}.struct_test VALUES
-  (2, row(null,null), row(null,null), row(null,null), row(null,map(null,null)), row(null,null), row(null, row(null,null)));
+  (2, row(null,null), row(null,null), row(null,null), row(null,map()), row(null,null), row(null, row(null,null)));
 
 -- query 7
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; s3 inner map had a trailing null key, dropped it (kept the non-null entry)
 INSERT INTO ${case_db}.struct_test VALUES
-  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',map(3,'a33c',null,null)), row(null,json_object('name','abc','age',23)), row(null, row(3,'a')));
+  (3, row(3,''), row(3,''), row(3,['3',null, null,null]), row('3',map(3,'a33c')), row(null,json_object('name','abc','age',23)), row(null, row(3,'a')));
 
 -- query 8
 -- @skip_result_check=true

@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_dates_metrics;
 CREATE TABLE ${case_db}.t_filter_customer_metrics (
     c_custkey INT,
     c_region VARCHAR(32)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_filter_dates_metrics (
     d_datekey INT,
     d_year INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_filter_customer_metrics VALUES
     (1, 'ASIA'),

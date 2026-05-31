@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int32Builder, Int64Array, Int64Builder, ListArray, ListBuilder, NullBufferBuilder, StringArray,
-    StringBuilder, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, NullBufferBuilder, StringArray, StructArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
@@ -30,6 +30,7 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::sql_expr::literal_to_i128_for_integer;
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]
@@ -1908,30 +1909,31 @@ fn build_literal_array(
         DataType::Int32 => Ok(Arc::new(Int32Array::from(
             values
                 .iter()
-                .map(|literal| match literal {
-                    Literal::Null => Ok(None),
-                    Literal::Int(value) => coerce_i32_literal(*value, logical_type),
-                    Literal::String(value) => value
-                        .trim()
-                        .parse::<i64>()
-                        .map_err(|_| format!("literal `{value}` is not valid for INT"))
-                        .and_then(|value| coerce_i32_literal(value, logical_type)),
-                    other => Err(format!("literal {:?} is not valid for INT", other)),
+                .map(|literal| {
+                    // Route through the shared scalar coercion helper so the
+                    // same implicit casts allowed for top-level INT columns
+                    // (Float truncation, empty-string -> NULL, numeric-string
+                    // parsing) also apply to INT literals nested inside ARRAY /
+                    // MAP / STRUCT constructors. `coerce_i32_literal` then
+                    // applies the i64 -> i32 range/logical-type narrowing.
+                    literal_to_i128_for_integer(literal, "INT")?.map_or(Ok(None), |value| {
+                        let value = i64::try_from(value)
+                            .map_err(|_| format!("literal {value} is out of range for INT"))?;
+                        coerce_i32_literal(value, logical_type)
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
         DataType::Int64 => Ok(Arc::new(Int64Array::from(
             values
                 .iter()
-                .map(|literal| match literal {
-                    Literal::Null => Ok(None),
-                    Literal::Int(value) => Ok(Some(*value)),
-                    Literal::String(value) => value
-                        .trim()
-                        .parse::<i64>()
-                        .map(Some)
-                        .map_err(|_| format!("literal `{value}` is not valid for BIGINT")),
-                    other => Err(format!("literal {:?} is not valid for BIGINT", other)),
+                .map(|literal| {
+                    // Same shared coercion as INT above; narrow i128 -> i64.
+                    literal_to_i128_for_integer(literal, "BIGINT")?.map_or(Ok(None), |value| {
+                        i64::try_from(value)
+                            .map(Some)
+                            .map_err(|_| format!("literal {value} is out of range for BIGINT"))
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
@@ -2049,119 +2051,13 @@ fn build_literal_array(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
-        DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
-            let mut builder = ListBuilder::new(Int32Builder::new());
-            for literal in values {
-                match literal {
-                    Literal::Null => builder.append(false),
-                    Literal::Array(items) => {
-                        for item in items {
-                            match item {
-                                Literal::Null => builder.values().append_null(),
-                                Literal::Int(value) => {
-                                    let value = i32::try_from(*value).map_err(|_| {
-                                        format!("literal {value} is out of range for ARRAY<INT>")
-                                    })?;
-                                    builder.values().append_value(value);
-                                }
-                                other => {
-                                    return Err(format!(
-                                        "literal {:?} is not valid for ARRAY<INT>",
-                                        other
-                                    ));
-                                }
-                            }
-                        }
-                        builder.append(true);
-                    }
-                    other => {
-                        return Err(format!("literal {:?} is not valid for ARRAY<INT>", other));
-                    }
-                }
-            }
-            let list = builder.finish();
-            let (_, offsets, values, nulls) = list.into_parts();
-            Ok(Arc::new(arrow::array::ListArray::new(
-                field.clone(),
-                offsets,
-                values,
-                nulls,
-            )))
-        }
-        DataType::List(field) if matches!(field.data_type(), DataType::Int64) => {
-            let mut builder = ListBuilder::new(Int64Builder::new());
-            for literal in values {
-                match literal {
-                    Literal::Null => builder.append(false),
-                    Literal::Array(items) => {
-                        for item in items {
-                            match item {
-                                Literal::Null => builder.values().append_null(),
-                                Literal::Int(value) => builder.values().append_value(*value),
-                                other => {
-                                    return Err(format!(
-                                        "literal {:?} is not valid for ARRAY<BIGINT>",
-                                        other
-                                    ));
-                                }
-                            }
-                        }
-                        builder.append(true);
-                    }
-                    other => {
-                        return Err(format!(
-                            "literal {:?} is not valid for ARRAY<BIGINT>",
-                            other
-                        ));
-                    }
-                }
-            }
-            let list = builder.finish();
-            let (_, offsets, values, nulls) = list.into_parts();
-            Ok(Arc::new(arrow::array::ListArray::new(
-                field.clone(),
-                offsets,
-                values,
-                nulls,
-            )))
-        }
-        DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-            let mut builder = ListBuilder::new(StringBuilder::new());
-            for literal in values {
-                match literal {
-                    Literal::Null => builder.append(false),
-                    Literal::Array(items) => {
-                        for item in items {
-                            match item {
-                                Literal::Null => builder.values().append_null(),
-                                Literal::String(value) => builder.values().append_value(value),
-                                other => {
-                                    return Err(format!(
-                                        "literal {:?} is not valid for ARRAY<STRING>",
-                                        other
-                                    ));
-                                }
-                            }
-                        }
-                        builder.append(true);
-                    }
-                    other => {
-                        return Err(format!(
-                            "literal {:?} is not valid for ARRAY<STRING>",
-                            other
-                        ));
-                    }
-                }
-            }
-            let list = builder.finish();
-            let (_, offsets, values, nulls) = list.into_parts();
-            Ok(Arc::new(arrow::array::ListArray::new(
-                field.clone(),
-                offsets,
-                values,
-                nulls,
-            )))
-        }
+        // All ARRAY element types (including INT / BIGINT / STRING) flow
+        // through this single recursive branch: it flattens the elements and
+        // calls `build_literal_array` on the element type, so element literals
+        // get exactly the same implicit coercion as top-level scalars
+        // (e.g. a Float element of ARRAY<BIGINT> truncates to BIGINT). Keeping
+        // one path avoids the per-type drift that previously rejected
+        // otherwise-coercible element literals.
         DataType::List(field) => {
             let mut offsets = Vec::with_capacity(values.len() + 1);
             let mut nulls = NullBufferBuilder::new(values.len());
@@ -2242,11 +2138,13 @@ fn build_literal_array(
                     build_literal_array(field.data_type(), &refs, None)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok(Arc::new(StructArray::new(
-                fields.clone(),
-                child_arrays,
-                struct_nulls.finish(),
-            )))
+            // Use try_new so an unmasked NULL in a non-nullable STRUCT field
+            // (e.g. a `required` nested field on an external table) surfaces as
+            // a clean Err instead of an Arrow panic on user input.
+            Ok(Arc::new(
+                StructArray::try_new(fields.clone(), child_arrays, struct_nulls.finish())
+                    .map_err(|e| format!("build iceberg STRUCT literal column failed: {e}"))?,
+            ))
         }
         DataType::Map(entries_field, ordered) => {
             // entries_field is Struct(key: KeyType, value: ValueType).
@@ -2297,11 +2195,29 @@ fn build_literal_array(
 
             let key_array = build_literal_array(key_field.data_type(), &flat_keys, None)?;
             let val_array = build_literal_array(val_field.data_type(), &flat_vals, None)?;
-            let entries_array = arrow::array::StructArray::new(
+            // The Iceberg MAP key field is `required` per the Iceberg spec, so
+            // its Arrow representation is a non-nullable Struct field. Building a
+            // StructArray with unmasked nulls on a non-nullable field panics
+            // inside `StructArray::new` (`Found unmasked nulls for non-nullable
+            // StructArray field "key"`). A NULL map key (e.g. `map(null, 'x')`,
+            // or an empty-string key coerced to NULL on an INT-keyed map) is not
+            // representable in an Iceberg table. Fail fast with a clear error
+            // instead of letting Arrow panic on user input (CLAUDE.md rule #2).
+            if !key_field.is_nullable() && key_array.null_count() > 0 {
+                return Err(format!(
+                    "Iceberg MAP keys must be non-null (column key field `{}`); cannot insert a NULL map key",
+                    key_field.name()
+                ));
+            }
+            // Backstop: even with the explicit null-key guard above, route the
+            // entries struct through try_new so any residual unmasked-null case
+            // (e.g. a non-nullable value field) is a clean Err, not a panic.
+            let entries_array = arrow::array::StructArray::try_new(
                 arrow::datatypes::Fields::from(vec![key_field.clone(), val_field.clone()]),
                 vec![key_array, val_array],
                 None,
-            );
+            )
+            .map_err(|e| format!("build iceberg MAP entries struct failed: {e}"))?;
             Ok(Arc::new(arrow::array::MapArray::new(
                 entries_field.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -2986,6 +2902,247 @@ mod table_property_tests {
         let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
         assert_eq!(field.initial_default.as_ref(), Some(&expected));
         assert_eq!(field.write_default.as_ref(), Some(&expected));
+    }
+}
+
+#[cfg(test)]
+mod build_literal_array_tests {
+    //! Coverage for `build_literal_array` literal coercion, especially for
+    //! literals nested inside ARRAY / MAP / STRUCT constructors. Top-level
+    //! scalar literals already coerce to the target column type (Float ->
+    //! integer truncation, empty string -> NULL, etc.); these tests pin down
+    //! that the same implicit coercion is applied to ARRAY elements and MAP
+    //! keys/values, matching the standalone managed-table behaviour.
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    use super::{Literal, build_literal_array};
+
+    fn list_int64_type() -> DataType {
+        DataType::List(Arc::new(Field::new("element", DataType::Int64, true)))
+    }
+
+    fn map_int_varchar_type() -> DataType {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, true),
+                    Field::new("value", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        DataType::Map(Arc::new(entries), false)
+    }
+
+    /// MAP<INT, VARCHAR> with a NON-nullable key field, matching the real
+    /// Iceberg Arrow schema (`schema_to_arrow_schema` marks the `required`
+    /// map key field as non-nullable). This is the shape that exposes the
+    /// null-map-key path; `map_int_varchar_type` above intentionally uses a
+    /// nullable key for the coercion-only tests.
+    fn map_int_varchar_type_required_key() -> DataType {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        DataType::Map(Arc::new(entries), false)
+    }
+
+    #[test]
+    fn array_bigint_coerces_float_element_to_truncated_integer() {
+        // `[1.0, 2.0, 3.0, 4.0, 10.0]` into ARRAY<BIGINT>: each Float element
+        // truncates to the matching integer, mirroring the scalar path used
+        // for top-level BIGINT columns.
+        let value = Literal::Array(vec![
+            Literal::Float(1.0),
+            Literal::Float(2.0),
+            Literal::Float(3.0),
+            Literal::Float(4.0),
+            Literal::Float(10.0),
+        ]);
+        let array = build_literal_array(&list_int64_type(), &[&value], None)
+            .expect("array<bigint> with float elements should coerce");
+        let list = array.as_any().downcast_ref::<ListArray>().expect("list");
+        let elements = list
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 elements")
+            .clone();
+        assert_eq!(elements.len(), 5);
+        assert_eq!(
+            (0..elements.len())
+                .map(|i| elements.value(i))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 10]
+        );
+    }
+
+    #[test]
+    fn array_bigint_preserves_null_element() {
+        let value = Literal::Array(vec![Literal::Int(1), Literal::Null]);
+        let array = build_literal_array(&list_int64_type(), &[&value], None)
+            .expect("array<bigint> with null element");
+        let list = array.as_any().downcast_ref::<ListArray>().expect("list");
+        let elements = list.value(0);
+        let elements = elements
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 elements");
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements.value(0), 1);
+        assert!(elements.is_null(1));
+    }
+
+    #[test]
+    fn array_bigint_rejects_non_numeric_string_element() {
+        // A genuinely-incompatible literal (non-numeric string) must still
+        // fail fast rather than silently coercing.
+        let value = Literal::Array(vec![Literal::String("not-a-number".to_string())]);
+        let err = build_literal_array(&list_int64_type(), &[&value], None)
+            .expect_err("non-numeric string element should be rejected");
+        assert!(
+            err.contains("is not valid for BIGINT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_int_key_coerces_empty_string_to_null_key() {
+        // `map(1,'abc','',null)` into MAP<INT, VARCHAR>: the empty-string key
+        // coerces to a NULL key (StarRocks-compatible), the int key stays, and
+        // values pass through. Golden: `{1:"abc",null:null}`.
+        let value = Literal::Map(vec![
+            (Literal::Int(1), Literal::String("abc".to_string())),
+            (Literal::String(String::new()), Literal::Null),
+        ]);
+        let array = build_literal_array(&map_int_varchar_type(), &[&value], None)
+            .expect("map<int,varchar> with empty-string key should coerce");
+        let map = array.as_any().downcast_ref::<MapArray>().expect("map");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 keys");
+        let vals = map
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 values");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.value(0), 1);
+        assert!(keys.is_null(1));
+        assert_eq!(vals.value(0), "abc");
+        assert!(vals.is_null(1));
+    }
+
+    #[test]
+    fn map_int_key_coerces_numeric_string_key() {
+        // A non-empty numeric string key parses to the integer key type.
+        let value = Literal::Map(vec![(
+            Literal::String("7".to_string()),
+            Literal::String("x".to_string()),
+        )]);
+        let array = build_literal_array(&map_int_varchar_type(), &[&value], None)
+            .expect("map<int,varchar> with numeric-string key should coerce");
+        let map = array.as_any().downcast_ref::<MapArray>().expect("map");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 keys");
+        assert_eq!(keys.value(0), 7);
+    }
+
+    #[test]
+    fn map_int_key_rejects_non_numeric_string_key() {
+        let value = Literal::Map(vec![(Literal::String("abc".to_string()), Literal::Null)]);
+        let err = build_literal_array(&map_int_varchar_type(), &[&value], None)
+            .expect_err("non-numeric string key should be rejected");
+        assert!(
+            err.contains("is not valid for INT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_null_key_on_required_key_field_returns_clean_error_not_panic() {
+        // `map(null, 'x')` into a real Iceberg MAP<INT, VARCHAR> whose key
+        // field is non-nullable (the Iceberg spec marks map keys `required`).
+        // A NULL key is not representable; the builder must return a clean
+        // Err rather than panicking inside Arrow's `StructArray::new`
+        // ("Found unmasked nulls for non-nullable StructArray field \"key\"").
+        let value = Literal::Map(vec![(Literal::Null, Literal::String("x".to_string()))]);
+        let err = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect_err("null map key on a required key field must be rejected, not panic");
+        assert!(
+            err.contains("Iceberg MAP keys must be non-null"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_empty_string_key_coerced_to_null_on_required_key_field_returns_clean_error() {
+        // `map(1,'abc','',null)` into a real Iceberg MAP<INT, VARCHAR>: the
+        // empty-string key coerces to a NULL INT key (StarRocks-compatible),
+        // which is unrepresentable in Iceberg because the key field is
+        // non-nullable. Must return a clean Err, not panic. This is the
+        // `join_struct_type` q5 / `join_map_type` shape.
+        let value = Literal::Map(vec![
+            (Literal::Int(1), Literal::String("abc".to_string())),
+            (Literal::String(String::new()), Literal::Null),
+        ]);
+        let err = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect_err(
+                "empty-string key coerced to NULL on a required key field must be rejected",
+            );
+        assert!(
+            err.contains("Iceberg MAP keys must be non-null"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_non_null_keys_on_required_key_field_still_succeed() {
+        // Regression guard: the null-key check must not reject valid maps
+        // whose keys are all non-null on a required key field.
+        let value = Literal::Map(vec![
+            (Literal::Int(1), Literal::String("a".to_string())),
+            (Literal::Int(2), Literal::Null),
+        ]);
+        let array = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect("map with all-non-null keys must succeed on a required key field");
+        let map = array.as_any().downcast_ref::<MapArray>().expect("map");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.value(0), 1);
+        assert_eq!(keys.value(1), 2);
+        assert_eq!(keys.null_count(), 0);
+    }
+
+    #[test]
+    fn scalar_int64_coerces_float_literal() {
+        // Top-level scalar behaviour parity: a Float into BIGINT truncates.
+        let value = Literal::Float(10.0);
+        let array = build_literal_array(&DataType::Int64, &[&value], None)
+            .expect("scalar bigint from float");
+        let ints = array.as_any().downcast_ref::<Int64Array>().expect("int64");
+        assert_eq!(ints.value(0), 10);
     }
 }
 

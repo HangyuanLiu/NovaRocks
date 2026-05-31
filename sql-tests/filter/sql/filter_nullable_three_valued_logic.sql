@@ -13,7 +13,8 @@ CREATE TABLE ${case_db}.t_filter_nullable_three_valued_logic (
   a INT,
   b INT,
   tag STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_nullable_three_valued_logic VALUES
   (1, 3, 1, 'n'),
   (2, 3, 0, 'n'),

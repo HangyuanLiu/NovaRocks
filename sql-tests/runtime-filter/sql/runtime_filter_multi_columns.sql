@@ -14,40 +14,24 @@ CREATE TABLE ${case_db}.t0 (
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 12
-PROPERTIES (
-  "colocate_with" = "rf_mc_cg",
-  "replication_num" = "1",
-  "in_memory" = "false",
-  "storage_format" = "DEFAULT"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t1 (
   c0 INT NULL,
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 12
-PROPERTIES (
-  "colocate_with" = "rf_mc_cg",
-  "replication_num" = "1",
-  "in_memory" = "false",
-  "storage_format" = "DEFAULT"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.small_table (
   c0 INT NULL,
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0, c1, c2) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.empty_t LIKE ${case_db}.t0;
 

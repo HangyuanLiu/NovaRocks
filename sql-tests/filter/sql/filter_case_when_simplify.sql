@@ -18,20 +18,8 @@ CREATE TABLE ${case_db}.t0 (
   `order_date` date NOT NULL COMMENT "",
   `income` decimal(7, 0) NOT NULL COMMENT "",
   `ship_mode` int NOT NULL COMMENT "",
-  `ship_code` int) ENGINE=OLAP
-DUPLICATE KEY(`region`, `order_date`)
-COMMENT "OLAP"
-PARTITION BY RANGE(`order_date`)
-(PARTITION p20220101 VALUES [("2022-01-01"), ("2022-01-02")),
-PARTITION p20220102 VALUES [("2022-01-02"), ("2022-01-03")),
-PARTITION p20220103 VALUES [("2022-01-03"), ("2022-01-05")))
-DISTRIBUTED BY HASH(`region`, `order_date`) BUCKETS 10
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "false",
-"compression" = "LZ4"
-);
+  `ship_code` int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -398,15 +386,7 @@ DROP TABLE IF EXISTS ${case_db}.ads_opt;
 CREATE TABLE ${case_db}.ads_opt (
   `region` varchar(128) NOT NULL COMMENT "",
   `handed_dept_name` int NOT NULL COMMENT "")
-ENGINE=OLAP
-DUPLICATE KEY(`region`)
-COMMENT "OLAP"
-PROPERTIES (
-"replication_num" = "1",
-"enable_persistent_index" = "true",
-"replicated_storage" = "false",
-"compression" = "LZ4"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 58
 -- Deeply nested CASE WHEN LIKE/REPLACE on empty table: result must be empty (0 rows)

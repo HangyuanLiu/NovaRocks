@@ -27,7 +27,8 @@ CREATE TABLE ${case_db}.t1 (
     k1 INT,
     k2 INT,
     v1 VARCHAR(10)
-) DUPLICATE KEY(k1) DISTRIBUTED BY HASH(k1) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 -- @skip_result_check=true
@@ -35,7 +36,8 @@ CREATE TABLE ${case_db}.t2 (
     k1 INT,
     k2 INT,
     v2 VARCHAR(10)
-) DUPLICATE KEY(k1) DISTRIBUTED BY HASH(k1) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 -- @skip_result_check=true
@@ -43,7 +45,8 @@ CREATE TABLE ${case_db}.t3 (
     k1 INT,
     k2 INT,
     v3 VARCHAR(10)
-) DUPLICATE KEY(k1) DISTRIBUTED BY HASH(k1) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -51,7 +54,8 @@ CREATE TABLE ${case_db}.t4 (
     k1 INT,
     k2 INT,
     v4 VARCHAR(10)
-) DUPLICATE KEY(k1) DISTRIBUTED BY HASH(k1) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true

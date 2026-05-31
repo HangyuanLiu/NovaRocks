@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_large_k_limit_offset;
 CREATE TABLE ${case_db}.t_topn_large_k_limit_offset (
   id INT,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_large_k_limit_offset VALUES
   (1, 100),
   (2, 95),

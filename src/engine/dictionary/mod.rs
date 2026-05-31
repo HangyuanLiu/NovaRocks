@@ -319,14 +319,15 @@ impl DictionaryQueryProvider {
                     table_id: *table_id,
                 }))
             }
-            ScanSource::IcebergDataFiles { table: info, .. } => {
-                Ok(Some(DictionaryOwner::IcebergTable {
-                    catalog: info.catalog.clone(),
-                    namespace: info.namespace.clone(),
-                    table: info.table.clone(),
-                    table_uuid: info.table_uuid.clone(),
-                }))
-            }
+            // Iceberg scans have no execution-layer dictionary-encode
+            // support: the iceberg/HDFS scan path cannot read a column as a
+            // dict-encoded INT, and the codegen guard in
+            // `src/sql/codegen/fragment_builder.rs` rejects `dict_columns` on
+            // a non-StarRocks lake scan. Returning no owner here makes
+            // `load_active_snapshot` yield `None`, so the low-cardinality
+            // dictionary rewrite never targets iceberg tables. Revisit if/when
+            // iceberg scan dict execution support (Option A) lands.
+            ScanSource::IcebergDataFiles { .. } => Ok(None),
             // Metadata tables, IVM delta scans, and IMV pinned-version
             // placeholders never participate in dictionary rewriting.
             ScanSource::IcebergMetadataTable { .. }
@@ -525,6 +526,98 @@ mod tests {
         assert!(
             loaded.is_some(),
             "lock-free owner_for must resolve identity from ScanSource::StarRocks {{ db_id, table_id }} payload, not from state.starrocks_table",
+        );
+    }
+
+    /// Iceberg scans must NOT participate in the low-cardinality dictionary
+    /// rewrite: the iceberg/HDFS scan execution path has no dictionary-encode
+    /// plumbing (see the guard in `src/sql/codegen/fragment_builder.rs` that
+    /// rejects `dict_columns` on a non-StarRocks lake scan). Even when an
+    /// Active iceberg dictionary snapshot exists in the metadata store,
+    /// `DictionaryQueryProvider::load_active_snapshot` must return `None` for
+    /// an `IcebergDataFiles` scan source so the rewrite collector never
+    /// registers iceberg string columns and the rewriter never fires.
+    #[test]
+    fn dictionary_provider_skips_iceberg_data_files_scan() {
+        use crate::sql::catalog::{
+            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        };
+        use arrow::datatypes::DataType;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let (_dir, state) = open_state();
+        let state = Arc::new(state);
+
+        // Persist an Active iceberg dictionary snapshot that matches the
+        // iceberg table identity used below. If owner_for still mapped
+        // IcebergDataFiles to an iceberg owner, this snapshot would be found.
+        let owner = DictionaryOwner::IcebergTable {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+        };
+        let snapshot = DictionarySnapshot {
+            dictionary_id: 99,
+            owner,
+            column_id: None,
+            column_name: "s".to_string(),
+            data_type: DataType::Utf8,
+            version: 1,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: Some(7),
+                schema_id: 1,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"a".to_vec(),
+            }],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        };
+        state
+            .dictionary_manager
+            .upsert_snapshot(&state, snapshot)
+            .expect("upsert iceberg snapshot");
+
+        let iceberg = IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        };
+        let table = TableDef {
+            name: "test_table".to_string(),
+            columns: vec![ColumnDef {
+                name: "s".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg,
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+            },
+        };
+
+        let provider = DictionaryQueryProvider::new(state);
+        let loaded = provider
+            .load_active_snapshot(&table, "test_db", "s")
+            .expect("load_active_snapshot returns Ok");
+
+        assert!(
+            loaded.is_none(),
+            "iceberg scans have no execution-layer dictionary-encode support, so the dictionary rewrite must not target them",
         );
     }
 }

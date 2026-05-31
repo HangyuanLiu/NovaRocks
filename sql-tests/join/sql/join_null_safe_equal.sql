@@ -16,9 +16,8 @@ CREATE TABLE ${case_db}.nullable_t1 (
   `t1_c2` int,
   `t1_c3` int,
   `t1_c4` varchar(10)
-) DUPLICATE KEY(`t1_c1`)
-DISTRIBUTED BY HASH(`t1_c1`)
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -27,9 +26,8 @@ CREATE TABLE ${case_db}.t2 (
   `t2_c2` int NOT NULL default "0",
   `t2_c3` int NOT NULL default "0",
   `t2_c4` varchar(10) NOT NULL default ""
-) DUPLICATE KEY(`t2_c1`)
-DISTRIBUTED BY HASH(`t2_c1`)
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

@@ -11,7 +11,8 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_order_limit;
 CREATE TABLE ${case_db}.t_topn_order_limit (
   id INT,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_order_limit VALUES
   (1, 70),
   (2, 95),

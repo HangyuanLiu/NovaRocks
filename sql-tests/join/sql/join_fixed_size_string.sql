@@ -13,12 +13,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -48,12 +44,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
   idx bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -69,12 +61,8 @@ CREATE TABLE ${case_db}.t1 (
     c_str8 STRING NULL,
     c_str16 STRING NULL,
     c_str32 STRING NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 64
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
@@ -103,12 +91,8 @@ CREATE TABLE ${case_db}.t2 (
     c_str8 STRING NULL,
     c_str16 STRING NULL,
     c_str32 STRING NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 64
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 14
 -- @skip_result_check=true

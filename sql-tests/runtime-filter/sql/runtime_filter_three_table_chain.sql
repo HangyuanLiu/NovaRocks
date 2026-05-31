@@ -13,15 +13,18 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_three_table_chain_c;
 CREATE TABLE ${case_db}.t_rf_three_table_chain_a (
     id INT,
     k1 INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_three_table_chain_b (
     k1 INT,
     k2 INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_three_table_chain_c (
     k2 INT,
     payload VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_rf_three_table_chain_a VALUES
     (1, 10),

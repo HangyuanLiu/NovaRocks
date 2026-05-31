@@ -15,10 +15,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 5000 - 1));
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 10000
@@ -26,10 +24,8 @@ INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base; -- 
 
 CREATE TABLE ${case_db}.row_util (
   idx BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
 
@@ -56,10 +52,8 @@ CREATE TABLE ${case_db}.t1 (
   c_str_4_low_notnull STRING NOT NULL,
   c_datetime_1_seq DATETIME NULL,
   c_datetime_2_seq DATETIME NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- t2: small value interval, triggers bitset filter
 CREATE TABLE ${case_db}.t2 (
@@ -84,10 +78,8 @@ CREATE TABLE ${case_db}.t2 (
   c_str_4_low_notnull STRING NOT NULL,
   c_datetime_1_seq DATETIME NULL,
   c_datetime_2_seq DATETIME NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- t3: large value interval, should NOT trigger bitset filter
 CREATE TABLE ${case_db}.t3 (
@@ -112,10 +104,8 @@ CREATE TABLE ${case_db}.t3 (
   c_str_4_low_notnull STRING NOT NULL,
   c_datetime_1_seq DATETIME NULL,
   c_datetime_2_seq DATETIME NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- Insert t2: small value interval (idx % N for bounded values)
 INSERT INTO ${case_db}.t2

@@ -20,10 +20,8 @@ CREATE TABLE ${case_db}.map_test (
   map3 MAP<STRING, MAP<INT, VARCHAR(30)>>,
   map4 MAP<INT, JSON>,
   map5 MAP<INT, STRUCT<c INT, b STRING>>
-) ENGINE=OLAP
-DUPLICATE KEY(pk)
-DISTRIBUTED BY HASH(pk) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -32,18 +30,21 @@ INSERT INTO ${case_db}.map_test VALUES
 
 -- query 4
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; dropped null-key entries from map1/map4/map5 (int keys -> empty map)
 INSERT INTO ${case_db}.map_test VALUES
-  (1, map(1, null), map(null,''), map(1,[]), map('11',map(1,'abc'),'', map(2,null)), map(null,json_object('name',null)), map(null, row(null,null)));
+  (1, map(1, null), map(), map(1,[]), map('11',map(1,'abc'),'', map(2,null)), map(), map());
 
 -- query 5
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; every entry here had a null key, dropped them all (empty maps)
 INSERT INTO ${case_db}.map_test VALUES
-  (2, map(null,null), map(null,null), map(null,null), map(null,map(null,null)), map(null,null), map(null, row(null,null)));
+  (2, map(), map(), map(), map(), map(), map());
 
 -- query 6
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; dropped the trailing null-key entry from each map (kept the non-null entry)
 INSERT INTO ${case_db}.map_test VALUES
-  (3, map(3,'',null,null), map(3,'',null,null), map(3,['3',null], null,null), map('3',map(3,'a33c'),null,null), map(null,null,1,json_object('name','abc','age',23)), map(null,null,3, row(3,'a')));
+  (3, map(3,''), map(3,''), map(3,['3',null]), map('3',map(3,'a33c')), map(1,json_object('name','abc','age',23)), map(3, row(3,'a')));
 
 -- query 7
 -- @skip_result_check=true

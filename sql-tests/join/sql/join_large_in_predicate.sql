@@ -47,12 +47,8 @@ CREATE TABLE ${case_db}.t_int (
     int_col int,
     bigint_col bigint,
     value varchar(50)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -62,12 +58,8 @@ CREATE TABLE ${case_db}.t_string (
     char_col char(10),
     text_col text,
     category varchar(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
@@ -81,12 +73,8 @@ CREATE TABLE ${case_db}.t_mixed (
     date_val date,
     datetime_val datetime,
     bool_val boolean
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
@@ -96,12 +84,8 @@ CREATE TABLE ${case_db}.t_large (
     status varchar(20),
     score double,
     created_date date
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 10
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
@@ -109,12 +93,8 @@ CREATE TABLE ${case_db}.t_dimension (
     dim_id int NOT NULL,
     dim_name varchar(50),
     dim_type varchar(20)
-) ENGINE=OLAP
-DUPLICATE KEY(dim_id)
-DISTRIBUTED BY HASH(dim_id) BUCKETS 3
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true

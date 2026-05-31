@@ -44,80 +44,64 @@ DROP TABLE IF EXISTS ${case_db}.t8;
 CREATE TABLE ${case_db}.t1 (
     id TINYINT,
     v1 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
     id SMALLINT,
     v2 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t3 (
     id INT,
     v3 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t4 (
     id BIGINT,
     v4 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t5 (
     id TINYINT,
     v5 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 14
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t6 (
     id INT,
     v6 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 15
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t7 (
     id BIGINT,
     v7 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t8 (
     id SMALLINT,
     v8 VARCHAR(20)
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 17
 -- @skip_result_check=true

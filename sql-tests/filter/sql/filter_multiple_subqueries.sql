@@ -17,10 +17,8 @@ DROP TABLE IF EXISTS ${case_db}.t_subq;
 CREATE TABLE ${case_db}.t_subq (
     id BIGINT NULL,
     v BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(id)
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_subq VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
 
 -- query 2

@@ -13,7 +13,8 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_dense_rank_filter_tie_expand;
 CREATE TABLE ${case_db}.t_topn_dense_rank_filter_tie_expand (
   id INT,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_topn_dense_rank_filter_tie_expand VALUES
   (1, 100),
   (2, 95),

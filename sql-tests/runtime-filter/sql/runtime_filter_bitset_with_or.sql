@@ -7,19 +7,15 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 16 - 1));
 
 CREATE TABLE ${case_db}.row_util (
   idx BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
 
@@ -27,10 +23,8 @@ CREATE TABLE ${case_db}.t1 (
   k1 BIGINT NULL,
   c_str_1 STRING NULL,
   c_str_2 STRING NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 4
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t1
 SELECT

@@ -11,10 +11,12 @@ DROP TABLE IF EXISTS ${case_db}.t_join_cross_a;
 DROP TABLE IF EXISTS ${case_db}.t_join_cross_b;
 CREATE TABLE ${case_db}.t_join_cross_a (
   id INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_cross_b (
   c STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_cross_a VALUES
   (1),
   (2);

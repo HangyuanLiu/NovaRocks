@@ -22,12 +22,8 @@ set enable_partition_hash_join = false;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -45,12 +41,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
   idx bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -63,12 +55,8 @@ CREATE TABLE ${case_db}.t1 (
     c_int int NULL,
     c_bigint bigint NULL,
     c_string STRING
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 96
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true

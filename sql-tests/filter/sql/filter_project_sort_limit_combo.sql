@@ -13,7 +13,8 @@ CREATE TABLE ${case_db}.t_filter_project_sort_limit_combo (
   name STRING,
   qty INT,
   price INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_filter_project_sort_limit_combo VALUES
   (1, 'apple', 2, 5),
   (2, 'banana', NULL, 3),

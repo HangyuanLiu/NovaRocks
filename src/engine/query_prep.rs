@@ -417,6 +417,73 @@ pub(crate) fn refresh_external_tables_for_query(
     register_external_tables_for_query_impl(state, current_catalog, current_database, query, true)
 }
 
+/// Materialize a single external connector table into the standalone in-memory
+/// catalog so that statement paths which do not run through the SELECT
+/// query-prep flow (e.g. `ANALYZE TABLE` / `ANALYZE FULL TABLE`) can still
+/// resolve its schema.
+///
+/// This mirrors the iceberg branch of `register_external_tables_for_query_impl`
+/// but operates on an explicitly-named table rather than names extracted from a
+/// query. Iceberg tables register lazily per-SELECT, so a table that was
+/// `CREATE`d and `INSERT`ed into but never `SELECT`ed from has no local-catalog
+/// entry yet; `ANALYZE` against it would otherwise fail with "unknown table".
+///
+/// Non-iceberg backends (local / StarRocks) register themselves on `CREATE`, so
+/// this is a no-op for them — the caller's existing local-catalog lookup
+/// already succeeds. Unlike the best-effort query-prep loop, a load failure for
+/// an iceberg table here is surfaced as an error: the table was named
+/// explicitly by the statement, so an unresolvable name is a real error.
+pub(crate) fn register_external_table_by_name(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    name: &ObjectName,
+) -> Result<(), String> {
+    let target = resolve_table_target(state, name, current_catalog, current_database)?;
+    if target.backend_name != "iceberg" {
+        // Local / StarRocks tables register themselves on CREATE; nothing to
+        // materialize here.
+        return Ok(());
+    }
+    // Synthetic time-travel tables live only in the in-memory catalog and are
+    // unknown to the iceberg backend; never attempt to reload them.
+    if is_synthetic_time_travel_table(&target.table) {
+        return Ok(());
+    }
+
+    let (catalog, source) = {
+        let registry = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock");
+        (
+            registry.catalog_backend("iceberg")?,
+            registry.table_source("iceberg")?,
+        )
+    };
+
+    {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        let entry = registry.get(&target.catalog)?;
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+    }
+    drop_registered_external_table(state, &target.namespace, &target.table)?;
+
+    let resolved = catalog
+        .load_table(&target.catalog, &target.namespace, &target.table)
+        .map_err(|err| {
+            format!(
+                "load iceberg table {}.{}.{} failed: {err}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    let table_def = source.build_table_def(&resolved)?;
+    register_external_table(state, &target.namespace, table_def)
+}
+
 fn register_external_tables_for_query_impl(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,

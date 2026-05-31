@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_runtime_empty_build_r;
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_l (
   id INT,
   lv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_r (
   id INT,
   rv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_right_outer_runtime_empty_build_l VALUES
   (1, 'L1'),
   (2, 'L2');

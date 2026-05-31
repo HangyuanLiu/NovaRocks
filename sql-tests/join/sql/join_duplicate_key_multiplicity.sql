@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_join_duplicate_key_r;
 CREATE TABLE ${case_db}.t_join_duplicate_key_l (
   id INT,
   ltag STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_duplicate_key_r (
   id INT,
   rtag STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_duplicate_key_l VALUES
   (1, 'L1a'),
   (1, 'L1b');

@@ -14,15 +14,8 @@ CREATE TABLE ${case_db}.t0 (
   income     DECIMAL(7, 0) NOT NULL,
   ship_mode  INT          NOT NULL,
   ship_code  INT
-) ENGINE=OLAP
-DUPLICATE KEY(region, order_date)
-DISTRIBUTED BY HASH(region, order_date) BUCKETS 10
-PROPERTIES (
-  "replication_num"          = "1",
-  "enable_persistent_index"  = "true",
-  "replicated_storage"       = "false",
-  "compression"              = "LZ4"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t0 (region, order_date, income, ship_mode, ship_code) VALUES
   ('USA',    '2022-01-01', 12345, 50,  1),

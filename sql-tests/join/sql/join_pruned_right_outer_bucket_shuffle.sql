@@ -14,12 +14,8 @@
 CREATE TABLE ${case_db}.t1 (
   k1 bigint NULL,
   c1 bigint
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 6
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

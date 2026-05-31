@@ -13,15 +13,18 @@ DROP TABLE IF EXISTS ${case_db}.t_join_chain_c;
 CREATE TABLE ${case_db}.t_join_chain_a (
   id INT,
   av STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_chain_b (
   id INT,
   mid INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_chain_c (
   mid INT,
   cv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_chain_a VALUES
   (1, 'A1'),
   (2, 'A2'),

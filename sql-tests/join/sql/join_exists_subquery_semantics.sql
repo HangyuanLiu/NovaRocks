@@ -12,10 +12,12 @@ DROP TABLE IF EXISTS ${case_db}.t_join_exists_r;
 CREATE TABLE ${case_db}.t_join_exists_l (
   id INT,
   v STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_exists_r (
   id INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_exists_l VALUES
   (1, 'a'),
   (2, 'b'),

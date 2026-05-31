@@ -12,12 +12,14 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_right_semi_residual_r;
 CREATE TABLE ${case_db}.t_rf_right_semi_residual_l (
     k INT,
     score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_right_semi_residual_r (
     k INT,
     threshold INT,
     tag VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_rf_right_semi_residual_l VALUES
     (1, 10),

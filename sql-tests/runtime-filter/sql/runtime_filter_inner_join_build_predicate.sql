@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_inner_join_build_predicate_r;
 CREATE TABLE ${case_db}.t_rf_inner_join_build_predicate_l (
     id INT,
     k INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_inner_join_build_predicate_r (
     k INT,
     score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_rf_inner_join_build_predicate_l VALUES
     (1, 1),

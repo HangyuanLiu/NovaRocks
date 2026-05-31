@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_left_join_preserve_r;
 CREATE TABLE ${case_db}.t_rf_left_join_preserve_l (
     id INT,
     k INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_left_join_preserve_r (
     k INT,
     tag VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_rf_left_join_preserve_l VALUES
     (1, 10),

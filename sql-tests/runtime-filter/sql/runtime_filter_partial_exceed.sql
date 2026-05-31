@@ -9,10 +9,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
   k1 BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 100 - 1));
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base;
@@ -22,10 +20,8 @@ INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base;
 
 CREATE TABLE ${case_db}.row_util (
   idx BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
 
@@ -33,10 +29,8 @@ CREATE TABLE ${case_db}.t1 (
   idx BIGINT NULL,
   c1  BIGINT NULL,
   c2  BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 8
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t1 SELECT idx, 1, 1 FROM ${case_db}.row_util;
 INSERT INTO ${case_db}.t1 SELECT idx, 2, 2 FROM ${case_db}.row_util WHERE idx < 1600 - 10;

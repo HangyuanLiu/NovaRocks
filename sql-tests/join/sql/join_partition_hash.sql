@@ -27,10 +27,8 @@ DROP TABLE IF EXISTS ${case_db}.phj_t1;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.phj_row_util_base (
   k1 BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
@@ -48,10 +46,8 @@ INSERT INTO ${case_db}.phj_row_util_base SELECT * FROM ${case_db}.phj_row_util_b
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.phj_row_util (
   idx BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(idx)
-DISTRIBUTED BY HASH(idx) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -63,10 +59,8 @@ CREATE TABLE ${case_db}.phj_t1 (
     k1 BIGINT NULL,
     c_bigint_null BIGINT NULL,
     c_string STRING
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 96
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
