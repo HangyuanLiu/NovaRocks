@@ -8,18 +8,17 @@
 --
 -- Observed numbers (NovaRocks debug build, REST catalog, 2026-05):
 --   full table .................. stats={rows=1000}
---   WHERE k1 < 100 .............. stats={rows=500}
+--   WHERE k1 < 100 .............. stats={rows=99}
 -- The reduction proves the selectivity chain (predicate -> LogicalProperties
 -- -> stats trailer) is wired end-to-end on a real Iceberg table.
 --
--- NOTE: 500 is the default 50% range-predicate selectivity, NOT the ~10%
--- that finite min/max bounds would yield. The NovaRocks Iceberg writer does
--- not currently persist per-column lower/upper bounds into the manifest
--- (value_count and null_count are written, min/max are not), so column min/max
--- stay at +/-inf and the range formula falls back to the default. When the
--- writer starts emitting bounds, k1 < 100 should drop to ~100 rows and the
--- post-filter assertion below must be re-recorded. The full-vs-filtered
--- inequality this case locks holds either way.
+-- The post-filter estimate is the real range selectivity, not the 0.5
+-- fallback: for k1 = 1..1000, `k1 < 100` matches the 99 values 1..99. This
+-- requires the NovaRocks Iceberg writer to persist per-column lower/upper
+-- bounds into the manifest. OQ-3.1 wired those bounds through the commit
+-- path (DataFile -> WrittenFile -> committed DataFile), so column min/max are
+-- now finite (k1[min=1 max=1000]) instead of +/-inf and the range formula
+-- yields the true row count. Re-recorded from the previous 500 fallback.
 
 -- query 1
 -- @skip_result_check=true
@@ -51,9 +50,11 @@ SELECT COUNT(*) AS n, MIN(k1) AS lo, MAX(k1) AS hi
 SELECT k1 FROM iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${uuid0};
 
 -- query 6
--- Range predicate drives the estimate strictly below the full row count.
+-- Range predicate drives the estimate to the real range selectivity (99 of
+-- the 1000 rows, i.e. k1 in 1..99), proving finite min/max bounds reach the
+-- cost model rather than the 0.5 fallback.
 -- @skip_result_check=true
--- @explain_contains=stats={rows=500}
+-- @explain_contains=stats={rows=99}
 SELECT k1 FROM iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${uuid0}
   WHERE k1 < 100;
 
