@@ -35,14 +35,8 @@ CREATE TABLE ${case_db}.test_all_null (
     id_array_varchar array<varchar(2000)> null,
     id_array_date array<date> null,
     id_array_datetime array<datetime> null
-) ENGINE=OLAP
-DUPLICATE KEY(`id_int`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`id_int`) BUCKETS 10
-PROPERTIES (
-    "replication_num" = "1",
-    "storage_format" = "DEFAULT"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

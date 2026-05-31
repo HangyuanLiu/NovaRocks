@@ -39,8 +39,7 @@ select SUBSTRING('', 9223372036854775806, 465254298) ;
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (id int, v bigint)
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true

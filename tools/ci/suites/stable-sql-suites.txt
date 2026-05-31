@@ -12,6 +12,10 @@ table-function
 runtime-filter
 low-cardinality
 low-cardinality-native
+complex-type-native
+complex-type
+function-native
+function
 optimizer
 iceberg
 iceberg-compatibility
@@ -26,9 +30,11 @@ iceberg-rest
 # tpc-h
 # tpc-ds
 # materialized-view
-# iceberg-mv-scheduler is excluded until scheduler timing expectations are verified for unattended daily runs.
+# iceberg-mv-scheduler passes 4/4 but only when the standalone-server runs with the MV-refresh
+#   scheduler config ($NOVAROCKS_STANDALONE_SCHEDULER_CONFIG, mv_refresh_scheduler_enabled=true);
+#   the default daily server uses the non-scheduler config, and the async cases remain timing
+#   -sensitive — excluded until the runner wires the scheduler config for unattended daily runs.
 # aggregate
 # analytic
-# complex-type
-# decimal
-# function
+# decimal tests DECIMAL256 (precision 39-76); the standalone Arrow engine caps at Decimal128
+#   (precision 38), so it fails on native too. Excluded until DECIMAL256 is supported.

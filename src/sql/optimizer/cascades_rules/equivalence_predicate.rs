@@ -250,11 +250,13 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
     if let Some(child_props) = memo.groups[child_group].logical_props.as_ref() {
         let row_count = (child_props.row_count * 0.1).max(1.0);
         let output_columns = child_props.output_columns.clone();
+        let column_statistics = child_props.column_statistics.clone();
         let props = crate::sql::optimizer::logical_props::derive_for_group(
             memo,
             new_group,
             output_columns,
             row_count,
+            column_statistics,
         );
         memo.groups[new_group].logical_props = Some(props);
     }
@@ -433,6 +435,45 @@ mod tests {
             InnerJoinEquivalencePredicateRule
                 .apply(&join, &mut memo)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn add_filter_group_propagates_column_statistics() {
+        use crate::sql::optimizer::statistics::ColumnStatistic;
+
+        let mut memo = Memo::new();
+        // Build a scan group with non-empty column_statistics in its logical_props.
+        let child = scan_group(&mut memo, 1, "a");
+        let mut child_props = LogicalProperties::new(vec![output(1, "a")], 100.0);
+        child_props.column_statistics.insert(
+            "a".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 99.0,
+                nulls_fraction: 0.0,
+                average_row_size: 4.0,
+                distinct_values_count: 50.0,
+            },
+        );
+        memo.groups[child].logical_props = Some(child_props);
+
+        // Call add_filter_group to synthesize a filter group above the scan.
+        let predicate = eq(col(1, "a"), lit(42));
+        let filter_group = add_filter_group(&mut memo, child, vec![predicate]);
+
+        // The filter group's logical_props must carry the child's column stats.
+        let filter_props = memo.groups[filter_group]
+            .logical_props
+            .as_ref()
+            .expect("filter group must have logical_props");
+        assert!(
+            !filter_props.column_statistics.is_empty(),
+            "column_statistics must not be empty after add_filter_group"
+        );
+        assert!(
+            filter_props.column_statistics.contains_key("a"),
+            "column_statistics must contain the child column 'a'"
         );
     }
 }

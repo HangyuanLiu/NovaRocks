@@ -11,9 +11,7 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (c1 int, c2 varchar(100), c3 double)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -153,9 +151,7 @@ SELECT field(dv.c1, vv.c1, dvv.c1) FROM dv, dvv, vv;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t2 (c1 int, c2 string)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 16
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 31
 -- @skip_result_check=true

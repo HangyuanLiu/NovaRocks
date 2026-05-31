@@ -90,10 +90,7 @@ select from_binary(to_binary('1', 'encode64'), 'hex');
 -- Create table with varbinary column
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0(c0 INT, c1 varbinary(16), c2 varchar(16))
-        DUPLICATE KEY(c0)
-        DISTRIBUTED BY HASH(c0)
-        BUCKETS 1
-        PROPERTIES('replication_num'='1');
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 22
 -- Insert one row (x'ab01' is binary literal)

@@ -54,6 +54,7 @@ mod validation;
 pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
+pub use data_file::written_file_to_iceberg_data_file;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub use mv_refresh_ref::{

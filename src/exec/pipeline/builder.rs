@@ -1322,17 +1322,16 @@ fn new_source_pipeline_with_dop(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+    use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
-    use crate::exec::node::values::ValuesNode;
+    use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
@@ -1346,22 +1345,18 @@ mod tests {
 
     #[test]
     fn ensure_hash_dedups_redundant_shuffle_for_nested_group_by() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int32, false),
-            Field::new("v", DataType::Int32, false),
-        ]));
-        let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
-        let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
+        // The input must be a dop>1 source so the inner aggregate inserts a local hash shuffle;
+        // the outer aggregate must then recognize the input is already partitioned by the same
+        // group keys and skip its own shuffle (dedup). A LookUp source maps to a dop>1 pipeline
+        // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress both
+        // shuffles, making this assertion vacuous.
+        let lookup_input_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int32, false),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
         let agg_output_chunk_schema = chunk_schema_of(
             &Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int32, false),
@@ -1377,7 +1372,11 @@ mod tests {
         let inner = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 0 }),
+                    kind: ExecNodeKind::LookUp(LookUpNode {
+                        node_id: 0,
+                        row_pos_descs: HashMap::new(),
+                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
+                    }),
                 }),
                 node_id: 0,
                 group_by: vec![k],
@@ -1447,22 +1446,18 @@ mod tests {
     fn merge_group_by_requires_local_shuffle_when_dop_gt_one() {
         // Regression for TPC-DS Q28: merge-serialize group-by aggregates must not emit duplicate
         // groups across drivers, otherwise downstream `count(key)` will over-count DISTINCT keys.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int32, true),
-            Field::new("v", DataType::Int32, true),
-        ]));
-        let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
-        let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
+        //
+        // The input must be a dop>1 source for the aggregate's local-shuffle insertion to fire
+        // (it is gated on `build.pipeline.dop > 1`). A LookUp source maps to a dop>1 pipeline
+        // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress the
+        // shuffle, making this assertion vacuous.
+        let lookup_input_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("v", DataType::Int32, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
         let agg_output_chunk_schema = chunk_schema_of(
             &Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int32, true),
@@ -1478,7 +1473,11 @@ mod tests {
         let root = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 0 }),
+                    kind: ExecNodeKind::LookUp(LookUpNode {
+                        node_id: 0,
+                        row_pos_descs: HashMap::new(),
+                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
+                    }),
                 }),
                 node_id: 0,
                 group_by: vec![k],
@@ -1527,22 +1526,18 @@ mod tests {
         // update-style group-by aggregates that output intermediate states (need_finalize=false)
         // must not emit duplicate group keys across drivers, otherwise upstream Sort+LIMIT can
         // return fewer than N distinct groups after downstream merge/finalize aggregation.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int32, true),
-            Field::new("v", DataType::Int32, true),
-        ]));
-        let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
-        let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
+        //
+        // The input must be a dop>1 source for the aggregate's local-shuffle insertion to fire
+        // (it is gated on `build.pipeline.dop > 1`). A LookUp source maps to a dop>1 pipeline
+        // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress the
+        // shuffle, making this assertion vacuous.
+        let lookup_input_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("v", DataType::Int32, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
         let agg_output_chunk_schema = chunk_schema_of(
             &Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int32, true),
@@ -1558,7 +1553,11 @@ mod tests {
         let root = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 0 }),
+                    kind: ExecNodeKind::LookUp(LookUpNode {
+                        node_id: 0,
+                        row_pos_descs: HashMap::new(),
+                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
+                    }),
                 }),
                 node_id: 0,
                 group_by: vec![k],

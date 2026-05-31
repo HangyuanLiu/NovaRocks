@@ -94,6 +94,8 @@ pub async fn write_position_delete_files(
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
             null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
             key_metadata: None,
             referenced_data_file: Some(group.referenced_data_file),
             equality_ids: None,

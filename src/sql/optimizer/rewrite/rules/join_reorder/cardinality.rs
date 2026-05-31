@@ -357,10 +357,17 @@ fn estimate_except(
 /// Get the NDV (number of distinct values) for an expression, looking up
 /// column stats if the expression is a simple column reference.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
+    // Only treat a column as informative when it has a real NDV (> 1).
+    // ColumnStatistic::unknown() (no-stats / managed-lake tables) reports
+    // distinct_values_count = 1.0; using that as a true NDV would let
+    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // cross-products. Guard `> 1.0` (mirroring estimate_eq_selectivity) so
+    // unknown/degenerate columns fall back to the default NDV below.
     if let Some(name) = extract_column_name(expr)
         && let Some(cs) = column_stats.get(&name.to_lowercase())
+        && cs.distinct_values_count > 1.0
     {
-        return cs.distinct_values_count.max(1.0);
+        return cs.distinct_values_count;
     }
     // Default NDV for unknown expressions.
     10.0

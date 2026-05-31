@@ -25,9 +25,7 @@ create table t0 (
     c5 array<double>,
     c6 array<float>
 )
-properties(
-   "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -177,9 +175,7 @@ create table t0 (
     c0 array<string>,
     c1 array<string>
 )
-properties(
-   "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 32
 -- @skip_result_check=true
@@ -227,9 +223,7 @@ create table t0 (
     k0 int,
     c0 array<int>
 )
-properties(
-   "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 41
 -- @skip_result_check=true
@@ -273,9 +267,7 @@ create table t0 (
     k0 int,
     c0 array<array<int>>
 )
-properties(
-   "replication_num" = "1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 49
 -- @skip_result_check=true

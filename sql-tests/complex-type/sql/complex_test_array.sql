@@ -21,7 +21,8 @@ CREATE TABLE array_data_type
     c2  array<bigint>, 
     c3  array<bigint>,
     c4  array<bigint> not null, 
-    c5  array<bigint> not null);
+    c5  array<bigint> not null)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -82,7 +83,8 @@ CREATE TABLE array_data_type_1
     c3  array<float>,
     c4  array<varchar(10)>,
     c5  array<varchar(20)>,
-    c6  array<array<varchar(10)>>);
+    c6  array<array<varchar(10)>>)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 15
 -- @skip_result_check=true
@@ -128,7 +130,8 @@ select c6[0] > array_map((x) -> concat(x, 'a'), c5) from array_data_type_1;
 USE sql_tests_complex_test_array;
 CREATE TABLE array_top_n
     (c1 int,
-    c2 array<int>);
+    c2 array<int>)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 24
 -- @skip_result_check=true
@@ -173,7 +176,8 @@ CREATE TABLE array_exprr
     (
     c1 int not null,
     c2 int not null
-    );
+    )
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 32
 -- @skip_result_check=true
@@ -240,7 +244,8 @@ CREATE TABLE `t2` (
   `pk` bigint(20) NOT NULL COMMENT "",
   `aas_1` array<array<array<varchar(65533)>>> NULL COMMENT "",
   `aad_1` array<array<array<DECIMAL128(26,2)>>> NULL COMMENT ""
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 43
 -- @skip_result_check=true
@@ -431,7 +436,8 @@ select array_repeat(1,-1);
 -- query 87
 -- @skip_result_check=true
 USE sql_tests_complex_test_array;
-CREATE TABLE IF NOT EXISTS repeat_test (COLA INT, COLB INT) PROPERTIES ("replication_num"="1");
+CREATE TABLE IF NOT EXISTS repeat_test (COLA INT, COLB INT)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 88
 -- @skip_result_check=true
@@ -454,7 +460,8 @@ select array_flatten([[[1],[2]],[[3],[4]]]);
 -- query 92
 -- @skip_result_check=true
 USE sql_tests_complex_test_array;
-CREATE TABLE IF NOT EXISTS flatten_test (COLA INT, COLB ARRAY<ARRAY<INT>>) PROPERTIES ("replication_num"="1");
+CREATE TABLE IF NOT EXISTS flatten_test (COLA INT, COLB ARRAY<ARRAY<INT>>)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 93
 -- @skip_result_check=true
@@ -476,7 +483,8 @@ SELECT array_flatten(array_slice(COLB, 1, 2)) FROM flatten_test ORDER BY COLA;
 -- query 97
 -- @skip_result_check=true
 USE sql_tests_complex_test_array;
-CREATE TABLE IF NOT EXISTS flatten_one_layer_arr_test (COLA INT, COLB ARRAY<INT>) PROPERTIES ("replication_num"="1");
+CREATE TABLE IF NOT EXISTS flatten_one_layer_arr_test (COLA INT, COLB ARRAY<INT>)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 98
 -- @skip_result_check=true
@@ -518,7 +526,8 @@ select null_or_empty([[1,2],[1]]);
 -- query 106
 -- @skip_result_check=true
 USE sql_tests_complex_test_array;
-CREATE TABLE IF NOT EXISTS null_or_empty_test (COLA INT, COLB ARRAY<INT>) PROPERTIES ("replication_num"="1");
+CREATE TABLE IF NOT EXISTS null_or_empty_test (COLA INT, COLB ARRAY<INT>)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 107
 -- @skip_result_check=true

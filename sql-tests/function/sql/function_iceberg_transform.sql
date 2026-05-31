@@ -7,9 +7,7 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t0 (c1 decimal(4,2))
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

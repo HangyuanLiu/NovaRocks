@@ -49,6 +49,22 @@ fn to_bytes_array(array: ArrayRef, arg_idx: usize) -> Result<BytesArray, String>
     if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
         return Ok(BytesArray::Binary(arr.clone()));
     }
+    // Iceberg-backed VARBINARY/VARCHAR columns arrive as the "Large" Arrow
+    // layout; normalize to the small layout via cast, then re-enter (the
+    // casted array is Binary/Utf8 so this does not recurse again).
+    if matches!(
+        array.data_type(),
+        arrow::datatypes::DataType::LargeBinary | arrow::datatypes::DataType::LargeUtf8
+    ) {
+        let target = if matches!(array.data_type(), arrow::datatypes::DataType::LargeUtf8) {
+            arrow::datatypes::DataType::Utf8
+        } else {
+            arrow::datatypes::DataType::Binary
+        };
+        if let Ok(casted) = cast(&array, &target) {
+            return to_bytes_array(casted, arg_idx);
+        }
+    }
     Err(format!(
         "xx_hash3_128: arg{} must be VARCHAR or VARBINARY",
         arg_idx

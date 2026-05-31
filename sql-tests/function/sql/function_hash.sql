@@ -9,9 +9,7 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t0 (id int, a string, b string)
-    DUPLICATE KEY(id)
-    DISTRIBUTED BY HASH(id) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

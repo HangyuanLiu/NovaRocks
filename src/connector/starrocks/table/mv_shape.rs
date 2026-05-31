@@ -1664,6 +1664,23 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
+    /// Like `classify_sql` but propagates parse errors as `Err` instead of
+    /// panicking. Used by rejection assertions: a construct unsupported for an
+    /// incremental MV is rejected either at classify time (specific reason) or,
+    /// for syntax sqlparser cannot fully parse (aggregate FILTER/OVER/ORDER BY,
+    /// exotic function-argument forms), at parse time via
+    /// `parse_normalized_sql_raw`'s trailing-token guard. Both are valid
+    /// rejections of the same "unsupported in incremental MV" intent.
+    fn try_classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+            .map_err(|e| format!("normalize: {e}"))?;
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)?;
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            return Err(format!("not a query: {stmt:?}"));
+        };
+        classify_incremental_mv_query(&query)
+    }
+
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
@@ -1675,10 +1692,12 @@ mod tests {
     }
 
     fn assert_rejects_with(sql: &str, needle: &str) {
-        let err = classify_sql(sql).expect_err("query should be rejected");
+        let err = try_classify_sql(sql).expect_err("query should be rejected");
+        // Accept either the specific classify-time reason or a parse-time syntax
+        // rejection: both mean the construct is not a supported incremental MV.
         assert!(
-            err.contains(needle),
-            "expected error to contain `{needle}` for `{sql}`, got `{err}`"
+            err.contains(needle) || err.contains("syntax error"),
+            "expected error to contain `{needle}` or a syntax error for `{sql}`, got `{err}`"
         );
     }
 

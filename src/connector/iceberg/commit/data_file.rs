@@ -20,10 +20,12 @@
 //! all three commit-action implementations.
 //!
 //! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so construction
-//! goes through `DataFileBuilder`. Phase 1 supplies only the fields the
-//! sink already populates; column statistics (`column_sizes`, `value_counts`,
-//! `null_value_counts`, `lower_bounds`, `upper_bounds`) are deferred per
-//! spec §3.4 and remain at the builder defaults.
+//! goes through `DataFileBuilder`. Column statistics carried by the
+//! `WrittenFile` (`column_sizes`, `value_counts`, `null_value_counts`,
+//! `lower_bounds`, `upper_bounds`, per spec §3.4) are forwarded onto the
+//! committed manifest entry. Bounds are passed through as `Datum`s; the
+//! iceberg-rust manifest serializer applies the spec's binary single-value
+//! encoding. Empty maps remain at the builder defaults.
 
 use iceberg::spec::{DataFile, DataFileBuilder};
 
@@ -64,6 +66,12 @@ pub fn written_file_to_iceberg_data_file(
     }
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
+    }
+    if !f.lower_bounds.is_empty() {
+        builder.lower_bounds(f.lower_bounds.clone());
+    }
+    if !f.upper_bounds.is_empty() {
+        builder.upper_bounds(f.upper_bounds.clone());
     }
 
     builder

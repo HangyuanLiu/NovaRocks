@@ -14,9 +14,8 @@ CREATE TABLE tc (
     `ass` array<varchar(100)> NULL COMMENT "",
     `mi` map<int(11),int> NULL COMMENT "",
     `ms` map<int(11),varchar(100)> NULL COMMENT ""
-) ENGINE=OLAP DUPLICATE KEY(`i`) COMMENT "OLAP"
-DISTRIBUTED BY HASH(`i`) BUCKETS 2
-PROPERTIES("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -25,18 +24,21 @@ INSERT INTO tc VALUES (4, null, null, null, null);
 
 -- query 3
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; dropped the null-key entry from ms (kept the non-null 1:null entry)
 USE ${case_db};
-INSERT INTO tc VALUES (3, null, ['a','b'], null, map{1:null,null:null});
+INSERT INTO tc VALUES (3, null, ['a','b'], null, map{1:null});
 
 -- query 4
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; dropped the null-key entry from mi (kept the non-null 1:1 entry)
 USE ${case_db};
-INSERT INTO tc VALUES (1, [1,2], null, map{1:1,null:2}, null);
+INSERT INTO tc VALUES (1, [1,2], null, map{1:1}, null);
 
 -- query 5
 -- @skip_result_check=true
+-- iceberg: map keys must be non-null; dropped the null-key entries from mi and ms (kept the non-null entries)
 USE ${case_db};
-INSERT INTO tc VALUES (2, [1,2], ['a','b'], map{1:1,null:2}, map{1:'b',null:null});
+INSERT INTO tc VALUES (2, [1,2], ['a','b'], map{1:1}, map{1:'b'});
 
 -- query 6
 -- CASE WHEN with array columns (with else)

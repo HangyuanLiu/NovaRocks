@@ -647,6 +647,8 @@ mod tests {
             column_sizes: Default::default(),
             value_counts: Default::default(),
             null_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
             key_metadata: None,
             referenced_data_file: None,
             equality_ids: None,

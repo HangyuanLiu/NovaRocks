@@ -71,6 +71,23 @@ pub(super) fn to_owned_bytes_array(
     if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
         return Ok(OwnedBytesArray::Binary(arr.clone()));
     }
+    // Iceberg-backed VARBINARY/VARCHAR columns are materialized in the "Large"
+    // Arrow layout (LargeBinary / LargeUtf8). Normalize them to the small
+    // layout the extractor understands via a zero-copy-ish arrow cast, then
+    // re-enter. The casted array is Binary/Utf8 so this does not recurse again.
+    if matches!(
+        array.data_type(),
+        DataType::LargeBinary | DataType::LargeUtf8
+    ) {
+        let target = if matches!(array.data_type(), DataType::LargeUtf8) {
+            DataType::Utf8
+        } else {
+            DataType::Binary
+        };
+        if let Ok(casted) = cast(&array, &target) {
+            return to_owned_bytes_array(casted, fn_name, arg_idx);
+        }
+    }
     // A typed-Null literal arrives as a NullArray; treat it as a VARCHAR
     // column whose every row is NULL so the per-row logic below collapses
     // the result to NULL rather than failing the static check.
@@ -501,4 +518,40 @@ pub(super) fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
 
 pub(super) fn encode_base64(input: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, LargeBinaryArray, LargeStringArray};
+
+    #[test]
+    fn to_owned_bytes_accepts_large_binary_iceberg_layout() {
+        // Iceberg VARBINARY columns arrive as LargeBinary; from_binary/sha2/aes
+        // must accept them, not reject with "must be VARCHAR or VARBINARY".
+        let arr: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"abc".as_ref()),
+            None,
+            Some(b"\x00\x01".as_ref()),
+        ]));
+        let owned = to_owned_bytes_array(arr, "from_binary", 0).expect("LargeBinary accepted");
+        assert_eq!(owned.len(), 3);
+        assert_eq!(owned.bytes(0), b"abc");
+        assert!(owned.is_null(1));
+        assert_eq!(owned.bytes(2), b"\x00\x01");
+    }
+
+    #[test]
+    fn to_owned_bytes_accepts_large_utf8_layout() {
+        let arr: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("hi"), None]));
+        let owned = to_owned_bytes_array(arr, "from_binary", 0).expect("LargeUtf8 accepted");
+        assert_eq!(owned.bytes(0), b"hi");
+        assert!(owned.is_null(1));
+    }
+
+    #[test]
+    fn to_owned_bytes_still_rejects_non_byte_types() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert!(to_owned_bytes_array(arr, "from_binary", 0).is_err());
+    }
 }

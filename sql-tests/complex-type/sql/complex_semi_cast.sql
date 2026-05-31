@@ -8,10 +8,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
   k1 bigint NULL
-) DISTRIBUTED BY HASH(`k1`) BUCKETS 64
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 insert into ${case_db}.row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 20000
 insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 40000
@@ -23,10 +21,8 @@ insert into ${case_db}.row_util_base select * from ${case_db}.row_util_base; -- 
 
 CREATE TABLE ${case_db}.row_util (
   idx bigint NULL
-) DISTRIBUTED BY HASH(`idx`) BUCKETS 64
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 insert into ${case_db}.row_util select row_number() over() as idx from ${case_db}.row_util_base;
 
 CREATE TABLE ${case_db}.t1 (
@@ -36,10 +32,8 @@ CREATE TABLE ${case_db}.t1 (
     c_array_int ARRAY<INT> NULL,
     c_map MAP<INT, INT> NULL,
     c_struct STRUCT<k1 INT, k2 INT> NULL
-) DISTRIBUTED BY HASH(`k1`) BUCKETS 64
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t1
 SELECT

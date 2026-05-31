@@ -13,9 +13,7 @@ CREATE TABLE t1 (
     c1 INT,
     c2 ARRAY<BIGINT>
 )
-DUPLICATE KEY(C1)
-DISTRIBUTED BY HASH(C1) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -24,9 +22,7 @@ CREATE TABLE t2 (
     c1 INT,
     c2 ARRAY<ARRAY<BIGINT>>
 )
-DUPLICATE KEY(C1)
-DISTRIBUTED BY HASH(C1) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true

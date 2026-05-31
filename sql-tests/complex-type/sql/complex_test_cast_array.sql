@@ -11,7 +11,8 @@ USE sql_tests_complex_test_cast_array;
 -- query 2
 -- @skip_result_check=true
 USE sql_tests_complex_test_cast_array;
-CREATE TABLE `tbl` (k1 string,k2 string,k3 int) DUPLICATE KEY(`k1`) DISTRIBUTED BY HASH(`k1`) BUCKETS 3 PROPERTIES ("replication_num" = "1");
+CREATE TABLE `tbl` (k1 string,k2 string,k3 int)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
