@@ -1050,6 +1050,90 @@ mod tests {
         );
     }
 
+    /// OQ-3.1: a NovaRocks-written Iceberg data file must carry per-column
+    /// min/max bounds end-to-end through the standalone commit round-trip
+    /// (`DataFile` → `WrittenFile` → committed `DataFile`), so range-predicate
+    /// selectivity reflects the real value range instead of the 0.5 fallback.
+    #[tokio::test]
+    async fn standalone_commit_round_trip_preserves_column_bounds() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use iceberg::spec::{Datum, NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let location = format!("file://{}", dir.path().display());
+
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "k1", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            iceberg_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            location.clone(),
+            iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+
+        let input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "k1",
+            DataType::Int32,
+            false,
+        )]));
+        let values: Vec<i32> = (1..=1000).collect();
+        let batch = RecordBatch::try_new(input_schema, vec![Arc::new(Int32Array::from(values))])
+            .expect("batch");
+
+        let data_files = write_record_batches_as_data_files(&table, vec![batch])
+            .await
+            .expect("write");
+        assert_eq!(data_files.len(), 1);
+        let df = &data_files[0];
+        // The iceberg-rust ParquetWriter populates bounds from the parquet footer.
+        assert_eq!(df.lower_bounds().get(&1), Some(&Datum::int(1)));
+        assert_eq!(df.upper_bounds().get(&1), Some(&Datum::int(1000)));
+
+        // Round-trip through the standalone commit path and assert the committed
+        // DataFile still carries the bounds (the OQ-3.1 fix).
+        let wf = crate::engine::iceberg_writer::data_file_to_written_file(df, 0).expect("wf");
+        assert_eq!(wf.lower_bounds.get(&1), Some(&Datum::int(1)));
+        assert_eq!(wf.upper_bounds.get(&1), Some(&Datum::int(1000)));
+
+        let collector = crate::connector::iceberg::commit::IcebergCommitCollector::new(
+            crate::connector::iceberg::commit::CommitOpKind::FastAppend,
+            iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            None,
+            0,
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().clone(),
+            "file:///tmp/staging".to_string(),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        );
+        let committed =
+            crate::connector::iceberg::commit::written_file_to_iceberg_data_file(&wf, &collector)
+                .expect("committed");
+        assert_eq!(committed.lower_bounds().get(&1), Some(&Datum::int(1)));
+        assert_eq!(committed.upper_bounds().get(&1), Some(&Datum::int(1000)));
+    }
+
     /// reannotate_array must narrow Decimal128(src_p, src_s) → Decimal128(tgt_p, tgt_s)
     /// with half-up rounding rather than returning an error.
     #[test]

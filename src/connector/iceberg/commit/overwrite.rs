@@ -591,6 +591,12 @@ pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, Strin
     if !f.null_value_counts.is_empty() {
         builder.null_value_counts(f.null_value_counts.clone());
     }
+    if !f.lower_bounds.is_empty() {
+        builder.lower_bounds(f.lower_bounds.clone());
+    }
+    if !f.upper_bounds.is_empty() {
+        builder.upper_bounds(f.upper_bounds.clone());
+    }
     if let Some(first_row_id) = f.first_row_id {
         builder.first_row_id(Some(first_row_id));
     }
