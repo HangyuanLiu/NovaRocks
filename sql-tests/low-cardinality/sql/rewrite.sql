@@ -6,7 +6,7 @@ CREATE TABLE ${case_db}.dict_rewrite_t (
   k INT,
   s STRING,
   v INT
-) DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1 PROPERTIES('replication_num' = '1');
+) TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.dict_rewrite_t VALUES
   (1, 'a', 10), (2, 'b', 20), (3, 'a', 30), (4, 'c', 40);
 ANALYZE FULL TABLE ${case_db}.dict_rewrite_t;

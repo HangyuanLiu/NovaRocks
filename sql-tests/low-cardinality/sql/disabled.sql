@@ -6,7 +6,7 @@ DROP TABLE IF EXISTS ${case_db}.dict_disabled_t;
 CREATE TABLE ${case_db}.dict_disabled_t (
   k INT,
   s STRING
-) DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1 PROPERTIES('replication_num' = '1');
+) TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.dict_disabled_t VALUES (1, 'a'), (2, 'b'), (3, 'a');
 ANALYZE FULL TABLE ${case_db}.dict_disabled_t;
 SET disable_optimizer_rules = 'LowCardinalityDictionaryRewrite';

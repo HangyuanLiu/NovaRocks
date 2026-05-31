@@ -11,6 +11,7 @@ set-op
 table-function
 runtime-filter
 low-cardinality
+low-cardinality-native
 optimizer
 iceberg
 iceberg-compatibility
