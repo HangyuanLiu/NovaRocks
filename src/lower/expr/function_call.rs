@@ -55,6 +55,27 @@ fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
     ) || largeint::is_largeint_data_type(data_type)
 }
 
+/// Accept the Arrow carriers for VARCHAR/VARBINARY scalar-function arguments.
+///
+/// Both the small and large Arrow string/binary layouts are valid VARCHAR/
+/// VARBINARY carriers in NovaRocks. In particular, Iceberg-backed binary
+/// columns are materialized as `LargeBinary` by the Parquet read path, and the
+/// standalone codegen maps `LargeUtf8` back to VARCHAR (see
+/// `src/sql/codegen/type_infer.rs`). Matching only `Utf8 | Binary` here would
+/// reject those Iceberg-sourced arguments.
+fn is_varchar_or_binary_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    )
+}
+
+/// Like [`is_varchar_or_binary_type`] but also accepts typed-`Null` literals,
+/// which propagate to per-row NULL instead of tripping the static type check.
+fn is_varchar_binary_or_null_type(data_type: &DataType) -> bool {
+    is_varchar_or_binary_type(data_type) || matches!(data_type, DataType::Null)
+}
+
 fn is_null_literal(arena: &ExprArena, expr_id: ExprId) -> bool {
     matches!(
         arena.node(expr_id),
@@ -195,6 +216,63 @@ mod tests {
         let left = array_type(DataType::Decimal128(38, 5));
         let right = array_type(DataType::Decimal128(2, 1));
         assert!(is_array_pair_compatible(&left, &right));
+    }
+
+    #[test]
+    fn varchar_or_binary_guard_accepts_small_and_large_layouts() {
+        // Iceberg-backed binary columns are materialized as `LargeBinary` by the
+        // Parquet read path; previously the binary/string scalar-function guards
+        // matched only `Utf8 | Binary`, which made `from_binary(c1, 'hex')` (and
+        // peers like `to_binary`, `sha2`, `md5`, `aes_encrypt`, `xx_hash3_128`)
+        // reject an Iceberg `VARBINARY` argument. All four carriers are valid.
+        assert!(is_varchar_or_binary_type(&DataType::Utf8));
+        assert!(is_varchar_or_binary_type(&DataType::Binary));
+        assert!(
+            is_varchar_or_binary_type(&DataType::LargeBinary),
+            "LargeBinary is the Iceberg VARBINARY carrier and must be accepted"
+        );
+        assert!(is_varchar_or_binary_type(&DataType::LargeUtf8));
+    }
+
+    #[test]
+    fn varchar_or_binary_guard_still_rejects_incompatible_types() {
+        // Fail-fast for genuinely-incompatible argument types is preserved.
+        assert!(!is_varchar_or_binary_type(&DataType::Int32));
+        assert!(!is_varchar_or_binary_type(&DataType::Boolean));
+        assert!(!is_varchar_or_binary_type(&DataType::Float64));
+        assert!(!is_varchar_or_binary_type(&DataType::Null));
+        assert!(!is_varchar_or_binary_type(&DataType::FixedSizeBinary(16)));
+    }
+
+    #[test]
+    fn varchar_binary_or_null_guard_accepts_large_layouts_and_null() {
+        // The optional aes_* IV/mode/aad arguments additionally accept typed-Null.
+        assert!(is_varchar_binary_or_null_type(&DataType::Utf8));
+        assert!(is_varchar_binary_or_null_type(&DataType::Binary));
+        assert!(is_varchar_binary_or_null_type(&DataType::LargeBinary));
+        assert!(is_varchar_binary_or_null_type(&DataType::LargeUtf8));
+        assert!(is_varchar_binary_or_null_type(&DataType::Null));
+        // But not arbitrary scalars.
+        assert!(!is_varchar_binary_or_null_type(&DataType::Int64));
+    }
+
+    #[test]
+    fn from_binary_resolves_to_encryption_guard_family() {
+        // Guards against silent re-wiring: `from_binary` (the function that
+        // failed on Iceberg) must dispatch through the Encryption branch whose
+        // first-argument check is `is_varchar_or_binary_type`.
+        assert!(matches!(
+            function::lookup_function("from_binary"),
+            Some(function::FunctionKind::Encryption("from_binary"))
+        ));
+        assert!(matches!(
+            function::lookup_function("to_binary"),
+            Some(function::FunctionKind::Encryption("to_binary"))
+        ));
+        assert!(matches!(
+            function::lookup_function("sha2"),
+            Some(function::FunctionKind::Encryption("sha2"))
+        ));
     }
 }
 
@@ -1322,8 +1400,7 @@ pub(crate) fn lower_function_call(
         }
 
         if let function::FunctionKind::Bit(name) = kind {
-            let is_varchar_or_binary =
-                |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary);
+            let is_varchar_or_binary = is_varchar_or_binary_type;
             let arg0 = arena
                 .data_type(children[0])
                 .ok_or_else(|| format!("{} missing arg0 type", name))?;
@@ -1399,12 +1476,10 @@ pub(crate) fn lower_function_call(
         }
 
         if let function::FunctionKind::Encryption(name) = kind {
-            let is_varchar_or_binary =
-                |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary);
+            let is_varchar_or_binary = is_varchar_or_binary_type;
             // NULL literal args (typed-Null) are valid; they propagate to
             // per-row NULL rather than tripping the static type check.
-            let is_varchar_binary_or_null =
-                |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary | DataType::Null);
+            let is_varchar_binary_or_null = is_varchar_binary_or_null_type;
             let is_integer = |dt: &DataType| {
                 matches!(
                     dt,
