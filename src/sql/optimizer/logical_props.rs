@@ -1,8 +1,11 @@
 //! Logical-property derivation for optimizer Memo groups.
 
+use std::collections::HashMap;
+
 use super::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
 use super::property::ColumnIdSet;
+use super::statistics::ColumnStatistic;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use arrow::datatypes::DataType;
@@ -12,13 +15,16 @@ pub(crate) fn derive_for_group(
     group_idx: GroupId,
     output_columns: Vec<OutputColumn>,
     row_count: f64,
+    column_statistics: HashMap<String, ColumnStatistic>,
 ) -> LogicalProperties {
     let group = &memo.groups[group_idx];
     let expr = group.logical_exprs.first().or(group.physical_exprs.first());
     let Some(expr) = expr else {
-        return LogicalProperties::new(output_columns, row_count);
+        let mut props = LogicalProperties::new(output_columns, row_count);
+        props.column_statistics = column_statistics;
+        return props;
     };
-    derive_for_expr(expr, memo, output_columns, row_count)
+    derive_for_expr(expr, memo, output_columns, row_count, column_statistics)
 }
 
 pub(crate) fn derive_for_expr(
@@ -26,9 +32,11 @@ pub(crate) fn derive_for_expr(
     memo: &Memo,
     output_columns: Vec<OutputColumn>,
     row_count: f64,
+    column_statistics: HashMap<String, ColumnStatistic>,
 ) -> LogicalProperties {
     let output_ids = output_id_set(&output_columns);
     let mut props = LogicalProperties::new(output_columns, row_count);
+    props.column_statistics = column_statistics;
 
     match &expr.op {
         Operator::LogicalFilter(filter) => {
@@ -393,7 +401,7 @@ mod tests {
             }),
             children: vec![child],
         });
-        let props = derive_for_group(&memo, filter, vec![output(1, "a"), output(2, "b")], 50.0);
+        let props = derive_for_group(&memo, filter, vec![output(1, "a"), output(2, "b")], 50.0, std::collections::HashMap::new());
         let class = props
             .equivalence_classes
             .class_containing(ColumnId(1))
@@ -420,7 +428,7 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
+        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0, std::collections::HashMap::new());
         let class = props
             .equivalence_classes
             .class_containing(ColumnId(2))
@@ -447,7 +455,7 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0);
+        let props = derive_for_group(&memo, join, vec![output(1, "lk"), output(2, "rk")], 10.0, std::collections::HashMap::new());
         assert!(
             props
                 .equivalence_classes

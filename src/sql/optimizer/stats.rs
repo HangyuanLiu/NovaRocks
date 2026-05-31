@@ -636,6 +636,7 @@ pub(crate) fn derive_group_statistics(
             group_idx,
             output_columns,
             stats.output_row_count,
+            stats.column_statistics,
         ));
     }
 }
@@ -652,12 +653,11 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
     let group_id = children[index];
     let group = &memo.groups[group_id];
     if let Some(ref props) = group.logical_props {
-        // Reconstruct Statistics from logical properties.
-        // Column statistics are not stored in LogicalProperties, so we
-        // return an empty map -- the row_count is the critical value.
+        // Column statistics now travel on LogicalProperties, so propagate
+        // them so parent operators estimate real selectivity / join NDV.
         Statistics {
             output_row_count: props.row_count,
-            column_statistics: HashMap::new(),
+            column_statistics: props.column_statistics.clone(),
         }
     } else {
         // Child not yet derived; use conservative default.
@@ -1574,12 +1574,11 @@ mod tests {
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((scan_props.row_count - 10_000.0).abs() < 1.0);
 
-        // Filter group (1): filter selectivity applied to child row_count
-        // But column stats are not propagated through child_statistics,
-        // so selectivity falls back to PREDICATE_UNKNOWN_FILTER (0.25).
+        // Filter group (1): with column stats now flowing through
+        // child_statistics, `a = 42` uses real NDV(a)=100 -> selectivity
+        // 1/100 = 0.01 -> 10000 * 0.01 = 100 rows.
         let filter_props = memo.groups[1].logical_props.as_ref().unwrap();
-        assert!(filter_props.row_count < 10_000.0);
-        assert!(filter_props.row_count >= 1.0);
+        assert!((filter_props.row_count - 100.0).abs() < 1.0);
     }
 
     #[test]
@@ -1639,13 +1638,10 @@ mod tests {
         logical_plan_to_memo(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
-        // Agg group: child_rows * UNKNOWN_GROUP_BY_CORRELATION vs NDV product.
-        // NDV = 10 (default, because child_statistics loses column stats),
-        // capped = 100000 * 0.75 = 75000.
-        // Result = min(10, 75000) = 10.
+        // Agg group: real NDV(status)=5 now flows through child_statistics,
+        // so output = min(5, 100000*0.75) = 5.
         let agg_props = memo.groups[1].logical_props.as_ref().unwrap();
-        assert!(agg_props.row_count >= 1.0);
-        assert!(agg_props.row_count <= 100_000.0);
+        assert!((agg_props.row_count - 5.0).abs() < 1.0);
     }
 
     #[test]

@@ -255,6 +255,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
             new_group,
             output_columns,
             row_count,
+            std::collections::HashMap::new(),
         );
         memo.groups[new_group].logical_props = Some(props);
     }
