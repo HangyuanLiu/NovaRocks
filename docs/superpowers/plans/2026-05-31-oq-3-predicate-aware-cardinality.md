@@ -491,6 +491,7 @@ Expected: FAIL — `format_column_stats_costs` 未定义（编译错）。
 /// Costs-only per-column statistics block. Kept separate from
 /// `format_stats_trailer` so Verbose/Analyze output (and existing golden
 /// files) stay unchanged — only `EXPLAIN COSTS` shows column stats.
+/// Unknown-stat columns (ColumnStatistic::unknown) render as min=-inf max=+inf ndv=1 null_frac=0.
 pub(crate) fn format_column_stats_costs(
     stats: &crate::sql::optimizer::statistics::Statistics,
 ) -> String {
@@ -503,11 +504,15 @@ pub(crate) fn format_column_stats_costs(
         .into_iter()
         .map(|name| {
             let c = &stats.column_statistics[name];
+            let ndv = if c.distinct_values_count.is_finite() {
+                (c.distinct_values_count.round() as i64).to_string()
+            } else {
+                "?".to_string()
+            };
             format!(
-                "{name}[min={} max={} ndv={} nulls={}]",
+                "{name}[min={} max={} ndv={ndv} null_frac={}]",
                 fmt_f64(c.min_value),
                 fmt_f64(c.max_value),
-                c.distinct_values_count.round() as i64,
                 fmt_f64(c.nulls_fraction),
             )
         })
@@ -516,7 +521,9 @@ pub(crate) fn format_column_stats_costs(
 }
 
 fn fmt_f64(v: f64) -> String {
-    if v.is_infinite() {
+    if v.is_nan() {
+        "?".to_string()
+    } else if v.is_infinite() {
         if v > 0.0 { "+inf".to_string() } else { "-inf".to_string() }
     } else if v.fract() == 0.0 {
         format!("{}", v as i64)
@@ -602,7 +609,7 @@ EXPLAIN COSTS SELECT k1 FROM iceberg_rest_card_probe.t WHERE k1 < 100;
 SQL
 ```
 
-预期：SCAN 行带 `colstats={k1[min=1 max=1000 ndv=... nulls=0], ...}`，且 `stats={rows=~100}`（而非 1000）。
+预期：SCAN 行带 `colstats={k1[min=1 max=1000 ndv=... null_frac=0], ...}`，且 `stats={rows=~100}`（而非 1000）。
 - 若 `colstats` 为空或 min/max 为 `+inf/-inf`：说明 Iceberg manifest 的 min/max 未进 `ColumnStatistic`。此时先修 `build_table_statistics_with_columns`（`src/sql/optimizer/statistics.rs:123`）/`collect_scan_stats`（`src/engine/mod.rs:2952`）让 INT 列 min/max/NDV 真正填充，再继续。把该修复单独提交。
 - 若 `stats={rows=1000}` 不变但 `colstats` 有真实值：检查谓词是否下推进 scan（`scan.predicates`）；未下推则由 Task 1 修好的 `child_statistics` 在 Filter 节点上体现，`EXPLAIN COSTS` 看 FILTER 行的 rows。
 
