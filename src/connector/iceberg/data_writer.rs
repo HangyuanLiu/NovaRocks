@@ -492,11 +492,26 @@ fn reannotate_array(
             let new_keys = reannotate_array(&keys_in, target_key_field.data_type())?;
             let new_values = reannotate_array(&values_in, target_value_field.data_type())?;
 
-            let new_entries = StructArray::new(
+            // The Iceberg MAP key field is `required` per the Iceberg spec, so
+            // its Arrow representation is a non-nullable Struct field. A NULL map
+            // key is not representable in an Iceberg table. Building a
+            // StructArray with unmasked nulls on a non-nullable field panics
+            // inside Arrow's `StructArray::new`; fail fast with a clear error on
+            // user input instead (CLAUDE.md rule #2).
+            if !target_key_field.is_nullable() && new_keys.null_count() > 0 {
+                return Err(format!(
+                    "Iceberg MAP keys must be non-null (column key field `{}`); cannot insert a NULL map key",
+                    target_key_field.name()
+                ));
+            }
+            let new_entries = StructArray::try_new(
                 target_entries_struct_fields.clone(),
                 vec![new_keys, new_values],
                 map.entries().nulls().cloned(),
-            );
+            )
+            .map_err(|e| {
+                format!("reannotate_array: rebuild Map entries StructArray failed: {e}")
+            })?;
             let new_map = MapArray::try_new(
                 target_entries_field.clone(),
                 OffsetBuffer::new(map.value_offsets().to_vec().into()),
@@ -527,11 +542,12 @@ fn reannotate_array(
                 let new_child = reannotate_array(&child, target_child_field.data_type())?;
                 new_children.push(new_child);
             }
-            let new_struct = StructArray::new(
+            let new_struct = StructArray::try_new(
                 target_fields.clone(),
                 new_children,
                 struct_arr.nulls().cloned(),
-            );
+            )
+            .map_err(|e| format!("reannotate_array: rebuild StructArray failed: {e}"))?;
             Ok(Arc::new(new_struct) as ArrayRef)
         }
         (DataType::List(_), DataType::List(target_child_field)) => {
@@ -1489,6 +1505,60 @@ mod tests {
         assert!(
             err.contains("incompatible data types"),
             "expected the fail-fast catch-all error, got: {err}"
+        );
+    }
+
+    /// reannotate_array must return a clean Err (not panic) when a runtime Map
+    /// column carrying a NULL key is reannotated to the Iceberg target Map type
+    /// whose key field is non-nullable (the spec marks map keys `required`).
+    /// Without the guard, Arrow's `StructArray::new` panics with
+    /// "Found unmasked nulls for non-nullable StructArray field \"key\"".
+    #[test]
+    fn reannotate_map_with_null_key_to_required_key_target_errors() {
+        use arrow::array::{ArrayRef, Int32Array, MapArray, StringArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Fields};
+        use std::sync::Arc;
+
+        // Runtime source MapArray: key field nullable (as execution produces),
+        // with a NULL key in the single entry [{null: "x"}].
+        let src_key_field = Arc::new(Field::new("key", DataType::Int32, true));
+        let src_value_field = Arc::new(Field::new("value", DataType::Utf8, true));
+        let src_entries_fields: Fields =
+            vec![src_key_field.clone(), src_value_field.clone()].into();
+        let src_entries_field = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(src_entries_fields.clone()),
+            false,
+        ));
+        let keys = Arc::new(Int32Array::from(vec![None])) as ArrayRef;
+        let values = Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef;
+        let src_entries = StructArray::new(src_entries_fields, vec![keys, values], None);
+        let src_map = MapArray::try_new(
+            src_entries_field,
+            OffsetBuffer::new(vec![0_i32, 1].into()),
+            src_entries,
+            None,
+            false,
+        )
+        .expect("src map");
+        let src: ArrayRef = Arc::new(src_map);
+
+        // Target Iceberg Map type: key field NON-nullable (required).
+        let target_key_field = Arc::new(Field::new("key", DataType::Int32, false));
+        let target_value_field = Arc::new(Field::new("value", DataType::Utf8, true));
+        let target_entries_field = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(vec![target_key_field, target_value_field].into()),
+            false,
+        ));
+        let target_dtype = DataType::Map(target_entries_field, false);
+
+        let err = reannotate_array(&src, &target_dtype)
+            .expect_err("null map key into a required key field must be a clean Err, not a panic");
+        assert!(
+            err.contains("Iceberg MAP keys must be non-null"),
+            "expected the null-map-key fail-fast error, got: {err}"
         );
     }
 }

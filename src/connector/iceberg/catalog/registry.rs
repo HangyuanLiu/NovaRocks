@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, ListArray, NullBufferBuilder, StringArray, StructArray, Time64MicrosecondArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, NullBufferBuilder, StringArray, StructArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
@@ -2138,11 +2138,13 @@ fn build_literal_array(
                     build_literal_array(field.data_type(), &refs, None)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok(Arc::new(StructArray::new(
-                fields.clone(),
-                child_arrays,
-                struct_nulls.finish(),
-            )))
+            // Use try_new so an unmasked NULL in a non-nullable STRUCT field
+            // (e.g. a `required` nested field on an external table) surfaces as
+            // a clean Err instead of an Arrow panic on user input.
+            Ok(Arc::new(
+                StructArray::try_new(fields.clone(), child_arrays, struct_nulls.finish())
+                    .map_err(|e| format!("build iceberg STRUCT literal column failed: {e}"))?,
+            ))
         }
         DataType::Map(entries_field, ordered) => {
             // entries_field is Struct(key: KeyType, value: ValueType).
@@ -2193,11 +2195,29 @@ fn build_literal_array(
 
             let key_array = build_literal_array(key_field.data_type(), &flat_keys, None)?;
             let val_array = build_literal_array(val_field.data_type(), &flat_vals, None)?;
-            let entries_array = arrow::array::StructArray::new(
+            // The Iceberg MAP key field is `required` per the Iceberg spec, so
+            // its Arrow representation is a non-nullable Struct field. Building a
+            // StructArray with unmasked nulls on a non-nullable field panics
+            // inside `StructArray::new` (`Found unmasked nulls for non-nullable
+            // StructArray field "key"`). A NULL map key (e.g. `map(null, 'x')`,
+            // or an empty-string key coerced to NULL on an INT-keyed map) is not
+            // representable in an Iceberg table. Fail fast with a clear error
+            // instead of letting Arrow panic on user input (CLAUDE.md rule #2).
+            if !key_field.is_nullable() && key_array.null_count() > 0 {
+                return Err(format!(
+                    "Iceberg MAP keys must be non-null (column key field `{}`); cannot insert a NULL map key",
+                    key_field.name()
+                ));
+            }
+            // Backstop: even with the explicit null-key guard above, route the
+            // entries struct through try_new so any residual unmasked-null case
+            // (e.g. a non-nullable value field) is a clean Err, not a panic.
+            let entries_array = arrow::array::StructArray::try_new(
                 arrow::datatypes::Fields::from(vec![key_field.clone(), val_field.clone()]),
                 vec![key_array, val_array],
                 None,
-            );
+            )
+            .map_err(|e| format!("build iceberg MAP entries struct failed: {e}"))?;
             Ok(Arc::new(arrow::array::MapArray::new(
                 entries_field.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -2919,6 +2939,26 @@ mod build_literal_array_tests {
         DataType::Map(Arc::new(entries), false)
     }
 
+    /// MAP<INT, VARCHAR> with a NON-nullable key field, matching the real
+    /// Iceberg Arrow schema (`schema_to_arrow_schema` marks the `required`
+    /// map key field as non-nullable). This is the shape that exposes the
+    /// null-map-key path; `map_int_varchar_type` above intentionally uses a
+    /// nullable key for the coercion-only tests.
+    fn map_int_varchar_type_required_key() -> DataType {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Int32, false),
+                    Field::new("value", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        DataType::Map(Arc::new(entries), false)
+    }
+
     #[test]
     fn array_bigint_coerces_float_element_to_truncated_integer() {
         // `[1.0, 2.0, 3.0, 4.0, 10.0]` into ARRAY<BIGINT>: each Float element
@@ -3034,6 +3074,65 @@ mod build_literal_array_tests {
             err.contains("is not valid for INT"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn map_null_key_on_required_key_field_returns_clean_error_not_panic() {
+        // `map(null, 'x')` into a real Iceberg MAP<INT, VARCHAR> whose key
+        // field is non-nullable (the Iceberg spec marks map keys `required`).
+        // A NULL key is not representable; the builder must return a clean
+        // Err rather than panicking inside Arrow's `StructArray::new`
+        // ("Found unmasked nulls for non-nullable StructArray field \"key\"").
+        let value = Literal::Map(vec![(Literal::Null, Literal::String("x".to_string()))]);
+        let err = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect_err("null map key on a required key field must be rejected, not panic");
+        assert!(
+            err.contains("Iceberg MAP keys must be non-null"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_empty_string_key_coerced_to_null_on_required_key_field_returns_clean_error() {
+        // `map(1,'abc','',null)` into a real Iceberg MAP<INT, VARCHAR>: the
+        // empty-string key coerces to a NULL INT key (StarRocks-compatible),
+        // which is unrepresentable in Iceberg because the key field is
+        // non-nullable. Must return a clean Err, not panic. This is the
+        // `join_struct_type` q5 / `join_map_type` shape.
+        let value = Literal::Map(vec![
+            (Literal::Int(1), Literal::String("abc".to_string())),
+            (Literal::String(String::new()), Literal::Null),
+        ]);
+        let err = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect_err(
+                "empty-string key coerced to NULL on a required key field must be rejected",
+            );
+        assert!(
+            err.contains("Iceberg MAP keys must be non-null"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_non_null_keys_on_required_key_field_still_succeed() {
+        // Regression guard: the null-key check must not reject valid maps
+        // whose keys are all non-null on a required key field.
+        let value = Literal::Map(vec![
+            (Literal::Int(1), Literal::String("a".to_string())),
+            (Literal::Int(2), Literal::Null),
+        ]);
+        let array = build_literal_array(&map_int_varchar_type_required_key(), &[&value], None)
+            .expect("map with all-non-null keys must succeed on a required key field");
+        let map = array.as_any().downcast_ref::<MapArray>().expect("map");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.value(0), 1);
+        assert_eq!(keys.value(1), 2);
+        assert_eq!(keys.null_count(), 0);
     }
 
     #[test]
