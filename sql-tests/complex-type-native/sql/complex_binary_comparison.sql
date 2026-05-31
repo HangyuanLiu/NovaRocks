@@ -15,8 +15,7 @@ CREATE TABLE ${case_db}.sc2 (
   `map2` MAP<INT, ARRAY<INT>> NULL,
   `map3` MAP<INT, STRUCT<c INT, b INT>> NULL,
   `st1` STRUCT<s1 int, s2 ARRAY<INT>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-)
-TBLPROPERTIES ("format-version" = "3");
+);
 
 insert into ${case_db}.sc2 values (1, [11,NULL,31,41], [map{11: 110}, map{101: 101}], [row(11, 12), row(12, 13)], map{14: 41, NULL: 11, 12: 31}, map{101: [1, 10, 11, 23]}, map{101: row(NULL, 12)}, row(1, [1, 10, 11], map{101: 111, NULL: NULL}, row(111, 110)));
 insert into ${case_db}.sc2 values (2, [12,22,32,42], [map{22: 220}, map{NULL: 201}], [row(21, 22), NULL], NULL, map{202: [2, 20, NULL, 23]}, map{202: row(21, 22)}, row(2, NULL, map{202: NULL}, row(222, 220)));
