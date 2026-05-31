@@ -6073,6 +6073,79 @@ enable_path_style_access = true
         );
     }
 
+    #[test]
+    fn select_resolves_iceberg_table_referenced_only_in_join_on_subquery() {
+        // Engine gap #4 (join_apply_to_join q7): a table referenced ONLY inside
+        // a subquery nested in a JOIN ON predicate must be registered into the
+        // in-memory catalog at query-prep time, exactly like FROM/WHERE
+        // subqueries. Before the fix the query-prep table-reference collection
+        // did not descend into JOIN ON predicates, so `t2` was never
+        // registered and the SELECT failed with `unknown table: t2`.
+        let warehouse = TempDir::new().expect("warehouse");
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create catalog");
+        session
+            .execute_in_database("create database ice.db1", "default")
+            .expect("create database");
+        for (name, col) in [("t0", "v1"), ("t1", "v5"), ("t2", "v7")] {
+            session
+                .execute_in_database(
+                    &format!(
+                        r#"create table ice.db1.{name} ({col} bigint) tblproperties("format-version"="2")"#
+                    ),
+                    "default",
+                )
+                .expect("create table");
+            session
+                .execute_in_database(
+                    &format!("insert into ice.db1.{name} values (1), (2), (3)"),
+                    "default",
+                )
+                .expect("seed table");
+        }
+
+        // `t2` is referenced ONLY inside the ON-clause IN-subquery. Sanity:
+        // it is not in the in-memory catalog before the SELECT runs.
+        assert!(
+            !engine.has_local_table("db1", "t2"),
+            "iceberg table t2 must not be pre-registered before the SELECT",
+        );
+
+        let result = session
+            .execute_in_context(
+                "select count(*) from db1.t0 \
+                 left join db1.t1 on v1 in (select v7 from db1.t2) or v1 < v5",
+                Some("ice"),
+                "db1",
+                None,
+            )
+            .expect("SELECT with ON-clause subquery table must resolve, not error unknown table");
+
+        // The ON-clause-only table is now materialized in the in-memory
+        // catalog, and the query produced a count row.
+        assert!(
+            engine.has_local_table("db1", "t2"),
+            "ON-clause-subquery table t2 must be registered during query-prep",
+        );
+        match result {
+            StatementResult::Query(query_result) => {
+                assert_eq!(
+                    query_result.row_count(),
+                    1,
+                    "count(*) over a LEFT JOIN must return exactly one row",
+                );
+            }
+            StatementResult::Ok => panic!("SELECT must return rows"),
+        }
+    }
+
     fn current_iceberg_snapshot_id(
         engine: &StandaloneNovaRocks,
         catalog: &str,

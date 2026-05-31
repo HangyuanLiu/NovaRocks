@@ -1,5 +1,75 @@
 use crate::sql::analyzer::iceberg_metadata::split_metadata_suffix;
 
+/// Return the `ON <expr>` predicate carried by a join operator, if any.
+///
+/// Every relational `JoinOperator` variant (INNER/LEFT/RIGHT/FULL/SEMI/ANTI/
+/// CROSS/STRAIGHT and the generic `JOIN`) carries a [`JoinConstraint`], and the
+/// `ASOF` variant carries one in a named field. Table references can hide
+/// inside subqueries nested in the `ON` predicate (e.g.
+/// `... JOIN t1 ON v IN (SELECT c FROM t2)`), so every table-reference walker
+/// must descend into this expression in addition to `join.relation`. Variants
+/// without an `ON` predicate (`USING`/`NATURAL`/`None`, `CROSS APPLY`,
+/// `OUTER APPLY`) yield `None`.
+fn join_on_constraint_expr(
+    join_operator: &sqlparser::ast::JoinOperator,
+) -> Option<&sqlparser::ast::Expr> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let constraint = match join_operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c)
+        | JoinOperator::AsOf { constraint: c, .. } => c,
+        JoinOperator::CrossApply | JoinOperator::OuterApply => return None,
+    };
+    match constraint {
+        JoinConstraint::On(expr) => Some(expr),
+        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => None,
+    }
+}
+
+/// Mutable counterpart of [`join_on_constraint_expr`]: returns the `ON <expr>`
+/// predicate of a join operator for in-place rewrites.
+fn join_on_constraint_expr_mut(
+    join_operator: &mut sqlparser::ast::JoinOperator,
+) -> Option<&mut sqlparser::ast::Expr> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let constraint = match join_operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c)
+        | JoinOperator::AsOf { constraint: c, .. } => c,
+        JoinOperator::CrossApply | JoinOperator::OuterApply => return None,
+    };
+    match constraint {
+        JoinConstraint::On(expr) => Some(expr),
+        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => None,
+    }
+}
+
 /// Extract `(namespace, table)` pairs from 2-part table references in a query
 /// AST. Only returns pairs where the reference is exactly 2 parts (no catalog,
 /// no metadata suffix). Callers should dedupe against
@@ -27,6 +97,9 @@ fn extract_two_part_refs_from_set_expr(
                 extract_two_part_refs_from_factor(&from.relation, refs);
                 for join in &from.joins {
                     extract_two_part_refs_from_factor(&join.relation, refs);
+                    if let Some(on_expr) = join_on_constraint_expr(&join.join_operator) {
+                        extract_two_part_refs_from_expr(on_expr, refs);
+                    }
                 }
             }
             if let Some(sel) = &select.selection {
@@ -143,6 +216,9 @@ fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut
                 extract_table_names_from_table_factor(&from.relation, names);
                 for join in &from.joins {
                     extract_table_names_from_table_factor(&join.relation, names);
+                    if let Some(on_expr) = join_on_constraint_expr(&join.join_operator) {
+                        extract_table_names_from_expr(on_expr, names);
+                    }
                 }
             }
             extract_table_names_from_expr_opt(select.selection.as_ref(), names);
@@ -287,6 +363,9 @@ fn extract_three_part_refs_from_set_expr(
                 extract_three_part_refs_from_factor(&from.relation, refs);
                 for join in &from.joins {
                     extract_three_part_refs_from_factor(&join.relation, refs);
+                    if let Some(on_expr) = join_on_constraint_expr(&join.join_operator) {
+                        extract_three_part_refs_from_expr(on_expr, refs);
+                    }
                 }
             }
             if let Some(selection) = &select.selection {
@@ -447,6 +526,9 @@ fn strip_catalog_in_set_expr(expr: &mut sqlparser::ast::SetExpr) {
                 strip_catalog_in_factor(&mut from.relation);
                 for join in &mut from.joins {
                     strip_catalog_in_factor(&mut join.relation);
+                    if let Some(on_expr) = join_on_constraint_expr_mut(&mut join.join_operator) {
+                        strip_catalog_in_expr(on_expr);
+                    }
                 }
             }
             if let Some(selection) = &mut select.selection {
@@ -840,6 +922,97 @@ mod tests {
         assert_eq!(
             query_refs::extract_two_part_table_refs(&query),
             vec![("db".to_string(), "t1".to_string())],
+        );
+    }
+
+    // --- JOIN ON-clause subquery traversal (engine gap #4) ---
+    //
+    // A table referenced ONLY inside a subquery nested in a JOIN ON predicate
+    // (e.g. `... LEFT JOIN t1 ON v1 IN (SELECT v7 FROM t2)`) must still be
+    // collected by every extractor; otherwise the external-catalog
+    // registration in `query_prep` never materializes it and execution fails
+    // with "unknown table". This mirrors the join_apply_to_join q7 shape.
+
+    #[test]
+    fn one_part_extractor_collects_on_clause_in_subquery_table() {
+        let query = parse_query(
+            "SELECT count(*) FROM t0 LEFT JOIN t1 ON v1 IN (SELECT v7 FROM t2) OR v1 < v5",
+        );
+
+        let names = query_refs::extract_table_names_from_query(&query);
+        assert!(
+            names.contains(&"t2".to_string()),
+            "ON-clause IN-subquery table 't2' must be collected, got {names:?}",
+        );
+        // The outer relations must still be present.
+        assert!(names.contains(&"t0".to_string()) && names.contains(&"t1".to_string()));
+    }
+
+    #[test]
+    fn one_part_extractor_collects_on_clause_exists_and_scalar_subquery_tables() {
+        // EXISTS subquery in ON (q11 shape).
+        let exists = parse_query(
+            "SELECT count(*) FROM t0 LEFT JOIN t1 ON EXISTS (SELECT v7 FROM t2) OR v1 < v5",
+        );
+        assert!(
+            query_refs::extract_table_names_from_query(&exists).contains(&"t2".to_string()),
+            "ON-clause EXISTS-subquery table 't2' must be collected",
+        );
+
+        // Scalar subquery in ON (q14 shape).
+        let scalar = parse_query(
+            "SELECT count(*) FROM t0 LEFT JOIN t1 \
+             ON (SELECT count(*) FROM t2 WHERE v4 = v7) > 0",
+        );
+        assert!(
+            query_refs::extract_table_names_from_query(&scalar).contains(&"t2".to_string()),
+            "ON-clause scalar-subquery table 't2' must be collected",
+        );
+    }
+
+    #[test]
+    fn two_part_extractor_collects_on_clause_in_subquery_table() {
+        let query = parse_query(
+            "SELECT count(*) FROM db.t0 LEFT JOIN db.t1 \
+             ON v1 IN (SELECT v7 FROM db.t2) OR v1 < v5",
+        );
+
+        let refs = query_refs::extract_two_part_table_refs(&query);
+        assert!(
+            refs.contains(&("db".to_string(), "t2".to_string())),
+            "ON-clause IN-subquery 2-part ref ['db','t2'] must be collected, got {refs:?}",
+        );
+    }
+
+    #[test]
+    fn three_part_extractor_collects_on_clause_in_subquery_table() {
+        let query = parse_query(
+            "SELECT count(*) FROM cat.db.t0 LEFT JOIN cat.db.t1 \
+             ON v1 IN (SELECT v7 FROM cat.db.t2) OR v1 < v5",
+        );
+
+        let refs = query_refs::extract_three_part_table_refs(&query);
+        assert!(
+            refs.contains(&("cat".to_string(), "db".to_string(), "t2".to_string())),
+            "ON-clause IN-subquery 3-part ref must be collected, got {refs:?}",
+        );
+    }
+
+    #[test]
+    fn strips_catalog_inside_on_clause_subquery() {
+        // The catalog-stripping rewrite must also descend into ON-clause
+        // subqueries so a 3-part ref there is reduced to 2-part before
+        // planning, consistent with WHERE/projection subqueries.
+        let mut query = parse_query(
+            "SELECT count(*) FROM cat.db.t0 LEFT JOIN cat.db.t1 \
+             ON v1 IN (SELECT v7 FROM cat.db.t2)",
+        );
+
+        query_refs::strip_catalog_from_three_part_names(&mut query);
+
+        assert_eq!(
+            query.to_string(),
+            "SELECT count(*) FROM db.t0 LEFT JOIN db.t1 ON v1 IN (SELECT v7 FROM db.t2)",
         );
     }
 }
