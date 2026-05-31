@@ -245,7 +245,7 @@ fn stats_for_group(
     if let Some(ref lp) = group.logical_props {
         return crate::sql::optimizer::statistics::Statistics {
             output_row_count: lp.row_count,
-            column_statistics: HashMap::new(),
+            column_statistics: lp.column_statistics.clone(),
         };
     }
 
