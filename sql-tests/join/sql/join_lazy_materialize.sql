@@ -43,8 +43,8 @@ CREATE TABLE ${case_db}.lm_t1 (
     t1_c3 INT NOT NULL,
     t1_c4 INT NOT NULL,
     t1_c5 INT NOT NULL
-) DUPLICATE KEY(t1_c1)
-DISTRIBUTED BY HASH(t1_c1) BUCKETS 1;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -54,8 +54,8 @@ CREATE TABLE ${case_db}.lm_t2 (
     t2_c3 INT NOT NULL,
     t2_c4 INT NOT NULL,
     t2_c5 INT NOT NULL
-) DUPLICATE KEY(t2_c1)
-DISTRIBUTED BY HASH(t2_c1) BUCKETS 1;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -65,8 +65,8 @@ CREATE TABLE ${case_db}.lm_nullable_t1 (
     t1_c3 INT,
     t1_c4 INT,
     t1_c5 INT
-) DUPLICATE KEY(t1_c1)
-DISTRIBUTED BY HASH(t1_c1) BUCKETS 1;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
@@ -76,8 +76,8 @@ CREATE TABLE ${case_db}.lm_nullable_t2 (
     t2_c3 INT,
     t2_c4 INT,
     t2_c5 INT
-) DUPLICATE KEY(t2_c1)
-DISTRIBUTED BY HASH(t2_c1) BUCKETS 1;
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true

@@ -36,11 +36,7 @@ CREATE TABLE ${case_db}.t1 (
     c_datetime DATETIME,
     c_string   STRING
 )
-DUPLICATE KEY(c_key)
-DISTRIBUTED BY HASH(c_key) BUCKETS 1
-PROPERTIES (
-    "replication_num"="1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -58,11 +54,7 @@ CREATE TABLE ${case_db}.t2 (
     c_datetime DATETIME,
     c_string   STRING
 )
-DUPLICATE KEY(c_key)
-DISTRIBUTED BY HASH(c_key) BUCKETS 1
-PROPERTIES (
-    "replication_num"="1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
@@ -429,11 +421,7 @@ CREATE TABLE ${case_db}.skew_t1 (
     c_datetime DATETIME,
     c_string   STRING
 )
-DUPLICATE KEY(c_key)
-DISTRIBUTED BY HASH(c_key) BUCKETS 1
-PROPERTIES (
-    "replication_num"="1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 82
 -- @skip_result_check=true
@@ -507,9 +495,7 @@ CREATE TABLE ${case_db}.t_mcv_l (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 100
 -- @skip_result_check=true
@@ -517,9 +503,7 @@ CREATE TABLE ${case_db}.t_mcv_r (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 101
 -- @skip_result_check=true
@@ -642,9 +626,7 @@ CREATE TABLE ${case_db}.t_mcv_l2 (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 129
 -- @skip_result_check=true
@@ -652,9 +634,7 @@ CREATE TABLE ${case_db}.t_mcv_r2 (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 130
 -- @skip_result_check=true
@@ -715,9 +695,7 @@ CREATE TABLE ${case_db}.t_null_l (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 144
 -- @skip_result_check=true
@@ -725,9 +703,7 @@ CREATE TABLE ${case_db}.t_null_r (
     k bigint null,
     v int null
 )
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 1
-PROPERTIES("replication_num"="1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 145
 -- @skip_result_check=true

@@ -18,13 +18,8 @@ CREATE TABLE ${case_db}.lineitem (
   `l_partkey` int(11) NOT NULL COMMENT "",
   `l_suppkey` int(11),
   `l_shipdate` date
-) ENGINE=OLAP
-DUPLICATE KEY(`l_orderkey`)
-COMMENT "OLAP"
-DISTRIBUTED BY HASH(`l_orderkey`) BUCKETS 3
-PROPERTIES (
-  "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true

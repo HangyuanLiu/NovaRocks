@@ -13,12 +13,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -36,12 +32,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
   idx bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 -- @skip_result_check=true
@@ -69,12 +61,8 @@ CREATE TABLE ${case_db}.t1 (
     c_date_null date NULL,
     c_datetime datetime,
     c_datetime_null datetime NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true

@@ -33,11 +33,7 @@ CREATE TABLE ${case_db}.t1 (
     c_datetime DATETIME,
     c_string   STRING
 )
-DUPLICATE KEY(c_key)
-DISTRIBUTED BY HASH(c_key) BUCKETS 1
-PROPERTIES (
-    "replication_num"="1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -55,11 +51,7 @@ CREATE TABLE ${case_db}.t2 (
     c_datetime DATETIME,
     c_string   STRING
 )
-DUPLICATE KEY(c_key)
-DISTRIBUTED BY HASH(c_key) BUCKETS 1
-PROPERTIES (
-    "replication_num"="1"
-);
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

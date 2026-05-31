@@ -37,7 +37,8 @@ CREATE TABLE ${case_db}.t0 (
   `v1` bigint NULL,
   `v2` bigint NULL,
   `v3` bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -45,7 +46,8 @@ CREATE TABLE ${case_db}.t1 (
   `v4` bigint NULL,
   `v5` bigint NULL,
   `v6` bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -53,7 +55,8 @@ CREATE TABLE ${case_db}.t2 (
   `v7` bigint NULL,
   `v8` bigint NULL,
   `v9` bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
@@ -61,7 +64,8 @@ CREATE TABLE ${case_db}.t3 (
   `v10` bigint NULL,
   `v11` bigint NULL,
   `v12` bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
@@ -76,7 +80,8 @@ CREATE TABLE ${case_db}.test_all_type (
   `id_datetime` datetime NULL,
   `id_date` date NULL,
   `id_decimal` decimal(10,2) NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
@@ -91,7 +96,8 @@ CREATE TABLE ${case_db}.test_all_type_not_null (
   `id_datetime` datetime NOT NULL,
   `id_date` date NOT NULL,
   `id_decimal` decimal(10,2) NOT NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true

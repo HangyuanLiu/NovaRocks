@@ -22,9 +22,8 @@ CREATE TABLE ${case_db}.pre_t0 (
     v1 INT,
     v2 INT,
     v3 VARCHAR(20)
-) DUPLICATE KEY(v1)
-DISTRIBUTED BY HASH(v1) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -32,9 +31,8 @@ CREATE TABLE ${case_db}.pre_t1 (
     v4 INT,
     v5 INT,
     v6 VARCHAR(20)
-) DUPLICATE KEY(v4)
-DISTRIBUTED BY HASH(v4) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

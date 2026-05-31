@@ -13,11 +13,13 @@ CREATE TABLE ${case_db}.t_naaj_corr_not_in_l (
     id INT,
     g INT,
     k INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_naaj_corr_not_in_r (
     g INT,
     k INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_naaj_corr_not_in_l VALUES
     (1, 1, 2),

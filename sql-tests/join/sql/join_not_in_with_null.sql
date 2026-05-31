@@ -11,10 +11,12 @@ DROP TABLE IF EXISTS ${case_db}.t_join_not_in_with_null_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_not_in_with_null_r;
 CREATE TABLE ${case_db}.t_join_not_in_with_null_l (
   id INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_not_in_with_null_r (
   id INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_not_in_with_null_l VALUES
   (1),
   (2),

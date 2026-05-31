@@ -17,12 +17,8 @@ CREATE TABLE ${case_db}.lineitem (
   `l_orderkey` int(11) NOT NULL,
   `l_partkey` int(11) NOT NULL,
   `l_suppkey` int(11)
-) ENGINE=OLAP
-DUPLICATE KEY(`l_orderkey`)
-DISTRIBUTED BY HASH(`l_orderkey`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
@@ -44,12 +40,8 @@ CREATE TABLE ${case_db}.lineitem_nullable (
   `l_orderkey` int(11),
   `l_partkey` int(11),
   `l_suppkey` int(11)
-) ENGINE=OLAP
-DUPLICATE KEY(`l_orderkey`)
-DISTRIBUTED BY HASH(`l_orderkey`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 -- @skip_result_check=true
@@ -98,12 +90,8 @@ CREATE TABLE ${case_db}.aware3 (
   `k1` int(11),
   `k2` int(11),
   `k3` int(11)
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 16
 -- @skip_result_check=true
@@ -115,12 +103,8 @@ CREATE TABLE ${case_db}.build1 (
   `k1` int(11),
   `k2` int(11),
   `k3` int(11)
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 18
 -- @skip_result_check=true
@@ -156,12 +140,8 @@ CREATE TABLE ${case_db}.build2 (
   `k1` int(11),
   `k2` int(11),
   `k3` int(11)
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 26
 -- @skip_result_check=true

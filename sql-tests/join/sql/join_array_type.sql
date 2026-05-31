@@ -33,12 +33,8 @@ ai_1  Array<Array<BigInt>>,
 as_1  Array<Array<String>>,
 aas_1 Array<Array<Array<String>>>,
 aad_1 Array<Array<Array<DECIMAL(26, 2)>>>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

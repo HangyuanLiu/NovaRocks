@@ -17,7 +17,8 @@ CREATE TABLE ${case_db}.lineitem (
   `l_orderkey` int(11) NOT NULL,
   `l_partkey` int(11) NOT NULL,
   `l_suppkey` int(11)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

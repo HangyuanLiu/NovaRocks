@@ -13,12 +13,14 @@ CREATE TABLE ${case_db}.t_join_multi_key_null_l (
   k1 INT,
   k2 INT,
   lv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_multi_key_null_r (
   k1 INT,
   k2 INT,
   rv STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_multi_key_null_l VALUES
   (1, 1, 'l11'),
   (1, NULL, 'l1n'),

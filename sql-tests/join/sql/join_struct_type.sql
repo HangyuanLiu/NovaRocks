@@ -21,10 +21,8 @@ CREATE TABLE ${case_db}.struct_test (
   s3 struct<c0 string, c1 map<int, varchar(30)>>,
   s4 struct<c0 int, c1 json>,
   s5 struct<c0 INT, c1 STRUCT<c INT, b string>>
-) ENGINE=OLAP
-DUPLICATE KEY(pk)
-DISTRIBUTED BY HASH(pk) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

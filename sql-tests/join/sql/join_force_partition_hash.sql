@@ -38,10 +38,8 @@ CREATE TABLE ${case_db}.fpj_t0 (
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0) BUCKETS 4
-PROPERTIES ("replication_num" = "1", "compression" = "LZ4");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 7
 -- @skip_result_check=true
@@ -50,10 +48,8 @@ CREATE TABLE ${case_db}.fpj_t1 (
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0) BUCKETS 4
-PROPERTIES ("replication_num" = "1", "compression" = "LZ4");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -104,10 +100,8 @@ CREATE TABLE ${case_db}.fpj_nullaware (
   k1 INT,
   k2 INT,
   k3 INT
-) ENGINE=OLAP
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 19
 -- @skip_result_check=true
@@ -145,10 +139,8 @@ CREATE TABLE ${case_db}.fpj_t2 (
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0) BUCKETS 4
-PROPERTIES ("replication_num" = "1", "compression" = "LZ4");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 26
 -- @skip_result_check=true
@@ -157,10 +149,8 @@ CREATE TABLE ${case_db}.fpj_t3 (
   c1 VARCHAR(20) NULL,
   c2 VARCHAR(200) NULL,
   c3 INT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0, c1)
-DISTRIBUTED BY HASH(c0) BUCKETS 4
-PROPERTIES ("replication_num" = "1", "compression" = "LZ4");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 27
 -- @skip_result_check=true

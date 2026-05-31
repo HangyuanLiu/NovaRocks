@@ -12,12 +12,14 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_semi_residual_r;
 CREATE TABLE ${case_db}.t_join_right_semi_residual_l (
   id INT,
   score INT
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_right_semi_residual_r (
   id INT,
   threshold INT,
   tag STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_right_semi_residual_l VALUES
   (1, 10),
   (1, 1),

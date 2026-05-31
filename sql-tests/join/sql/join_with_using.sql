@@ -23,7 +23,8 @@ CREATE TABLE ${case_db}.left_table (
     id2 INT,
     salary DECIMAL(10,2),
     status VARCHAR(10)
-) DUPLICATE KEY(name) DISTRIBUTED BY HASH(name) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -32,7 +33,8 @@ CREATE TABLE ${case_db}.right_table (
     id1 INT,
     bonus DECIMAL(8,2),
     id2 INT
-) DUPLICATE KEY(dept) DISTRIBUTED BY HASH(dept) BUCKETS 1 PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true

@@ -12,11 +12,13 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_key_inner_r;
 CREATE TABLE ${case_db}.t_join_null_key_inner_l (
   k INT,
   vl STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_join_null_key_inner_r (
   k INT,
   vr STRING
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_join_null_key_inner_l VALUES
   (NULL, 'LN'),
   (2, 'L2');

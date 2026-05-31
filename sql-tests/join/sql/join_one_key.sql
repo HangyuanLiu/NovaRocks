@@ -16,10 +16,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util_base;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
   k1 bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -41,10 +39,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util;
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
   idx bigint NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`idx`)
-DISTRIBUTED BY HASH(`idx`) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -90,10 +86,8 @@ CREATE TABLE ${case_db}.t1 (
     c_char_null char(100) NULL,
     c_varchar varchar(100),
     c_varchar_null varchar(100) NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true

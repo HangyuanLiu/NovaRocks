@@ -20,10 +20,8 @@ CREATE TABLE ${case_db}.map_test (
   map3 MAP<STRING, MAP<INT, VARCHAR(30)>>,
   map4 MAP<INT, JSON>,
   map5 MAP<INT, STRUCT<c INT, b STRING>>
-) ENGINE=OLAP
-DUPLICATE KEY(pk)
-DISTRIBUTED BY HASH(pk) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

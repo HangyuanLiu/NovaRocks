@@ -15,24 +15,16 @@
 CREATE TABLE ${case_db}.arr_lhs (
   `pk` int(11) NOT NULL,
   `d_1` Array<DECIMAL(26, 2)>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.arr_rhs (
   `pk` int(11) NOT NULL,
   `i_0` Array<INT> NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

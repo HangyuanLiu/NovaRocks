@@ -22,25 +22,19 @@ CREATE TABLE ${case_db}.t_jr_left (
     k BIGINT NULL,
     v BIGINT NULL,
     d BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_jr_right (
     k BIGINT NULL,
     v BIGINT NULL,
     d BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(k)
-DISTRIBUTED BY HASH(k) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_jr_dim (
     d BIGINT NULL,
     label BIGINT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(d)
-DISTRIBUTED BY HASH(d) BUCKETS 3
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.t_jr_left  VALUES (1, 10, 100), (2, 20, 200), (3, 30, 100);
 INSERT INTO ${case_db}.t_jr_right VALUES (1, 11, 100), (2, 22, 200), (3, 33, 200);
 INSERT INTO ${case_db}.t_jr_dim   VALUES (100, 1), (200, 2), (300, 3);
