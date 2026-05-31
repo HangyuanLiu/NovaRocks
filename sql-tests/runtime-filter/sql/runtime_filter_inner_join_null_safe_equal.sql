@@ -13,11 +13,13 @@ CREATE TABLE ${case_db}.t_rf_inner_null_safe_l (
     id INT,
     k INT,
     v VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 CREATE TABLE ${case_db}.t_rf_inner_null_safe_r (
     k INT,
     tag VARCHAR(20)
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t_rf_inner_null_safe_l VALUES
     (1, NULL, 'ln1'),

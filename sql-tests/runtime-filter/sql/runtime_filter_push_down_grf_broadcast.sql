@@ -12,40 +12,22 @@ CREATE TABLE ${case_db}.t0 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 4
-PROPERTIES (
-    "replication_num" = "1",
-    "in_memory" = "false",
-    "storage_format" = "default"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t1 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 4
-PROPERTIES (
-    "replication_num" = "1",
-    "in_memory" = "false",
-    "storage_format" = "default"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE ${case_db}.t2 (
     c0 INT NOT NULL,
     c1 VARCHAR(32) NOT NULL,
     c2 VARCHAR(32) NOT NULL
-) ENGINE=OLAP
-DUPLICATE KEY(c0)
-DISTRIBUTED BY HASH(c0, c1) BUCKETS 4
-PROPERTIES (
-    "replication_num" = "1",
-    "in_memory" = "false",
-    "storage_format" = "default"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t0 (c0, c1, c2) VALUES
     (4, 'DvvRNNLAAKj5mc3e', 'oHHGEp'),

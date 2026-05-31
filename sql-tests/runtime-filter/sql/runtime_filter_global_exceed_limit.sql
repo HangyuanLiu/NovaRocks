@@ -9,9 +9,7 @@
 CREATE TABLE ${case_db}.t1 (
     k1 INT
 )
-DUPLICATE KEY(k1)
-DISTRIBUTED BY HASH(k1) BUCKETS 32
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.t1 SELECT generate_series FROM TABLE(generate_series(1, 65535));
 INSERT INTO ${case_db}.t1 SELECT k1 + 65535 FROM ${case_db}.t1;
