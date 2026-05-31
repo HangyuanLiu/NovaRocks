@@ -542,6 +542,37 @@ fn reannotate_array(
                 )
             })
         }
+        // Implicit scalar -> STRING coercion: INSERT-SELECT may feed a numeric,
+        // boolean, or temporal source column into a STRING/VARCHAR sink column
+        // (Arrow `Utf8`). The native (managed-lake) write path accepts this
+        // coercion, so the iceberg write path must too. Delegate to the same
+        // relaxed cast the engine uses for `CAST(... AS STRING)` so the textual
+        // formatting is identical. This is deliberately restricted to scalar
+        // sources -> Utf8; composite mismatches (e.g. Struct -> Int) still hit
+        // the fail-fast catch-all below.
+        (
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Boolean
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _),
+            DataType::Utf8,
+        ) => crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
+            format!(
+                "reannotate_array: coerce {:?} to Utf8 failed: {e}",
+                array.data_type()
+            )
+        }),
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
         )),
@@ -1148,5 +1179,102 @@ mod tests {
         let src: ArrayRef = Arc::new(Int32Array::from(vec![Some(7_i32), None]));
         let result = reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
         assert!(Arc::ptr_eq(&src, &result));
+    }
+
+    /// reannotate_array must implicitly coerce an integer column to Utf8 when the
+    /// iceberg sink column is STRING/VARCHAR, matching the native write path.
+    #[test]
+    fn reannotate_int64_coerces_to_utf8() {
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1_i64),
+            Some(2_i64),
+            Some(3_i64),
+            None,
+        ]));
+
+        let result = reannotate_array(&src, &DataType::Utf8).expect("Int64->Utf8 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.value(0), "1");
+        assert_eq!(out.value(1), "2");
+        assert_eq!(out.value(2), "3");
+        assert!(out.is_null(3));
+    }
+
+    /// reannotate_array must coerce a DECIMAL column to Utf8 using the same
+    /// formatting the engine uses for CAST(... AS STRING) (value 150, scale 2 -> "1.50").
+    #[test]
+    fn reannotate_decimal128_coerces_to_utf8() {
+        use arrow::array::{ArrayRef, Decimal128Array, StringArray};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(150_i128), Some(-25_i128), None])
+                .with_precision_and_scale(10, 2)
+                .expect("src decimal"),
+        );
+
+        let result =
+            reannotate_array(&src, &DataType::Utf8).expect("Decimal128->Utf8 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0), "1.50");
+        assert_eq!(out.value(1), "-0.25");
+        assert!(out.is_null(2));
+    }
+
+    /// reannotate_array must coerce a BOOLEAN column to Utf8 ("true"/"false").
+    #[test]
+    fn reannotate_boolean_coerces_to_utf8() {
+        use arrow::array::{ArrayRef, BooleanArray, StringArray};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]));
+
+        let result = reannotate_array(&src, &DataType::Utf8).expect("Boolean->Utf8 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0), "true");
+        assert_eq!(out.value(1), "false");
+        assert!(out.is_null(2));
+    }
+
+    /// reannotate_array must keep failing fast for genuinely incompatible pairs
+    /// (e.g. Struct -> Int32). The fix only adds the `-> Utf8` coercion arm; it
+    /// must not broaden the catch-all into arbitrary scalar/composite casts.
+    #[test]
+    fn reannotate_struct_to_int32_still_errors() {
+        use arrow::array::{ArrayRef, Int64Array, StructArray};
+        use arrow::datatypes::{DataType, Field, Fields};
+        use std::sync::Arc;
+
+        let child = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let fields: Fields = vec![Arc::new(Field::new("a", DataType::Int64, true))].into();
+        let src: ArrayRef = Arc::new(StructArray::new(fields, vec![child], None));
+
+        let err = reannotate_array(&src, &DataType::Int32)
+            .expect_err("Struct -> Int32 must remain a fail-fast error");
+        assert!(
+            err.contains("incompatible data types"),
+            "expected the fail-fast catch-all error, got: {err}"
+        );
     }
 }
