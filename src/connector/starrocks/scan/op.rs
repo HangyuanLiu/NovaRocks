@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::common::ids::SlotId;
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -35,7 +33,7 @@ use crate::types;
 
 use super::reader::StarRocksNativeReader;
 
-pub type QueryGlobalDictEncodeMap = HashMap<SlotId, Arc<HashMap<Vec<u8>, i32>>>;
+pub use crate::exec::dict_encode::QueryGlobalDictEncodeMap;
 
 #[derive(Clone, Debug)]
 pub struct StarRocksScanRange {
