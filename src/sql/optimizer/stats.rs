@@ -277,8 +277,12 @@ pub(crate) fn derive_statistics(
                     .iter()
                     .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
                     .collect();
+                let mut selectivity = 1.0;
+                for pred in &scan.predicates {
+                    selectivity *= estimate_selectivity(pred, &column_statistics);
+                }
                 Statistics {
-                    output_row_count: default_rows,
+                    output_row_count: (default_rows * selectivity).max(1.0),
                     column_statistics,
                 }
             }
@@ -733,8 +737,12 @@ fn derive_scan(
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
+        let mut selectivity = 1.0;
+        for pred in &scan.predicates {
+            selectivity *= estimate_selectivity(pred, &column_statistics);
+        }
         Statistics {
-            output_row_count: default_rows,
+            output_row_count: (default_rows * selectivity).max(1.0),
             column_statistics,
         }
     }
@@ -1501,6 +1509,36 @@ mod tests {
             dict_columns: vec![],
             required_output_columns: None,
         })
+    }
+
+    fn scan_plan_with_predicates(
+        name: &str,
+        cols: &[&str],
+        predicates: Vec<TypedExpr>,
+    ) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.predicates = predicates;
+        LogicalPlan::Scan(node)
+    }
+
+    #[test]
+    fn fallback_scan_applies_predicate_selectivity() {
+        // No table stats registered -> derive_scan takes the heuristic
+        // fallback. With the fix, the predicate still reduces the row count.
+        let table_stats: HashMap<String, TableStatistics> = HashMap::new();
+        let pred = eq_expr(col_ref("a"), int_lit(42));
+        let plan = scan_plan_with_predicates("unknown_tbl", &["a"], vec![pred]);
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
+        // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
+        let props = memo.groups[0].logical_props.as_ref().unwrap();
+        assert!((props.row_count - 25_000.0).abs() < 1.0);
     }
 
     fn col_ref(name: &str) -> TypedExpr {
