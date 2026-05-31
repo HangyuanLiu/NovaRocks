@@ -18,16 +18,12 @@ create table t1 (
     date_str_with_whitespace string,
     datetime_str_with_whitespace string
 )
-duplicate key(k1)
-distributed by hash(k1) buckets 1
-PROPERTIES ("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 CREATE TABLE __row_util (
   k1 bigint null
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 1
-PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 insert into __row_util select generate_series from TABLE(generate_series(0, 10000 - 1));
 insert into __row_util select k1 + 20000 from __row_util;
 insert into __row_util select k1 + 40000 from __row_util;

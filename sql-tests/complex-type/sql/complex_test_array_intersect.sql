@@ -28,7 +28,8 @@ CREATE TABLE test_array_intersect (
     array_varchar ARRAY<VARCHAR(50)>,
     array_date ARRAY<DATE>,
     array_datetime ARRAY<DATETIME>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

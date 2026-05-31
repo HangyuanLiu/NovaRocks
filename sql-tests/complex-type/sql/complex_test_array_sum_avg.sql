@@ -25,7 +25,8 @@ CREATE TABLE test_array_functions (
     array_decimal64 ARRAY<DECIMAL64(18, 2)>,
     array_decimal128 ARRAY<DECIMAL128(38, 10)>,
     array_decimalv2 ARRAY<DECIMAL(27, 9)>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true

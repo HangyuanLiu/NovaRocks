@@ -47,12 +47,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 6
 -- @skip_result_check=true
@@ -158,12 +154,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 24
 -- @skip_result_check=true
@@ -196,12 +188,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 28
 -- @skip_result_check=true
@@ -285,12 +273,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 44
 -- @skip_result_check=true
@@ -347,12 +331,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 53
 -- @skip_result_check=true
@@ -389,12 +369,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 58
 -- @skip_result_check=true
@@ -426,12 +402,8 @@ CREATE TABLE `t1` (
   `src` varchar(65533) NULL COMMENT "",
   `from_str` varchar(65533) NULL COMMENT "",
   `to_str` varchar(65533) NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`src`)
-DISTRIBUTED BY HASH(`src`) BUCKETS 1
-PROPERTIES (
-    "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 62
 -- @skip_result_check=true

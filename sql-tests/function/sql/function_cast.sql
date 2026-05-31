@@ -10,17 +10,13 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1(c1 int, c2 string, c3 string)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t2(c1 int, c2 binary, c3 varbinary)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -63,17 +59,13 @@ DROP TABLE IF EXISTS t2;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1(c1 int, c2 binary, c3 varbinary)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t2(c1 int, c2 string, c3 string)
-    DUPLICATE KEY(c1)
-    DISTRIBUTED BY HASH(c1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true
@@ -113,9 +105,7 @@ DROP TABLE IF EXISTS t2;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1(k1 int, d1 double, f1 float)
-    DUPLICATE KEY(k1)
-    DISTRIBUTED BY HASH(k1) BUCKETS 1
-    PROPERTIES("replication_num" = "1");
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 21
 -- @skip_result_check=true

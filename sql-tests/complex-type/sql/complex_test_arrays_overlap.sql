@@ -26,12 +26,8 @@ ai_1  Array<Array<BigInt>>,
 as_1  Array<Array<String>>,
 aas_1 Array<Array<Array<String>>>,
 aad_1 Array<Array<Array<DECIMAL(26, 2)>>>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -551,12 +547,8 @@ CREATE TABLE `t1` (
   `k1` int(11) NULL,
   `a1` array<String> NULL,
   `a2` array<String> NULL
-) ENGINE=OLAP
-DUPLICATE KEY(`k1`)
-DISTRIBUTED BY HASH(`k1`) BUCKETS 1
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 120
 -- @skip_result_check=true

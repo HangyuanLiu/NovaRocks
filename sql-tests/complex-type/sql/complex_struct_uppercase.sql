@@ -7,7 +7,8 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.struct_upper_case
     (c1 int,
-    c2 struct<c2_sub1 int, C2_SUB2 int>);
+    c2 struct<c2_sub1 int, C2_SUB2 int>)
+TBLPROPERTIES ("format-version" = "3");
 
 insert into ${case_db}.struct_upper_case values (1, named_struct('c2_sub1', 1, 'c2_sub2', 1)), (2, named_struct('C2_SUB1', 2, 'C2_SUB2', 2));
 

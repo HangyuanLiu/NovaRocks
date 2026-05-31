@@ -17,7 +17,8 @@ str string,
 arr_bigint array<bigint>,
 arr_str array<string>,
 arr_decimal array<decimal(38,5)>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -145,7 +146,8 @@ create table t (
     v1 array<decimal(38,5)>,
     v2 array<array<decimal(38,5)>>,
     v3 array<array<array<decimal(38,5)>>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 32
 -- @skip_result_check=true
@@ -202,7 +204,8 @@ CREATE TABLE t (
   arr_0 array<bigint(20)> NOT NULL,
   arr_1 array<bigint(20)>,
   arr_2 array<bigint(20)>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 44
 -- @skip_result_check=true
@@ -439,7 +442,8 @@ CREATE TABLE test_array_contains (
     array_varchar ARRAY<VARCHAR(100)>,
     array_date ARRAY<DATE>,
     array_datetime ARRAY<DATETIME>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 94
 -- @skip_result_check=true
@@ -1339,7 +1343,8 @@ CREATE TABLE test_array_contains_complex_type (
     array_map ARRAY<MAP<STRING, INT>>,
     array_json ARRAY<JSON>,
     array_struct ARRAY<STRUCT<f1 INT, f2 STRING>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 286
 -- @skip_result_check=true
@@ -1555,7 +1560,8 @@ str string,
 arr_bigint array<bigint>,
 arr_str array<string>,
 arr_decimal array<decimal(38,5)>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 335
 -- @skip_result_check=true

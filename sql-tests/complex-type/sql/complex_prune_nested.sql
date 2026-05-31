@@ -12,7 +12,8 @@ CREATE TABLE ${case_db}.sc3 (
   `m1` MAP<INT, INT> NULL,
   `m2` MAP<INT, STRUCT<c INT, b ARRAY<INT>>> NULL,
   `s1` STRUCT<s1 int, s2 ARRAY<STRUCT<a int, b int>>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 insert into ${case_db}.sc3 values (1, [1,2,3],[row(1,11),row(2,21),row(3,31)], map{1:11, 2:21}, map{1:row(11, [111, 221, 331]), 2:row(22, [221, 221, 331])}, row(1, [row(1,1), row(2,1)], map{1:11, 2:21}, row(1,1)));
 insert into ${case_db}.sc3 values (2, [2,2,3],[row(1,12),row(2,22),row(3,32)], map{1:12, 2:22}, map{1:row(12, [112, 222, 332]), 2:row(22, [222, 222, 332])}, row(1, [row(1,2), row(2,2)], map{1:12, 2:22}, row(1,2)));
@@ -101,7 +102,8 @@ CREATE TABLE ${case_db}.scs3 (
   `m1` MAP<INT, INT> NULL,
   `m2` MAP<INT, STRUCT<c INT, b ARRAY<INT>>> NULL,
   `s1` STRUCT<s1 int, s2 ARRAY<STRUCT<a int, b int>>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 insert into ${case_db}.scs3 values (1, "aa", [1,2,3],[row(1,11),row(2,21),row(3,31)], map{1:11, 2:21}, map{1:row(11, [111, 221, 331]), 2:row(22, [221, 221, 331])}, row(1, [row(1,1), row(2,1)], map{1:11, 2:21}, row(1,1)));
 insert into ${case_db}.scs3 values (2, "bb", [2,2,3],[row(1,12),row(2,22),row(3,32)], map{1:12, 2:22}, map{1:row(12, [112, 222, 332]), 2:row(22, [222, 222, 332])}, row(1, [row(1,2), row(2,2)], map{1:12, 2:22}, row(1,2)));

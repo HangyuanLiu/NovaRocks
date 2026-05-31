@@ -15,12 +15,8 @@ CREATE TABLE `array_map_test` (
   `id` tinyint(4) NOT NULL COMMENT "",
   `arr_str` array<string> NULL COMMENT "",
   `arr_largeint` array<largeint> NULL COMMENT ""
-) ENGINE=OLAP
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY RANDOM
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -69,12 +65,8 @@ CREATE TABLE `t` (
   `arr_0` array<bigint> NOT NULL COMMENT "",
   `arr_1` array<bigint> NULL COMMENT "",
   `arr_2` array<bigint> NULL COMMENT ""
-) ENGINE=OLAP
-PRIMARY KEY(`k`)
-DISTRIBUTED BY HASH(`k`) BUCKETS 1
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 13
 -- @skip_result_check=true
@@ -200,12 +192,8 @@ CREATE TABLE `array_map_x` (
   `id` tinyint(4) NOT NULL COMMENT "",
   `arr_str` array<varchar(65533)> NULL COMMENT "",
   `arr_largeint` array<largeint(40)> NULL COMMENT ""
-) ENGINE=OLAP 
-DUPLICATE KEY(`id`)
-DISTRIBUTED BY RANDOM
-PROPERTIES (
-"replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 42
 -- @skip_result_check=true

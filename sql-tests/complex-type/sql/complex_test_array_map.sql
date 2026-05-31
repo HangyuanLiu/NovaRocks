@@ -14,7 +14,8 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE t1 (
     k1 bigint,
     c1 array < varchar(65536) > 
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -22,7 +23,8 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE t2 (
     k1 bigint,
     c1 bigint
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
@@ -100,7 +102,8 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE table1 (
     id INT,
     arr_largeint ARRAY<INT> NOT NULL
-)PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
@@ -116,7 +119,8 @@ USE sql_tests_complex_test_array_map;
 CREATE TABLE table2 (
     id INT,
     arr_str ARRAY<INT> NOT NULL
-) PROPERTIES ("replication_num" = "1");
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
