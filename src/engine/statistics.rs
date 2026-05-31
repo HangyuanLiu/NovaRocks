@@ -98,6 +98,7 @@ impl Default for StandaloneStatistics {
 pub(crate) fn try_handle_statement(
     state: &Arc<StandaloneState>,
     sql: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<Option<StatementResult>, String> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -132,7 +133,7 @@ pub(crate) fn try_handle_statement(
         return Ok(Some(StatementResult::Ok));
     }
     if lower.starts_with("analyze ") {
-        handle_analyze_statement(state, trimmed, current_database)?;
+        handle_analyze_statement(state, trimmed, current_catalog, current_database)?;
         return Ok(Some(StatementResult::Query(ok_result()?)));
     }
     if lower.starts_with("explain costs ")
@@ -426,11 +427,24 @@ fn handle_table_statistic_property(
 fn handle_analyze_statement(
     state: &Arc<StandaloneState>,
     sql: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<(), String> {
     let lower = sql.to_ascii_lowercase();
     let table = analyze_table_name(sql)?;
     let key = table_key(&table, current_database)?;
+    // Iceberg external tables register into the in-memory catalog lazily at
+    // query-prep time per SELECT. ANALYZE may target a table that was created
+    // and populated but never SELECTed from, so materialize it here before the
+    // schema/stats lookups below (otherwise `table_columns` and the stats
+    // aggregate query fail with "unknown table"). No-op for local/StarRocks
+    // tables, which register on CREATE.
+    crate::engine::query_prep::register_external_table_by_name(
+        state,
+        current_catalog,
+        current_database,
+        &table,
+    )?;
     if lower.contains(" drop histogram on ") {
         let columns = parse_columns_after_marker(sql, "drop histogram on")?;
         let mut stats = state
@@ -2340,7 +2354,7 @@ mod tests {
         .expect("query stats");
         assert_eq!(result_cell(&before, 0, 0).as_deref(), Some("1"));
 
-        try_handle_statement(&state, "drop stats t1", "db1")
+        try_handle_statement(&state, "drop stats t1", None, "db1")
             .expect("drop stats")
             .expect("handled");
         let after = query_column_statistics(
