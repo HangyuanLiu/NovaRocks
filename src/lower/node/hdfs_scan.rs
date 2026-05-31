@@ -1166,6 +1166,7 @@ pub(crate) fn lower_hdfs_scan_node(
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         iceberg_output_schema,
+        query_global_dicts: Default::default(),
     };
     let orc_cfg = OrcScanConfig {
         columns: parquet_cfg.columns.clone(),
@@ -1203,6 +1204,7 @@ pub(crate) fn lower_hdfs_scan_node(
         format,
         object_store_config: object_store_config.clone(),
         iceberg_table_locations,
+        query_global_dicts: Default::default(),
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(
