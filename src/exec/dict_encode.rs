@@ -240,7 +240,13 @@ fn encode_utf8_column_to_dict_ids(
     })
 }
 
-fn dict_scan_data_type_for_output(output_type: &DataType) -> Option<DataType> {
+/// Map a dict-encoded output type to the type the scan must READ from storage:
+/// an integer dict-code column (`Int32`, etc.) is stored as `Utf8`, and a
+/// `List<int>` of dict codes is stored as `List<Utf8>`. Returns `None` for
+/// types that are not a dict-code shape. Callers use this to rewrite a dict
+/// column's read-side type before the storage read, then encode back to the
+/// declared output type.
+pub fn dict_scan_data_type_for_output(output_type: &DataType) -> Option<DataType> {
     if is_integer_dict_code_type(output_type) {
         return Some(DataType::Utf8);
     }
