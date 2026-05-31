@@ -1109,13 +1109,14 @@ mod tests {
 
     #[test]
     fn min_non_order_preserving_decodes() {
-        // MIN(s) on a non-order-preserving snapshot must keep its arg
-        // as the string column (no dict-id rewrite). Internally the
-        // rewriter does not insert a Decode below the aggregate either
-        // — the scan still emits the original string column — but the
-        // critical assertion is that the arg does NOT become the dict
-        // slot, otherwise min would order by dict id which has no
-        // relation to lexical order of strings.
+        // MIN(s) on a non-order-preserving snapshot. `min` is NOT on the
+        // dict-id allowlist (`DICT_AGG_FUNCTIONS`), and `s`'s only use is
+        // this `min`, so the collector BLOCKLISTS `s` and the scan never
+        // dict-encodes it. The plan is therefore unchanged: a plain
+        // `Aggregate(min(s))` over the string column, with NO dict slot on
+        // the scan and NO Decode. (Encoding `s` would have made `min`
+        // operate on Int32 dict ids — a latent wrong-result bug; not
+        // encoding is the fix.)
         let scan = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
             table: make_table(),
@@ -1151,6 +1152,7 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
+        // No Decode anywhere: the scan keeps emitting the plain string.
         let LogicalPlan::Aggregate(agg) = rewritten else {
             panic!("expected aggregate root, got {rewritten:?}");
         };
@@ -1164,19 +1166,33 @@ mod tests {
             "non-order-preserving min must keep the string column"
         );
         assert_eq!(arg.data_type, DataType::Utf8);
+        // NEW correct shape: `s` was blocklisted (only consumed by the
+        // non-allowlisted `min`), so the scan has NO dict encoding.
+        let LogicalPlan::Scan(scan) = *agg.input else {
+            panic!("expected scan directly under aggregate (no Decode)");
+        };
+        assert!(
+            scan.dict_columns.is_empty(),
+            "s must not be dict-encoded — its only use is min(s); got {:?}",
+            scan.dict_columns
+        );
+        assert!(
+            scan.columns.iter().all(|c| c.name == "s"),
+            "scan output must contain only the original `s` column"
+        );
     }
 
     #[test]
     fn min_order_preserving_decodes_before_aggregate() {
-        // MIN(s) on an order-preserving snapshot: even though the
+        // MIN(s) on an order-preserving snapshot. Even though the
         // dictionary is order-preserving, `min` is NOT on the dict-id
-        // allowlist (`DICT_AGG_FUNCTIONS`). The reason is the result-
-        // type mismatch — rewriting the arg to the Int32 dict slot
-        // would make the aggregate emit Int32 dict ids while the
-        // declared output column type is still Utf8, a silent wrong-
-        // result bug. The rewrite must therefore keep the arg as the
-        // string column (the scan still exposes it alongside the dict
-        // slot). See `DICT_AGG_FUNCTIONS` and TODO(task-8-min-max).
+        // allowlist (`DICT_AGG_FUNCTIONS`) — rewriting the arg to the
+        // Int32 dict slot would make the aggregate emit Int32 dict ids
+        // under a still-Utf8 result column. Because `s`'s only use is this
+        // `min`, the collector BLOCKLISTS `s`, so the scan never
+        // dict-encodes it and the plan is unchanged: a plain
+        // `Aggregate(min(s))` over the string column, with NO dict slot on
+        // the scan and NO Decode. See `DICT_AGG_FUNCTIONS`.
         let scan = LogicalPlan::Scan(ScanNode {
             database: "db".to_string(),
             table: make_table(),
@@ -1227,6 +1243,164 @@ mod tests {
             "min(s) must keep the string column even when the snapshot is order-preserving"
         );
         assert_eq!(arg.data_type, DataType::Utf8);
+        // NEW correct shape: `s` was blocklisted (only consumed by the
+        // non-allowlisted `min`), so the scan has NO dict encoding.
+        let LogicalPlan::Scan(scan) = *agg.input else {
+            panic!("expected scan directly under aggregate (no Decode)");
+        };
+        assert!(
+            scan.dict_columns.is_empty(),
+            "s must not be dict-encoded — its only use is min(s); got {:?}",
+            scan.dict_columns
+        );
+        assert!(
+            scan.columns.iter().all(|c| c.name == "s"),
+            "scan output must contain only the original `s` column"
+        );
+    }
+
+    #[test]
+    fn aggregate_unsupported_function_arg_not_dict_encoded() {
+        // SUM(murmur_hash3_32(s)) GROUP BY k. `sum` is not on
+        // `DICT_AGG_FUNCTIONS`, and its argument is a function call over
+        // `s`, so the collector blocklists `s` (it is consumed in an
+        // unsafe position — the murmur hash must hash the STRING, not the
+        // Int32 dict id). The scan must therefore NOT dict-encode `s`,
+        // and the plan is otherwise unchanged. This is the regression for
+        // the grf_broadcast wrong-fingerprint bug: hashing the dict id
+        // produced a different fingerprint than hashing the string.
+        let scan = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "t".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "s".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    ColumnDef {
+                        name: "k".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                ],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: None,
+            columns: vec![
+                s_output_column(),
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            required_output_columns: None,
+        });
+        // murmur_hash3_32(s)
+        let murmur = TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "murmur_hash3_32".to_string(),
+                args: vec![s_column_ref()],
+                distinct: false,
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let k_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let aggregate = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![k_ref],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![murmur],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+            }],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "h".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        install_provider(&mut ctx, true);
+        let table_stats = HashMap::new();
+        let pipeline = query_rewrite_pipeline(&table_stats);
+        let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
+        // Plan must be unchanged: Aggregate over a plain Scan, no Decode.
+        let LogicalPlan::Aggregate(agg) = rewritten else {
+            panic!("expected aggregate root (no Decode), got {rewritten:?}");
+        };
+        // The aggregate arg must still hash the STRING column `s`.
+        let arg = agg.aggregates[0].args.first().expect("sum has 1 arg");
+        let ExprKind::FunctionCall { name, args, .. } = &arg.kind else {
+            panic!("sum arg must remain a murmur function call");
+        };
+        assert_eq!(name, "murmur_hash3_32");
+        let Ek::ColumnRef { column, .. } = &args[0].kind else {
+            panic!("murmur arg must be a ColumnRef");
+        };
+        assert_eq!(
+            column, "s",
+            "murmur must hash the string column, not the dict id"
+        );
+        // CRITICAL: the scan must not dict-encode `s`.
+        let LogicalPlan::Scan(scan) = *agg.input else {
+            panic!("expected scan directly under aggregate (no Decode)");
+        };
+        assert!(
+            scan.dict_columns.is_empty(),
+            "s must not be dict-encoded — its only use is the unsupported murmur_hash3_32; got {:?}",
+            scan.dict_columns
+        );
+        assert!(
+            scan.columns.iter().any(|c| c.name == "s"),
+            "scan must still expose the original `s` column"
+        );
+        assert!(
+            scan.columns
+                .iter()
+                .all(|c| !c.name.starts_with("__nr_dict_")),
+            "scan must not expose any dict slot; got {:?}",
+            scan.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
