@@ -399,26 +399,28 @@ fn annotate_batch(
         .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
 }
 
-/// Whether `dtype` is in the numeric allowlist used by `reannotate_array`'s
-/// implicit numeric <-> numeric coercion arm: signed/unsigned integers,
-/// floats, and Decimal128. Deliberately excludes Utf8, Boolean, temporal, and
-/// all composite types so that only clean numeric->numeric casts are coerced;
-/// everything else must fail fast in `reannotate_array`.
-fn is_numeric_dtype(dtype: &arrow::datatypes::DataType) -> bool {
+/// Whether `dtype` is a nested / composite Arrow type whose inner `Field`
+/// definitions are part of the `DataType` itself (so structural identity is
+/// load-bearing). `reannotate_array` rebuilds the supported nested types
+/// (Struct / List / Map) through dedicated arms and must NEVER hand a nested
+/// type to the general scalar cast: a nested-vs-scalar pair (e.g. List -> Int)
+/// or an unsupported nested-vs-nested pair (e.g. List -> Struct) must fail
+/// fast via the catch-all. This guard gates the general scalar coercion arm so
+/// only genuine scalar <-> scalar pairs are delegated to the engine cast.
+fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     matches!(
         dtype,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
+        DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+            | DataType::Dictionary(_, _)
+            | DataType::RunEndEncoded(_, _)
     )
 }
 
@@ -438,6 +440,19 @@ fn is_numeric_dtype(dtype: &arrow::datatypes::DataType) -> bool {
 /// `PARQUET:field_id`; the runtime chunk does not. This helper deep-rebuilds
 /// the array so its inner field layout matches the target, while keeping the
 /// original buffers.
+///
+/// Beyond field-id reannotation, this is also the single place that reconciles
+/// an INSERT's source Arrow type to the sink column's target type, matching the
+/// native (managed-lake) write path. The arms are tried in order:
+///   1. exact type equality -> passthrough;
+///   2. supported nested rebuilds (Map / Struct / List -> same kind), recursing
+///      into children;
+///   3. Arrow `Null` source (bare NULL literal insert) -> all-null target array;
+///   4. general scalar <-> scalar coercion via `cast_with_special_rules`,
+///      GUARDED so neither side is a nested/composite type;
+///   5. catch-all fail-fast `Err` for everything else (structural mismatches
+///      such as List -> Int, scalar -> nested, or unsupported nested pairs),
+///      per CLAUDE.md rule #2.
 fn reannotate_array(
     array: &arrow::array::ArrayRef,
     target_dtype: &arrow::datatypes::DataType,
@@ -535,64 +550,43 @@ fn reannotate_array(
             Ok(Arc::new(new_list) as ArrayRef)
         }
         (a, b) if a == b => Ok(array.clone()),
-        // Implicit numeric <-> numeric coercion: INSERT-SELECT may feed one
-        // numeric-family source column into a different numeric-family sink
-        // column. This covers, among others:
-        //   * Decimal128 -> Decimal128 narrowing (half-up rounding via the
-        //     engine's relaxed cast, e.g. an explicit CAST widened the SELECT);
-        //   * integer narrowing (BIGINT -> INT/SMALLINT/TINYINT, etc.);
-        //   * integer -> Decimal128 (e.g. INSERT of a BIGINT expression into a
-        //     DECIMAL(18,0) column);
-        //   * integer -> float widening (INT -> DOUBLE);
-        //   * float narrowing / float -> integer (DOUBLE -> FLOAT, DOUBLE -> INT).
+        // Arrow `Null` source -> any target type. A `Null` array is produced
+        // when an INSERT supplies a bare NULL literal (no type information):
+        // every row is NULL. Build an all-null array of the target type
+        // directly rather than routing through a cast kernel; this is always
+        // valid for a nullable insert and avoids the kernel-specific holes
+        // around `Null -> <T>`. Length is preserved.
+        (DataType::Null, _) => Ok(arrow::array::new_null_array(target_dtype, array.len())),
+        // General scalar <-> scalar coercion. INSERT-SELECT may feed a source
+        // scalar column into a different-typed scalar sink column, e.g.
+        //   * numeric <-> numeric (integer narrowing, integer -> Decimal128,
+        //     Decimal128 -> Decimal128 narrowing with half-up rounding,
+        //     integer -> float widening, float narrowing/float -> integer);
+        //   * scalar -> STRING (numeric/boolean/temporal -> Utf8);
+        //   * STRING -> scalar and temporal <-> string, etc.
         // The native (managed-lake) write path accepts these coercions, so the
         // iceberg write path must too. We delegate to the same relaxed cast the
         // engine uses for `CAST(... AS <type>)`, which applies safe=true
         // semantics (out-of-range values become NULL, matching the DECIMAL
-        // overflow convention). This arm is deliberately restricted to the
-        // numeric allowlist below (Int*/UInt*/Float*/Decimal128); it does NOT
-        // accept Utf8 sources or any composite type, so structural mismatches
-        // (e.g. Struct -> Int) still hit the fail-fast catch-all below.
-        (a, b) if is_numeric_dtype(a) && is_numeric_dtype(b) => {
+        // overflow convention) and identical textual formatting for ->STRING.
+        //
+        // This arm is GUARDED to scalar pairs only: if either side is a nested
+        // / composite type (`is_nested_dtype`), we fall through to the
+        // fail-fast catch-all below. Supported nested rebuilds (Struct/List/Map
+        // -> same kind) are handled by the dedicated arms ABOVE; a nested ->
+        // scalar pair (e.g. List -> Int), a scalar -> nested pair, or an
+        // unsupported nested -> nested pair MUST NOT reach the cast and instead
+        // errors out, preserving CLAUDE.md rule #2 (fail fast on structural
+        // mismatches).
+        (a, b) if !is_nested_dtype(a) && !is_nested_dtype(b) => {
             crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
                 format!(
-                    "reannotate_array: coerce numeric {:?} to {:?} failed: {e}",
+                    "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
                     array.data_type(),
                     target_dtype
                 )
             })
         }
-        // Implicit scalar -> STRING coercion: INSERT-SELECT may feed a numeric,
-        // boolean, or temporal source column into a STRING/VARCHAR sink column
-        // (Arrow `Utf8`). The native (managed-lake) write path accepts this
-        // coercion, so the iceberg write path must too. Delegate to the same
-        // relaxed cast the engine uses for `CAST(... AS STRING)` so the textual
-        // formatting is identical. This is deliberately restricted to scalar
-        // sources -> Utf8; composite mismatches (e.g. Struct -> Int) still hit
-        // the fail-fast catch-all below.
-        (
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Boolean
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(_, _),
-            DataType::Utf8,
-        ) => crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
-            format!(
-                "reannotate_array: coerce {:?} to Utf8 failed: {e}",
-                array.data_type()
-            )
-        }),
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
         )),
@@ -1406,6 +1400,92 @@ mod tests {
 
         let err = reannotate_array(&src, &DataType::Int32)
             .expect_err("Struct -> Int32 must remain a fail-fast error");
+        assert!(
+            err.contains("incompatible data types"),
+            "expected the fail-fast catch-all error, got: {err}"
+        );
+    }
+
+    /// reannotate_array must coerce an Arrow `Null` source array (all nulls,
+    /// e.g. an INSERT of a bare NULL literal) into an all-null array of the
+    /// sink column's BOOLEAN type. The native write path accepts NULL inserts
+    /// into any nullable column, so the iceberg path must too.
+    #[test]
+    fn reannotate_null_array_coerces_to_boolean() {
+        use arrow::array::{ArrayRef, BooleanArray};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
+        let result =
+            reannotate_array(&src, &DataType::Boolean).expect("Null->Boolean must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 3);
+    }
+
+    /// reannotate_array must coerce an Arrow `Null` source array into an
+    /// all-null Int64 array.
+    #[test]
+    fn reannotate_null_array_coerces_to_int64() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
+        let result = reannotate_array(&src, &DataType::Int64).expect("Null->Int64 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 3);
+    }
+
+    /// reannotate_array must coerce an Arrow `Null` source array into an
+    /// all-null Utf8 array.
+    #[test]
+    fn reannotate_null_array_coerces_to_utf8() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
+        let result = reannotate_array(&src, &DataType::Utf8).expect("Null->Utf8 must succeed");
+        let out = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 3);
+    }
+
+    /// reannotate_array must keep failing fast when a NESTED source (List) is
+    /// fed into a scalar sink column (Int32). Generalizing scalar->scalar
+    /// coercion must NOT open a path that casts nested arrays to scalars; such
+    /// structural mismatches must still hit the fail-fast catch-all.
+    #[test]
+    fn reannotate_list_to_int32_still_errors() {
+        use arrow::array::{ArrayRef, Int32Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        // List<Int32> with 2 lists: [1,2] and [3].
+        let values = Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef;
+        let child_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let offsets = OffsetBuffer::new(vec![0_i32, 2, 3].into());
+        let list = ListArray::try_new(child_field, offsets, values, None).expect("list");
+        let src: ArrayRef = Arc::new(list);
+
+        let err = reannotate_array(&src, &DataType::Int32)
+            .expect_err("List<Int32> -> Int32 must remain a fail-fast error");
         assert!(
             err.contains("incompatible data types"),
             "expected the fail-fast catch-all error, got: {err}"
