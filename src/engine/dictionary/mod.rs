@@ -346,9 +346,36 @@ impl QueryDictionaryProvider for DictionaryQueryProvider {
         let Some(owner) = self.owner_for(table, database)? else {
             return Ok(None);
         };
-        self.state
-            .dictionary_manager
-            .load_active_snapshot(&self.state, &owner, column_name)
+        let Some(snapshot) = self.state.dictionary_manager.load_active_snapshot(
+            &self.state,
+            &owner,
+            column_name,
+        )?
+        else {
+            return Ok(None);
+        };
+        // Iceberg snapshot-watermark staleness: a dictionary built by ANALYZE
+        // FULL is pinned to the table snapshot + schema it scanned (its
+        // watermark). Any later commit (INSERT / OVERWRITE / DELETE / schema
+        // change) advances the table's current snapshot or schema id, after
+        // which the dictionary may no longer cover the visible string set. A
+        // watermark mismatch therefore means the snapshot is stale and must
+        // NOT drive the rewrite (encoding an uncovered value would silently
+        // map it to the null/0 id). This is conservative per the
+        // low-cardinality design — we do not try to prove a delete-only commit
+        // is safe; ANALYZE FULL must be re-run to refresh the dictionary.
+        // (StarRocks tables use the tablet-version watermark maintained by
+        // their own write path and are unaffected here.)
+        if let ScanSource::IcebergDataFiles { table: info, .. } = &table.source
+            && let DictionaryWatermark::Iceberg {
+                snapshot_id,
+                schema_id,
+            } = &snapshot.watermark
+            && (*snapshot_id != info.current_snapshot_id || *schema_id != info.schema_id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 }
 
@@ -615,5 +642,92 @@ mod tests {
             loaded.expect("iceberg scans support dict execution (Option A); snapshot must load");
         assert_eq!(snapshot.column_name, "s");
         assert_eq!(snapshot.dictionary_id, 99);
+    }
+
+    /// Iceberg snapshot-watermark staleness: a dictionary built for snapshot 7
+    /// must NOT be used once the table's current snapshot advances (e.g. after
+    /// an INSERT), even though the persisted snapshot is still `Active`. This
+    /// keeps a post-write query from driving the rewrite off a stale dict
+    /// (which would encode the new, uncovered values to the null/0 id).
+    #[test]
+    fn dictionary_provider_skips_stale_iceberg_snapshot_after_table_advances() {
+        use crate::sql::catalog::{
+            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        };
+        use arrow::datatypes::DataType;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let (_dir, state) = open_state();
+        let state = Arc::new(state);
+
+        let owner = DictionaryOwner::IcebergTable {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+        };
+        let snapshot = DictionarySnapshot {
+            dictionary_id: 99,
+            owner,
+            column_id: None,
+            column_name: "s".to_string(),
+            data_type: DataType::Utf8,
+            version: 1,
+            // Built for snapshot 7.
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: Some(7),
+                schema_id: 1,
+            },
+            values: vec![DictionaryValue {
+                id: 1,
+                bytes: b"a".to_vec(),
+            }],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        };
+        state
+            .dictionary_manager
+            .upsert_snapshot(&state, snapshot)
+            .expect("upsert iceberg snapshot");
+
+        let iceberg = IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            // Table has since advanced to snapshot 8 (e.g. an INSERT committed).
+            current_snapshot_id: Some(8),
+            schema_id: 1,
+            location: "file:///tmp/test_table".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        };
+        let table = TableDef {
+            name: "test_table".to_string(),
+            columns: vec![ColumnDef {
+                name: "s".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg,
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+            },
+        };
+
+        let provider = DictionaryQueryProvider::new(state);
+        let loaded = provider
+            .load_active_snapshot(&table, "test_db", "s")
+            .expect("load_active_snapshot returns Ok");
+        assert!(
+            loaded.is_none(),
+            "dict built for snapshot 7 must be stale once the table advances to snapshot 8",
+        );
     }
 }
