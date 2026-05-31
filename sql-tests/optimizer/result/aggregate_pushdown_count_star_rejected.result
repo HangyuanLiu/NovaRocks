@@ -8,8 +8,10 @@ PROJECT [count() AS count(*)] stats={rows=1}
              TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a
              columns: k
              min-max stats
+             predicates: a.k IS NOT NULL
         GATHER EXCHANGE stats={rows=100000}
           SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b (alias=b) stats={rows=100000}
                TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b
                columns: k
                min-max stats
+               predicates: b.k IS NOT NULL

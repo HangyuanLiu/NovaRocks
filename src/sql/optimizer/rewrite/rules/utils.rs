@@ -684,6 +684,109 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
     }
 }
 
+/// One equi-join key pair, with operands oriented so `left` comes from the
+/// join's left child and `right` from the right child. Operands are the
+/// unwrapped inner `ColumnRef` (Cast/Nested peeled).
+#[derive(Debug)]
+pub(crate) struct JoinEquiKey {
+    pub(crate) left: TypedExpr,
+    pub(crate) right: TypedExpr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+/// Peel `Cast` / `Nested` wrappers and return the inner `ColumnRef` expr, if any.
+fn unwrap_column_ref(expr: &TypedExpr) -> Option<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::ColumnRef { .. } => Some(expr),
+        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => unwrap_column_ref(expr),
+        _ => None,
+    }
+}
+
+/// Classify a join-condition operand as left/right child column, returning the
+/// unwrapped inner `ColumnRef` clone. `None` if it is not a column unambiguously
+/// owned by exactly one side (constants, expressions, ambiguous self-join refs).
+fn classify_operand(
+    expr: &TypedExpr,
+    left_cols: &HashSet<QualifiedRef>,
+    right_cols: &HashSet<QualifiedRef>,
+) -> Option<(JoinSide, TypedExpr)> {
+    let inner = unwrap_column_ref(expr)?;
+    let ExprKind::ColumnRef {
+        qualifier, column, ..
+    } = &inner.kind
+    else {
+        unreachable!("unwrap_column_ref only returns a ColumnRef expression");
+    };
+    let key = (
+        qualifier.as_ref().map(|q| q.to_lowercase()),
+        column.to_lowercase(),
+    );
+    match (left_cols.contains(&key), right_cols.contains(&key)) {
+        (true, false) => Some((JoinSide::Left, inner.clone())),
+        (false, true) => Some((JoinSide::Right, inner.clone())),
+        _ => None,
+    }
+}
+
+/// Extract equi-join key pairs from a join's ON condition (lenient: walks the
+/// top-level AND chain and keeps every `col = col` conjunct it can orient,
+/// ignoring other conjuncts). Returns empty when there is no usable equi key.
+pub(crate) fn join_equi_keys(join: &JoinNode) -> Vec<JoinEquiKey> {
+    let Some(condition) = join.condition.as_ref() else {
+        return Vec::new();
+    };
+    let left_cols = collect_qualified_output_columns(&join.left);
+    let right_cols = collect_qualified_output_columns(&join.right);
+    let mut keys = Vec::new();
+    collect_join_equi_keys(condition, &left_cols, &right_cols, &mut keys);
+    keys
+}
+
+fn collect_join_equi_keys(
+    expr: &TypedExpr,
+    left_cols: &HashSet<QualifiedRef>,
+    right_cols: &HashSet<QualifiedRef>,
+    keys: &mut Vec<JoinEquiKey>,
+) {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_join_equi_keys(left, left_cols, right_cols, keys);
+            collect_join_equi_keys(right, left_cols, right_cols, keys);
+        }
+        // Only strict `Eq`. `EqForNull` (<=>) is null-safe (NULL <=> NULL is
+        // true), so deriving IS NOT NULL on its operands would change results;
+        // it is intentionally excluded (matches StarRocks `isEqual()`).
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => match (
+            classify_operand(left, left_cols, right_cols),
+            classify_operand(right, left_cols, right_cols),
+        ) {
+            (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
+            | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
+                keys.push(JoinEquiKey {
+                    left: le,
+                    right: re,
+                });
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod column_id_helper_tests {
     use super::*;
@@ -941,5 +1044,191 @@ mod column_id_helper_tests {
 
         let ordered = collect_output_ids_ordered(&plan);
         assert_eq!(ordered, vec![real_id], "UNSET items must be filtered out");
+    }
+
+    // ---------------------------------------------------------------------
+    // join_equi_keys tests
+    // ---------------------------------------------------------------------
+
+    fn nullable_scan(alias: &str, table: &str, cols: &[(&str, u32)]) -> LogicalPlan {
+        let column_defs = cols
+            .iter()
+            .map(|(name, _)| ColumnDef {
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect();
+        let output = cols
+            .iter()
+            .map(|(name, id)| OutputColumn {
+                column_id: ColumnId::new_for_test(*id),
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                is_internal: false,
+            })
+            .collect();
+        LogicalPlan::Scan(ScanNode {
+            database: "default".to_string(),
+            table: TableDef {
+                name: table.to_string(),
+                columns: column_defs,
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: Some(alias.to_string()),
+            columns: output,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            required_output_columns: None,
+        })
+    }
+
+    fn qcol(qualifier: &str, name: &str, id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some(qualifier.to_string()),
+                column: name.to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: true,
+        }
+    }
+
+    fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: crate::sql::analysis::BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: crate::sql::analysis::BinOp::And,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn two_table_join(condition: Option<TypedExpr>) -> JoinNode {
+        JoinNode {
+            left: Box::new(nullable_scan("l", "tl", &[("a", 1), ("a2", 3)])),
+            right: Box::new(nullable_scan("r", "tr", &[("b", 2), ("b2", 4)])),
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            condition,
+            required_output_columns: None,
+        }
+    }
+
+    #[test]
+    fn join_equi_keys_extracts_single_pair_oriented_left_right() {
+        let join = two_table_join(Some(eq_expr(qcol("l", "a", 1), qcol("r", "b", 2))));
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        // left operand belongs to join.left, right operand to join.right.
+        assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
+        assert!(matches!(&keys[0].right.kind, ExprKind::ColumnRef { column, .. } if column == "b"));
+    }
+
+    #[test]
+    fn join_equi_keys_orients_reversed_pair() {
+        // r.b = l.a  -> still left=a, right=b
+        let join = two_table_join(Some(eq_expr(qcol("r", "b", 2), qcol("l", "a", 1))));
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
+        assert!(matches!(&keys[0].right.kind, ExprKind::ColumnRef { column, .. } if column == "b"));
+    }
+
+    #[test]
+    fn join_equi_keys_collects_each_and_conjunct() {
+        let join = two_table_join(Some(and_expr(
+            eq_expr(qcol("l", "a", 1), qcol("r", "b", 2)),
+            eq_expr(qcol("l", "a2", 3), qcol("r", "b2", 4)),
+        )));
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn join_equi_keys_skips_non_equi_and_missing_condition() {
+        assert!(join_equi_keys(&two_table_join(None)).is_empty());
+        let gt = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qcol("l", "a", 1)),
+                op: crate::sql::analysis::BinOp::Gt,
+                right: Box::new(qcol("r", "b", 2)),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        };
+        assert!(join_equi_keys(&two_table_join(Some(gt))).is_empty());
+    }
+
+    #[test]
+    fn join_equi_keys_peels_cast_wrapper() {
+        let cast_col = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(qcol("l", "a", 1)),
+                target: DataType::Int64,
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let join = two_table_join(Some(eq_expr(cast_col, qcol("r", "b", 2))));
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
+    }
+
+    #[test]
+    fn join_equi_keys_excludes_null_safe_eq() {
+        let cond = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qcol("l", "a", 1)),
+                op: crate::sql::analysis::BinOp::EqForNull,
+                right: Box::new(qcol("r", "b", 2)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        assert!(join_equi_keys(&two_table_join(Some(cond))).is_empty());
+    }
+
+    #[test]
+    fn join_equi_keys_disambiguates_self_join_by_qualifier() {
+        // q22 shape: same column name on both sides, distinct aliases.
+        let join = JoinNode {
+            left: Box::new(nullable_scan("a", "t", &[("k", 1)])),
+            right: Box::new(nullable_scan("b", "t", &[("k", 2)])),
+            join_type: crate::sql::analysis::JoinKind::LeftSemi,
+            condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
+            required_output_columns: None,
+        };
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        assert!(
+            matches!(&keys[0].left.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "a")
+        );
+        assert!(
+            matches!(&keys[0].right.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "b")
+        );
     }
 }

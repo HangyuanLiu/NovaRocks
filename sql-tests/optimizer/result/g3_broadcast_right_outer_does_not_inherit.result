@@ -7,6 +7,10 @@ GATHER EXCHANGE stats={rows=1000000000}
           HASH JOIN (BROADCAST, RIGHT OUTER, eq: [a.k = b.k]) stats={rows=1000000000}
             SCAN db_sqlt_570a7facce59396a.g3_ro_left (alias=a) stats={rows=100000}
                  TABLE: db_sqlt_570a7facce59396a.g3_ro_left
+                 columns: k, v
+                 min-max stats
             GATHER EXCHANGE stats={rows=100000}
               SCAN db_sqlt_570a7facce59396a.g3_ro_right (alias=b) stats={rows=100000}
                    TABLE: db_sqlt_570a7facce59396a.g3_ro_right
+                   columns: k, w
+                   min-max stats
