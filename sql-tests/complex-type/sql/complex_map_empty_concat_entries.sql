@@ -10,7 +10,8 @@
 CREATE TABLE ${case_db}.test_map (
     col_int INT,
     col_map MAP<VARCHAR(50), INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.test_map VALUES
     (1, map{"a":1,"b":2}),

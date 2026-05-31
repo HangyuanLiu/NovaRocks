@@ -54,12 +54,8 @@ CREATE TABLE arrays_zip_test (
   single_element_array Array<BigInt>,
   large_array Array<String>,
   decimal_array Array<DECIMAL(10, 2)>
-) ENGINE=OLAP
-DUPLICATE KEY(`pk`)
-DISTRIBUTED BY HASH(`pk`) BUCKETS 3
-PROPERTIES (
-  "replication_num" = "1"
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true

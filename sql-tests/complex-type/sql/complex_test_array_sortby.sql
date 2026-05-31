@@ -17,7 +17,8 @@ CREATE TABLE t1 (
     array_col2 ARRAY<DOUBLE>,
     array_col3 ARRAY<VARCHAR(20)>,
     array_col4 ARRAY<DATE>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
@@ -52,7 +53,8 @@ select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 
 USE ${case_db};
 CREATE TABLE __row_util_base (
   k1 bigint NULL
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 8
 -- @skip_result_check=true
@@ -72,7 +74,8 @@ insert into __row_util_base select * from __row_util_base; -- 640000
 CREATE TABLE __row_util (
   idx bigint NULL,
   array_c1 ARRAY<INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 10
 -- @skip_result_check=true
@@ -93,7 +96,8 @@ CREATE TABLE t1 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 12
 -- @skip_result_check=true
@@ -156,7 +160,8 @@ CREATE TABLE t2 (
     int_2 ARRAY<INT>,
     str_1 ARRAY<VARCHAR(20)>,
     date_1 ARRAY<DATE>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 18
 -- @skip_result_check=true
@@ -219,7 +224,8 @@ CREATE TABLE t3 (
     int_2 ARRAY<INT> not null,
     str_1 ARRAY<VARCHAR(20)> not null,
     date_1 ARRAY<DATE> not null
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 24
 -- @skip_result_check=true
@@ -377,7 +383,8 @@ CREATE TABLE test_array_sortby (
     array_datetime ARRAY<DATETIME>,
     array_date ARRAY<DATE>,
     array_json ARRAY<JSON>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 -- query 47
 -- @skip_result_check=true

@@ -15,7 +15,8 @@ CREATE TABLE ${case_db}.sc2 (
   `map2` MAP<INT, ARRAY<INT>> NULL,
   `map3` MAP<INT, STRUCT<c INT, b INT>> NULL,
   `st1` STRUCT<s1 int, s2 ARRAY<INT>, s3 MAP<INT, INT>, s4 Struct<e INT, f INT>>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 insert into ${case_db}.sc2 values (0, null, null, null, null, null, null, null, null);
 insert into ${case_db}.sc2 values (2, json_object("a", null), [1,3,2], [map{null:null}], [row(1, 2)], map{2:null}, map{2:[2,3,4], 1:[1,2,3]}, map{2:row(2,4), 1:row(1,2)}, row(1, [2,1,3], map{2:2, 1:1}, null));

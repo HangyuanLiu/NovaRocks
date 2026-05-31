@@ -10,7 +10,8 @@
 CREATE TABLE ${case_db}.map_top_n (
     c1 INT,
     c2 MAP<VARCHAR(8), INT>
-);
+)
+TBLPROPERTIES ("format-version" = "3");
 
 INSERT INTO ${case_db}.map_top_n VALUES
     (1, map{"key1":1}),
