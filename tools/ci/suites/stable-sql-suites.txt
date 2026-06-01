@@ -11,6 +11,7 @@ set-op
 table-function
 runtime-filter
 low-cardinality
+low-cardinality-native
 complex-type-native
 complex-type
 function-native

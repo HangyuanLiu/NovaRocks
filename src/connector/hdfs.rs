@@ -47,6 +47,11 @@ pub struct HdfsScanConfig {
     /// Cached Iceberg table locations keyed by `table_id`, used to resolve incremental
     /// scan ranges that only carry `relative_path`.
     pub iceberg_table_locations: HashMap<crate::types::TTableId, String>,
+    /// Per-slot global dictionary encode maps (string bytes -> dict id) for
+    /// dict-encoded output columns. Empty for all non-dict scans. Injected into
+    /// the parquet format config in `execute_iter`; the reader reads the dict
+    /// column as Utf8 and encodes the strings to ids.
+    pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +174,7 @@ impl ScanOp for HdfsScanOp {
                 parquet_cfg.datacache = parquet_cfg
                     .datacache
                     .with_external_range_options(external_datacache.as_ref())?;
+                parquet_cfg.query_global_dicts = self.cfg.query_global_dicts.clone();
                 FileFormatConfig::Parquet(parquet_cfg)
             }
             FileFormatConfig::Orc(mut orc_cfg) => {
@@ -714,6 +720,7 @@ mod tests {
             format: None,
             object_store_config: None,
             iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
         };
         let op = HdfsScanOp::new(cfg);
 
@@ -761,6 +768,7 @@ mod tests {
             format: None,
             object_store_config: None,
             iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
         };
         let op = HdfsScanOp::new(cfg);
 
@@ -809,6 +817,7 @@ mod tests {
             format: None,
             object_store_config: None,
             iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
         };
         let op = HdfsScanOp::new(cfg);
 
@@ -840,6 +849,7 @@ mod tests {
             format: None,
             object_store_config: None,
             iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
         };
         let op = HdfsScanOp::new(cfg);
 
@@ -903,6 +913,7 @@ mod tests {
             format: None,
             object_store_config: None,
             iceberg_table_locations: std::collections::HashMap::new(),
+            query_global_dicts: Default::default(),
         };
         let op = HdfsScanOp::new(cfg);
 

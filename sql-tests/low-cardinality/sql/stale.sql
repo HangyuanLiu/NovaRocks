@@ -5,7 +5,7 @@ DROP TABLE IF EXISTS ${case_db}.dict_stale_t;
 CREATE TABLE ${case_db}.dict_stale_t (
   k INT,
   s STRING
-) DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1 PROPERTIES('replication_num' = '1');
+) TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.dict_stale_t VALUES (1, 'a'), (2, 'b');
 ANALYZE FULL TABLE ${case_db}.dict_stale_t;
 INSERT INTO ${case_db}.dict_stale_t VALUES (3, 'c');

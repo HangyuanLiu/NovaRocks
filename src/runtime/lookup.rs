@@ -327,6 +327,7 @@ pub(crate) fn execute_lookup_request(
             ),
             profile_label: None,
             iceberg_output_schema: None,
+            query_global_dicts: Default::default(),
         };
         let format = match scan_cfg.file_format {
             descriptors::THdfsFileFormat::PARQUET => FileFormatConfig::Parquet(parquet_cfg),

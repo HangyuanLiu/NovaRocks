@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
@@ -37,12 +36,13 @@ use crate::lower::layout::{
     layout_for_row_tuples, layout_from_slot_ids, slot_arrow_type_lookup,
     slot_display_name_from_desc,
 };
+use crate::lower::node::decode::build_scan_query_global_dicts;
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
-use crate::novarocks_logging::{debug, info, warn};
+use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::{descriptors, internal_service, plan_nodes, runtime_filter, types};
@@ -666,45 +666,6 @@ fn normalize_optional_table_name(name: &str, unknown_sentinel: &str) -> Option<S
     } else {
         Some(trimmed.to_string())
     }
-}
-
-type ScanQueryGlobalDicts = HashMap<SlotId, Arc<HashMap<Vec<u8>, i32>>>;
-
-fn build_scan_query_global_dicts(
-    output_slots: &[SlotId],
-    query_global_dict_map: &QueryGlobalDictMap,
-) -> Result<ScanQueryGlobalDicts, String> {
-    let mut out = HashMap::new();
-    for slot_id in output_slots {
-        let raw_slot_id = i32::try_from(slot_id.as_u32()).map_err(|_| {
-            format!(
-                "slot id out of i32 range for query global dict: {}",
-                slot_id
-            )
-        })?;
-        let Some(dict_values) = query_global_dict_map.get(&raw_slot_id) else {
-            continue;
-        };
-        let mut value_to_id = HashMap::with_capacity(dict_values.len());
-        for (id, value) in dict_values.iter() {
-            if let Some(existing) = value_to_id.insert(value.clone(), *id)
-                && existing != *id
-            {
-                return Err(format!(
-                    "query global dict has duplicated string with different ids: slot_id={}, existing_id={}, new_id={}",
-                    slot_id, existing, id
-                ));
-            }
-        }
-        out.insert(*slot_id, Arc::new(value_to_id));
-    }
-    if !out.is_empty() {
-        info!(
-            "LAKE_SCAN query global dict enabled for slots={:?}",
-            out.keys().collect::<Vec<_>>()
-        );
-    }
-    Ok(out)
 }
 
 pub(crate) fn build_lake_properties(

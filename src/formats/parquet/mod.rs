@@ -208,6 +208,10 @@ pub struct ParquetScanConfig {
     pub cache_policy: ParquetReadCachePolicy,
     pub profile_label: Option<String>,
     pub iceberg_output_schema: Option<SchemaRef>,
+    /// Per-slot global dictionary encode maps. Non-empty only for dict-encoded
+    /// scans. When set, the iterator reads the dict columns as Utf8 and maps
+    /// them to Int32 dict ids.
+    pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,7 +265,7 @@ pub fn build_parquet_iter(
         limit,
         profile,
         runtime_filters,
-    );
+    )?;
     Ok(Box::new(iter))
 }
 
@@ -348,6 +352,8 @@ struct ParquetScanIter {
     limit: Option<usize>,
     profile: Option<RuntimeProfile>,
     runtime_filters: Option<RuntimeFilterContext>,
+    scan_read_chunk_schema: ChunkSchemaRef,
+    has_dict_encoded_output: bool,
 }
 
 impl ParquetScanIter {
@@ -479,9 +485,30 @@ impl ParquetScanIter {
         limit: Option<usize>,
         profile: Option<RuntimeProfile>,
         runtime_filters: Option<RuntimeFilterContext>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let remaining = limit.unwrap_or(usize::MAX);
-        Self {
+        let (scan_read_chunk_schema, has_dict_encoded_output) = if cfg.query_global_dicts.is_empty()
+        {
+            (cfg.chunk_schema.clone(), false)
+        } else {
+            let out_arrow = cfg.chunk_schema.arrow_schema_ref();
+            let (scan_arrow, has_dict) =
+                crate::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
+                    &out_arrow,
+                    &cfg.chunk_schema,
+                    &cfg.query_global_dicts,
+                )?;
+            if has_dict {
+                let scan_chunk = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                    scan_arrow.as_ref(),
+                    cfg.chunk_schema.slot_ids(),
+                )?;
+                (scan_chunk, true)
+            } else {
+                (cfg.chunk_schema.clone(), false)
+            }
+        };
+        Ok(Self {
             cfg,
             ranges,
             factory,
@@ -491,7 +518,9 @@ impl ParquetScanIter {
             limit,
             profile,
             runtime_filters,
-        }
+            scan_read_chunk_schema,
+            has_dict_encoded_output,
+        })
     }
 
     fn maybe_build_delayed_reader(
@@ -984,8 +1013,21 @@ impl Iterator for ParquetScanIter {
                     }
                     let batch = match reorder_batch(&self.cfg, batch)
                         .and_then(|b| convert_variant_columns(&self.cfg, b))
-                        .and_then(|b| normalize_batch_to_chunk_schema(b, &self.cfg.chunk_schema))
-                    {
+                        .and_then(|b| {
+                            normalize_batch_to_chunk_schema(b, &self.scan_read_chunk_schema)
+                        })
+                        .and_then(|b| {
+                            if self.has_dict_encoded_output {
+                                crate::exec::dict_encode::encode_batch_with_query_global_dicts(
+                                    b,
+                                    &self.cfg.chunk_schema.arrow_schema_ref(),
+                                    &self.cfg.chunk_schema,
+                                    &self.cfg.query_global_dicts,
+                                )
+                            } else {
+                                Ok(b)
+                            }
+                        }) {
                         Ok(batch) => batch,
                         Err(e) => return Some(Err(e)),
                     };
@@ -2224,7 +2266,70 @@ mod tests {
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: None,
             iceberg_output_schema: iceberg_output_schema.map(Arc::new),
+            query_global_dicts: Default::default(),
         }
+    }
+
+    #[test]
+    fn parquet_scan_iter_encodes_dict_columns_utf8_to_int32() {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use crate::exec::dict_encode::QueryGlobalDictEncodeMap;
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field};
+        use arrow::record_batch::RecordBatch;
+        use std::collections::HashMap;
+
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(7),
+                Field::new("s", DataType::Int32, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let mut dict_values = HashMap::new();
+        dict_values.insert(b"a".to_vec(), 11);
+        let mut dicts = QueryGlobalDictEncodeMap::new();
+        dicts.insert(SlotId::new(7), Arc::new(dict_values));
+
+        // 1) scan-read schema must rewrite the Int32 dict slot to Utf8:
+        let out_arrow = chunk_schema.arrow_schema_ref();
+        let (scan_arrow, changed) =
+            crate::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
+                &out_arrow,
+                &chunk_schema,
+                &dicts,
+            )
+            .expect("scan schema");
+        assert!(changed);
+        assert_eq!(scan_arrow.field(0).data_type(), &DataType::Utf8);
+
+        // 2) encode Utf8 -> Int32 ids:
+        let scan_batch = RecordBatch::try_new(
+            scan_arrow,
+            vec![Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("z"),
+                None,
+            ]))],
+        )
+        .expect("scan batch");
+        let encoded = crate::exec::dict_encode::encode_batch_with_query_global_dicts(
+            scan_batch,
+            &out_arrow,
+            &chunk_schema,
+            &dicts,
+        )
+        .expect("encode");
+        let ids = encoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32");
+        assert_eq!(ids.value(0), 11);
+        assert_eq!(ids.value(1), 0); // dict miss -> 0
+        assert!(ids.is_null(2));
     }
 
     fn read_single_batch(cfg: ParquetScanConfig, path: &Path) -> arrow::record_batch::RecordBatch {

@@ -36,6 +36,7 @@ use crate::lower::layout::{
     Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
     layout_from_slot_ids,
 };
+use crate::lower::node::decode::{QueryGlobalDictMap, build_scan_query_global_dicts};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::novarocks_config::config as novarocks_app_config;
@@ -351,6 +352,7 @@ pub(crate) fn lower_hdfs_scan_node(
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
     query_opts: Option<&internal_service::TQueryOptions>,
     connectors: &ConnectorRegistry,
+    query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
@@ -1136,6 +1138,31 @@ pub(crate) fn lower_hdfs_scan_node(
             });
         }
     }
+    // Build the per-slot dict encode map up front. iceberg/HDFS dict columns
+    // are declared Int32 in the chunk/tuple schema but stored as Utf8 strings;
+    // the parquet reader reads them as Utf8 and encodes Utf8 -> Int32 dict ids.
+    // The iceberg schema-evolution alignment (`align_batch_to_iceberg_schema`,
+    // driven by `iceberg_output_schema`) casts every projected column to its
+    // target type, so a dict column MUST carry its Utf8 scan-read type there or
+    // the align would cast Utf8 -> Int32 and null everything out. Rewrite the
+    // dict columns in `iceberg_projected_columns` to their scan-read type before
+    // building `iceberg_output_schema`. `parquet_chunk_schema` below keeps the
+    // Int32 output type on purpose — it is the post-encode output layout that
+    // `encode_batch_with_query_global_dicts` produces.
+    let query_global_dicts = build_scan_query_global_dicts(&data_slot_ids, query_global_dict_map)?;
+    if !query_global_dicts.is_empty() {
+        for (col, slot_id) in iceberg_projected_columns
+            .iter_mut()
+            .zip(data_slot_ids.iter())
+        {
+            if query_global_dicts.contains_key(slot_id)
+                && let Some(scan_ty) =
+                    crate::exec::dict_encode::dict_scan_data_type_for_output(&col.data_type)
+            {
+                col.data_type = scan_ty;
+            }
+        }
+    }
     let iceberg_output_schema = iceberg_table
         .as_ref()
         .map(|iceberg| build_projected_output_schema(iceberg, &iceberg_projected_columns))
@@ -1166,6 +1193,7 @@ pub(crate) fn lower_hdfs_scan_node(
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         iceberg_output_schema,
+        query_global_dicts: Default::default(),
     };
     let orc_cfg = OrcScanConfig {
         columns: parquet_cfg.columns.clone(),
@@ -1203,6 +1231,7 @@ pub(crate) fn lower_hdfs_scan_node(
         format,
         object_store_config: object_store_config.clone(),
         iceberg_table_locations,
+        query_global_dicts,
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(

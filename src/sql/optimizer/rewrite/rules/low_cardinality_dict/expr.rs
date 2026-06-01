@@ -199,3 +199,101 @@ pub(crate) fn expr_references_string_column(expr: &TypedExpr, scope: &DictScope)
         ExprKind::Lambda { body, .. } => expr_references_string_column(body, scope),
     }
 }
+
+/// Collect (lowercased) names of every column referenced anywhere in
+/// `expr`. Exhaustive over all `ExprKind` variants (mirrors the recursion
+/// of `expr_references_string_column`). Used by the collector's
+/// blocklist walk to discover which columns a node consumes in an unsafe
+/// position (i.e. one the rewriter does not retarget to the dict slot).
+pub(crate) fn collect_all_columns(expr: &TypedExpr, out: &mut std::collections::BTreeSet<String>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column, .. } => {
+            out.insert(column.to_ascii_lowercase());
+        }
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_all_columns(left, out);
+            collect_all_columns(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. } => collect_all_columns(expr, out),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                collect_all_columns(a, out);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => collect_all_columns(body, out),
+        ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
+            collect_all_columns(expr, out)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_all_columns(expr, out);
+            for e in list {
+                collect_all_columns(e, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_all_columns(expr, out);
+            collect_all_columns(low, out);
+            collect_all_columns(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_all_columns(expr, out);
+            collect_all_columns(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(e) = operand.as_deref() {
+                collect_all_columns(e, out);
+            }
+            for (w, t) in when_then {
+                collect_all_columns(w, out);
+                collect_all_columns(t, out);
+            }
+            if let Some(e) = else_expr.as_deref() {
+                collect_all_columns(e, out);
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } | ExprKind::Nested(expr) => {
+            collect_all_columns(expr, out)
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for e in args {
+                collect_all_columns(e, out);
+            }
+            for e in partition_by {
+                collect_all_columns(e, out);
+            }
+            for s in order_by {
+                collect_all_columns(&s.expr, out);
+            }
+        }
+        ExprKind::Lambda { body, .. } => collect_all_columns(body, out),
+    }
+}
+
+/// Collect column names referenced by `expr` ONLY when they appear nested
+/// inside a compound expression. A bare top-level `ColumnRef` contributes
+/// nothing (it merely propagates the dict slot, a safe position), but
+/// `f(col)` / `col + 1` / `col = x` contribute their columns (the column
+/// is consumed by an operator the rewriter cannot run on dict ids).
+pub(crate) fn collect_nested_columns(
+    expr: &TypedExpr,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    if matches!(expr.kind, ExprKind::ColumnRef { .. }) {
+        return;
+    }
+    collect_all_columns(expr, out);
+}

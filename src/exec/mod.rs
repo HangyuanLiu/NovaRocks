@@ -16,6 +16,7 @@
 // under the License.
 pub mod change_op;
 pub mod chunk;
+pub mod dict_encode;
 pub mod expr;
 pub mod hash_table;
 pub mod node;
