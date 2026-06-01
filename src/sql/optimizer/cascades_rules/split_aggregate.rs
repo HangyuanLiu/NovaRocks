@@ -1,4 +1,6 @@
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
@@ -27,24 +29,30 @@ impl Rule for SplitAggregateRule {
             return Vec::new();
         }
 
+        let local_output_columns = local_output_columns(agg);
+        let local_group_by =
+            aggregate_group_key_output_ref(&local_output_columns, agg.group_by.len());
         let local = LogicalAggregateOp::staged(
             AggStage::Local,
             agg.group_by.clone(),
             agg.aggregates.clone(),
-            agg.output_columns.clone(),
+            local_output_columns,
             vec![false; agg.aggregates.len()],
             true,
         );
-        let local_id = memo.next_expr_id();
-        let local_group = memo.new_group(MExpr {
-            id: local_id,
-            op: Operator::LogicalAggregate(local),
-            children: expr.children.clone(),
-        });
-        let global_group_by = aggregate_group_key_output_ref(&agg.group_by, &agg.output_columns);
+        let local_op = Operator::LogicalAggregate(local);
+        let local_group = find_existing_logical_group(memo, &local_op, &expr.children)
+            .unwrap_or_else(|| {
+                let local_id = memo.next_expr_id();
+                memo.new_group(MExpr {
+                    id: local_id,
+                    op: local_op,
+                    children: expr.children.clone(),
+                })
+            });
         let global = LogicalAggregateOp::staged(
             AggStage::Global,
-            global_group_by,
+            local_group_by,
             agg.aggregates.clone(),
             agg.output_columns.clone(),
             vec![true; agg.aggregates.len()],
@@ -75,14 +83,51 @@ fn is_splittable_aggregate(call: &AggregateCall) -> bool {
         )
 }
 
+fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
+    let mut columns = Vec::with_capacity(agg.group_by.len() + agg.aggregates.len());
+    columns.extend(agg.group_by.iter().map(|expr| {
+        let name = typed_expr_display_name(expr);
+        OutputColumn {
+            column_id: group_key_output_column_id(expr, &name, &agg.output_columns),
+            name,
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            is_internal: false,
+        }
+    }));
+    columns.extend(agg.aggregates.iter().map(|call| OutputColumn {
+        column_id: ColumnId::UNSET,
+        name: agg_call_display_name(call),
+        data_type: call.result_type.clone(),
+        nullable: true,
+        is_internal: true,
+    }));
+    columns
+}
+
+fn group_key_output_column_id(
+    expr: &TypedExpr,
+    display_name: &str,
+    existing_outputs: &[OutputColumn],
+) -> ColumnId {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => existing_outputs
+            .iter()
+            .find(|output| output.name == display_name)
+            .map(|output| output.column_id)
+            .unwrap_or(ColumnId::UNSET),
+    }
+}
+
 fn aggregate_group_key_output_ref(
-    group_by: &[TypedExpr],
-    output_columns: &[OutputColumn],
+    local_output_columns: &[OutputColumn],
+    group_by_len: usize,
 ) -> Vec<TypedExpr> {
-    group_by
+    local_output_columns
         .iter()
-        .zip(output_columns.iter())
-        .map(|(_, output)| TypedExpr {
+        .take(group_by_len)
+        .map(|output| TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: output.column_id,
                 qualifier: None,
@@ -92,6 +137,16 @@ fn aggregate_group_key_output_ref(
             nullable: output.nullable,
         })
         .collect()
+}
+
+fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
+    let op_debug = format!("{op:?}");
+    memo.groups.iter().position(|group| {
+        group
+            .logical_exprs
+            .iter()
+            .any(|expr| expr.children == children && format!("{:?}", expr.op) == op_debug)
+    })
 }
 
 #[cfg(test)]
@@ -164,6 +219,19 @@ mod tests {
         }
     }
 
+    fn select_order_grouped_expr(memo: &mut Memo) -> MExpr {
+        let child = values_group(memo);
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col_ref(1, "k")],
+                vec![count_call(false)],
+                vec![output_column(3, "count(v)"), output_column(1, "k")],
+            )),
+            children: vec![child],
+        }
+    }
+
     fn single_scalar_expr(memo: &mut Memo) -> MExpr {
         let child = values_group(memo);
         MExpr {
@@ -190,7 +258,7 @@ mod tests {
         assert_eq!(global.is_merge, vec![true]);
         assert!(global.is_split);
         assert_eq!(global.group_by.len(), 1);
-        assert!(!global.group_by[0].nullable);
+        assert!(global.group_by[0].nullable);
         assert_eq!(out[0].children.len(), 1);
         let local_group_id = out[0].children[0];
         let local_group = &memo.groups[local_group_id];
@@ -201,6 +269,41 @@ mod tests {
         assert_eq!(local.stage, AggStage::Local);
         assert_eq!(local.is_merge, vec![false]);
         assert!(local.is_split);
+    }
+
+    #[test]
+    fn split_global_group_by_uses_local_group_key_layout_not_select_order_output() {
+        let mut memo = Memo::new();
+        let expr = select_order_grouped_expr(&mut memo);
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::LogicalAggregate(global) = &out[0].op else {
+            panic!("expected global aggregate");
+        };
+        assert_eq!(global.group_by.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &global.group_by[0].kind
+        else {
+            panic!("expected global group key column ref");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(1));
+        assert_eq!(column, "t.k");
+    }
+
+    #[test]
+    fn repeated_apply_reuses_existing_local_group() {
+        let mut memo = Memo::new();
+        let expr = single_grouped_expr(&mut memo);
+        let first = SplitAggregateRule.apply(&expr, &mut memo);
+        assert_eq!(first.len(), 1);
+        let first_local_group = first[0].children[0];
+        let group_count_after_first = memo.groups.len();
+
+        let second = SplitAggregateRule.apply(&expr, &mut memo);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].children[0], first_local_group);
+        assert_eq!(memo.groups.len(), group_count_after_first);
     }
 
     #[test]
