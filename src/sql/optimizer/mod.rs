@@ -343,6 +343,11 @@ mod is_known_rule_name_tests {
     }
 
     #[test]
+    fn is_known_rule_name_recognizes_split_aggregate_rule() {
+        assert!(is_known_rule_name("SplitAggregateRule"));
+    }
+
+    #[test]
     fn is_known_rule_name_rejects_typos() {
         assert!(!is_known_rule_name("TotallyNotARealRule"));
         assert!(!is_known_rule_name(""));
