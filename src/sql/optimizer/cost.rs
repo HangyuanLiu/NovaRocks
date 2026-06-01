@@ -268,6 +268,53 @@ mod tests {
     }
 
     #[test]
+    fn split_agg_total_cost_can_win_or_lose_after_exchange_cost() {
+        use crate::sql::optimizer::property::DistributionSpec;
+
+        let single = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Single,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let local = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let global = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Global,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let gather = Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::Gather,
+        });
+
+        let large_input = stats(1_000_000.0, 100.0);
+        let reduced_rows = stats(100.0, 16.0);
+        let final_rows = stats(100.0, 16.0);
+        let single_large_cost = compute_cost(&single, &final_rows, &[&large_input]);
+        let split_large_cost = compute_cost(&local, &reduced_rows, &[&large_input])
+            + compute_cost(&gather, &reduced_rows, &[])
+            + compute_cost(&global, &final_rows, &[&reduced_rows]);
+        assert!(split_large_cost < single_large_cost);
+
+        let small_input = stats(10.0, 8.0);
+        let unreduced_rows = stats(10.0, 8.0);
+        let single_small_cost = compute_cost(&single, &unreduced_rows, &[&small_input]);
+        let split_small_cost = compute_cost(&local, &unreduced_rows, &[&small_input])
+            + compute_cost(&gather, &unreduced_rows, &[])
+            + compute_cost(&global, &unreduced_rows, &[&unreduced_rows]);
+        assert!(single_small_cost < split_small_cost);
+    }
+
+    #[test]
     fn sort_cost_nlogn() {
         let s = stats(1024.0, 10.0);
         let op = Operator::PhysicalSort(PhysicalSortOp {
