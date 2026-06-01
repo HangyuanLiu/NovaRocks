@@ -49,10 +49,10 @@ impl SchemaCache {
         // Fast path: read lock, check hit + schema_id match.
         {
             let guard = self.entries.read().expect("schema cache read lock");
-            if let Some(entry) = guard.get(id) {
-                if entry.schema_id == current_schema_id {
-                    return Ok(entry.metadata.clone());
-                }
+            if let Some(entry) = guard.get(id)
+                && entry.schema_id == current_schema_id
+            {
+                return Ok(entry.metadata.clone());
             }
         }
         // Miss or stale: build without holding the lock.

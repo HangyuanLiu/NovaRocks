@@ -1,7 +1,7 @@
 //! `IcebergCatalog`: a `Catalog` over an Iceberg backend. Resolves schema-level
 //! metadata via the existing `CatalogBackend` + `TableSource` abstractions and
-//! caches it in a `SchemaCache`. Scan-binding (data files) is NOT resolved here
-//! - it happens at codegen time (P2). P1 passes `current_schema_id = None`
+//! caches it in a `SchemaCache`. Scan-binding (data files) is NOT resolved here;
+//! it happens at codegen time (P2). P1 passes `current_schema_id = None`
 //! (no remote schema probe yet); the probe is wired in P3.
 
 use std::sync::Arc;
