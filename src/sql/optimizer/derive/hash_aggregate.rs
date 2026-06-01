@@ -20,12 +20,16 @@ fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Vec<ColumnId> {
 
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        // For Local / Single the group_by may contain non-ColumnRef
+        if matches!(self.mode, AggMode::Local | AggMode::DistinctLocal) {
+            return PhysicalPropertySet::any();
+        }
+
+        // For Single / Global the group_by may contain non-ColumnRef
         // expressions (e.g. `GROUP BY mod(k, 2)`); reading the column id
         // from `output_columns` instead of the typed group_by exprs is the
-        // only way to recover the planner-minted ColumnId for those
-        // synthesised slots so the Local-emitted distribution matches what
-        // Global asks for. Mirrors the G1 fix that previously lived in
+        // only way to recover the planner-minted ColumnId for those synthetic
+        // slots so the emitted distribution matches downstream requirements.
+        // Mirrors the G1 fix that previously lived in
         // search.rs::output_properties.
         let cols: Vec<ColumnId> = self
             .output_columns
@@ -35,12 +39,7 @@ impl DeriveOutput for PhysicalHashAggregateOp {
             .filter(|id| *id != ColumnId::UNSET)
             .collect();
         if cols.is_empty() {
-            match self.mode {
-                AggMode::Local | AggMode::DistinctLocal => PhysicalPropertySet::any(),
-                AggMode::Single | AggMode::Global | AggMode::DistinctGlobal => {
-                    PhysicalPropertySet::gather()
-                }
-            }
+            PhysicalPropertySet::gather()
         } else {
             PhysicalPropertySet {
                 distribution: DistributionSpec::shuffle_agg(cols),
@@ -196,6 +195,37 @@ mod tests {
         };
         let props = op.derive_output(&[]);
         assert!(matches!(props.distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn local_grouped_aggregate_outputs_any_distribution() {
+        let col_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(7),
+                qualifier: None,
+                column: "k".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        };
+        for mode in [AggMode::Local, AggMode::DistinctLocal] {
+            let op = PhysicalHashAggregateOp {
+                mode,
+                group_by: vec![col_ref.clone()],
+                aggregates: vec![],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId(7),
+                    name: "k".into(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                is_merge: vec![],
+            };
+
+            let props = op.derive_output(&[]);
+            assert!(matches!(props.distribution, DistributionSpec::Any));
+        }
     }
 
     #[test]

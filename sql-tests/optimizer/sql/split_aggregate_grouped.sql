@@ -9,6 +9,7 @@ INSERT INTO ${case_db}.t_split_agg_grouped VALUES
 ANALYZE TABLE ${case_db}.t_split_agg_grouped;
 
 -- @explain_contains=HASH AGGREGATE (LOCAL
+-- @explain_contains=HASH EXCHANGE (source: ShuffleAgg
 -- @explain_contains=HASH AGGREGATE (GLOBAL
 SELECT k, SUM(v) AS s
 FROM ${case_db}.t_split_agg_grouped
