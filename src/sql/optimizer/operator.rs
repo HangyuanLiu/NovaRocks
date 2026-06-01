@@ -51,6 +51,23 @@ pub(crate) enum TopNPhase {
 // Logical operator structs
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggStage {
+    Single,
+    Local,
+    Global,
+}
+
+impl AggStage {
+    pub(crate) fn to_physical_mode(self) -> AggMode {
+        match self {
+            AggStage::Single => AggMode::Single,
+            AggStage::Local => AggMode::Local,
+            AggStage::Global => AggMode::Global,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalScanOp {
     pub database: String,
@@ -77,9 +94,49 @@ pub(crate) struct LogicalProjectOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalAggregateOp {
+    pub stage: AggStage,
     pub group_by: Vec<TypedExpr>,
     pub aggregates: Vec<AggregateCall>,
     pub output_columns: Vec<OutputColumn>,
+    pub is_merge: Vec<bool>,
+    pub is_split: bool,
+}
+
+impl LogicalAggregateOp {
+    pub(crate) fn single(
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+    ) -> Self {
+        let is_merge = vec![false; aggregates.len()];
+        Self {
+            stage: AggStage::Single,
+            group_by,
+            aggregates,
+            output_columns,
+            is_merge,
+            is_split: false,
+        }
+    }
+
+    pub(crate) fn staged(
+        stage: AggStage,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+        is_merge: Vec<bool>,
+        is_split: bool,
+    ) -> Self {
+        debug_assert_eq!(aggregates.len(), is_merge.len());
+        Self {
+            stage,
+            group_by,
+            aggregates,
+            output_columns,
+            is_merge,
+            is_split,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -474,5 +531,73 @@ impl Operator {
 
     pub(crate) fn is_physical(&self) -> bool {
         !self.is_logical()
+    }
+}
+
+#[cfg(test)]
+mod aggregate_stage_tests {
+    use super::*;
+    use crate::sql::analysis::{OutputColumn, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::AggregateCall;
+
+    fn output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn col_ref(id: u32, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some("t".to_string()),
+                column: name.to_string(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn count_call() -> AggregateCall {
+        AggregateCall {
+            name: "count".to_string(),
+            args: vec![col_ref(2, "v")],
+            distinct: false,
+            result_type: arrow::datatypes::DataType::Int64,
+            order_by: vec![],
+        }
+    }
+
+    #[test]
+    fn single_constructor_sets_unsplit_single_metadata() {
+        let op = LogicalAggregateOp::single(
+            vec![col_ref(1, "k")],
+            vec![count_call()],
+            vec![output_column(1, "k"), output_column(3, "count(v)")],
+        );
+        assert_eq!(op.stage, AggStage::Single);
+        assert_eq!(op.is_merge, vec![false]);
+        assert!(!op.is_split);
+    }
+
+    #[test]
+    fn staged_constructor_preserves_merge_flags_and_split_marker() {
+        let op = LogicalAggregateOp::staged(
+            AggStage::Global,
+            vec![col_ref(1, "k")],
+            vec![count_call()],
+            vec![output_column(1, "k"), output_column(3, "count(v)")],
+            vec![true],
+            true,
+        );
+        assert_eq!(op.stage, AggStage::Global);
+        assert_eq!(op.stage.to_physical_mode(), AggMode::Global);
+        assert_eq!(op.is_merge, vec![true]);
+        assert!(op.is_split);
     }
 }

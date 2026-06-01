@@ -802,6 +802,19 @@ impl Rule for AggToHashAgg {
             return vec![];
         };
 
+        if op.is_split || op.stage != AggStage::Single {
+            return vec![NewExpr {
+                op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                    mode: op.stage.to_physical_mode(),
+                    group_by: op.group_by.clone(),
+                    aggregates: op.aggregates.clone(),
+                    output_columns: op.output_columns.clone(),
+                    is_merge: op.is_merge.clone(),
+                }),
+                children: expr.children.clone(),
+            }];
+        }
+
         // Alternative 1: Single-phase aggregation (always applicable).
         let single = NewExpr {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -2040,16 +2053,16 @@ mod two_phase_agg_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("city")],
-                aggregates: vec![AggregateCall {
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("city")],
+                vec![AggregateCall {
                     name: "sum".into(),
                     args: vec![col("amount")],
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
                 }],
-                output_columns: vec![
+                vec![
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "city".into(),
@@ -2065,7 +2078,7 @@ mod two_phase_agg_tests {
                         is_internal: false,
                     },
                 ],
-            }),
+            )),
             children: vec![child_group],
         };
 
@@ -2121,16 +2134,16 @@ mod two_phase_agg_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("city")],
-                aggregates: vec![AggregateCall {
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("city")],
+                vec![AggregateCall {
                     name: "count".into(),
                     args: vec![col("id")],
                     distinct: true,
                     result_type: DataType::Int64,
                     order_by: vec![],
                 }],
-                output_columns: vec![
+                vec![
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "city".into(),
@@ -2146,7 +2159,7 @@ mod two_phase_agg_tests {
                         is_internal: false,
                     },
                 ],
-            }),
+            )),
             children: vec![child_group],
         };
 
@@ -2178,16 +2191,16 @@ mod two_phase_agg_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![group_expr.clone()],
-                aggregates: vec![AggregateCall {
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group_expr.clone()],
+                vec![AggregateCall {
                     name: "min".into(),
                     args: vec![col("amount")],
                     distinct: false,
                     result_type: DataType::Int32,
                     order_by: vec![],
                 }],
-                output_columns: vec![
+                vec![
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "city % 2".into(),
@@ -2203,7 +2216,7 @@ mod two_phase_agg_tests {
                         is_internal: false,
                     },
                 ],
-            }),
+            )),
             children: vec![child_group],
         };
 

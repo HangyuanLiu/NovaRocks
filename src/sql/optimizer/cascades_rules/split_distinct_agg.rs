@@ -416,21 +416,21 @@ mod tests {
 
     #[test]
     fn matches_when_any_distinct() {
-        let op = Operator::LogicalAggregate(LogicalAggregateOp {
-            group_by: vec![],
-            aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
-            output_columns: vec![],
-        });
+        let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
+            vec![],
+            vec![count_distinct("x"), sum_non_distinct("a")],
+            vec![],
+        ));
         assert!(SplitDistinctAgg.matches(&op));
     }
 
     #[test]
     fn does_not_match_when_no_distinct() {
-        let op = Operator::LogicalAggregate(LogicalAggregateOp {
-            group_by: vec![],
-            aggregates: vec![sum_non_distinct("a")],
-            output_columns: vec![],
-        });
+        let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
+            vec![],
+            vec![sum_non_distinct("a")],
+            vec![],
+        ));
         assert!(!SplitDistinctAgg.matches(&op));
     }
 
@@ -448,11 +448,11 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![],
-                aggregates: vec![two_arg],
-                output_columns: vec![],
-            }),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![two_arg],
+                vec![],
+            )),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -465,11 +465,11 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![],
-                aggregates: vec![count_distinct("a"), count_distinct("b")],
-                output_columns: vec![],
-            }),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![count_distinct("a"), count_distinct("b")],
+                vec![],
+            )),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -482,9 +482,9 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("g")],
-                aggregates: vec![
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("g")],
+                vec![
                     AggregateCall {
                         name: "array_agg".into(),
                         args: vec![col("name")],
@@ -502,8 +502,8 @@ mod tests {
                     },
                     count_distinct("name"),
                 ],
-                output_columns: vec![],
-            }),
+                vec![],
+            )),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -516,9 +516,9 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![],
-                aggregates: vec![
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![
                     count_distinct("x"),
                     AggregateCall {
                         name: "ds_hll_count_distinct".into(),
@@ -528,8 +528,8 @@ mod tests {
                         order_by: vec![],
                     },
                 ],
-                output_columns: vec![],
-            }),
+                vec![],
+            )),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -542,9 +542,9 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("g")],
-                aggregates: vec![AggregateCall {
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("g")],
+                vec![AggregateCall {
                     name: "array_agg".into(),
                     args: vec![col("name")],
                     distinct: true,
@@ -559,8 +559,8 @@ mod tests {
                         nulls_first: true,
                     }],
                 }],
-                output_columns: vec![],
-            }),
+                vec![],
+            )),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -594,10 +594,10 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("g")],
-                aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
-                output_columns: vec![
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("g")],
+                vec![count_distinct("x"), sum_non_distinct("a")],
+                vec![
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "g".into(),
@@ -620,7 +620,7 @@ mod tests {
                         is_internal: false,
                     },
                 ],
-            }),
+            )),
             children: vec![sg],
         };
         let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
@@ -671,15 +671,15 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![col("g")],
-                aggregates: vec![
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col("g")],
+                vec![
                     array_agg_distinct("x"),
                     count_distinct("x"),
                     sum_non_distinct("a"),
                 ],
-                output_columns: vec![],
-            }),
+                vec![],
+            )),
             children: vec![sg],
         };
 
@@ -707,10 +707,10 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: vec![],
-                aggregates: vec![count_distinct("x"), sum_non_distinct("a")],
-                output_columns: vec![
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![count_distinct("x"), sum_non_distinct("a")],
+                vec![
                     OutputColumn {
                         column_id: ColumnId::UNSET,
                         name: "count(distinct x)".into(),
@@ -726,7 +726,7 @@ mod tests {
                         is_internal: false,
                     },
                 ],
-            }),
+            )),
             children: vec![sg],
         };
         let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
