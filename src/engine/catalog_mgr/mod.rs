@@ -3,6 +3,7 @@
 
 pub(crate) mod catalog;
 pub(crate) mod metadata;
+pub(crate) mod schema_cache;
 
 use std::collections::HashMap;
 use std::sync::Arc;
