@@ -2,6 +2,7 @@
 //! docs/superpowers/specs/2026-06-01-connector-metadata-layer-design.md
 
 pub(crate) mod catalog;
+pub(crate) mod internal;
 pub(crate) mod metadata;
 pub(crate) mod schema_cache;
 
