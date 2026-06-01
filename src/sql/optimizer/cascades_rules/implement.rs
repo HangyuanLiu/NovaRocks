@@ -802,19 +802,6 @@ impl Rule for AggToHashAgg {
             return vec![];
         };
 
-        if op.is_split || op.stage != AggStage::Single {
-            return vec![NewExpr {
-                op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
-                    mode: op.stage.to_physical_mode(),
-                    group_by: op.group_by.clone(),
-                    aggregates: op.aggregates.clone(),
-                    output_columns: op.output_columns.clone(),
-                    is_merge: op.is_merge.clone(),
-                }),
-                children: expr.children.clone(),
-            }];
-        }
-
         // Alternative 1: Single-phase aggregation (always applicable).
         let single = NewExpr {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {

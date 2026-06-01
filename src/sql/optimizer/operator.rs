@@ -581,12 +581,15 @@ mod aggregate_stage_tests {
             vec![output_column(1, "k"), output_column(3, "count(v)")],
         );
         assert_eq!(op.stage, AggStage::Single);
+        assert_eq!(op.stage.to_physical_mode(), AggMode::Single);
         assert_eq!(op.is_merge, vec![false]);
         assert!(!op.is_split);
     }
 
     #[test]
     fn staged_constructor_preserves_merge_flags_and_split_marker() {
+        assert_eq!(AggStage::Local.to_physical_mode(), AggMode::Local);
+
         let op = LogicalAggregateOp::staged(
             AggStage::Global,
             vec![col_ref(1, "k")],
