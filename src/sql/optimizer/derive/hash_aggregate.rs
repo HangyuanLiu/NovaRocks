@@ -35,7 +35,12 @@ impl DeriveOutput for PhysicalHashAggregateOp {
             .filter(|id| *id != ColumnId::UNSET)
             .collect();
         if cols.is_empty() {
-            PhysicalPropertySet::gather()
+            match self.mode {
+                AggMode::Local | AggMode::DistinctLocal => PhysicalPropertySet::any(),
+                AggMode::Single | AggMode::Global | AggMode::DistinctGlobal => {
+                    PhysicalPropertySet::gather()
+                }
+            }
         } else {
             PhysicalPropertySet {
                 distribution: DistributionSpec::shuffle_agg(cols),
@@ -178,5 +183,52 @@ mod tests {
         let reqs = op.derive_required(&PhysicalPropertySet::gather(), 1);
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn local_scalar_aggregate_outputs_any_distribution() {
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let props = op.derive_output(&[]);
+        assert!(matches!(props.distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn global_scalar_aggregate_outputs_and_requires_gather() {
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::Global,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let out = op.derive_output(&[]);
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Gather));
+    }
+
+    #[test]
+    fn single_scalar_aggregate_keeps_gather_output_and_requirement() {
+        let op = PhysicalHashAggregateOp {
+            mode: AggMode::Single,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        };
+        let out = op.derive_output(&[]);
+        assert!(matches!(out.distribution, DistributionSpec::Gather));
+
+        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].distribution, DistributionSpec::Gather));
     }
 }
