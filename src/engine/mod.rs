@@ -35,6 +35,7 @@ use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
+pub(crate) mod catalog_mgr;
 pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_ref_flow;
