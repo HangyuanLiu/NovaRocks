@@ -1,7 +1,8 @@
 -- @tags=optimizer,aggregate_pushdown,negative
 -- Test Objective:
--- COUNT(*) must NOT be pushed; the plan should contain a single
--- top-level AGGREGATE with no partial AGGREGATE underneath the join.
+-- COUNT(*) must NOT be pushed underneath the join. OQ-4 may split the
+-- top aggregate into Local/Global stages, but both stages must stay above
+-- the join.
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_neg_a;
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_neg_b;
 CREATE TABLE ${case_db}.t_agg_pd_neg_a (k INT);

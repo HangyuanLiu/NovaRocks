@@ -2,8 +2,8 @@
 -- Test Objective:
 -- Verify SET disable_optimizer_rules = 'AggregatePushdown' suppresses
 -- the rewrite. Two EXPLAIN VERBOSE outputs around the SET must differ:
--- first has partial AGGREGATE under the join; second has a single top-level
--- AGGREGATE only.
+-- first has partial AGGREGATE under the join; second keeps the aggregate
+-- above the join. OQ-4 may split that top aggregate into Local/Global stages.
 -- Data design: 20 000 rows on the left, NDV(k) = 100. ANALYZE TABLE
 -- ensures the cost gate fires in the baseline (enabled) case.
 DROP TABLE IF EXISTS ${case_db}.t_agg_pd_dis_a;
@@ -26,7 +26,7 @@ GROUP BY a.k;
 
 SET disable_optimizer_rules = 'AggregatePushdown';
 
--- With AggregatePushdown disabled: single top-level AGGREGATE, no partial.
+-- With AggregatePushdown disabled: top aggregate only, no partial below join.
 EXPLAIN VERBOSE
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_dis_a a
