@@ -18,6 +18,7 @@
 - **Modify** `src/sql/optimizer/convert.rs` — analyzer plan 转 optimizer memo 时,所有普通聚合默认生成 `LogicalAggregateOp::single(...)`。
 - **Create** `src/sql/optimizer/cascades_rules/split_aggregate.rs` — 独立 transformation rule,负责 eligible check、group key output-ref 重写、Local/Global 逻辑节点构造和规则单元测试。
 - **Modify** `src/sql/optimizer/cascades_rules/mod.rs` — 注册 `split_aggregate` 模块,把 `SplitAggregateRule` 加入 transformation rules;保留 `SplitDistinctAgg` 在 implementation rules。
+- **Modify** `src/sql/optimizer/mod.rs` — 补 `is_known_rule_name("SplitAggregateRule")` 单元测试,保证 `disable_optimizer_rules` 能识别新 transformation rule 名。
 - **Modify** `src/sql/optimizer/cascades_rules/implement.rs` — 删除普通 SplitAgg physical alternative 生成逻辑;`AggToHashAgg` 只把当前 logical stage lowering 到一个 `PhysicalHashAggregateOp`。
 - **Modify** `src/sql/optimizer/cascades_rules/split_distinct_agg.rs` — 所有测试与 helper 使用新的 `LogicalAggregateOp::single(...)`;不改变 DISTINCT 多阶段 implementation 语义。
 - **Modify** `src/sql/optimizer/derive/hash_aggregate.rs` — `AggMode::Local` / `AggMode::DistinctLocal` 在 empty group key 时输出 `Any`,Single/Global/DistinctGlobal scalar 仍输出/要求 Gather。
@@ -46,12 +47,13 @@ Add this test module at the end of `src/sql/optimizer/operator.rs`:
 #[cfg(test)]
 mod aggregate_stage_tests {
     use super::*;
-    use crate::sql::analysis::{AggregateCall, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::AggregateCall;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId(id),
+            column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
@@ -62,7 +64,7 @@ mod aggregate_stage_tests {
     fn col_ref(id: u32, name: &str) -> TypedExpr {
         TypedExpr {
             kind: crate::sql::analysis::ExprKind::ColumnRef {
-                column_id: ColumnId(id),
+                column_id: ColumnId::new_for_test(id),
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
@@ -73,13 +75,11 @@ mod aggregate_stage_tests {
 
     fn count_call() -> AggregateCall {
         AggregateCall {
-            func: "count".to_string(),
+            name: "count".to_string(),
             args: vec![col_ref(2, "v")],
             distinct: false,
-            output_name: "count(v)".to_string(),
-            output_column_id: ColumnId(3),
-            return_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            result_type: arrow::datatypes::DataType::Int64,
+            order_by: vec![],
         }
     }
 
@@ -147,12 +147,12 @@ impl AggStage {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalAggregateOp {
-    pub(crate) stage: AggStage,
-    pub(crate) group_by: Vec<TypedExpr>,
-    pub(crate) aggregates: Vec<AggregateCall>,
-    pub(crate) output_columns: Vec<OutputColumn>,
-    pub(crate) is_merge: Vec<bool>,
-    pub(crate) is_split: bool,
+    pub stage: AggStage,
+    pub group_by: Vec<TypedExpr>,
+    pub aggregates: Vec<AggregateCall>,
+    pub output_columns: Vec<OutputColumn>,
+    pub is_merge: Vec<bool>,
+    pub is_split: bool,
 }
 
 impl LogicalAggregateOp {
@@ -199,9 +199,9 @@ In `src/sql/optimizer/convert.rs`, replace the aggregate operator construction:
 
 ```rust
 let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
-    agg.group_by,
-    agg.aggr_exprs,
-    agg.output_columns,
+    node.group_by.clone(),
+    node.aggregates.clone(),
+    node.output_columns.clone(),
 ));
 ```
 
@@ -253,28 +253,33 @@ git commit -m "OQ-4: add aggregate stage metadata"
 **Files:**
 - Create: `src/sql/optimizer/cascades_rules/split_aggregate.rs`
 - Modify: `src/sql/optimizer/cascades_rules/mod.rs`
+- Modify: `src/sql/optimizer/mod.rs`
 
 - [ ] **Step 1: Write failing unit tests for grouped, scalar, and guarded split**
 
 Create `src/sql/optimizer/cascades_rules/split_aggregate.rs` with this initial test-focused skeleton:
 
 ```rust
-use crate::sql::optimizer::cascades_rules::{Rule, RuleContext};
-use crate::sql::optimizer::memo::NewExpr;
+use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 pub(crate) struct SplitAggregateRule;
 
 impl Rule for SplitAggregateRule {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "SplitAggregateRule"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
     }
 
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(&self, _expr: &NewExpr, _ctx: &RuleContext) -> Vec<NewExpr> {
+    fn apply(&self, _expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         Vec::new()
     }
 }
@@ -282,15 +287,17 @@ impl Rule for SplitAggregateRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{AggregateCall, ExprKind, OutputColumn, TypedExpr};
+    use arrow::datatypes::DataType;
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp};
+    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, LogicalValuesOp};
+    use crate::sql::planner::plan::AggregateCall;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId(id),
+            column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
+            data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         }
@@ -299,52 +306,68 @@ mod tests {
     fn col_ref(id: u32, name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId(id),
+                column_id: ColumnId::new_for_test(id),
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
+            data_type: DataType::Int64,
             nullable: false,
         }
     }
 
     fn count_call(distinct: bool) -> AggregateCall {
         AggregateCall {
-            func: "count".to_string(),
+            name: "count".to_string(),
             args: vec![col_ref(2, "v")],
             distinct,
-            output_name: "count(v)".to_string(),
-            output_column_id: ColumnId(3),
-            return_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
         }
     }
 
-    fn single_grouped_expr() -> NewExpr {
-        NewExpr {
+    fn values_group(memo: &mut Memo) -> usize {
+        let id = memo.next_expr_id();
+        memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        })
+    }
+
+    fn single_grouped_expr(memo: &mut Memo) -> MExpr {
+        let child = values_group(memo);
+        MExpr {
+            id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![col_ref(1, "k")],
                 vec![count_call(false)],
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
             )),
-            children: vec![0],
+            children: vec![child],
         }
     }
 
-    fn single_scalar_expr() -> NewExpr {
-        NewExpr {
+    fn single_scalar_expr(memo: &mut Memo) -> MExpr {
+        let child = values_group(memo);
+        MExpr {
+            id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![],
                 vec![count_call(false)],
                 vec![output_column(3, "count(v)")],
             )),
-            children: vec![0],
+            children: vec![child],
         }
     }
 
     #[test]
     fn splits_grouped_aggregate_into_global_over_local() {
-        let out = SplitAggregateRule.apply(&single_grouped_expr(), &RuleContext::default());
+        let mut memo = Memo::new();
+        let expr = single_grouped_expr(&mut memo);
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
@@ -353,7 +376,10 @@ mod tests {
         assert_eq!(global.is_merge, vec![true]);
         assert!(global.is_split);
         assert_eq!(out[0].children.len(), 1);
-        let Operator::LogicalAggregate(local) = &out[0].children[0].op else {
+        let local_group_id = out[0].children[0];
+        let local_group = &memo.groups[local_group_id];
+        assert_eq!(local_group.logical_exprs.len(), 1);
+        let Operator::LogicalAggregate(local) = &local_group.logical_exprs[0].op else {
             panic!("expected local aggregate child");
         };
         assert_eq!(local.stage, AggStage::Local);
@@ -363,14 +389,18 @@ mod tests {
 
     #[test]
     fn splits_scalar_aggregate() {
-        let out = SplitAggregateRule.apply(&single_scalar_expr(), &RuleContext::default());
+        let mut memo = Memo::new();
+        let expr = single_scalar_expr(&mut memo);
+        let out = SplitAggregateRule.apply(&expr, &mut memo);
         assert_eq!(out.len(), 1);
         let Operator::LogicalAggregate(global) = &out[0].op else {
             panic!("expected global aggregate");
         };
         assert_eq!(global.stage, AggStage::Global);
         assert!(global.group_by.is_empty());
-        let Operator::LogicalAggregate(local) = &out[0].children[0].op else {
+        let local_group_id = out[0].children[0];
+        let local_group = &memo.groups[local_group_id];
+        let Operator::LogicalAggregate(local) = &local_group.logical_exprs[0].op else {
             panic!("expected local aggregate child");
         };
         assert_eq!(local.stage, AggStage::Local);
@@ -379,19 +409,21 @@ mod tests {
 
     #[test]
     fn rejects_distinct_and_already_split_aggregate() {
-        let distinct = NewExpr {
+        let mut memo = Memo::new();
+        let child = values_group(&mut memo);
+        let distinct = MExpr {
+            id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
                 vec![col_ref(1, "k")],
                 vec![count_call(true)],
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
             )),
-            children: vec![0],
+            children: vec![child],
         };
-        assert!(SplitAggregateRule
-            .apply(&distinct, &RuleContext::default())
-            .is_empty());
+        assert!(SplitAggregateRule.apply(&distinct, &mut memo).is_empty());
 
-        let already_split = NewExpr {
+        let already_split = MExpr {
+            id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                 AggStage::Local,
                 vec![col_ref(1, "k")],
@@ -400,11 +432,9 @@ mod tests {
                 vec![false],
                 true,
             )),
-            children: vec![0],
+            children: vec![child],
         };
-        assert!(SplitAggregateRule
-            .apply(&already_split, &RuleContext::default())
-            .is_empty());
+        assert!(SplitAggregateRule.apply(&already_split, &mut memo).is_empty());
     }
 }
 ```
@@ -440,23 +470,28 @@ Do not add it to `all_implementation_rules()`.
 Replace the skeleton body in `src/sql/optimizer/cascades_rules/split_aggregate.rs` with:
 
 ```rust
-use crate::sql::analysis::{AggregateCall, ExprKind, OutputColumn, TypedExpr};
-use crate::sql::optimizer::cascades_rules::{Rule, RuleContext};
-use crate::sql::optimizer::memo::NewExpr;
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
+use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::planner::plan::AggregateCall;
 
 pub(crate) struct SplitAggregateRule;
 
 impl Rule for SplitAggregateRule {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "SplitAggregateRule"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
     }
 
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(&self, expr: &NewExpr, _ctx: &RuleContext) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Vec::new();
         };
@@ -472,6 +507,12 @@ impl Rule for SplitAggregateRule {
             vec![false; agg.aggregates.len()],
             true,
         );
+        let local_id = memo.next_expr_id();
+        let local_group = memo.new_group(MExpr {
+            id: local_id,
+            op: Operator::LogicalAggregate(local),
+            children: expr.children.clone(),
+        });
         let global_group_by = aggregate_group_key_output_ref(&agg.group_by, &agg.output_columns);
         let global = LogicalAggregateOp::staged(
             AggStage::Global,
@@ -484,10 +525,7 @@ impl Rule for SplitAggregateRule {
 
         vec![NewExpr {
             op: Operator::LogicalAggregate(global),
-            children: vec![NewExpr {
-                op: Operator::LogicalAggregate(local),
-                children: expr.children.clone(),
-            }],
+            children: vec![local_group],
         }]
     }
 }
@@ -496,14 +534,15 @@ fn is_eligible(agg: &LogicalAggregateOp) -> bool {
     agg.stage == AggStage::Single
         && !agg.is_split
         && agg.is_merge.iter().all(|flag| !*flag)
-        && !agg.aggregates.is_empty()
+        && (!agg.aggregates.is_empty() || !agg.group_by.is_empty())
         && agg.aggregates.iter().all(is_splittable_aggregate)
 }
 
 fn is_splittable_aggregate(call: &AggregateCall) -> bool {
     !call.distinct
+        && call.order_by.is_empty()
         && matches!(
-            call.func.to_ascii_lowercase().as_str(),
+            call.name.to_ascii_lowercase().as_str(),
             "sum" | "min" | "max" | "count"
         )
 }
@@ -540,24 +579,27 @@ Expected: grouped/scalar split tests pass; DISTINCT and already-split guards pas
 
 - [ ] **Step 6: Verify rule-name disable registry recognizes it**
 
+Add this test to `src/sql/optimizer/mod.rs` inside `mod is_known_rule_name_tests`:
+
+```rust
+#[test]
+fn is_known_rule_name_recognizes_split_aggregate_rule() {
+    assert!(is_known_rule_name("SplitAggregateRule"));
+}
+```
+
 Run:
 
 ```bash
-cargo test -q sql::optimizer::cascades_rules::tests::known_rule_names_include_all_registered_rules
+cargo test -q sql::optimizer::is_known_rule_name_tests::is_known_rule_name_recognizes_split_aggregate_rule
 ```
 
-Expected: pass. If this exact test name does not exist, run:
-
-```bash
-cargo test -q sql::optimizer::cascades_rules
-```
-
-Expected: pass, including rule registration tests.
+Expected: pass. This proves the server-side `SET disable_optimizer_rules = 'SplitAggregateRule'` parser recognizes the new transformation rule name.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/sql/optimizer/cascades_rules/mod.rs src/sql/optimizer/cascades_rules/split_aggregate.rs
+git add src/sql/optimizer/cascades_rules/mod.rs src/sql/optimizer/cascades_rules/split_aggregate.rs src/sql/optimizer/mod.rs
 git commit -m "OQ-4: add split aggregate transformation rule"
 ```
 
@@ -571,81 +613,120 @@ git commit -m "OQ-4: add split aggregate transformation rule"
 
 - [ ] **Step 1: Write failing lowering tests**
 
-In `src/sql/optimizer/cascades_rules/implement.rs`, add these tests to the existing `#[cfg(test)]` module:
+In `src/sql/optimizer/cascades_rules/implement.rs`, inside the existing `two_phase_agg_tests` module, replace `agg_to_hash_agg_produces_single_and_two_phase` with these helpers and tests. Leave `agg_to_hash_agg_skips_two_phase_for_distinct` in place but update its aggregate construction to `LogicalAggregateOp::single(...)` from Task 1.
 
 ```rust
+fn output_column(id: u32, name: &str) -> OutputColumn {
+    OutputColumn {
+        column_id: ColumnId::new_for_test(id),
+        name: name.into(),
+        data_type: DataType::Int64,
+        nullable: false,
+        is_internal: false,
+    }
+}
+
+fn count_call(arg: &str, distinct: bool) -> AggregateCall {
+    AggregateCall {
+        name: "count".into(),
+        args: vec![col(arg)],
+        distinct,
+        result_type: DataType::Int64,
+        order_by: vec![],
+    }
+}
+
+fn values_group(memo: &mut Memo) -> usize {
+    let id = memo.next_expr_id();
+    memo.new_group(MExpr {
+        id,
+        op: Operator::LogicalValues(LogicalValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }),
+        children: vec![],
+    })
+}
+
 #[test]
 fn agg_to_hash_agg_lowers_single_to_one_physical_single() {
-    let expr = NewExpr {
+    let mut memo = Memo::new();
+    let child_group = values_group(&mut memo);
+    let expr = MExpr {
+        id: memo.next_expr_id(),
         op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-            vec![col_ref(1, "k")],
-            vec![count_call(false)],
+            vec![col("k")],
+            vec![count_call("v", false)],
             vec![output_column(1, "k"), output_column(3, "count(v)")],
         )),
-        children: vec![0],
+        children: vec![child_group],
     };
 
-    let out = AggToHashAgg.apply(&expr, &RuleContext::default());
+    let out = AggToHashAgg.apply(&expr, &mut memo);
     assert_eq!(out.len(), 1);
     let Operator::PhysicalHashAggregate(op) = &out[0].op else {
         panic!("expected physical hash aggregate");
     };
     assert_eq!(op.mode, AggMode::Single);
     assert_eq!(op.is_merge, vec![false]);
-    assert_eq!(out[0].children, vec![0]);
+    assert_eq!(out[0].children, vec![child_group]);
 }
 
 #[test]
 fn agg_to_hash_agg_lowers_split_stages_without_creating_extra_alternatives() {
-    let local_expr = NewExpr {
+    let mut memo = Memo::new();
+    let child_group = values_group(&mut memo);
+    let local_expr = MExpr {
+        id: memo.next_expr_id(),
         op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
             AggStage::Local,
-            vec![col_ref(1, "k")],
-            vec![count_call(false)],
+            vec![col("k")],
+            vec![count_call("v", false)],
             vec![output_column(1, "k"), output_column(3, "count(v)")],
             vec![false],
             true,
         )),
-        children: vec![0],
+        children: vec![child_group],
     };
-    let local_out = AggToHashAgg.apply(&local_expr, &RuleContext::default());
+    let local_out = AggToHashAgg.apply(&local_expr, &mut memo);
     assert_eq!(local_out.len(), 1);
     let Operator::PhysicalHashAggregate(local) = &local_out[0].op else {
         panic!("expected local physical aggregate");
     };
     assert_eq!(local.mode, AggMode::Local);
     assert_eq!(local.is_merge, vec![false]);
+    assert_eq!(local_out[0].children, vec![child_group]);
 
-    let global_expr = NewExpr {
+    let local_group = values_group(&mut memo);
+    let global_expr = MExpr {
+        id: memo.next_expr_id(),
         op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
             AggStage::Global,
-            vec![col_ref(1, "k")],
-            vec![count_call(false)],
+            vec![col("k")],
+            vec![count_call("v", false)],
             vec![output_column(1, "k"), output_column(3, "count(v)")],
             vec![true],
             true,
         )),
-        children: vec![1],
+        children: vec![local_group],
     };
-    let global_out = AggToHashAgg.apply(&global_expr, &RuleContext::default());
+    let global_out = AggToHashAgg.apply(&global_expr, &mut memo);
     assert_eq!(global_out.len(), 1);
     let Operator::PhysicalHashAggregate(global) = &global_out[0].op else {
         panic!("expected global physical aggregate");
     };
     assert_eq!(global.mode, AggMode::Global);
     assert_eq!(global.is_merge, vec![true]);
-    assert_eq!(global_out[0].children, vec![1]);
+    assert_eq!(global_out[0].children, vec![local_group]);
 }
 ```
-
-The helper functions `col_ref`, `count_call`, and `output_column` should already exist in the module from current aggregate implementation tests. If any helper name differs, add the same helper definitions from Task 2 test code inside the implement.rs test module.
 
 - [ ] **Step 2: Run failing lowering tests**
 
 Run:
 
 ```bash
-cargo test -q sql::optimizer::cascades_rules::implement::tests::agg_to_hash_agg
+cargo test -q sql::optimizer::cascades_rules::implement::two_phase_agg_tests::agg_to_hash_agg_lowers_single_to_one_physical_single
 ```
 
 Expected: the single test fails because current `AggToHashAgg` still emits Local/Global alternatives for grouped non-DISTINCT aggregate.
@@ -655,7 +736,7 @@ Expected: the single test fails because current `AggToHashAgg` still emits Local
 In `src/sql/optimizer/cascades_rules/implement.rs`, replace the current `AggToHashAgg::apply` body with:
 
 ```rust
-fn apply(&self, expr: &NewExpr, _ctx: &RuleContext) -> Vec<NewExpr> {
+fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
     let Operator::LogicalAggregate(op) = &expr.op else {
         return Vec::new();
     };
@@ -689,8 +770,8 @@ Expected: pass. `SplitDistinctAgg` still emits its existing physical DISTINCT ch
 Run:
 
 ```bash
-cargo test -q sql::optimizer::cascades_rules::implement::tests::agg_to_hash_agg_lowers_single_to_one_physical_single
-cargo test -q sql::optimizer::cascades_rules::implement::tests::agg_to_hash_agg_lowers_split_stages_without_creating_extra_alternatives
+cargo test -q sql::optimizer::cascades_rules::implement::two_phase_agg_tests::agg_to_hash_agg_lowers_single_to_one_physical_single
+cargo test -q sql::optimizer::cascades_rules::implement::two_phase_agg_tests::agg_to_hash_agg_lowers_split_stages_without_creating_extra_alternatives
 ```
 
 Expected: both pass.
@@ -839,15 +920,21 @@ In `src/sql/optimizer/stats.rs`, add this test to the existing `#[cfg(test)]` mo
 ```rust
 #[test]
 fn aggregate_stats_are_independent_of_split_stage_metadata() {
-    use crate::sql::analysis::{AggregateCall, ExprKind, OutputColumn, TypedExpr};
+    use std::collections::HashMap;
+
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::memo::{Memo, NewExpr};
-    use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
+    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::operator::{
+        AggStage, LogicalAggregateOp, LogicalValuesOp, Operator,
+    };
+    use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::planner::plan::AggregateCall;
 
     fn col_ref(id: u32, name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId(id),
+                column_id: ColumnId::new_for_test(id),
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
@@ -858,7 +945,7 @@ fn aggregate_stats_are_independent_of_split_stage_metadata() {
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId(id),
+            column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
@@ -868,18 +955,43 @@ fn aggregate_stats_are_independent_of_split_stage_metadata() {
 
     fn count_call() -> AggregateCall {
         AggregateCall {
-            func: "count".to_string(),
+            name: "count".to_string(),
             args: vec![col_ref(2, "v")],
             distinct: false,
-            output_name: "count(v)".to_string(),
-            output_column_id: ColumnId(3),
-            return_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            result_type: arrow::datatypes::DataType::Int64,
+            order_by: vec![],
         }
     }
 
-    let child_group = 0;
-    let single = NewExpr {
+    fn values_group(memo: &mut Memo) -> usize {
+        let id = memo.next_expr_id();
+        memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        })
+    }
+
+    let mut memo = Memo::new();
+    let child_group = values_group(&mut memo);
+    let mut child_props = LogicalProperties::new(vec![output_column(1, "k")], 10_000.0);
+    child_props.column_statistics.insert(
+        "k".to_string(),
+        ColumnStatistic {
+            min_value: 0.0,
+            max_value: 10_000.0,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: 100.0,
+        },
+    );
+    memo.groups[child_group].logical_props = Some(child_props);
+
+    let single = MExpr {
+        id: memo.next_expr_id(),
         op: Operator::LogicalAggregate(LogicalAggregateOp::single(
             vec![col_ref(1, "k")],
             vec![count_call()],
@@ -887,7 +999,8 @@ fn aggregate_stats_are_independent_of_split_stage_metadata() {
         )),
         children: vec![child_group],
     };
-    let local = NewExpr {
+    let local = MExpr {
+        id: memo.next_expr_id() + 1,
         op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
             AggStage::Local,
             vec![col_ref(1, "k")],
@@ -899,33 +1012,64 @@ fn aggregate_stats_are_independent_of_split_stage_metadata() {
         children: vec![child_group],
     };
 
-    let mut memo = Memo::new_for_test();
-    memo.groups[child_group].statistics.output_row_count = 10_000.0;
-    memo.groups[child_group]
-        .statistics
-        .column_statistics
-        .insert("k".to_string(), ColumnStatistic {
-            ndv: Some(100.0),
-            null_count: Some(0.0),
-            min_value: None,
-            max_value: None,
-            avg_size: None,
-        });
-
-    let single_stats = derive_statistics_for_expr(&memo, &single);
-    let local_stats = derive_statistics_for_expr(&memo, &local);
+    let table_stats = HashMap::new();
+    let single_stats = derive_statistics(&single, &memo, &table_stats);
+    let local_stats = derive_statistics(&local, &memo, &table_stats);
     assert_eq!(single_stats.output_row_count, local_stats.output_row_count);
 }
 ```
 
-If helper constructors such as `Memo::new_for_test` or `derive_statistics_for_expr` have different names, use the equivalent test helpers already present in `stats.rs`; keep the assertion that Single and Local with the same group keys derive identical row counts.
+- [ ] **Step 2: Add split-vs-single cost budget tests**
 
-- [ ] **Step 2: Update cost tests for struct changes**
-
-In `src/sql/optimizer/cost.rs`, keep the existing `local_agg_cheaper_than_single` test and update any `PhysicalHashAggregateOp` literal to include all fields required after Task 1. The expected invariant remains:
+In `src/sql/optimizer/cost.rs`, keep the existing `local_agg_cheaper_than_single` test and add this test to the same `#[cfg(test)] mod tests`.
 
 ```rust
-assert!(compute_cost(&single, &own, &cs) > compute_cost(&local, &own, &cs));
+#[test]
+fn split_agg_total_cost_can_win_or_lose_after_exchange_cost() {
+    use crate::sql::optimizer::property::DistributionSpec;
+
+    let single = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+        mode: AggMode::Single,
+        group_by: vec![],
+        aggregates: vec![],
+        output_columns: vec![],
+        is_merge: vec![],
+    });
+    let local = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+        mode: AggMode::Local,
+        group_by: vec![],
+        aggregates: vec![],
+        output_columns: vec![],
+        is_merge: vec![],
+    });
+    let global = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+        mode: AggMode::Global,
+        group_by: vec![],
+        aggregates: vec![],
+        output_columns: vec![],
+        is_merge: vec![],
+    });
+    let gather = Operator::PhysicalDistribution(PhysicalDistributionOp {
+        spec: DistributionSpec::Gather,
+    });
+
+    let large_input = stats(1_000_000.0, 100.0);
+    let reduced_rows = stats(100.0, 16.0);
+    let final_rows = stats(100.0, 16.0);
+    let single_large_cost = compute_cost(&single, &final_rows, &[&large_input]);
+    let split_large_cost = compute_cost(&local, &reduced_rows, &[&large_input])
+        + compute_cost(&gather, &reduced_rows, &[])
+        + compute_cost(&global, &final_rows, &[&reduced_rows]);
+    assert!(split_large_cost < single_large_cost);
+
+    let small_input = stats(10.0, 8.0);
+    let unreduced_rows = stats(10.0, 8.0);
+    let single_small_cost = compute_cost(&single, &unreduced_rows, &[&small_input]);
+    let split_small_cost = compute_cost(&local, &unreduced_rows, &[&small_input])
+        + compute_cost(&gather, &unreduced_rows, &[])
+        + compute_cost(&global, &unreduced_rows, &[&unreduced_rows]);
+    assert!(single_small_cost < split_small_cost);
+}
 ```
 
 - [ ] **Step 3: Run stats and cost tests**
@@ -935,9 +1079,10 @@ Run:
 ```bash
 cargo test -q sql::optimizer::stats::tests::aggregate_stats_are_independent_of_split_stage_metadata
 cargo test -q sql::optimizer::cost::tests::local_agg_cheaper_than_single
+cargo test -q sql::optimizer::cost::tests::split_agg_total_cost_can_win_or_lose_after_exchange_cost
 ```
 
-Expected: both pass.
+Expected: all three tests pass.
 
 - [ ] **Step 4: Commit**
 
@@ -1117,7 +1262,7 @@ git commit -m "OQ-4: add split aggregate optimizer coverage"
 ## Task 7: Full validation and roadmap handoff
 
 **Files:**
-- Modify: `/Users/harbor/Documents/Obsidian/NovaRocks TODO/NovaRocks Roadmap.md` if the implementation branch is complete and validated
+- Modify: `/Users/harbor/Documents/Obsidian/NovaRocks TODO/NovaRocks Roadmap.md`
 
 - [ ] **Step 1: Run Rust formatting**
 
@@ -1136,8 +1281,8 @@ Run:
 ```bash
 cargo test -q sql::optimizer::operator::aggregate_stage_tests
 cargo test -q sql::optimizer::cascades_rules::split_aggregate
-cargo test -q sql::optimizer::cascades_rules::implement::tests::agg_to_hash_agg_lowers_single_to_one_physical_single
-cargo test -q sql::optimizer::cascades_rules::implement::tests::agg_to_hash_agg_lowers_split_stages_without_creating_extra_alternatives
+cargo test -q sql::optimizer::cascades_rules::implement::two_phase_agg_tests::agg_to_hash_agg_lowers_single_to_one_physical_single
+cargo test -q sql::optimizer::cascades_rules::implement::two_phase_agg_tests::agg_to_hash_agg_lowers_split_stages_without_creating_extra_alternatives
 cargo test -q sql::optimizer::derive::hash_aggregate
 cargo test -q sql::optimizer::cost::tests::local_agg_cheaper_than_single
 ```
@@ -1211,3 +1356,22 @@ If only the external Roadmap changed, do not commit it from the repository workt
 - DISTINCT aggregation continues to use existing `SplitDistinctAgg` implementation path.
 - `SET disable_optimizer_rules = 'SplitAggregateRule'` prevents the ordinary split alternative while leaving single-phase aggregate available.
 - Targeted Rust tests, optimizer module tests, and optimizer SQL suite pass.
+
+---
+
+## Self-Review
+
+**1. Spec coverage:**
+- Spec §1 goals: Tasks 1-7 cover logical SplitAgg, Single fallback, grouped/scalar Local->Global shapes, disable-rule behavior, SQL golden, and final validation.
+- Spec §4.1 logical aggregate stage: Task 1 adds `AggStage`, `LogicalAggregateOp::single`, `LogicalAggregateOp::staged`, and conversion changes.
+- Spec §4.2 `SplitAggregateRule`: Task 2 creates the transformation rule, registers it in `all_transformation_rules()`, allocates the Local memo group through `Memo::new_group`, and adds grouped/scalar/guard tests.
+- Spec §4.3 `AggToHashAgg` simplification: Task 3 changes `AggToHashAgg` to one stage-to-physical lowering path and keeps `SplitDistinctAgg` independent.
+- Spec §4.4 distribution boundaries: Task 4 fixes Local scalar output to `Any` while Single/Global scalar keep `Gather`.
+- Spec §4.5 cost gate: Task 5 keeps the existing Local-vs-Single invariant and adds a total-cost test proving Split can win for large reduced input and lose for small unreduced input after exchange cost.
+- Spec §6 SQL golden and §6.3 marker checks: Task 6 adds grouped, scalar, and disabled-rule SQL cases; Task 7 runs the full optimizer suite and records Roadmap evidence.
+
+**2. Placeholder scan:** No deferred-work or fill-in placeholders remain. The only conditional behavior is operational cleanup: Task 7 commits formatting changes only if `cargo fmt` changes repository files.
+
+**3. Type consistency:** The plan now uses the current optimizer API: `Rule::apply(&MExpr, &mut Memo) -> Vec<NewExpr>`, `NewExpr.children: Vec<GroupId>`, `AggregateCall { name, args, distinct, result_type, order_by }`, `ColumnId::new_for_test`, and `ColumnStatistic { min_value, max_value, nulls_fraction, average_row_size, distinct_values_count }`.
+
+**4. Scope:** One subsystem only: standalone Cascades optimizer SplitAgg. FE-compatible lowering, execution aggregate semantics, and DISTINCT multi-stage redesign stay out of scope except for regression tests.

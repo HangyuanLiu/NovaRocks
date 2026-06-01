@@ -1558,6 +1558,128 @@ mod tests {
         assert!((props.row_count - 25_000.0).abs() < 1.0);
     }
 
+    #[test]
+    fn aggregate_stats_are_independent_of_split_stage_metadata() {
+        use std::collections::HashMap;
+
+        use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+        use crate::sql::optimizer::operator::{
+            AggStage, LogicalAggregateOp, LogicalValuesOp, Operator,
+        };
+        use crate::sql::optimizer::statistics::ColumnStatistic;
+        use crate::sql::planner::plan::AggregateCall;
+
+        fn col_ref(id: u32, name: &str) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(id),
+                    qualifier: Some("t".to_string()),
+                    column: name.to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            }
+        }
+
+        fn output_column(id: u32, name: &str) -> OutputColumn {
+            OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }
+        }
+
+        fn count_call() -> AggregateCall {
+            AggregateCall {
+                name: "count".to_string(),
+                args: vec![col_ref(2, "v")],
+                distinct: false,
+                result_type: arrow::datatypes::DataType::Int64,
+                order_by: vec![],
+            }
+        }
+
+        fn values_group(memo: &mut Memo) -> usize {
+            let id = memo.next_expr_id();
+            memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            })
+        }
+
+        let mut memo = Memo::new();
+        let child_group = values_group(&mut memo);
+        let mut child_props = LogicalProperties::new(vec![output_column(1, "k")], 10_000.0);
+        child_props.column_statistics.insert(
+            "k".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 10_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 100.0,
+            },
+        );
+        memo.groups[child_group].logical_props = Some(child_props);
+
+        fn aggregate_expr(
+            memo: &Memo,
+            child_group: usize,
+            stage: AggStage,
+            is_merge: Vec<bool>,
+            is_split: bool,
+        ) -> MExpr {
+            MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+                    stage,
+                    vec![col_ref(1, "k")],
+                    vec![count_call()],
+                    vec![output_column(1, "k"), output_column(3, "count(v)")],
+                    is_merge,
+                    is_split,
+                )),
+                children: vec![child_group],
+            }
+        }
+
+        let single = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col_ref(1, "k")],
+                vec![count_call()],
+                vec![output_column(1, "k"), output_column(3, "count(v)")],
+            )),
+            children: vec![child_group],
+        };
+        let local = aggregate_expr(&memo, child_group, AggStage::Local, vec![false], true);
+        let global = aggregate_expr(&memo, child_group, AggStage::Global, vec![true], true);
+        let global_without_split =
+            aggregate_expr(&memo, child_group, AggStage::Global, vec![true], false);
+
+        let table_stats = HashMap::new();
+        let single_stats = derive_statistics(&single, &memo, &table_stats);
+        for alternative in [&local, &global, &global_without_split] {
+            let alternative_stats = derive_statistics(alternative, &memo, &table_stats);
+            assert_eq!(
+                single_stats.output_row_count,
+                alternative_stats.output_row_count
+            );
+            assert_eq!(
+                single_stats.column_statistics.len(),
+                alternative_stats.column_statistics.len()
+            );
+        }
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {

@@ -62,11 +62,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
 
         LogicalPlan::Aggregate(node) => {
             let child = logical_plan_to_memo(&node.input, memo);
-            let op = Operator::LogicalAggregate(LogicalAggregateOp {
-                group_by: node.group_by.clone(),
-                aggregates: node.aggregates.clone(),
-                output_columns: node.output_columns.clone(),
-            });
+            let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
+                node.group_by.clone(),
+                node.aggregates.clone(),
+                node.output_columns.clone(),
+            ));
             let expr = MExpr {
                 id: memo.next_expr_id(),
                 op,
