@@ -82,14 +82,14 @@ fn aggregate_group_key_output_ref(
     group_by
         .iter()
         .zip(output_columns.iter())
-        .map(|(expr, output)| TypedExpr {
+        .map(|(_, output)| TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: output.column_id,
                 qualifier: None,
                 column: output.name.clone(),
             },
             data_type: output.data_type.clone(),
-            nullable: expr.nullable,
+            nullable: output.nullable,
         })
         .collect()
 }
@@ -114,6 +114,10 @@ mod tests {
     }
 
     fn col_ref(id: u32, name: &str) -> TypedExpr {
+        nullable_col_ref(id, name, false)
+    }
+
+    fn nullable_col_ref(id: u32, name: &str, nullable: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
@@ -121,7 +125,7 @@ mod tests {
                 column: name.to_string(),
             },
             data_type: DataType::Int64,
-            nullable: false,
+            nullable,
         }
     }
 
@@ -152,7 +156,7 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col_ref(1, "k")],
+                vec![nullable_col_ref(1, "k", true)],
                 vec![count_call(false)],
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
             )),
@@ -185,6 +189,8 @@ mod tests {
         assert_eq!(global.stage, AggStage::Global);
         assert_eq!(global.is_merge, vec![true]);
         assert!(global.is_split);
+        assert_eq!(global.group_by.len(), 1);
+        assert!(!global.group_by[0].nullable);
         assert_eq!(out[0].children.len(), 1);
         let local_group_id = out[0].children[0];
         let local_group = &memo.groups[local_group_id];
