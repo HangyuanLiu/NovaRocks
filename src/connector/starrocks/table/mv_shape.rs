@@ -321,7 +321,11 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     };
     reject_unsupported_aggregate_select_clauses(select)?;
 
-    let base_table = extract_single_base_table(select, aggregate_error, aggregate_error)?;
+    let fan_in_bases = extract_union_all_fan_in_bases(select)?;
+    let base_table = match fan_in_bases.first() {
+        Some(first) => first.clone(),
+        None => extract_single_base_table(select, aggregate_error, aggregate_error)?,
+    };
     if let Some(selection) = &select.selection {
         reject_unsupported_expr(selection).map_err(aggregate_expr_error)?;
     }
@@ -329,11 +333,48 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
     Ok(AggregateMvShape {
         base_table,
-        fan_in_bases: Vec::new(),
+        fan_in_bases,
         group_keys,
         aggregates,
         visible_outputs,
     })
+}
+
+fn extract_union_all_fan_in_bases(
+    select: &sqlparser::ast::Select,
+) -> Result<Vec<sqlparser::ast::ObjectName>, String> {
+    let [from] = select.from.as_slice() else {
+        return Ok(Vec::new());
+    };
+    if !from.joins.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sqlparser::ast::TableFactor::Derived { subquery, .. } = &from.relation else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        subquery.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation { .. }
+    ) {
+        return Ok(Vec::new());
+    }
+
+    let mut branch_bodies = Vec::new();
+    flatten_union_all(subquery.body.as_ref(), &mut branch_bodies)?;
+    if branch_bodies.len() < 2 {
+        return Err(aggregate_error());
+    }
+
+    branch_bodies
+        .into_iter()
+        .map(|body| {
+            let sqlparser::ast::SetExpr::Select(branch_select) = body else {
+                return Err(aggregate_error());
+            };
+            extract_single_base_table(branch_select, aggregate_error, aggregate_error)
+        })
+        .collect()
 }
 
 fn classify_join_aggregate_mv_query(
@@ -2053,6 +2094,28 @@ mod tests {
             bases,
             vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
         );
+    }
+
+    #[test]
+    fn accepts_aggregate_over_union_all_fan_in() {
+        let shape = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 \
+             ) u group by k",
+        )
+        .expect("aggregate over UNION ALL should be accepted");
+        let IncrementalMvShape::Aggregate(a) = shape else {
+            panic!("expected Aggregate shape (A-family)");
+        };
+        assert_eq!(
+            a.fan_in_bases
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>(),
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+        assert_eq!(a.group_keys.len(), 1);
+        assert_eq!(a.aggregates.len(), 1);
     }
 
     #[test]
