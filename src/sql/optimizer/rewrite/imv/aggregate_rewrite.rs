@@ -31,6 +31,8 @@ pub(crate) fn signed_state_function(name: &str) -> Result<&'static str, String> 
         "avg" => Ok("avg_state_signed"),
         "min" => Ok("min_state_signed"),
         "max" => Ok("max_state_signed"),
+        "bool_or" | "boolor_agg" => Ok("bool_or_state_signed"),
+        "bool_and" | "booland_agg" | "every" => Ok("bool_and_state_signed"),
         other => Err(format!("unsupported IMV aggregate function {other}")),
     }
 }
@@ -982,6 +984,18 @@ mod tests {
         assert_eq!(signed_state_function("avg").unwrap(), "avg_state_signed");
         assert_eq!(signed_state_function("min").unwrap(), "min_state_signed");
         assert_eq!(signed_state_function("max").unwrap(), "max_state_signed");
+        assert_eq!(
+            signed_state_function("bool_or").unwrap(),
+            "bool_or_state_signed"
+        );
+        assert_eq!(
+            signed_state_function("bool_and").unwrap(),
+            "bool_and_state_signed"
+        );
+        assert_eq!(
+            signed_state_function("every").unwrap(),
+            "bool_and_state_signed"
+        );
     }
 
     #[test]

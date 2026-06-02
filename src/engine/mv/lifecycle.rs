@@ -136,6 +136,7 @@ pub(crate) struct IcebergRefreshPlan {
     pub stmt: RefreshMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
+    pub affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
 }
 
 #[derive(Clone, Debug)]

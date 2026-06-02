@@ -1180,6 +1180,25 @@ pub(crate) fn refresh_iceberg_mv(
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    let affected_partitions = crate::engine::mv::partition::AffectedMvPartitions::unknown(
+        "refresh was executed without a planned affected partition set",
+    );
+    refresh_iceberg_mv_with_planned_partitions(
+        state,
+        current_catalog,
+        current_database,
+        stmt,
+        &affected_partitions,
+    )
+}
+
+fn refresh_iceberg_mv_with_planned_partitions(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
+) -> Result<StatementResult, String> {
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     if stmt.full {
@@ -1229,6 +1248,7 @@ pub(crate) fn refresh_iceberg_mv(
             &base_refs,
             &shape,
             &aggregate_shape,
+            planned_affected_partitions,
         );
     }
     if is_join_projection_filter_mv(&shape) {
@@ -1491,6 +1511,7 @@ fn refresh_iceberg_aggregate_mv(
     base_refs: &[IcebergTableRef],
     shape: &IncrementalMvShape,
     aggregate_shape: &AggregateMvShape,
+    planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     match shape {
@@ -1507,6 +1528,7 @@ fn refresh_iceberg_aggregate_mv(
             base_refs,
             schema_contract,
             aggregate_shape,
+            planned_affected_partitions,
         ),
         IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
             refresh_join_aggregate_iceberg_mv(
@@ -1523,6 +1545,7 @@ fn refresh_iceberg_aggregate_mv(
                 schema_contract,
                 join_aggregate_shape,
                 aggregate_shape,
+                planned_affected_partitions,
             )
         }
         _ => Err(
@@ -1571,6 +1594,7 @@ fn refresh_single_aggregate_iceberg_mv(
     base_refs: &[IcebergTableRef],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     aggregate_shape: &AggregateMvShape,
+    planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     let [base_ref] = base_refs else {
         return Err(
@@ -1670,7 +1694,7 @@ fn refresh_single_aggregate_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_affected_partitions(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -1683,6 +1707,7 @@ fn refresh_single_aggregate_iceberg_mv(
             Arc::new(target_entry.clone()),
             iceberg_catalog.clone(),
             target_table.clone(),
+            planned_affected_partitions.clone(),
         )?
     };
     tracing::info!(
@@ -2150,6 +2175,7 @@ fn refresh_join_aggregate_iceberg_mv(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     join_aggregate_shape: &JoinAggregateMvShape,
     aggregate_shape: &AggregateMvShape,
+    planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
         return Err(
@@ -2280,7 +2306,7 @@ fn refresh_join_aggregate_iceberg_mv(
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new(
+        IcebergMvRefreshContext::new_with_affected_partitions(
             target.clone(),
             mv_definition.mv_id,
             current_catalog,
@@ -2293,6 +2319,7 @@ fn refresh_join_aggregate_iceberg_mv(
             Arc::new(target_entry.clone()),
             iceberg_catalog.clone(),
             target_table.clone(),
+            planned_affected_partitions.clone(),
         )?
     };
     tracing::info!(
@@ -2435,6 +2462,57 @@ fn noop_affected_partitions(
             std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
             std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
         )
+    }
+}
+
+fn plan_aggregate_mv_affected_partitions(
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    mode: RefreshMode,
+    previous_snapshot_id: Option<i64>,
+    current_snapshot_id: Option<i64>,
+    base_table: &iceberg::table::Table,
+) -> crate::engine::mv::partition::AffectedMvPartitions {
+    match mode {
+        RefreshMode::Noop => noop_affected_partitions(schema_contract),
+        RefreshMode::Incremental => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+            } else {
+                let Some(previous) = previous_snapshot_id else {
+                    return crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                        "incremental aggregate MV affected partition planning missing previous snapshot",
+                    );
+                };
+                let Some(current) = current_snapshot_id else {
+                    return crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                        "incremental aggregate MV affected partition planning missing current snapshot",
+                    );
+                };
+                match plan_changes(base_table, previous, Some(current), &[]) {
+                    Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
+                        &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                            schema_contract,
+                            change_batch: Some(&batch),
+                        },
+                    ),
+                    Err(err) => crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                        format!("failed to plan Iceberg changes for affected partitions: {err}"),
+                    ),
+                }
+            }
+        }
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned
+            } else {
+                crate::engine::mv::partition::planner::plan_affected_partitions(
+                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                        schema_contract,
+                        change_batch: None,
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -2653,11 +2731,12 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 })
                 .collect(),
             snapshot_pins,
-            affected_partitions,
+            affected_partitions: affected_partitions.clone(),
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
+                affected_partitions: affected_partitions.clone(),
             }),
         });
     }
@@ -2712,11 +2791,12 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 table: base_ref.table.clone(),
             }],
             snapshot_pins,
-            affected_partitions,
+            affected_partitions: affected_partitions.clone(),
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
+                affected_partitions: affected_partitions.clone(),
             }),
         });
     }
@@ -2819,11 +2899,12 @@ pub(crate) fn plan_iceberg_mv_refresh(
             table: base_ref.table.clone(),
         }],
         snapshot_pins,
-        affected_partitions,
+        affected_partitions: affected_partitions.clone(),
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
+            affected_partitions: affected_partitions.clone(),
         }),
     })
 }
@@ -2901,6 +2982,14 @@ fn plan_iceberg_aggregate_mv_refresh(
             };
             let mut snapshot_pins = BTreeMap::new();
             snapshot_pins.insert(base_ref.fqn(), current);
+            let affected_partitions = plan_aggregate_mv_affected_partitions(
+                schema_contract,
+                mode,
+                previous,
+                current,
+                &loaded.table,
+            );
+            log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
                 mv_definition,
                 target,
@@ -2910,6 +2999,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                 base_refs,
                 snapshot_pins,
                 mode,
+                affected_partitions,
             ))
         }
         IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
@@ -3025,6 +3115,8 @@ fn plan_iceberg_aggregate_mv_refresh(
             } else {
                 RefreshMode::Incremental
             };
+            let affected_partitions = unknown_join_affected_partitions();
+            log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
                 mv_definition,
                 target,
@@ -3034,6 +3126,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                 base_refs,
                 snapshot_pins,
                 mode,
+                affected_partitions,
             ))
         }
         _ => Err(RefreshError::user(
@@ -3051,6 +3144,7 @@ fn build_iceberg_refresh_plan(
     base_refs: &[IcebergTableRef],
     snapshot_pins: BTreeMap<String, Option<i64>>,
     mode: RefreshMode,
+    affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
 ) -> RefreshPlan {
     RefreshPlan {
         mv_id: Some(mv_definition.mv_id),
@@ -3066,13 +3160,12 @@ fn build_iceberg_refresh_plan(
             })
             .collect(),
         snapshot_pins,
-        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-            "aggregate MV affected partition planning is not implemented",
-        ),
+        affected_partitions: affected_partitions.clone(),
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
+            affected_partitions: affected_partitions.clone(),
         }),
     }
 }
@@ -3081,11 +3174,12 @@ pub(crate) fn execute_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: &IcebergRefreshPlan,
 ) -> Result<IcebergRefreshOutcome, RefreshError> {
-    refresh_iceberg_mv(
+    refresh_iceberg_mv_with_planned_partitions(
         state,
         plan.current_catalog.as_deref(),
         &plan.current_database,
         &plan.stmt,
+        &plan.affected_partitions,
     )
     .map_err(|err| {
         if is_iceberg_commit_unknown_error(&err) {

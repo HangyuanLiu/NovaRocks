@@ -89,6 +89,15 @@ impl ExprScope {
         self.add_column(qualifier, name, binding);
     }
 
+    /// Register a `ColumnId` lookup for an existing output slot without adding
+    /// another visible column name. Use this when an operator remaps a child's
+    /// physical binding but keeps the same semantic column identity.
+    pub fn add_id_alias(&mut self, column_id: ColumnId, binding: ColumnBinding) {
+        if column_id != ColumnId::UNSET {
+            self.by_id.insert(column_id, binding);
+        }
+    }
+
     /// Register a qualified alias for lookup without adding to the ordered
     /// column list.  Use this for secondary qualifiers (e.g. `ss.s_store_sk`
     /// when the unqualified `s_store_sk` is already registered).
@@ -135,6 +144,10 @@ impl ExprScope {
         self.qualified
             .iter()
             .map(|((qualifier, name), binding)| (qualifier, name, binding))
+    }
+
+    pub fn iter_id_bindings(&self) -> impl Iterator<Item = (&ColumnId, &ColumnBinding)> {
+        self.by_id.iter()
     }
 
     /// Merge another scope into this one. Used for building JOIN output scopes.

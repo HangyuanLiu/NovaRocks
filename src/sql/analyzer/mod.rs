@@ -3995,14 +3995,13 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ordering_comparison_analyzes() {
-        let resolved = parse_raw_and_analyze("SELECT i_1 > [1, 2] FROM array_test")
-            .expect("array ordering comparison should analyze");
-        assert_eq!(resolved.output_columns.len(), 1);
-        assert!(matches!(
-            resolved.output_columns[0].data_type,
-            arrow::datatypes::DataType::Boolean
-        ));
+    fn test_array_ordering_comparison_is_rejected() {
+        let err = parse_raw_and_analyze("SELECT i_1 > [1, 2] FROM array_test")
+            .expect_err("array ordering comparison should be rejected");
+        assert!(
+            err.contains("does not support binary predicate operation on ARRAY"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

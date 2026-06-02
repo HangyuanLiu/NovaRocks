@@ -34,7 +34,7 @@ use arrow::record_batch::RecordBatch;
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
 use crate::exec::node::iceberg_delta_scan::{
-    DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode,
+    DeltaSourceFile, DeltaSourceRole, IcebergDeltaScanNode, PositionDeleteSourceData,
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -442,19 +442,9 @@ fn open_scanner_for_role(
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     match &file.role {
         DeltaSourceRole::DataFile => open_data_file_scanner(node, &file),
-        DeltaSourceRole::PositionDelete {
-            targets,
-            file_format,
-            content_offset,
-            content_size_in_bytes,
-        } => open_position_delete_scanner(
-            node,
-            &file,
-            targets,
-            *file_format,
-            *content_offset,
-            *content_size_in_bytes,
-        ),
+        DeltaSourceRole::PositionDelete { deletes } => {
+            open_position_delete_scanner(node, &file, deletes)
+        }
         DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets: _,
@@ -691,34 +681,31 @@ impl DeltaFileScanner for PositionDeleteScanner {
 fn open_position_delete_scanner(
     node: &IcebergDeltaScanNode,
     file: &DeltaSourceFile,
-    targets: &[crate::exec::node::iceberg_delta_scan::PositionDeleteTargetData],
-    file_format: crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat,
-    content_offset: Option<i64>,
-    content_size_in_bytes: Option<i64>,
+    deletes: &[PositionDeleteSourceData],
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
-    let referenced = if targets.len() == 1 {
-        Some(targets[0].data_file_path.clone())
-    } else {
-        None
-    };
-    let iceberg_format = match file_format {
-        crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Parquet => {
-            iceberg::spec::DataFileFormat::Parquet
-        }
-        crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Puffin => {
-            iceberg::spec::DataFileFormat::Puffin
-        }
-    };
-    let delete = crate::connector::iceberg::changes::PositionDeleteRef {
-        delete_file_path: file.path.clone(),
-        delete_file_size: file.size,
-        record_count: None,
-        referenced_data_file: referenced,
-        file_format: iceberg_format,
-        content_offset,
-        content_size_in_bytes,
-        partition_values: Vec::new(),
-    };
+    let delete_refs = deletes
+        .iter()
+        .map(|delete| {
+            let iceberg_format = match delete.file_format {
+                crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Parquet => {
+                    iceberg::spec::DataFileFormat::Parquet
+                }
+                crate::exec::node::iceberg_delta_scan::PositionDeleteFileFormat::Puffin => {
+                    iceberg::spec::DataFileFormat::Puffin
+                }
+            };
+            crate::connector::iceberg::changes::PositionDeleteRef {
+                delete_file_path: delete.delete_file_path.clone(),
+                delete_file_size: delete.delete_file_size,
+                record_count: None,
+                referenced_data_file: delete.referenced_data_file.clone(),
+                file_format: iceberg_format,
+                content_offset: delete.content_offset,
+                content_size_in_bytes: delete.content_size_in_bytes,
+                partition_values: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
     let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
         format!(
             "ivm-a1 position-delete scanner: runtime.delete_side missing for {} (lower_plan \
@@ -729,9 +716,10 @@ fn open_position_delete_scanner(
     let lineage = position_delete_lineage_lookup(delete_side);
     let rows = crate::connector::iceberg::changes::scan_position_delete_rows_for_targets(
         &node.iceberg_runtime.base_table,
-        &delete,
+        &delete_refs,
         &lineage,
         &delete_side.deleted_data_file_paths,
+        &delete_side.previously_deleted_positions_per_file,
         node.iceberg_runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
     )?;
@@ -919,6 +907,7 @@ mod tests {
         let delete_side = crate::exec::node::iceberg_delta_scan::DeltaScanDeleteSide {
             base_data_file_lineage: current,
             previous_delete_visibility: Default::default(),
+            previously_deleted_positions_per_file: Default::default(),
             previous_data_file_lineage: previous,
             deleted_data_file_paths: Default::default(),
         };

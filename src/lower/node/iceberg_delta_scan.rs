@@ -34,7 +34,7 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::iceberg_delta_scan::{
     ApplyKeySource, BaseTableIdent, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
     EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergRuntimeHandles,
-    PositionDeleteFileFormat, PositionDeleteTargetData,
+    PositionDeleteFileFormat, PositionDeleteSourceData,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
@@ -149,6 +149,36 @@ pub(crate) fn lower_iceberg_delta_scan_node(
             .iter()
             .map(|file| file.path.clone())
             .collect();
+        let touched_referenced_data_files: std::collections::HashSet<String> = batch
+            .deletes
+            .iter()
+            .filter_map(|delete| delete.referenced_data_file.clone())
+            .collect();
+        let previously_deleted_positions_per_file = if !touched_referenced_data_files.is_empty() {
+            crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
+                &loaded.table,
+                batch.previous_snapshot_id,
+                object_store_factory.as_ref(),
+                &|path: &str| {
+                    crate::connector::iceberg::changes::normalize_delete_projection_path(
+                        path,
+                        entry.object_store_config(),
+                    )
+                },
+                |data_file_path: &str| touched_referenced_data_files.contains(data_file_path),
+            )
+            .map_err(|e| {
+                format!(
+                    "ivm-a1 lower delta-scan: preload previous deleted positions failed for {}.{}.{} at snapshot {}: {e}",
+                    payload.catalog,
+                    payload.iceberg_namespace,
+                    payload.table,
+                    batch.previous_snapshot_id,
+                )
+            })?
+        } else {
+            std::collections::HashMap::new()
+        };
         let previous_delete_visibility =
             crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
                 &loaded.table,
@@ -158,6 +188,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         Some(DeltaScanDeleteSide {
             base_data_file_lineage,
             previous_delete_visibility,
+            previously_deleted_positions_per_file,
             previous_data_file_lineage,
             deleted_data_file_paths,
         })
@@ -240,39 +271,33 @@ fn build_delta_source_files_from_batch(
             row_id_allow_list: ins.row_id_allow_list.clone(),
         });
     }
+    let mut position_deletes = Vec::with_capacity(batch.deletes.len());
     for del in &batch.deletes {
-        // `referenced_data_file` is the only target identity present on the
-        // PositionDeleteRef. The operator scanner re-derives `data_file_first_row_id`
-        // through `runtime.delete_side.base_data_file_lineage` (preloaded above).
-        let targets = del
-            .referenced_data_file
-            .as_ref()
-            .map(|p| {
-                vec![PositionDeleteTargetData {
-                    data_file_path: p.clone(),
-                    data_file_first_row_id: None,
-                }]
-            })
-            .unwrap_or_default();
-        let file_format = match del.file_format {
-            iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
-            iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
-            other => {
-                return Err(format!(
-                    "ivm-a1 lower delta-scan: position-delete file {} has unsupported \
-                     file_format {:?}; only Parquet and Puffin are supported",
-                    del.delete_file_path, other
-                ));
-            }
-        };
+        position_deletes.push(PositionDeleteSourceData {
+            delete_file_path: del.delete_file_path.clone(),
+            delete_file_size: del.delete_file_size,
+            referenced_data_file: del.referenced_data_file.clone(),
+            file_format: match del.file_format {
+                iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
+                iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
+                other => {
+                    return Err(format!(
+                        "ivm-a1 lower delta-scan: position-delete file {} has unsupported \
+                         file_format {:?}; only Parquet and Puffin are supported",
+                        del.delete_file_path, other
+                    ));
+                }
+            },
+            content_offset: del.content_offset,
+            content_size_in_bytes: del.content_size_in_bytes,
+        });
+    }
+    if let Some(first) = position_deletes.first() {
         out.push(DeltaSourceFile {
-            path: del.delete_file_path.clone(),
-            size: del.delete_file_size,
+            path: first.delete_file_path.clone(),
+            size: 0,
             role: DeltaSourceRole::PositionDelete {
-                targets,
-                file_format,
-                content_offset: del.content_offset,
-                content_size_in_bytes: del.content_size_in_bytes,
+                deletes: position_deletes,
             },
             partition_spec_id: None,
             partition_key: None,

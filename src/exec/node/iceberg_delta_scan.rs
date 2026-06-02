@@ -83,20 +83,7 @@ pub struct DeltaSourceFile {
 pub enum DeltaSourceRole {
     DataFile,
     PositionDelete {
-        targets: Vec<PositionDeleteTargetData>,
-        /// Position-delete encoding: Parquet for the v2 (positional rows)
-        /// format, Puffin for the v3 (deletion vector blob) format. The
-        /// operator dispatches `scan_position_delete_rows_for_targets`
-        /// accordingly. Other variants are rejected at plan time.
-        file_format: PositionDeleteFileFormat,
-        /// Required when `file_format == Puffin`: byte offset of the
-        /// `deletion-vector-v1` blob inside the Puffin file. `None` for
-        /// the Parquet position-delete format.
-        content_offset: Option<i64>,
-        /// Required when `file_format == Puffin`: byte length of the
-        /// `deletion-vector-v1` blob inside the Puffin file. `None` for
-        /// the Parquet position-delete format.
-        content_size_in_bytes: Option<i64>,
+        deletes: Vec<PositionDeleteSourceData>,
     },
     EqualityDelete {
         equality_field_ids: Vec<i32>,
@@ -123,9 +110,22 @@ pub enum PositionDeleteFileFormat {
 }
 
 #[derive(Clone, Debug)]
-pub struct PositionDeleteTargetData {
-    pub data_file_path: String,
-    pub data_file_first_row_id: Option<i64>,
+pub struct PositionDeleteSourceData {
+    pub delete_file_path: String,
+    pub delete_file_size: i64,
+    pub referenced_data_file: Option<String>,
+    /// Position-delete encoding: Parquet for the v2 (positional rows)
+    /// format, Puffin for the v3 (deletion vector blob) format. Other
+    /// variants are rejected at plan time.
+    pub file_format: PositionDeleteFileFormat,
+    /// Required when `file_format == Puffin`: byte offset of the
+    /// `deletion-vector-v1` blob inside the Puffin file. `None` for the
+    /// Parquet position-delete format.
+    pub content_offset: Option<i64>,
+    /// Required when `file_format == Puffin`: byte length of the
+    /// `deletion-vector-v1` blob inside the Puffin file. `None` for the
+    /// Parquet position-delete format.
+    pub content_size_in_bytes: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +171,12 @@ pub struct DeltaScanDeleteSide {
     pub base_data_file_lineage: std::collections::HashMap<String, BaseDataFileLineage>,
     pub(crate) previous_delete_visibility:
         crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    /// Position-delete rows already visible at the previous MV-refresh
+    /// snapshot, keyed by raw Iceberg data-file path. Puffin deletion vectors
+    /// are cumulative replacements, so delta-scan position-delete scanners
+    /// subtract this map before reverse-projecting rows.
+    pub(crate) previously_deleted_positions_per_file:
+        std::collections::HashMap<String, roaring::RoaringTreemap>,
     /// `first_row_id` / `data_sequence_number` index keyed by data-file
     /// path, built from the **previous** MV-refresh snapshot (i.e. the
     /// `from_snapshot_id` of the delta range). Used as a fallback by the

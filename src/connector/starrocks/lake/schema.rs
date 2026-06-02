@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use prost::Message;
+
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
 use crate::formats::starrocks::writer::bundle_meta::{
@@ -229,20 +231,6 @@ where
     };
     register_tablet_runtime(&runtime_ctx)?;
 
-    let standalone_v1_path = standalone_meta_file_path(tablet_root_path, tablet_id, 1)?;
-    if read_bytes_if_exists(&standalone_v1_path)?.is_some() {
-        return Ok(());
-    }
-
-    let latest_version = match load_latest_tablet_metadata(tablet_root_path, tablet_id) {
-        Ok((version, _)) => version,
-        Err(err) if is_missing_tablet_page_in_bundle_error(&err) => 0,
-        Err(err) => return Err(err),
-    };
-    if latest_version > 1 {
-        return Ok(());
-    }
-
     let persistent_index_type = match request.persistent_index_type {
         Some(v) => Some(map_create_tablet_persistent_index_type(v)? as i32),
         None => None,
@@ -270,6 +258,30 @@ where
     tablet_meta.compaction_strategy = compaction_strategy;
     tablet_meta.flat_json_config = flat_json_config;
     seed_tablet_metadata_schema(&mut tablet_meta, &tablet_schema);
+
+    let standalone_v1_path = standalone_meta_file_path(tablet_root_path, tablet_id, 1)?;
+    if let Some(bytes) = read_bytes_if_exists(&standalone_v1_path)? {
+        let existing = TabletMetadataPb::decode(bytes.as_slice()).map_err(|e| {
+            format!(
+                "decode existing standalone tablet metadata failed: path={}, error={}",
+                standalone_v1_path, e
+            )
+        })?;
+        if existing.schema.as_ref() == Some(&tablet_schema) {
+            return Ok(());
+        }
+        return write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta);
+    }
+
+    let latest_version = match load_latest_tablet_metadata(tablet_root_path, tablet_id) {
+        Ok((version, _)) => version,
+        Err(err) if is_missing_tablet_page_in_bundle_error(&err) => 0,
+        Err(err) => return Err(err),
+    };
+    if latest_version > 1 {
+        return Ok(());
+    }
+
     if request.enable_tablet_creation_optimization.unwrap_or(false) {
         let initial_path = initial_meta_file_path(tablet_root_path)?;
         if read_bytes_if_exists(&initial_path)?.is_some() {
@@ -1483,6 +1495,27 @@ mod tests {
         let schema = metadata.schema.expect("schema should be persisted");
         assert_eq!(schema.id, Some(88001));
         assert_eq!(metadata.historical_schemas.get(&88001), Some(&schema));
+    }
+
+    #[test]
+    fn create_tablet_refreshes_stale_standalone_metadata_when_schema_differs() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tablet_id = 41007;
+        let root = temp_dir.path().to_str().expect("temp path to str");
+        let first = build_test_create_tablet_req(tablet_id, false);
+        create_lake_tablet_from_req(&first, root, None).expect("create first tablet");
+
+        let mut second = build_test_create_tablet_req(tablet_id, false);
+        second.tablet_schema.id = Some(88002);
+        second.tablet_schema.schema_hash = 1002;
+        create_lake_tablet_from_req(&second, root, None).expect("refresh stale tablet metadata");
+
+        let metadata = load_tablet_metadata_at_version(root, tablet_id, 1)
+            .expect("load refreshed tablet metadata")
+            .expect("metadata should exist");
+        let schema = metadata.schema.expect("schema should be persisted");
+        assert_eq!(schema.id, Some(88002));
+        assert_eq!(metadata.historical_schemas.get(&88002), Some(&schema));
     }
 
     #[test]

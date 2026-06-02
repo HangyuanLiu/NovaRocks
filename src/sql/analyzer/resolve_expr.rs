@@ -1191,9 +1191,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
                 // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
-                // MAP / STRUCT values. ARRAY values follow StarRocks'
-                // lexicographic ordering and are handled by the nested
-                // comparison executor.
+                // ARRAY / MAP / STRUCT values in standalone SQL. Keep equality
+                // and null-safe equality on ARRAY available, but reject
+                // ordering predicates at analysis time so join predicates fail
+                // before reaching execution.
                 let is_ordering_op = matches!(
                     op,
                     sqlast::BinaryOperator::Lt
@@ -1203,7 +1204,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 );
                 if is_ordering_op {
                     let unsupported_complex_kind = |dt: &DataType| match dt {
-                        DataType::LargeList(_) => Some("ARRAY"),
+                        DataType::List(_)
+                        | DataType::LargeList(_)
+                        | DataType::FixedSizeList(_, _) => Some("ARRAY"),
                         DataType::Map(_, _) => Some("MAP"),
                         DataType::Struct(_) => Some("STRUCT"),
                         _ => None,

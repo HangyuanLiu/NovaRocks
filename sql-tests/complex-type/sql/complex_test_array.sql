@@ -66,6 +66,7 @@ USE sql_tests_complex_test_array;
 select c4 = c5 from array_data_type;
 
 -- query 12
+-- @expect_error=comparison operator
 USE sql_tests_complex_test_array;
 select c4 > c5 from array_data_type;
 
@@ -121,6 +122,7 @@ USE sql_tests_complex_test_array;
 select c6[0] = ['a'] from array_data_type_1;
 
 -- query 22
+-- @expect_error=comparison operator
 USE sql_tests_complex_test_array;
 select c6[0] > array_map((x) -> concat(x, 'a'), c5) from array_data_type_1;
 
