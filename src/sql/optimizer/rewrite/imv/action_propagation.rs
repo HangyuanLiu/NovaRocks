@@ -341,7 +341,15 @@ fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::colu
             .items
             .iter()
             .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-            .map(|item| item.output_column_id),
+            .and_then(|item| {
+                let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
+                    return None;
+                };
+                (*column_id == item.output_column_id
+                    && item.expr.data_type == arrow::datatypes::DataType::Int8
+                    && !item.expr.nullable)
+                    .then_some(item.output_column_id)
+            }),
         LogicalPlan::ImvDelta(node) => branch_output_action_column_id(&node.input),
         LogicalPlan::ImvVersion(node) => branch_output_action_column_id(&node.input),
         _ => None,
@@ -654,6 +662,50 @@ mod tests {
         })
     }
 
+    fn malformed_delta_project_with_action_name(
+        action_id: ColumnId,
+        user_col_id: ColumnId,
+    ) -> LogicalPlan {
+        let mut scan = delta_scan_with_action(action_id);
+        scan.columns[0].column_id = user_col_id;
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
+                input: Box::new(LogicalPlan::Scan(scan)),
+                is_root: false,
+                action_column: Some(action_id),
+            })),
+            items: vec![
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: user_col_id,
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: "k".to_string(),
+                    output_column_id: user_col_id,
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: user_col_id,
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: ImvActionColumn::NAME.to_string(),
+                    output_column_id: action_id,
+                },
+            ],
+            required_output_columns: None,
+        })
+    }
+
     #[test]
     fn propagate_through_project() {
         let rule = PropagateActionColumnRule;
@@ -839,6 +891,26 @@ mod tests {
             inputs: vec![
                 normalized_delta_project(ColumnId(100), ColumnId(1)),
                 normalized_delta_project(ColumnId(101), ColumnId(10)),
+            ],
+            all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
+        });
+
+        assert!(rule.matches(&union, &ctx));
+        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
+        assert!(err.contains("Phase 6"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_fan_in_delta_union_with_malformed_project_action_item() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let union = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                normalized_delta_project(ColumnId(100), ColumnId(1)),
+                malformed_delta_project_with_action_name(ColumnId(100), ColumnId(10)),
             ],
             all: true,
             output_columns: Vec::new(),
