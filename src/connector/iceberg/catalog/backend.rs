@@ -528,7 +528,7 @@ fn hidden_internal_column_names(
     out
 }
 
-fn data_file_with_stats_to_iceberg_data_file_info(
+pub(crate) fn data_file_with_stats_to_iceberg_data_file_info(
     file: super::registry::DataFileWithStats,
 ) -> IcebergDataFileInfo {
     IcebergDataFileInfo {

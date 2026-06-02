@@ -1,6 +1,9 @@
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
+use crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry;
 use crate::connector::scan_planning::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ScanHandle, Split,
 };
@@ -16,13 +19,19 @@ const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;
 const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
+pub(crate) enum IcebergSplitSource {
+    CurrentSnapshot,
+    ExplicitFiles(Vec<IcebergDataFileInfo>),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct IcebergTableHandle {
     pub(crate) catalog: String,
     pub(crate) namespace: String,
     pub(crate) table: String,
     pub(crate) snapshot_id: Option<i64>,
     pub(crate) table_info: IcebergTableInfo,
-    pub(crate) files: Vec<IcebergDataFileInfo>,
+    pub(crate) split_source: IcebergSplitSource,
     pub(crate) column_names: Vec<String>,
 }
 
@@ -70,12 +79,28 @@ use crate::connector::scan_planning::{
     ThriftScanPlan, validate_split_connectors,
 };
 
-#[derive(Debug, Default)]
-pub(crate) struct IcebergConnectorScanPlanner;
+#[derive(Default)]
+pub(crate) struct IcebergConnectorScanPlanner {
+    registry: Option<Arc<RwLock<IcebergCatalogRegistry>>>,
+}
+
+impl fmt::Debug for IcebergConnectorScanPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IcebergConnectorScanPlanner")
+            .field("has_registry", &self.registry.is_some())
+            .finish()
+    }
+}
 
 impl IcebergConnectorScanPlanner {
     pub(crate) fn new() -> Self {
-        Self
+        Self { registry: None }
+    }
+
+    pub(crate) fn with_catalog_registry(registry: Arc<RwLock<IcebergCatalogRegistry>>) -> Self {
+        Self {
+            registry: Some(registry),
+        }
     }
 
     pub(crate) fn table_handle_from_source(
@@ -95,10 +120,91 @@ impl IcebergConnectorScanPlanner {
                 table: table.to_string(),
                 snapshot_id,
                 table_info,
-                files,
+                split_source: IcebergSplitSource::ExplicitFiles(files),
                 column_names,
             },
         )
+    }
+
+    pub(crate) fn table_handle_for_current_snapshot(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        table_info: IcebergTableInfo,
+        column_names: Vec<String>,
+    ) -> TableHandle {
+        TableHandle::new(
+            CONNECTOR_ID,
+            IcebergTableHandle {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                snapshot_id: None,
+                table_info,
+                split_source: IcebergSplitSource::CurrentSnapshot,
+                column_names,
+            },
+        )
+    }
+
+    fn plan_files_for_scan(
+        &self,
+        table: &IcebergTableHandle,
+    ) -> Result<Vec<IcebergDataFileInfo>, String> {
+        match &table.split_source {
+            IcebergSplitSource::ExplicitFiles(files) => Ok(files.clone()),
+            IcebergSplitSource::CurrentSnapshot => self.plan_current_snapshot_files(table),
+        }
+    }
+
+    fn plan_current_snapshot_files(
+        &self,
+        table: &IcebergTableHandle,
+    ) -> Result<Vec<IcebergDataFileInfo>, String> {
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            format!(
+                "Iceberg current-snapshot scan {}.{}.{} requires a catalog registry",
+                table.catalog, table.namespace, table.table
+            )
+        })?;
+        let entry = {
+            let guard = registry
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+            guard.get(&table.catalog)?
+        };
+        let loaded = crate::connector::iceberg::catalog::registry::load_table(
+            &entry,
+            &table.namespace,
+            &table.table,
+        )?;
+        let Some(snapshot_id) = loaded.table.metadata().current_snapshot_id() else {
+            return Ok(vec![]);
+        };
+        let data_files = if let Some(cached) =
+            entry.cached_data_files(&table.namespace, &table.table, Some(snapshot_id))?
+        {
+            cached
+        } else {
+            let extracted =
+                crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                    &loaded.table,
+                    snapshot_id,
+                )?;
+            entry.cache_data_files(
+                &table.namespace,
+                &table.table,
+                Some(snapshot_id),
+                extracted.clone(),
+            )?;
+            extracted
+        };
+        Ok(data_files
+            .into_iter()
+            .map(
+                crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+            )
+            .collect())
     }
 }
 
@@ -124,18 +230,10 @@ impl ConnectorScanPlanner for IcebergConnectorScanPlanner {
         _ctx: SplitPlanningContext,
     ) -> Result<Vec<Split>, String> {
         let scan = iceberg_scan_handle(scan)?;
-        Ok(scan
-            .table
-            .files
-            .iter()
-            .map(|file| {
-                Split::new(
-                    CONNECTOR_ID,
-                    IcebergSplit {
-                        data_file: file.clone(),
-                    },
-                )
-            })
+        Ok(self
+            .plan_files_for_scan(&scan.table)?
+            .into_iter()
+            .map(|file| Split::new(CONNECTOR_ID, IcebergSplit { data_file: file }))
             .collect())
     }
 
@@ -488,6 +586,80 @@ mod tests {
         }
     }
 
+    fn test_iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_uuid: None,
+            current_snapshot_id: Some(7),
+            schema_id: 0,
+            location: "s3://bucket/t".to_string(),
+            schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+        }
+    }
+
+    fn test_data_file(path: &str) -> IcebergDataFileInfo {
+        IcebergDataFileInfo {
+            path: path.to_string(),
+            size: 1,
+            row_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        }
+    }
+
+    #[test]
+    fn current_snapshot_table_handle_does_not_embed_files() {
+        let table_info = test_iceberg_table_info();
+        let handle = IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            "ice",
+            "db",
+            "t",
+            table_info,
+            vec!["id".to_string()],
+        );
+        let inner = handle
+            .downcast_ref::<IcebergTableHandle>()
+            .expect("iceberg table handle");
+
+        assert!(matches!(
+            inner.split_source,
+            IcebergSplitSource::CurrentSnapshot
+        ));
+    }
+
+    #[test]
+    fn explicit_file_table_handle_preserves_files() {
+        let file = test_data_file("s3://bucket/old.parquet");
+        let handle = IcebergConnectorScanPlanner::table_handle_from_source(
+            "ice",
+            "db",
+            "t",
+            Some(7),
+            test_iceberg_table_info(),
+            vec![file.clone()],
+            vec!["id".to_string()],
+        );
+        let inner = handle
+            .downcast_ref::<IcebergTableHandle>()
+            .expect("iceberg table handle");
+
+        let IcebergSplitSource::ExplicitFiles(files) = &inner.split_source else {
+            panic!("expected explicit files");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, file.path);
+    }
+
     #[test]
     fn downcasts_iceberg_scan_and_split() {
         let table = IcebergTableHandle {
@@ -496,7 +668,7 @@ mod tests {
             table: "orders".to_string(),
             snapshot_id: Some(42),
             table_info: dummy_iceberg_table_info(),
-            files: vec![dummy_iceberg_file()],
+            split_source: IcebergSplitSource::ExplicitFiles(vec![dummy_iceberg_file()]),
             column_names: vec!["id".to_string()],
         };
         let scan = ScanHandle::new(
