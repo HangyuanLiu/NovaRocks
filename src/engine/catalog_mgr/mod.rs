@@ -45,7 +45,8 @@ impl CatalogMgr {
         namespace: &str,
         table: &str,
     ) -> Result<(), String> {
-        self.get_catalog(catalog)?.invalidate_table(namespace, table);
+        self.get_catalog(catalog)?
+            .invalidate_table(namespace, table);
         Ok(())
     }
 

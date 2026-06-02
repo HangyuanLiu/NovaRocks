@@ -554,30 +554,11 @@ fn execute_update_match_query(
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal UPDATE match query was not a SELECT".to_string());
     };
-    crate::engine::query_prep::refresh_external_tables_for_query(
+    let result = crate::engine::execute_query_with_catalog_mgr(
         state,
         current_catalog,
         current_database,
         &query,
-    )?;
-    // Clone-then-release: pipeline execution must not hold
-    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let result = crate::engine::execute_query(
-        &query,
-        &catalog_snapshot,
-        &connectors_snapshot,
-        current_database,
-        state.exchange_port,
         None,
     )?;
     matched_update_batch_from_query_result(result)
@@ -1651,30 +1632,11 @@ fn execute_merge_match_query(
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal MERGE match query was not a SELECT".to_string());
     };
-    crate::engine::query_prep::refresh_external_tables_for_query(
+    let result = crate::engine::execute_query_with_catalog_mgr(
         state,
         current_catalog,
         current_database,
         &query,
-    )?;
-    // Clone-then-release: pipeline execution must not hold
-    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let result = crate::engine::execute_query(
-        &query,
-        &catalog_snapshot,
-        &connectors_snapshot,
-        current_database,
-        state.exchange_port,
         None,
     )?;
     let Some(first_chunk) = result.chunks.first() else {

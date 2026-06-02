@@ -1635,10 +1635,8 @@ fn latest_table_metadata_location_local(
         // `<warehouse>/<ns>/<tbl>/metadata/`. A missing directory means the
         // table no longer exists in this catalog (dropped, never created,
         // or pruned externally). Surface this as an "unknown table" error
-        // so callers can distinguish absence from genuine I/O trouble —
-        // notably, `register_external_tables_for_query_impl` uses the
-        // distinction to evict a stale local-catalog entry instead of
-        // hanging onto it.
+        // so callers can distinguish absence from genuine I/O trouble and
+        // evict any stale metadata cache entry instead of hanging onto it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!("unknown iceberg table {ns}.{tbl}"));
         }

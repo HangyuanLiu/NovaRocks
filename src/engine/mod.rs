@@ -107,7 +107,7 @@ pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
     stream_load_engine_cell().get().cloned()
 }
 
-fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
+pub(crate) fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
     state
         .catalog_mgr
         .read()
@@ -115,7 +115,7 @@ fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr
         .clone()
 }
 
-fn build_analyzer_provider<'a>(
+pub(crate) fn build_analyzer_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog: &'a InMemoryCatalog,
     catalog_mgr: &'a catalog_mgr::CatalogMgr,
@@ -1928,48 +1928,6 @@ pub(crate) fn dispatch_statement(
     }
 }
 
-pub(crate) fn register_iceberg_tables_for_query(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-) -> Result<(), String> {
-    crate::engine::query_prep::register_external_tables_for_query(
-        state,
-        current_catalog,
-        current_database,
-        query,
-    )
-}
-
-fn register_iceberg_tables_for_explain(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-) -> Result<(), String> {
-    crate::engine::query_prep::register_external_tables_for_query_with_scan_bindings(
-        state,
-        current_catalog,
-        current_database,
-        query,
-    )
-}
-
-fn refresh_iceberg_tables_for_query(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-) -> Result<(), String> {
-    crate::engine::query_prep::refresh_external_tables_for_query(
-        state,
-        current_catalog,
-        current_database,
-        query,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
@@ -2716,6 +2674,42 @@ pub(crate) fn execute_query(
         connectors,
         current_database,
         exchange_port,
+        query_opts,
+    )
+}
+
+pub(crate) fn execute_query_with_catalog_mgr(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<QueryResult, String> {
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr_snapshot = catalog_mgr_snapshot(state);
+    let analyzer_provider = build_analyzer_provider(
+        current_catalog,
+        &catalog_snapshot,
+        &catalog_mgr_snapshot,
+        &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+    execute_query_with_catalog_provider(
+        query,
+        &analyzer_provider,
+        &catalog_snapshot,
+        &connectors_snapshot,
+        current_database,
+        state.exchange_port,
         query_opts,
     )
 }

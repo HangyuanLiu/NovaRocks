@@ -1283,11 +1283,9 @@ fn add_analyze_status(
 fn ensure_normal_usage(state: &Arc<StandaloneState>, key: &TableKey) -> Result<(), String> {
     // Column-usage tracking is only meaningful for tables registered in the
     // in-memory local catalog (StarRocks tables register on CREATE;
-    // iceberg external tables register at query-prep time). For SELECTs
-    // against iceberg tables that haven't been seen yet — e.g. the very
-    // first SELECT after CREATE TABLE — observe_query runs before
-    // register_external_tables_for_query, so the local catalog has no
-    // entry. Silently skip column-usage tracking in that case.
+    // iceberg external tables resolve through CatalogMgrProvider). For
+    // SELECTs against iceberg tables, the local catalog may have no entry.
+    // Silently skip column-usage tracking in that case.
     let table = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
         match catalog.get(&key.db, &key.table) {

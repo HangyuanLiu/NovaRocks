@@ -7,7 +7,7 @@ use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
     RefreshError, RefreshRequest,
 };
-use crate::engine::{StandaloneState, StatementResult, execute_query};
+use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
@@ -17,10 +17,7 @@ use crate::sql::parser::ast::{
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
 };
-use crate::sql::parser::query_refs::{
-    extract_three_part_table_ref_occurrences, extract_three_part_table_refs,
-    strip_catalog_from_three_part_names,
-};
+use crate::sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 
 fn backend_by_engine(
     state: &Arc<StandaloneState>,
@@ -677,56 +674,26 @@ pub(crate) fn analyze_visible_query(
         );
     };
 
-    // Register iceberg tables referenced by the query so the analyzer can
-    // resolve their column types. Uses the non-forced variant so tables already
-    // present in the local catalog are skipped without touching the iceberg backend.
-    // If registration fails (e.g., iceberg connector unavailable), we only propagate
-    // the error when the table is genuinely missing from the local catalog; if it is
-    // already present the registration failure is harmless and we proceed.
-    //
-    // Safety contract for this swallow path: it is safe ONLY because the production
-    // refresh path (execute_query_for_mv_refresh) separately calls
-    // refresh_external_tables_for_query (force=true) before execution,
-    // ensuring catalog freshness. This analyzer-only path tolerates registration failure
-    // when tables are already cached locally to keep test fixtures simple (tests pre-populate
-    // the catalog without a live iceberg backend). If a non-refresh caller ever invokes this
-    // function, registration failures should be propagated rather than swallowed.
-    let three_parts = extract_three_part_table_refs(&query);
-    if !three_parts.is_empty() {
-        let reg_result = crate::engine::query_prep::register_external_tables_for_query(
-            state,
-            None,
-            current_database,
-            &query,
-        );
-        if let Err(ref reg_err) = reg_result {
-            // Evaluate whether all referenced tables are already resolvable in the
-            // local catalog (after stripping the catalog prefix). If yes, swallow the
-            // registration error because the analyzer will resolve correctly. If not,
-            // propagate it so callers see a meaningful "table not found" error.
-            let catalog = state.catalog.read().expect("standalone catalog read lock");
-            let all_present = three_parts.iter().all(|(_cat, ns, tbl)| {
-                let ns_normalized = crate::engine::catalog::normalize_identifier(ns)
-                    .unwrap_or_else(|_| ns.to_lowercase());
-                let tbl_normalized = crate::engine::catalog::normalize_identifier(tbl)
-                    .unwrap_or_else(|_| tbl.to_lowercase());
-                catalog.get(&ns_normalized, &tbl_normalized).is_ok()
-            });
-            if !all_present {
-                return Err(format!(
-                    "aggregate MV visible type analysis: failed to register iceberg tables: {reg_err}"
-                ));
-            }
-        }
-    }
-
-    let mut analyzable = query.as_ref().clone();
-    if !three_parts.is_empty() {
-        strip_catalog_from_three_part_names(&mut analyzable);
-    }
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let catalog = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr = crate::engine::catalog_mgr_snapshot(state);
+    let provider = crate::engine::build_analyzer_provider(
+        None,
+        &catalog,
+        &catalog_mgr,
+        &connectors,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
     let (resolved, _cte_registry, _factory) =
-        crate::sql::analyzer::analyze(&analyzable, &*catalog, current_database)
+        crate::sql::analyzer::analyze(&query, &provider, current_database)
             .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
     Ok(resolved)
 }
@@ -743,40 +710,7 @@ pub(crate) fn execute_query_for_mv_refresh(
         return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
     };
 
-    let three_parts = extract_three_part_table_refs(&query);
-    if !three_parts.is_empty() {
-        crate::engine::query_prep::refresh_external_tables_for_query(
-            state,
-            None,
-            current_database,
-            &query,
-        )?;
-    }
-
-    let mut executable = query.as_ref().clone();
-    if !three_parts.is_empty() {
-        strip_catalog_from_three_part_names(&mut executable);
-    }
-    // Clone-then-release: pipeline execution must not hold
-    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks.
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    execute_query(
-        &executable,
-        &catalog_snapshot,
-        &connectors_snapshot,
-        current_database,
-        state.exchange_port,
-        None,
-    )
+    crate::engine::execute_query_with_catalog_mgr(state, None, current_database, &query, None)
 }
 
 fn normalize_incremental_mv_base_ref(

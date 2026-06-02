@@ -3991,35 +3991,11 @@ fn run_mv_full_select_result(
             &mut query,
         )?;
     }
-    let three_parts = crate::sql::parser::query_refs::extract_three_part_table_refs(&query);
-    if current_catalog.is_some() || !three_parts.is_empty() {
-        crate::engine::query_prep::refresh_external_tables_for_query(
-            state,
-            current_catalog,
-            current_database,
-            &query,
-        )?;
-    }
-
-    if !three_parts.is_empty() {
-        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-    }
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    crate::engine::execute_query(
-        &query,
-        &catalog_snapshot,
-        &connectors_snapshot,
+    crate::engine::execute_query_with_catalog_mgr(
+        state,
+        current_catalog,
         current_database,
-        state.exchange_port,
+        &query,
         None,
     )
 }
