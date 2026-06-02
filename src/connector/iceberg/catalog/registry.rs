@@ -698,39 +698,10 @@ pub(crate) fn load_table(
         block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
             .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?
-    } else if let Some(s3_config) = &entry.s3_config {
+    } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
-        let (_, root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let meta_prefix = format!(
-            "{}/{}/{}/metadata/",
-            root_prefix.trim_end_matches('/'),
-            ns_name,
-            tbl_name
-        );
-
-        // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
-        // which is the canonical format written by HadoopFileSystemCatalog, with fallback
-        // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
-        let (metadata_file_name, metadata_bytes) = block_on_iceberg(async {
-            let entries = op
-                .list(&meta_prefix)
-                .await
-                .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
-            let file_names: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
-            let latest = choose_latest_metadata_filename(&file_names)
-                .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
-            let path = format!("{meta_prefix}{latest}");
-            let data = op
-                .read(&path)
-                .await
-                .map_err(|e| format!("read metadata {path}: {e}"))?;
-            Ok::<(String, Vec<u8>), String>((latest, data.to_vec()))
-        })
-        .map_err(|e| format!("load table metadata runtime: {e}"))??;
+        let (metadata_file_name, metadata_bytes) =
+            latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?;
 
         let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
@@ -856,6 +827,36 @@ pub(crate) fn load_table(
     }
 
     Ok(loaded)
+}
+
+pub(crate) fn current_schema_id(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+) -> Result<i32, String> {
+    let ns_name = normalize_identifier(namespace_name)?;
+    let tbl_name = normalize_identifier(table_name)?;
+
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+            .map_err(|e| format!("build REST table ident: {e}"))?;
+        let table = block_on_iceberg(async { catalog.load_table(&ident).await })
+            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?;
+        return Ok(table.metadata().current_schema_id());
+    }
+
+    let metadata_bytes = if entry.s3_config.is_some() {
+        latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?.1
+    } else {
+        let metadata_location = latest_table_metadata_location_local(entry, &ns_name, &tbl_name)?;
+        let metadata_path = metadata_location
+            .strip_prefix("file://")
+            .unwrap_or(&metadata_location);
+        std::fs::read(metadata_path).map_err(|e| format!("read local metadata file: {e}"))?
+    };
+    current_schema_id_from_metadata_json(&metadata_bytes, &ns_name, &tbl_name)
 }
 
 pub(crate) fn insert_rows(
@@ -1660,6 +1661,68 @@ fn latest_table_metadata_location_local(
     let latest = choose_latest_metadata_filename(&file_names)
         .map_err(|_| format!("unknown iceberg table {ns}.{tbl}"))?;
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
+}
+
+fn latest_table_metadata_file_s3(
+    entry: &IcebergCatalogEntry,
+    ns_name: &str,
+    tbl_name: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let s3_config = entry
+        .s3_config
+        .as_ref()
+        .ok_or_else(|| "missing S3 config for iceberg metadata load".to_string())?;
+    let op = crate::fs::object_store::build_oss_operator(s3_config)
+        .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
+    let (_, root_prefix) =
+        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    let meta_prefix = format!(
+        "{}/{}/{}/metadata/",
+        root_prefix.trim_end_matches('/'),
+        ns_name,
+        tbl_name
+    );
+
+    // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
+    // which is the canonical format written by HadoopFileSystemCatalog, with fallback
+    // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
+    block_on_iceberg(async {
+        let entries = op
+            .list(&meta_prefix)
+            .await
+            .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
+        let file_names: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
+        let latest = choose_latest_metadata_filename(&file_names)
+            .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
+        let path = format!("{meta_prefix}{latest}");
+        let data = op
+            .read(&path)
+            .await
+            .map_err(|e| format!("read metadata {path}: {e}"))?;
+        Ok::<(String, Vec<u8>), String>((latest, data.to_vec()))
+    })
+    .map_err(|e| format!("load table metadata runtime: {e}"))?
+}
+
+fn current_schema_id_from_metadata_json(
+    metadata_bytes: &[u8],
+    ns_name: &str,
+    tbl_name: &str,
+) -> Result<i32, String> {
+    let metadata: serde_json::Value = serde_json::from_slice(metadata_bytes)
+        .map_err(|e| format!("deserialize iceberg metadata for {ns_name}.{tbl_name}: {e}"))?;
+    let raw = metadata
+        .get("current-schema-id")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            format!("iceberg metadata for {ns_name}.{tbl_name} missing current-schema-id")
+        })?;
+    i32::try_from(raw).map_err(|_| {
+        format!(
+            "iceberg metadata for {ns_name}.{tbl_name} has out-of-range current-schema-id {raw}"
+        )
+    })
 }
 
 fn parse_internal_metadata_version(file_name: &str) -> Option<i32> {
