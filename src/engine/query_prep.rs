@@ -1,5 +1,6 @@
-//! Query preparation that materializes external connector tables into the
-//! standalone in-memory catalog before planning.
+//! Synthetic/local query preparation for time-travel, delta scans, MV helpers,
+//! ANALYZE schema materialization, and CatalogMgr table invalidation. Ordinary
+//! SELECT external tables resolve through CatalogMgrProvider.
 
 use std::sync::Arc;
 

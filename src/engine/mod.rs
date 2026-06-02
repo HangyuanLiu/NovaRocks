@@ -6592,10 +6592,10 @@ enable_path_style_access = true
 
     // -----------------------------------------------------------------------
     // ANALYZE TABLE / ANALYZE FULL TABLE against iceberg external-catalog
-    // tables that were created + populated but never SELECTed from. Iceberg
-    // tables register into the in-memory catalog lazily per SELECT, so the
-    // statistics path must materialize the table itself before resolving its
-    // columns (regression: ANALYZE failed with "unknown table").
+    // tables. Ordinary SELECT resolves external tables through
+    // CatalogMgrProvider and no longer pre-registers them in the local catalog,
+    // so the statistics path must materialize the table itself before reading
+    // local metadata (regression: ANALYZE failed with "unknown table").
     // -----------------------------------------------------------------------
 
     fn iceberg_column_stat_row_count(session: &StandaloneSession, table_name: &str) -> usize {

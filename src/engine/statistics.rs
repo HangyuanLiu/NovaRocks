@@ -433,12 +433,11 @@ fn handle_analyze_statement(
     let lower = sql.to_ascii_lowercase();
     let table = analyze_table_name(sql)?;
     let key = table_key(&table, current_database)?;
-    // Iceberg external tables register into the in-memory catalog lazily at
-    // query-prep time per SELECT. ANALYZE may target a table that was created
-    // and populated but never SELECTed from, so materialize it here before the
-    // schema/stats lookups below (otherwise `table_columns` and the stats
-    // aggregate query fail with "unknown table"). No-op for local/StarRocks
-    // tables, which register on CREATE.
+    // ANALYZE still materializes an external table schema into the local
+    // catalog because the statistics code below reads local catalog metadata.
+    // Ordinary SELECT no longer does this; it resolves external tables through
+    // CatalogMgrProvider. No-op for local/StarRocks tables, which register on
+    // CREATE.
     crate::engine::query_prep::register_external_table_by_name(
         state,
         current_catalog,
@@ -1022,12 +1021,11 @@ fn estimate_insert_source_stats(
     insert_columns: &[String],
     source: &InsertSource,
 ) -> Result<Option<Vec<ColumnStatRow>>, String> {
-    // Stats estimation is only meaningful for tables registered in the
-    // in-memory local catalog (StarRocks tables register themselves on
-    // CREATE; iceberg external tables register themselves at query-prep
-    // time per SELECT). For INSERTs that target an iceberg table without
-    // any prior SELECT, the local catalog has no entry — silently skip
-    // stats estimation in that case rather than aborting the INSERT.
+    // Stats estimation is only meaningful for tables present in the in-memory
+    // local catalog (local/StarRocks tables, or external tables explicitly
+    // materialized by statistics paths such as ANALYZE). Ordinary Iceberg
+    // SELECT resolves through CatalogMgrProvider and may not create local
+    // entries, so skip stats estimation when no local entry exists.
     let table = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
         match catalog.get(&key.db, &key.table) {
