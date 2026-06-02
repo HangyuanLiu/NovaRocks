@@ -21,8 +21,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks::common::network;
@@ -948,8 +948,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch_standalone_role, load_config_and_resolve_role, parse_standalone_server_args,
-        probe_all_backends, resolve_cluster_role, wait_for_tcp_ready, StandaloneServerCliArgs,
+        StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
+        parse_standalone_server_args, probe_all_backends, resolve_cluster_role, wait_for_tcp_ready,
     };
 
     #[test]

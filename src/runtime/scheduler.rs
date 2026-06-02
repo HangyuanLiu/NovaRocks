@@ -54,9 +54,7 @@ use crate::data_sinks::TPlanFragmentDestination;
 use crate::internal_service::TScanRangeParams;
 use crate::partitions::TPartitionType;
 use crate::runtime_filter::TRuntimeFilterProberParams;
-use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentId, RuntimeFilterPlanResult,
-};
+use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentId, RuntimeFilterPlanResult};
 use crate::types::{TNetworkAddress, TUniqueId};
 
 // ---------------------------------------------------------------------------
@@ -489,8 +487,8 @@ mod tests {
     use crate::internal_service;
     use crate::partitions;
     use crate::plan_nodes;
-    use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentEdgeKind, OutputColumn};
     use crate::sql::codegen::RuntimeFilterPlanResult;
+    use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentEdgeKind, OutputColumn};
     use crate::types;
 
     // -----------------------------------------------------------------------
