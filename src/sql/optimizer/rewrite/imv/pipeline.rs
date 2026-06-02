@@ -1,9 +1,9 @@
 //! IMV rewrite pipeline construction.
 //!
-//! Stages run in order: logical normalize, delta marker, join delta, aggregate
-//! state, delta pushdown, scan binding, action propagation, marker cleanup,
-//! validation. Each stage's name is part of the trace contract and is asserted
-//! in pipeline tests.
+//! Stages run in order: logical normalize, delta marker, join delta, union
+//! delta, aggregate state, delta pushdown, scan binding, action propagation,
+//! marker cleanup, validation. Each stage's name is part of the trace contract
+//! and is asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
@@ -18,6 +18,7 @@ use crate::sql::optimizer::rewrite::imv::marker::{
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::InjectRowIdRule;
 use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
+use crate::sql::optimizer::rewrite::imv::union_delta::RewriteUnionAggregateDeltaRule;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
@@ -38,6 +39,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-join-delta",
             RewritePhase::StructuralRewrite,
             vec![Box::new(RewriteJoinAggregateDeltaRule) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-union-delta",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(RewriteUnionAggregateDeltaRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-aggregate-state",
@@ -112,6 +118,10 @@ mod tests {
             .iter()
             .position(|n| *n == "imv-join-delta")
             .expect("join delta stage must exist");
+        let union = names
+            .iter()
+            .position(|n| *n == "imv-union-delta")
+            .expect("union delta stage must exist");
         let agg = names
             .iter()
             .position(|n| *n == "imv-aggregate-state")
@@ -121,7 +131,8 @@ mod tests {
             .position(|n| *n == "imv-delta-pushdown")
             .expect("delta pushdown stage must exist");
 
-        assert!(join < agg, "stage order: {names:?}");
+        assert!(join < union, "stage order: {names:?}");
+        assert!(union < agg, "stage order: {names:?}");
         assert!(agg < pushdown, "stage order: {names:?}");
     }
 }

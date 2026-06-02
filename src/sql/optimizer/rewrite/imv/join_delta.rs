@@ -149,7 +149,10 @@ fn join_output_columns(
     Ok(out)
 }
 
-fn mark_delta_scan(plan: LogicalPlan, action_column: ColumnId) -> Result<LogicalPlan, String> {
+pub(crate) fn mark_delta_scan(
+    plan: LogicalPlan,
+    action_column: ColumnId,
+) -> Result<LogicalPlan, String> {
     mark_scan(plan, MarkerKind::Delta(action_column))
 }
 
@@ -223,7 +226,10 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
     }
 }
 
-fn normalize_branch_output(input: LogicalPlan, output_columns: &[OutputColumn]) -> LogicalPlan {
+pub(crate) fn normalize_branch_output(
+    input: LogicalPlan,
+    output_columns: &[OutputColumn],
+) -> LogicalPlan {
     LogicalPlan::Project(ProjectNode {
         input: Box::new(input),
         items: output_columns
