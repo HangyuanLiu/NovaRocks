@@ -275,9 +275,24 @@ fn union_branch_kind(shape: &IncrementalMvShape) -> Result<UnionBranchKind, Stri
     }
 }
 
-fn validate_union_branch_outputs_compatible(
-    _branches: &[IncrementalMvShape],
-) -> Result<(), String> {
+fn validate_union_branch_outputs_compatible(branches: &[IncrementalMvShape]) -> Result<(), String> {
+    let arity = |shape: &IncrementalMvShape| -> usize {
+        match shape {
+            IncrementalMvShape::Aggregate(a) => a.visible_outputs.len(),
+            _ => usize::MAX,
+        }
+    };
+    let Some(first_branch) = branches.first() else {
+        return Err(union_all_error());
+    };
+    let first = arity(first_branch);
+    if first != usize::MAX {
+        for branch in &branches[1..] {
+            if arity(branch) != first {
+                return Err(union_all_branch_output_mismatch_error());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1927,6 +1942,75 @@ mod tests {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>(),
             vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_top_level_union_all_of_projection_branches() {
+        let shape = classify_sql(
+            "select k1, v2 from ice.ns.t1 where v2 > 0 \
+             union all \
+             select k1, v2 from ice.ns.t2 where v2 < 0",
+        )
+        .expect("union all of projection/filter should be accepted");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(u.branch_kind, UnionBranchKind::ProjectionFilter);
+        assert_eq!(u.branches.len(), 2);
+    }
+
+    #[test]
+    fn flattens_three_branch_union_all() {
+        let shape = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, sum(v2) s from ice.ns.t2 group by k1 \
+             union all select k1, sum(v2) s from ice.ns.t3 group by k1",
+        )
+        .expect("three-branch union all should flatten");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(u.branches.len(), 3);
+    }
+
+    #[test]
+    fn rejects_union_distinct() {
+        let err = classify_sql("select k1 from ice.ns.t1 union select k1 from ice.ns.t2")
+            .expect_err("UNION distinct must be rejected");
+        assert!(err.contains("UNION ALL"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_intersect() {
+        let err = classify_sql("select k1 from ice.ns.t1 intersect select k1 from ice.ns.t2")
+            .expect_err("INTERSECT must be rejected");
+        assert!(
+            err.contains("not supported") || err.contains("UNION ALL"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_aggregate_and_projection_branches() {
+        let err = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, v2 from ice.ns.t2",
+        )
+        .expect_err("mixed shapes must be rejected");
+        assert!(err.contains("same shape"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_arity_mismatch() {
+        let err = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, sum(v2) s, count(*) c from ice.ns.t2 group by k1",
+        )
+        .expect_err("arity mismatch must be rejected");
+        assert!(
+            err.contains("arity") || err.contains("identical output"),
+            "unexpected: {err}"
         );
     }
 
