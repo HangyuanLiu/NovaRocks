@@ -162,16 +162,28 @@ pub(crate) fn create_iceberg_mv(
                 })
                 .collect::<Result<Vec<_>, String>>()?
         }
-        IncrementalMvShape::Aggregate(_) => {
-            let [base_ref] = base_refs.as_slice() else {
-                return Err(
-                    "iceberg-backed aggregate materialized views require exactly one iceberg base table"
-                        .to_string(),
-                );
-            };
-            let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
-            ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
-            vec![(base_ref.clone(), loaded_base)]
+        IncrementalMvShape::Aggregate(aggregate_shape) => {
+            if aggregate_shape.fan_in_bases.is_empty() {
+                let [base_ref] = base_refs.as_slice() else {
+                    return Err(
+                        "iceberg-backed aggregate materialized views require exactly one iceberg base table"
+                            .to_string(),
+                    );
+                };
+                let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
+                ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+                vec![(base_ref.clone(), loaded_base)]
+            } else {
+                validate_aggregate_fan_in_base_refs(aggregate_shape, &base_refs)?;
+                base_refs
+                    .iter()
+                    .map(|base_ref| {
+                        let loaded_base = load_current_iceberg_base_table(state, base_ref)?;
+                        ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
+                        Ok((base_ref.clone(), loaded_base))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            }
         }
         IncrementalMvShape::UnionAll(_) => base_refs
             .iter()
@@ -855,35 +867,93 @@ fn build_iceberg_mv_schema_contract(
             }
         }
         IncrementalMvShape::Aggregate(aggregate_shape) => {
-            let [(base_ref, loaded_base)] = loaded_bases else {
-                return Err(
-                    "aggregate iceberg MV schema contract requires one loaded base".to_string(),
-                );
-            };
-            let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
-                &analysis.resolved_query,
-                loaded_base.table.metadata().current_schema(),
-            )?;
             let layout = build_aggregate_layout_from_analysis(aggregate_shape, analysis)?;
-            crate::meta::repository::mv_contract::MvSchemaContract {
-                contract_version: 3,
-                base: base_contract(base_ref, loaded_base, None, lineage.base_fields.clone()),
-                bases: vec![],
-                output: crate::meta::repository::mv_contract::OutputContract {
-                    columns: lineage.output_columns,
-                    filter: lineage.filter,
-                },
-                join: None,
-                aggregate: Some(aggregate_contract(&layout, target_loaded)?),
-                branch: None,
-                target: target_contract(
-                    analysis,
-                    target,
-                    target_loaded,
-                    actual_apply_key_field_id,
-                    crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                    crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
-                )?,
+            if aggregate_shape.fan_in_bases.is_empty() {
+                let [(base_ref, loaded_base)] = loaded_bases else {
+                    return Err(
+                        "aggregate iceberg MV schema contract requires one loaded base".to_string(),
+                    );
+                };
+                let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+                    &analysis.resolved_query,
+                    loaded_base.table.metadata().current_schema(),
+                )?;
+                crate::meta::repository::mv_contract::MvSchemaContract {
+                    contract_version: 3,
+                    base: base_contract(base_ref, loaded_base, None, lineage.base_fields.clone()),
+                    bases: vec![],
+                    output: crate::meta::repository::mv_contract::OutputContract {
+                        columns: lineage.output_columns,
+                        filter: lineage.filter,
+                    },
+                    join: None,
+                    aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+                    branch: None,
+                    target: target_contract(
+                        analysis,
+                        target,
+                        target_loaded,
+                        actual_apply_key_field_id,
+                        crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                        crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
+                    )?,
+                }
+            } else {
+                let loaded_base_refs = loaded_bases
+                    .iter()
+                    .map(|(base_ref, _)| base_ref.clone())
+                    .collect::<Vec<_>>();
+                validate_aggregate_fan_in_base_refs(aggregate_shape, &loaded_base_refs)?;
+                let base_contracts = loaded_bases
+                    .iter()
+                    .map(|(base_ref, loaded_base)| {
+                        base_contract(
+                            base_ref,
+                            loaded_base,
+                            None,
+                            base_fields_from_current_schema(
+                                loaded_base.table.metadata().current_schema(),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let base = base_contracts.first().cloned().ok_or_else(|| {
+                    "aggregate-over-UNION-ALL iceberg MV schema contract requires loaded bases"
+                        .to_string()
+                })?;
+                crate::meta::repository::mv_contract::MvSchemaContract {
+                    contract_version: 3,
+                    base,
+                    bases: base_contracts,
+                    output: crate::meta::repository::mv_contract::OutputContract {
+                        columns: analysis
+                            .output_columns
+                            .iter()
+                            .map(
+                                |_| crate::meta::repository::mv_contract::OutputColumnLineage {
+                                    expression:
+                                        crate::meta::repository::mv_contract::ExpressionLineage {
+                                            kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
+                                            referenced_base_field_ids: Vec::new(),
+                                            referenced_base_fields: Vec::new(),
+                                        },
+                                },
+                            )
+                            .collect(),
+                        filter: None,
+                    },
+                    join: None,
+                    aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+                    branch: None,
+                    target: target_contract(
+                        analysis,
+                        target,
+                        target_loaded,
+                        actual_apply_key_field_id,
+                        crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                        crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
+                    )?,
+                }
             }
         }
         IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
@@ -9826,166 +9896,20 @@ mod tests {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
-        let select_sql = "SELECT region, sum(amount) AS s
-                          FROM (
-                              SELECT region, amount FROM ice.sales.fact_east
-                              UNION ALL
-                              SELECT region, amount FROM ice.sales.fact_west
-                          ) u
-                          GROUP BY region";
-        let query = parse_select_query(select_sql);
-        let canonical_query =
-            canonicalize_iceberg_mv_select_query(&query, Some("ice"), &env.current_db);
-        let analysis =
-            analyze_mv_select(&env.state, Some("ice"), &env.current_db, &canonical_query)
-                .expect("analyze aggregate-over-UNION-ALL query");
-        let shape = classify_incremental_mv_query(&canonical_query).expect("classify shape");
-        let aggregate_shape = match &shape {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected A-family aggregate shape, got {other:?}"),
-        };
-        assert_eq!(
-            aggregate_shape
-                .fan_in_bases
-                .iter()
-                .map(|name| name.to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "ice.sales.fact_east".to_string(),
-                "ice.sales.fact_west".to_string()
-            ]
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_fact_region
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, sum(amount) AS s
+                FROM (
+                    SELECT region, amount FROM ice.sales.fact_east
+                    UNION ALL
+                    SELECT region, amount FROM ice.sales.fact_west
+                ) u
+                GROUP BY region",
         );
-
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_union_fact_region".to_string(),
-        };
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let target_columns =
-            iceberg_aggregate_target_columns(aggregate_shape, &analysis).expect("target columns");
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            "analytics",
-            "mv_union_fact_region",
-            &target_columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-                (
-                    ICEBERG_MV_PROP_HIDDEN_COLUMNS.to_string(),
-                    "__agg_state_s".to_string(),
-                ),
-            ],
-        )
-        .expect("create aggregate-over-UNION-ALL target table");
-        let target_loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_union_fact_region",
-        )
-        .expect("load target table");
-        let base_refs = parse_iceberg_table_refs(&[
-            "ice.sales.fact_east".to_string(),
-            "ice.sales.fact_west".to_string(),
-        ])
-        .expect("parse base refs");
-        let loaded_bases = base_refs
-            .iter()
-            .map(|base_ref| {
-                let loaded_base =
-                    load_current_iceberg_base_table(&env.state, base_ref).expect("load base");
-                (base_ref.clone(), loaded_base)
-            })
-            .collect::<Vec<_>>();
-        let base_contracts = loaded_bases
-            .iter()
-            .map(|(base_ref, loaded_base)| {
-                base_contract(
-                    base_ref,
-                    loaded_base,
-                    None,
-                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
-                )
-            })
-            .collect::<Vec<_>>();
-        let layout =
-            build_aggregate_layout_from_analysis(aggregate_shape, &analysis).expect("layout");
-        let schema_contract = crate::meta::repository::mv_contract::MvSchemaContract {
-            contract_version: 3,
-            base: base_contracts.first().expect("base contract").clone(),
-            bases: base_contracts,
-            output: crate::meta::repository::mv_contract::OutputContract {
-                columns: analysis
-                    .output_columns
-                    .iter()
-                    .map(
-                        |_| crate::meta::repository::mv_contract::OutputColumnLineage {
-                            expression: crate::meta::repository::mv_contract::ExpressionLineage {
-                                kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
-                                referenced_base_field_ids: Vec::new(),
-                                referenced_base_fields: Vec::new(),
-                            },
-                        },
-                    )
-                    .collect(),
-                filter: None,
-            },
-            join: None,
-            aggregate: Some(
-                aggregate_contract(&layout, &target_loaded).expect("aggregate contract"),
-            ),
-            branch: None,
-            target: target_contract(
-                &analysis,
-                &target,
-                &target_loaded,
-                target_field_id_by_column(&target_loaded, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN)
-                    .expect("row id field"),
-                crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
-            )
-            .expect("target contract"),
-        };
-        schema_contract
-            .ensure_self_consistent()
-            .expect("schema contract self-check");
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let mut txn = provider
-            .begin_write("seed aggregate-over-union mv definition")
-            .expect("write txn");
-        env.state
-            .mv_repo
-            .create_definition(
-                txn.as_mut(),
-                CreateMvDefinitionRequest {
-                    select_sql: select_sql.to_string(),
-                    base_table_refs: vec![
-                        "ice.sales.fact_east".to_string(),
-                        "ice.sales.fact_west".to_string(),
-                    ],
-                    primary_key_columns: Vec::new(),
-                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
-                    target_catalog: Some("ice".to_string()),
-                    target_namespace: Some("analytics".to_string()),
-                    target_table: Some("mv_union_fact_region".to_string()),
-                    schema_contract: Some(schema_contract),
-                    partition_spec: None,
-                    created_at_ms: now_ms(),
-                },
-            )
-            .expect("create aggregate-over-union mv definition");
-        txn.commit()
-            .expect("commit aggregate-over-union mv definition");
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate-over-UNION-ALL iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
         let target = crate::engine::mv::lifecycle::MvTarget {
