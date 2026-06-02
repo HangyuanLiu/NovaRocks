@@ -2569,7 +2569,8 @@ fn prepare_explain_query(
     let mut prepared = query.clone();
     self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
 
-    // Time-travel: rewrite version clauses before Iceberg registration.
+    // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
+    // remain untouched and resolve through CatalogMgrProvider during analysis.
     if has_time_travel_refs(&prepared) {
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
@@ -6675,13 +6676,12 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn select_resolves_iceberg_table_referenced_only_in_join_on_subquery() {
+    fn select_resolves_join_on_subquery_iceberg_table_without_local_registration() {
         // Engine gap #4 (join_apply_to_join q7): a table referenced ONLY inside
-        // a subquery nested in a JOIN ON predicate must be registered into the
-        // in-memory catalog at query-prep time, exactly like FROM/WHERE
-        // subqueries. Before the fix the query-prep table-reference collection
-        // did not descend into JOIN ON predicates, so `t2` was never
-        // registered and the SELECT failed with `unknown table: t2`.
+        // a subquery nested in a JOIN ON predicate must resolve through the
+        // catalog-aware provider, exactly like FROM/WHERE subqueries. This
+        // SELECT must not materialize ordinary Iceberg tables into the local
+        // in-memory catalog.
         let warehouse = TempDir::new().expect("warehouse");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
         let session = engine.session();
@@ -6729,11 +6729,12 @@ enable_path_style_access = true
             )
             .expect("SELECT with ON-clause subquery table must resolve, not error unknown table");
 
-        // The ON-clause-only table is now materialized in the in-memory
-        // catalog, and the query produced a count row.
+        // The ON-clause-only table resolved through CatalogMgrProvider without
+        // being materialized in the in-memory catalog, and the query produced a
+        // count row.
         assert!(
-            engine.has_local_table("db1", "t2"),
-            "ON-clause-subquery table t2 must be registered during query-prep",
+            !engine.has_local_table("db1", "t2"),
+            "ON-clause-subquery table t2 must not be locally registered",
         );
         match result {
             StatementResult::Query(query_result) => {
