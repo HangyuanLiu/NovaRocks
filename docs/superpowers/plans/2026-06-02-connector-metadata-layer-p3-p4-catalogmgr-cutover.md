@@ -1317,34 +1317,167 @@ cargo clippy --lib
 
 Expected: build passes; clippy has no new warnings in touched P3/P4 files.
 
-- [ ] **Step 4: Run Iceberg REST SQL smoke**
+- [ ] **Step 4: Start the generated Iceberg REST runtime and standalone server**
 
 Run:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
+LOG=/tmp/novarocks-p3-p4-server.log
 NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone-server \
-  --config "$NOVAROCKS_STANDALONE_CONFIG" > /tmp/novarocks-p3-p4-server.log 2>&1 &
+  --config "$NOVAROCKS_STANDALONE_CONFIG" > "$LOG" 2>&1 &
 SRV_PID=$!
 for i in $(seq 1 60); do
-  if grep -q '^NOVAROCKS_READY ' /tmp/novarocks-p3-p4-server.log; then break; fi
+  if grep -q '^NOVAROCKS_READY ' "$LOG"; then break; fi
   if ! kill -0 "$SRV_PID" 2>/dev/null; then
-    tail -40 /tmp/novarocks-p3-p4-server.log >&2
+    tail -40 "$LOG" >&2
     exit 1
   fi
   sleep 1
 done
-grep -q '^NOVAROCKS_READY ' /tmp/novarocks-p3-p4-server.log
+grep -q '^NOVAROCKS_READY ' "$LOG"
+```
+
+Expected: server prints `NOVAROCKS_READY mysql_port=...` for the generated worktree port.
+
+- [ ] **Step 5: Run the P3 concurrency regression gate**
+
+Prepare the SQL test runner and bootstrap SSB data once against the running server:
+
+```bash
+cargo build --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests
+SQL_TEST_RUNNER=tests/sql-test-runner/target/debug/sql-tests
+
+"$SQL_TEST_RUNNER" \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite ssb \
+  --only q2.1 \
+  --mode verify \
+  --query-timeout 120 \
+  -j 1
+```
+
+Run the original SSB q2.1 reproduction shape without allowing concurrent benchmark bootstrap:
+
+```bash
+for worker in $(seq 1 8); do
+  (
+    for iter in $(seq 1 10); do
+      "$SQL_TEST_RUNNER" \
+        --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+        --suite ssb \
+        --only q2.1 \
+        --mode verify \
+        --no-auto-bootstrap-benchmark-data \
+        --query-timeout 120 \
+        -j 1
+    done
+  ) >"/tmp/novarocks-q21-worker-${worker}.log" 2>&1 &
+done
+wait
+```
+
+Expected: all 8 workers complete 10/10 iterations with 0 `unknown table` failures.
+
+- [ ] **Step 6: Run the SSB parallel suite gate**
+
+Run:
+
+```bash
+"$SQL_TEST_RUNNER" \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite ssb \
+  --mode verify \
+  --no-auto-bootstrap-benchmark-data \
+  --query-timeout 120 \
+  -j 8
+```
+
+Expected: `ssb` passes under parallel case execution.
+
+- [ ] **Step 7: Run schema freshness gates**
+
+Run the in-process schema evolution case:
+
+```bash
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-rest --mode verify
+  --suite iceberg-rest \
+  --only iceberg_rest_schema_evolution \
+  --mode verify \
+  --query-timeout 120 \
+  -j 1
+```
+
+Run the Spark-written external schema evolution case:
+
+```bash
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility \
+  --only spark_rest_minio_v3_schema_evolution \
+  --mode verify \
+  --query-timeout 180 \
+  -j 1
+```
+
+Expected: the local `ALTER`/write path sees the new schema after invalidation, and Spark schema changes are visible through `schema_id` validation.
+
+- [ ] **Step 8: Run the full spec SQL regression gate**
+
+Run:
+
+```bash
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg \
+  --mode verify \
+  --query-timeout 120 \
+  -j 1
+
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-rest \
+  --mode verify \
+  --query-timeout 120 \
+  -j 1
+
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite iceberg-compatibility \
+  --mode verify \
+  --query-timeout 180 \
+  -j 1
+
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite join \
+  --mode verify \
+  --query-timeout 60 \
+  -j 1
+
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite tpc-h \
+  --mode verify \
+  --query-timeout 120 \
+  -j 1
+```
+
+Expected: all required spec suites pass with no regressions.
+
+- [ ] **Step 9: Stop the standalone server**
+
+Run:
+
+```bash
 kill -INT "$SRV_PID"
 ```
 
-Expected: `iceberg-rest` passes 10/10.
+Expected: the standalone server exits cleanly.
 
-- [ ] **Step 5: Final search for forbidden boundary regressions**
+- [ ] **Step 10: Final search for forbidden boundary regressions**
 
 Run:
 
@@ -1357,9 +1490,9 @@ Expected:
 - First command returns no matches.
 - Second command returns no matches after Task 6 cleanup.
 
-- [ ] **Step 6: Final commit if verification required fixes**
+- [ ] **Step 11: Final commit if verification required fixes**
 
-Only if Step 1-5 required fixes, stage the files changed by those fixes explicitly. For example, if the fix touches the analyzer provider and engine wiring:
+Only if Step 1-10 required fixes, stage the files changed by those fixes explicitly. For example, if the fix touches the analyzer provider and engine wiring:
 
 ```bash
 git add src/engine/catalog_mgr/provider.rs src/engine/mod.rs
@@ -1377,7 +1510,11 @@ git commit -m "chore(catalog-mgr): verify P3 P4 cutover"
 5. `CREATE CATALOG`, metadata restore, and `DROP CATALOG` update `CatalogMgr`.
 6. `src/lower/**` has no `catalog_mgr` dependency.
 7. Normal query-prep external-table drop/register helpers are removed or reduced to synthetic time-travel/local cleanup only.
-8. Targeted unit tests, `cargo build`, `cargo clippy --lib`, and `iceberg-rest` SQL smoke pass.
+8. Targeted unit tests, `cargo build`, and `cargo clippy --lib` pass.
+9. P3 concurrency regression gate passes with 8 workers x 10 q2.1 iterations and 0 failures.
+10. `ssb` passes under `-j 8` parallel verify.
+11. Schema freshness passes for both in-process Iceberg REST schema evolution and Spark-written `iceberg-compatibility` schema evolution.
+12. Full spec SQL regression gate passes for `iceberg`, `iceberg-rest`, `iceberg-compatibility`, `join`, and `tpc-h`.
 
 ## Risks and Mitigations
 
