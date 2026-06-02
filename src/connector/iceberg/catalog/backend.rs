@@ -16,10 +16,10 @@ use crate::sql::catalog::{
 use crate::sql::parser::ast::Literal;
 
 use super::registry::{
-    create_namespace as reg_create_namespace, create_table as reg_create_table,
-    drop_namespace as reg_drop_namespace, drop_table as reg_drop_table,
-    insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
-    namespace_exists as reg_namespace_exists, IcebergCatalogEntry, IcebergCatalogRegistry,
+    IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
+    create_table as reg_create_table, drop_namespace as reg_drop_namespace,
+    drop_table as reg_drop_table, insert_rows as reg_insert_rows, list_tables as reg_list_tables,
+    load_table as reg_load_table, namespace_exists as reg_namespace_exists,
 };
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
@@ -754,12 +754,9 @@ mod tests {
         properties: HashMap<String, String>,
     ) -> IcebergLoadedTable {
         let schema = Schema::builder()
-            .with_fields(vec![NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Long),
-            )
-            .into()])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
             .build()
             .expect("schema");
         let metadata = TableMetadataBuilder::new(
