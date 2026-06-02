@@ -417,6 +417,13 @@ pub(crate) fn refresh_external_tables_for_query(
     register_external_tables_for_query_impl(state, current_catalog, current_database, query, true)
 }
 
+fn build_registration_table_def(
+    source: &dyn crate::connector::backend::TableSource,
+    resolved: &crate::connector::backend::ResolvedTable,
+) -> Result<TableDef, String> {
+    source.build_schema_table_def(resolved)
+}
+
 /// Materialize a single external connector table into the standalone in-memory
 /// catalog so that statement paths which do not run through the SELECT
 /// query-prep flow (e.g. `ANALYZE TABLE` / `ANALYZE FULL TABLE`) can still
@@ -480,7 +487,7 @@ pub(crate) fn register_external_table_by_name(
                 target.catalog, target.namespace, target.table
             )
         })?;
-    let table_def = source.build_table_def(&resolved)?;
+    let table_def = build_registration_table_def(source.as_ref(), &resolved)?;
     register_external_table(state, &target.namespace, table_def)
 }
 
@@ -560,7 +567,7 @@ fn register_external_tables_for_query_impl(
                 continue;
             }
         };
-        let table_def = source.build_table_def(&resolved)?;
+        let table_def = build_registration_table_def(source.as_ref(), &resolved)?;
         register_external_table(state, &target.namespace, table_def)?;
     }
 
@@ -892,6 +899,53 @@ mod tests {
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
         }
+    }
+
+    #[test]
+    fn registration_table_def_uses_schema_only_table_source() {
+        struct SchemaOnlySource;
+        impl crate::connector::backend::TableSource for SchemaOnlySource {
+            fn name(&self) -> &'static str {
+                "iceberg"
+            }
+
+            fn build_table_def(
+                &self,
+                _table: &crate::connector::backend::ResolvedTable,
+            ) -> Result<TableDef, String> {
+                Err("scan-binding path must not be used for registration".to_string())
+            }
+
+            fn build_schema_table_def(
+                &self,
+                table: &crate::connector::backend::ResolvedTable,
+            ) -> Result<TableDef, String> {
+                Ok(TableDef {
+                    name: table.table.clone(),
+                    columns: table.columns.clone(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![],
+                        cloud_properties: Default::default(),
+                    },
+                })
+            }
+        }
+
+        let resolved = crate::connector::backend::ResolvedTable {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            columns: vec![],
+        };
+        let table_def = super::build_registration_table_def(&SchemaOnlySource, &resolved)
+            .expect("schema-only registration");
+
+        let ScanSource::IcebergDataFiles { files, .. } = table_def.source else {
+            panic!("expected iceberg source");
+        };
+        assert!(files.is_empty());
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {

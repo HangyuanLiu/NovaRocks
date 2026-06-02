@@ -328,6 +328,7 @@ fn iceberg_table_info(
 fn add_iceberg_equality_delete_required_columns(
     required: &mut std::collections::HashSet<String>,
     table: &crate::sql::catalog::TableDef,
+    planned_scan: Option<&crate::sql::codegen::resolve::PlannedConnectorScan>,
 ) -> Result<(), String> {
     let crate::sql::catalog::ScanSource::IcebergDataFiles {
         table: iceberg,
@@ -343,27 +344,43 @@ fn add_iceberg_equality_delete_required_columns(
         .iter()
         .map(|field| (field.field_id, field.name.clone()))
         .collect();
-    for file in files {
-        for delete_file in &file.delete_files {
-            if delete_file.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
-                continue;
-            }
-            if delete_file.equality_field_ids.is_empty() {
-                for column in &delete_file.equality_column_names {
+    let mut add_required_columns_for_file =
+        |file: &crate::sql::catalog::IcebergDataFileInfo| -> Result<(), String> {
+            for delete_file in &file.delete_files {
+                if delete_file.file_content
+                    != crate::sql::catalog::IcebergDeleteFileContent::Equality
+                {
+                    continue;
+                }
+                if delete_file.equality_field_ids.is_empty() {
+                    for column in &delete_file.equality_column_names {
+                        required.insert(column.to_lowercase());
+                    }
+                    continue;
+                }
+                for field_id in &delete_file.equality_field_ids {
+                    let Some(column) = field_id_to_name.get(field_id) else {
+                        return Err(format!(
+                            "iceberg equality-delete file {} references unknown field id {} in table {}",
+                            delete_file.path, field_id, table.name
+                        ));
+                    };
                     required.insert(column.to_lowercase());
                 }
-                continue;
             }
-            for field_id in &delete_file.equality_field_ids {
-                let column = field_id_to_name.get(field_id).ok_or_else(|| {
-                    format!(
-                        "iceberg equality-delete file {} references unknown field id {} in table {}",
-                        delete_file.path, field_id, table.name
-                    )
-                })?;
-                required.insert(column.to_lowercase());
-            }
+            Ok(())
+        };
+
+    if let Some(planned_scan) = planned_scan {
+        for split in &planned_scan.splits {
+            let split = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
+            add_required_columns_for_file(&split.data_file)?;
         }
+        return Ok(());
+    }
+
+    for file in files {
+        add_required_columns_for_file(file)?;
     }
     Ok(())
 }
@@ -1085,14 +1102,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut iceberg_metadata_pseudo_column_slots = BTreeSet::new();
 
         // Determine which columns to emit
-        let mut required: Option<std::collections::HashSet<String>> = op
-            .required_columns
-            .as_ref()
-            .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
-        if let Some(required) = required.as_mut() {
-            add_iceberg_equality_delete_required_columns(required, &table)?;
-        }
-
         let planned_scan = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
                 let planner = self.connectors.scan_planner("starrocks")?;
@@ -1138,6 +1147,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             _ => None,
         };
+        let mut required: Option<std::collections::HashSet<String>> = op
+            .required_columns
+            .as_ref()
+            .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
+        if let Some(required) = required.as_mut() {
+            add_iceberg_equality_delete_required_columns(required, &table, planned_scan.as_ref())?;
+        }
         let scan_table_id = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { table_id, .. } => Some(*table_id),
             _ => iceberg_table_info(&table.source)
@@ -5776,7 +5792,8 @@ mod tests {
             ],
         );
 
-        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("resolve ids");
+        add_iceberg_equality_delete_required_columns(&mut required, &table, None)
+            .expect("resolve ids");
 
         assert!(required.contains("id"));
         assert!(required.contains("category"));
@@ -5800,7 +5817,8 @@ mod tests {
             }],
         );
 
-        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("legacy names");
+        add_iceberg_equality_delete_required_columns(&mut required, &table, None)
+            .expect("legacy names");
 
         assert!(required.contains("id"));
         assert!(required.contains("category"));
@@ -5821,10 +5839,89 @@ mod tests {
             }],
         );
 
-        let err = add_iceberg_equality_delete_required_columns(&mut required, &table)
+        let err = add_iceberg_equality_delete_required_columns(&mut required, &table, None)
             .expect_err("unknown field id");
 
         assert!(err.contains("unknown field id 99"), "{err}");
+    }
+
+    #[test]
+    fn equality_delete_required_columns_are_added_from_planned_iceberg_splits() {
+        let iceberg_schema_fields = vec![
+            IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "id".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![],
+            },
+            IcebergSchemaFieldDef {
+                field_id: 3,
+                name: "category".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![],
+            },
+        ];
+        let mut planned_file = iceberg_i32_file("s3://bucket/current.parquet", 1, 1);
+        planned_file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
+        let table = TableDef {
+            name: "ice_t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "category".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info_with_schema(iceberg_schema_fields),
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+            },
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table,
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: Some(vec!["id".to_string()]),
+                dict_columns: vec![],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(vec![planned_file]),
+            "default",
+        )
+        .expect("build Iceberg fragment");
+        let root = build.fragment_results.first().expect("root fragment");
+
+        assert!(
+            slot_id_by_name_opt(&root.desc_tbl, "category").is_some(),
+            "equality-delete column must be scanned even when registered Iceberg files are empty"
+        );
     }
 
     #[test]
