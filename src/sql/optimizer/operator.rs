@@ -183,13 +183,18 @@ pub(crate) struct LogicalWindowOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalUnionOp {
     pub all: bool,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalIntersectOp;
+pub(crate) struct LogicalIntersectOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalExceptOp;
+pub(crate) struct LogicalExceptOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalValuesOp {
@@ -213,12 +218,6 @@ pub(crate) struct LogicalTableFunctionOp {
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalSubqueryAliasOp {
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,13 +395,18 @@ pub(crate) struct PhysicalRepeatOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalUnionOp {
     pub all: bool,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalIntersectOp;
+pub(crate) struct PhysicalIntersectOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalExceptOp;
+pub(crate) struct PhysicalExceptOp {
+    pub output_columns: Vec<OutputColumn>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalValuesOp {
@@ -426,12 +430,6 @@ pub(crate) struct PhysicalTableFunctionOp {
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PhysicalSubqueryAliasOp {
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
 }
 
 /// Physical counterpart of [`LogicalDecodeOp`]. The codegen step (Task 6)
@@ -468,7 +466,6 @@ pub(crate) enum Operator {
     LogicalValues(LogicalValuesOp),
     LogicalGenerateSeries(LogicalGenerateSeriesOp),
     LogicalTableFunction(LogicalTableFunctionOp),
-    LogicalSubqueryAlias(LogicalSubqueryAliasOp),
     LogicalRepeat(LogicalRepeatOp),
     LogicalCTEAnchor(LogicalCTEAnchorOp),
     LogicalCTEProduce(LogicalCTEProduceOp),
@@ -497,7 +494,6 @@ pub(crate) enum Operator {
     PhysicalValues(PhysicalValuesOp),
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
     PhysicalTableFunction(PhysicalTableFunctionOp),
-    PhysicalSubqueryAlias(PhysicalSubqueryAliasOp),
     PhysicalDecode(PhysicalDecodeOp),
 }
 
@@ -520,7 +516,6 @@ impl Operator {
                 | Operator::LogicalValues(_)
                 | Operator::LogicalGenerateSeries(_)
                 | Operator::LogicalTableFunction(_)
-                | Operator::LogicalSubqueryAlias(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)

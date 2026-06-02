@@ -232,11 +232,6 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlan::SubqueryAlias(s) => s
-            .output_columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
         LogicalPlan::Repeat(r) => collect_output_columns(&r.input),
         LogicalPlan::CTEConsume(c) => c
             .output_columns
@@ -384,7 +379,6 @@ pub(crate) fn collect_output_ids_ordered(
             .collect(),
         LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::SubqueryAlias(s) => s.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
         LogicalPlan::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
@@ -654,14 +648,6 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 out.insert((None, col.name.to_lowercase()));
             }
         }
-        LogicalPlan::SubqueryAlias(s) => {
-            let alias_lower = s.alias.to_lowercase();
-            for c in &s.output_columns {
-                let col = c.name.to_lowercase();
-                out.insert((Some(alias_lower.clone()), col.clone()));
-                out.insert((None, col));
-            }
-        }
         LogicalPlan::Repeat(r) => collect_qualified_output_columns_inner(&r.input, out),
         LogicalPlan::CTEConsume(c) => {
             let alias_lower = c.alias.to_lowercase();
@@ -713,16 +699,28 @@ fn unwrap_column_ref(expr: &TypedExpr) -> Option<&TypedExpr> {
 /// owned by exactly one side (constants, expressions, ambiguous self-join refs).
 fn classify_operand(
     expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<QualifiedRef>,
     right_cols: &HashSet<QualifiedRef>,
 ) -> Option<(JoinSide, TypedExpr)> {
     let inner = unwrap_column_ref(expr)?;
     let ExprKind::ColumnRef {
-        qualifier, column, ..
+        column_id,
+        qualifier,
+        column,
     } = &inner.kind
     else {
         unreachable!("unwrap_column_ref only returns a ColumnRef expression");
     };
+    if *column_id != crate::sql::column_id::ColumnId::UNSET {
+        match (left_ids.contains(column_id), right_ids.contains(column_id)) {
+            (true, false) => return Some((JoinSide::Left, inner.clone())),
+            (false, true) => return Some((JoinSide::Right, inner.clone())),
+            _ => {}
+        }
+    }
+
     let key = (
         qualifier.as_ref().map(|q| q.to_lowercase()),
         column.to_lowercase(),
@@ -743,13 +741,24 @@ pub(crate) fn join_equi_keys(join: &JoinNode) -> Vec<JoinEquiKey> {
     };
     let left_cols = collect_qualified_output_columns(&join.left);
     let right_cols = collect_qualified_output_columns(&join.right);
+    let left_ids = collect_output_ids(&join.left);
+    let right_ids = collect_output_ids(&join.right);
     let mut keys = Vec::new();
-    collect_join_equi_keys(condition, &left_cols, &right_cols, &mut keys);
+    collect_join_equi_keys(
+        condition,
+        &left_ids,
+        &right_ids,
+        &left_cols,
+        &right_cols,
+        &mut keys,
+    );
     keys
 }
 
 fn collect_join_equi_keys(
     expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
     left_cols: &HashSet<QualifiedRef>,
     right_cols: &HashSet<QualifiedRef>,
     keys: &mut Vec<JoinEquiKey>,
@@ -760,8 +769,8 @@ fn collect_join_equi_keys(
             op: BinOp::And,
             right,
         } => {
-            collect_join_equi_keys(left, left_cols, right_cols, keys);
-            collect_join_equi_keys(right, left_cols, right_cols, keys);
+            collect_join_equi_keys(left, left_ids, right_ids, left_cols, right_cols, keys);
+            collect_join_equi_keys(right, left_ids, right_ids, left_cols, right_cols, keys);
         }
         // Only strict `Eq`. `EqForNull` (<=>) is null-safe (NULL <=> NULL is
         // true), so deriving IS NOT NULL on its operands would change results;
@@ -771,8 +780,8 @@ fn collect_join_equi_keys(
             op: BinOp::Eq,
             right,
         } => match (
-            classify_operand(left, left_cols, right_cols),
-            classify_operand(right, left_cols, right_cols),
+            classify_operand(left, left_ids, right_ids, left_cols, right_cols),
+            classify_operand(right, left_ids, right_ids, left_cols, right_cols),
         ) {
             (Some((JoinSide::Left, le)), Some((JoinSide::Right, re)))
             | (Some((JoinSide::Right, re)), Some((JoinSide::Left, le))) => {
@@ -790,7 +799,7 @@ fn collect_join_equi_keys(
 #[cfg(test)]
 mod column_id_helper_tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, OutputColumn};
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
@@ -1229,6 +1238,58 @@ mod column_id_helper_tests {
         );
         assert!(
             matches!(&keys[0].right.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "b")
+        );
+    }
+
+    fn derived_project_with_output_id(name: &str, source_id: u32, output_id: u32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(source_id),
+                    name: format!("{name}_source"),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                required_output_columns: None,
+            })),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::new_for_test(source_id),
+                        qualifier: None,
+                        column: format!("{name}_source"),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: true,
+                },
+                output_name: "k".to_string(),
+                output_column_id: ColumnId::new_for_test(output_id),
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn join_equi_keys_classifies_alias_free_project_outputs_by_column_id() {
+        let join = JoinNode {
+            left: Box::new(derived_project_with_output_id("left", 11, 101)),
+            right: Box::new(derived_project_with_output_id("right", 22, 202)),
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            condition: Some(eq_expr(qcol("a", "k", 101), qcol("b", "k", 202))),
+            required_output_columns: None,
+        };
+
+        let keys = join_equi_keys(&join);
+        assert_eq!(keys.len(), 1);
+        assert!(
+            matches!(&keys[0].left.kind, ExprKind::ColumnRef { column_id, qualifier: Some(q), column, .. }
+                if *column_id == ColumnId::new_for_test(101) && q == "a" && column == "k")
+        );
+        assert!(
+            matches!(&keys[0].right.kind, ExprKind::ColumnRef { column_id, qualifier: Some(q), column, .. }
+                if *column_id == ColumnId::new_for_test(202) && q == "b" && column == "k")
         );
     }
 }

@@ -153,11 +153,6 @@ pub(crate) fn derive_statistics(
         }
 
         Operator::LogicalWindow(_) => {
-            // Window preserves row count.
-            child_statistics(memo, &expr.children, 0)
-        }
-
-        Operator::LogicalSubqueryAlias(_) => {
             // Passthrough child stats.
             child_statistics(memo, &expr.children, 0)
         }
@@ -491,7 +486,6 @@ pub(crate) fn derive_statistics(
         }
 
         Operator::PhysicalWindow(_) => child_statistics(memo, &expr.children, 0),
-        Operator::PhysicalSubqueryAlias(_) => child_statistics(memo, &expr.children, 0),
 
         Operator::PhysicalDistribution(_) => {
             // Distribution enforcer preserves row count.
@@ -1005,7 +999,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalAggregate(a) => a.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
-        Operator::LogicalSubqueryAlias(s) => s.output_columns.clone(),
         // Decode renames dict->string and therefore breaks the
         // child-passthrough invariant the rest of the rename-free
         // operators rely on. Return the operator's stored output_columns
@@ -1066,18 +1059,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
 
-        // Union/Intersect/Except: use first child's output columns.
-        Operator::LogicalUnion(_) | Operator::LogicalIntersect(_) | Operator::LogicalExcept(_) => {
-            if let Some(&child_id) = expr.children.first() {
-                memo.groups[child_id]
-                    .logical_props
-                    .as_ref()
-                    .map(|p| p.output_columns.clone())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        }
+        Operator::LogicalUnion(op) => op.output_columns.clone(),
+        Operator::LogicalIntersect(op) => op.output_columns.clone(),
+        Operator::LogicalExcept(op) => op.output_columns.clone(),
 
         // Physical operator counterparts.
         Operator::PhysicalScan(s) => s.columns.clone(),
@@ -1104,7 +1088,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
-        Operator::PhysicalSubqueryAlias(s) => s.output_columns.clone(),
         // Decode renames dict->string; see the LogicalDecode arm above.
         Operator::PhysicalDecode(d) => d.output_columns.clone(),
         Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
@@ -1170,19 +1153,9 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 .unwrap_or_default();
             widen_for_join_kind(j.join_type, left_cols, right_cols)
         }
-        Operator::PhysicalUnion(_)
-        | Operator::PhysicalIntersect(_)
-        | Operator::PhysicalExcept(_) => {
-            if let Some(&child_id) = expr.children.first() {
-                memo.groups[child_id]
-                    .logical_props
-                    .as_ref()
-                    .map(|p| p.output_columns.clone())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        }
+        Operator::PhysicalUnion(op) => op.output_columns.clone(),
+        Operator::PhysicalIntersect(op) => op.output_columns.clone(),
+        Operator::PhysicalExcept(op) => op.output_columns.clone(),
     }
 }
 

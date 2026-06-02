@@ -5,8 +5,7 @@ use super::operator::{
     LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp, LogicalCTEProduceOp,
     LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp,
     LogicalJoinOp, LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
-    LogicalSubqueryAliasOp, LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp,
-    LogicalWindowOp, Operator,
+    LogicalTableFunctionOp, LogicalUnionOp, LogicalValuesOp, LogicalWindowOp, Operator,
 };
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -124,7 +123,10 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalUnion(LogicalUnionOp { all: node.all });
+            let op = Operator::LogicalUnion(LogicalUnionOp {
+                all: node.all,
+                output_columns: node.output_columns.clone(),
+            });
             let expr = MExpr {
                 id: memo.next_expr_id(),
                 op,
@@ -139,7 +141,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalIntersect(LogicalIntersectOp);
+            let op = Operator::LogicalIntersect(LogicalIntersectOp {
+                output_columns: node.output_columns.clone(),
+            });
             let expr = MExpr {
                 id: memo.next_expr_id(),
                 op,
@@ -154,7 +158,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
-            let op = Operator::LogicalExcept(LogicalExceptOp);
+            let op = Operator::LogicalExcept(LogicalExceptOp {
+                output_columns: node.output_columns.clone(),
+            });
             let expr = MExpr {
                 id: memo.next_expr_id(),
                 op,
@@ -213,20 +219,6 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let child = logical_plan_to_memo(&node.input, memo);
             let op = Operator::LogicalWindow(LogicalWindowOp {
                 window_exprs: node.window_exprs.clone(),
-                output_columns: node.output_columns.clone(),
-            });
-            let expr = MExpr {
-                id: memo.next_expr_id(),
-                op,
-                children: vec![child],
-            };
-            memo.new_group(expr)
-        }
-
-        LogicalPlan::SubqueryAlias(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
-            let op = Operator::LogicalSubqueryAlias(LogicalSubqueryAliasOp {
-                alias: node.alias.clone(),
                 output_columns: node.output_columns.clone(),
             });
             let expr = MExpr {
@@ -324,7 +316,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{FilterNode, ScanNode};
+    use crate::sql::planner::plan::{FilterNode, ScanNode, UnionNode, ValuesNode};
     use arrow::datatypes::DataType;
     use std::path::PathBuf;
 
@@ -354,6 +346,62 @@ mod tests {
             nullable: false,
             is_internal: false,
         }]
+    }
+
+    fn test_output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn values_with_columns(columns: Vec<OutputColumn>) -> LogicalPlan {
+        LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns,
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn set_op_output_columns_survive_memo_stats_with_duplicate_names() {
+        let target = vec![test_output_column(20, "dup"), test_output_column(21, "dup")];
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                values_with_columns(vec![
+                    test_output_column(10, "dup"),
+                    test_output_column(11, "dup"),
+                ]),
+                values_with_columns(vec![
+                    test_output_column(12, "dup"),
+                    test_output_column(13, "dup"),
+                ]),
+            ],
+            all: true,
+            output_columns: target.clone(),
+            required_output_columns: None,
+        });
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo(&plan, &mut memo);
+        crate::sql::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &std::collections::HashMap::new(),
+        );
+
+        let output_columns = &memo.groups[root]
+            .logical_props
+            .as_ref()
+            .expect("set-op root should have logical properties")
+            .output_columns;
+        assert_eq!(output_columns.len(), target.len());
+        assert_eq!(output_columns[0].name, "dup");
+        assert_eq!(output_columns[1].name, "dup");
+        assert_eq!(output_columns[0].column_id, target[0].column_id);
+        assert_eq!(output_columns[1].column_id, target[1].column_id);
     }
 
     #[test]

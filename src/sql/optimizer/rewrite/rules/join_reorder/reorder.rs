@@ -256,10 +256,6 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
             e.inputs = e.inputs.into_iter().map(reorder_joins_heuristic).collect();
             LogicalPlan::Except(e)
         }
-        LogicalPlan::SubqueryAlias(mut s) => {
-            s.input = Box::new(reorder_joins_heuristic(*s.input));
-            LogicalPlan::SubqueryAlias(s)
-        }
         LogicalPlan::Repeat(mut r) => {
             r.input = Box::new(reorder_joins_heuristic(*r.input));
             LogicalPlan::Repeat(r)
@@ -278,7 +274,8 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
 // ===========================================================================
 
 use crate::sql::optimizer::rewrite::rules::utils::{
-    QualifiedRef, collect_qualified_output_columns, combine_and, split_and,
+    QualifiedRef, collect_column_id_refs, collect_output_ids, collect_qualified_column_refs,
+    collect_qualified_output_columns, combine_and, split_and,
 };
 
 /// Entry for the DP memo table.
@@ -419,10 +416,6 @@ pub(crate) fn reorder_joins_cbo(
                 .collect();
             LogicalPlan::Except(e)
         }
-        LogicalPlan::SubqueryAlias(mut s) => {
-            s.input = Box::new(reorder_joins_cbo(*s.input, table_stats));
-            LogicalPlan::SubqueryAlias(s)
-        }
         LogicalPlan::Repeat(mut r) => {
             r.input = Box::new(reorder_joins_cbo(*r.input, table_stats));
             LogicalPlan::Repeat(r)
@@ -460,6 +453,8 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
         .iter()
         .map(collect_qualified_output_columns)
         .collect();
+    let relation_column_ids: Vec<HashSet<crate::sql::column_id::ColumnId>> =
+        relations.iter().map(collect_output_ids).collect();
 
     // Pre-process: factor common equi-join conditions out of OR predicates
     // so the join graph sees them as independent binary predicates.
@@ -493,16 +488,7 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     let mut predicates = Vec::new();
     let mut per_relation_filters: Vec<Vec<TypedExpr>> = vec![Vec::new(); relations.len()];
     for pred in expanded_predicates {
-        let refs =
-            crate::sql::optimizer::rewrite::rules::utils::collect_qualified_column_refs(&pred);
-        let mut mask: u32 = 0;
-        for qref in &refs {
-            for (i, rel_cols) in relation_columns.iter().enumerate() {
-                if rel_cols.contains(qref) {
-                    mask |= 1u32 << i;
-                }
-            }
-        }
+        let mask = predicate_relation_mask(&pred, &relation_column_ids, &relation_columns);
         let bit_count = mask.count_ones();
         if bit_count == 1 {
             // Exactly one relation touched: push the predicate down to
@@ -548,6 +534,46 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
         relations,
         predicates,
     })
+}
+
+fn predicate_relation_mask(
+    pred: &TypedExpr,
+    relation_column_ids: &[HashSet<crate::sql::column_id::ColumnId>],
+    relation_columns: &[HashSet<QualifiedRef>],
+) -> u32 {
+    let id_refs = collect_column_id_refs(pred);
+    let qualified_refs = collect_qualified_column_refs(pred);
+
+    if !id_refs.is_empty() && id_refs.len() == qualified_refs.len() {
+        let mut mask = 0u32;
+        let mut classified_all = true;
+        for id in id_refs {
+            let mut matched = false;
+            for (i, rel_ids) in relation_column_ids.iter().enumerate() {
+                if rel_ids.contains(&id) {
+                    mask |= 1u32 << i;
+                    matched = true;
+                }
+            }
+            if !matched {
+                classified_all = false;
+                break;
+            }
+        }
+        if classified_all {
+            return mask;
+        }
+    }
+
+    let mut mask = 0u32;
+    for qref in &qualified_refs {
+        for (i, rel_cols) in relation_columns.iter().enumerate() {
+            if rel_cols.contains(qref) {
+                mask |= 1u32 << i;
+            }
+        }
+    }
+    mask
 }
 
 /// Recursively flatten a tree of INNER/CROSS JOINs into leaf relations and

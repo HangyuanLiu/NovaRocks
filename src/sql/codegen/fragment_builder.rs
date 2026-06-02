@@ -41,8 +41,8 @@ use crate::sql::optimizer::operator::{
     PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
     PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalSubqueryAliasOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp,
-    PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
+    PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    ScanDictionaryColumn,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -495,7 +495,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalValues(op) => self.visit_values(op, node),
             Operator::PhysicalGenerateSeries(op) => self.visit_generate_series(op, node),
             Operator::PhysicalTableFunction(op) => self.visit_table_function(op, node),
-            Operator::PhysicalSubqueryAlias(op) => self.visit_subquery_alias(op, node),
             Operator::PhysicalRepeat(op) => self.visit_repeat(op, node),
             Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
             Operator::PhysicalCTEAnchor(op) => self.visit_cte_anchor(op, node),
@@ -3365,55 +3364,6 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     // -------------------------------------------------------------------
-    // visit_subquery_alias
-    // -------------------------------------------------------------------
-
-    fn visit_subquery_alias(
-        &mut self,
-        op: &PhysicalSubqueryAliasOp,
-        node: &PhysicalPlanNode,
-    ) -> Result<VisitResult, String> {
-        let mut child = self.visit(&node.children[0])?;
-        let child_output_bindings: Vec<_> = child
-            .scope
-            .iter_columns()
-            .map(|(_, binding)| binding.clone())
-            .collect();
-
-        // Register all output columns with the alias as qualifier. Per the
-        // G1 invariant ("SubqueryAlias does not create new ids, only changes
-        // the display name") we also re-index each binding under the alias's
-        // ColumnId so the by-id lookup follows the column through the alias
-        // boundary.
-        for (idx, col) in op.output_columns.iter().enumerate() {
-            let col_name_lower = col.name.to_lowercase();
-            let binding = child
-                .scope
-                .resolve_by_id(col.column_id)
-                .cloned()
-                .or_else(|| child.scope.resolve_column(None, &col_name_lower).cloned().ok())
-                .or_else(|| child_output_bindings.get(idx).cloned())
-                .ok_or_else(|| {
-                    format!(
-                        "subquery alias '{}' exposes column '{}' at position {} but child has only {} columns",
-                        op.alias,
-                        col.name,
-                        idx,
-                        child_output_bindings.len()
-                    )
-                })?;
-            child.scope.add_column_with_id(
-                col.column_id,
-                Some(op.alias.clone()),
-                col.name.clone(),
-                binding,
-            );
-        }
-
-        Ok(child)
-    }
-
-    // -------------------------------------------------------------------
     // visit_repeat
     // -------------------------------------------------------------------
 
@@ -3785,6 +3735,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let result = self.visit_set_op_common(
             node,
+            &op.output_columns,
             plan_nodes::TPlanNodeType::UNION_NODE,
             |plan_node, tnode| {
                 plan_node.union_node = Some(tnode);
@@ -3793,17 +3744,18 @@ impl<'a> PlanFragmentBuilder<'a> {
         if op.all {
             Ok(result)
         } else {
-            self.emit_distinct_on_top(result)
+            self.emit_distinct_on_top(result, &op.output_columns)
         }
     }
 
     fn visit_intersect(
         &mut self,
-        _op: &PhysicalIntersectOp,
+        op: &PhysicalIntersectOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         self.visit_set_op_common(
             node,
+            &op.output_columns,
             plan_nodes::TPlanNodeType::INTERSECT_NODE,
             |plan_node, tnode| {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
@@ -3820,11 +3772,12 @@ impl<'a> PlanFragmentBuilder<'a> {
 
     fn visit_except(
         &mut self,
-        _op: &PhysicalExceptOp,
+        op: &PhysicalExceptOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         self.visit_set_op_common(
             node,
+            &op.output_columns,
             plan_nodes::TPlanNodeType::EXCEPT_NODE,
             |plan_node, tnode| {
                 plan_node.except_node = Some(plan_nodes::TExceptNode {
@@ -3841,6 +3794,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     fn visit_set_op_common(
         &mut self,
         node: &PhysicalPlanNode,
+        explicit_output_columns: &[crate::sql::analysis::OutputColumn],
         node_type: plan_nodes::TPlanNodeType,
         apply_payload: impl FnOnce(&mut plan_nodes::TPlanNode, plan_nodes::TUnionNode),
     ) -> Result<VisitResult, String> {
@@ -3857,7 +3811,9 @@ impl<'a> PlanFragmentBuilder<'a> {
         let set_op_node_id = self.alloc_node();
 
         let output_columns: Vec<crate::sql::analysis::OutputColumn> =
-            if node.output_columns.is_empty() {
+            if !explicit_output_columns.is_empty() {
+                explicit_output_columns.to_vec()
+            } else if node.output_columns.is_empty() {
                 child_results[0]
                     .scope
                     .iter_columns()
@@ -3898,7 +3854,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 output_col.nullable,
                 idx as i32,
             );
-            output_scope.add_column(
+            output_scope.add_column_with_id(
+                output_col.column_id,
                 None,
                 output_col.name.clone(),
                 ColumnBinding {
@@ -3976,7 +3933,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         })
     }
 
-    fn emit_distinct_on_top(&mut self, child: VisitResult) -> Result<VisitResult, String> {
+    fn emit_distinct_on_top(
+        &mut self,
+        child: VisitResult,
+        output_columns: &[crate::sql::analysis::OutputColumn],
+    ) -> Result<VisitResult, String> {
         let agg_tuple_id = self.alloc_tuple();
         let agg_node_id = self.alloc_node();
 
@@ -3990,6 +3951,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             .collect();
 
         for (idx, (name, binding)) in child_cols.iter().enumerate() {
+            let output_col = output_columns.get(idx);
+            let output_name = output_col
+                .map(|col| col.name.clone())
+                .unwrap_or_else(|| name.clone());
+            let output_column_id = output_col
+                .map(|col| col.column_id)
+                .unwrap_or(ColumnId::UNSET);
             let type_desc = expr_compiler::binding_type_desc(binding)?;
             let texpr =
                 expr_compiler::build_slot_ref_texpr(binding.slot_id, binding.tuple_id, type_desc);
@@ -4000,7 +3968,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 self.desc_builder.add_slot_with_type_desc(
                     slot_id,
                     agg_tuple_id,
-                    name,
+                    &output_name,
                     slot_type_desc,
                     binding.nullable,
                     idx as i32,
@@ -4009,15 +3977,16 @@ impl<'a> PlanFragmentBuilder<'a> {
                 self.desc_builder.add_slot(
                     slot_id,
                     agg_tuple_id,
-                    name,
+                    &output_name,
                     &binding.data_type,
                     binding.nullable,
                     idx as i32,
                 );
             }
-            agg_scope.add_column(
+            agg_scope.add_column_with_id(
+                output_column_id,
                 None,
-                name.clone(),
+                output_name,
                 ColumnBinding {
                     tuple_id: agg_tuple_id,
                     slot_id,

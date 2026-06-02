@@ -45,7 +45,7 @@
 //!   decoded before the union. UNION DISTINCT / INTERSECT / EXCEPT
 //!   always decode (set-distinct semantics hash on the user-facing
 //!   string value, so dict ids would diverge across snapshots).
-//! * `Window` / `TableFunction` / `Repeat` / `SubqueryAlias` /
+//! * `Window` / `TableFunction` / `Repeat` /
 //!   `CTEAnchor` / `CTEProduce`: conservative decode boundary — every
 //!   dict column flowing through is decoded back to its string before
 //!   the node. For multi-consumer CTEs, see the `TODO(task-8-cte)`
@@ -124,7 +124,6 @@ fn rewrite_node(
         | LogicalPlan::Window(_)
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::Repeat(_)
-        | LogicalPlan::SubqueryAlias(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -1157,11 +1156,6 @@ fn rewrite_children_decoded(
             node.input = Box::new(wrap_with_decode(input, &scope, ctx));
             Ok(LogicalPlan::Repeat(node))
         }
-        LogicalPlan::SubqueryAlias(mut node) => {
-            let (input, scope) = rewrite_node(*node.input, ctx)?;
-            node.input = Box::new(wrap_with_decode(input, &scope, ctx));
-            Ok(LogicalPlan::SubqueryAlias(node))
-        }
         LogicalPlan::CTEAnchor(mut node) => {
             let (produce, produce_scope) = rewrite_node(*node.produce, ctx)?;
             let (consumer, consumer_scope) = rewrite_node(*node.consumer, ctx)?;
@@ -1247,7 +1241,6 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
         LogicalPlan::Scan(scan) => scan.columns.clone(),
         LogicalPlan::Aggregate(node) => node.output_columns.clone(),
         LogicalPlan::Window(node) => node.output_columns.clone(),
-        LogicalPlan::SubqueryAlias(node) => node.output_columns.clone(),
         LogicalPlan::TableFunction(node) => node.output_columns.clone(),
         LogicalPlan::CTEProduce(node) => node.output_columns.clone(),
         LogicalPlan::CTEConsume(node) => node.output_columns.clone(),
@@ -1272,21 +1265,9 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             out.extend(plan_output_columns(&node.right));
             out
         }
-        LogicalPlan::Union(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
-        LogicalPlan::Intersect(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
-        LogicalPlan::Except(node) => node
-            .inputs
-            .first()
-            .map(plan_output_columns)
-            .unwrap_or_default(),
+        LogicalPlan::Union(node) => node.output_columns.clone(),
+        LogicalPlan::Intersect(node) => node.output_columns.clone(),
+        LogicalPlan::Except(node) => node.output_columns.clone(),
         LogicalPlan::Values(node) => node.columns.clone(),
         LogicalPlan::GenerateSeries(node) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
@@ -1298,6 +1279,65 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::planner::plan::{ExceptNode, IntersectNode, UnionNode, ValuesNode};
+
+    fn output_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn values_with_output(id: u32, name: &str) -> LogicalPlan {
+        LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![output_col(id, name)],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn set_op_plan_output_columns_use_explicit_set_op_outputs() {
+        let left = values_with_output(1, "k");
+        let right = values_with_output(2, "k");
+        let output_columns = vec![output_col(100, "set_k")];
+
+        let plans = vec![
+            LogicalPlan::Union(UnionNode {
+                inputs: vec![left.clone(), right.clone()],
+                all: true,
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+            LogicalPlan::Intersect(IntersectNode {
+                inputs: vec![left.clone(), right.clone()],
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+            LogicalPlan::Except(ExceptNode {
+                inputs: vec![left, right],
+                output_columns: output_columns.clone(),
+                required_output_columns: None,
+            }),
+        ];
+
+        for plan in plans {
+            let actual = plan_output_columns(&plan);
+            assert_eq!(actual.len(), output_columns.len());
+            assert_eq!(actual[0].column_id, output_columns[0].column_id);
+            assert_eq!(actual[0].name, output_columns[0].name);
+            assert_eq!(actual[0].data_type, output_columns[0].data_type);
+            assert_eq!(actual[0].nullable, output_columns[0].nullable);
         }
     }
 }

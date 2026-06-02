@@ -64,8 +64,8 @@ fn plan_scoped_query(
     // overwrite its output_columns with the fresh ColumnIds that the analyzer
     // allocated for this query's output (stored in `output_columns`).  The
     // planner previously left branch-side ColumnIds in those fields, which
-    // disagreed with the fresh IDs that the parent scope (and any wrapping
-    // SubqueryAliasNode) uses to reference the set-op output.
+    // disagreed with the fresh IDs that the parent scope uses to reference
+    // the set-op output.
     match &mut body_plan {
         LogicalPlan::Union(node) => {
             node.output_columns = output_columns.clone();
@@ -423,6 +423,163 @@ fn plan_body_scoped(
         QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry, factory),
         QueryBody::Values(values) => plan_values(values, factory),
     }
+}
+
+pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
+    match plan {
+        LogicalPlan::Scan(node) => Ok(node.columns.clone()),
+        LogicalPlan::Filter(node) => plan_output_columns(&node.input),
+        LogicalPlan::Project(node) => Ok(node
+            .items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect()),
+        LogicalPlan::Aggregate(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Join(node) => {
+            let left = plan_output_columns(&node.left)?;
+            let right = plan_output_columns(&node.right)?;
+            Ok(join_output_columns(node.join_type, left, right))
+        }
+        LogicalPlan::Sort(node) => plan_output_columns(&node.input),
+        LogicalPlan::Limit(node) => plan_output_columns(&node.input),
+        LogicalPlan::Union(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Intersect(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Except(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Values(node) => Ok(node.columns.clone()),
+        LogicalPlan::GenerateSeries(node) => Ok(vec![OutputColumn {
+            column_id: ColumnId::UNSET,
+            name: node.column_name.clone(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }]),
+        LogicalPlan::TableFunction(node) => {
+            let mut columns = plan_output_columns(&node.input)?;
+            columns.extend(node.output_columns.clone());
+            Ok(columns)
+        }
+        LogicalPlan::Window(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Repeat(node) => plan_output_columns(&node.input),
+        LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
+        LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+            Err("imv marker leaked into non-IMV planner output adaptation".to_string())
+        }
+    }
+}
+
+pub(crate) fn adapt_plan_output(
+    input: LogicalPlan,
+    target_output_columns: &[OutputColumn],
+) -> Result<LogicalPlan, String> {
+    let source_output_columns = plan_output_columns(&input)?;
+    if source_output_columns.len() != target_output_columns.len() {
+        return Err(format!(
+            "output column count mismatch while adapting subquery/CTE output: child has {}, target has {}",
+            source_output_columns.len(),
+            target_output_columns.len()
+        ));
+    }
+
+    if source_output_columns
+        .iter()
+        .zip(target_output_columns.iter())
+        .all(|(source, target)| output_column_metadata_equal(source, target))
+    {
+        return Ok(input);
+    }
+
+    let mut items = Vec::with_capacity(target_output_columns.len());
+    for (source, target) in source_output_columns
+        .iter()
+        .zip(target_output_columns.iter())
+    {
+        if source.data_type != target.data_type {
+            return Err(format!(
+                "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
+                target.name, source.data_type, target.data_type
+            ));
+        }
+        if source.nullable && !target.nullable {
+            return Err(format!(
+                "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
+                target.name, source.nullable, target.nullable
+            ));
+        }
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: source.column_id,
+                    qualifier: None,
+                    column: source.name.clone(),
+                },
+                data_type: source.data_type.clone(),
+                nullable: target.nullable,
+            },
+            output_name: target.name.clone(),
+            output_column_id: target.column_id,
+        });
+    }
+
+    Ok(LogicalPlan::Project(ProjectNode {
+        input: Box::new(input),
+        items,
+        required_output_columns: None,
+    }))
+}
+
+fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
+    left.column_id == right.column_id
+        && left.name == right.name
+        && left.data_type == right.data_type
+        && left.nullable == right.nullable
+        && left.is_internal == right.is_internal
+}
+
+fn join_output_columns(
+    join_type: JoinKind,
+    left: Vec<OutputColumn>,
+    right: Vec<OutputColumn>,
+) -> Vec<OutputColumn> {
+    match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
+        JoinKind::RightSemi | JoinKind::RightAnti => right,
+        JoinKind::LeftOuter => {
+            let mut out = left;
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::RightOuter => {
+            let mut out = make_nullable(left);
+            out.extend(right);
+            out
+        }
+        JoinKind::FullOuter => {
+            let mut out = make_nullable(left);
+            out.extend(make_nullable(right));
+            out
+        }
+        JoinKind::Inner | JoinKind::Cross => {
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+    }
+}
+
+fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
 }
 
 // ---------------------------------------------------------------------------
@@ -954,16 +1111,23 @@ fn logical_plan_satisfies_window_ordering(
     partition_by: &[TypedExpr],
 ) -> bool {
     match input {
+        LogicalPlan::Project(project) if project_preserves_column_identity(project) => {
+            logical_plan_satisfies_window_ordering(&project.input, required_items, partition_by)
+        }
         LogicalPlan::Sort(sort) => {
             logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
         }
-        // SubqueryAlias only changes qualifier/display metadata and preserves
-        // column ids, so a child ordering remains valid above the alias.
-        LogicalPlan::SubqueryAlias(alias) => {
-            logical_plan_satisfies_window_ordering(&alias.input, required_items, partition_by)
-        }
         _ => false,
     }
+}
+
+fn project_preserves_column_identity(project: &ProjectNode) -> bool {
+    project.items.iter().all(|item| {
+        matches!(
+            &item.expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if item.output_column_id == *column_id
+        )
+    })
 }
 
 fn logical_sort_satisfies_window_ordering(
@@ -1737,18 +1901,11 @@ fn plan_relation_scoped(
         }
         Relation::Subquery {
             query,
-            alias,
+            alias: _,
             output_columns,
         } => {
             let inner_plan = plan_scoped_query(*query, cte_registry, factory)?;
-            // SubqueryAlias MUST reuse the inner query's ColumnIds.
-            // The output_columns from the analyzer already carry the right ids.
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-                input: Box::new(inner_plan),
-                alias,
-                output_columns,
-                required_output_columns: None,
-            }))
+            adapt_plan_output(inner_plan, &output_columns)
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
@@ -2310,14 +2467,199 @@ mod tests {
         plan_query(resolved, cte_registry, &mut factory)
     }
 
-    fn find_subquery_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
         match plan {
-            LogicalPlan::Project(node) => find_subquery_input(&node.input),
-            LogicalPlan::Sort(node) => find_subquery_input(&node.input),
-            LogicalPlan::Limit(node) => find_subquery_input(&node.input),
-            LogicalPlan::SubqueryAlias(node) => Some(&node.input),
-            _ => None,
+            LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
+            LogicalPlan::Sort(node) => strip_project_sort_limit(&node.input),
+            LogicalPlan::Limit(node) => strip_project_sort_limit(&node.input),
+            other => other,
         }
+    }
+
+    fn unwrap_project_input(plan: &LogicalPlan) -> &LogicalPlan {
+        match plan {
+            LogicalPlan::Project(project) => project.input.as_ref(),
+            other => other,
+        }
+    }
+
+    fn contains_identity_project_adapter(
+        plan: &LogicalPlan,
+        source_column: &str,
+        output_name: &str,
+    ) -> bool {
+        match plan {
+            LogicalPlan::Project(project) => {
+                project.items.iter().any(|item| {
+                    item.output_name == output_name
+                        && matches!(
+                            &item.expr.kind,
+                            ExprKind::ColumnRef { column_id, column, .. }
+                                if column == source_column && item.output_column_id == *column_id
+                        )
+                }) || contains_identity_project_adapter(&project.input, source_column, output_name)
+            }
+            LogicalPlan::Filter(node) => {
+                contains_identity_project_adapter(&node.input, source_column, output_name)
+            }
+            LogicalPlan::Sort(node) => {
+                contains_identity_project_adapter(&node.input, source_column, output_name)
+            }
+            LogicalPlan::Limit(node) => {
+                contains_identity_project_adapter(&node.input, source_column, output_name)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn adapt_plan_output_passthrough_when_outputs_match() {
+        let source_id = ColumnId::new_for_test(10);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: source_id,
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
+        assert!(matches!(adapted, LogicalPlan::Values(_)));
+    }
+
+    #[test]
+    fn adapt_plan_output_renames_and_rebinds_with_project() {
+        let source_id = ColumnId::new_for_test(10);
+        let target_id = ColumnId::new_for_test(20);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: target_id,
+            name: "alias_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items.len(), 1);
+        assert_eq!(project.items[0].output_name, "alias_k");
+        assert_eq!(project.items[0].output_column_id, target_id);
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!("expected adapter item to read child column");
+        };
+        assert_eq!(*column_id, source_id);
+        assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn adapt_plan_output_allows_nullable_widening() {
+        let source_id = ColumnId::new_for_test(10);
+        let target_id = ColumnId::new_for_test(20);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: target_id,
+            name: "nullable_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output(input, &target).expect("adapter should widen nullability");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items.len(), 1);
+        assert!(project.items[0].expr.nullable);
+        assert_eq!(project.items[0].output_column_id, target_id);
+    }
+
+    #[test]
+    fn adapt_plan_output_rejects_nullable_narrowing() {
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(20),
+            name: "not_null_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let err = adapt_plan_output(input, &target)
+            .expect_err("adapter should reject nullable narrowing");
+        assert!(
+            err.contains("output nullability mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn adapt_plan_output_rejects_shape_mismatch() {
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(20),
+            name: "alias_k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let err =
+            adapt_plan_output(input, &target).expect_err("adapter should reject arity mismatch");
+        assert!(
+            err.contains("output column count mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2401,6 +2743,36 @@ mod tests {
     }
 
     #[test]
+    fn derived_table_plans_without_alias_operator() {
+        let plan =
+            parse_analyze_and_plan("SELECT s.o_orderkey FROM (SELECT o_orderkey FROM orders) s")
+                .expect("planner should succeed");
+
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("alias operator"),
+            "derived table must not create alias operator: {debug}"
+        );
+    }
+
+    #[test]
+    fn derived_table_column_alias_uses_project_adapter() {
+        let plan = parse_analyze_and_plan("SELECT s.ok FROM (SELECT o_orderkey FROM orders) s(ok)")
+            .expect("planner should succeed");
+
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("alias operator"),
+            "column alias derived table must not create alias operator: {debug}"
+        );
+
+        assert!(
+            contains_identity_project_adapter(&plan, "o_orderkey", "ok"),
+            "expected identity Project adapter to expose column alias ok: {plan:?}"
+        );
+    }
+
+    #[test]
     fn test_nested_with_in_derived_table_stays_inside_subquery_scope() {
         let plan = parse_analyze_and_plan(
             "WITH outer_t AS (SELECT o_orderkey AS ok FROM orders) \
@@ -2412,8 +2784,7 @@ mod tests {
         match plan {
             LogicalPlan::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 0);
-                let subquery_input = find_subquery_input(&outer_anchor.consumer)
-                    .expect("expected derived subquery under outer consumer");
+                let subquery_input = strip_project_sort_limit(&outer_anchor.consumer);
                 match subquery_input {
                     LogicalPlan::CTEAnchor(inner_anchor) => {
                         assert_eq!(inner_anchor.cte_id, 1);
@@ -2464,23 +2835,23 @@ mod tests {
 
         let lines =
             crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Normal);
-        let subquery_idx = lines
+        let outer_anchor_idx = lines
             .iter()
-            .position(|line| line.contains("SUBQUERY ALIAS [s]"))
-            .expect("expected subquery alias line");
+            .position(|line| line.contains("CTE_ANCHOR(cte_id=0)"))
+            .expect("expected outer anchor line");
         let inner_anchor_idx = lines
             .iter()
             .position(|line| line.contains("CTE_ANCHOR(cte_id=1)"))
             .expect("expected nested inner anchor line");
 
         assert!(
-            inner_anchor_idx > subquery_idx,
-            "nested inner anchor should appear under subquery: {lines:?}"
+            inner_anchor_idx > outer_anchor_idx,
+            "nested inner anchor should remain inside derived-table subtree: {lines:?}"
         );
     }
 
     #[test]
-    fn window_reuses_ordering_through_subquery_alias() {
+    fn window_reuses_ordering_through_derived_table() {
         let plan = parse_analyze_and_plan(
             "SELECT sum(o_custkey) OVER \
                     (ORDER BY o_orderkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
@@ -2498,6 +2869,33 @@ mod tests {
         assert_eq!(
             sort_count, 1,
             "window should reuse the derived table ordering: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn window_reuses_ordering_through_derived_table_column_alias_project() {
+        let plan = parse_analyze_and_plan(
+            "SELECT sum(ok) OVER \
+                    (ORDER BY ok ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+                    AS running_sum \
+             FROM (SELECT o_orderkey FROM orders ORDER BY o_orderkey) s(ok)",
+        )
+        .expect("planner should succeed");
+
+        let lines =
+            crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Verbose);
+        let sort_lines = lines
+            .iter()
+            .filter(|line| line.contains("SORT BY ["))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sort_lines.len(),
+            1,
+            "window should reuse derived table ordering through identity Project: {lines:?}"
+        );
+        assert!(
+            sort_lines[0].contains("SORT BY [o_orderkey ASC NULLS FIRST]"),
+            "expected the preserved derived-table ordering, got {sort_lines:?}"
         );
     }
 
@@ -2552,15 +2950,10 @@ mod tests {
 
     /// Regression test for the ColumnId-correctness bug where UnionNode.output_columns
     /// carried left-branch ColumnIds instead of the fresh set-op output ColumnIds.
-    ///
-    /// After the fix, SubqueryAlias.output_columns (which carries the fresh IDs from
-    /// the analyzer's parent scope) must equal child Union.output_columns position by
-    /// position.  Before the fix these were two disjoint ID spaces.
     #[test]
-    fn union_output_columns_carry_fresh_set_op_ids_matching_subquery_alias() {
-        // Plan a derived table that wraps a UNION ALL.  The subquery alias node
-        // receives the fresh set-op output ColumnIds from the analyzer scope; the
-        // Union node must carry the same IDs (not the left-branch scan IDs).
+    fn output_columns_carry_fresh_set_op_ids() {
+        // Plan a derived table that wraps a UNION ALL. The Union node must carry
+        // the analyzer-visible output IDs directly, without an alias wrapper.
         let plan = parse_analyze_and_plan(
             "SELECT o_orderkey, o_custkey \
              FROM (SELECT o_orderkey, o_custkey FROM orders \
@@ -2569,40 +2962,34 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        // Navigate to SubqueryAlias — it is either the root or directly under a Project.
-        let alias_node = match &plan {
-            LogicalPlan::SubqueryAlias(n) => n,
-            LogicalPlan::Project(p) => match p.input.as_ref() {
-                LogicalPlan::SubqueryAlias(n) => n,
-                other => panic!("expected SubqueryAlias under Project, got {other:?}"),
-            },
-            other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
-        };
-        assert_eq!(alias_node.alias, "sub");
+        let debug = format!("{plan:?}");
+        assert!(
+            !debug.contains("alias operator"),
+            "set-op derived table must not create alias operator: {debug}"
+        );
 
-        // The direct child of SubqueryAlias must be the Union node.
-        let union_node = match alias_node.input.as_ref() {
+        let union_node = match unwrap_project_input(&plan) {
             LogicalPlan::Union(n) => n,
-            other => panic!("expected Union as SubqueryAlias child, got {other:?}"),
+            other => panic!("expected Union below adapter, got {other:?}"),
         };
+        let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
 
         // Core assertion: fresh IDs must match position-by-position.
         assert_eq!(
-            alias_node.output_columns.len(),
+            visible_columns.len(),
             union_node.output_columns.len(),
-            "SubqueryAlias and Union output_columns length must match"
+            "visible output and Union output_columns length must match"
         );
-        for (i, (alias_col, union_col)) in alias_node
-            .output_columns
+        for (i, (visible_col, union_col)) in visible_columns
             .iter()
             .zip(union_node.output_columns.iter())
             .enumerate()
         {
             assert_eq!(
-                alias_col.column_id, union_col.column_id,
-                "output_columns[{i}]: SubqueryAlias column_id {:?} != Union column_id {:?} \
+                visible_col.column_id, union_col.column_id,
+                "output_columns[{i}]: visible column_id {:?} != Union column_id {:?} \
                  (Union must carry the fresh set-op IDs, not left-branch IDs)",
-                alias_col.column_id, union_col.column_id
+                visible_col.column_id, union_col.column_id
             );
         }
     }
@@ -2618,27 +3005,27 @@ mod tests {
         ] {
             let plan = parse_analyze_and_plan(sql).expect("planner should succeed");
 
-            let alias_node = match &plan {
-                LogicalPlan::SubqueryAlias(n) => n,
-                LogicalPlan::Project(p) => match p.input.as_ref() {
-                    LogicalPlan::SubqueryAlias(n) => n,
-                    other => panic!("expected SubqueryAlias under Project, got {other:?}"),
-                },
-                other => panic!("expected SubqueryAlias or Project root, got {other:?}"),
+            let debug = format!("{plan:?}");
+            assert!(
+                !debug.contains("alias operator"),
+                "set-op derived table must not create alias operator: {debug}"
+            );
+
+            let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
+            let set_op_cols = match unwrap_project_input(&plan) {
+                LogicalPlan::Intersect(n) => &n.output_columns,
+                LogicalPlan::Except(n) => &n.output_columns,
+                other => panic!("expected Intersect/Except below adapter, got {other:?}"),
             };
 
-            let (alias_cols, set_op_cols) = match alias_node.input.as_ref() {
-                LogicalPlan::Intersect(n) => (&alias_node.output_columns, &n.output_columns),
-                LogicalPlan::Except(n) => (&alias_node.output_columns, &n.output_columns),
-                other => panic!("expected Intersect/Except as child, got {other:?}"),
-            };
-
-            assert_eq!(alias_cols.len(), set_op_cols.len());
-            for (i, (ac, sc)) in alias_cols.iter().zip(set_op_cols.iter()).enumerate() {
+            assert_eq!(visible_columns.len(), set_op_cols.len());
+            for (i, (visible_col, set_op_col)) in
+                visible_columns.iter().zip(set_op_cols.iter()).enumerate()
+            {
                 assert_eq!(
-                    ac.column_id, sc.column_id,
-                    "output_columns[{i}]: SubqueryAlias {:?} != set-op {:?} for SQL: {sql}",
-                    ac.column_id, sc.column_id
+                    visible_col.column_id, set_op_col.column_id,
+                    "output_columns[{i}]: visible {:?} != set-op {:?} for SQL: {sql}",
+                    visible_col.column_id, set_op_col.column_id
                 );
             }
         }
