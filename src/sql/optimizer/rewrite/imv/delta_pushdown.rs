@@ -159,6 +159,7 @@ mod tests {
                     },
                     files: Vec::new(),
                     cloud_properties: BTreeMap::new(),
+                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                 },
             },
             alias: None,

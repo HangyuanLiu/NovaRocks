@@ -404,6 +404,7 @@ impl IcebergMvRefreshContext {
             table: table.clone(),
             files,
             cloud_properties: entry.cloud_properties_map(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -516,6 +517,7 @@ impl IcebergMvRefreshContext {
             table: target_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 }

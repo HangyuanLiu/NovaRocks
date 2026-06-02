@@ -328,6 +328,7 @@ fn iceberg_table_info(
 fn add_iceberg_equality_delete_required_columns(
     required: &mut std::collections::HashSet<String>,
     table: &crate::sql::catalog::TableDef,
+    planned_scan: Option<&crate::sql::codegen::resolve::PlannedConnectorScan>,
 ) -> Result<(), String> {
     let crate::sql::catalog::ScanSource::IcebergDataFiles {
         table: iceberg,
@@ -343,33 +344,82 @@ fn add_iceberg_equality_delete_required_columns(
         .iter()
         .map(|field| (field.field_id, field.name.clone()))
         .collect();
-    for file in files {
-        for delete_file in &file.delete_files {
-            if delete_file.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
-                continue;
-            }
-            if delete_file.equality_field_ids.is_empty() {
-                for column in &delete_file.equality_column_names {
+    let mut add_required_columns_for_file =
+        |file: &crate::sql::catalog::IcebergDataFileInfo| -> Result<(), String> {
+            for delete_file in &file.delete_files {
+                if delete_file.file_content
+                    != crate::sql::catalog::IcebergDeleteFileContent::Equality
+                {
+                    continue;
+                }
+                if delete_file.equality_field_ids.is_empty() {
+                    for column in &delete_file.equality_column_names {
+                        required.insert(column.to_lowercase());
+                    }
+                    continue;
+                }
+                for field_id in &delete_file.equality_field_ids {
+                    let Some(column) = field_id_to_name.get(field_id) else {
+                        return Err(format!(
+                            "iceberg equality-delete file {} references unknown field id {} in table {}",
+                            delete_file.path, field_id, table.name
+                        ));
+                    };
                     required.insert(column.to_lowercase());
                 }
-                continue;
             }
-            for field_id in &delete_file.equality_field_ids {
-                let column = field_id_to_name.get(field_id).ok_or_else(|| {
-                    format!(
-                        "iceberg equality-delete file {} references unknown field id {} in table {}",
-                        delete_file.path, field_id, table.name
-                    )
-                })?;
-                required.insert(column.to_lowercase());
-            }
+            Ok(())
+        };
+
+    if let Some(planned_scan) = planned_scan {
+        for split in &planned_scan.splits {
+            let split = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
+            add_required_columns_for_file(&split.data_file)?;
         }
+        return Ok(());
+    }
+
+    for file in files {
+        add_required_columns_for_file(file)?;
     }
     Ok(())
 }
 
 fn effective_iceberg_scan_column_names(table: &crate::sql::catalog::TableDef) -> Vec<String> {
     table.columns.iter().map(|c| c.name.clone()).collect()
+}
+
+fn iceberg_scan_table_handle_for_codegen(
+    original_source: &crate::sql::catalog::ScanSource,
+    iceberg_table: &crate::sql::catalog::IcebergTableInfo,
+    files: Vec<crate::sql::catalog::IcebergDataFileInfo>,
+    column_names: Vec<String>,
+) -> crate::connector::scan_planning::TableHandle {
+    match original_source {
+        crate::sql::catalog::ScanSource::IcebergDataFiles {
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            ..
+        }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_) => {
+            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                &iceberg_table.catalog,
+                &iceberg_table.namespace,
+                &iceberg_table.table,
+                iceberg_table.current_snapshot_id,
+                iceberg_table.clone(),
+                files,
+                column_names,
+            )
+        }
+        _ => crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            &iceberg_table.catalog,
+            &iceberg_table.namespace,
+            &iceberg_table.table,
+            iceberg_table.clone(),
+            column_names,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,14 +1106,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut iceberg_metadata_pseudo_column_slots = BTreeSet::new();
 
         // Determine which columns to emit
-        let mut required: Option<std::collections::HashSet<String>> = op
-            .required_columns
-            .as_ref()
-            .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
-        if let Some(required) = required.as_mut() {
-            add_iceberg_equality_delete_required_columns(required, &table)?;
-        }
-
         let planned_scan = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
                 let planner = self.connectors.scan_planner("starrocks")?;
@@ -1076,12 +1118,10 @@ impl<'a> PlanFragmentBuilder<'a> {
                     );
                 let scan = planner.begin_scan(
                     table_handle,
-                    crate::connector::scan_planning::BeginScanContext::default(),
+                    crate::connector::scan_planning::BeginScanContext,
                 )?;
-                let splits = planner.plan_splits(
-                    &scan,
-                    crate::connector::scan_planning::SplitPlanningContext::default(),
-                )?;
+                let splits = planner
+                    .plan_splits(&scan, crate::connector::scan_planning::SplitPlanningContext)?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
             }
             crate::sql::catalog::ScanSource::IcebergDataFiles {
@@ -1091,28 +1131,29 @@ impl<'a> PlanFragmentBuilder<'a> {
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
                 let column_names = effective_iceberg_scan_column_names(&table);
-                let table_handle =
-                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
-                        &iceberg_table.catalog,
-                        &iceberg_table.namespace,
-                        &iceberg_table.table,
-                        iceberg_table.current_snapshot_id,
-                        iceberg_table.clone(),
-                        files.clone(),
-                        column_names,
-                    );
+                let table_handle = iceberg_scan_table_handle_for_codegen(
+                    &op.table.source,
+                    iceberg_table,
+                    files.clone(),
+                    column_names,
+                );
                 let scan = planner.begin_scan(
                     table_handle,
-                    crate::connector::scan_planning::BeginScanContext::default(),
+                    crate::connector::scan_planning::BeginScanContext,
                 )?;
-                let splits = planner.plan_splits(
-                    &scan,
-                    crate::connector::scan_planning::SplitPlanningContext::default(),
-                )?;
+                let splits = planner
+                    .plan_splits(&scan, crate::connector::scan_planning::SplitPlanningContext)?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
             }
             _ => None,
         };
+        let mut required: Option<std::collections::HashSet<String>> = op
+            .required_columns
+            .as_ref()
+            .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
+        if let Some(required) = required.as_mut() {
+            add_iceberg_equality_delete_required_columns(required, &table, planned_scan.as_ref())?;
+        }
         let scan_table_id = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { table_id, .. } => Some(*table_id),
             _ => iceberg_table_info(&table.source)
@@ -5388,36 +5429,63 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct CountingIcebergScanPlanner {
-        inner: crate::connector::iceberg::IcebergConnectorScanPlanner,
+    struct CurrentSnapshotAssertingIcebergPlanner {
         counts: std::sync::Arc<ScanPlannerCallCounts>,
+        files: Vec<IcebergDataFileInfo>,
     }
 
-    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingIcebergScanPlanner {
+    impl crate::connector::scan_planning::ConnectorScanPlanner
+        for CurrentSnapshotAssertingIcebergPlanner
+    {
         fn name(&self) -> &'static str {
-            crate::connector::scan_planning::ConnectorScanPlanner::name(&self.inner)
+            "iceberg"
         }
 
         fn begin_scan(
             &self,
             table: crate::connector::scan_planning::TableHandle,
-            ctx: crate::connector::scan_planning::BeginScanContext,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
         ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
             self.counts
                 .begin_scan
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.begin_scan(table, ctx)
+            let inner = table
+                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .ok_or_else(|| "expected IcebergTableHandle".to_string())?
+                .clone();
+            assert!(
+                matches!(
+                    inner.split_source,
+                    crate::connector::iceberg::scan_planner::IcebergSplitSource::CurrentSnapshot
+                ),
+                "ordinary Iceberg scans must not embed registered files"
+            );
+            Ok(crate::connector::scan_planning::ScanHandle::new(
+                "iceberg",
+                crate::connector::iceberg::IcebergScanHandle { table: inner },
+            ))
         }
 
         fn plan_splits(
             &self,
             scan: &crate::connector::scan_planning::ScanHandle,
-            ctx: crate::connector::scan_planning::SplitPlanningContext,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
         ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
             self.counts
                 .plan_splits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.plan_splits(scan, ctx)
+            let _scan = crate::connector::iceberg::scan_planner::iceberg_scan_handle(scan)?;
+            Ok(self
+                .files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    crate::connector::scan_planning::Split::new(
+                        "iceberg",
+                        crate::connector::iceberg::IcebergSplit { data_file },
+                    )
+                })
+                .collect())
         }
 
         fn to_thrift_scan(
@@ -5434,7 +5502,8 @@ mod tests {
                 .lock()
                 .expect("thrift contexts")
                 .push(ctx.clone());
-            self.inner.to_thrift_scan(scan, splits, ctx)
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new()
+                .to_thrift_scan(scan, splits, ctx)
         }
     }
 
@@ -5460,21 +5529,49 @@ mod tests {
         registry
     }
 
+    fn register_current_snapshot_iceberg_planner(
+        registry: &mut crate::connector::ConnectorRegistry,
+        files: Vec<IcebergDataFileInfo>,
+    ) {
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner { counts, files });
+        registry.register_scan_planner(planner);
+    }
+
     fn mock_iceberg_registry() -> crate::connector::ConnectorRegistry {
+        mock_current_snapshot_iceberg_registry_with_files(vec![iceberg_i32_file(
+            "s3://bucket/current.parquet",
+            1,
+            1,
+        )])
+    }
+
+    fn mock_current_snapshot_iceberg_registry_with_files(
+        files: Vec<IcebergDataFileInfo>,
+    ) -> crate::connector::ConnectorRegistry {
         let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
+        register_current_snapshot_iceberg_planner(&mut registry, files);
         registry
+    }
+
+    fn iceberg_scan_files(plan: &PhysicalPlanNode) -> Vec<IcebergDataFileInfo> {
+        let Operator::PhysicalScan(scan) = &plan.op else {
+            panic!("expected scan plan");
+        };
+        let ScanSource::IcebergDataFiles { files, .. } = &scan.table.source else {
+            panic!("expected iceberg source");
+        };
+        files.clone()
     }
 
     fn mock_starrocks_and_iceberg_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
         let mut registry = mock_starrocks_registry(layout);
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
+        register_current_snapshot_iceberg_planner(
+            &mut registry,
+            vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
+        );
         registry
     }
 
@@ -5647,6 +5744,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -5695,7 +5793,8 @@ mod tests {
             ],
         );
 
-        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("resolve ids");
+        add_iceberg_equality_delete_required_columns(&mut required, &table, None)
+            .expect("resolve ids");
 
         assert!(required.contains("id"));
         assert!(required.contains("category"));
@@ -5719,7 +5818,8 @@ mod tests {
             }],
         );
 
-        add_iceberg_equality_delete_required_columns(&mut required, &table).expect("legacy names");
+        add_iceberg_equality_delete_required_columns(&mut required, &table, None)
+            .expect("legacy names");
 
         assert!(required.contains("id"));
         assert!(required.contains("category"));
@@ -5740,10 +5840,90 @@ mod tests {
             }],
         );
 
-        let err = add_iceberg_equality_delete_required_columns(&mut required, &table)
+        let err = add_iceberg_equality_delete_required_columns(&mut required, &table, None)
             .expect_err("unknown field id");
 
         assert!(err.contains("unknown field id 99"), "{err}");
+    }
+
+    #[test]
+    fn equality_delete_required_columns_are_added_from_planned_iceberg_splits() {
+        let iceberg_schema_fields = vec![
+            IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "id".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![],
+            },
+            IcebergSchemaFieldDef {
+                field_id: 3,
+                name: "category".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![],
+            },
+        ];
+        let mut planned_file = iceberg_i32_file("s3://bucket/current.parquet", 1, 1);
+        planned_file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
+        let table = TableDef {
+            name: "ice_t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "category".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info_with_schema(iceberg_schema_fields),
+                files: vec![],
+                cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table,
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: Some(vec!["id".to_string()]),
+                dict_columns: vec![],
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(vec![planned_file]),
+            "default",
+        )
+        .expect("build Iceberg fragment");
+        let root = build.fragment_results.first().expect("root fragment");
+
+        assert!(
+            slot_id_by_name_opt(&root.desc_tbl, "category").is_some(),
+            "equality-delete column must be scanned even when registered Iceberg files are empty"
+        );
     }
 
     #[test]
@@ -5771,6 +5951,7 @@ mod tests {
                 table: test_iceberg_table_info(),
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 
@@ -5802,6 +5983,7 @@ mod tests {
                 partition_values: vec![],
             }],
             cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
         };
 
         let err = nodes::reject_target_state_equality_deletes(&source)
@@ -5844,6 +6026,7 @@ mod tests {
                             partition_values: Vec::new(),
                         }],
                         cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -5911,6 +6094,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -5948,6 +6132,7 @@ mod tests {
                             iceberg_i32_file("s3://bucket/file-10-20.parquet", 10, 20),
                         ],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -5985,6 +6170,7 @@ mod tests {
                             iceberg_i32_partition_file("s3://bucket/id-12.parquet", 12),
                         ],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6021,6 +6207,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6059,6 +6246,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6079,9 +6267,13 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6124,9 +6316,13 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6161,9 +6357,13 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6201,7 +6401,7 @@ mod tests {
         let err = match PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &mock_iceberg_registry(),
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
             "default",
         ) {
             Ok(_) => panic!("delete-heavy scan should fail fast"),
@@ -7455,6 +7655,7 @@ mod tests {
                         table: iceberg_table_info,
                         files: vec![],
                         cloud_properties: std::collections::BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -7629,9 +7830,9 @@ mod tests {
         let catalog = DummyCatalog;
 
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
-        let planner = std::sync::Arc::new(CountingIcebergScanPlanner {
-            inner: crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
             counts: counts.clone(),
+            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
@@ -7684,5 +7885,130 @@ mod tests {
             contexts_with_conjuncts, 1,
             "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
         );
+    }
+
+    #[test]
+    fn visit_scan_uses_current_snapshot_handle_for_ordinary_iceberg_scan() {
+        let mut plan = iceberg_scan_plan();
+        if let Operator::PhysicalScan(scan) = &mut plan.op {
+            let ScanSource::IcebergDataFiles { files, .. } = &mut scan.table.source else {
+                panic!("expected iceberg source");
+            };
+            files.push(iceberg_i32_file(
+                "s3://bucket/stale-registered.parquet",
+                1,
+                1,
+            ));
+        }
+        let catalog = DummyCatalog;
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
+            counts: counts.clone(),
+            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build Iceberg fragment");
+
+        assert_eq!(
+            counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn refresh_derived_iceberg_scan_handle_uses_explicit_files() {
+        fn assert_explicit_file_path(
+            table_handle: crate::connector::scan_planning::TableHandle,
+            expected_path: &str,
+        ) {
+            let table_handle = table_handle
+                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .expect("IcebergTableHandle");
+            let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
+                &table_handle.split_source
+            else {
+                panic!("refresh-derived Iceberg scans must preserve explicit files");
+            };
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, expected_path);
+        }
+
+        let iceberg_table = test_iceberg_table_info_with_id_schema();
+        let original_source = ScanSource::IcebergVersionTable {
+            table: iceberg_table.clone(),
+            snapshot_id: 42,
+        };
+
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &original_source,
+            &iceberg_table,
+            vec![iceberg_i32_file("s3://bucket/pinned-refresh.parquet", 1, 1)],
+            vec!["id".to_string()],
+        );
+        assert_explicit_file_path(table_handle, "s3://bucket/pinned-refresh.parquet");
+
+        let target_state_source =
+            ScanSource::IcebergMvTargetState(crate::sql::catalog::IcebergMvTargetStateScan {
+                catalog: iceberg_table.catalog.clone(),
+                database: iceberg_table.namespace.clone(),
+                table: iceberg_table.table.clone(),
+                target_table_uuid: iceberg_table.table_uuid.clone().expect("test table uuid"),
+                target_snapshot_id: iceberg_table.current_snapshot_id,
+                aggregate_state_layout_version: 1,
+                columns: vec![],
+                group_key_names: vec![],
+                aggregate_state_names: vec![],
+                physical_column_names: vec![],
+                row_id_column_name: "_row_id".to_string(),
+                row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                    row_id_column_name: "_row_id".to_string(),
+                },
+                partition_constraint:
+                    crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            });
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &target_state_source,
+            &iceberg_table,
+            vec![iceberg_i32_file(
+                "s3://bucket/target-state-refresh.parquet",
+                1,
+                1,
+            )],
+            vec!["id".to_string()],
+        );
+        assert_explicit_file_path(table_handle, "s3://bucket/target-state-refresh.parquet");
+    }
+
+    #[test]
+    fn explicit_iceberg_data_file_binding_uses_explicit_files() {
+        let iceberg_table = test_iceberg_table_info_with_id_schema();
+        let file = iceberg_i32_file("s3://bucket/explicit-snapshot.parquet", 1, 1);
+        let original_source = ScanSource::IcebergDataFiles {
+            table: iceberg_table.clone(),
+            files: vec![file.clone()],
+            cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        };
+
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &original_source,
+            &iceberg_table,
+            vec![file],
+            vec!["id".to_string()],
+        );
+        let table_handle = table_handle
+            .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+            .expect("IcebergTableHandle");
+        let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
+            &table_handle.split_source
+        else {
+            panic!("explicit Iceberg data-file scans must preserve explicit files");
+        };
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "s3://bucket/explicit-snapshot.parquet");
     }
 }

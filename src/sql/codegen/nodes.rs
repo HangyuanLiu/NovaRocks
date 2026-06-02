@@ -716,6 +716,7 @@ fn build_iceberg_scan_ranges_from_source(
         table,
         files,
         cloud_properties,
+        ..
     } = source
     else {
         return Err("refresh-only scan source did not resolve to Iceberg data files".to_string());
@@ -1344,6 +1345,7 @@ mod tests {
                         table: iceberg_table_info,
                         files: iceberg_files,
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
                     },
                 },
                 alias: None,
@@ -1511,6 +1513,7 @@ mod tests {
                         table: iceberg_table_info,
                         files: iceberg_files,
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
                     },
                 },
                 alias: None,
