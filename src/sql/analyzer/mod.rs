@@ -47,7 +47,7 @@ struct RepeatGroupBySpec {
 /// along with a registry of all non-recursive CTE definitions.
 pub(crate) fn analyze(
     query: &sqlast::Query,
-    catalog: &impl CatalogProvider,
+    catalog: &dyn CatalogProvider,
     current_database: &str,
 ) -> Result<
     (
@@ -2457,9 +2457,10 @@ fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, Relation};
     use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
     };
 
     struct TestCatalog;
@@ -4454,6 +4455,99 @@ mod tests {
         assert_eq!(name, "ceil");
         assert_eq!(args.len(), 1);
         assert!(matches!(args[0].kind, ExprKind::AggregateCall { .. }));
+    }
+
+    struct CatalogAwareTestCatalog;
+
+    impl crate::sql::catalog::CatalogProvider for CatalogAwareTestCatalog {
+        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+            self.get_table_in_catalog(None, database, table)
+        }
+
+        fn get_table_in_catalog(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<TableDef, String> {
+            let catalog_name = catalog.unwrap_or("default_catalog");
+            Ok(TableDef {
+                name: format!("{catalog_name}_{database}_{table}"),
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: if catalog == Some("ice") { 100 } else { 1 },
+                    table_id: 2,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn analyzer_passes_three_part_catalog_to_catalog_provider() {
+        let stmt =
+            crate::sql::parser::parse_sql_raw("SELECT id FROM ice.db.orders").expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+
+        let (resolved, _, _) =
+            analyze(&query, &CatalogAwareTestCatalog, "default").expect("analyze");
+
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("expected select");
+        };
+        let Some(Relation::Scan(scan)) = select.from else {
+            panic!("expected scan");
+        };
+        assert_eq!(scan.database, "db");
+        assert_eq!(scan.table.name, "ice_db_orders");
+    }
+
+    #[test]
+    fn analyzer_uses_metadata_lookup_mode_for_partitions_table() {
+        struct MetadataModeCatalog(std::cell::Cell<bool>);
+        impl crate::sql::catalog::CatalogProvider for MetadataModeCatalog {
+            fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+                self.get_table_with_mode(None, database, table, TableLookupMode::SchemaOnly)
+            }
+
+            fn get_table_with_mode(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+                mode: TableLookupMode,
+            ) -> Result<TableDef, String> {
+                self.0.set(matches!(
+                    mode,
+                    TableLookupMode::IcebergMetadata {
+                        metadata_table_type: IcebergMetadataTableType::Partitions,
+                    }
+                ));
+                CatalogAwareTestCatalog.get_table_in_catalog(catalog, database, table)
+            }
+        }
+
+        let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
+        let stmt =
+            crate::sql::parser::parse_sql_raw("SELECT record_count FROM ice.db.orders$partitions")
+                .expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+
+        let _ = analyze(&query, &catalog, "default").expect("analyze");
+        assert!(
+            catalog.0.get(),
+            "partitions metadata lookup mode was not requested"
+        );
     }
 
     #[test]
