@@ -2,6 +2,7 @@ use crate::engine::mv::partition::TargetPartitionFilter;
 
 pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
 pub(crate) const ICEBERG_MV_JOIN_APPLY_KEY_COLUMN: &str = "__nova_join_row_key";
+pub(crate) const ICEBERG_MV_BRANCH_ID_COLUMN: &str = "__branch_id__";
 pub(crate) const ICEBERG_MV_GROUP_APPLY_KEY_COLUMN: &str = "__row_id__";
 pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID: &str = "base._row_id";
 pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY: &str = "JoinRowKey";
@@ -25,6 +26,16 @@ pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableCol
     crate::sql::parser::ast::TableColumnDef {
         name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
         data_type: crate::sql::parser::ast::SqlType::String,
+        nullable: false,
+        aggregation: None,
+        default: None,
+    }
+}
+
+pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
+    crate::sql::parser::ast::TableColumnDef {
+        name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+        data_type: crate::sql::parser::ast::SqlType::Int,
         nullable: false,
         aggregation: None,
         default: None,
@@ -698,6 +709,18 @@ mod tests {
         assert!(!column.nullable);
         assert!(column.aggregation.is_none());
         assert!(column.default.is_none());
+    }
+
+    #[test]
+    fn branch_id_table_column_is_required_int() {
+        let col = branch_id_table_column();
+        assert_eq!(col.name, ICEBERG_MV_BRANCH_ID_COLUMN);
+        assert_eq!(col.name, "__branch_id__");
+        assert!(!col.nullable);
+        assert!(matches!(
+            col.data_type,
+            crate::sql::parser::ast::SqlType::Int
+        ));
     }
 
     #[test]
