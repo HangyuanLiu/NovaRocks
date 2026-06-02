@@ -16,10 +16,10 @@ use crate::sql::catalog::{
 use crate::sql::parser::ast::Literal;
 
 use super::registry::{
-    IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
-    create_table as reg_create_table, drop_namespace as reg_drop_namespace,
-    drop_table as reg_drop_table, insert_rows as reg_insert_rows, list_tables as reg_list_tables,
-    load_table as reg_load_table, namespace_exists as reg_namespace_exists,
+    create_namespace as reg_create_namespace, create_table as reg_create_table,
+    drop_namespace as reg_drop_namespace, drop_table as reg_drop_table,
+    insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
+    namespace_exists as reg_namespace_exists, IcebergCatalogEntry, IcebergCatalogRegistry,
 };
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
@@ -135,6 +135,19 @@ impl TableSource for IcebergTableSource {
         "iceberg"
     }
 
+    fn build_schema_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
+        let guard = self.registry.read().expect("iceberg catalog read lock");
+        let entry = guard.get(&table.catalog)?;
+        let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
+        build_iceberg_schema_table_def(
+            &entry,
+            &table.catalog,
+            &table.namespace,
+            &table.table,
+            loaded,
+        )
+    }
+
     fn build_table_def_at(
         &self,
         table: &ResolvedTable,
@@ -197,6 +210,39 @@ pub(crate) fn build_iceberg_table_def_with_files(
     )
 }
 
+fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
+    vec![
+        ColumnDef {
+            name: "_file".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: "_pos".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: "_row_id".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: "_last_updated_sequence_number".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ]
+}
+
 /// IVM-A1 helper: build a `TableDef` for the base table without registering
 /// any data files. Always advertises Iceberg v3 row-lineage virtual columns
 /// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`) plus the
@@ -253,49 +299,44 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     let iceberg_table_info =
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = empty_iceberg_scan_source(iceberg_table_info.clone());
-    let iceberg_row_lineage_metadata_columns = vec![
-        ColumnDef {
-            name: "_file".to_string(),
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        ColumnDef {
-            name: "_pos".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        ColumnDef {
-            name: "_row_id".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        ColumnDef {
-            name: "_last_updated_sequence_number".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        ColumnDef {
-            name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
-            data_type: arrow::datatypes::DataType::Int8,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-    ];
+    let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
+    iceberg_row_lineage_metadata_columns.push(ColumnDef {
+        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        data_type: arrow::datatypes::DataType::Int8,
+        nullable: false,
+        write_default: None,
+        logical_type: None,
+    });
     Ok(TableDef {
         name: table_name.to_string(),
         columns,
         iceberg_row_lineage_metadata_columns,
         source,
     })
+}
+
+fn build_iceberg_schema_table_def(
+    entry: &IcebergCatalogEntry,
+    catalog_name: &str,
+    namespace: &str,
+    table_name: &str,
+    loaded: IcebergLoadedTable,
+) -> Result<TableDef, String> {
+    build_iceberg_table_def_with_data_files_impl(
+        entry,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
+        Vec::new(),
+        IcebergTableDefMode::SchemaOnly,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IcebergTableDefMode {
+    ScanBinding,
+    SchemaOnly,
 }
 
 fn build_iceberg_table_def_with_data_files(
@@ -305,6 +346,26 @@ fn build_iceberg_table_def_with_data_files(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
+) -> Result<TableDef, String> {
+    build_iceberg_table_def_with_data_files_impl(
+        entry,
+        catalog_name,
+        namespace,
+        table_name,
+        loaded,
+        data_files,
+        IcebergTableDefMode::ScanBinding,
+    )
+}
+
+fn build_iceberg_table_def_with_data_files_impl(
+    entry: &IcebergCatalogEntry,
+    catalog_name: &str,
+    namespace: &str,
+    table_name: &str,
+    loaded: IcebergLoadedTable,
+    data_files: Vec<super::registry::DataFileWithStats>,
+    mode: IcebergTableDefMode,
 ) -> Result<TableDef, String> {
     let has_data_files = !data_files.is_empty();
     // Row-lineage metadata columns (_row_id etc.) are only usable when every
@@ -346,54 +407,36 @@ fn build_iceberg_table_def_with_data_files(
         empty_iceberg_scan_source(iceberg_table_info)
     };
 
-    let iceberg_row_lineage_metadata_columns = if has_data_files
-        && is_v3_row_lineage(loaded.table.metadata())
-        && all_files_have_first_row_id
-    {
-        vec![
-            ColumnDef {
-                name: "_file".to_string(),
-                data_type: arrow::datatypes::DataType::Utf8,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "_pos".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "_row_id".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "_last_updated_sequence_number".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-        ]
-    } else {
-        if has_data_files
-            && is_v3_row_lineage(loaded.table.metadata())
-            && !all_files_have_first_row_id
-        {
-            tracing::warn!(
-                table = %format!("{}.{}", namespace, table_name),
-                "iceberg table declares write.row-lineage=true but at least one data file lacks \
-                 first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number, \
-                 _file, _pos) are hidden — downstream features depending on row lineage \
-                 (e.g. IVM apply-key) will not see correct data for those rows"
-            );
+    let iceberg_row_lineage_metadata_columns = match mode {
+        IcebergTableDefMode::SchemaOnly => {
+            if row_lineage_enabled(loaded.table.metadata()) {
+                iceberg_row_lineage_metadata_columns()
+            } else {
+                vec![]
+            }
         }
-        vec![]
+        IcebergTableDefMode::ScanBinding => {
+            if has_data_files
+                && is_v3_row_lineage(loaded.table.metadata())
+                && all_files_have_first_row_id
+            {
+                iceberg_row_lineage_metadata_columns()
+            } else {
+                if has_data_files
+                    && is_v3_row_lineage(loaded.table.metadata())
+                    && !all_files_have_first_row_id
+                {
+                    tracing::warn!(
+                        table = %format!("{}.{}", namespace, table_name),
+                        "iceberg table declares write.row-lineage=true but at least one data file lacks \
+                         first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number, \
+                         _file, _pos) are hidden; downstream features depending on row lineage \
+                         (e.g. IVM apply-key) will not see correct data for those rows"
+                    );
+                }
+                vec![]
+            }
+        }
     };
 
     Ok(TableDef {
@@ -686,9 +729,12 @@ mod tests {
 
     fn v3_row_lineage_loaded_table() -> IcebergLoadedTable {
         let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .expect("schema");
         let metadata = TableMetadataBuilder::new(
@@ -698,6 +744,54 @@ mod tests {
             "memory://test/table".to_string(),
             FormatVersion::V3,
             HashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "t".to_string(),
+            ))
+            .build()
+            .expect("table");
+
+        IcebergLoadedTable {
+            table,
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            logical_types: HashMap::new(),
+            key_desc: None,
+            column_aggregations: HashMap::new(),
+            object_store_config: None,
+        }
+    }
+
+    fn loaded_table() -> IcebergLoadedTable {
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
         )
         .expect("metadata builder")
         .build()
@@ -832,6 +926,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["region", "c"]
         );
+    }
+
+    #[test]
+    fn schema_only_v3_row_lineage_table_def_keeps_metadata_columns_without_files() {
+        let table_def = build_iceberg_schema_table_def(
+            &test_entry(),
+            "ice",
+            "db",
+            "t",
+            v3_row_lineage_loaded_table(),
+        )
+        .expect("schema-only table def");
+
+        let names = table_def
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+        );
+        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
+            panic!("expected iceberg data-file scan source");
+        };
+        assert!(
+            files.is_empty(),
+            "schema-only registration must not carry scan-binding files"
+        );
+    }
+
+    #[test]
+    fn schema_only_v2_table_def_hides_row_lineage_metadata_columns() {
+        let table_def =
+            build_iceberg_schema_table_def(&test_entry(), "ice", "db", "t", loaded_table())
+                .expect("schema-only table def");
+
+        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
     }
 
     #[test]

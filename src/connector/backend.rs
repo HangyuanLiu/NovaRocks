@@ -92,6 +92,13 @@ pub(crate) trait TableSource: Send + Sync {
     /// (IcebergDataFiles / IcebergMetadataTable / IcebergDeltaTable).
     fn build_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String>;
 
+    /// Build a schema-only `TableDef` for catalog registration. The default
+    /// preserves existing connector behavior. Iceberg overrides this to avoid
+    /// expanding snapshot data files during query-prep registration.
+    fn build_schema_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
+        self.build_table_def(table)
+    }
+
     /// Phase-1 entry point for time-travel-aware table-def construction.
     /// Default impl ignores the snapshot pin and delegates to `build_table_def`,
     /// which is correct for connectors that do not have time-travel semantics.
