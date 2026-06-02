@@ -1086,19 +1086,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table: iceberg_table,
-                files,
                 ..
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
                 let column_names = effective_iceberg_scan_column_names(&table);
                 let table_handle =
-                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
                         &iceberg_table.catalog,
                         &iceberg_table.namespace,
                         &iceberg_table.table,
-                        iceberg_table.current_snapshot_id,
                         iceberg_table.clone(),
-                        files.clone(),
                         column_names,
                     );
                 let scan = planner.begin_scan(
@@ -5388,36 +5385,57 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct CountingIcebergScanPlanner {
-        inner: crate::connector::iceberg::IcebergConnectorScanPlanner,
+    struct CurrentSnapshotAssertingIcebergPlanner {
         counts: std::sync::Arc<ScanPlannerCallCounts>,
     }
 
-    impl crate::connector::scan_planning::ConnectorScanPlanner for CountingIcebergScanPlanner {
+    impl crate::connector::scan_planning::ConnectorScanPlanner
+        for CurrentSnapshotAssertingIcebergPlanner
+    {
         fn name(&self) -> &'static str {
-            crate::connector::scan_planning::ConnectorScanPlanner::name(&self.inner)
+            "iceberg"
         }
 
         fn begin_scan(
             &self,
             table: crate::connector::scan_planning::TableHandle,
-            ctx: crate::connector::scan_planning::BeginScanContext,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
         ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
             self.counts
                 .begin_scan
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.begin_scan(table, ctx)
+            let inner = table
+                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .ok_or_else(|| "expected IcebergTableHandle".to_string())?
+                .clone();
+            assert!(
+                matches!(
+                    inner.split_source,
+                    crate::connector::iceberg::scan_planner::IcebergSplitSource::CurrentSnapshot
+                ),
+                "ordinary Iceberg scans must not embed registered files"
+            );
+            Ok(crate::connector::scan_planning::ScanHandle::new(
+                "iceberg",
+                crate::connector::iceberg::IcebergScanHandle { table: inner },
+            ))
         }
 
         fn plan_splits(
             &self,
             scan: &crate::connector::scan_planning::ScanHandle,
-            ctx: crate::connector::scan_planning::SplitPlanningContext,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
         ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
             self.counts
                 .plan_splits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.plan_splits(scan, ctx)
+            let _scan = crate::connector::iceberg::scan_planner::iceberg_scan_handle(scan)?;
+            Ok(vec![crate::connector::scan_planning::Split::new(
+                "iceberg",
+                crate::connector::iceberg::IcebergSplit {
+                    data_file: iceberg_i32_file("s3://bucket/current.parquet", 1, 1),
+                },
+            )])
         }
 
         fn to_thrift_scan(
@@ -5434,7 +5452,8 @@ mod tests {
                 .lock()
                 .expect("thrift contexts")
                 .push(ctx.clone());
-            self.inner.to_thrift_scan(scan, splits, ctx)
+            crate::connector::iceberg::IcebergConnectorScanPlanner::new()
+                .to_thrift_scan(scan, splits, ctx)
         }
     }
 
@@ -5465,6 +5484,14 @@ mod tests {
         registry.register_scan_planner(std::sync::Arc::new(
             crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
         ));
+        registry
+    }
+
+    fn mock_current_snapshot_iceberg_registry() -> crate::connector::ConnectorRegistry {
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner { counts });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
         registry
     }
 
@@ -7504,8 +7531,13 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        PlanFragmentBuilder::build(&plan, &catalog, &mock_iceberg_registry(), "default")
-            .expect("iceberg scan with dict_columns must now succeed (Option A)");
+        PlanFragmentBuilder::build(
+            &plan,
+            &catalog,
+            &mock_current_snapshot_iceberg_registry(),
+            "default",
+        )
+        .expect("iceberg scan with dict_columns must now succeed (Option A)");
     }
 
     #[test]
@@ -7629,8 +7661,7 @@ mod tests {
         let catalog = DummyCatalog;
 
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
-        let planner = std::sync::Arc::new(CountingIcebergScanPlanner {
-            inner: crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
             counts: counts.clone(),
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
@@ -7683,6 +7714,36 @@ mod tests {
         assert_eq!(
             contexts_with_conjuncts, 1,
             "exactly one to_thrift_scan call should carry node conjuncts; the range-only call should not"
+        );
+    }
+
+    #[test]
+    fn visit_scan_uses_current_snapshot_handle_for_ordinary_iceberg_scan() {
+        let mut plan = iceberg_scan_plan();
+        if let Operator::PhysicalScan(scan) = &mut plan.op {
+            let ScanSource::IcebergDataFiles { files, .. } = &mut scan.table.source else {
+                panic!("expected iceberg source");
+            };
+            files.push(iceberg_i32_file(
+                "s3://bucket/stale-registered.parquet",
+                1,
+                1,
+            ));
+        }
+        let catalog = DummyCatalog;
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
+            counts: counts.clone(),
+        });
+        let mut registry = crate::connector::ConnectorRegistry::new();
+        registry.register_scan_planner(planner);
+
+        PlanFragmentBuilder::build(&plan, &catalog, &registry, "default")
+            .expect("build Iceberg fragment");
+
+        assert_eq!(
+            counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }
