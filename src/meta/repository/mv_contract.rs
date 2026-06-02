@@ -465,12 +465,6 @@ impl MvSchemaContract {
                     actual: branch.branch_id_column.column_name.clone(),
                 });
             }
-            if branch.inner_apply_key_source != self.target.hidden_apply_key.source {
-                return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
-                    branch_source: branch.inner_apply_key_source,
-                    hidden_apply_key_source: self.target.hidden_apply_key.source,
-                });
-            }
         }
         match self.target.hidden_apply_key.source {
             ApplyKeySource::JoinRowKey => match &self.join {
@@ -489,6 +483,14 @@ impl MvSchemaContract {
                 if self.aggregate.is_none() {
                     return Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract);
                 }
+            }
+        }
+        if let Some(branch) = &self.branch {
+            if branch.inner_apply_key_source != self.target.hidden_apply_key.source {
+                return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
+                    branch_source: branch.inner_apply_key_source,
+                    hidden_apply_key_source: self.target.hidden_apply_key.source,
+                });
             }
         }
         if let Some(aggregate) = &self.aggregate {
@@ -795,6 +797,44 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_preserves_join_source_error_priority() {
+        let mut contract = sample_join_contract();
+        contract.join = None;
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+        ));
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_preserves_group_source_error_priority() {
+        let mut contract = sample_aggregate_contract();
+        contract.aggregate = None;
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract)
+        ));
     }
 
     #[test]
