@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -697,7 +698,7 @@ pub(crate) fn load_table(
             .map_err(|e| format!("build REST table ident: {e}"))?;
         block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?
+            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?
     } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
         let (metadata_file_name, metadata_bytes) =
@@ -843,7 +844,7 @@ pub(crate) fn current_schema_id(
             .map_err(|e| format!("build REST table ident: {e}"))?;
         let table = block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?;
+            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?;
         return Ok(table.metadata().current_schema_id());
     }
 
@@ -1638,7 +1639,7 @@ fn latest_table_metadata_location_local(
         // so callers can distinguish absence from genuine I/O trouble and
         // evict any stale metadata cache entry instead of hanging onto it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("unknown iceberg table {ns}.{tbl}"));
+            return Err(format!("unknown table: {ns}.{tbl}"));
         }
         Err(e) => {
             return Err(format!(
@@ -1657,8 +1658,22 @@ fn latest_table_metadata_location_local(
         })
         .collect();
     let latest = choose_latest_metadata_filename(&file_names)
-        .map_err(|_| format!("unknown iceberg table {ns}.{tbl}"))?;
+        .map_err(|_| format!("unknown table: {ns}.{tbl}"))?;
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
+}
+
+fn format_rest_load_table_error<E: fmt::Display>(
+    ident: &TableIdent,
+    ns_name: &str,
+    tbl_name: &str,
+    err: E,
+) -> String {
+    let message = err.to_string();
+    if message.contains("Tried to load a table that does not exist") {
+        format!("unknown table: {ns_name}.{tbl_name}")
+    } else {
+        format!("load REST iceberg table {ident}: {message}")
+    }
 }
 
 fn latest_table_metadata_file_s3(
@@ -3226,7 +3241,7 @@ mod rest_catalog_tests {
 
     use super::{
         IcebergCatalogEntry, IcebergCatalogKind, build_catalog_entry, build_iceberg_catalog,
-        build_rest_catalog,
+        build_rest_catalog, current_schema_id, load_table,
     };
 
     fn rest_props(uri: &str) -> Vec<(String, String)> {
@@ -3394,6 +3409,73 @@ mod rest_catalog_tests {
             .expect("create namespace via mock");
         assert_eq!(created.name(), &ns);
         create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn load_table_normalizes_rest_not_found_to_unknown_table() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/analytics/tables/missing")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"message":"Table does not exist","type":"NoSuchTable","code":404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let err = tokio::task::spawn_blocking(move || load_table(&entry, "analytics", "missing"))
+            .await
+            .expect("blocking task")
+            .map(|_| ())
+            .expect_err("missing REST table should fail");
+
+        assert!(
+            err.contains("unknown table: analytics.missing"),
+            "expected unknown-table normalization, got: {err}"
+        );
+        load_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn current_schema_id_normalizes_rest_not_found_to_unknown_table() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/analytics/tables/missing")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"message":"Table does not exist","type":"NoSuchTable","code":404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let err =
+            tokio::task::spawn_blocking(move || current_schema_id(&entry, "analytics", "missing"))
+                .await
+                .expect("blocking task")
+                .map(|_| ())
+                .expect_err("missing REST table should fail");
+
+        assert!(
+            err.contains("unknown table: analytics.missing"),
+            "expected unknown-table normalization, got: {err}"
+        );
+        load_mock.assert_async().await;
     }
 
     /// Helper: register a `GET /v1/namespaces` mock that returns the given
