@@ -25,7 +25,9 @@ use crate::lower::expr::literals::{
     build_decimal_literal, parse_date_literal, parse_decimal_literal,
 };
 use crate::lower::layout::Layout;
-use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
+use crate::lower::type_lowering::{
+    arrow_type_from_desc, arrow_type_from_primitive, primitive_type_from_node,
+};
 use crate::types;
 
 /// Parse a min/max conjunct TExpr into MinMaxPredicates used for pruning.
@@ -137,8 +139,9 @@ where
     };
 
     let column = resolve_column(slot_ref)?;
-    let value = match extract_literal_value(right_node) {
-        Ok(value) => value,
+    let value = match extract_min_max_literal_value(root, left_node, right_node) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Ok(None),
         Err(err) => {
             debug!(
                 "skip min/max predicate pruning for slot {} because rhs is not a supported scalar literal: {}",
@@ -158,6 +161,34 @@ where
     };
 
     Ok(Some(predicate))
+}
+
+fn extract_min_max_literal_value(
+    root: &exprs::TExprNode,
+    left_node: &exprs::TExprNode,
+    right_node: &exprs::TExprNode,
+) -> Result<Option<MinMaxPredicateValue>, String> {
+    let left_type = arrow_type_from_desc(&left_node.type_);
+    let compare_type = root
+        .child_type_desc
+        .as_ref()
+        .and_then(arrow_type_from_desc)
+        .or_else(|| root.child_type.and_then(arrow_type_from_primitive));
+
+    if let (Some(left_type), Some(compare_type)) = (left_type.as_ref(), compare_type.as_ref()) {
+        if left_type != compare_type {
+            debug!(
+                "skip min/max predicate pruning because comparison type {:?} differs from scan column type {:?}",
+                compare_type, left_type
+            );
+            return Ok(None);
+        }
+        if is_utf8_type(left_type) {
+            return extract_literal_as_utf8_bytes(right_node).map(Some);
+        }
+    }
+
+    Ok(Some(extract_literal_value(right_node)?))
 }
 
 fn child_count(node: &exprs::TExprNode) -> Result<usize, String> {
@@ -301,6 +332,50 @@ fn extract_literal_value(node: &exprs::TExprNode) -> Result<MinMaxPredicateValue
             node.node_type
         )),
     }
+}
+
+fn extract_literal_as_utf8_bytes(node: &exprs::TExprNode) -> Result<MinMaxPredicateValue, String> {
+    let value = match node.node_type {
+        t if t == exprs::TExprNodeType::STRING_LITERAL => node
+            .string_literal
+            .as_ref()
+            .ok_or_else(|| "STRING_LITERAL missing value".to_string())?
+            .value
+            .clone(),
+        t if t == exprs::TExprNodeType::INT_LITERAL => node
+            .int_literal
+            .as_ref()
+            .ok_or_else(|| "INT_LITERAL missing value".to_string())?
+            .value
+            .to_string(),
+        t if t == exprs::TExprNodeType::LARGE_INT_LITERAL => node
+            .large_int_literal
+            .as_ref()
+            .ok_or_else(|| "LARGE_INT_LITERAL missing value".to_string())?
+            .value
+            .trim()
+            .to_string(),
+        t if t == exprs::TExprNodeType::DATE_LITERAL => node
+            .date_literal
+            .as_ref()
+            .ok_or_else(|| "DATE_LITERAL missing value".to_string())?
+            .value
+            .clone(),
+        t if t == exprs::TExprNodeType::NULL_LITERAL => {
+            return Err("min/max predicate does not support NULL literal".to_string());
+        }
+        other => {
+            return Err(format!(
+                "unsupported literal type for VARCHAR min/max predicate: {:?}",
+                other
+            ));
+        }
+    };
+    Ok(MinMaxPredicateValue::ByteArray(value.into_bytes()))
+}
+
+fn is_utf8_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
 }
 
 fn extract_int_literal(
@@ -614,6 +689,7 @@ fn fits_decimal_precision(value: i128, precision: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::codegen::type_infer::arrow_type_to_type_desc;
     use std::collections::HashMap;
 
     fn create_dummy_type() -> types::TTypeDesc {
@@ -679,6 +755,10 @@ mod tests {
             order: vec![(1, 1)],
             index: HashMap::from([((1, 1), 0usize)]),
         }
+    }
+
+    fn type_desc(data_type: &DataType) -> types::TTypeDesc {
+        arrow_type_to_type_desc(data_type).expect("type desc")
     }
 
     #[test]
@@ -752,6 +832,83 @@ mod tests {
                 column: "0".to_string(),
                 value: MinMaxPredicateValue::Int64(7),
             }]
+        );
+    }
+
+    #[test]
+    fn parse_min_max_conjunct_casts_numeric_literal_for_varchar_slot() {
+        let expr = exprs::TExpr {
+            nodes: vec![
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_PRED,
+                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    num_children: 2,
+                    child_type_desc: Some(type_desc(&DataType::Utf8)),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::SLOT_REF,
+                    type_: type_desc(&DataType::Utf8),
+                    slot_ref: Some(exprs::TSlotRef {
+                        slot_id: 1,
+                        tuple_id: 1,
+                    }),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::INT_LITERAL,
+                    type_: type_desc(&DataType::Int64),
+                    int_literal: Some(exprs::TIntLiteral { value: 1 }),
+                    ..default_t_expr_node()
+                },
+            ],
+        };
+
+        let parsed = parse_min_max_conjuncts(&expr, &single_slot_layout()).expect("parse");
+        assert_eq!(
+            parsed,
+            vec![MinMaxPredicate::Eq {
+                column: "0".to_string(),
+                value: MinMaxPredicateValue::ByteArray(b"1".to_vec()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_min_max_conjunct_skips_when_compare_type_differs_from_slot_type() {
+        let expr = exprs::TExpr {
+            nodes: vec![
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_PRED,
+                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                    num_children: 2,
+                    child_type_desc: Some(type_desc(&DataType::Utf8)),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::SLOT_REF,
+                    type_: type_desc(&DataType::Int64),
+                    slot_ref: Some(exprs::TSlotRef {
+                        slot_id: 1,
+                        tuple_id: 1,
+                    }),
+                    ..default_t_expr_node()
+                },
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::STRING_LITERAL,
+                    type_: type_desc(&DataType::Utf8),
+                    string_literal: Some(exprs::TStringLiteral {
+                        value: "1".to_string(),
+                    }),
+                    ..default_t_expr_node()
+                },
+            ],
+        };
+
+        let parsed = parse_min_max_conjuncts(&expr, &single_slot_layout()).expect("parse");
+        assert!(
+            parsed.is_empty(),
+            "string comparison semantics are unsafe for numeric min/max pruning"
         );
     }
 

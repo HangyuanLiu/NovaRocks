@@ -4717,6 +4717,9 @@ enable_path_style_access = true
             base_catalog_entries: std::collections::BTreeMap::new(),
             iceberg_catalog,
             target_table,
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "engine test context",
+            ),
         }
     }
 

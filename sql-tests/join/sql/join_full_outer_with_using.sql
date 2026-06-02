@@ -266,7 +266,7 @@ SELECT k1, k2, v1, v2, v3, v4
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t4 USING(k1, k2)
-ORDER BY k1 DESC, k2 ASC, v1, v2;
+ORDER BY k1 DESC, k2 ASC, v1, v2, v3 DESC, v4;
 
 -- query 33
 -- Three-table FULL OUTER USING + DISTINCT

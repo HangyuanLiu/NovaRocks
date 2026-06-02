@@ -696,23 +696,28 @@ pub(crate) fn plan_changes(
 #[allow(dead_code)]
 pub(crate) fn scan_position_delete_rows_for_targets(
     base_table: &iceberg::table::Table,
-    delete: &PositionDeleteRef,
+    deletes: &[PositionDeleteRef],
     base_data_file_lineage: &std::collections::HashMap<
         String,
         crate::exec::node::iceberg_delta_scan::BaseDataFileLineage,
     >,
     suppressed_data_files: &std::collections::HashSet<String>,
+    previously_deleted_positions_per_file: &std::collections::HashMap<
+        String,
+        roaring::RoaringTreemap,
+    >,
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let size_lookup = |_path: &str| -> Option<u64> { None };
     crate::connector::iceberg::scan_deletes::scan_deletes_with_lineage_lookup_and_path_normalizer(
-        std::slice::from_ref(delete),
+        deletes,
         factory,
         base_table.file_io(),
         size_lookup,
         |path| base_data_file_lineage.get(path).copied(),
         suppressed_data_files,
+        previously_deleted_positions_per_file,
         |path| normalize_delete_projection_path(path, object_store_config),
     )
     .map_err(|e| e.to_string())

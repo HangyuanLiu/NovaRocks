@@ -3635,6 +3635,13 @@ impl<'a> PlanFragmentBuilder<'a> {
                 );
             }
         }
+        for (column_id, binding) in child.scope.iter_id_bindings() {
+            if let Some(new_binding) =
+                remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
+            {
+                project_scope.add_id_alias(*column_id, new_binding.clone());
+            }
+        }
 
         let mut param_slots = Vec::with_capacity(op.args.len());
         let mut param_type_descs = Vec::with_capacity(op.args.len());
@@ -3696,6 +3703,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                     output_binding.clone(),
                 );
             }
+        }
+        let output_id_aliases: Vec<_> = project_scope
+            .iter_id_bindings()
+            .filter_map(|(column_id, binding)| {
+                output_outer_by_project_slot
+                    .get(&binding.slot_id)
+                    .map(|output_binding| (*column_id, output_binding.clone()))
+            })
+            .collect();
+        for (column_id, output_binding) in output_id_aliases {
+            output_scope.add_id_alias(column_id, output_binding);
         }
 
         let mut fn_result_slots = Vec::with_capacity(op.output_columns.len());

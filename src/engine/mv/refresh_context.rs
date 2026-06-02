@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
@@ -20,8 +21,8 @@ use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::catalog::{
-    IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergSchemaDef, IcebergSchemaFieldDef,
-    IcebergTableInfo, ScanSource,
+    IcebergDataFileInfo, IcebergMvTargetStateScan, IcebergPartitionFieldValue,
+    IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
 };
 
 use super::iceberg_refresh::IcebergMvTarget;
@@ -68,6 +69,7 @@ pub(crate) struct IcebergMvRefreshContext {
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
+    pub affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
 }
 
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
@@ -310,12 +312,216 @@ impl IcebergMvRewriteContext {
             });
         }
 
-        let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+        let aggregate_input_types =
+            aggregate_input_types_from_schema_contract(&aggregate_shape, &self.schema_contract)?;
+        let layout =
+            crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
             &aggregate_shape,
             &output_columns,
+            &aggregate_input_types,
         )?;
         Ok((aggregate_shape, layout))
     }
+}
+
+fn aggregate_input_types_from_schema_contract(
+    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    contract: &MvSchemaContract,
+) -> Result<Vec<Option<DataType>>, String> {
+    use crate::connector::starrocks::table::mv_shape::{AggregateInput, VisibleAggregateOutput};
+
+    let mut input_types = vec![None; shape.aggregates.len()];
+    for (aggregate_index, aggregate) in shape.aggregates.iter().enumerate() {
+        if matches!(aggregate.input, AggregateInput::Star) {
+            continue;
+        }
+        if let Some(cast_type) = aggregate_input_cast_type(&aggregate.input)? {
+            input_types[aggregate_index] = Some(cast_type);
+            continue;
+        }
+
+        let visible_index = shape
+            .visible_outputs
+            .iter()
+            .position(|output| {
+                matches!(output, VisibleAggregateOutput::Aggregate(index) if *index == aggregate_index)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV aggregate output is not visible: aggregate_index={aggregate_index}"
+                )
+            })?;
+        let lineage = contract.output.columns.get(visible_index).ok_or_else(|| {
+            format!(
+                "aggregate MV contract output lineage missing for visible index {visible_index}"
+            )
+        })?;
+        input_types[aggregate_index] =
+            aggregate_input_type_from_lineage(contract, &lineage.expression)?;
+    }
+    Ok(input_types)
+}
+
+fn aggregate_input_cast_type(
+    input: &crate::connector::starrocks::table::mv_shape::AggregateInput,
+) -> Result<Option<DataType>, String> {
+    let crate::connector::starrocks::table::mv_shape::AggregateInput::Expr(expr) = input else {
+        return Ok(None);
+    };
+    explicit_cast_type(expr)
+}
+
+fn explicit_cast_type(expr: &sqlparser::ast::Expr) -> Result<Option<DataType>, String> {
+    match expr {
+        sqlparser::ast::Expr::Cast { data_type, .. } => sql_data_type_to_arrow(data_type).map(Some),
+        sqlparser::ast::Expr::Nested(inner) => explicit_cast_type(inner),
+        _ => Ok(None),
+    }
+}
+
+fn aggregate_input_type_from_lineage(
+    contract: &MvSchemaContract,
+    lineage: &crate::meta::repository::mv_contract::ExpressionLineage,
+) -> Result<Option<DataType>, String> {
+    if let [qualified] = lineage.referenced_base_fields.as_slice() {
+        let Some(field) = base_contracts(contract)
+            .into_iter()
+            .find(|base| base.table_fqn.eq_ignore_ascii_case(&qualified.table_fqn))
+            .and_then(|base| {
+                base.schema_at_create
+                    .fields
+                    .iter()
+                    .find(|field| field.field_id == qualified.field_id)
+            })
+        else {
+            return Err(format!(
+                "aggregate MV contract references unknown base field {}#{}",
+                qualified.table_fqn, qualified.field_id
+            ));
+        };
+        return arrow_type_from_contract_signature(&field.type_signature).map(Some);
+    }
+
+    if let [field_id] = lineage.referenced_base_field_ids.as_slice() {
+        let mut matches = base_contracts(contract)
+            .into_iter()
+            .filter_map(|base| {
+                base.schema_at_create
+                    .fields
+                    .iter()
+                    .find(|field| field.field_id == *field_id)
+                    .map(|field| field.type_signature.as_str())
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        match matches.as_slice() {
+            [type_signature] => {
+                return arrow_type_from_contract_signature(type_signature).map(Some);
+            }
+            [] => {
+                return Err(format!(
+                    "aggregate MV contract references unknown base field id {field_id}"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "aggregate MV contract base field id {field_id} is ambiguous across join inputs"
+                ));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn base_contracts(
+    contract: &MvSchemaContract,
+) -> Vec<&crate::meta::repository::mv_contract::BaseContract> {
+    if contract.bases.is_empty() {
+        vec![&contract.base]
+    } else {
+        contract.bases.iter().collect()
+    }
+}
+
+fn sql_data_type_to_arrow(data_type: &sqlparser::ast::DataType) -> Result<DataType, String> {
+    use sqlparser::ast as sqlast;
+
+    Ok(match data_type {
+        sqlast::DataType::TinyInt(_) => DataType::Int8,
+        sqlast::DataType::SmallInt(_) => DataType::Int16,
+        sqlast::DataType::Int(_) | sqlast::DataType::Integer(_) => DataType::Int32,
+        sqlast::DataType::BigInt(_) => DataType::Int64,
+        sqlast::DataType::Float(_) => DataType::Float32,
+        sqlast::DataType::Double(_) | sqlast::DataType::DoublePrecision => DataType::Float64,
+        sqlast::DataType::Boolean => DataType::Boolean,
+        sqlast::DataType::Varchar(_)
+        | sqlast::DataType::CharVarying(_)
+        | sqlast::DataType::Text
+        | sqlast::DataType::Char(_)
+        | sqlast::DataType::Character(_)
+        | sqlast::DataType::String(_) => DataType::Utf8,
+        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => DataType::Binary,
+        sqlast::DataType::Date => DataType::Date32,
+        sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        sqlast::DataType::Decimal(info)
+        | sqlast::DataType::Dec(info)
+        | sqlast::DataType::Numeric(info) => match info {
+            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                DataType::Decimal128(*p as u8, *s as i8)
+            }
+            sqlast::ExactNumberInfo::Precision(p) => DataType::Decimal128(*p as u8, 0),
+            sqlast::ExactNumberInfo::None => DataType::Decimal128(38, 0),
+        },
+        other => {
+            return Err(format!(
+                "aggregate MV explicit cast input type is unsupported: {other}"
+            ));
+        }
+    })
+}
+
+fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
+    let trimmed = type_signature.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    Ok(match lower.as_str() {
+        "boolean" | "bool" => DataType::Boolean,
+        "tinyint" => DataType::Int8,
+        "smallint" => DataType::Int16,
+        "int" | "integer" => DataType::Int32,
+        "long" | "bigint" => DataType::Int64,
+        "float" => DataType::Float32,
+        "double" => DataType::Float64,
+        "date" => DataType::Date32,
+        "timestamp" | "timestamptz" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        "string" | "varchar" | "char" => DataType::Utf8,
+        "binary" | "varbinary" => DataType::Binary,
+        _ if lower.starts_with("decimal(") => {
+            let inner = trimmed
+                .strip_prefix("decimal(")
+                .or_else(|| trimmed.strip_prefix("DECIMAL("))
+                .and_then(|value| value.strip_suffix(')'))
+                .ok_or_else(|| format!("invalid decimal type signature `{type_signature}`"))?;
+            let mut parts = inner.split(',').map(str::trim);
+            let precision = parts
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .ok_or_else(|| format!("invalid decimal precision in `{type_signature}`"))?;
+            let scale = parts
+                .next()
+                .and_then(|value| value.parse::<i8>().ok())
+                .ok_or_else(|| format!("invalid decimal scale in `{type_signature}`"))?;
+            DataType::Decimal128(precision, scale)
+        }
+        _ => {
+            return Err(format!(
+                "aggregate MV contract input type is unsupported: {type_signature}"
+            ));
+        }
+    })
 }
 
 impl IcebergMvRefreshContext {
@@ -336,6 +542,41 @@ impl IcebergMvRefreshContext {
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
+    ) -> Result<Self, String> {
+        Self::new_with_affected_partitions(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "refresh context was constructed without planned affected partitions",
+            ),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_affected_partitions(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[IcebergTableRef]>,
+        pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
@@ -365,6 +606,7 @@ impl IcebergMvRefreshContext {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
+            affected_partitions,
         })
     }
 
@@ -450,15 +692,7 @@ impl IcebergMvRefreshContext {
                 self.rewrite.target_snapshot_id
             ));
         }
-        if matches!(
-            scan.partition_constraint,
-            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
-        ) {
-            return Err(format!(
-                "Iceberg target-state scan {} requires an affected partition allow-list before scanning target files",
-                scan.fqn()
-            ));
-        }
+        let target_partition_allow_list = self.target_state_partition_allow_list(scan)?;
         let aggregate_contract =
             self.rewrite
                 .schema_contract
@@ -512,11 +746,53 @@ impl IcebergMvRefreshContext {
             Some(snapshot_id) => data_files_at_snapshot(&self.target_table, snapshot_id)?,
             None => Vec::new(),
         };
+        let files = if let Some(allow_list) = target_partition_allow_list {
+            filter_target_state_files_by_partition(
+                self.rewrite.schema_contract.as_ref(),
+                &allow_list,
+                files,
+                scan,
+            )?
+        } else {
+            files
+        };
         Ok(ScanSource::IcebergDataFiles {
             table: target_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
         })
+    }
+
+    fn target_state_partition_allow_list(
+        &self,
+        scan: &IcebergMvTargetStateScan,
+    ) -> Result<Option<BTreeSet<crate::engine::mv::partition::MvPartitionKey>>, String> {
+        match scan.partition_constraint {
+            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
+                Ok(None)
+            }
+            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+                match &self.affected_partitions {
+                    crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned => Ok(None),
+                    crate::engine::mv::partition::AffectedMvPartitions::Known {
+                        new_partitions,
+                        old_partitions,
+                    } => {
+                        let mut allow_list = new_partitions.clone();
+                        allow_list.extend(old_partitions.iter().cloned());
+                        Ok(Some(allow_list))
+                    }
+                    crate::engine::mv::partition::AffectedMvPartitions::Unknown { reason } => {
+                        tracing::warn!(
+                            target = %scan.fqn(),
+                            reason = %reason,
+                            "falling back to full target-state scan because affected partition planning is unknown"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -534,6 +810,149 @@ fn data_files_at_snapshot(
             .map(data_file_with_stats_to_info)
             .collect()
     })
+}
+
+fn filter_target_state_files_by_partition(
+    contract: &MvSchemaContract,
+    allow_list: &BTreeSet<crate::engine::mv::partition::MvPartitionKey>,
+    files: Vec<IcebergDataFileInfo>,
+    scan: &IcebergMvTargetStateScan,
+) -> Result<Vec<IcebergDataFileInfo>, String> {
+    if allow_list.is_empty() {
+        return Ok(Vec::new());
+    }
+    files
+        .into_iter()
+        .filter_map(|file| match target_file_partition_key(contract, &file) {
+            Ok(Some(key)) if allow_list.contains(&key) => Some(Ok(file)),
+            Ok(Some(_)) => None,
+            Ok(None) => Some(Err(format!(
+                "Iceberg target-state scan {} requires partition keys for target files",
+                scan.fqn()
+            ))),
+            Err(err) => Some(Err(format!(
+                "Iceberg target-state scan {} cannot map target file {} partition: {}",
+                scan.fqn(),
+                file.path,
+                err
+            ))),
+        })
+        .collect()
+}
+
+fn target_file_partition_key(
+    contract: &MvSchemaContract,
+    file: &IcebergDataFileInfo,
+) -> Result<Option<crate::engine::mv::partition::MvPartitionKey>, String> {
+    let Some(partition) = &contract.target.partition else {
+        return Ok(None);
+    };
+    let Some(spec_id) = file.partition_spec_id else {
+        return Err(format!(
+            "target file {} is missing partition spec id",
+            file.path
+        ));
+    };
+    let mut fields = Vec::with_capacity(partition.fields.len());
+    for partition_field in &partition.fields {
+        let expected_transform = target_contract_transform_text(&partition_field.transform)
+            .ok_or_else(|| {
+                format!(
+                    "MV partition field {} uses unsupported void transform",
+                    partition_field.partition_field_name
+                )
+            })?;
+        let value = file
+            .partition_values
+            .iter()
+            .find(|value| {
+                value
+                    .source_column
+                    .eq_ignore_ascii_case(&partition_field.source_column_name)
+                    && value.transform.eq_ignore_ascii_case(&expected_transform)
+            })
+            .or_else(|| {
+                file.partition_values.iter().find(|value| {
+                    value
+                        .field_name
+                        .eq_ignore_ascii_case(&partition_field.partition_field_name)
+                        && value.transform.eq_ignore_ascii_case(&expected_transform)
+                })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "target file {} has no partition value for {} with transform {}",
+                    file.path, partition_field.partition_field_name, expected_transform
+                )
+            })?;
+        fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+            partition_field.partition_field_name.clone(),
+            target_partition_value_to_mv_value(value)?,
+        ));
+    }
+
+    Ok(Some(crate::engine::mv::partition::MvPartitionKey::new(
+        spec_id, fields,
+    )))
+}
+
+fn target_partition_value_to_mv_value(
+    value: &IcebergPartitionFieldValue,
+) -> Result<crate::engine::mv::partition::MvPartitionValue, String> {
+    match &value.value {
+        None => Ok(crate::engine::mv::partition::MvPartitionValue::Null),
+        Some(IcebergPartitionValue::Boolean(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
+        ),
+        Some(IcebergPartitionValue::Int32(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
+        ),
+        Some(IcebergPartitionValue::Int64(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
+        ),
+        Some(IcebergPartitionValue::Float(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
+        ),
+        Some(IcebergPartitionValue::Double(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
+        ),
+        Some(IcebergPartitionValue::String(v)) => Ok(
+            crate::engine::mv::partition::MvPartitionValue::String(v.clone()),
+        ),
+        Some(IcebergPartitionValue::Binary(_)) => Err(format!(
+            "target partition field {} has unsupported binary value",
+            value.field_name
+        )),
+    }
+}
+
+fn target_contract_transform_text(
+    transform: &crate::meta::repository::mv_contract::MvPartitionTransformContract,
+) -> Option<String> {
+    match transform {
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Identity => {
+            Some("identity".to_string())
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Year => {
+            Some("year".to_string())
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Month => {
+            Some("month".to_string())
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Day => {
+            Some("day".to_string())
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Hour => {
+            Some("hour".to_string())
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Bucket {
+            num_buckets,
+        } => Some(format!("bucket({num_buckets})")),
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Truncate { width } => {
+            Some(format!("truncate({width})"))
+        }
+        crate::meta::repository::mv_contract::MvPartitionTransformContract::Void => None,
+    }
 }
 
 fn collect_base_catalog_entries(
@@ -655,8 +1074,9 @@ pub(crate) mod tests_support {
     use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, HiddenApplyKeyContract,
-        MvSchemaContract, OutputContract, TargetContract, TargetVisibleColumn,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
+        OutputContract, TargetContract, TargetVisibleColumn,
     };
 
     use super::*;
@@ -703,17 +1123,40 @@ pub(crate) mod tests_support {
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
-                    fields: vec![BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "k".to_string(),
-                        type_signature: "long".to_string(),
-                        required: true,
-                    }],
+                    fields: vec![
+                        BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "k".to_string(),
+                            type_signature: "long".to_string(),
+                            required: true,
+                        },
+                        BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "v".to_string(),
+                            type_signature: "long".to_string(),
+                            required: false,
+                        },
+                    ],
                 },
             },
             bases: Vec::new(),
             output: OutputContract {
-                columns: Vec::new(),
+                columns: vec![
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![1],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![2],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                ],
                 filter: None,
             },
             join: None,
@@ -1484,6 +1927,9 @@ mod tests {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "test context",
+            ),
         };
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
@@ -1558,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn target_state_scan_fails_fast_when_partition_allow_list_is_required() {
+    fn target_state_scan_falls_back_without_partition_allow_list() {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
         use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
 
@@ -1610,12 +2056,15 @@ mod tests {
             ))
             .build()
             .expect("target table");
-        let ctx = IcebergMvRefreshContext {
+        let mut ctx = IcebergMvRefreshContext {
             rewrite: dummy_rewrite_context(),
             target_entry,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
+            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                "test context",
+            ),
         };
         let scan = IcebergMvTargetStateScan {
             catalog: "tgt".to_string(),
@@ -1636,9 +2085,25 @@ mod tests {
                 crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
         };
 
-        let err = ctx
-            .target_state_scan_source(&scan)
-            .expect_err("partitioned target-state scan must fail before file planning");
-        assert!(err.contains("affected partition allow-list"), "{err}");
+        let unknown_filter = ctx
+            .target_state_partition_allow_list(&scan)
+            .expect("unknown affected partitions should fall back to full target scan");
+        assert!(
+            unknown_filter.is_none(),
+            "unknown affected partitions should disable pruning"
+        );
+
+        let new_key = crate::engine::mv::partition::MvPartitionKey::new(1, Vec::new());
+        let old_key = crate::engine::mv::partition::MvPartitionKey::new(2, Vec::new());
+        ctx.affected_partitions = crate::engine::mv::partition::AffectedMvPartitions::known(
+            [new_key.clone()],
+            [old_key.clone()],
+        );
+        let allow_list = ctx
+            .target_state_partition_allow_list(&scan)
+            .expect("known affected partitions should satisfy partition contract")
+            .expect("partitioned scan should return an allow-list");
+        assert!(allow_list.contains(&new_key));
+        assert!(allow_list.contains(&old_key));
     }
 }

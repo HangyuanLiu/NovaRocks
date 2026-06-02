@@ -116,6 +116,7 @@ fn test_iceberg_connector_module() {
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
         iceberg_output_schema: None,
+        query_global_dicts: Default::default(),
     };
     let config = novarocks::novarocks_connector_iceberg::HdfsScanConfig {
         ranges: vec![novarocks::connector::FileScanRange {
@@ -137,6 +138,7 @@ fn test_iceberg_connector_module() {
         format: Some(FileFormatConfig::Parquet(parquet_cfg)),
         object_store_config: None,
         iceberg_table_locations: std::collections::HashMap::new(),
+        query_global_dicts: Default::default(),
     };
     let _scan = novarocks::novarocks_connector_iceberg::HdfsScanOp::new(config.clone());
     assert_eq!(config.ranges.len(), 1);

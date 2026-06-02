@@ -224,7 +224,11 @@ fn replace_cte_consume(
 ) -> Result<LogicalPlan, String> {
     match plan {
         LogicalPlan::CTEConsume(node) if node.cte_id == cte_id => {
-            crate::sql::planner::adapt_plan_output(replacement.clone(), &node.output_columns)
+            crate::sql::planner::adapt_plan_output_with_qualifier(
+                replacement.clone(),
+                &node.output_columns,
+                Some(&node.alias),
+            )
         }
         LogicalPlan::Scan(_)
         | LogicalPlan::Values(_)

@@ -286,9 +286,18 @@ fn collect_extra_sort_items(
 ) -> Vec<ProjectItem> {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
+    let output_ids: std::collections::HashSet<ColumnId> = output
+        .iter()
+        .filter_map(|c| (c.column_id != ColumnId::UNSET).then_some(c.column_id))
+        .collect();
     let mut added = std::collections::HashSet::new();
     let mut extra = Vec::new();
     for item in order_by {
+        if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
+            && output_ids.contains(column_id)
+        {
+            continue;
+        }
         let output_name = crate::sql::codegen::helpers::typed_expr_display_name(&item.expr);
         let output_name_lower = output_name.to_lowercase();
         if !output_names.contains(&output_name_lower) && added.insert(output_name_lower) {
@@ -481,6 +490,14 @@ pub(crate) fn adapt_plan_output(
     input: LogicalPlan,
     target_output_columns: &[OutputColumn],
 ) -> Result<LogicalPlan, String> {
+    adapt_plan_output_with_qualifier(input, target_output_columns, None)
+}
+
+pub(crate) fn adapt_plan_output_with_qualifier(
+    input: LogicalPlan,
+    target_output_columns: &[OutputColumn],
+    output_qualifier: Option<&str>,
+) -> Result<LogicalPlan, String> {
     let source_output_columns = plan_output_columns(&input)?;
     if source_output_columns.len() != target_output_columns.len() {
         return Err(format!(
@@ -519,7 +536,11 @@ pub(crate) fn adapt_plan_output(
             expr: TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: source.column_id,
-                    qualifier: None,
+                    qualifier: if source.column_id == ColumnId::UNSET {
+                        None
+                    } else {
+                        output_qualifier.map(str::to_string)
+                    },
                     column: source.name.clone(),
                 },
                 data_type: source.data_type.clone(),
@@ -2581,6 +2602,48 @@ mod tests {
     }
 
     #[test]
+    fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
+        let source_id = ColumnId::new_for_test(10);
+        let target_id = ColumnId::new_for_test(20);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "k1".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: target_id,
+            name: "k1".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output_with_qualifier(input, &target, Some("w1"))
+            .expect("adapter should succeed");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter");
+        };
+        assert_eq!(project.items[0].output_column_id, target_id);
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &project.items[0].expr.kind
+        else {
+            panic!("expected adapter item to read child column");
+        };
+        assert_eq!(*column_id, source_id);
+        assert_eq!(qualifier.as_deref(), Some("w1"));
+        assert_eq!(column, "k1");
+    }
+
+    #[test]
     fn adapt_plan_output_allows_nullable_widening() {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
@@ -3214,6 +3277,41 @@ mod tests {
         assert_eq!(
             sort_key_id, extra_item.output_column_id,
             "sort key must reference the sort-only expression extra by ColumnId"
+        );
+    }
+
+    #[test]
+    fn qualified_order_by_selected_column_does_not_create_sort_extra() {
+        let plan = parse_analyze_and_plan(
+            "SELECT s.o_orderkey FROM (SELECT o_orderkey FROM orders) s ORDER BY s.o_orderkey",
+        )
+        .expect("planner should succeed");
+
+        let sort = match &plan {
+            LogicalPlan::Sort(s) => s,
+            other => {
+                panic!("qualified ORDER BY selected column must not add strip Project: {other:?}")
+            }
+        };
+        let project = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected SELECT Project under Sort, got {other:?}"),
+        };
+        assert_eq!(
+            project.items.len(),
+            1,
+            "selected ORDER BY column must not be appended as a sort-only extra"
+        );
+        let ExprKind::ColumnRef {
+            column_id: sort_key_id,
+            ..
+        } = sort.items[0].expr.kind
+        else {
+            panic!("sort key should remain a ColumnRef");
+        };
+        assert_eq!(
+            sort_key_id, project.items[0].output_column_id,
+            "sort key should reference the selected output column by ColumnId"
         );
     }
 }

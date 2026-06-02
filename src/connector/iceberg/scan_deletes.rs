@@ -1088,6 +1088,7 @@ pub(crate) fn scan_deletes_with_lineage_lookup_and_path_normalizer<F, R, N>(
     data_file_size_lookup: F,
     lineage_lookup: R,
     suppressed_data_files: &std::collections::HashSet<String>,
+    previously_deleted_positions_per_file: &HashMap<String, RoaringTreemap>,
     normalize_path: N,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
@@ -1125,6 +1126,12 @@ where
     for path in suppressed_data_files {
         positions_per_file.remove(path);
     }
+    for (path, prior) in previously_deleted_positions_per_file {
+        if let Some(current) = positions_per_file.get_mut(path) {
+            *current -= prior;
+        }
+    }
+    positions_per_file.retain(|_, positions| !positions.is_empty());
 
     let mut out: Vec<RecordBatch> = Vec::new();
     let mut data_file_paths: Vec<&String> = positions_per_file.keys().collect();
@@ -1575,6 +1582,124 @@ mod tests {
         .expect("scan must succeed even when prior covers all positions");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn scan_deletes_with_lineage_lookup_subtracts_previously_deleted_positions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(
+            &data_path,
+            &[10, 20, 30, 40, 50],
+            &["a", "b", "c", "d", "e"],
+        );
+        let delete_path = dir.path().join("cumulative_dv.parquet");
+        let data_uri = "data.parquet";
+        write_delete_parquet(&delete_path, &[data_uri, data_uri], &[0, 4]);
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: "cumulative_dv.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: Some(2),
+            referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+            partition_values: Vec::new(),
+        }];
+
+        let mut prior = std::collections::HashMap::new();
+        let mut prior_positions = RoaringTreemap::new();
+        prior_positions.insert(0);
+        prior.insert(data_uri.to_string(), prior_positions);
+        let lineage = crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+            first_row_id: 1_000,
+            data_sequence_number: 17,
+        };
+
+        let batches = super::scan_deletes_with_lineage_lookup_and_path_normalizer(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| (path == data_uri).then_some(lineage),
+            &std::collections::HashSet::new(),
+            &prior,
+            super::normalize_local_fs_path_owned,
+        )
+        .expect("scan with lineage prior subtraction");
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1);
+        let batch = batches.first().expect("one lineage batch");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id int64");
+        assert_eq!(row_id.values(), &[1_004]);
+    }
+
+    #[test]
+    fn scan_deletes_with_lineage_lookup_unions_current_delete_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(&data_path, &[10, 20, 30, 40], &["a", "b", "c", "d"]);
+        let first_delete_path = dir.path().join("dv_1.parquet");
+        let second_delete_path = dir.path().join("dv_2.parquet");
+        let data_uri = "data.parquet";
+        write_delete_parquet(&first_delete_path, &[data_uri], &[0]);
+        write_delete_parquet(&second_delete_path, &[data_uri, data_uri], &[0, 2]);
+        let refs = vec![
+            PositionDeleteRef {
+                delete_file_path: "dv_1.parquet".to_string(),
+                delete_file_size: 0,
+                record_count: Some(1),
+                referenced_data_file: Some(data_uri.to_string()),
+                file_format: iceberg::spec::DataFileFormat::Parquet,
+                content_offset: None,
+                content_size_in_bytes: None,
+                partition_values: Vec::new(),
+            },
+            PositionDeleteRef {
+                delete_file_path: "dv_2.parquet".to_string(),
+                delete_file_size: 0,
+                record_count: Some(2),
+                referenced_data_file: Some(data_uri.to_string()),
+                file_format: iceberg::spec::DataFileFormat::Parquet,
+                content_offset: None,
+                content_size_in_bytes: None,
+                partition_values: Vec::new(),
+            },
+        ];
+        let lineage = crate::exec::node::iceberg_delta_scan::BaseDataFileLineage {
+            first_row_id: 5_000,
+            data_sequence_number: 3,
+        };
+
+        let batches = super::scan_deletes_with_lineage_lookup_and_path_normalizer(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| (path == data_uri).then_some(lineage),
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            super::normalize_local_fs_path_owned,
+        )
+        .expect("scan with current delete union");
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 2,
+            "overlapping current delete files should emit each row once"
+        );
+        let batch = batches.first().expect("one union batch");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id int64");
+        assert_eq!(row_id.values(), &[5_000, 5_002]);
     }
 
     #[test]

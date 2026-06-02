@@ -499,7 +499,7 @@ mod cascaded_derivation_tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![PhysicalHashJoinEqCondition {
                 left: col(10),
-                right: col(99),
+                right: col(10),
                 null_safe: false,
             }],
             other_condition: None,
@@ -566,12 +566,32 @@ mod cascaded_derivation_tests {
             "Window should reuse Broadcast Join's left distribution; no enforcer needed. winner = {w:?}"
         );
 
-        // The Broadcast Join's winner output must still contain c10.
-        let bj_req = PhysicalPropertySet {
-            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
-            ordering: OrderingSpec::Any,
-        };
-        let bj_winner = ctx.winners.get(&(g_bj, bj_req)).unwrap();
+        // The Broadcast Join's winner output must still contain c10. Use
+        // Window's actual child requirement here; it includes both partition
+        // distribution and ordering.
+        let window_expr = memo.groups[root]
+            .physical_exprs
+            .first()
+            .expect("window physical expr");
+        assert_eq!(window_expr.children.as_slice(), &[g_bj]);
+        let bj_req = crate::sql::optimizer::derive::derive_required(
+            &window_expr.op,
+            &PhysicalPropertySet::any(),
+            1,
+        )
+        .into_iter()
+        .next()
+        .expect("window child requirement");
+        let bj_winner = ctx
+            .winners
+            .get(&(g_bj, bj_req))
+            .expect("broadcast join child requirement should have a winner");
+        if let Some(enforcer) = &bj_winner.enforcer {
+            assert!(
+                !matches!(enforcer.kind, EnforcerKind::Distribution(_)),
+                "Broadcast Join should not need a distribution enforcer; winner = {bj_winner:?}"
+            );
+        }
         match &bj_winner.output.distribution {
             DistributionSpec::HashPartitioned { cols, .. } => {
                 assert!(

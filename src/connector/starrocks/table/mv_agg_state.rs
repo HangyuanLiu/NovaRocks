@@ -575,7 +575,7 @@ fn validate_state_shaped_input_schema(
         if !actual_field
             .name()
             .eq_ignore_ascii_case(expected_field.name())
-            || actual_field.data_type() != expected_field.data_type()
+            || !state_shaped_data_type_matches(index, actual_field, expected_field, shape)
             || !state_shaped_nullable_matches(index, actual_field, expected_field, shape)
         {
             return Err(format!(
@@ -590,6 +590,18 @@ fn validate_state_shaped_input_schema(
         }
     }
     Ok(())
+}
+
+fn state_shaped_data_type_matches(
+    index: usize,
+    actual: &Field,
+    expected: &Field,
+    shape: &AggregateMvShape,
+) -> bool {
+    actual.data_type() == expected.data_type()
+        || (state_shaped_field_is_state(index, shape)
+            && is_varbinary_arrow_type(actual.data_type())
+            && is_varbinary_arrow_type(expected.data_type()))
 }
 
 fn state_shaped_nullable_matches(
@@ -676,7 +688,7 @@ fn state_shaped_input_fields(
 
 fn state_shaped_state_data_type(state_column: &AggregateStateColumn) -> DataType {
     match state_column.state_role {
-        AggregateStateRole::Single => DataType::Binary,
+        AggregateStateRole::Single => state_column.data_type.clone(),
         AggregateStateRole::RetractionCount => state_column.data_type.clone(),
     }
 }
