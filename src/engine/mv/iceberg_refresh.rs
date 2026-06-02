@@ -171,6 +171,12 @@ pub(crate) fn create_iceberg_mv(
             ensure_base_row_lineage_contract(&loaded_base.table, &base_ref.fqn())?;
             vec![(base_ref.clone(), loaded_base)]
         }
+        IncrementalMvShape::UnionAll(_) => {
+            return Err(
+                "iceberg-backed UNION ALL materialized views are not supported in this phase"
+                    .to_string(),
+            );
+        }
         IncrementalMvShape::JoinAggregate(join_shape) => {
             if base_refs.len() != 2 {
                 return Err(
@@ -212,6 +218,12 @@ pub(crate) fn create_iceberg_mv(
                         .to_string(),
                 );
             }
+            IncrementalMvShape::UnionAll(_) => {
+                return Err(
+                    "iceberg-backed UNION ALL materialized views do not support PRIMARY KEY in this phase"
+                        .to_string(),
+                );
+            }
             IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
                 return Err(
                     "iceberg-backed aggregate materialized views do not support PRIMARY KEY"
@@ -225,6 +237,12 @@ pub(crate) fn create_iceberg_mv(
     let apply_key_column_name = match &shape {
         IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_COLUMN,
         IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        IncrementalMvShape::UnionAll(_) => {
+            return Err(
+                "iceberg-backed UNION ALL materialized views are not supported in this phase"
+                    .to_string(),
+            );
+        }
         IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
             ICEBERG_MV_GROUP_APPLY_KEY_COLUMN
         }
@@ -232,6 +250,12 @@ pub(crate) fn create_iceberg_mv(
     let apply_key_source_property = match &shape {
         IncrementalMvShape::ProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
         IncrementalMvShape::JoinProjectionFilter(_) => ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
+        IncrementalMvShape::UnionAll(_) => {
+            return Err(
+                "iceberg-backed UNION ALL materialized views are not supported in this phase"
+                    .to_string(),
+            );
+        }
         IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
             ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID
         }
@@ -258,6 +282,12 @@ pub(crate) fn create_iceberg_mv(
         columns.push(match &shape {
             IncrementalMvShape::ProjectionFilter(_) => apply_key_table_column(),
             IncrementalMvShape::JoinProjectionFilter(_) => join_apply_key_table_column(),
+            IncrementalMvShape::UnionAll(_) => {
+                return Err(
+                    "iceberg-backed UNION ALL materialized views are not supported in this phase"
+                        .to_string(),
+                );
+            }
             IncrementalMvShape::Aggregate(_) | IncrementalMvShape::JoinAggregate(_) => {
                 unreachable!("aggregate shape was handled above")
             }
@@ -716,6 +746,12 @@ fn build_iceberg_mv_schema_contract(
                     crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
                 )?,
             }
+        }
+        IncrementalMvShape::UnionAll(_) => {
+            return Err(
+                "iceberg-backed UNION ALL MV schema contract is not supported in this phase"
+                    .to_string(),
+            );
         }
     };
     contract

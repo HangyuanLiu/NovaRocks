@@ -475,6 +475,9 @@ where
             "join aggregate IMV refresh is not supported by legacy StarRocks MV refresh"
                 .to_string(),
         ),
+        (super::mv_shape::IncrementalMvShape::UnionAll(_), _) => {
+            Err("UNION ALL IMV refresh is not supported by legacy StarRocks MV refresh".to_string())
+        }
         (
             super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::FullRefresh { .. },

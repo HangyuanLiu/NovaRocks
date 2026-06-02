@@ -2682,6 +2682,7 @@ mod tests {
 
         let shape = AggregateMvShape {
             base_table: ObjectName(vec![]),
+            fan_in_bases: Vec::new(),
             group_keys: vec![GroupKeyShape {
                 output_name: "k".to_string(),
                 expr: sqlparser::ast::Expr::Identifier("k".into()),

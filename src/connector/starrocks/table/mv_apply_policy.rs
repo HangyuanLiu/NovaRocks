@@ -28,6 +28,10 @@ pub(crate) fn apply_policy_for_change(
         // Phase 4 wired the detail-map state through merge / negate /
         // derive-visible, so DELETE deltas are handled incrementally.
         IncrementalMvShape::Aggregate(_) => MvApplyPolicy::Incremental,
+        IncrementalMvShape::UnionAll(_) => MvApplyPolicy::Unsupported {
+            reason: "UNION ALL IMV refresh is not supported by the legacy StarRocks MV apply policy"
+                .to_string(),
+        },
         IncrementalMvShape::JoinProjectionFilter(_) => MvApplyPolicy::Unsupported {
             reason: "join projection/filter IMV refresh is not supported by the legacy StarRocks MV apply policy".to_string(),
         },
@@ -64,6 +68,7 @@ mod tests {
     fn aggregate_shape(function: AggregateFunctionKind) -> IncrementalMvShape {
         IncrementalMvShape::Aggregate(AggregateMvShape {
             base_table: object_name(),
+            fan_in_bases: Vec::new(),
             group_keys: Vec::new(),
             aggregates: vec![AggregateCallShape {
                 output_name: "a".to_string(),

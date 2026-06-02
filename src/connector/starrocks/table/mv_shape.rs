@@ -2,6 +2,7 @@
 pub(crate) enum IncrementalMvShape {
     ProjectionFilter(ProjectionFilterMvShape),
     Aggregate(AggregateMvShape),
+    UnionAll(UnionAllMvShape),
     JoinProjectionFilter(JoinProjectionFilterMvShape),
     JoinAggregate(JoinAggregateMvShape),
 }
@@ -11,7 +12,9 @@ impl IncrementalMvShape {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
-            IncrementalMvShape::JoinProjectionFilter(_) | IncrementalMvShape::JoinAggregate(_) => {
+            IncrementalMvShape::UnionAll(_)
+            | IncrementalMvShape::JoinProjectionFilter(_)
+            | IncrementalMvShape::JoinAggregate(_) => {
                 panic!("base_table() is only valid for single-base MV shapes")
             }
         }
@@ -20,7 +23,18 @@ impl IncrementalMvShape {
     pub(crate) fn base_tables(&self) -> Vec<&sqlparser::ast::ObjectName> {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => vec![&shape.base_table],
-            IncrementalMvShape::Aggregate(shape) => vec![&shape.base_table],
+            IncrementalMvShape::Aggregate(shape) => {
+                if shape.fan_in_bases.is_empty() {
+                    vec![&shape.base_table]
+                } else {
+                    shape.fan_in_bases.iter().collect()
+                }
+            }
+            IncrementalMvShape::UnionAll(shape) => shape
+                .branches
+                .iter()
+                .flat_map(|branch| branch.base_tables())
+                .collect(),
             IncrementalMvShape::JoinProjectionFilter(shape) => {
                 vec![&shape.left_table, &shape.right_table]
             }
@@ -39,9 +53,23 @@ pub(crate) struct ProjectionFilterMvShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AggregateMvShape {
     pub(crate) base_table: sqlparser::ast::ObjectName,
+    /// All base tables that feed the aggregate when the shape has fan-in branches.
+    pub(crate) fan_in_bases: Vec<sqlparser::ast::ObjectName>,
     pub(crate) group_keys: Vec<GroupKeyShape>,
     pub(crate) aggregates: Vec<AggregateCallShape>,
     pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnionBranchKind {
+    ProjectionFilter,
+    Aggregate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnionAllMvShape {
+    pub(crate) branch_kind: UnionBranchKind,
+    pub(crate) branches: Vec<IncrementalMvShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +93,7 @@ impl JoinAggregateMvShape {
     pub(crate) fn as_aggregate_shape_for_layout(&self) -> AggregateMvShape {
         AggregateMvShape {
             base_table: self.join.left_table.clone(),
+            fan_in_bases: Vec::new(),
             group_keys: self.group_keys.clone(),
             aggregates: self.aggregates.clone(),
             visible_outputs: self.visible_outputs.clone(),
@@ -177,6 +206,7 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
     Ok(AggregateMvShape {
         base_table,
+        fan_in_bases: Vec::new(),
         group_keys,
         aggregates,
         visible_outputs,
@@ -1681,6 +1711,19 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
+    fn name(s: &str) -> sqlparser::ast::ObjectName {
+        let parts = s
+            .split('.')
+            .map(sqlparser::ast::Ident::new)
+            .collect::<Vec<_>>();
+        sqlparser::ast::ObjectName(
+            parts
+                .into_iter()
+                .map(sqlparser::ast::ObjectNamePart::Identifier)
+                .collect(),
+        )
+    }
+
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
@@ -1698,6 +1741,53 @@ mod tests {
         assert!(
             err.contains(needle) || err.contains("syntax error"),
             "expected error to contain `{needle}` or a syntax error for `{sql}`, got `{err}`"
+        );
+    }
+
+    #[test]
+    fn union_all_shape_reports_all_branch_base_tables() {
+        let agg = AggregateMvShape {
+            base_table: name("ice.ns.t1"),
+            fan_in_bases: Vec::new(),
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let agg2 = AggregateMvShape {
+            base_table: name("ice.ns.t2"),
+            fan_in_bases: Vec::new(),
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let shape = IncrementalMvShape::UnionAll(UnionAllMvShape {
+            branch_kind: UnionBranchKind::Aggregate,
+            branches: vec![
+                IncrementalMvShape::Aggregate(agg),
+                IncrementalMvShape::Aggregate(agg2),
+            ],
+        });
+        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            bases,
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn aggregate_shape_fan_in_bases_drive_base_tables() {
+        let agg = AggregateMvShape {
+            base_table: name("ice.ns.t1"),
+            fan_in_bases: vec![name("ice.ns.t1"), name("ice.ns.t2")],
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let shape = IncrementalMvShape::Aggregate(agg);
+        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            bases,
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
         );
     }
 
