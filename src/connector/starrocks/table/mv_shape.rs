@@ -224,10 +224,7 @@ fn flatten_union_all<'a>(
             right,
         } => {
             if !matches!(op, sqlparser::ast::SetOperator::Union)
-                || !matches!(
-                    set_quantifier,
-                    sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
-                )
+                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
             {
                 return Err(union_all_non_all_error());
             }
@@ -276,22 +273,24 @@ fn union_branch_kind(shape: &IncrementalMvShape) -> Result<UnionBranchKind, Stri
 }
 
 fn validate_union_branch_outputs_compatible(branches: &[IncrementalMvShape]) -> Result<(), String> {
-    let arity = |shape: &IncrementalMvShape| -> usize {
-        match shape {
-            IncrementalMvShape::Aggregate(a) => a.visible_outputs.len(),
-            _ => usize::MAX,
-        }
-    };
     let Some(first_branch) = branches.first() else {
         return Err(union_all_error());
     };
-    let first = arity(first_branch);
-    if first != usize::MAX {
-        for branch in &branches[1..] {
-            if arity(branch) != first {
-                return Err(union_all_branch_output_mismatch_error());
+
+    match first_branch {
+        IncrementalMvShape::Aggregate(first) => {
+            let first_arity = first.visible_outputs.len();
+            for branch in &branches[1..] {
+                let IncrementalMvShape::Aggregate(other) = branch else {
+                    return Err(union_all_mixed_shape_error());
+                };
+                if other.visible_outputs.len() != first_arity {
+                    return Err(union_all_branch_output_mismatch_error());
+                }
             }
         }
+        IncrementalMvShape::ProjectionFilter(_) => {}
+        _ => return Err(union_all_mixed_shape_error()),
     }
     Ok(())
 }
@@ -1602,7 +1601,7 @@ fn union_all_error() -> String {
 }
 
 fn union_all_non_all_error() -> String {
-    "incremental UNION ALL MV supports only UNION ALL; UNION (distinct) / INTERSECT / EXCEPT are not supported".to_string()
+    "incremental UNION ALL MV supports only positional UNION ALL; UNION ALL BY NAME, UNION (distinct), INTERSECT, and EXCEPT are not supported".to_string()
 }
 
 fn union_all_mixed_shape_error() -> String {
@@ -1613,9 +1612,9 @@ fn union_all_branch_join_unsupported_error() -> String {
     "incremental UNION ALL MV branches may not contain joins in this version".to_string()
 }
 
-#[allow(dead_code)]
 fn union_all_branch_output_mismatch_error() -> String {
-    "incremental UNION ALL MV branches must have identical output arity, types, and nullability (no implicit cast)".to_string()
+    "incremental UNION ALL MV aggregate branches must have identical visible output arity"
+        .to_string()
 }
 
 /// Rewrite a MV SELECT SQL into state-shaped output columns.
@@ -1979,6 +1978,17 @@ mod tests {
         let err = classify_sql("select k1 from ice.ns.t1 union select k1 from ice.ns.t2")
             .expect_err("UNION distinct must be rejected");
         assert!(err.contains("UNION ALL"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_union_all_by_name() {
+        let err =
+            classify_sql("select k1 from ice.ns.t1 union all by name select k1 from ice.ns.t2")
+                .expect_err("UNION ALL BY NAME must be rejected");
+        assert!(
+            err.contains("UNION ALL") || err.contains("BY NAME"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
