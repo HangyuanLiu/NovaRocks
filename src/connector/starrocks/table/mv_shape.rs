@@ -238,7 +238,10 @@ fn flatten_union_all<'a>(
             out.push(body);
             Ok(())
         }
-        sqlparser::ast::SetExpr::Query(inner) => flatten_union_all(inner.body.as_ref(), out),
+        sqlparser::ast::SetExpr::Query(inner) => {
+            reject_unsupported_query_clauses(inner).map_err(|_| union_all_error())?;
+            flatten_union_all(inner.body.as_ref(), out)
+        }
         _ => Err(union_all_error()),
     }
 }
@@ -1924,6 +1927,20 @@ mod tests {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>(),
             vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_union_all_branch_with_parenthesized_limit() {
+        let err = classify_sql(
+            "(select k1, sum(v2) as s from ice.ns.t1 group by k1 limit 1) \
+             union all \
+             select k1, sum(v2) as s from ice.ns.t2 group by k1",
+        )
+        .expect_err("branch-local LIMIT must be rejected");
+        assert!(
+            err.contains("UNION ALL") || err.contains("incremental"),
+            "unexpected: {err}"
         );
     }
 
