@@ -405,7 +405,30 @@ pub(crate) fn register_external_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_external_tables_for_query_impl(state, current_catalog, current_database, query, false)
+    register_external_tables_for_query_impl(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        false,
+        QueryRegistrationMode::SchemaOnly,
+    )
+}
+
+pub(crate) fn register_external_tables_for_query_with_scan_bindings(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<(), String> {
+    register_external_tables_for_query_impl(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        true,
+        QueryRegistrationMode::ScanBinding,
+    )
 }
 
 pub(crate) fn refresh_external_tables_for_query(
@@ -414,7 +437,20 @@ pub(crate) fn refresh_external_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_external_tables_for_query_impl(state, current_catalog, current_database, query, true)
+    register_external_tables_for_query_impl(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        true,
+        QueryRegistrationMode::SchemaOnly,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryRegistrationMode {
+    SchemaOnly,
+    ScanBinding,
 }
 
 fn build_registration_table_def(
@@ -422,6 +458,17 @@ fn build_registration_table_def(
     resolved: &crate::connector::backend::ResolvedTable,
 ) -> Result<TableDef, String> {
     source.build_schema_table_def(resolved)
+}
+
+fn build_query_registration_table_def(
+    source: &dyn crate::connector::backend::TableSource,
+    resolved: &crate::connector::backend::ResolvedTable,
+    mode: QueryRegistrationMode,
+) -> Result<TableDef, String> {
+    match mode {
+        QueryRegistrationMode::SchemaOnly => build_registration_table_def(source, resolved),
+        QueryRegistrationMode::ScanBinding => source.build_table_def(resolved),
+    }
 }
 
 /// Materialize a single external connector table into the standalone in-memory
@@ -497,6 +544,7 @@ fn register_external_tables_for_query_impl(
     current_database: &str,
     query: &sqlparser::ast::Query,
     force_refresh: bool,
+    mode: QueryRegistrationMode,
 ) -> Result<(), String> {
     let mut names = query_table_names(current_catalog, query);
     if names.is_empty() {
@@ -504,6 +552,8 @@ fn register_external_tables_for_query_impl(
     }
     names.sort_by(|left, right| left.parts.cmp(&right.parts));
     names.dedup_by(|left, right| left.parts == right.parts);
+    let partition_metadata_scan_binding_targets =
+        partition_metadata_scan_binding_targets(state, current_catalog, current_database, query);
 
     let (catalog, source) = {
         let registry = state
@@ -567,7 +617,17 @@ fn register_external_tables_for_query_impl(
                 continue;
             }
         };
-        let table_def = build_registration_table_def(source.as_ref(), &resolved)?;
+        let registration_mode = if partition_metadata_scan_binding_targets.contains(&(
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+        )) {
+            QueryRegistrationMode::ScanBinding
+        } else {
+            mode
+        };
+        let table_def =
+            build_query_registration_table_def(source.as_ref(), &resolved, registration_mode)?;
         register_external_table(state, &target.namespace, table_def)?;
     }
 
@@ -646,6 +706,583 @@ fn query_table_names(
     names.sort_by(|a, b| a.parts.cmp(&b.parts));
     names.dedup_by(|a, b| a.parts == b.parts);
     names
+}
+
+type ScanBindingTargetKey = (String, String, String);
+
+fn partition_metadata_scan_binding_targets(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> std::collections::BTreeSet<ScanBindingTargetKey> {
+    partition_metadata_table_refs(current_catalog, query)
+        .into_iter()
+        .filter_map(|parts| {
+            let name = ObjectName { parts };
+            let target =
+                resolve_table_target(state, &name, current_catalog, current_database).ok()?;
+            (target.backend_name == "iceberg").then_some((
+                target.catalog,
+                target.namespace,
+                target.table,
+            ))
+        })
+        .collect()
+}
+
+fn query_requires_partition_metadata_files(query: &sqlparser::ast::Query) -> bool {
+    let mut refs = std::collections::BTreeSet::new();
+    collect_partition_metadata_refs_from_query(query, true, &mut refs);
+    !refs.is_empty()
+}
+
+fn partition_metadata_table_refs(
+    current_catalog: Option<&str>,
+    query: &sqlparser::ast::Query,
+) -> std::collections::BTreeSet<Vec<String>> {
+    let mut refs = std::collections::BTreeSet::new();
+    collect_partition_metadata_refs_from_query(query, current_catalog.is_some(), &mut refs);
+    refs
+}
+
+fn collect_partition_metadata_refs_from_query(
+    query: &sqlparser::ast::Query,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_partition_metadata_refs_from_query(&cte.query, include_session_refs, refs);
+        }
+    }
+    collect_partition_metadata_refs_from_set_expr(query.body.as_ref(), include_session_refs, refs);
+    if let Some(order_by) = &query.order_by {
+        collect_partition_metadata_refs_from_order_by(order_by, include_session_refs, refs);
+    }
+    collect_partition_metadata_refs_from_limit_clause(
+        query.limit_clause.as_ref(),
+        include_session_refs,
+        refs,
+    );
+}
+
+fn collect_partition_metadata_refs_from_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &select.from {
+                collect_partition_metadata_refs_from_table_factor(
+                    &from.relation,
+                    include_session_refs,
+                    refs,
+                );
+                for join in &from.joins {
+                    collect_partition_metadata_refs_from_table_factor(
+                        &join.relation,
+                        include_session_refs,
+                        refs,
+                    );
+                    if let Some(on_expr) = join_on_constraint_expr(&join.join_operator) {
+                        collect_partition_metadata_refs_from_expr(
+                            on_expr,
+                            include_session_refs,
+                            refs,
+                        );
+                    }
+                }
+            }
+            if let Some(prewhere) = &select.prewhere {
+                collect_partition_metadata_refs_from_expr(prewhere, include_session_refs, refs);
+            }
+            if let Some(selection) = &select.selection {
+                collect_partition_metadata_refs_from_expr(selection, include_session_refs, refs);
+            }
+            for connect_by in &select.connect_by {
+                collect_partition_metadata_refs_from_connect_by(
+                    connect_by,
+                    include_session_refs,
+                    refs,
+                );
+            }
+            collect_partition_metadata_refs_from_group_by(
+                &select.group_by,
+                include_session_refs,
+                refs,
+            );
+            for expr in &select.cluster_by {
+                collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            }
+            for expr in &select.distribute_by {
+                collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            }
+            for order_by in &select.sort_by {
+                collect_partition_metadata_refs_from_order_by_expr(
+                    order_by,
+                    include_session_refs,
+                    refs,
+                );
+            }
+            if let Some(having) = &select.having {
+                collect_partition_metadata_refs_from_expr(having, include_session_refs, refs);
+            }
+            if let Some(qualify) = &select.qualify {
+                collect_partition_metadata_refs_from_expr(qualify, include_session_refs, refs);
+            }
+            for projection in &select.projection {
+                match projection {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+                    }
+                    _ => {}
+                }
+            }
+            for lateral_view in &select.lateral_views {
+                collect_partition_metadata_refs_from_expr(
+                    &lateral_view.lateral_view,
+                    include_session_refs,
+                    refs,
+                );
+            }
+            for named_window in &select.named_window {
+                collect_partition_metadata_refs_from_named_window(
+                    named_window,
+                    include_session_refs,
+                    refs,
+                );
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            collect_partition_metadata_refs_from_set_expr(left, include_session_refs, refs);
+            collect_partition_metadata_refs_from_set_expr(right, include_session_refs, refs);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            collect_partition_metadata_refs_from_query(query, include_session_refs, refs);
+        }
+        sqlparser::ast::SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in row {
+                    collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn join_on_constraint_expr(
+    join_operator: &sqlparser::ast::JoinOperator,
+) -> Option<&sqlparser::ast::Expr> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let constraint = match join_operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c)
+        | JoinOperator::AsOf { constraint: c, .. } => c,
+        JoinOperator::CrossApply | JoinOperator::OuterApply => return None,
+    };
+    match constraint {
+        JoinConstraint::On(expr) => Some(expr),
+        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => None,
+    }
+}
+
+fn collect_partition_metadata_refs_from_table_factor(
+    factor: &sqlparser::ast::TableFactor,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let (_, metadata_suffix) =
+                crate::sql::analyzer::iceberg_metadata::split_metadata_suffix(&parts);
+            if matches!(
+                metadata_suffix,
+                Some(crate::connector::iceberg::IcebergMetadataTableType::Partitions)
+            ) {
+                let (base_parts, _) =
+                    crate::sql::analyzer::iceberg_metadata::split_metadata_suffix(&parts);
+                if base_parts.len() == 3
+                    || (include_session_refs && matches!(base_parts.len(), 1 | 2))
+                {
+                    refs.insert(base_parts.to_vec());
+                }
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            collect_partition_metadata_refs_from_query(subquery, include_session_refs, refs);
+        }
+        sqlparser::ast::TableFactor::TableFunction { expr, .. } => {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        sqlparser::ast::TableFactor::Function { args, .. } => {
+            for arg in args {
+                collect_partition_metadata_refs_from_function_arg(arg, include_session_refs, refs);
+            }
+        }
+        sqlparser::ast::TableFactor::UNNEST { array_exprs, .. } => {
+            for expr in array_exprs {
+                collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            }
+        }
+        sqlparser::ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_partition_metadata_refs_from_table_with_joins(
+                table_with_joins,
+                include_session_refs,
+                refs,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_partition_metadata_refs_from_table_with_joins(
+    table_with_joins: &sqlparser::ast::TableWithJoins,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    collect_partition_metadata_refs_from_table_factor(
+        &table_with_joins.relation,
+        include_session_refs,
+        refs,
+    );
+    for join in &table_with_joins.joins {
+        collect_partition_metadata_refs_from_table_factor(
+            &join.relation,
+            include_session_refs,
+            refs,
+        );
+        if let Some(on_expr) = join_on_constraint_expr(&join.join_operator) {
+            collect_partition_metadata_refs_from_expr(on_expr, include_session_refs, refs);
+        }
+    }
+}
+
+fn collect_partition_metadata_refs_from_expr(
+    expr: &sqlparser::ast::Expr,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => collect_partition_metadata_refs_from_query(query, include_session_refs, refs),
+        Expr::InSubquery { subquery, expr, .. } => {
+            collect_partition_metadata_refs_from_query(subquery, include_session_refs, refs);
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_partition_metadata_refs_from_expr(left, include_session_refs, refs);
+            collect_partition_metadata_refs_from_expr(right, include_session_refs, refs);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            collect_partition_metadata_refs_from_expr(low, include_session_refs, refs);
+            collect_partition_metadata_refs_from_expr(high, include_session_refs, refs);
+        }
+        Expr::Function(function) => {
+            collect_partition_metadata_refs_from_function(function, include_session_refs, refs);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_partition_metadata_refs_from_expr(op, include_session_refs, refs);
+            }
+            for case_when in conditions {
+                collect_partition_metadata_refs_from_expr(
+                    &case_when.condition,
+                    include_session_refs,
+                    refs,
+                );
+                collect_partition_metadata_refs_from_expr(
+                    &case_when.result,
+                    include_session_refs,
+                    refs,
+                );
+            }
+            if let Some(else_expr) = else_result {
+                collect_partition_metadata_refs_from_expr(else_expr, include_session_refs, refs);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        _ => {}
+    }
+}
+
+fn collect_partition_metadata_refs_from_group_by(
+    group_by: &sqlparser::ast::GroupByExpr,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = group_by {
+        for expr in exprs {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+    }
+}
+
+fn collect_partition_metadata_refs_from_order_by(
+    order_by: &sqlparser::ast::OrderBy,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+        for expr in exprs {
+            collect_partition_metadata_refs_from_order_by_expr(expr, include_session_refs, refs);
+        }
+    }
+    if let Some(interpolate) = &order_by.interpolate
+        && let Some(exprs) = &interpolate.exprs
+    {
+        for expr in exprs {
+            if let Some(inner) = &expr.expr {
+                collect_partition_metadata_refs_from_expr(inner, include_session_refs, refs);
+            }
+        }
+    }
+}
+
+fn collect_partition_metadata_refs_from_order_by_expr(
+    order_by: &sqlparser::ast::OrderByExpr,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    collect_partition_metadata_refs_from_expr(&order_by.expr, include_session_refs, refs);
+    if let Some(with_fill) = &order_by.with_fill {
+        if let Some(expr) = &with_fill.from {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        if let Some(expr) = &with_fill.to {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        if let Some(expr) = &with_fill.step {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+    }
+}
+
+fn collect_partition_metadata_refs_from_limit_clause(
+    limit_clause: Option<&sqlparser::ast::LimitClause>,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match limit_clause {
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if let Some(limit) = limit {
+                collect_partition_metadata_refs_from_expr(limit, include_session_refs, refs);
+            }
+            if let Some(offset) = offset {
+                collect_partition_metadata_refs_from_expr(
+                    &offset.value,
+                    include_session_refs,
+                    refs,
+                );
+            }
+            for expr in limit_by {
+                collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            }
+        }
+        Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+            collect_partition_metadata_refs_from_expr(offset, include_session_refs, refs);
+            collect_partition_metadata_refs_from_expr(limit, include_session_refs, refs);
+        }
+        None => {}
+    }
+}
+
+fn collect_partition_metadata_refs_from_connect_by(
+    connect_by: &sqlparser::ast::ConnectByKind,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match connect_by {
+        sqlparser::ast::ConnectByKind::ConnectBy { relationships, .. } => {
+            for expr in relationships {
+                collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+            }
+        }
+        sqlparser::ast::ConnectByKind::StartWith { condition, .. } => {
+            collect_partition_metadata_refs_from_expr(condition, include_session_refs, refs);
+        }
+    }
+}
+
+fn collect_partition_metadata_refs_from_named_window(
+    named_window: &sqlparser::ast::NamedWindowDefinition,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    if let sqlparser::ast::NamedWindowExpr::WindowSpec(spec) = &named_window.1 {
+        collect_partition_metadata_refs_from_window_spec(spec, include_session_refs, refs);
+    }
+}
+
+fn collect_partition_metadata_refs_from_window_spec(
+    spec: &sqlparser::ast::WindowSpec,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    for expr in &spec.partition_by {
+        collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+    }
+    for order_by in &spec.order_by {
+        collect_partition_metadata_refs_from_order_by_expr(order_by, include_session_refs, refs);
+    }
+}
+
+fn collect_partition_metadata_refs_from_function(
+    function: &sqlparser::ast::Function,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    collect_partition_metadata_refs_from_function_arguments(
+        &function.parameters,
+        include_session_refs,
+        refs,
+    );
+    collect_partition_metadata_refs_from_function_arguments(
+        &function.args,
+        include_session_refs,
+        refs,
+    );
+    if let Some(filter) = &function.filter {
+        collect_partition_metadata_refs_from_expr(filter, include_session_refs, refs);
+    }
+    if let Some(over) = &function.over {
+        collect_partition_metadata_refs_from_window_type(over, include_session_refs, refs);
+    }
+    for order_by in &function.within_group {
+        collect_partition_metadata_refs_from_order_by_expr(order_by, include_session_refs, refs);
+    }
+}
+
+fn collect_partition_metadata_refs_from_window_type(
+    window: &sqlparser::ast::WindowType,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    if let sqlparser::ast::WindowType::WindowSpec(spec) = window {
+        collect_partition_metadata_refs_from_window_spec(spec, include_session_refs, refs);
+    }
+}
+
+fn collect_partition_metadata_refs_from_function_arguments(
+    args: &sqlparser::ast::FunctionArguments,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match args {
+        sqlparser::ast::FunctionArguments::Subquery(query) => {
+            collect_partition_metadata_refs_from_query(query, include_session_refs, refs);
+        }
+        sqlparser::ast::FunctionArguments::List(arg_list) => {
+            for arg in &arg_list.args {
+                collect_partition_metadata_refs_from_function_arg(arg, include_session_refs, refs);
+            }
+            for clause in &arg_list.clauses {
+                collect_partition_metadata_refs_from_function_clause(
+                    clause,
+                    include_session_refs,
+                    refs,
+                );
+            }
+        }
+        sqlparser::ast::FunctionArguments::None => {}
+    }
+}
+
+fn collect_partition_metadata_refs_from_function_arg(
+    arg: &sqlparser::ast::FunctionArg,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    let inner = match arg {
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+            Some(expr)
+        }
+        sqlparser::ast::FunctionArg::Named {
+            arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+            ..
+        } => Some(expr),
+        sqlparser::ast::FunctionArg::ExprNamed {
+            arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+            ..
+        } => Some(expr),
+        _ => None,
+    };
+    if let Some(expr) = inner {
+        collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+    }
+}
+
+fn collect_partition_metadata_refs_from_function_clause(
+    clause: &sqlparser::ast::FunctionArgumentClause,
+    include_session_refs: bool,
+    refs: &mut std::collections::BTreeSet<Vec<String>>,
+) {
+    match clause {
+        sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
+            for expr in order_by {
+                collect_partition_metadata_refs_from_order_by_expr(
+                    expr,
+                    include_session_refs,
+                    refs,
+                );
+            }
+        }
+        sqlparser::ast::FunctionArgumentClause::Limit(expr) => {
+            collect_partition_metadata_refs_from_expr(expr, include_session_refs, refs);
+        }
+        sqlparser::ast::FunctionArgumentClause::Having(bound) => {
+            collect_partition_metadata_refs_from_expr(&bound.1, include_session_refs, refs);
+        }
+        _ => {}
+    }
 }
 
 /// Returns true if `table_name` was produced by the time-travel rewriter.
@@ -928,6 +1565,7 @@ mod tests {
                         table: test_iceberg_table_info(),
                         files: vec![],
                         cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 })
             }
@@ -946,6 +1584,219 @@ mod tests {
             panic!("expected iceberg source");
         };
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn scan_binding_registration_uses_table_def_source() {
+        struct ScanBindingSource;
+        impl crate::connector::backend::TableSource for ScanBindingSource {
+            fn name(&self) -> &'static str {
+                "iceberg"
+            }
+
+            fn build_table_def(
+                &self,
+                table: &crate::connector::backend::ResolvedTable,
+            ) -> Result<TableDef, String> {
+                Ok(TableDef {
+                    name: table.table.clone(),
+                    columns: table.columns.clone(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![],
+                        cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+                    },
+                })
+            }
+
+            fn build_schema_table_def(
+                &self,
+                _table: &crate::connector::backend::ResolvedTable,
+            ) -> Result<TableDef, String> {
+                Err("schema-only path must not be used for scan binding".to_string())
+            }
+        }
+
+        let resolved = crate::connector::backend::ResolvedTable {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            columns: vec![],
+        };
+        let table_def = super::build_query_registration_table_def(
+            &ScanBindingSource,
+            &resolved,
+            super::QueryRegistrationMode::ScanBinding,
+        )
+        .expect("scan-binding registration");
+
+        let ScanSource::IcebergDataFiles { binding, .. } = table_def.source else {
+            panic!("expected iceberg source");
+        };
+        assert_eq!(
+            binding,
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+        );
+    }
+
+    struct PerTableBindingBackend;
+
+    impl crate::connector::backend::CatalogBackend for PerTableBindingBackend {
+        fn name(&self) -> &'static str {
+            "iceberg"
+        }
+
+        fn namespace_exists(&self, _: &str, _: &str) -> Result<bool, String> {
+            Err("unused".to_string())
+        }
+
+        fn create_namespace(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+
+        fn drop_namespace(&self, _: &str, _: &str, _: bool) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+
+        fn create_table(
+            &self,
+            _: crate::connector::backend::CreateTableRequest,
+        ) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+
+        fn table_exists(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
+            Err("unused".to_string())
+        }
+
+        fn drop_table(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+
+        fn load_table(
+            &self,
+            catalog: &str,
+            namespace: &str,
+            table: &str,
+        ) -> Result<crate::connector::backend::ResolvedTable, String> {
+            Ok(crate::connector::backend::ResolvedTable {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                columns: vec![],
+            })
+        }
+    }
+
+    struct PerTableBindingSource;
+
+    impl crate::connector::backend::TableSource for PerTableBindingSource {
+        fn name(&self) -> &'static str {
+            "iceberg"
+        }
+
+        fn build_table_def(
+            &self,
+            table: &crate::connector::backend::ResolvedTable,
+        ) -> Result<TableDef, String> {
+            Ok(table_def_with_binding(
+                table,
+                crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            ))
+        }
+
+        fn build_schema_table_def(
+            &self,
+            table: &crate::connector::backend::ResolvedTable,
+        ) -> Result<TableDef, String> {
+            Ok(table_def_with_binding(
+                table,
+                crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            ))
+        }
+    }
+
+    fn table_def_with_binding(
+        table: &crate::connector::backend::ResolvedTable,
+        binding: crate::sql::catalog::IcebergDataFileBinding,
+    ) -> TableDef {
+        let mut iceberg = test_iceberg_table_info();
+        iceberg.catalog = table.catalog.clone();
+        iceberg.namespace = table.namespace.clone();
+        iceberg.table = table.table.clone();
+        TableDef {
+            name: table.table.clone(),
+            columns: table.columns.clone(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg,
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding,
+            },
+        }
+    }
+
+    fn state_with_per_table_binding_source() -> std::sync::Arc<crate::engine::StandaloneState> {
+        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
+        {
+            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
+            catalogs
+                .create_catalog(
+                    "ice",
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            "file:///tmp/novarocks-per-table-binding".to_string(),
+                        ),
+                    ],
+                )
+                .expect("create iceberg catalog");
+        }
+        {
+            let mut connectors = state.connectors.write().expect("connector registry write");
+            connectors.register_catalog_backend(std::sync::Arc::new(PerTableBindingBackend));
+            connectors.register_table_source(std::sync::Arc::new(PerTableBindingSource));
+        }
+        state
+    }
+
+    fn registered_binding(
+        state: &crate::engine::StandaloneState,
+        namespace: &str,
+        table: &str,
+    ) -> crate::sql::catalog::IcebergDataFileBinding {
+        let guard = state.catalog.read().expect("catalog read");
+        let table_def = crate::sql::catalog::CatalogProvider::get_table(&*guard, namespace, table)
+            .expect("registered table");
+        let ScanSource::IcebergDataFiles { binding, .. } = table_def.source else {
+            panic!("expected iceberg source");
+        };
+        binding
+    }
+
+    #[test]
+    fn partition_metadata_scan_binding_is_per_table() {
+        let state = state_with_per_table_binding_source();
+        let query = parse_query_for_table_names(
+            "SELECT * FROM plain JOIN ice.db.parted.__nr_meta_partitions__ ON true",
+        );
+
+        super::register_external_tables_for_query(&state, Some("ice"), "db", &query)
+            .expect("register external tables");
+
+        assert_eq!(
+            registered_binding(&state, "db", "plain"),
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+        );
+        assert_eq!(
+            registered_binding(&state, "db", "parted"),
+            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+        );
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
@@ -1032,6 +1883,58 @@ mod tests {
     }
 
     #[test]
+    fn partitions_metadata_query_requires_scan_binding_table_def() {
+        let query = parse_query_for_table_names("SELECT * FROM ice.db.t.__nr_meta_partitions__");
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
+    fn partitions_metadata_query_detects_projection_subquery() {
+        let query = parse_query_for_table_names(
+            "SELECT EXISTS (SELECT 1 FROM ice.db.t.__nr_meta_partitions__)",
+        );
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
+    fn partitions_metadata_query_detects_where_subquery() {
+        let query = parse_query_for_table_names(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM ice.db.t.__nr_meta_partitions__)",
+        );
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
+    fn partitions_metadata_query_detects_join_on_subquery() {
+        let query = parse_query_for_table_names(
+            "SELECT * FROM base JOIN other ON EXISTS (SELECT 1 FROM ice.db.t.__nr_meta_partitions__)",
+        );
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
+    fn partitions_metadata_query_detects_group_by_subquery() {
+        let query = parse_query_for_table_names(
+            "SELECT count(*) FROM base GROUP BY EXISTS (SELECT 1 FROM ice.db.t.__nr_meta_partitions__)",
+        );
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
+    fn partitions_metadata_query_detects_query_order_by_subquery() {
+        let query = parse_query_for_table_names(
+            "SELECT * FROM base ORDER BY EXISTS (SELECT 1 FROM ice.db.t.__nr_meta_partitions__)",
+        );
+
+        assert!(super::query_requires_partition_metadata_files(&query));
+    }
+
+    #[test]
     fn query_table_names_two_part_not_duplicated_as_one_part() {
         // When the query has `testdb.t_src`, only the 2-part form should be in
         // the output. The 1-part name `t_src` must not also appear.
@@ -1108,6 +2011,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1179,6 +2083,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1225,6 +2130,7 @@ mod tests {
                 table: test_iceberg_table_info(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 

@@ -2893,6 +2893,7 @@ mod tests {
                         table: test_iceberg_table_info(),
                         files: vec![],
                         cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 }),
                 _ => Err(format!("table not found: {table}")),

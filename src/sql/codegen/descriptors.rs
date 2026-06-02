@@ -352,6 +352,7 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let mut builder = DescriptorTableBuilder::new();

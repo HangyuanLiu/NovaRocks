@@ -147,6 +147,7 @@ mod tests {
                 table: iceberg_info(),
                 files: vec![], // files should be dropped, not carried into TableMetadata
                 cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let id = TableIdentity::new("ice", "ns", "t");

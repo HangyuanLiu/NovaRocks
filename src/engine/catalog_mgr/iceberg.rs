@@ -152,6 +152,7 @@ mod tests {
                     },
                     files: vec![],
                     cloud_properties: Default::default(),
+                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                 },
             })
         }

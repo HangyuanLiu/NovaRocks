@@ -184,6 +184,11 @@ impl TableSource for IcebergTableSource {
             &table.table,
             loaded,
             data_files,
+            if snapshot_id.is_some() {
+                crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+            } else {
+                crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+            },
         )
     }
 
@@ -207,6 +212,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
         table_name,
         loaded,
         data_files,
+        crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
     )
 }
 
@@ -298,7 +304,10 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     let schema = iceberg_schema_def(loaded.table.metadata().current_schema());
     let iceberg_table_info =
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
-    let source = empty_iceberg_scan_source(iceberg_table_info.clone());
+    let source = empty_iceberg_scan_source(
+        iceberg_table_info.clone(),
+        crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+    );
     let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
     iceberg_row_lineage_metadata_columns.push(ColumnDef {
         name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
@@ -329,7 +338,10 @@ fn build_iceberg_schema_table_def(
         table_name,
         loaded,
         Vec::new(),
-        IcebergTableDefMode::SchemaOnly,
+        IcebergTableDefOptions {
+            mode: IcebergTableDefMode::SchemaOnly,
+            binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+        },
     )
 }
 
@@ -339,6 +351,12 @@ enum IcebergTableDefMode {
     SchemaOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IcebergTableDefOptions {
+    mode: IcebergTableDefMode,
+    binding: crate::sql::catalog::IcebergDataFileBinding,
+}
+
 fn build_iceberg_table_def_with_data_files(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
@@ -346,6 +364,7 @@ fn build_iceberg_table_def_with_data_files(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
+    binding: crate::sql::catalog::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
         entry,
@@ -354,7 +373,10 @@ fn build_iceberg_table_def_with_data_files(
         table_name,
         loaded,
         data_files,
-        IcebergTableDefMode::ScanBinding,
+        IcebergTableDefOptions {
+            mode: IcebergTableDefMode::ScanBinding,
+            binding,
+        },
     )
 }
 
@@ -365,7 +387,7 @@ fn build_iceberg_table_def_with_data_files_impl(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
-    mode: IcebergTableDefMode,
+    options: IcebergTableDefOptions,
 ) -> Result<TableDef, String> {
     let has_data_files = !data_files.is_empty();
     // Row-lineage metadata columns (_row_id etc.) are only usable when every
@@ -389,6 +411,7 @@ fn build_iceberg_table_def_with_data_files_impl(
                 .map(data_file_with_stats_to_iceberg_data_file_info)
                 .collect(),
             cloud_properties,
+            binding: options.binding,
         }
     } else if has_data_files {
         // Local Iceberg tables can have multiple data files across snapshots.
@@ -402,12 +425,13 @@ fn build_iceberg_table_def_with_data_files_impl(
                 .map(data_file_with_stats_to_iceberg_data_file_info)
                 .collect(),
             cloud_properties: Default::default(),
+            binding: options.binding,
         }
     } else {
-        empty_iceberg_scan_source(iceberg_table_info)
+        empty_iceberg_scan_source(iceberg_table_info, options.binding)
     };
 
-    let iceberg_row_lineage_metadata_columns = match mode {
+    let iceberg_row_lineage_metadata_columns = match options.mode {
         IcebergTableDefMode::SchemaOnly => {
             if row_lineage_enabled(loaded.table.metadata()) {
                 iceberg_row_lineage_metadata_columns()
@@ -661,11 +685,15 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 /// ranges to read"; the runtime returns an empty result without ever
 /// touching the filesystem. This keeps empty Iceberg tables represented as
 /// catalog-owned scan sources instead of synthetic placeholder files.
-fn empty_iceberg_scan_source(table: IcebergTableInfo) -> ScanSource {
+fn empty_iceberg_scan_source(
+    table: IcebergTableInfo,
+    binding: crate::sql::catalog::IcebergDataFileBinding,
+) -> ScanSource {
     ScanSource::IcebergDataFiles {
         table,
         files: Vec::new(),
         cloud_properties: Default::default(),
+        binding,
     }
 }
 
@@ -1078,6 +1106,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![],
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1093,6 +1122,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file()],
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1108,6 +1138,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file_without_first_row_id()],
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 

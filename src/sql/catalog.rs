@@ -250,8 +250,8 @@ pub struct PhysicalTableLayout {
 /// - `StarRocks`: StarRocks table; the actual tablet/version
 ///   layout flows separately through `PhysicalTableLayout`.
 /// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
-///   parquet files — a concrete list of data files plus table identity
-///   and optional cloud-store credentials.
+///   parquet files — a concrete list of data files plus table identity,
+///   optional cloud-store credentials, and scan-binding provenance.
 /// - `IcebergMetadataTable`: synthetic source for iceberg metadata
 ///   tables (`t$snapshots` etc.); the operator reads
 ///   `iceberg::spec::TableMetadata` natively in Rust.
@@ -274,6 +274,7 @@ pub enum ScanSource {
         table: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,
         cloud_properties: BTreeMap<String, String>,
+        binding: IcebergDataFileBinding,
     },
     /// Synthetic scan source for an Iceberg metadata-table reference
     /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
@@ -330,6 +331,17 @@ pub enum ScanSource {
     /// or runtime behavior in this task. Future tasks will implement the
     /// optimizer rewrite and execution path.
     IcebergMvTargetState(IcebergMvTargetStateScan),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcebergDataFileBinding {
+    /// Ordinary catalog table registration. The `files` vector may be empty
+    /// for schema-only registration or populated for metadata-table planning,
+    /// but execution must bind splits from the table's current snapshot.
+    CurrentSnapshot,
+    /// Snapshot, refresh, or synthetic delta input whose `files` vector is the
+    /// complete execution input, including the empty-snapshot case.
+    ExplicitFiles,
 }
 
 #[derive(Clone, Debug)]
@@ -420,6 +432,7 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
+                binding: IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 

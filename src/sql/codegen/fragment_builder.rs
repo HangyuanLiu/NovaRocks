@@ -396,7 +396,11 @@ fn iceberg_scan_table_handle_for_codegen(
     column_names: Vec<String>,
 ) -> crate::connector::scan_planning::TableHandle {
     match original_source {
-        crate::sql::catalog::ScanSource::IcebergVersionTable { .. }
+        crate::sql::catalog::ScanSource::IcebergDataFiles {
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            ..
+        }
+        | crate::sql::catalog::ScanSource::IcebergVersionTable { .. }
         | crate::sql::catalog::ScanSource::IcebergMvTargetState(_) => {
             crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
                 &iceberg_table.catalog,
@@ -5740,6 +5744,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -5886,6 +5891,7 @@ mod tests {
                 table: test_iceberg_table_info_with_schema(iceberg_schema_fields),
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let plan = PhysicalPlanNode {
@@ -5945,6 +5951,7 @@ mod tests {
                 table: test_iceberg_table_info(),
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 
@@ -5976,6 +5983,7 @@ mod tests {
                 partition_values: vec![],
             }],
             cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
         };
 
         let err = nodes::reject_target_state_equality_deletes(&source)
@@ -6018,6 +6026,7 @@ mod tests {
                             partition_values: Vec::new(),
                         }],
                         cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6085,6 +6094,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6122,6 +6132,7 @@ mod tests {
                             iceberg_i32_file("s3://bucket/file-10-20.parquet", 10, 20),
                         ],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6159,6 +6170,7 @@ mod tests {
                             iceberg_i32_partition_file("s3://bucket/id-12.parquet", 12),
                         ],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6195,6 +6207,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -6233,6 +6246,7 @@ mod tests {
                         table: test_iceberg_table_info_with_id_schema(),
                         files: vec![file],
                         cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -7641,6 +7655,7 @@ mod tests {
                         table: iceberg_table_info,
                         files: vec![],
                         cloud_properties: std::collections::BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -7965,5 +7980,35 @@ mod tests {
             vec!["id".to_string()],
         );
         assert_explicit_file_path(table_handle, "s3://bucket/target-state-refresh.parquet");
+    }
+
+    #[test]
+    fn explicit_iceberg_data_file_binding_uses_explicit_files() {
+        let iceberg_table = test_iceberg_table_info_with_id_schema();
+        let file = iceberg_i32_file("s3://bucket/explicit-snapshot.parquet", 1, 1);
+        let original_source = ScanSource::IcebergDataFiles {
+            table: iceberg_table.clone(),
+            files: vec![file.clone()],
+            cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        };
+
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &original_source,
+            &iceberg_table,
+            vec![file],
+            vec!["id".to_string()],
+        );
+        let table_handle = table_handle
+            .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+            .expect("IcebergTableHandle");
+        let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
+            &table_handle.split_source
+        else {
+            panic!("explicit Iceberg data-file scans must preserve explicit files");
+        };
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "s3://bucket/explicit-snapshot.parquet");
     }
 }

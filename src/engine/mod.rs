@@ -1975,6 +1975,20 @@ pub(crate) fn register_iceberg_tables_for_query(
     )
 }
 
+fn register_iceberg_tables_for_explain(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<(), String> {
+    crate::engine::query_prep::register_external_tables_for_query_with_scan_bindings(
+        state,
+        current_catalog,
+        current_database,
+        query,
+    )
+}
+
 fn refresh_iceberg_tables_for_query(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -2634,17 +2648,18 @@ fn prepare_explain_query(
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
 
-    // When current_catalog is an Iceberg catalog, materialize referenced
-    // Iceberg tables into the local catalog first.
+    // EXPLAIN needs manifest row counts and min/max bounds for stable
+    // optimizer observability, so it registers scan-binding metadata while the
+    // regular SELECT path can keep schema-only registration.
     if current_catalog.is_some() {
-        register_iceberg_tables_for_query(state, current_catalog, current_database, &prepared)?;
+        register_iceberg_tables_for_explain(state, current_catalog, current_database, &prepared)?;
     }
 
     // Three-part catalog.database.table names: register and strip.
     let three_parts = extract_three_part_table_refs(&prepared);
     if !three_parts.is_empty() {
         if current_catalog.is_none() {
-            register_iceberg_tables_for_query(state, None, current_database, &prepared)?;
+            register_iceberg_tables_for_explain(state, None, current_database, &prepared)?;
         }
         strip_catalog_from_three_part_names(&mut prepared);
     }
@@ -3018,6 +3033,7 @@ fn collect_scan_stats(
                 table,
                 files,
                 cloud_properties,
+                ..
             } = &s.table.source
             {
                 // Best-effort: pull NDV from registered Puffin statistics for
@@ -4780,6 +4796,7 @@ enable_path_style_access = true
                         },
                         files: Vec::new(),
                         cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
             )
