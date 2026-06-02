@@ -372,6 +372,35 @@ fn effective_iceberg_scan_column_names(table: &crate::sql::catalog::TableDef) ->
     table.columns.iter().map(|c| c.name.clone()).collect()
 }
 
+fn iceberg_scan_table_handle_for_codegen(
+    original_source: &crate::sql::catalog::ScanSource,
+    iceberg_table: &crate::sql::catalog::IcebergTableInfo,
+    files: Vec<crate::sql::catalog::IcebergDataFileInfo>,
+    column_names: Vec<String>,
+) -> crate::connector::scan_planning::TableHandle {
+    match original_source {
+        crate::sql::catalog::ScanSource::IcebergVersionTable { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_) => {
+            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_from_source(
+                &iceberg_table.catalog,
+                &iceberg_table.namespace,
+                &iceberg_table.table,
+                iceberg_table.current_snapshot_id,
+                iceberg_table.clone(),
+                files,
+                column_names,
+            )
+        }
+        _ => crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            &iceberg_table.catalog,
+            &iceberg_table.namespace,
+            &iceberg_table.table,
+            iceberg_table.clone(),
+            column_names,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
@@ -1086,18 +1115,17 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table: iceberg_table,
+                files,
                 ..
             } => {
                 let planner = self.connectors.scan_planner("iceberg")?;
                 let column_names = effective_iceberg_scan_column_names(&table);
-                let table_handle =
-                    crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
-                        &iceberg_table.catalog,
-                        &iceberg_table.namespace,
-                        &iceberg_table.table,
-                        iceberg_table.clone(),
-                        column_names,
-                    );
+                let table_handle = iceberg_scan_table_handle_for_codegen(
+                    &op.table.source,
+                    iceberg_table,
+                    files.clone(),
+                    column_names,
+                );
                 let scan = planner.begin_scan(
                     table_handle,
                     crate::connector::scan_planning::BeginScanContext::default(),
@@ -7780,5 +7808,69 @@ mod tests {
             counts.begin_scan.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[test]
+    fn refresh_derived_iceberg_scan_handle_uses_explicit_files() {
+        fn assert_explicit_file_path(
+            table_handle: crate::connector::scan_planning::TableHandle,
+            expected_path: &str,
+        ) {
+            let table_handle = table_handle
+                .downcast_ref::<crate::connector::iceberg::IcebergTableHandle>()
+                .expect("IcebergTableHandle");
+            let crate::connector::iceberg::scan_planner::IcebergSplitSource::ExplicitFiles(files) =
+                &table_handle.split_source
+            else {
+                panic!("refresh-derived Iceberg scans must preserve explicit files");
+            };
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, expected_path);
+        }
+
+        let iceberg_table = test_iceberg_table_info_with_id_schema();
+        let original_source = ScanSource::IcebergVersionTable {
+            table: iceberg_table.clone(),
+            snapshot_id: 42,
+        };
+
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &original_source,
+            &iceberg_table,
+            vec![iceberg_i32_file("s3://bucket/pinned-refresh.parquet", 1, 1)],
+            vec!["id".to_string()],
+        );
+        assert_explicit_file_path(table_handle, "s3://bucket/pinned-refresh.parquet");
+
+        let target_state_source =
+            ScanSource::IcebergMvTargetState(crate::sql::catalog::IcebergMvTargetStateScan {
+                catalog: iceberg_table.catalog.clone(),
+                database: iceberg_table.namespace.clone(),
+                table: iceberg_table.table.clone(),
+                target_table_uuid: iceberg_table.table_uuid.clone().expect("test table uuid"),
+                target_snapshot_id: iceberg_table.current_snapshot_id,
+                aggregate_state_layout_version: 1,
+                columns: vec![],
+                group_key_names: vec![],
+                aggregate_state_names: vec![],
+                physical_column_names: vec![],
+                row_id_column_name: "_row_id".to_string(),
+                row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                    row_id_column_name: "_row_id".to_string(),
+                },
+                partition_constraint:
+                    crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            });
+        let table_handle = iceberg_scan_table_handle_for_codegen(
+            &target_state_source,
+            &iceberg_table,
+            vec![iceberg_i32_file(
+                "s3://bucket/target-state-refresh.parquet",
+                1,
+                1,
+            )],
+            vec!["id".to_string()],
+        );
+        assert_explicit_file_path(table_handle, "s3://bucket/target-state-refresh.parquet");
     }
 }
