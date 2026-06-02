@@ -629,6 +629,7 @@ mod tests {
             exec_params: minimal_exec_params(scan_ranges),
             output_sink: minimal_noop_sink(),
             output_columns: vec![],
+            direct_exec: None,
             cte_id: None,
             cte_exchange_nodes: vec![],
             query_global_dicts: None,
