@@ -240,9 +240,8 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         .await
     })??;
 
-    // 8. Invalidate the iceberg entry's table cache so subsequent SELECTs
-    //    see the new snapshot. The standalone catalog rebuilds its TableDef
-    //    on the next register_iceberg_tables_for_query call.
+    // 8. Invalidate the iceberg entry and CatalogMgr table caches so
+    //    subsequent SELECTs see the new snapshot.
     invalidate_iceberg_caches(state, target)?;
     crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
 
@@ -261,14 +260,12 @@ pub(crate) fn invalidate_iceberg_caches(
         let entry = registry.get(&target.catalog)?;
         entry.invalidate_table_cache(&target.namespace, &target.table);
     }
-    {
-        let mut local = state
-            .catalog
-            .write()
-            .map_err(|e| format!("standalone catalog write lock: {e}"))?;
-        let _ = local.drop_table(&target.namespace, &target.table);
-    }
-    Ok(())
+    crate::engine::query_prep::invalidate_catalog_mgr_table(
+        state,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )
 }
 
 fn target_string(t: &TargetBackend) -> String {
@@ -324,58 +321,20 @@ pub(crate) fn run_select_to_chunks(
     target: &TargetBackend,
     query: &sqlparser::ast::Query,
 ) -> Result<Vec<Chunk>, String> {
-    // Force-refresh every iceberg table referenced by the SELECT. The
-    // simpler `register_iceberg_tables_for_query` skips already-registered
-    // tables, but the table backing the INSERT may have been mutated by a
-    // prior statement in the same session and the cached `TableDef` would
-    // miss the new files. Refreshing here is mandatory before running the
-    // SELECT so it sees all data files committed up to this point.
-    //
     // Pass `current_catalog` when the target is an iceberg table so that
     // 1-part and 2-part table references in the SELECT (e.g. `db.table`)
-    // are resolved against the active catalog rather than being silently
-    // skipped. This is the same pattern used by `run_select_to_chunks_and_schema`.
+    // resolve against the active catalog.
     let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
         Some(target.catalog.as_str())
     } else {
         None
     };
-    crate::engine::query_prep::refresh_external_tables_for_query(
+
+    let result = crate::engine::execute_query_with_catalog_mgr(
         state,
         current_catalog,
         &target.namespace,
         query,
-    )?;
-
-    // The SELECT may use 3-part `catalog.database.table` names (the INSERT
-    // target itself uses one). Strip the catalog prefix before analysis so
-    // we feed the analyzer 2-part names — it does not understand catalog-
-    // qualified references on its own. This mirrors the standalone SELECT
-    // dispatcher's handling of three-part names.
-    let mut rewritten = query.clone();
-    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
-
-    // Clone-then-release: do not hold `state.catalog.read()` across
-    // `execute_query`. The call drives a pipeline that may run for many
-    // seconds; concurrent writers (e.g. INSERT cleanup taking
-    // `state.catalog.write()` in `invalidate_iceberg_caches`) would
-    // otherwise block indefinitely on the std::sync::RwLock writer queue.
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let result = crate::engine::execute_query(
-        &rewritten,
-        &catalog_snapshot,
-        &connectors_snapshot,
-        &target.namespace,
-        state.exchange_port,
         None,
     )?;
     query_result_to_chunks(result)
@@ -397,41 +356,18 @@ pub(crate) fn run_select_to_chunks_and_schema(
     String,
 > {
     // CTAS context: SELECT may reference iceberg tables (1-part or 2-part
-    // names) that need registration into the standalone in-memory catalog
-    // before planning. resolve_table_target dispatches between iceberg and
-    // StarRocks table based on whether current_catalog is supplied: passing
-    // Some(target.catalog) routes the unqualified refs to iceberg, mirroring
-    // the standalone server's SELECT path (engine/mod.rs:611).
+    // names). Passing Some(target.catalog) routes unqualified refs to iceberg,
+    // mirroring the standalone server's SELECT path.
     let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
         Some(target.catalog.as_str())
     } else {
         None
     };
-    crate::engine::query_prep::refresh_external_tables_for_query(
+    let result = crate::engine::execute_query_with_catalog_mgr(
         state,
         current_catalog,
         &target.namespace,
         query,
-    )?;
-    let mut rewritten = query.clone();
-    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
-    // Clone-then-release: same rationale as `run_select_to_chunks` above.
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let result = crate::engine::execute_query(
-        &rewritten,
-        &catalog_snapshot,
-        &connectors_snapshot,
-        &target.namespace,
-        state.exchange_port,
         None,
     )?;
     let schema_cols = result.columns.clone();

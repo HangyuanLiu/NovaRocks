@@ -359,9 +359,39 @@ pub struct TableDef {
     pub source: ScanSource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableLookupMode {
+    SchemaOnly,
+    IcebergMetadata {
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    },
+    ExplainStats,
+}
+
 /// Catalog abstraction for SQL analysis.
 pub trait CatalogProvider {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String>;
+
+    fn get_table_in_catalog(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<TableDef, String> {
+        let _ = catalog;
+        self.get_table(database, table)
+    }
+
+    fn get_table_with_mode(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        mode: TableLookupMode,
+    ) -> Result<TableDef, String> {
+        let _ = mode;
+        self.get_table_in_catalog(catalog, database, table)
+    }
 
     fn get_legacy_range_partition(
         &self,

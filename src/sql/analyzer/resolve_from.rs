@@ -343,10 +343,18 @@ impl<'a> super::AnalyzerContext<'a> {
                         ));
                     }
 
-                    let (db_lower, tbl_lower) = match base_parts.as_slice() {
-                        [tbl] => (self.current_database.to_lowercase(), tbl.to_lowercase()),
-                        [db, tbl] => (db.to_lowercase(), tbl.to_lowercase()),
-                        [_cat, db, tbl] => (db.to_lowercase(), tbl.to_lowercase()),
+                    let (catalog_override, db_lower, tbl_lower) = match base_parts.as_slice() {
+                        [tbl] => (
+                            None,
+                            self.current_database.to_lowercase(),
+                            tbl.to_lowercase(),
+                        ),
+                        [db, tbl] => (None, db.to_lowercase(), tbl.to_lowercase()),
+                        [cat, db, tbl] => (
+                            Some(cat.to_lowercase()),
+                            db.to_lowercase(),
+                            tbl.to_lowercase(),
+                        ),
                         _ => {
                             return Err(format!(
                                 "iceberg metadata table requires <tbl> | <db>.<tbl> | <cat>.<db>.<tbl>, got: {parts:?}"
@@ -354,7 +362,14 @@ impl<'a> super::AnalyzerContext<'a> {
                         }
                     };
 
-                    let table_def = self.catalog.get_table(&db_lower, &tbl_lower)?;
+                    let table_def = self.catalog.get_table_with_mode(
+                        catalog_override.as_deref(),
+                        &db_lower,
+                        &tbl_lower,
+                        crate::sql::catalog::TableLookupMode::IcebergMetadata {
+                            metadata_table_type: metadata_ty.clone(),
+                        },
+                    )?;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                     // Build scope from the fixed metadata schema.
@@ -387,15 +402,14 @@ impl<'a> super::AnalyzerContext<'a> {
                     return Ok((relation, scope));
                 }
 
-                let (db, tbl) = match parts.len() {
-                    1 => (self.current_database.to_string(), parts[0].clone()),
-                    2 => (parts[0].clone(), parts[1].clone()),
-                    // <cat>.<db>.<tbl>: drop catalog component. Mirrors the
-                    // metadata-table branch above and is required by the IMV
-                    // refresh pipeline, whose canonical_select_query carries
-                    // fully-qualified 3-part names produced by
-                    // canonicalize_iceberg_mv_select_query.
-                    3 => (parts[1].clone(), parts[2].clone()),
+                let (catalog_override, db, tbl) = match parts.len() {
+                    1 => (None, self.current_database.to_string(), parts[0].clone()),
+                    2 => (None, parts[0].clone(), parts[1].clone()),
+                    3 => (
+                        Some(parts[0].to_lowercase()),
+                        parts[1].clone(),
+                        parts[2].clone(),
+                    ),
                     _ => return Err(format!("unsupported table name: {name}")),
                 };
                 let db_lower = db.to_lowercase();
@@ -464,7 +478,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
-                let table_def = self.catalog.get_table(&db_lower, &tbl_lower)?;
+                let table_def = self.catalog.get_table_in_catalog(
+                    catalog_override.as_deref(),
+                    &db_lower,
+                    &tbl_lower,
+                )?;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                 // Build scope

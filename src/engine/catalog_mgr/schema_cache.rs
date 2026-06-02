@@ -173,8 +173,8 @@ mod tests {
 
     #[test]
     fn none_schema_id_always_hits_after_build() {
-        // P1 IcebergCatalog passes None (no schema_id probe yet): once built,
-        // subsequent None lookups must hit the cache.
+        // Backends without schema-id tracking pass None: once built, subsequent
+        // None lookups must hit the cache until explicit invalidation.
         let cache = SchemaCache::new();
         let id = TableIdentity::new("c", "ns", "t");
         let calls = AtomicUsize::new(0);

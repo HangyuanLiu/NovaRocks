@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -697,40 +698,11 @@ pub(crate) fn load_table(
             .map_err(|e| format!("build REST table ident: {e}"))?;
         block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("load REST iceberg table {ident}: {e}"))?
-    } else if let Some(s3_config) = &entry.s3_config {
+            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?
+    } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
-        let op = crate::fs::object_store::build_oss_operator(s3_config)
-            .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
-        let (_, root_prefix) =
-            crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
-                .map_err(|e| format!("parse warehouse URI: {e}"))?;
-        let meta_prefix = format!(
-            "{}/{}/{}/metadata/",
-            root_prefix.trim_end_matches('/'),
-            ns_name,
-            tbl_name
-        );
-
-        // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
-        // which is the canonical format written by HadoopFileSystemCatalog, with fallback
-        // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
-        let (metadata_file_name, metadata_bytes) = block_on_iceberg(async {
-            let entries = op
-                .list(&meta_prefix)
-                .await
-                .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
-            let file_names: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
-            let latest = choose_latest_metadata_filename(&file_names)
-                .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
-            let path = format!("{meta_prefix}{latest}");
-            let data = op
-                .read(&path)
-                .await
-                .map_err(|e| format!("read metadata {path}: {e}"))?;
-            Ok::<(String, Vec<u8>), String>((latest, data.to_vec()))
-        })
-        .map_err(|e| format!("load table metadata runtime: {e}"))??;
+        let (metadata_file_name, metadata_bytes) =
+            latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?;
 
         let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
@@ -856,6 +828,36 @@ pub(crate) fn load_table(
     }
 
     Ok(loaded)
+}
+
+pub(crate) fn current_schema_id(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+) -> Result<i32, String> {
+    let ns_name = normalize_identifier(namespace_name)?;
+    let tbl_name = normalize_identifier(table_name)?;
+
+    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+            .map_err(|e| format!("build REST table ident: {e}"))?;
+        let table = block_on_iceberg(async { catalog.load_table(&ident).await })
+            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?;
+        return Ok(table.metadata().current_schema_id());
+    }
+
+    let metadata_bytes = if entry.s3_config.is_some() {
+        latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?.1
+    } else {
+        let metadata_location = latest_table_metadata_location_local(entry, &ns_name, &tbl_name)?;
+        let metadata_path = metadata_location
+            .strip_prefix("file://")
+            .unwrap_or(&metadata_location);
+        std::fs::read(metadata_path).map_err(|e| format!("read local metadata file: {e}"))?
+    };
+    current_schema_id_from_metadata_json(&metadata_bytes, &ns_name, &tbl_name)
 }
 
 pub(crate) fn insert_rows(
@@ -1634,12 +1636,10 @@ fn latest_table_metadata_location_local(
         // `<warehouse>/<ns>/<tbl>/metadata/`. A missing directory means the
         // table no longer exists in this catalog (dropped, never created,
         // or pruned externally). Surface this as an "unknown table" error
-        // so callers can distinguish absence from genuine I/O trouble —
-        // notably, `register_external_tables_for_query_impl` uses the
-        // distinction to evict a stale local-catalog entry instead of
-        // hanging onto it.
+        // so callers can distinguish absence from genuine I/O trouble and
+        // evict any stale metadata cache entry instead of hanging onto it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("unknown iceberg table {ns}.{tbl}"));
+            return Err(format!("unknown table: {ns}.{tbl}"));
         }
         Err(e) => {
             return Err(format!(
@@ -1658,8 +1658,84 @@ fn latest_table_metadata_location_local(
         })
         .collect();
     let latest = choose_latest_metadata_filename(&file_names)
-        .map_err(|_| format!("unknown iceberg table {ns}.{tbl}"))?;
+        .map_err(|_| format!("unknown table: {ns}.{tbl}"))?;
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
+}
+
+fn format_rest_load_table_error<E: fmt::Display>(
+    ident: &TableIdent,
+    ns_name: &str,
+    tbl_name: &str,
+    err: E,
+) -> String {
+    let message = err.to_string();
+    if message.contains("Tried to load a table that does not exist") {
+        format!("unknown table: {ns_name}.{tbl_name}")
+    } else {
+        format!("load REST iceberg table {ident}: {message}")
+    }
+}
+
+fn latest_table_metadata_file_s3(
+    entry: &IcebergCatalogEntry,
+    ns_name: &str,
+    tbl_name: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let s3_config = entry
+        .s3_config
+        .as_ref()
+        .ok_or_else(|| "missing S3 config for iceberg metadata load".to_string())?;
+    let op = crate::fs::object_store::build_oss_operator(s3_config)
+        .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
+    let (_, root_prefix) =
+        crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+    let meta_prefix = format!(
+        "{}/{}/{}/metadata/",
+        root_prefix.trim_end_matches('/'),
+        ns_name,
+        tbl_name
+    );
+
+    // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
+    // which is the canonical format written by HadoopFileSystemCatalog, with fallback
+    // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
+    block_on_iceberg(async {
+        let entries = op
+            .list(&meta_prefix)
+            .await
+            .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
+        let file_names: Vec<String> = entries.iter().map(|e| e.name().to_string()).collect();
+        let latest = choose_latest_metadata_filename(&file_names)
+            .map_err(|_| format!("no metadata files for {ns_name}.{tbl_name}"))?;
+        let path = format!("{meta_prefix}{latest}");
+        let data = op
+            .read(&path)
+            .await
+            .map_err(|e| format!("read metadata {path}: {e}"))?;
+        Ok::<(String, Vec<u8>), String>((latest, data.to_vec()))
+    })
+    .map_err(|e| format!("load table metadata runtime: {e}"))?
+}
+
+fn current_schema_id_from_metadata_json(
+    metadata_bytes: &[u8],
+    ns_name: &str,
+    tbl_name: &str,
+) -> Result<i32, String> {
+    let metadata: serde_json::Value = serde_json::from_slice(metadata_bytes)
+        .map_err(|e| format!("deserialize iceberg metadata for {ns_name}.{tbl_name}: {e}"))?;
+    let raw = metadata
+        .get("current-schema-id")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            format!("iceberg metadata for {ns_name}.{tbl_name} missing current-schema-id")
+        })?;
+    i32::try_from(raw).map_err(|_| {
+        format!(
+            "iceberg metadata for {ns_name}.{tbl_name} has out-of-range current-schema-id {raw}"
+        )
+    })
 }
 
 fn parse_internal_metadata_version(file_name: &str) -> Option<i32> {
@@ -3165,7 +3241,7 @@ mod rest_catalog_tests {
 
     use super::{
         IcebergCatalogEntry, IcebergCatalogKind, build_catalog_entry, build_iceberg_catalog,
-        build_rest_catalog,
+        build_rest_catalog, current_schema_id, load_table,
     };
 
     fn rest_props(uri: &str) -> Vec<(String, String)> {
@@ -3333,6 +3409,73 @@ mod rest_catalog_tests {
             .expect("create namespace via mock");
         assert_eq!(created.name(), &ns);
         create_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn load_table_normalizes_rest_not_found_to_unknown_table() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/analytics/tables/missing")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"message":"Table does not exist","type":"NoSuchTable","code":404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let err = tokio::task::spawn_blocking(move || load_table(&entry, "analytics", "missing"))
+            .await
+            .expect("blocking task")
+            .map(|_| ())
+            .expect_err("missing REST table should fail");
+
+        assert!(
+            err.contains("unknown table: analytics.missing"),
+            "expected unknown-table normalization, got: {err}"
+        );
+        load_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn current_schema_id_normalizes_rest_not_found_to_unknown_table() {
+        let mut server = Server::new_async().await;
+        let _config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(EMPTY_CONFIG_BODY)
+            .create_async()
+            .await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/analytics/tables/missing")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"message":"Table does not exist","type":"NoSuchTable","code":404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let entry =
+            build_catalog_entry("ice_rest", &rest_props(&server.url())).expect("rest entry");
+        let err =
+            tokio::task::spawn_blocking(move || current_schema_id(&entry, "analytics", "missing"))
+                .await
+                .expect("blocking task")
+                .map(|_| ())
+                .expect_err("missing REST table should fail");
+
+        assert!(
+            err.contains("unknown table: analytics.missing"),
+            "expected unknown-table normalization, got: {err}"
+        );
+        load_mock.assert_async().await;
     }
 
     /// Helper: register a `GET /v1/namespaces` mock that returns the given

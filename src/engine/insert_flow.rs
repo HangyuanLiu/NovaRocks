@@ -162,7 +162,13 @@ pub(crate) fn run_insert(
                 ));
             }
             let batch = execute_insert_from_query_on_pipeline(
-                state, &target, &resolved, columns, query, query_opts,
+                state,
+                current_catalog,
+                &target,
+                &resolved,
+                columns,
+                query,
+                query_opts,
             )?;
             if batch.num_rows() > 0 {
                 sink.append_batch(&resolved, batch)?;
@@ -186,31 +192,18 @@ pub(crate) fn run_insert(
 
 pub(crate) fn execute_insert_from_query_on_pipeline(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
     query_opts: Option<&crate::internal_service::TQueryOptions>,
 ) -> Result<RecordBatch, String> {
-    // Clone-then-release: pipeline execution must not hold
-    // `state.catalog.read()`. See iceberg_writer::run_select_to_chunks for
-    // the full rationale (writer starvation under std::sync::RwLock).
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let query_result = crate::engine::execute_query(
-        query,
-        &catalog_snapshot,
-        &connectors_snapshot,
+    let query_result = crate::engine::execute_query_with_catalog_mgr(
+        state,
+        current_catalog,
         &target.namespace,
-        state.exchange_port,
+        query,
         query_opts.cloned(),
     )?;
 

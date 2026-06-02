@@ -3,6 +3,8 @@
 use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::plan::{AggregateCall, LogicalPlan};
 
+pub(crate) type ColumnRefIdentity = (Option<String>, String);
+
 /// Which side of the original join receives the partial aggregate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -18,8 +20,8 @@ pub(crate) struct AggregatePushDownContext {
     pub original_groupby: Vec<TypedExpr>,
     /// Original aggregate calls from the top LogicalAggregate.
     pub original_aggregates: Vec<AggregateCall>,
-    /// Columns required by aggregate args + group-by.
-    pub required_columns: Vec<String>,
+    /// Qualified columns required by aggregate args + group-by.
+    pub required_column_refs: Vec<ColumnRefIdentity>,
 }
 
 /// Result of a successful collector descent.

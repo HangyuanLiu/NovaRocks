@@ -17,9 +17,10 @@ use crate::sql::parser::ast::Literal;
 
 use super::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
-    create_table as reg_create_table, drop_namespace as reg_drop_namespace,
-    drop_table as reg_drop_table, insert_rows as reg_insert_rows, list_tables as reg_list_tables,
-    load_table as reg_load_table, namespace_exists as reg_namespace_exists,
+    create_table as reg_create_table, current_schema_id as reg_current_schema_id,
+    drop_namespace as reg_drop_namespace, drop_table as reg_drop_table,
+    insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
+    namespace_exists as reg_namespace_exists,
 };
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
@@ -117,6 +118,15 @@ impl CatalogBackend for IcebergCatalogBackend {
             table: table.to_string(),
             columns: loaded.columns,
         })
+    }
+
+    fn current_schema_id(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Option<i32>, String> {
+        reg_current_schema_id(&self.entry(catalog)?, namespace, table).map(Some)
     }
 }
 
@@ -777,6 +787,42 @@ mod tests {
             .to_string()
     }
 
+    fn latest_local_metadata_json_path(
+        warehouse: &str,
+        namespace: &str,
+        table: &str,
+    ) -> std::path::PathBuf {
+        let metadata_dir = std::path::Path::new(warehouse)
+            .join(namespace)
+            .join(table)
+            .join("metadata");
+        let mut files = std::fs::read_dir(&metadata_dir)
+            .unwrap_or_else(|err| panic!("read metadata dir {}: {err}", metadata_dir.display()))
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                if name.starts_with('v') && name.ends_with(".metadata.json") {
+                    let version = name
+                        .strip_prefix('v')?
+                        .strip_suffix(".metadata.json")?
+                        .parse::<i32>()
+                        .ok()?;
+                    Some((version, path))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by_key(|(version, _)| *version);
+        files.pop().map(|(_, path)| path).unwrap_or_else(|| {
+            panic!(
+                "metadata dir {} has no metadata json",
+                metadata_dir.display()
+            )
+        })
+    }
+
     fn loaded_table_with_properties(
         format_version: FormatVersion,
         properties: HashMap<String, String>,
@@ -968,6 +1014,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["region", "c"]
         );
+    }
+
+    #[test]
+    fn current_schema_id_bypasses_cached_loaded_table_for_local_catalog() {
+        let warehouse = unique_warehouse("current_schema_id_uncached");
+        let registry = Arc::new(RwLock::new(IcebergCatalogRegistry::default()));
+        {
+            let mut guard = registry.write().expect("iceberg catalog write lock");
+            guard
+                .create_catalog(
+                    "ice",
+                    &[("iceberg.catalog.warehouse".to_string(), warehouse.clone())],
+                )
+                .expect("create catalog");
+        }
+        let backend = IcebergCatalogBackend::new(registry);
+        backend
+            .create_namespace("ice", "db")
+            .expect("create namespace");
+        backend
+            .create_table(CreateTableRequest {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                columns: vec![TableColumnDef {
+                    name: "id".to_string(),
+                    data_type: SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key_desc: None,
+                bucket_count: None,
+                partition_fields: vec![],
+                properties: vec![],
+            })
+            .expect("create table");
+
+        let cached = backend.load_table("ice", "db", "t").expect("seed cache");
+        let initial = backend
+            .current_schema_id("ice", "db", "t")
+            .expect("schema id")
+            .expect("tracked schema id");
+        let metadata_path = latest_local_metadata_json_path(&warehouse, "db", "t");
+        let mut metadata_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata json"))
+                .expect("parse metadata json");
+        let json_schema_id = metadata_json
+            .get("current-schema-id")
+            .and_then(|value| value.as_i64())
+            .expect("current-schema-id");
+        assert_eq!(initial as i64, json_schema_id);
+        assert_eq!(cached.columns.len(), 1);
+
+        let changed = initial + 17;
+        metadata_json["current-schema-id"] = serde_json::Value::from(changed);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata_json).expect("serialize metadata json"),
+        )
+        .expect("write metadata json");
+
+        let probed = backend
+            .current_schema_id("ice", "db", "t")
+            .expect("schema id")
+            .expect("tracked schema id");
+        assert_eq!(probed, changed);
     }
 
     #[test]

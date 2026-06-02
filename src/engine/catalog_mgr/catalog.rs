@@ -10,6 +10,8 @@ pub(crate) trait Catalog: Send + Sync {
     /// Resolve schema-level metadata for `namespace.table`. Returns an error
     /// when the table does not exist or cannot be resolved.
     fn get_table_metadata(&self, namespace: &str, table: &str) -> Result<TableMetadata, String>;
+
+    fn invalidate_table(&self, _namespace: &str, _table: &str) {}
 }
 
 #[cfg(test)]

@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule as RewriteRule;
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -24,20 +27,34 @@ impl RewriteRule for AggregatePushdownRule {
         "AggregatePushdown"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
         matches!(plan, LogicalPlan::Aggregate(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
+    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let agg = match &plan {
             LogicalPlan::Aggregate(a) => a,
-            _ => return None,
+            _ => return Ok(RewriteResult::Unchanged),
         };
-        let push = super::collector::collect_push_plan(agg, &self.table_stats)?;
+        let Some(push) = super::collector::collect_push_plan(agg, &self.table_stats) else {
+            return Ok(RewriteResult::Unchanged);
+        };
         if !super::cost::should_push(&push, &self.table_stats) {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        Some(super::rewriter::rewrite(agg, push))
+        let factory = ctx
+            .column_ref_factory()
+            .ok_or_else(|| "AggregatePushdown requires ColumnRefFactory".to_string())?;
+        let mut factory = factory.borrow_mut();
+        Ok(RewriteResult::Changed(super::rewriter::rewrite(
+            agg,
+            push,
+            &mut factory,
+        )))
     }
 }
 
@@ -47,6 +64,8 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::planner::plan::{AggregateNode, ScanNode};
     use arrow::datatypes::DataType;
 
@@ -88,8 +107,12 @@ mod tests {
     fn stub_returns_none() {
         let rule = AggregatePushdownRule::new(Arc::new(HashMap::new()));
         let plan = dummy_aggregate();
-        assert!(rule.matches(&plan));
-        assert!(rule.apply(plan).is_none());
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        assert!(rule.matches(&plan, &ctx));
+        assert!(matches!(
+            rule.apply(plan, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     #[test]
@@ -171,7 +194,11 @@ mod tests {
 
         let rule = AggregatePushdownRule::new(Arc::new(HashMap::new()));
         assert!(
-            rule.apply(plan).is_none(),
+            matches!(
+                rule.apply(plan, &mut RewriteContext::new(RewriteConsumer::Query))
+                    .unwrap(),
+                RewriteResult::Unchanged
+            ),
             "must not re-fire on already_pushed"
         );
     }

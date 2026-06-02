@@ -2627,15 +2627,18 @@ mod mv_target_tests {
         let mut catalog = InMemoryCatalog::default();
         catalog.create_database("analytics").expect("database");
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks).expect("register catalog");
+        let mut state = StandaloneState {
+            starrocks_table: std::sync::RwLock::new(starrocks),
+            starrocks_table_config: Some(config),
+            metadata_provider: Some(Arc::new(metadata_provider)),
+            ..Default::default()
+        };
+        state.catalog = Arc::new(std::sync::RwLock::new(catalog));
+        let state = Arc::new(state);
+        crate::connector::register_default_catalog_mgr_entries(&state);
 
         MvTestFixture {
-            state: Arc::new(StandaloneState {
-                catalog: std::sync::RwLock::new(catalog),
-                starrocks_table: std::sync::RwLock::new(starrocks),
-                starrocks_table_config: Some(config),
-                metadata_provider: Some(Arc::new(metadata_provider)),
-                ..Default::default()
-            }),
+            state,
             _metadata_dir: metadata_dir,
         }
     }
@@ -3110,15 +3113,18 @@ mod mv_target_tests {
             .map_err(|e| format!("create analytics failed: {e}"))?;
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks)
             .map_err(|e| format!("register StarRocks tables failed: {e}"))?;
+        let mut state = StandaloneState {
+            starrocks_table: std::sync::RwLock::new(starrocks),
+            starrocks_table_config: Some(config),
+            metadata_provider: Some(Arc::new(metadata_provider)),
+            ..Default::default()
+        };
+        state.catalog = Arc::new(std::sync::RwLock::new(catalog));
+        let state = Arc::new(state);
+        crate::connector::register_default_catalog_mgr_entries(&state);
 
         Ok(MvTestFixture {
-            state: Arc::new(StandaloneState {
-                catalog: std::sync::RwLock::new(catalog),
-                starrocks_table: std::sync::RwLock::new(starrocks),
-                starrocks_table_config: Some(config),
-                metadata_provider: Some(Arc::new(metadata_provider)),
-                ..Default::default()
-            }),
+            state,
             _metadata_dir: metadata_dir,
         })
     }

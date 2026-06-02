@@ -80,6 +80,15 @@ pub(crate) trait CatalogBackend: Send + Sync {
         namespace: &str,
         table: &str,
     ) -> Result<ResolvedTable, String>;
+
+    fn current_schema_id(
+        &self,
+        _catalog: &str,
+        _namespace: &str,
+        _table: &str,
+    ) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
 }
 
 /// Scan-side metadata conversion used to register external connector tables

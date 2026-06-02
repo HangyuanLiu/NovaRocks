@@ -6,6 +6,8 @@
 //! (no Iceberg data files, no StarRocks tablets, no snapshot) so it is stable
 //! and safe to cache.
 
+use std::collections::BTreeMap;
+
 use crate::sql::catalog::{ColumnDef, IcebergTableInfo, ScanSource, TableDef};
 
 /// Fully-qualified table identity. Used as the schema-cache key.
@@ -34,7 +36,10 @@ pub(crate) enum TableBinding {
     Internal { db_id: i64, table_id: i64 },
     /// Iceberg table. `info` carries identity + schema; the current snapshot's
     /// data files are resolved at codegen time, never stored here.
-    Iceberg { info: IcebergTableInfo },
+    Iceberg {
+        info: IcebergTableInfo,
+        cloud_properties: BTreeMap<String, String>,
+    },
 }
 
 /// Schema-level metadata returned by `Catalog::get_table_metadata`. Cacheable.
@@ -56,11 +61,18 @@ impl TableMetadata {
                 db_id: *db_id,
                 table_id: *table_id,
             },
-            ScanSource::IcebergDataFiles { table, .. } => {
+            ScanSource::IcebergDataFiles {
+                table,
+                cloud_properties,
+                ..
+            } => {
                 let mut info = table.clone();
                 info.current_snapshot_id = None;
                 info.serialized_metadata = None;
-                TableBinding::Iceberg { info }
+                TableBinding::Iceberg {
+                    info,
+                    cloud_properties: cloud_properties.clone(),
+                }
             }
             ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
@@ -79,6 +91,30 @@ impl TableMetadata {
             binding,
         })
     }
+
+    pub(crate) fn to_table_def(&self) -> TableDef {
+        let source = match &self.binding {
+            TableBinding::Internal { db_id, table_id } => ScanSource::StarRocks {
+                db_id: *db_id,
+                table_id: *table_id,
+            },
+            TableBinding::Iceberg {
+                info,
+                cloud_properties,
+            } => ScanSource::IcebergDataFiles {
+                table: info.clone(),
+                files: Vec::new(),
+                cloud_properties: cloud_properties.clone(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        TableDef {
+            name: self.identity.table.clone(),
+            columns: self.columns.clone(),
+            iceberg_row_lineage_metadata_columns: self.iceberg_row_lineage_columns.clone(),
+            source,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +124,7 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use arrow::datatypes::DataType;
+    use std::collections::BTreeMap;
 
     fn col(name: &str) -> ColumnDef {
         ColumnDef {
@@ -111,6 +148,16 @@ mod tests {
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: Some("{\"format-version\":2}".to_string()),
         }
+    }
+
+    fn cloud_properties() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://minio:9000".to_string(),
+            ),
+            ("aws.s3.region".to_string(), "us-east-1".to_string()),
+        ])
     }
 
     #[test]
@@ -155,11 +202,15 @@ mod tests {
         assert_eq!(meta.columns.len(), 2);
         assert_eq!(meta.iceberg_row_lineage_columns.len(), 1);
         match meta.binding {
-            TableBinding::Iceberg { info } => {
+            TableBinding::Iceberg {
+                info,
+                cloud_properties,
+            } => {
                 assert_eq!(info.schema_id, 3);
                 assert_eq!(info.table, "t");
                 assert_eq!(info.current_snapshot_id, None);
                 assert_eq!(info.serialized_metadata, None);
+                assert!(cloud_properties.is_empty());
             }
             other => panic!("expected Iceberg binding, got {other:?}"),
         }
@@ -179,5 +230,61 @@ mod tests {
         let id = TableIdentity::new("ice", "ns", "t");
         let err = TableMetadata::from_table_def(id, &td).expect_err("must reject synthetic");
         assert!(err.contains("synthetic"), "got: {err}");
+    }
+
+    #[test]
+    fn table_metadata_to_table_def_rebuilds_schema_only_iceberg_source() {
+        let id = TableIdentity::new("ice", "ns", "orders");
+        let meta = TableMetadata {
+            identity: id,
+            columns: vec![col("id")],
+            iceberg_row_lineage_columns: vec![col("_row_id")],
+            binding: TableBinding::Iceberg {
+                info: iceberg_info(),
+                cloud_properties: Default::default(),
+            },
+        };
+
+        let table_def = meta.to_table_def();
+
+        assert_eq!(table_def.name, "orders");
+        assert_eq!(table_def.columns.len(), 1);
+        assert_eq!(table_def.iceberg_row_lineage_metadata_columns.len(), 1);
+        let ScanSource::IcebergDataFiles { files, binding, .. } = table_def.source else {
+            panic!("expected iceberg source");
+        };
+        assert!(files.is_empty());
+        assert_eq!(
+            binding,
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+        );
+    }
+
+    #[test]
+    fn table_metadata_round_trip_preserves_iceberg_cloud_properties() {
+        let td = TableDef {
+            name: "orders".to_string(),
+            columns: vec![col("id")],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg_info(),
+                files: vec![],
+                cloud_properties: cloud_properties(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let id = TableIdentity::new("ice", "ns", "orders");
+
+        let meta = TableMetadata::from_table_def(id, &td).expect("convert");
+        let table_def = meta.to_table_def();
+
+        let ScanSource::IcebergDataFiles {
+            cloud_properties: restored_cloud_properties,
+            ..
+        } = table_def.source
+        else {
+            panic!("expected iceberg source");
+        };
+        assert_eq!(restored_cloud_properties, cloud_properties());
     }
 }
