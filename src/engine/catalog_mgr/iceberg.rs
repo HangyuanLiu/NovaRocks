@@ -54,6 +54,10 @@ impl Catalog for IcebergCatalog {
             TableMetadata::from_table_def(id.clone(), &td)
         })
     }
+
+    fn invalidate_table(&self, namespace: &str, table: &str) {
+        self.invalidate(namespace, table);
+    }
 }
 
 #[cfg(test)]
@@ -62,6 +66,7 @@ mod tests {
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
+    use crate::engine::catalog_mgr::CatalogMgr;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
     use crate::sql::catalog::{
@@ -180,6 +185,35 @@ mod tests {
             loads.load(Ordering::SeqCst),
             1,
             "second resolve must hit cache"
+        );
+    }
+
+    #[test]
+    fn catalog_mgr_invalidation_clears_iceberg_schema_cache() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut mgr = CatalogMgr::new();
+        mgr.register(Arc::new(IcebergCatalog::new(
+            "ice",
+            Arc::new(MockBackend {
+                loads: Arc::clone(&loads),
+            }),
+            Arc::new(MockSource),
+        )));
+
+        let _ = mgr.resolve("ice", "ns", "t").expect("resolve");
+        let _ = mgr.resolve("ice", "ns", "t").expect("hit");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "second resolve must hit cache"
+        );
+
+        mgr.invalidate_table("ice", "ns", "t").expect("invalidate");
+        let _ = mgr.resolve("ice", "ns", "t").expect("reload");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            2,
+            "resolve after invalidation must reload schema"
         );
     }
 }
