@@ -1956,13 +1956,15 @@ mod tests {
         let mut catalog = InMemoryCatalog::default();
         register_starrocks_table_in_catalog(&mut catalog, &runtime)
             .expect("register StarRocks table");
-        let state = Arc::new(StandaloneState {
-            catalog: RwLock::new(catalog),
+        let mut state = StandaloneState {
             starrocks_table: RwLock::new(starrocks),
             starrocks_table_config: Some(test_starrocks_table_config()),
             metadata_provider: Some(Arc::new(metadata_provider)),
             ..StandaloneState::default()
-        });
+        };
+        state.catalog = Arc::new(RwLock::new(catalog));
+        let state = Arc::new(state);
+        crate::connector::register_default_catalog_mgr_entries(&state);
         (dir, state)
     }
 

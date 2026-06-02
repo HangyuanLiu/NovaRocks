@@ -1835,7 +1835,6 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
 mod tests {
     use super::*;
 
-    use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
     use crate::connector::starrocks::ObjectStoreProfile;
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::lake::schema::{
@@ -4010,11 +4009,7 @@ enable_path_style_access = true
             StarRocksTableCatalog::rebuild_from_repository(Some(config.clone()), snapshot)
                 .expect("rebuild StarRocks catalog");
         let state = Arc::new(StandaloneState {
-            catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(starrocks),
-            statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
-            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: Some(config),
             metadata_provider: Some(Arc::new(provider)),
             exchange_port: 0,
@@ -4152,17 +4147,16 @@ enable_path_style_access = true
         let mut catalog = InMemoryCatalog::default();
         catalog.create_database("analytics")?;
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks)?;
-        let state = Arc::new(StandaloneState {
-            catalog: RwLock::new(catalog),
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+        let mut state = StandaloneState {
             starrocks_table: RwLock::new(starrocks),
-            statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
-            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: Some(config),
             metadata_provider: Some(Arc::new(provider)),
             exchange_port: 0,
             ..Default::default()
-        });
+        };
+        state.catalog = Arc::new(RwLock::new(catalog));
+        let state = Arc::new(state);
+        crate::connector::register_default_catalog_mgr_entries(&state);
         Ok((metadata_dir, state, shape))
     }
 

@@ -986,7 +986,13 @@ pub(crate) fn execute_drop_catalog_statement(
     match guard.drop_catalog(catalog_name) {
         Ok(()) => {
             drop(guard);
-            delete_iceberg_catalog_if_needed(state, &normalize_identifier(catalog_name)?)?;
+            let normalized_catalog = normalize_identifier(catalog_name)?;
+            delete_iceberg_catalog_if_needed(state, &normalized_catalog)?;
+            state
+                .catalog_mgr
+                .write()
+                .expect("catalog mgr write lock")
+                .unregister(&normalized_catalog);
             Ok(StatementResult::Ok)
         }
         Err(err) if if_exists && err.contains("unknown catalog") => Ok(StatementResult::Ok),

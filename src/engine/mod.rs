@@ -189,7 +189,8 @@ pub(crate) fn build_string_query_result(
 }
 
 pub(crate) struct StandaloneState {
-    pub(crate) catalog: RwLock<InMemoryCatalog>,
+    pub(crate) catalog: Arc<RwLock<InMemoryCatalog>>,
+    pub(crate) catalog_mgr: RwLock<catalog_mgr::CatalogMgr>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
@@ -220,8 +221,15 @@ pub(crate) struct StandaloneState {
 
 impl Default for StandaloneState {
     fn default() -> Self {
+        let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
+        let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
+        catalog_mgr.register(Arc::new(catalog_mgr::internal::InternalCatalog::new(
+            "default_catalog",
+            Arc::clone(&catalog),
+        )));
         Self {
-            catalog: RwLock::new(InMemoryCatalog::default()),
+            catalog,
+            catalog_mgr: RwLock::new(catalog_mgr),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
@@ -347,7 +355,15 @@ impl StandaloneNovaRocks {
             .map(open_metadata_provider)
             .transpose()?;
         let starrocks_table_config = resolve_starrocks_table_config()?;
+        let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
+        let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
+        catalog_mgr.register(Arc::new(catalog_mgr::internal::InternalCatalog::new(
+            "default_catalog",
+            Arc::clone(&catalog),
+        )));
         let inner = Arc::new(StandaloneState {
+            catalog,
+            catalog_mgr: RwLock::new(catalog_mgr),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
             )),
@@ -1498,6 +1514,7 @@ impl StandaloneSession {
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
+        crate::connector::register_iceberg_catalog_mgr_entry(&self.inner, &stmt.name)?;
         persist_iceberg_catalog_if_needed(
             &self.inner,
             &normalize_identifier(&stmt.name)?,
@@ -2102,6 +2119,7 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .expect("standalone iceberg catalog write lock");
         for catalog in &catalogs {
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
+            crate::connector::register_iceberg_catalog_mgr_entry(state, &catalog.catalog)?;
         }
     }
 
@@ -3928,6 +3946,20 @@ path = "{metadata_path}"
         )
         .expect("write metadata config");
         config_path
+    }
+
+    #[test]
+    fn create_catalog_registers_catalog_mgr_entry() {
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open");
+        let warehouse = TempDir::new().expect("warehouse");
+        let sql = format!(
+            r#"CREATE EXTERNAL CATALOG ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        engine.session().execute(&sql).expect("create catalog");
+
+        let mgr = engine.inner.catalog_mgr.read().expect("catalog mgr");
+        assert!(mgr.get_catalog("ice").is_ok());
     }
 
     #[test]

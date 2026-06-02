@@ -64,6 +64,20 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, St
 mod backend_test;
 
 #[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    #[test]
+    fn standalone_backends_register_internal_catalog_mgr_entry() {
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        super::register_standalone_backends(&state);
+
+        let mgr = state.catalog_mgr.read().expect("catalog mgr");
+        assert!(mgr.get_catalog("default_catalog").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod scan_planning_registry_tests {
     use std::sync::Arc;
 
@@ -309,38 +323,75 @@ impl ConnectorRegistry {
 }
 
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
-    let mut connectors = state
-        .connectors
-        .write()
-        .expect("standalone connector registry write lock");
     let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
-    connectors.register_catalog_backend(Arc::new(iceberg::catalog::IcebergCatalogBackend::new(
-        Arc::clone(&iceberg_catalogs),
-    )));
-    connectors.register_table_source(Arc::new(iceberg::catalog::IcebergTableSource::new(
-        Arc::clone(&iceberg_catalogs),
-    )));
-    connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
-        Arc::clone(&iceberg_catalogs),
-    )));
+    {
+        let mut connectors = state
+            .connectors
+            .write()
+            .expect("standalone connector registry write lock");
+        connectors.register_catalog_backend(Arc::new(
+            iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(&iceberg_catalogs)),
+        ));
+        connectors.register_table_source(Arc::new(iceberg::catalog::IcebergTableSource::new(
+            Arc::clone(&iceberg_catalogs),
+        )));
+        connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
+            Arc::clone(&iceberg_catalogs),
+        )));
 
-    connectors.register_catalog_backend(Arc::new(starrocks::table::StarRocksTableBackend::new(
-        state,
-    )));
-    connectors.register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
-    connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
-    connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
-        state,
-    )));
-    connectors.register_scan_planner(Arc::new(
-        iceberg::IcebergConnectorScanPlanner::with_catalog_registry(Arc::clone(&iceberg_catalogs)),
+        connectors.register_catalog_backend(Arc::new(
+            starrocks::table::StarRocksTableBackend::new(state),
+        ));
+        connectors
+            .register_table_source(Arc::new(starrocks::table::StarRocksTableSource::new(state)));
+        connectors.register_table_sink(Arc::new(starrocks::table::StarRocksTableSink::new(state)));
+        connectors.register_scan_planner(Arc::new(
+            starrocks::table::StarRocksTableScanPlanner::new(state),
+        ));
+        connectors.register_scan_planner(Arc::new(
+            iceberg::IcebergConnectorScanPlanner::with_catalog_registry(Arc::clone(
+                &iceberg_catalogs,
+            )),
+        ));
+        connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
+            state,
+        )));
+        connectors.register_mv_backend(Arc::new(
+            crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
+        ));
+    }
+    register_default_catalog_mgr_entries(state);
+}
+
+pub(crate) fn register_default_catalog_mgr_entries(state: &Arc<crate::engine::StandaloneState>) {
+    let mut mgr = state.catalog_mgr.write().expect("catalog mgr write lock");
+    mgr.register(Arc::new(
+        crate::engine::catalog_mgr::internal::InternalCatalog::new(
+            "default_catalog",
+            Arc::clone(&state.catalog),
+        ),
     ));
-    connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
-        state,
-    )));
-    connectors.register_mv_backend(Arc::new(
-        crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
-    ));
+}
+
+pub(crate) fn register_iceberg_catalog_mgr_entry(
+    state: &Arc<crate::engine::StandaloneState>,
+    catalog_name: &str,
+) -> Result<(), String> {
+    let connectors = state
+        .connectors
+        .read()
+        .expect("connector registry read lock");
+    let backend = connectors.catalog_backend("iceberg")?;
+    let source = connectors.table_source("iceberg")?;
+    drop(connectors);
+    state
+        .catalog_mgr
+        .write()
+        .expect("catalog mgr write lock")
+        .register(Arc::new(
+            crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(catalog_name, backend, source),
+        ));
+    Ok(())
 }
 
 impl Default for ConnectorRegistry {
