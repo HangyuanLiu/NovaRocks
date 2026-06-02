@@ -1114,12 +1114,10 @@ impl<'a> PlanFragmentBuilder<'a> {
                     );
                 let scan = planner.begin_scan(
                     table_handle,
-                    crate::connector::scan_planning::BeginScanContext::default(),
+                    crate::connector::scan_planning::BeginScanContext,
                 )?;
-                let splits = planner.plan_splits(
-                    &scan,
-                    crate::connector::scan_planning::SplitPlanningContext::default(),
-                )?;
+                let splits = planner
+                    .plan_splits(&scan, crate::connector::scan_planning::SplitPlanningContext)?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
             }
             crate::sql::catalog::ScanSource::IcebergDataFiles {
@@ -1137,12 +1135,10 @@ impl<'a> PlanFragmentBuilder<'a> {
                 );
                 let scan = planner.begin_scan(
                     table_handle,
-                    crate::connector::scan_planning::BeginScanContext::default(),
+                    crate::connector::scan_planning::BeginScanContext,
                 )?;
-                let splits = planner.plan_splits(
-                    &scan,
-                    crate::connector::scan_planning::SplitPlanningContext::default(),
-                )?;
+                let splits = planner
+                    .plan_splits(&scan, crate::connector::scan_planning::SplitPlanningContext)?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
             }
             _ => None,
