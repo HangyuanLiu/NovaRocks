@@ -1163,6 +1163,7 @@ pub(crate) mod tests_support {
             },
             join: None,
             aggregate: None,
+            branch: None,
             target: TargetContract {
                 table_fqn: "tgt.db.mv".to_string(),
                 table_uuid: "uuid-tgt".to_string(),

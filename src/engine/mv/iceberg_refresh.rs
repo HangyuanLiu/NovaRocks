@@ -585,6 +585,7 @@ fn build_iceberg_mv_schema_contract(
                 },
                 join: None,
                 aggregate: None,
+                branch: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -644,6 +645,7 @@ fn build_iceberg_mv_schema_contract(
                 },
                 join: Some(join_lineage.join),
                 aggregate: None,
+                branch: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -675,6 +677,7 @@ fn build_iceberg_mv_schema_contract(
                 },
                 join: None,
                 aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+                branch: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -737,6 +740,7 @@ fn build_iceberg_mv_schema_contract(
                 },
                 join: Some(join_lineage.join),
                 aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+                branch: None,
                 target: target_contract(
                     analysis,
                     target,
@@ -11422,6 +11426,7 @@ mod tests {
                 },
                 join: None,
                 aggregate: None,
+                branch: None,
                 target: TargetContract {
                     table_fqn: "ice.analytics.mv_orders".to_string(),
                     table_uuid: "target-uuid".to_string(),

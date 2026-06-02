@@ -134,6 +134,7 @@ fn sample_mv_schema_contract(partition: MvPartitionContract) -> MvSchemaContract
         },
         join: None,
         aggregate: None,
+        branch: None,
         target: TargetContract {
             table_fqn: "ice.analytics.orders_mv".to_string(),
             table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
