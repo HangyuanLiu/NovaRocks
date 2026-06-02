@@ -185,9 +185,18 @@ mod tests {
         );
         assert_eq!(union.required_output_columns, required_output_columns());
 
-        for (idx, branch) in union.inputs.iter().enumerate() {
-            assert_normalized_delta_branch(branch, action_column, idx);
-        }
+        assert_normalized_delta_branch(
+            &union.inputs[0],
+            action_column,
+            0,
+            &[ColumnId(1), ColumnId(2), action_column],
+        );
+        assert_normalized_delta_branch(
+            &union.inputs[1],
+            action_column,
+            1,
+            &[ColumnId(10), ColumnId(11), action_column],
+        );
     }
 
     fn build_ctx() -> RewriteContext {
@@ -221,7 +230,7 @@ mod tests {
 
     fn source_union(all: bool) -> LogicalPlan {
         LogicalPlan::Union(UnionNode {
-            inputs: vec![scan("t1", 1), scan("t2", 1)],
+            inputs: vec![scan("t1", 1), scan("t2", 10)],
             all,
             output_columns: vec![output_column(1, "k"), output_column(2, "v")],
             required_output_columns: required_output_columns(),
@@ -316,7 +325,12 @@ mod tests {
         }
     }
 
-    fn assert_normalized_delta_branch(plan: &LogicalPlan, action_column: ColumnId, idx: usize) {
+    fn assert_normalized_delta_branch(
+        plan: &LogicalPlan,
+        action_column: ColumnId,
+        idx: usize,
+        expected_item_ids: &[ColumnId],
+    ) {
         let LogicalPlan::Project(project) = plan else {
             panic!("branch {idx} must be normalized through Project");
         };
@@ -326,7 +340,18 @@ mod tests {
                 .iter()
                 .map(|item| item.output_column_id)
                 .collect::<Vec<_>>(),
-            vec![ColumnId(1), ColumnId(2), action_column]
+            expected_item_ids
+        );
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| match &item.expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    other => panic!("branch {idx} must project ColumnRef, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            expected_item_ids
         );
         assert!(
             project.items.iter().any(|item| item
