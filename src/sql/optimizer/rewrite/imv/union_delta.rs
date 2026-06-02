@@ -202,18 +202,12 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
         union_output_columns.push(action_output);
         union_output_columns.push(branch_output);
 
-        Ok(RewriteResult::Changed(LogicalPlan::ImvDelta(
-            ImvDeltaNode {
-                input: Box::new(LogicalPlan::Union(UnionNode {
-                    inputs: rewritten_inputs,
-                    all,
-                    output_columns: union_output_columns,
-                    required_output_columns,
-                })),
-                is_root: true,
-                action_column: Some(action_column),
-            },
-        )))
+        Ok(RewriteResult::Changed(LogicalPlan::Union(UnionNode {
+            inputs: rewritten_inputs,
+            all,
+            output_columns: union_output_columns,
+            required_output_columns,
+        })))
     }
 }
 
@@ -269,9 +263,16 @@ fn normalize_top_level_union_branch_output(
     });
     items.push(ProjectItem {
         expr: crate::sql::analysis::TypedExpr {
-            kind: crate::sql::analysis::ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(
-                branch_idx as i64,
-            )),
+            kind: crate::sql::analysis::ExprKind::Cast {
+                expr: Box::new(crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(branch_idx as i64),
+                    ),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                }),
+                target: arrow::datatypes::DataType::Int32,
+            },
             data_type: branch_output.data_type.clone(),
             nullable: false,
         },
@@ -336,7 +337,7 @@ mod tests {
     use super::*;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
@@ -346,7 +347,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
-    use crate::sql::planner::plan::{AggregateNode, FilterNode, ProjectNode, ScanNode, UnionNode};
+    use crate::sql::planner::plan::{
+        AggregateNode, FilterNode, JoinNode, ProjectNode, ScanNode, UnionNode,
+    };
 
     #[test]
     fn matches_root_delta_over_aggregate_over_source_union() {
@@ -424,21 +427,14 @@ mod tests {
         let plan = delta(project_filter_union(true));
 
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::ImvDelta(root_delta)) = rule
+        let RewriteResult::Changed(LogicalPlan::Union(union)) = rule
             .apply(plan, &mut ctx)
             .expect("top-level UNION ALL delta must rewrite")
         else {
-            panic!("expected Changed(ImvDelta)");
+            panic!("expected Changed(Union)");
         };
-        assert!(root_delta.is_root);
-        let action_column = root_delta
-            .action_column
-            .expect("root delta must carry shared action column");
+        let action_column = ColumnId(100);
         assert_eq!(action_column, ColumnId(100));
-
-        let LogicalPlan::Union(union) = root_delta.input.as_ref() else {
-            panic!("expected root ImvDelta(Union)");
-        };
         assert!(union.all);
         assert_eq!(union.inputs.len(), 2);
         assert_eq!(
@@ -484,6 +480,27 @@ mod tests {
         assert_eq!(
             err,
             "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Aggregate"
+        );
+    }
+
+    #[test]
+    fn rewrite_top_level_union_delta_rejects_join_branch_shape() {
+        let rule = RewriteTopLevelUnionDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = delta(LogicalPlan::Union(UnionNode {
+            inputs: vec![join_branch(), project_over_filter("t2", 10)],
+            all: true,
+            output_columns: vec![output_column(1, "k"), output_column(2, "v")],
+            required_output_columns: required_output_columns(),
+        }));
+
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule
+            .apply(plan, &mut ctx)
+            .expect_err("join branch must be rejected");
+        assert_eq!(
+            err,
+            "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Join"
         );
     }
 
@@ -566,6 +583,24 @@ mod tests {
                     output_column_id: ColumnId(first_id + 1),
                 },
             ],
+            required_output_columns: None,
+        })
+    }
+
+    fn join_branch() -> LogicalPlan {
+        LogicalPlan::Join(JoinNode {
+            left: Box::new(scan("j1", 20)),
+            right: Box::new(scan("j2", 30)),
+            join_type: JoinKind::Inner,
+            condition: Some(TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_expr(20, "k")),
+                    op: BinOp::Eq,
+                    right: Box::new(col_expr(30, "k")),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
             required_output_columns: None,
         })
     }
@@ -762,7 +797,13 @@ mod tests {
         assert!(!branch.expr.nullable);
         assert!(matches!(
             &branch.expr.kind,
-            ExprKind::Literal(LiteralValue::Int(value)) if *value == expected_branch_id
+            ExprKind::Cast { expr, target }
+                if *target == DataType::Int32
+                    && matches!(
+                        &expr.kind,
+                        ExprKind::Literal(LiteralValue::Int(value))
+                            if *value == expected_branch_id
+                    )
         ));
 
         assert!(

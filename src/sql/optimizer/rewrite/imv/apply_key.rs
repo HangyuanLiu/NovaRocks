@@ -7,11 +7,15 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
+use crate::engine::mv::iceberg_target_apply::{
+    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
+};
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_propagation::descendant_internal_columns;
+use crate::sql::optimizer::rewrite::imv::action_propagation::{
+    descendant_internal_columns, is_supported_fan_in_delta_union,
+};
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -48,10 +52,30 @@ fn root_row_id_ref(plan: &LogicalPlan) -> Option<(ColumnId, String)> {
             }
         }
     }
+    if let LogicalPlan::Union(u) = plan {
+        if is_branch_delta_union(u) {
+            if let Some(column) = u
+                .output_columns
+                .iter()
+                .find(|column| ImvRowIdColumn::matches(column))
+            {
+                return Some((column.column_id, column.name.clone()));
+            }
+        }
+    }
     descendant_internal_columns(plan)
         .into_iter()
         .find(|c| ImvRowIdColumn::matches(c))
         .map(|c| (c.column_id, c.name))
+}
+
+fn is_branch_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    is_supported_fan_in_delta_union(node)
+        && node.output_columns.iter().any(|column| {
+            column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        })
 }
 
 fn output_has_apply_key(plan: &LogicalPlan) -> bool {
@@ -81,7 +105,10 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         if self.fired.load(Ordering::SeqCst) {
             return false;
         }
-        if !matches!(plan, LogicalPlan::Project(_) | LogicalPlan::Filter(_)) {
+        if !matches!(
+            plan,
+            LogicalPlan::Project(_) | LogicalPlan::Filter(_) | LogicalPlan::Union(_)
+        ) {
             return false;
         }
         root_row_id_ref(plan).is_some() && !output_has_apply_key(plan)
@@ -114,11 +141,42 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                 p.items.push(apply_item);
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
             }
+            LogicalPlan::Union(u) => {
+                let mut items = u
+                    .output_columns
+                    .iter()
+                    .map(project_item_for_output_column)
+                    .collect::<Vec<_>>();
+                items.push(apply_item);
+                Ok(RewriteResult::Changed(LogicalPlan::Project(
+                    crate::sql::planner::plan::ProjectNode {
+                        input: Box::new(LogicalPlan::Union(u)),
+                        items,
+                        required_output_columns: None,
+                    },
+                )))
+            }
             other => Err(format!(
-                "InjectApplyKeyProject expected root Project for PF MV rewrite, got {}",
+                "InjectApplyKeyProject expected root Project or Union for PF MV rewrite, got {}",
                 plan_kind(&other)
             )),
         }
+    }
+}
+
+fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: column.column_id,
+                qualifier: None,
+                column: column.name.clone(),
+            },
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        },
+        output_name: column.name.clone(),
+        output_column_id: column.column_id,
     }
 }
 

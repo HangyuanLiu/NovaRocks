@@ -8,11 +8,13 @@
 //! recognized IMV delta algebra rewrites are accepted by shape-specific
 //! predicates.
 
+use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
+use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -246,15 +248,19 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     && !is_supported_join_delta_branch(j)
             }
             LogicalPlan::Union(u) => {
-                u.inputs.iter().any(subtree_has_action_column)
-                    && !is_supported_join_delta_union(u)
-                    && !is_supported_fan_in_delta_union(u)
+                if branch_delta_union_needs_row_id_output(u) {
+                    true
+                } else {
+                    u.inputs.iter().any(subtree_has_action_column)
+                        && !is_supported_join_delta_union(u)
+                        && !is_supported_fan_in_delta_union(u)
+                }
             }
             _ => false,
         }
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Diagnostic: the delta base under an unsupported node, if any. Computed
         // up-front from `&plan` so the fail-fast arms can name the offending
         // base table; harmless for the Project happy path.
@@ -296,6 +302,18 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                  delta-bound scan {base} in Phase 2; join delta algebra is \
                  scheduled for Phase 5"
             )),
+            LogicalPlan::Union(mut u) if branch_delta_union_needs_row_id_output(&u) => {
+                let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                    "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
+                })?;
+                let row_id_column = ext.allocate_column_id();
+                for input in &mut u.inputs {
+                    normalize_branch_row_id_output(input, row_id_column)?;
+                }
+                u.output_columns
+                    .push(ImvRowIdColumn::output_column(row_id_column));
+                Ok(RewriteResult::Changed(LogicalPlan::Union(u)))
+            }
             LogicalPlan::Union(_) => Err(format!(
                 "IMV action column propagation does not support UNION above \
                  delta-bound scan {base} in Phase 2; union delta rewrite is \
@@ -304,6 +322,53 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             _ => Ok(RewriteResult::Unchanged),
         }
     }
+}
+
+fn branch_delta_union_needs_row_id_output(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    is_branch_delta_union(node)
+        && !node.output_columns.iter().any(ImvRowIdColumn::matches)
+        && node.inputs.iter().all(branch_project_has_row_id)
+}
+
+fn is_branch_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    is_supported_fan_in_delta_union(node)
+        && node.output_columns.iter().any(|column| {
+            column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        })
+}
+
+fn branch_project_has_row_id(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Project(project)
+            if project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+    )
+}
+
+fn normalize_branch_row_id_output(
+    plan: &mut LogicalPlan,
+    row_id_column: crate::sql::column_id::ColumnId,
+) -> Result<(), String> {
+    let LogicalPlan::Project(project) = plan else {
+        return Err(
+            "IMV branch UNION row-id propagation expected normalized Project branch".to_string(),
+        );
+    };
+    let Some(item) = project
+        .items
+        .iter_mut()
+        .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+    else {
+        return Err("IMV branch UNION row-id propagation expected _row_id output".to_string());
+    };
+    item.output_column_id = row_id_column;
+    item.output_name = ImvRowIdColumn::NAME.to_string();
+    Ok(())
 }
 
 fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {

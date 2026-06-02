@@ -70,6 +70,9 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mv::iceberg_target_apply::{
+        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
+    };
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
@@ -77,7 +80,9 @@ mod tests {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource,
     };
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -92,8 +97,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, AggregateStateMergeNode, JoinNode, LogicalPlan, ProjectNode,
-        ScanNode, ValuesNode,
+        AggregateCall, AggregateNode, AggregateStateMergeNode, FilterNode, JoinNode, LogicalPlan,
+        ProjectNode, ScanNode, UnionNode, ValuesNode,
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -113,6 +118,10 @@ mod tests {
     }
 
     fn iceberg_scan_plan() -> LogicalPlan {
+        iceberg_scan_plan_with_column_id(1)
+    }
+
+    fn iceberg_scan_plan_with_column_id(column_id: u32) -> LogicalPlan {
         let column = ColumnDef {
             name: "k".to_string(),
             data_type: DataType::Int64,
@@ -145,7 +154,7 @@ mod tests {
             },
             alias: None,
             columns: vec![OutputColumn {
-                column_id: ColumnId(1),
+                column_id: ColumnId(column_id),
                 name: "k".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -156,6 +165,69 @@ mod tests {
             dict_columns: Vec::new(),
             required_output_columns: None,
         })
+    }
+
+    fn top_level_project_filter_union_plan() -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![project_filter_branch(1), project_filter_branch(10)],
+            all: true,
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(1),
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    fn project_filter_branch(first_id: u32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Filter(FilterNode {
+                input: Box::new(iceberg_scan_plan_with_column_id(first_id)),
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(column_ref(first_id, "k", DataType::Int64, false)),
+                        op: BinOp::Ge,
+                        right: Box::new(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(0)),
+                            data_type: DataType::Int32,
+                            nullable: false,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+                required_output_columns: None,
+            })),
+            items: vec![ProjectItem {
+                expr: column_ref(first_id, "k", DataType::Int64, false),
+                output_name: "k".to_string(),
+                output_column_id: ColumnId(first_id),
+            }],
+            required_output_columns: None,
+        })
+    }
+
+    fn column_ref(id: u32, name: &str, data_type: DataType, nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type,
+            nullable,
+        }
+    }
+
+    fn project_output_names(project: &ProjectNode) -> Vec<String> {
+        project
+            .items
+            .iter()
+            .map(|item| item.output_name.clone())
+            .collect()
     }
 
     fn aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
@@ -749,7 +821,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 10);
+        assert_eq!(outcome.trace.stage_names().len(), 11);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -890,6 +962,7 @@ mod tests {
                 "imv-logical-normalize",
                 "imv-delta-marker",
                 "imv-join-delta",
+                "imv-union-delta",
                 "imv-aggregate-state",
                 "imv-delta-pushdown",
                 "imv-scan-binding",
@@ -1083,6 +1156,75 @@ mod tests {
                 .any(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op")),
             "child scan must carry the internal action column"
         );
+    }
+
+    #[test]
+    fn imv_pipeline_rewrites_top_level_union_all_delta_end_to_end() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: top_level_project_filter_union_plan(),
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("top-level projection/filter UNION ALL must rewrite through the full IMV pipeline");
+
+        assert!(
+            !plan_contains_imv_marker(&outcome.plan),
+            "final plan must not contain unresolved IMV markers: {:?}",
+            outcome.plan
+        );
+        let LogicalPlan::Project(project) = &outcome.plan else {
+            panic!("expected root apply-key Project, got {:?}", outcome.plan);
+        };
+        assert!(
+            project.items.iter().any(|item| item
+                .output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            "root output must include branch id; items: {:?}",
+            project_output_names(project)
+        );
+        assert!(
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "root output must include action column; items: {:?}",
+            project_output_names(project)
+        );
+        assert!(
+            project.items.iter().any(|item| item
+                .output_name
+                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)),
+            "root output must include apply key; items: {:?}",
+            project_output_names(project)
+        );
+        let LogicalPlan::Union(union) = project.input.as_ref() else {
+            panic!("expected root Project over Union, got {:?}", project.input);
+        };
+        assert!(
+            union.output_columns.iter().any(|column| column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            "Union output must include branch id"
+        );
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "Union output must include action column"
+        );
+        for branch in &union.inputs {
+            let LogicalPlan::Project(branch_project) = branch else {
+                panic!("expected normalized branch Project, got {branch:?}");
+            };
+            assert_eq!(
+                branch_project.items.len(),
+                union.output_columns.len(),
+                "branch Project output count must match Union output count"
+            );
+        }
     }
 
     #[test]
