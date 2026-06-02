@@ -4,8 +4,9 @@
 //! non-nullable column. Project transparently carries **all** internal columns
 //! (including `_row_id` added in Task 2, and any future internal column).
 //! Filter is a schema-passthrough node and requires no work.
-//! Join/UnionAll/Aggregate above a Delta scan are unsupported in Phase 2 and
-//! fail-fast.
+//! Unsupported Join/UnionAll/Aggregate shapes above a Delta scan fail fast;
+//! recognized IMV delta algebra rewrites are accepted by shape-specific
+//! predicates.
 
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
@@ -235,8 +236,8 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             // schema verbatim, so once the child has the action column the
             // Filter's effective output also has it. No work needed.
             LogicalPlan::Filter(_) => false,
-            // Aggregate / Join / Union above a delta subtree are unsupported in
-            // Phase 2; match here so `apply` can fail-fast with a clear error.
+            // Unsupported Aggregate / Join / Union shapes above a delta subtree
+            // match here so `apply` can fail-fast with a clear error.
             LogicalPlan::Aggregate(a) => {
                 subtree_has_action_column(&a.input) && !is_signed_state_aggregate(a)
             }
@@ -315,12 +316,36 @@ fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) ->
 }
 
 pub(crate) fn is_supported_fan_in_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
-    node.all
-        && !node.inputs.is_empty()
-        && node
-            .inputs
+    if !node.all || node.inputs.is_empty() {
+        return false;
+    }
+    let Some(action_column_id) = branch_output_action_column_id(&node.inputs[0]) else {
+        return false;
+    };
+    node.inputs.iter().all(|branch| {
+        subtree_has_delta_scan(branch)
+            && !subtree_has_version_scan(branch)
+            && branch_output_action_column_id(branch) == Some(action_column_id)
+    })
+}
+
+fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::column_id::ColumnId> {
+    match plan {
+        LogicalPlan::Scan(scan) => scan
+            .columns
             .iter()
-            .all(|branch| subtree_has_delta_scan(branch) && !subtree_has_version_scan(branch))
+            .find(|column| ImvActionColumn::matches(column))
+            .map(|column| column.column_id),
+        LogicalPlan::Filter(node) => branch_output_action_column_id(&node.input),
+        LogicalPlan::Project(project) => project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .map(|item| item.output_column_id),
+        LogicalPlan::ImvDelta(node) => branch_output_action_column_id(&node.input),
+        LogicalPlan::ImvVersion(node) => branch_output_action_column_id(&node.input),
+        _ => None,
+    }
 }
 
 fn is_supported_normalized_join_delta_branch(plan: &LogicalPlan) -> bool {
@@ -603,6 +628,32 @@ mod tests {
         })
     }
 
+    fn normalized_delta_project_without_action(user_col_id: ColumnId) -> LogicalPlan {
+        let mut scan = delta_scan();
+        scan.columns[0].column_id = user_col_id;
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
+                input: Box::new(LogicalPlan::Scan(scan)),
+                is_root: false,
+                action_column: None,
+            })),
+            items: vec![ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: user_col_id,
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "k".to_string(),
+                output_column_id: user_col_id,
+            }],
+            required_output_columns: None,
+        })
+    }
+
     #[test]
     fn propagate_through_project() {
         let rule = PropagateActionColumnRule;
@@ -740,6 +791,64 @@ mod tests {
         });
 
         assert!(!rule.matches(&union, &ctx));
+    }
+
+    #[test]
+    fn accepts_bare_delta_scan_union_with_shared_action_column() {
+        let rule = PropagateActionColumnRule;
+        let ctx = build_ctx();
+        let action_id = ColumnId(100);
+        let union = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                LogicalPlan::Scan(delta_scan_with_action(action_id)),
+                LogicalPlan::Scan(delta_scan_with_action(action_id)),
+            ],
+            all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
+        });
+
+        assert!(!rule.matches(&union, &ctx));
+    }
+
+    #[test]
+    fn rejects_fan_in_delta_union_missing_branch_action_column() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let union = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                normalized_delta_project(ColumnId(100), ColumnId(1)),
+                normalized_delta_project_without_action(ColumnId(10)),
+            ],
+            all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
+        });
+
+        assert!(rule.matches(&union, &ctx));
+        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
+        assert!(err.contains("Phase 6"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_fan_in_delta_union_with_mismatched_action_column_ids() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let union = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                normalized_delta_project(ColumnId(100), ColumnId(1)),
+                normalized_delta_project(ColumnId(101), ColumnId(10)),
+            ],
+            all: true,
+            output_columns: Vec::new(),
+            required_output_columns: None,
+        });
+
+        assert!(rule.matches(&union, &ctx));
+        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
+        assert!(err.contains("Phase 6"), "unexpected error: {err}");
+        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
 
     #[test]
