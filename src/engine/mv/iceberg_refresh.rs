@@ -2891,6 +2891,16 @@ pub(crate) fn plan_iceberg_mv_refresh(
     );
     let shape =
         classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
+    if let IncrementalMvShape::UnionAll(_) = &shape {
+        return Err(RefreshError::user(
+            "incremental UNION ALL MV refresh is not yet supported in this build",
+        ));
+    }
+    if matches!(&shape, IncrementalMvShape::Aggregate(a) if !a.fan_in_bases.is_empty()) {
+        return Err(RefreshError::user(
+            "incremental aggregate-over-UNION-ALL refresh is not yet supported in this build",
+        ));
+    }
     if aggregate_shape_for_layout(&shape).is_some() {
         return plan_iceberg_aggregate_mv_refresh(
             state,
@@ -9494,6 +9504,39 @@ mod tests {
     }
 
     #[test]
+    fn plan_iceberg_mv_refresh_rejects_union_all_projection_mv() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "returns");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_union_orders".to_string(),
+        };
+        let err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("UNION ALL refresh planning should fail fast");
+
+        assert!(
+            err.message
+                .contains("incremental UNION ALL MV refresh is not yet supported"),
+            "err={err:?}"
+        );
+    }
+
+    #[test]
     fn create_iceberg_union_all_projection_mv_rejects_branch_id_output_alias() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
@@ -9605,6 +9648,67 @@ mod tests {
             crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
         );
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
+    }
+
+    #[test]
+    fn plan_iceberg_mv_refresh_rejects_aggregate_over_union_all_mv() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
+        create_base_table(&env.state, "ice", "analytics", "mv_union_fact_region");
+        let select_sql = "SELECT region, sum(amount) AS s
+                          FROM (
+                              SELECT region, amount FROM ice.sales.fact_east
+                              UNION ALL
+                              SELECT region, amount FROM ice.sales.fact_west
+                          ) u
+                          GROUP BY region";
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed aggregate-over-union mv definition")
+            .expect("write txn");
+        env.state
+            .mv_repo
+            .create_definition(
+                txn.as_mut(),
+                CreateMvDefinitionRequest {
+                    select_sql: select_sql.to_string(),
+                    base_table_refs: vec![
+                        "ice.sales.fact_east".to_string(),
+                        "ice.sales.fact_west".to_string(),
+                    ],
+                    primary_key_columns: Vec::new(),
+                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    target_catalog: Some("ice".to_string()),
+                    target_namespace: Some("analytics".to_string()),
+                    target_table: Some("mv_union_fact_region".to_string()),
+                    schema_contract: None,
+                    partition_spec: None,
+                    created_at_ms: now_ms(),
+                },
+            )
+            .expect("create aggregate-over-union mv definition");
+        txn.commit()
+            .expect("commit aggregate-over-union mv definition");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_union_fact_region".to_string(),
+        };
+        let err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("aggregate-over-UNION-ALL refresh planning should fail fast");
+
+        assert!(
+            err.message.contains("aggregate-over-UNION-ALL"),
+            "err={err:?}"
+        );
     }
 
     #[test]
