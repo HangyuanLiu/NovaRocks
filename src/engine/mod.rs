@@ -668,6 +668,27 @@ impl StandaloneSession {
                 (normalized.clone(), None)
             };
 
+        if let Some(parsed) = parse_explain_refresh_materialized_view(&normalized) {
+            let (stmt, level, analyze) = parsed?;
+            if analyze {
+                return Err(
+                    "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
+                );
+            }
+            let lines =
+                crate::engine::mv::iceberg_refresh::explain_iceberg_mv_refresh_rewrite_plan(
+                    &self.inner,
+                    current_catalog,
+                    current_database,
+                    &stmt,
+                    level,
+                )?;
+            return Ok(StatementResult::Query(build_string_query_result(
+                "Explain String",
+                lines,
+            )?));
+        }
+
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&parse_sql)
@@ -2548,6 +2569,7 @@ fn single_fragment_plan(
         desc_tbl: fragment.desc_tbl,
         exec_params: fragment.exec_params,
         output_columns: fragment.output_columns,
+        direct_exec: fragment.direct_exec,
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
@@ -2742,6 +2764,9 @@ pub(crate) fn execute_query(
 /// `mv_refresh_ctx = Some(ctx)` runs the IMV rewrite pipeline on the
 /// logical plan before optimization. Callers that do not need IMV rewriting
 /// pass `None` (dormant until Task 9 flips the PF refresh caller).
+pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome) -> Result<(), String>
+    + 'a;
+
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
@@ -2753,10 +2778,38 @@ pub(crate) fn execute_query_with_options(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator(
+        query,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_with_options_and_imv_validator(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     if let Some(mv_ctx) = mv_refresh_ctx {
+        logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
         let outcome = crate::sql::optimizer::rewrite::imv::entrypoint::run_imv_rewrite(
             crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteInput {
                 plan: logical,
@@ -2770,7 +2823,12 @@ pub(crate) fn execute_query_with_options(
             },
         )
         .map_err(|e| format!("imv rewrite: {e}"))?;
+        if let Some(validator) = imv_rewrite_validator {
+            validator(&outcome)?;
+        }
         logical = outcome.plan;
+    } else if imv_rewrite_validator.is_some() {
+        return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
@@ -2785,12 +2843,14 @@ pub(crate) fn execute_query_with_options(
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
     }
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        &physical,
-        catalog,
-        connectors,
-        current_database,
-    )?;
+    let build_result =
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
+            &physical,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?;
 
     let execution_plan = choose_standalone_execution(build_result);
 
@@ -3013,6 +3073,10 @@ fn collect_scan_stats(
         }
         LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Decode(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::AggregateStateMerge(n) => {
+            collect_scan_stats(&n.old_input, out);
+            collect_scan_stats(&n.delta_input, out);
+        }
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
@@ -3160,19 +3224,52 @@ fn build_stats_file_io(
     Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build())
 }
 
-fn execute_plan(
+fn lower_plan_build_result(
     result: PlanBuildResult,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
-    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    arena: &mut crate::exec::expr::ExprArena,
+    query_opts: Option<&crate::internal_service::TQueryOptions>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-) -> Result<QueryResult, String> {
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+) -> Result<crate::exec::node::ExecNode, String> {
     use crate::lower::thrift::layout::{build_tuple_slot_order, reorder_tuple_slots};
     use crate::lower::thrift::lower_plan;
-    use crate::runtime::runtime_state::RuntimeState;
+
+    if let Some(direct) = result.direct_exec {
+        match *direct {
+            crate::sql::codegen::DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                layout,
+            } => {
+                let old_input =
+                    lower_plan_build_result(*old_input, arena, query_opts, iceberg_catalogs)?;
+                let delta_input =
+                    lower_plan_build_result(*delta_input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(
+                    crate::sql::codegen::nodes::build_aggregate_state_merge_exec_node(
+                        old_input,
+                        delta_input,
+                        layout,
+                    ),
+                );
+            }
+            crate::sql::codegen::DirectExecPlan::AggregateStatePhysicalize {
+                input,
+                layout,
+                shape,
+            } => {
+                let input = lower_plan_build_result(*input, arena, query_opts, iceberg_catalogs)?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::AggregateStatePhysicalize(
+                        crate::exec::operators::aggregate_state_merge::AggregateStatePhysicalizePlan {
+                            input: Box::new(input),
+                            layout,
+                            shape,
+                        },
+                    ),
+                });
+            }
+        }
+    }
 
     let desc_tbl = result.desc_tbl;
     let plan = result.plan;
@@ -3184,17 +3281,16 @@ fn execute_plan(
     reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
     let layout_hints = tuple_slots.clone();
 
-    let mut arena = ExprArena::default();
     let connectors = crate::connector::ConnectorRegistry::default();
     let lowered = lower_plan(
         &plan,
-        &mut arena,
+        arena,
         &tuple_slots,
         Some(&desc_tbl),
         query_global_dicts.as_deref(),
         query_global_dict_exprs.as_ref(),
         Some(&exec_params),
-        query_opts.as_ref(),
+        query_opts,
         None,
         &connectors,
         &layout_hints,
@@ -3202,10 +3298,25 @@ fn execute_plan(
         None,
         iceberg_catalogs,
     )?;
-    let mut exec_plan = ExecPlan {
-        arena,
-        root: lowered.node,
-    };
+    Ok(lowered.node)
+}
+
+fn execute_plan(
+    result: PlanBuildResult,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+) -> Result<QueryResult, String> {
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    let output_columns = result.output_columns.clone();
+    let mut arena = ExprArena::default();
+    let root = lower_plan_build_result(result, &mut arena, query_opts.as_ref(), iceberg_catalogs)?;
+    let mut exec_plan = ExecPlan { arena, root };
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     // Default to the result-capturing sink unless the caller supplied a
@@ -3240,8 +3351,7 @@ fn execute_plan(
     )?;
 
     Ok(QueryResult {
-        columns: result
-            .output_columns
+        columns: output_columns
             .iter()
             .map(|c| QueryResultColumn {
                 name: c.name.clone(),
@@ -3539,6 +3649,67 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
     } else {
         None
     }
+}
+
+fn parse_explain_refresh_materialized_view(
+    sql: &str,
+) -> Option<
+    Result<
+        (
+            crate::sql::parser::ast::RefreshMaterializedViewStmt,
+            crate::sql::explain::ExplainLevel,
+            bool,
+        ),
+        String,
+    >,
+> {
+    let trimmed = sql.trim_start();
+    let prefixes = [
+        (
+            "EXPLAIN ANALYZE REFRESH ",
+            crate::sql::explain::ExplainLevel::Analyze,
+            true,
+        ),
+        (
+            "EXPLAIN VERBOSE REFRESH ",
+            crate::sql::explain::ExplainLevel::Verbose,
+            false,
+        ),
+        (
+            "EXPLAIN COSTS REFRESH ",
+            crate::sql::explain::ExplainLevel::Costs,
+            false,
+        ),
+        (
+            "EXPLAIN REFRESH ",
+            crate::sql::explain::ExplainLevel::Normal,
+            false,
+        ),
+    ];
+    for (prefix, level, analyze) in prefixes {
+        if trimmed
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+        {
+            let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
+            let mut statements = match crate::sql::parser::parse_sql(&body) {
+                Ok(statements) => statements,
+                Err(e) => return Some(Err(e)),
+            };
+            let Some(statement) = statements.pop() else {
+                return Some(Err("EXPLAIN REFRESH parsed no statement".to_string()));
+            };
+            let crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) = statement
+            else {
+                return Some(Err(
+                    "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
+                ));
+            };
+            return Some(Ok((stmt, level, analyze)));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4458,6 +4629,183 @@ enable_path_style_access = true
             crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
         ));
         registry
+    }
+
+    fn parse_query_for_engine_test(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
+        let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+            .expect("parse query statement");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        *query
+    }
+
+    fn dummy_mv_refresh_context_for_validator_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type,
+        };
+        use iceberg::table::Table;
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let warehouse = format!(
+            "memory://novarocks-imv-validator-test-{}",
+            uuid::Uuid::new_v4()
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.clone(),
+                    )]),
+                ))
+                .expect("memory catalog"),
+        );
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "k", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://validator-target/table".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::from([(
+                "write.row-lineage".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("catalog entry"),
+        );
+
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+            rewrite: crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context(),
+            target_entry,
+            base_catalog_entries: std::collections::BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+        }
+    }
+
+    #[test]
+    fn execute_query_with_imv_validator_propagates_validator_error() {
+        let query = parse_query_for_engine_test("select k, v from ice.db.b");
+        let mut catalog = super::InMemoryCatalog::default();
+        catalog.create_database("db").expect("create db");
+        catalog
+            .register(
+                "db",
+                crate::sql::catalog::TableDef {
+                    name: "b".to_string(),
+                    columns: vec![
+                        crate::sql::catalog::ColumnDef {
+                            name: "k".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        crate::sql::catalog::ColumnDef {
+                            name: "v".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                        table: crate::sql::catalog::IcebergTableInfo {
+                            catalog: "ice".to_string(),
+                            namespace: "db".to_string(),
+                            table: "b".to_string(),
+                            table_uuid: Some("uuid-b".to_string()),
+                            current_snapshot_id: Some(22),
+                            schema_id: 1,
+                            location: "memory://ice/db/b".to_string(),
+                            schema: crate::sql::catalog::IcebergSchemaDef {
+                                fields: vec![
+                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                        field_id: 1,
+                                        name: "k".to_string(),
+                                        initial_default: None,
+                                        write_default: None,
+                                        initial_default_json: None,
+                                        children: Vec::new(),
+                                    },
+                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                        field_id: 2,
+                                        name: "v".to_string(),
+                                        initial_default: None,
+                                        write_default: None,
+                                        initial_default_json: None,
+                                        children: Vec::new(),
+                                    },
+                                ],
+                            },
+                            serialized_metadata: None,
+                        },
+                        files: Vec::new(),
+                        cloud_properties: Default::default(),
+                    },
+                },
+            )
+            .expect("register base table");
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let mv_ctx = dummy_mv_refresh_context_for_validator_test();
+        let validator =
+            |_outcome: &crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome| {
+                Err("sentinel IMV validator error".to_string())
+            };
+
+        let err = super::execute_query_with_options_and_imv_validator(
+            &query,
+            &catalog,
+            &connectors,
+            "default",
+            0,
+            None,
+            None,
+            None,
+            Some(&mv_ctx),
+            Some(&validator),
+        )
+        .expect_err("validator errors must abort refresh query execution");
+
+        assert_eq!(err, "sentinel IMV validator error");
     }
 
     #[test]
@@ -7398,5 +7746,37 @@ enable_path_style_access = true
         let msg = result.err().expect("expected error");
         assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
         assert!(msg.contains('2'), "must include count: {msg}");
+    }
+
+    #[test]
+    fn parse_explain_refresh_materialized_view_supports_verbose_and_costs() {
+        let verbose = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(verbose.0.name.parts, vec!["mv1"]);
+        assert_eq!(verbose.1, crate::sql::explain::ExplainLevel::Verbose);
+        assert!(!verbose.2);
+
+        let costs = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN COSTS REFRESH MATERIALIZED VIEW db.mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(costs.0.name.parts, vec!["db", "mv1"]);
+        assert_eq!(costs.1, crate::sql::explain::ExplainLevel::Costs);
+        assert!(!costs.2);
+    }
+
+    #[test]
+    fn parse_explain_refresh_materialized_view_marks_analyze() {
+        let parsed = super::parse_explain_refresh_materialized_view(
+            "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW mv1",
+        )
+        .expect("recognized")
+        .expect("parsed");
+        assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
+        assert!(parsed.2);
     }
 }

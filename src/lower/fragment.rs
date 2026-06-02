@@ -134,6 +134,13 @@ fn collect_glm_metadata(
         }
         ExecNodeKind::Values(_) => {}
         ExecNodeKind::IcebergDeltaScan(_) => {}
+        ExecNodeKind::AggregateStateMerge(node) => {
+            collect_glm_metadata(&node.old_input, row_pos_descs)?;
+            collect_glm_metadata(&node.delta_input, row_pos_descs)?;
+        }
+        ExecNodeKind::AggregateStatePhysicalize(node) => {
+            collect_glm_metadata(&node.input, row_pos_descs)?;
+        }
     }
     Ok(())
 }

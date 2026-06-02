@@ -130,6 +130,71 @@ pub struct IcebergTableInfo {
     pub serialized_metadata: Option<String>,
 }
 
+/// Metadata for an IMV target-state scan source. This struct carries only
+/// planner-safe metadata for the MV's own target state — catalog identity,
+/// column definitions, and the aggregate/join logical contract. It has no
+/// execution or catalog handles and is designed to be inspectable during
+/// analyzer/optimizer phases without triggering runtime behavior. The
+/// standalone refresh codegen lowers this source into the local target-state
+/// scan used by aggregate-state merge execution.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IcebergMvTargetStateScan {
+    pub(crate) catalog: String,
+    pub(crate) database: String,
+    pub(crate) table: String,
+    pub(crate) target_table_uuid: String,
+    pub(crate) target_snapshot_id: Option<i64>,
+    pub(crate) aggregate_state_layout_version: u16,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) group_key_names: Vec<String>,
+    pub(crate) aggregate_state_names: Vec<String>,
+    pub(crate) physical_column_names: Vec<String>,
+    pub(crate) row_id_column_name: String,
+    pub(crate) row_filter: IcebergMvTargetStateRowFilter,
+    pub(crate) partition_constraint: IcebergMvTargetStatePartitionConstraint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergMvTargetStateRowFilter {
+    DeltaInputRowIds { row_id_column_name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergMvTargetStatePartitionConstraint {
+    Unpartitioned,
+    AffectedPartitionAllowListRequired,
+}
+
+impl IcebergMvTargetStateScan {
+    pub(crate) fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.database, self.table)
+    }
+
+    pub(crate) fn constraint_summary(&self) -> String {
+        let row_filter = match &self.row_filter {
+            IcebergMvTargetStateRowFilter::DeltaInputRowIds { row_id_column_name } => {
+                format!("row_filter=delta_input_row_ids({row_id_column_name})")
+            }
+        };
+        let partition = match self.partition_constraint {
+            IcebergMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
+            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+                "partition=affected_allow_list_required"
+            }
+        };
+        format!(
+            "uuid={} snapshot={} layout={} {} {}",
+            self.target_table_uuid,
+            self.target_snapshot_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.aggregate_state_layout_version,
+            row_filter,
+            partition
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergDataFileInfo {
     pub path: String,
@@ -258,6 +323,13 @@ pub enum ScanSource {
         table: IcebergTableInfo,
         snapshot_id: i64,
     },
+    /// IMV target-state scan placeholder. Produced by the analyzer when
+    /// constructing an IMV refresh plan that reads the MV's own target state.
+    /// This variant carries only metadata-level information (catalog identity,
+    /// columns, and the aggregate/join logical contract) and has no codegen
+    /// or runtime behavior in this task. Future tasks will implement the
+    /// optimizer rewrite and execution path.
+    IcebergMvTargetState(IcebergMvTargetStateScan),
 }
 
 #[derive(Clone, Debug)]
@@ -357,5 +429,62 @@ mod tests {
         assert_eq!(iceberg.location, "file:///tmp/test_table");
         assert_eq!(iceberg.schema.fields[0].field_id, 10);
         assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
+    }
+}
+
+#[cfg(test)]
+mod imv_target_state_tests {
+    use super::*;
+
+    fn sample_columns() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef {
+                name: "region".to_string(),
+                data_type: arrow::datatypes::DataType::Utf8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "c".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn iceberg_mv_target_state_scan_source_carries_logical_contract() {
+        let source = ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
+            catalog: "ice".to_string(),
+            database: "ns".to_string(),
+            table: "mv_sales".to_string(),
+            target_table_uuid: "target-uuid".to_string(),
+            target_snapshot_id: Some(42),
+            aggregate_state_layout_version: 1,
+            columns: sample_columns(),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["c".to_string()],
+            physical_column_names: vec!["region".to_string(), "c".to_string()],
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+            },
+            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        });
+
+        let ScanSource::IcebergMvTargetState(scan) = source else {
+            panic!("expected target-state scan source");
+        };
+        assert_eq!(scan.fqn(), "ice.ns.mv_sales");
+        assert_eq!(scan.group_key_names, vec!["region"]);
+        assert_eq!(scan.aggregate_state_names, vec!["c"]);
+        assert_eq!(scan.row_id_column_name, "__row_id__");
+        assert!(
+            scan.constraint_summary()
+                .contains("row_filter=delta_input_row_ids(__row_id__)")
+        );
     }
 }

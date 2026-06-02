@@ -470,6 +470,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
         LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }
@@ -2288,7 +2289,8 @@ fn iceberg_table_info(
         | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks { .. } => None,
+        crate::sql::catalog::ScanSource::StarRocks { .. }
+        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. } => None,
     }
 }
 

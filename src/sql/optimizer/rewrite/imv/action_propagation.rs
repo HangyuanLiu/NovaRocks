@@ -7,7 +7,7 @@
 //! Join/UnionAll/Aggregate above a Delta scan are unsupported in Phase 2 and
 //! fail-fast.
 
-use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -15,7 +15,7 @@ use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,6 +41,9 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::ImvDelta(node) => output_has_action_column(&node.input),
         LogicalPlan::ImvVersion(node) => output_has_action_column(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            output_has_action_column(&node.old_input) || output_has_action_column(&node.delta_input)
+        }
         _ => false,
     }
 }
@@ -56,6 +59,9 @@ pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
             .cloned(),
         LogicalPlan::Filter(node) => find_action_column(&node.input),
         LogicalPlan::Project(node) => find_action_column(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            find_action_column(&node.old_input).or_else(|| find_action_column(&node.delta_input))
+        }
         _ => None,
     }
 }
@@ -66,6 +72,15 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
         || match plan {
             LogicalPlan::Filter(node) => subtree_has_action_column(&node.input),
             LogicalPlan::Project(node) => subtree_has_action_column(&node.input),
+            LogicalPlan::Aggregate(node) => subtree_has_action_column(&node.input),
+            LogicalPlan::AggregateStateMerge(node) => {
+                subtree_has_action_column(&node.old_input)
+                    || subtree_has_action_column(&node.delta_input)
+            }
+            LogicalPlan::Join(node) => {
+                subtree_has_action_column(&node.left) || subtree_has_action_column(&node.right)
+            }
+            LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_action_column),
             _ => false,
         }
 }
@@ -87,6 +102,8 @@ pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
         LogicalPlan::Filter(node) => first_delta_base_fqn(&node.input),
         LogicalPlan::Project(node) => first_delta_base_fqn(&node.input),
         LogicalPlan::Aggregate(node) => first_delta_base_fqn(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => first_delta_base_fqn(&node.old_input)
+            .or_else(|| first_delta_base_fqn(&node.delta_input)),
         LogicalPlan::Join(node) => {
             first_delta_base_fqn(&node.left).or_else(|| first_delta_base_fqn(&node.right))
         }
@@ -111,8 +128,33 @@ pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColum
             .collect(),
         LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
         LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            let mut columns = descendant_internal_columns(&node.old_input);
+            columns.extend(descendant_internal_columns(&node.delta_input));
+            columns
+        }
         _ => Vec::new(),
     }
+}
+
+fn is_signed_state_aggregate(node: &AggregateNode) -> bool {
+    !node.aggregates.is_empty()
+        && node
+            .aggregates
+            .iter()
+            .any(|call| call.name.ends_with("_state_signed"))
+        && node.aggregates.iter().all(|call| {
+            call.name.ends_with("_state_signed") || is_hidden_retraction_count_call(call)
+        })
+}
+
+fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCall) -> bool {
+    call.name.eq_ignore_ascii_case("sum")
+        && call.args.len() == 1
+        && matches!(
+            &call.args[0].kind,
+            ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -195,11 +237,16 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             LogicalPlan::Filter(_) => false,
             // Aggregate / Join / Union above a delta subtree are unsupported in
             // Phase 2; match here so `apply` can fail-fast with a clear error.
-            LogicalPlan::Aggregate(a) => subtree_has_action_column(&a.input),
-            LogicalPlan::Join(j) => {
-                subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right)
+            LogicalPlan::Aggregate(a) => {
+                subtree_has_action_column(&a.input) && !is_signed_state_aggregate(a)
             }
-            LogicalPlan::Union(u) => u.inputs.iter().any(subtree_has_action_column),
+            LogicalPlan::Join(j) => {
+                (subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right))
+                    && !is_supported_join_delta_branch(j)
+            }
+            LogicalPlan::Union(u) => {
+                u.inputs.iter().any(subtree_has_action_column) && !is_supported_join_delta_union(u)
+            }
             _ => false,
         }
     }
@@ -253,6 +300,77 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             )),
             _ => Ok(RewriteResult::Unchanged),
         }
+    }
+}
+
+fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    node.all
+        && !node.inputs.is_empty()
+        && node
+            .inputs
+            .iter()
+            .all(is_supported_normalized_join_delta_branch)
+}
+
+fn is_supported_normalized_join_delta_branch(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project(project) => {
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+                && matches!(
+                    project.input.as_ref(),
+                    LogicalPlan::Join(join) if is_supported_join_delta_branch(join)
+                )
+        }
+        LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
+        _ => false,
+    }
+}
+
+fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {
+    matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
+        && exactly_one_delta_one_version(&node.left, &node.right)
+}
+
+fn exactly_one_delta_one_version(left: &LogicalPlan, right: &LogicalPlan) -> bool {
+    let left_delta = subtree_has_delta_scan(left);
+    let right_delta = subtree_has_delta_scan(right);
+    let left_version = subtree_has_version_scan(left);
+    let right_version = subtree_has_version_scan(right);
+    ((left_delta && right_version) || (right_delta && left_version))
+        && !(left_delta && right_delta)
+        && !(left_version && right_version)
+}
+
+fn subtree_has_delta_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_delta_scan(&node.input),
+        LogicalPlan::Project(node) => subtree_has_delta_scan(&node.input),
+        LogicalPlan::Join(node) => {
+            subtree_has_delta_scan(&node.left) || subtree_has_delta_scan(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta_scan),
+        _ => false,
+    }
+}
+
+fn subtree_has_version_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_version_scan(&node.input),
+        LogicalPlan::Project(node) => subtree_has_version_scan(&node.input),
+        LogicalPlan::Join(node) => {
+            subtree_has_version_scan(&node.left) || subtree_has_version_scan(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version_scan),
+        _ => false,
     }
 }
 

@@ -2,15 +2,15 @@
 //!
 //! The action column is an optimizer-internal `Int8` non-nullable column
 //! produced by `InjectActionColumnRule` on Delta-bound scans. It carries
-//! `+1` for inserts/upserts and `-1` for deletes at runtime (Phase 3+),
-//! and is never exposed to user-visible output.
+//! `+1` for inserts/upserts and `-1` for deletes at runtime, and is never
+//! exposed to user-visible output.
 
 use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -25,10 +25,10 @@ pub(crate) struct ImvActionColumn;
 
 impl ImvActionColumn {
     pub(crate) const NAME: &'static str = crate::exec::change_op::CHANGE_OP_COLUMN;
-    // consumed by Phase 3 execution cutover
+    // Consumed by IMV refresh execution.
     #[allow(dead_code)]
     pub(crate) const INSERT_VALUE: i8 = crate::exec::change_op::CHANGE_OP_INSERT;
-    // consumed by Phase 3 execution cutover
+    // Consumed by IMV refresh execution.
     #[allow(dead_code)]
     pub(crate) const DELETE_VALUE: i8 = crate::exec::change_op::CHANGE_OP_DELETE;
 
@@ -107,7 +107,10 @@ fn validate(plan: &LogicalPlan) -> Result<(), String> {
         );
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
-    if subtree_has_delta(plan) && !output_has_apply_key(plan) {
+    if !matches!(plan, LogicalPlan::AggregateStateMerge(_))
+        && subtree_has_delta(plan)
+        && !output_has_apply_key(plan)
+    {
         let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
         return Err(format!(
             "plan above delta-bound scan {fqn} is missing apply key column \
@@ -124,11 +127,15 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
     match plan {
         LogicalPlan::Scan(scan) => validate_scan(scan),
         LogicalPlan::Filter(node) => validate_node(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            validate_node(&node.old_input)?;
+            validate_state_merge_delta_input(&node.delta_input)
+        }
         LogicalPlan::Project(node) => {
             validate_node(&node.input)?;
             // V3: if a delta is below, Project must expose the action column.
             // NOTE: this re-walks the subtree per Project node, so validation is
-            // O(depth * subtree) on deep linear plans. Negligible for Phase 2's
+            // O(depth * subtree) on deep linear plans. Negligible for current
             // single-table shapes; revisit with memoization if plans grow.
             if subtree_has_delta(&node.input) {
                 let has = node
@@ -148,31 +155,168 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         LogicalPlan::Aggregate(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Aggregate above delta-bound scan {fqn}; deferred to Phase 4"
+                "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
         }
         LogicalPlan::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Join above delta-bound scan {fqn}; deferred to Phase 5"
+                "Iceberg IMV rewrite does not support this join shape above delta-bound scan {fqn}"
             ))
         }
         LogicalPlan::Union(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support Union above delta-bound scan {fqn}; deferred to Phase 6"
+                "Iceberg IMV rewrite does not support this union shape above delta-bound scan {fqn}"
             ))
         }
         // Last safety gate: any unhandled node kind (Sort/Limit/Window/etc.)
-        // sitting above a delta subtree is unsupported in Phase 2 and rejected.
+        // sitting above a delta subtree is unsupported and rejected.
         other if subtree_has_delta(other) => {
             let fqn = first_delta_base_fqn(other).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
-                "Phase 2 does not support this plan shape above delta-bound scan {fqn}; \
-                 only Scan/Project/Filter are supported"
+                "Iceberg IMV rewrite does not support this plan shape above delta-bound scan {fqn}; \
+                 supported shapes must be consumed before validation"
             ))
         }
         _ => Ok(()),
+    }
+}
+
+fn validate_state_merge_delta_input(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node) => {
+            validate_signed_delta_input(&node.input)
+        }
+        LogicalPlan::Project(project)
+            if matches!(
+                project.input.as_ref(),
+                LogicalPlan::Aggregate(node) if is_signed_state_aggregate(node)
+            ) =>
+        {
+            let LogicalPlan::Aggregate(node) = project.input.as_ref() else {
+                unreachable!();
+            };
+            validate_signed_delta_input(&node.input)
+        }
+        _ => validate_node(plan),
+    }
+}
+
+fn is_signed_state_aggregate(node: &crate::sql::planner::plan::AggregateNode) -> bool {
+    !node.aggregates.is_empty()
+        && node
+            .aggregates
+            .iter()
+            .any(|call| call.name.ends_with("_state_signed"))
+        && node.aggregates.iter().all(|call| {
+            call.name.ends_with("_state_signed") || is_hidden_retraction_count_call(call)
+        })
+}
+
+fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCall) -> bool {
+    call.name.eq_ignore_ascii_case("sum")
+        && call.args.len() == 1
+        && matches!(
+            &call.args[0].kind,
+            ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
+        )
+}
+
+fn validate_signed_delta_input(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Scan(scan) => validate_scan(scan),
+        LogicalPlan::Filter(node) => validate_signed_delta_input(&node.input),
+        LogicalPlan::Project(node) => {
+            validate_signed_delta_input(&node.input)?;
+            if subtree_has_delta(&node.input) {
+                let has = node
+                    .items
+                    .iter()
+                    .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME));
+                if !has {
+                    let fqn = first_delta_base_fqn(&node.input)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    return Err(format!(
+                        "action column dropped at Project above delta-bound scan {fqn}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Join(node) if is_supported_join_delta_branch(node) => {
+            validate_signed_delta_input(&node.left)?;
+            validate_signed_delta_input(&node.right)
+        }
+        LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
+            for input in &node.inputs {
+                validate_signed_delta_input(input)?;
+            }
+            Ok(())
+        }
+        _ => validate_node(plan),
+    }
+}
+
+fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    node.all
+        && !node.inputs.is_empty()
+        && node
+            .inputs
+            .iter()
+            .all(is_supported_normalized_join_delta_branch)
+}
+
+fn is_supported_normalized_join_delta_branch(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project(project) => {
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+                && matches!(
+                    project.input.as_ref(),
+                    LogicalPlan::Join(join) if is_supported_join_delta_branch(join)
+                )
+        }
+        LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
+        _ => false,
+    }
+}
+
+fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {
+    matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
+        && exactly_one_delta_one_version(&node.left, &node.right)
+}
+
+fn exactly_one_delta_one_version(left: &LogicalPlan, right: &LogicalPlan) -> bool {
+    let left_delta = subtree_has_delta(left);
+    let right_delta = subtree_has_delta(right);
+    let left_version = subtree_has_version(left);
+    let right_version = subtree_has_version(right);
+    ((left_delta && right_version) || (right_delta && left_version))
+        && !(left_delta && right_delta)
+        && !(left_version && right_version)
+}
+
+fn subtree_has_version(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
+        }
+        LogicalPlan::Filter(node) => subtree_has_version(&node.input),
+        LogicalPlan::Project(node) => subtree_has_version(&node.input),
+        LogicalPlan::Aggregate(node) => subtree_has_version(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            subtree_has_version(&node.old_input) || subtree_has_version(&node.delta_input)
+        }
+        LogicalPlan::Join(node) => {
+            subtree_has_version(&node.left) || subtree_has_version(&node.right)
+        }
+        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version),
+        LogicalPlan::ImvDelta(node) => subtree_has_version(&node.input),
+        LogicalPlan::ImvVersion(node) => subtree_has_version(&node.input),
+        _ => false,
     }
 }
 
@@ -242,6 +386,9 @@ fn subtree_has_delta(plan: &LogicalPlan) -> bool {
         LogicalPlan::Filter(node) => subtree_has_delta(&node.input),
         LogicalPlan::Project(node) => subtree_has_delta(&node.input),
         LogicalPlan::Aggregate(node) => subtree_has_delta(&node.input),
+        LogicalPlan::AggregateStateMerge(node) => {
+            subtree_has_delta(&node.old_input) || subtree_has_delta(&node.delta_input)
+        }
         LogicalPlan::Join(node) => subtree_has_delta(&node.left) || subtree_has_delta(&node.right),
         LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta),
         LogicalPlan::ImvDelta(node) => subtree_has_delta(&node.input),
@@ -262,6 +409,9 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
                     .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         }),
         LogicalPlan::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
+        LogicalPlan::AggregateStateMerge(node) => {
+            node.output_columns.iter().any(|c| !c.is_internal)
+        }
         LogicalPlan::Join(node) => {
             has_visible_output(&node.left) || has_visible_output(&node.right)
         }
@@ -276,7 +426,9 @@ mod tests {
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::ProjectNode;
+    use crate::sql::planner::plan::{
+        AggregateCall, AggregateNode, AggregateStateMergeNode, ProjectNode, ValuesNode,
+    };
 
     #[test]
     fn output_column_has_expected_shape() {
@@ -538,7 +690,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("aggregate above delta must fail");
-        assert!(err.contains("Phase 4"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
+            "got: {err}"
+        );
         assert!(err.contains("ice.db.b"), "got: {err}");
     }
 
@@ -558,7 +713,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("join above delta must fail");
-        assert!(err.contains("Phase 5"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this join shape"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -573,7 +731,10 @@ mod tests {
             required_output_columns: None,
         });
         let err = validate(&plan).expect_err("union above delta must fail");
-        assert!(err.contains("Phase 6"), "got: {err}");
+        assert!(
+            err.contains("Iceberg IMV rewrite does not support this union shape"),
+            "got: {err}"
+        );
     }
 
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
@@ -649,5 +810,77 @@ mod tests {
         ))));
         let err = validate(&plan).expect_err("missing _row_id must fail");
         assert!(err.contains("_row_id"), "got: {err}");
+    }
+
+    fn signed_aggregate_state_merge(action: Option<OutputColumn>) -> LogicalPlan {
+        let mut scan = delta_scan_with(action);
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                required_output_columns: None,
+            })),
+            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(LogicalPlan::Scan(scan)),
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId(10),
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+                required_output_columns: None,
+            })),
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["__agg_state_s".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(10),
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        })
+    }
+
+    #[test]
+    fn validation_accepts_signed_aggregate_inside_state_merge() {
+        let plan =
+            signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
+
+        validate(&plan).expect("signed aggregate inside AggregateStateMerge must validate");
+    }
+
+    #[test]
+    fn validation_traverses_state_merge_delta_input_for_missing_action_column() {
+        let plan = signed_aggregate_state_merge(None);
+
+        let err = validate(&plan).expect_err("missing action inside state merge must fail");
+        assert!(err.contains("missing action column"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_uses_state_merge_output_for_visible_output_check() {
+        let mut plan =
+            signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
+        let LogicalPlan::AggregateStateMerge(node) = &mut plan else {
+            unreachable!();
+        };
+        node.output_columns = vec![ImvActionColumn::output_column(ColumnId(200))];
+
+        let err = validate(&plan).expect_err("internal-only state merge output must fail");
+        assert!(err.contains("no user-visible output"), "got: {err}");
     }
 }

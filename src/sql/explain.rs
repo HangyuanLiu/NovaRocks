@@ -118,6 +118,13 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             {
                 out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
+            if matches!(
+                level,
+                ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+            ) && let Some(source) = logical_scan_source_label(&node.table.source)
+            {
+                out.push(format!("{pad}     source: {source}"));
+            }
             if !node.predicates.is_empty() {
                 let preds: Vec<String> = node.predicates.iter().map(format_expr).collect();
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
@@ -313,9 +320,36 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
             format_node(&node.input, level, indent + 1, out);
         }
+        LogicalPlan::AggregateStateMerge(node) => {
+            out.push(format!(
+                "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}",
+                pad,
+                node.group_key_names.join(","),
+                node.aggregate_state_names.join(","),
+                node.change_op_column
+            ));
+            format_node(&node.old_input, level, indent + 1, out);
+            format_node(&node.delta_input, level, indent + 1, out);
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
+    }
+}
+
+fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
+    match source {
+        ScanSource::IcebergVersionTable { snapshot_id, .. } => {
+            Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
+        }
+        ScanSource::IcebergMvTargetState(scan) => Some(format!(
+            "IcebergMvTargetState target={} keys=[{}] states=[{}] {}",
+            scan.fqn(),
+            scan.group_key_names.join(","),
+            scan.aggregate_state_names.join(","),
+            scan.constraint_summary()
+        )),
+        _ => None,
     }
 }
 
@@ -732,6 +766,20 @@ fn format_physical_node(
                 format_physical_node(child, level, indent + 1, out);
             }
         }
+        Operator::PhysicalAggregateStateMerge(op) => {
+            out.push(format!(
+                "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}{}{}",
+                pad,
+                op.group_key_names.join(","),
+                op.aggregate_state_names.join(","),
+                op.change_op_column,
+                costs_suffix,
+                stats_suffix
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
         // Logical operators should not appear in physical plan
         _ => {
             out.push(format!(
@@ -943,8 +991,11 @@ fn scan_supports_decode_hint(
         // hint path does not apply.
         ScanSource::IcebergMetadataTable { .. } => false,
         // IVM delta-scan does not produce stable column-dictionary stats.
-        // IMV pinned-version placeholders never produce parquet stats either.
-        ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. } => false,
+        // IMV pinned-version placeholders and target-state scans never
+        // produce parquet stats either.
+        ScanSource::IcebergDeltaTable { .. }
+        | ScanSource::IcebergVersionTable { .. }
+        | ScanSource::IcebergMvTargetState { .. } => false,
     }
 }
 
@@ -956,9 +1007,11 @@ fn scan_supports_min_max_stats(
         ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
         // Iceberg metadata tables do not produce parquet column statistics.
         ScanSource::IcebergMetadataTable { .. } => return false,
-        // IVM delta-scan and IMV pinned-version placeholders are synthetic;
-        // no parquet stats.
-        ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. } => {
+        // IVM delta-scan, IMV pinned-version placeholders, and target-state
+        // scans are synthetic; no parquet stats.
+        ScanSource::IcebergDeltaTable { .. }
+        | ScanSource::IcebergVersionTable { .. }
+        | ScanSource::IcebergMvTargetState { .. } => {
             return false;
         }
     }
@@ -1166,7 +1219,10 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use super::{ExplainLevel, explain_physical_plan, format_physical_node, format_stats_trailer};
+    use super::{
+        ExplainLevel, explain_physical_plan, explain_plan, format_physical_node,
+        format_stats_trailer,
+    };
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
@@ -1174,6 +1230,35 @@ mod tests {
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
+
+    fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
+        explain_plan(plan, ExplainLevel::Normal).join("\n")
+    }
+
+    #[test]
+    fn explain_prints_aggregate_state_merge_evidence() {
+        fn empty_values_for_test() -> LogicalPlan {
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })
+        }
+
+        let plan = LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(empty_values_for_test()),
+            delta_input: Box::new(empty_values_for_test()),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["c".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![],
+        });
+        let text = explain_logical_plan_for_test(&plan);
+        assert!(text.contains("AggregateStateMerge"), "{text}");
+        assert!(text.contains("keys=[region]"), "{text}");
+        assert!(text.contains("states=[c]"), "{text}");
+    }
 
     #[test]
     fn starrocks_scan_verbose_explain_reports_min_max_stats_for_supported_required_columns() {

@@ -81,6 +81,9 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         if self.fired.load(Ordering::SeqCst) {
             return false;
         }
+        if !matches!(plan, LogicalPlan::Project(_) | LogicalPlan::Filter(_)) {
+            return false;
+        }
         root_row_id_ref(plan).is_some() && !output_has_apply_key(plan)
     }
 
@@ -140,6 +143,7 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CTEProduce(_) => "CTEProduce",
         LogicalPlan::CTEConsume(_) => "CTEConsume",
         LogicalPlan::Decode(_) => "Decode",
+        LogicalPlan::AggregateStateMerge(_) => "AggregateStateMerge",
         LogicalPlan::ImvDelta(_) => "ImvDelta",
         LogicalPlan::ImvVersion(_) => "ImvVersion",
     }

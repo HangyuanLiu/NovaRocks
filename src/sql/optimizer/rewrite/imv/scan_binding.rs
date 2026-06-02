@@ -8,6 +8,7 @@ use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, ImvVersionNode};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -65,7 +66,14 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                 let LogicalPlan::Scan(scan) = *node.input else {
                     return Ok(RewriteResult::Unchanged);
                 };
-                let bound = bind_delta_scan(scan, &ext.mv_ctx)?;
+                let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
+                if let Some(column_id) = node.action_column
+                    && !bound.columns.iter().any(ImvActionColumn::matches)
+                {
+                    bound
+                        .columns
+                        .push(ImvActionColumn::output_column(column_id));
+                }
                 Ok(RewriteResult::Changed(LogicalPlan::Scan(bound)))
             }
             LogicalPlan::ImvVersion(node) => {
@@ -106,6 +114,11 @@ fn bind_version_scan(
         ImvVersionRole::To => window.to_snapshot_id,
     };
     scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id };
+    scan.columns
+        .retain(|column| !ImvActionColumn::matches(column));
+    scan.table
+        .iceberg_row_lineage_metadata_columns
+        .retain(|column| !column.name.eq_ignore_ascii_case(ImvActionColumn::NAME));
     Ok(scan)
 }
 
@@ -115,7 +128,7 @@ fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableIn
         | ScanSource::IcebergMetadataTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => Ok(table),
-        ScanSource::StarRocks { .. } => {
+        ScanSource::StarRocks { .. } | ScanSource::IcebergMvTargetState { .. } => {
             Err("BindIcebergScan only supports Iceberg scan sources".to_string())
         }
     }
@@ -189,6 +202,14 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+    use crate::sql::optimizer::rewrite::imv::action_propagation::InjectActionColumnRule;
+    use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
 
     fn iceberg_table_info(uuid: Option<&str>) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -278,6 +299,39 @@ mod tests {
     }
 
     #[test]
+    fn bind_delta_marker_preserves_existing_action_column_id_for_injection() {
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            mv_ctx: dummy_rewrite_context(),
+            annotation: ImvPlanAnnotation::default(),
+            next_column_id: Arc::new(AtomicU32::new(1000)),
+        });
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(LogicalPlan::Scan(iceberg_scan(Some("uuid-b")))),
+            is_root: false,
+            action_column: Some(ColumnId::new_for_test(77)),
+        });
+        let bind = BindIcebergScanRule;
+        let RewriteResult::Changed(LogicalPlan::Scan(bound)) =
+            bind.apply(plan, &mut ctx).expect("bind must succeed")
+        else {
+            panic!("expected changed scan");
+        };
+        let action = bound
+            .columns
+            .iter()
+            .find(|column| ImvActionColumn::matches(column))
+            .expect("bound delta scan must carry marker action column");
+        assert_eq!(action.column_id, ColumnId::new_for_test(77));
+
+        let inject = InjectActionColumnRule;
+        assert!(
+            !inject.matches(&LogicalPlan::Scan(bound), &ctx),
+            "inject action must skip a scan that already carries the marker action id"
+        );
+    }
+
+    #[test]
     fn bind_version_scan_uses_from_snapshot() {
         let ctx = dummy_rewrite_context();
         let bound = bind_version_scan(iceberg_scan(Some("uuid-b")), &ctx, ImvVersionRole::From)
@@ -301,5 +355,38 @@ mod tests {
             }
             other => panic!("expected IcebergVersionTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bind_version_scan_strips_refresh_action_column() {
+        let ctx = dummy_rewrite_context();
+        let mut scan = iceberg_scan(Some("uuid-b"));
+        scan.columns
+            .push(ImvActionColumn::output_column(ColumnId::new_for_test(99)));
+        scan.table
+            .iceberg_row_lineage_metadata_columns
+            .push(ColumnDef {
+                name: ImvActionColumn::NAME.to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            });
+
+        let bound =
+            bind_version_scan(scan, &ctx, ImvVersionRole::To).expect("version scan should bind");
+
+        assert!(
+            !bound.columns.iter().any(ImvActionColumn::matches),
+            "version scan must not project refresh action column"
+        );
+        assert!(
+            !bound
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)),
+            "version scan table metadata must not advertise refresh action column"
+        );
     }
 }
