@@ -8,7 +8,10 @@ use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, plan_contains_im
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, UnionNode};
+use crate::sql::planner::plan::{LogicalPlan, ProjectNode, UnionNode};
+use crate::{
+    engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN, sql::analysis::ProjectItem,
+};
 
 pub(crate) struct RewriteUnionAggregateDeltaRule;
 
@@ -109,6 +112,219 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
     }
 }
 
+pub(crate) struct RewriteTopLevelUnionDeltaRule;
+
+impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
+    fn name(&self) -> &'static str {
+        "RewriteTopLevelUnionDelta"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+        matches!(
+            plan,
+            LogicalPlan::ImvDelta(delta)
+                if delta.is_root
+                    && matches!(
+                        delta.input.as_ref(),
+                        LogicalPlan::Union(union)
+                            if union.all && !plan_contains_imv_marker(delta.input.as_ref())
+                    )
+        )
+    }
+
+    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let LogicalPlan::ImvDelta(delta) = plan else {
+            return Ok(RewriteResult::Unchanged);
+        };
+        if !delta.is_root {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let LogicalPlan::Union(union) = *delta.input else {
+            return Ok(RewriteResult::Unchanged);
+        };
+        if plan_contains_imv_marker(&LogicalPlan::Union(union.clone())) {
+            return Ok(RewriteResult::Unchanged);
+        }
+        if !union.all {
+            return Err(
+                "Iceberg IMV top-level union delta rewrite supports UNION ALL only".to_string(),
+            );
+        }
+
+        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+            "RewriteTopLevelUnionDelta requires ImvExtension in RewriteContext".to_string()
+        })?;
+        let action_column = delta
+            .action_column
+            .unwrap_or_else(|| ext.allocate_column_id());
+        let branch_id_column = ext.allocate_column_id();
+
+        let UnionNode {
+            inputs,
+            all,
+            output_columns,
+            required_output_columns,
+        } = union;
+        let action_output = ImvActionColumn::output_column(action_column);
+        let branch_output = branch_id_output_column(branch_id_column);
+
+        let mut rewritten_inputs = Vec::with_capacity(inputs.len());
+        for (idx, branch) in inputs.into_iter().enumerate() {
+            ensure_top_level_union_branch_supported(&branch)?;
+            let branch_output_columns = plan_output_columns(&branch)?;
+            if branch_output_columns.len() != output_columns.len() {
+                return Err(format!(
+                    "Iceberg IMV top-level UNION ALL delta rewrite branch {idx} output column count {} does not match union output column count {}",
+                    branch_output_columns.len(),
+                    output_columns.len()
+                ));
+            }
+            let marked = mark_delta_scan(branch, action_column)?;
+            rewritten_inputs.push(normalize_top_level_union_branch_output(
+                marked,
+                &output_columns,
+                &branch_output_columns,
+                &action_output,
+                &branch_output,
+                idx,
+            ));
+        }
+
+        let mut union_output_columns = output_columns;
+        union_output_columns.push(action_output);
+        union_output_columns.push(branch_output);
+
+        Ok(RewriteResult::Changed(LogicalPlan::ImvDelta(
+            ImvDeltaNode {
+                input: Box::new(LogicalPlan::Union(UnionNode {
+                    inputs: rewritten_inputs,
+                    all,
+                    output_columns: union_output_columns,
+                    required_output_columns,
+                })),
+                is_root: true,
+                action_column: Some(action_column),
+            },
+        )))
+    }
+}
+
+fn branch_id_output_column(
+    column_id: crate::sql::column_id::ColumnId,
+) -> crate::sql::analysis::OutputColumn {
+    crate::sql::analysis::OutputColumn {
+        column_id,
+        name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+        data_type: arrow::datatypes::DataType::Int32,
+        nullable: false,
+        is_internal: true,
+    }
+}
+
+fn normalize_top_level_union_branch_output(
+    input: LogicalPlan,
+    union_visible_output: &[crate::sql::analysis::OutputColumn],
+    branch_visible_output: &[crate::sql::analysis::OutputColumn],
+    action_output: &crate::sql::analysis::OutputColumn,
+    branch_output: &crate::sql::analysis::OutputColumn,
+    branch_idx: usize,
+) -> LogicalPlan {
+    let mut items = union_visible_output
+        .iter()
+        .zip(branch_visible_output)
+        .map(|(union_column, branch_column)| ProjectItem {
+            expr: crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::ColumnRef {
+                    column_id: branch_column.column_id,
+                    qualifier: None,
+                    column: branch_column.name.clone(),
+                },
+                data_type: branch_column.data_type.clone(),
+                nullable: branch_column.nullable,
+            },
+            output_name: union_column.name.clone(),
+            output_column_id: union_column.column_id,
+        })
+        .collect::<Vec<_>>();
+    items.push(ProjectItem {
+        expr: crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: action_output.column_id,
+                qualifier: None,
+                column: action_output.name.clone(),
+            },
+            data_type: action_output.data_type.clone(),
+            nullable: action_output.nullable,
+        },
+        output_name: action_output.name.clone(),
+        output_column_id: action_output.column_id,
+    });
+    items.push(ProjectItem {
+        expr: crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(
+                branch_idx as i64,
+            )),
+            data_type: branch_output.data_type.clone(),
+            nullable: false,
+        },
+        output_name: branch_output.name.clone(),
+        output_column_id: branch_output.column_id,
+    });
+
+    LogicalPlan::Project(ProjectNode {
+        input: Box::new(input),
+        items,
+        required_output_columns: None,
+    })
+}
+
+fn ensure_top_level_union_branch_supported(plan: &LogicalPlan) -> Result<(), String> {
+    match plan {
+        LogicalPlan::Scan(_) => Ok(()),
+        LogicalPlan::Project(project) => ensure_top_level_union_branch_supported(&project.input),
+        LogicalPlan::Filter(filter) => ensure_top_level_union_branch_supported(&filter.input),
+        other => Err(format!(
+            "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got {}",
+            plan_kind(other)
+        )),
+    }
+}
+
+fn plan_kind(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan(_) => "Scan",
+        LogicalPlan::Filter(_) => "Filter",
+        LogicalPlan::Project(_) => "Project",
+        LogicalPlan::Aggregate(_) => "Aggregate",
+        LogicalPlan::Join(_) => "Join",
+        LogicalPlan::Sort(_) => "Sort",
+        LogicalPlan::Limit(_) => "Limit",
+        LogicalPlan::Union(_) => "Union",
+        LogicalPlan::Intersect(_) => "Intersect",
+        LogicalPlan::Except(_) => "Except",
+        LogicalPlan::Values(_) => "Values",
+        LogicalPlan::GenerateSeries(_) => "GenerateSeries",
+        LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Window(_) => "Window",
+        LogicalPlan::Repeat(_) => "Repeat",
+        LogicalPlan::CTEAnchor(_) => "CTEAnchor",
+        LogicalPlan::CTEProduce(_) => "CTEProduce",
+        LogicalPlan::CTEConsume(_) => "CTEConsume",
+        LogicalPlan::Decode(_) => "Decode",
+        LogicalPlan::AggregateStateMerge(_) => "AggregateStateMerge",
+        LogicalPlan::ImvDelta(_) => "ImvDelta",
+        LogicalPlan::ImvVersion(_) => "ImvVersion",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -119,7 +335,9 @@ mod tests {
 
     use super::*;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
-    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -128,7 +346,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
-    use crate::sql::planner::plan::{AggregateNode, ScanNode, UnionNode};
+    use crate::sql::planner::plan::{AggregateNode, FilterNode, ProjectNode, ScanNode, UnionNode};
 
     #[test]
     fn matches_root_delta_over_aggregate_over_source_union() {
@@ -199,6 +417,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rewrite_top_level_union_delta_adds_branch_and_action_columns() {
+        let rule = RewriteTopLevelUnionDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = delta(project_filter_union(true));
+
+        assert!(rule.matches(&plan, &ctx));
+        let RewriteResult::Changed(LogicalPlan::ImvDelta(root_delta)) = rule
+            .apply(plan, &mut ctx)
+            .expect("top-level UNION ALL delta must rewrite")
+        else {
+            panic!("expected Changed(ImvDelta)");
+        };
+        assert!(root_delta.is_root);
+        let action_column = root_delta
+            .action_column
+            .expect("root delta must carry shared action column");
+        assert_eq!(action_column, ColumnId(100));
+
+        let LogicalPlan::Union(union) = root_delta.input.as_ref() else {
+            panic!("expected root ImvDelta(Union)");
+        };
+        assert!(union.all);
+        assert_eq!(union.inputs.len(), 2);
+        assert_eq!(
+            union
+                .output_columns
+                .iter()
+                .map(|column| (
+                    column.column_id,
+                    column.name.as_str(),
+                    column.data_type.clone(),
+                    column.nullable,
+                    column.is_internal
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (ColumnId(1), "k", DataType::Int64, false, false),
+                (ColumnId(2), "v", DataType::Int64, false, false),
+                (action_column, "__change_op", DataType::Int8, false, true),
+                (ColumnId(101), "__branch_id__", DataType::Int32, false, true),
+            ]
+        );
+        assert_eq!(union.required_output_columns, required_output_columns());
+
+        assert_top_level_union_branch(&union.inputs[0], action_column, ColumnId(101), 0);
+        assert_top_level_union_branch(&union.inputs[1], action_column, ColumnId(101), 1);
+    }
+
+    #[test]
+    fn rewrite_top_level_union_delta_rejects_unsupported_branch_shape() {
+        let rule = RewriteTopLevelUnionDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = delta(LogicalPlan::Union(UnionNode {
+            inputs: vec![aggregate_over(scan("t1", 1)), project_over_filter("t2", 10)],
+            all: true,
+            output_columns: vec![output_column(1, "k"), output_column(2, "v")],
+            required_output_columns: required_output_columns(),
+        }));
+
+        assert!(rule.matches(&plan, &ctx));
+        let err = rule
+            .apply(plan, &mut ctx)
+            .expect_err("aggregate branch must be rejected");
+        assert_eq!(
+            err,
+            "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Aggregate"
+        );
+    }
+
+    #[test]
+    fn rewrite_top_level_union_delta_does_not_silently_rewrite_union_distinct() {
+        let rule = RewriteTopLevelUnionDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = delta(project_filter_union(false));
+
+        assert!(!rule.matches(&plan, &ctx));
+        let err = rule
+            .apply(plan, &mut ctx)
+            .expect_err("UNION DISTINCT must not be rewritten as UNION ALL");
+        assert_eq!(
+            err,
+            "Iceberg IMV top-level union delta rewrite supports UNION ALL only"
+        );
+    }
+
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_extension::<ImvExtension>(ImvExtension {
@@ -234,6 +538,55 @@ mod tests {
             all,
             output_columns: vec![output_column(1, "k"), output_column(2, "v")],
             required_output_columns: required_output_columns(),
+        })
+    }
+
+    fn project_filter_union(all: bool) -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![project_over_filter("t1", 1), project_over_filter("t2", 10)],
+            all,
+            output_columns: vec![output_column(1, "k"), output_column(2, "v")],
+            required_output_columns: required_output_columns(),
+        })
+    }
+
+    fn project_over_filter(name: &str, first_id: u32) -> LogicalPlan {
+        let scan = scan(name, first_id);
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(filter_over(scan, first_id, "k")),
+            items: vec![
+                ProjectItem {
+                    expr: col_expr(first_id, "k"),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId(first_id),
+                },
+                ProjectItem {
+                    expr: col_expr(first_id + 1, "v"),
+                    output_name: "v".to_string(),
+                    output_column_id: ColumnId(first_id + 1),
+                },
+            ],
+            required_output_columns: None,
+        })
+    }
+
+    fn filter_over(input: LogicalPlan, column_id: u32, column: &str) -> LogicalPlan {
+        LogicalPlan::Filter(FilterNode {
+            input: Box::new(input),
+            predicate: TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_expr(column_id, column)),
+                    op: BinOp::Ge,
+                    right: Box::new(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+            required_output_columns: None,
         })
     }
 
@@ -366,5 +719,74 @@ mod tests {
         assert!(!delta.is_root);
         assert_eq!(delta.action_column, Some(action_column));
         assert!(matches!(delta.input.as_ref(), LogicalPlan::Scan(_)));
+    }
+
+    fn assert_top_level_union_branch(
+        plan: &LogicalPlan,
+        action_column: ColumnId,
+        branch_column: ColumnId,
+        expected_branch_id: i64,
+    ) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("branch {expected_branch_id} must be normalized through Project");
+        };
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1), ColumnId(2), action_column, branch_column]
+        );
+        assert_visible_branch_expr(&project.items[0], expected_branch_id, 0);
+        assert_visible_branch_expr(&project.items[1], expected_branch_id, 1);
+        let action = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
+            .expect("branch Project must expose shared action column");
+        assert_eq!(action.output_column_id, action_column);
+        assert!(matches!(
+            &action.expr.kind,
+            ExprKind::ColumnRef { column_id, column, .. }
+                if *column_id == action_column && column == ImvActionColumn::NAME
+        ));
+
+        let branch = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
+            .expect("branch Project must expose branch id column");
+        assert_eq!(branch.output_column_id, branch_column);
+        assert_eq!(branch.expr.data_type, DataType::Int32);
+        assert!(!branch.expr.nullable);
+        assert!(matches!(
+            &branch.expr.kind,
+            ExprKind::Literal(LiteralValue::Int(value)) if *value == expected_branch_id
+        ));
+
+        assert!(
+            contains_non_root_delta(project.input.as_ref(), action_column),
+            "branch {expected_branch_id} must place a non-root delta marker at the leaf scan"
+        );
+    }
+
+    fn assert_visible_branch_expr(item: &ProjectItem, expected_branch_id: i64, visible_idx: u32) {
+        let expected_column_id = ColumnId(1 + (expected_branch_id as u32 * 9) + visible_idx);
+        assert!(matches!(
+            &item.expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if *column_id == expected_column_id
+        ));
+    }
+
+    fn contains_non_root_delta(plan: &LogicalPlan, action_column: ColumnId) -> bool {
+        match plan {
+            LogicalPlan::ImvDelta(delta) => {
+                !delta.is_root && delta.action_column == Some(action_column)
+            }
+            LogicalPlan::Project(project) => contains_non_root_delta(&project.input, action_column),
+            LogicalPlan::Filter(filter) => contains_non_root_delta(&filter.input, action_column),
+            _ => false,
+        }
     }
 }

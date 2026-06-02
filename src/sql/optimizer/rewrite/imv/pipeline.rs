@@ -18,7 +18,9 @@ use crate::sql::optimizer::rewrite::imv::marker::{
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::InjectRowIdRule;
 use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
-use crate::sql::optimizer::rewrite::imv::union_delta::RewriteUnionAggregateDeltaRule;
+use crate::sql::optimizer::rewrite::imv::union_delta::{
+    RewriteTopLevelUnionDeltaRule, RewriteUnionAggregateDeltaRule,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
@@ -43,7 +45,10 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
         RewriteStage::new(
             "imv-union-delta",
             RewritePhase::StructuralRewrite,
-            vec![Box::new(RewriteUnionAggregateDeltaRule) as Box<dyn LogicalRewriteRule>],
+            vec![
+                Box::new(RewriteUnionAggregateDeltaRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(RewriteTopLevelUnionDeltaRule) as Box<dyn LogicalRewriteRule>,
+            ],
         ),
         RewriteStage::new(
             "imv-aggregate-state",
