@@ -2,7 +2,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -575,26 +575,29 @@ fn validate_aggregate_fan_in_base_refs(
     shape: &AggregateMvShape,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
-    if shape.fan_in_bases.len() != base_refs.len() {
-        return Err(format!(
-            "aggregate-over-UNION-ALL MV shape references {} base tables but analyzer resolved {}",
-            shape.fan_in_bases.len(),
-            base_refs.len()
-        ));
-    }
-    for name in shape
-        .fan_in_bases
-        .iter()
-        .map(|base| base.to_string().to_ascii_lowercase())
-    {
-        if !base_refs
-            .iter()
-            .any(|base| base.fqn().eq_ignore_ascii_case(&name))
-        {
+    let mut fan_in_refs = BTreeSet::new();
+    for base in &shape.fan_in_bases {
+        let fqn = base.to_string().to_ascii_lowercase();
+        if !fan_in_refs.insert(fqn.clone()) {
             return Err(format!(
-                "aggregate-over-UNION-ALL MV shape references base {name} but analyzer resolved {base_refs:?}"
+                "aggregate-over-UNION-ALL MV duplicate fan-in base {fqn} is not supported in this build"
             ));
         }
+    }
+
+    let mut resolved_refs = BTreeSet::new();
+    for base in base_refs {
+        let fqn = base.fqn().to_ascii_lowercase();
+        if !resolved_refs.insert(fqn.clone()) {
+            return Err(format!(
+                "aggregate-over-UNION-ALL MV duplicate resolved base ref {fqn} is not supported in this build"
+            ));
+        }
+    }
+    if fan_in_refs != resolved_refs {
+        return Err(format!(
+            "aggregate-over-UNION-ALL MV fan-in bases must exactly match resolved base refs: fan_in={fan_in_refs:?}, resolved={resolved_refs:?}"
+        ));
     }
     Ok(())
 }
@@ -926,6 +929,9 @@ fn build_iceberg_mv_schema_contract(
                     base,
                     bases: base_contracts,
                     output: crate::meta::repository::mv_contract::OutputContract {
+                        // Precise branch-aware output lineage for aggregate fan-in is not
+                        // available yet. Keep full base schemas and mark outputs as mixed so
+                        // refresh validates base schema compatibility conservatively.
                         columns: analysis
                             .output_columns
                             .iter()
@@ -1972,6 +1978,14 @@ fn refresh_iceberg_aggregate_mv(
 ) -> Result<StatementResult, String> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     match shape {
+        IncrementalMvShape::Aggregate(aggregate_shape)
+            if !aggregate_shape.fan_in_bases.is_empty() =>
+        {
+            Err(
+                "incremental aggregate-over-UNION-ALL refresh execution is not yet supported in this build"
+                    .to_string(),
+            )
+        }
         IncrementalMvShape::Aggregate(_) => refresh_single_aggregate_iceberg_mv(
             state,
             target,
@@ -8629,6 +8643,14 @@ mod tests {
         stmt
     }
 
+    fn iceberg_ref(catalog: &str, namespace: &str, table: &str) -> IcebergTableRef {
+        IcebergTableRef {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+        }
+    }
+
     fn parse_drop_mv(sql: &str) -> DropMaterializedViewStmt {
         let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
         let crate::sql::parser::ast::Statement::DropMaterializedView(stmt) = statements.remove(0)
@@ -9778,6 +9800,61 @@ mod tests {
     }
 
     #[test]
+    fn validate_aggregate_fan_in_base_refs_rejects_mismatch() {
+        let query = parse_select_query(
+            "SELECT region, sum(amount) AS s
+             FROM (
+                 SELECT region, amount FROM ice.sales.fact_east
+                 UNION ALL
+                 SELECT region, amount FROM ice.sales.fact_west
+             ) u
+             GROUP BY region",
+        );
+        let shape = match classify_incremental_mv_query(&query).expect("shape") {
+            IncrementalMvShape::Aggregate(shape) => shape,
+            other => panic!("expected aggregate shape, got {other:?}"),
+        };
+        let base_refs = vec![
+            iceberg_ref("ice", "sales", "fact_east"),
+            iceberg_ref("ice", "sales", "fact_other"),
+        ];
+
+        let err = validate_aggregate_fan_in_base_refs(&shape, &base_refs)
+            .expect_err("fan-in and resolved refs must match exactly");
+
+        assert!(err.contains("exactly match"), "err={err}");
+        assert!(err.contains("fact_west"), "err={err}");
+        assert!(err.contains("fact_other"), "err={err}");
+    }
+
+    #[test]
+    fn validate_aggregate_fan_in_base_refs_rejects_duplicate_fan_in_base() {
+        let query = parse_select_query(
+            "SELECT region, sum(amount) AS s
+             FROM (
+                 SELECT region, amount FROM ice.sales.fact
+                 UNION ALL
+                 SELECT region, amount FROM ice.sales.fact
+             ) u
+             GROUP BY region",
+        );
+        let shape = match classify_incremental_mv_query(&query).expect("shape") {
+            IncrementalMvShape::Aggregate(shape) => shape,
+            other => panic!("expected aggregate shape, got {other:?}"),
+        };
+        let base_refs = vec![
+            iceberg_ref("ice", "sales", "fact"),
+            iceberg_ref("ice", "sales", "fact"),
+        ];
+
+        let err = validate_aggregate_fan_in_base_refs(&shape, &base_refs)
+            .expect_err("duplicate fan-in bases should be rejected");
+
+        assert!(err.contains("duplicate fan-in base"), "err={err}");
+        assert!(err.contains("ice.sales.fact"), "err={err}");
+    }
+
+    #[test]
     fn create_iceberg_union_all_projection_mv_rejects_branch_id_output_alias() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
@@ -9940,6 +10017,40 @@ mod tests {
         assert_eq!(
             plan.snapshot_pins.get("ice.sales.fact_west").copied(),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn refresh_iceberg_mv_rejects_aggregate_over_union_all_execution_explicitly() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_fact_region
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, sum(amount) AS s
+                FROM (
+                    SELECT region, amount FROM ice.sales.fact_east
+                    UNION ALL
+                    SELECT region, amount FROM ice.sales.fact_west
+                ) u
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate-over-UNION-ALL iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("aggregate-over-UNION-ALL execution should fail explicitly");
+
+        assert!(
+            err.contains("aggregate-over-UNION-ALL refresh execution is not yet supported"),
+            "err={err}"
+        );
+        assert!(
+            !err.contains("exactly one base table reference"),
+            "err={err}"
         );
     }
 
