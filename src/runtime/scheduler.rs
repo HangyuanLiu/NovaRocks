@@ -228,6 +228,9 @@ impl FragmentScheduler {
 
             // Step 7 (Scheme C): partition scan ranges round-robin.
             for (&node_id, all_ranges) in &fr.exec_params.per_node_scan_ranges {
+                for inst in instances.iter_mut() {
+                    inst.scan_ranges.entry(node_id).or_default();
+                }
                 for (i, range) in all_ranges.iter().enumerate() {
                     instances[i % count]
                         .scan_ranges
@@ -938,6 +941,31 @@ mod tests {
         assert_eq!(counts, vec![3, 2, 2], "round-robin 7 across 3: [3,2,2]");
         let total: usize = counts.iter().sum();
         assert_eq!(total, 7, "no ranges lost");
+    }
+
+    #[test]
+    fn scan_preserves_empty_range_entry_for_each_instance() {
+        let backends = two_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![fake_fragment(0, Some(7), 0), fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(
+            0,
+            1,
+            partitions::TPartitionType::UNPARTITIONED,
+            10,
+        )];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 0))
+            .expect("assign");
+        let f0 = &plan.by_fragment[&0];
+        assert_eq!(f0.len(), 2);
+        for inst in f0 {
+            let ranges = inst
+                .scan_ranges
+                .get(&7)
+                .expect("empty scan range entry is preserved");
+            assert!(ranges.is_empty());
+        }
     }
 
     #[test]

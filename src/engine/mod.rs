@@ -5645,7 +5645,7 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn iceberg_refresh_load_failure_removes_stale_local_catalog_entry() {
+    fn iceberg_refresh_load_failure_does_not_use_stale_external_metadata() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
@@ -5653,16 +5653,10 @@ enable_path_style_access = true
             .expect("insert iceberg row");
         session
             .query("select id from ice.db1.t")
-            .expect("register iceberg table");
+            .expect("query iceberg table");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_ok(),
-            "local table should be registered before external drop"
+            !engine.has_local_table("db1", "t"),
+            "ordinary iceberg SELECT should not register a local catalog table"
         );
 
         let entry = {
@@ -5675,21 +5669,18 @@ enable_path_style_access = true
         let err = session
             .query("select id from ice.db1.t")
             .expect_err("dropped backing table should not use stale local table");
-        assert!(err.contains("unknown iceberg table"), "err={err}");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_err(),
-            "stale local table should be removed after failed refresh"
+            err.contains("unknown iceberg table") || err.contains("unknown table"),
+            "err={err}"
+        );
+        assert!(
+            !engine.has_local_table("db1", "t"),
+            "failed refresh should not leave a local catalog table"
         );
     }
 
     #[test]
-    fn drop_iceberg_table_removes_stale_local_catalog_entry() {
+    fn drop_iceberg_table_invalidates_external_metadata_without_local_registration() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
@@ -5697,16 +5688,10 @@ enable_path_style_access = true
             .expect("insert iceberg row");
         session
             .query("select id from ice.db1.t")
-            .expect("register iceberg table");
+            .expect("query iceberg table");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_ok(),
-            "local table should be registered before drop"
+            !engine.has_local_table("db1", "t"),
+            "ordinary iceberg SELECT should not register a local catalog table"
         );
 
         let drop = session
@@ -5714,14 +5699,15 @@ enable_path_style_access = true
             .expect("drop iceberg table");
         assert!(matches!(drop, StatementResult::Ok));
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_err(),
-            "drop table should remove stale local table"
+            !engine.has_local_table("db1", "t"),
+            "drop table should keep the local catalog clear"
+        );
+        let err = session
+            .query("select id from ice.db1.t")
+            .expect_err("dropped iceberg table should not be queryable");
+        assert!(
+            err.contains("unknown iceberg table") || err.contains("unknown table"),
+            "err={err}"
         );
     }
 
@@ -7756,10 +7742,10 @@ enable_path_style_access = true
             .expect("create namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.t3 (id bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.t3 (id bigint) tblproperties("format-version"="3","write.row-lineage"="false")"#,
                 "default",
             )
-            .expect("create V3 iceberg table without row-lineage");
+            .expect("create V3 iceberg table with row-lineage disabled");
 
         let err = session
             .execute_in_database("select _row_id from ice.ns.t3", "default")

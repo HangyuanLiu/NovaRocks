@@ -484,7 +484,14 @@ SELECT k1, k2, v1, v2,
        ROW_NUMBER() OVER (PARTITION BY k1 ORDER BY k2) as rn,
        COUNT(*) OVER (PARTITION BY k1) as cnt_per_k1
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE
+           WHEN v1 IS NOT NULL AND v2 IS NOT NULL THEN 'BOTH'
+           WHEN v1 IS NOT NULL THEN 'T1_ONLY'
+           WHEN v2 IS NOT NULL THEN 'T2_ONLY'
+           ELSE 'NEITHER'
+         END,
+         COALESCE(v1, v2);
 
 -- query 53
 -- Four-table FULL OUTER USING + BETWEEN + complex OR filter

@@ -8099,6 +8099,8 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+            .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -8134,6 +8136,8 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+            .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -8172,6 +8176,8 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
+        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+            .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
