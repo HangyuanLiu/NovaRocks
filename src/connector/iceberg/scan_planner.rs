@@ -133,6 +133,9 @@ impl IcebergConnectorScanPlanner {
         table_info: IcebergTableInfo,
         column_names: Vec<String>,
     ) -> TableHandle {
+        // CurrentSnapshot is scan intent, not a snapshot pin. Split planning
+        // reloads the table's current snapshot through the registry; schema
+        // and metadata-evolution validation belongs to catalog/schema checks.
         TableHandle::new(
             CONNECTOR_ID,
             IcebergTableHandle {
@@ -548,12 +551,14 @@ pub(crate) fn build_hdfs_scan_range_params(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
 
     use crate::connector::scan_planning::{
         ScanHandle, Split, ThriftScanContext, validate_split_connectors,
     };
     use crate::plan_nodes;
     use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+    use crate::sql::{Literal, SqlType, TableColumnDef};
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -617,6 +622,76 @@ mod tests {
         }
     }
 
+    fn test_data_file_with_stats(
+        path: &str,
+    ) -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            path: path.to_string(),
+            size: 1,
+            record_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            partition_values: None,
+            manifest_path: None,
+            partition_field_values: vec![],
+            first_row_id: None,
+            data_sequence_number: None,
+            delete_files: vec![],
+        }
+    }
+
+    fn registry_with_empty_table(
+        test_name: &str,
+    ) -> (
+        Arc<RwLock<IcebergCatalogRegistry>>,
+        crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
+        tempfile::TempDir,
+    ) {
+        let warehouse = tempfile::Builder::new()
+            .prefix(&format!("novarocks_scan_planner_test_{test_name}_"))
+            .tempdir()
+            .expect("warehouse tempdir");
+        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let registry = Arc::new(RwLock::new(IcebergCatalogRegistry::default()));
+        {
+            let mut guard = registry.write().expect("iceberg catalog write lock");
+            guard
+                .create_catalog(
+                    "ice",
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                        ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+                    ],
+                )
+                .expect("create catalog");
+        }
+        let entry = {
+            let guard = registry.read().expect("iceberg catalog read lock");
+            guard.get("ice").expect("catalog entry")
+        };
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "db")
+            .expect("create namespace");
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            "db",
+            "t",
+            &[TableColumnDef {
+                name: "id".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create table");
+        (registry, entry, warehouse)
+    }
+
     #[test]
     fn current_snapshot_table_handle_does_not_embed_files() {
         let table_info = test_iceberg_table_info();
@@ -635,6 +710,122 @@ mod tests {
             inner.split_source,
             IcebergSplitSource::CurrentSnapshot
         ));
+    }
+
+    #[test]
+    fn current_snapshot_plan_requires_registry() {
+        let planner = IcebergConnectorScanPlanner::new();
+        let handle = IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            "ice",
+            "db",
+            "t",
+            test_iceberg_table_info(),
+            vec!["id".to_string()],
+        );
+        let scan = planner
+            .begin_scan(handle, Default::default())
+            .expect("begin scan");
+
+        let err = planner
+            .plan_splits(&scan, Default::default())
+            .expect_err("registry required");
+
+        assert!(
+            err.contains("Iceberg current-snapshot scan ice.db.t requires a catalog registry"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn current_snapshot_empty_table_returns_empty_splits() {
+        let (registry, _entry, _warehouse) = registry_with_empty_table("empty_current_snapshot");
+        let planner = IcebergConnectorScanPlanner::with_catalog_registry(registry);
+        let handle = IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            "ice",
+            "db",
+            "t",
+            test_iceberg_table_info(),
+            vec!["id".to_string()],
+        );
+        let scan = planner
+            .begin_scan(handle, Default::default())
+            .expect("begin scan");
+
+        let splits = planner
+            .plan_splits(&scan, Default::default())
+            .expect("plan splits");
+
+        assert!(splits.is_empty());
+    }
+
+    #[test]
+    fn current_snapshot_plans_loaded_snapshot_files_and_uses_cache() {
+        let (registry, entry, _warehouse) = registry_with_empty_table("current_snapshot_cache");
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &entry,
+            "db",
+            "t",
+            &[vec![Literal::Int(1)]],
+        )
+        .expect("insert row");
+        let loaded = crate::connector::iceberg::catalog::registry::load_table(&entry, "db", "t")
+            .expect("load table");
+        let snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("current snapshot id");
+
+        let planner = IcebergConnectorScanPlanner::with_catalog_registry(registry);
+        let handle = IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+            "ice",
+            "db",
+            "t",
+            IcebergTableInfo {
+                current_snapshot_id: Some(snapshot_id + 1),
+                ..test_iceberg_table_info()
+            },
+            vec!["id".to_string()],
+        );
+        let scan = planner
+            .begin_scan(handle, Default::default())
+            .expect("begin scan");
+
+        let splits = planner
+            .plan_splits(&scan, Default::default())
+            .expect("plan current snapshot splits");
+
+        assert_eq!(splits.len(), 1);
+        let split = iceberg_split(&splits[0]).expect("iceberg split");
+        assert_eq!(split.data_file.row_count, Some(1));
+        assert!(split.data_file.path.ends_with(".parquet"));
+        assert!(
+            entry
+                .cached_data_files("db", "t", Some(snapshot_id))
+                .expect("read cached files")
+                .is_some()
+        );
+
+        entry
+            .cache_data_files(
+                "db",
+                "t",
+                Some(snapshot_id),
+                vec![test_data_file_with_stats("file:///cached-snapshot.parquet")],
+            )
+            .expect("replace cached files");
+        let cached_splits = planner
+            .plan_splits(&scan, Default::default())
+            .expect("plan cached current snapshot splits");
+
+        assert_eq!(cached_splits.len(), 1);
+        assert_eq!(
+            iceberg_split(&cached_splits[0])
+                .expect("cached split")
+                .data_file
+                .path,
+            "file:///cached-snapshot.parquet"
+        );
     }
 
     #[test]
