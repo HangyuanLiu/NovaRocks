@@ -1765,6 +1765,40 @@ mod tests {
         state
     }
 
+    #[test]
+    fn catalog_mgr_provider_analyzes_iceberg_query_without_global_registration() {
+        let state = state_with_per_table_binding_source();
+        {
+            let mut mgr = state.catalog_mgr.write().expect("catalog mgr");
+            let connectors = state.connectors.read().expect("connectors");
+            mgr.register(std::sync::Arc::new(
+                crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(
+                    "ice",
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ),
+            ));
+        }
+        let local = state.catalog.read().expect("catalog").clone();
+        let connectors = state.connectors.read().expect("connectors").clone();
+        let mgr = state.catalog_mgr.read().expect("catalog mgr").clone();
+        let provider = crate::engine::catalog_mgr::provider::CatalogMgrProvider::new(
+            Some("ice"),
+            &local,
+            &mgr,
+            &connectors,
+            crate::sql::catalog::TableLookupMode::SchemaOnly,
+        );
+        let query = parse_query_for_table_names("SELECT * FROM parted");
+
+        let _ = crate::sql::analyzer::analyze(&query, &provider, "db").expect("analyze");
+
+        assert!(
+            local.get("db", "parted").is_err(),
+            "Iceberg analysis must not require global InMemoryCatalog registration"
+        );
+    }
+
     fn registered_binding(
         state: &crate::engine::StandaloneState,
         namespace: &str,

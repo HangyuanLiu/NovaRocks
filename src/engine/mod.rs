@@ -84,9 +84,6 @@ use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
-use crate::sql::parser::query_refs::{
-    extract_three_part_table_refs, strip_catalog_from_three_part_names,
-};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -108,6 +105,30 @@ pub(crate) fn register_stream_load_engine(engine: StandaloneNovaRocks) {
 
 pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
     stream_load_engine_cell().get().cloned()
+}
+
+fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
+    state
+        .catalog_mgr
+        .read()
+        .expect("catalog mgr read lock")
+        .clone()
+}
+
+fn build_analyzer_provider<'a>(
+    current_catalog: Option<&'a str>,
+    catalog: &'a InMemoryCatalog,
+    catalog_mgr: &'a catalog_mgr::CatalogMgr,
+    connectors: &'a crate::connector::ConnectorRegistry,
+    mode: crate::sql::catalog::TableLookupMode,
+) -> catalog_mgr::provider::CatalogMgrProvider<'a> {
+    catalog_mgr::provider::CatalogMgrProvider::new(
+        current_catalog,
+        catalog,
+        catalog_mgr,
+        connectors,
+        mode,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -805,13 +826,33 @@ impl StandaloneSession {
                         crate::sql::explain::ExplainLevel::Normal
                     }
                 });
-                let catalog = self
+                let catalog_snapshot = self
                     .inner
                     .catalog
                     .read()
-                    .expect("standalone catalog read lock");
-                let result = explain_query(&prepared, &catalog, current_database, level)?;
-                drop(catalog);
+                    .expect("standalone catalog read lock")
+                    .clone();
+                let connectors_snapshot = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("standalone connector registry read lock")
+                    .clone();
+                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
+                let analyzer_provider = build_analyzer_provider(
+                    current_catalog,
+                    &catalog_snapshot,
+                    &catalog_mgr_snapshot,
+                    &connectors_snapshot,
+                    crate::sql::catalog::TableLookupMode::ExplainStats,
+                );
+                let result = explain_query(
+                    &prepared,
+                    &analyzer_provider,
+                    &catalog_snapshot,
+                    current_database,
+                    level,
+                )?;
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Explain {
@@ -824,26 +865,35 @@ impl StandaloneSession {
                 };
                 let prepared =
                     prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
-                let catalog = self
+                let catalog_snapshot = self
                     .inner
                     .catalog
                     .read()
-                    .expect("standalone catalog read lock");
+                    .expect("standalone catalog read lock")
+                    .clone();
                 let connectors_snapshot = self
                     .inner
                     .connectors
                     .read()
                     .expect("standalone connector registry read lock")
                     .clone();
+                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
+                let analyzer_provider = build_analyzer_provider(
+                    current_catalog,
+                    &catalog_snapshot,
+                    &catalog_mgr_snapshot,
+                    &connectors_snapshot,
+                    crate::sql::catalog::TableLookupMode::ExplainStats,
+                );
                 let result = explain_analyze_query(
                     &prepared,
-                    &catalog,
+                    &analyzer_provider,
+                    &catalog_snapshot,
                     &connectors_snapshot,
                     current_database,
                     self.inner.exchange_port,
                     None,
                 )?;
-                drop(catalog);
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
@@ -859,147 +909,38 @@ impl StandaloneSession {
                 }
 
                 // Inline any user-defined views referenced in the query so the
-                // remaining rewrites (time-travel, three-part-name, iceberg
-                // registration) see only base tables. `expand_views_in_query`
+                // remaining rewrites see only base tables. `expand_views_in_query`
                 // is a no-op when no views are registered.
-                let mut view_expanded = query.clone();
+                let mut prepared = query.as_ref().clone();
                 self::view_rewrite::expand_views_in_query(
-                    view_expanded.as_mut(),
+                    &mut prepared,
                     &self.inner.views,
                     current_database,
                 );
                 // Materialize information_schema virtual tables (e.g. `schemata`)
                 // into VALUES-backed derived tables. Run after view expansion
-                // (a view may project from a virtual table) and before iceberg
-                // registration / 3-part stripping so those passes never see
-                // the synthetic references.
-                self::virtual_table::rewrite_query(&self.inner, view_expanded.as_mut())?;
-                let query = &view_expanded;
+                // because a view may project from a virtual table.
+                self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
 
                 // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.
-                // Clone the query, rewrite version-bearing table refs to synthetic
-                // per-snapshot names, register the synthetic TableDefs, then execute.
-                // Non-version table refs in the same query are handled by the
-                // regular registration path that follows in the rewritten query.
-                if has_time_travel_refs(query) {
-                    let mut rewritten = query.as_ref().clone();
+                // Rewrite version-bearing table refs to synthetic per-snapshot
+                // names and register only those synthetic TableDefs. Ordinary
+                // Iceberg refs are resolved by CatalogMgrProvider during analysis.
+                if has_time_travel_refs(&prepared) {
                     rewrite_time_travel_refs(
                         &self.inner,
                         current_catalog,
                         current_database,
-                        &mut rewritten,
+                        &mut prepared,
                     )?;
-                    // Register any remaining (non-time-travel) iceberg tables in the rewritten query.
-                    if current_catalog.is_some() {
-                        register_iceberg_tables_for_query(
-                            &self.inner,
-                            current_catalog,
-                            current_database,
-                            &rewritten,
-                        )?;
-                    }
-                    let three_parts = extract_three_part_table_refs(&rewritten);
-                    if !three_parts.is_empty() {
-                        if current_catalog.is_none() {
-                            register_iceberg_tables_for_query(
-                                &self.inner,
-                                None,
-                                current_database,
-                                &rewritten,
-                            )?;
-                        }
-                        strip_catalog_from_three_part_names(&mut rewritten);
-                    }
-                    // Clone-then-release: do not hold `state.catalog.read()`
-                    // across `execute_query`. Pipeline execution can run for
-                    // many seconds and would otherwise starve writers (e.g.
-                    // INSERT cleanup taking `state.catalog.write()` in
-                    // `invalidate_iceberg_caches`) on the std::sync::RwLock
-                    // writer queue.
-                    let catalog_snapshot = self
-                        .inner
-                        .catalog
-                        .read()
-                        .expect("standalone catalog read lock")
-                        .clone();
-                    let connectors_snapshot = self
-                        .inner
-                        .connectors
-                        .read()
-                        .expect("standalone connector registry read lock")
-                        .clone();
-                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
-                    let result = execute_query(
-                        &rewritten,
-                        &catalog_snapshot,
-                        &connectors_snapshot,
-                        current_database,
-                        self.inner.exchange_port,
-                        query_opts.clone(),
-                    )?;
-                    return Ok(StatementResult::Query(result));
-                }
-
-                // When current_catalog is an Iceberg catalog, materialize
-                // referenced Iceberg tables into the local catalog first.
-                if current_catalog.is_some() {
-                    register_iceberg_tables_for_query(
-                        &self.inner,
-                        current_catalog,
-                        current_database,
-                        query,
-                    )?;
-                }
-
-                // Handle fully-qualified 3-part table names (catalog.database.table).
-                // Strip the leading catalog so the analyzer sees a 2-part name; the
-                // registration above (or the explicit one below in current_catalog=None
-                // mode) has already materialized the iceberg base table into the local
-                // catalog. The strip also turns 4-part `cat.db.tbl.__nr_meta_*__`
-                // metadata references into the 3-part form the analyzer's metadata
-                // path expects.
-                let three_parts = extract_three_part_table_refs(query);
-                if !three_parts.is_empty() {
-                    if current_catalog.is_none() {
-                        register_iceberg_tables_for_query(
-                            &self.inner,
-                            None,
-                            current_database,
-                            query,
-                        )?;
-                    }
-                    let mut rewritten = query.as_ref().clone();
-                    strip_catalog_from_three_part_names(&mut rewritten);
-                    // Clone-then-release: do not hold the catalog read lock
-                    // across pipeline execution; see comment on the
-                    // time-travel branch above.
-                    let catalog_snapshot = self
-                        .inner
-                        .catalog
-                        .read()
-                        .expect("standalone catalog read lock")
-                        .clone();
-                    let connectors_snapshot = self
-                        .inner
-                        .connectors
-                        .read()
-                        .expect("standalone connector registry read lock")
-                        .clone();
-                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
-                    let result = execute_query(
-                        &rewritten,
-                        &catalog_snapshot,
-                        &connectors_snapshot,
-                        current_database,
-                        self.inner.exchange_port,
-                        query_opts.clone(),
-                    )?;
-                    return Ok(StatementResult::Query(result));
                 }
 
                 // Clone-then-release: do not hold the catalog read lock
-                // across pipeline execution; see comment on the time-travel
-                // branch above.
+                // across pipeline execution. Pipeline execution can run for
+                // many seconds and would otherwise starve writers (e.g.
+                // INSERT cleanup taking `state.catalog.write()` in
+                // `invalidate_iceberg_caches`) on the std::sync::RwLock
+                // writer queue.
                 let catalog_snapshot = self
                     .inner
                     .catalog
@@ -1012,9 +953,18 @@ impl StandaloneSession {
                     .read()
                     .expect("standalone connector registry read lock")
                     .clone();
-                self::statistics::observe_query(&self.inner, query, current_database)?;
-                let result = execute_query(
-                    query,
+                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
+                let analyzer_provider = build_analyzer_provider(
+                    current_catalog,
+                    &catalog_snapshot,
+                    &catalog_mgr_snapshot,
+                    &connectors_snapshot,
+                    crate::sql::catalog::TableLookupMode::SchemaOnly,
+                );
+                self::statistics::observe_query(&self.inner, &prepared, current_database)?;
+                let result = execute_query_with_catalog_provider(
+                    &prepared,
+                    &analyzer_provider,
                     &catalog_snapshot,
                     &connectors_snapshot,
                     current_database,
@@ -2649,8 +2599,8 @@ fn collapse_distribution_enforcers_for_single_fragment(
 }
 
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
-/// inline user-defined views, rewrite time-travel refs, register Iceberg
-/// tables, and strip three-part catalog names. Returns the rewritten query.
+/// inline user-defined views and rewrite time-travel refs. Ordinary Iceberg
+/// table resolution is handled by the analyzer provider.
 fn prepare_explain_query(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -2666,22 +2616,6 @@ fn prepare_explain_query(
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
 
-    // EXPLAIN needs manifest row counts and min/max bounds for stable
-    // optimizer observability, so it registers scan-binding metadata while the
-    // regular SELECT path can keep schema-only registration.
-    if current_catalog.is_some() {
-        register_iceberg_tables_for_explain(state, current_catalog, current_database, &prepared)?;
-    }
-
-    // Three-part catalog.database.table names: register and strip.
-    let three_parts = extract_three_part_table_refs(&prepared);
-    if !three_parts.is_empty() {
-        if current_catalog.is_none() {
-            register_iceberg_tables_for_explain(state, None, current_database, &prepared)?;
-        }
-        strip_catalog_from_three_part_names(&mut prepared);
-    }
-
     Ok(prepared)
 }
 
@@ -2691,7 +2625,8 @@ fn prepare_explain_query(
 /// the pipeline has no systematic profile collection yet.
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -2706,7 +2641,7 @@ fn explain_analyze_query(
     // follow-up PR will replace the query-level timing summary.
     let t_plan = Instant::now();
     let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
@@ -2714,9 +2649,10 @@ fn explain_analyze_query(
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let executed = execute_query(
+    let executed = execute_query_with_catalog_provider(
         query,
-        catalog,
+        analyzer_catalog,
+        codegen_catalog,
         connectors,
         current_database,
         exchange_port,
@@ -2737,14 +2673,15 @@ fn explain_analyze_query(
 /// Produce EXPLAIN output for a query without executing it.
 fn explain_query(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    _codegen_catalog: &InMemoryCatalog,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
     let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
@@ -2772,13 +2709,35 @@ pub(crate) fn execute_query(
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
 ) -> Result<QueryResult, String> {
-    execute_query_with_options(
+    execute_query_with_catalog_provider(
         query,
+        catalog,
         catalog,
         connectors,
         current_database,
         exchange_port,
         query_opts,
+    )
+}
+
+pub(crate) fn execute_query_with_catalog_provider(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        analyzer_catalog,
+        codegen_catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        None,
         None,
         None,
         None,
@@ -2838,8 +2797,37 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
 ) -> Result<QueryResult, String> {
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        catalog,
+        catalog,
+        connectors,
+        current_database,
+        exchange_port,
+        query_opts,
+        terminal_sink,
+        iceberg_catalogs,
+        mv_refresh_ctx,
+        imv_rewrite_validator,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_with_options_and_imv_validator_with_catalog_provider(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     if let Some(mv_ctx) = mv_refresh_ctx {
         logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
@@ -2879,7 +2867,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
             &physical,
-            catalog,
+            codegen_catalog,
             connectors,
             current_database,
             mv_refresh_ctx,
@@ -3960,6 +3948,129 @@ path = "{metadata_path}"
 
         let mgr = engine.inner.catalog_mgr.read().expect("catalog mgr");
         assert!(mgr.get_catalog("ice").is_ok());
+    }
+
+    #[test]
+    fn explain_iceberg_query_uses_catalog_mgr_without_global_registration() {
+        struct TestBackend;
+        impl crate::connector::backend::CatalogBackend for TestBackend {
+            fn name(&self) -> &'static str {
+                "iceberg"
+            }
+
+            fn namespace_exists(&self, _: &str, _: &str) -> Result<bool, String> {
+                Err("unused".to_string())
+            }
+
+            fn create_namespace(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn drop_namespace(&self, _: &str, _: &str, _: bool) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn create_table(
+                &self,
+                _: crate::connector::backend::CreateTableRequest,
+            ) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn table_exists(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
+                Err("unused".to_string())
+            }
+
+            fn drop_table(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn load_table(
+                &self,
+                catalog: &str,
+                namespace: &str,
+                table: &str,
+            ) -> Result<crate::connector::backend::ResolvedTable, String> {
+                Ok(crate::connector::backend::ResolvedTable {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: table.to_string(),
+                    columns: vec![crate::sql::catalog::ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                })
+            }
+        }
+
+        struct TestSource;
+        impl crate::connector::backend::TableSource for TestSource {
+            fn name(&self) -> &'static str {
+                "iceberg"
+            }
+
+            fn build_table_def(
+                &self,
+                table: &crate::connector::backend::ResolvedTable,
+            ) -> Result<crate::sql::catalog::TableDef, String> {
+                let iceberg = crate::sql::catalog::IcebergTableInfo {
+                    catalog: table.catalog.clone(),
+                    namespace: table.namespace.clone(),
+                    table: table.table.clone(),
+                    table_uuid: Some("uuid-parted".to_string()),
+                    current_snapshot_id: Some(1),
+                    schema_id: 1,
+                    location: "memory://ice/db/parted".to_string(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                };
+                Ok(crate::sql::catalog::TableDef {
+                    name: table.table.clone(),
+                    columns: table.columns.clone(),
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                        table: iceberg,
+                        files: Vec::new(),
+                        cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    },
+                })
+            }
+        }
+
+        let state = Arc::new(StandaloneState::default());
+        {
+            let mut connectors = state.connectors.write().expect("connectors");
+            connectors.register_catalog_backend(Arc::new(TestBackend));
+            connectors.register_table_source(Arc::new(TestSource));
+        }
+        {
+            let connectors = state.connectors.read().expect("connectors");
+            let mut mgr = state.catalog_mgr.write().expect("catalog mgr");
+            mgr.register(Arc::new(
+                crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(
+                    "ice",
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ),
+            ));
+        }
+        let session = StandaloneSession {
+            inner: Arc::clone(&state),
+        };
+
+        session
+            .execute_in_context("EXPLAIN SELECT id FROM parted", Some("ice"), "db", None)
+            .expect("explain");
+
+        let local = state.catalog.read().expect("catalog");
+        assert!(
+            local.get("db", "parted").is_err(),
+            "EXPLAIN analysis must not require global InMemoryCatalog registration"
+        );
     }
 
     #[test]
