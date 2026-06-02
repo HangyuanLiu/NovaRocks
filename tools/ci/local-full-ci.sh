@@ -289,7 +289,7 @@ run_sql_suites() {
   local code
   local duration
   local -a suite_extra_args
-  local query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
+  local query_timeout
 
   resolve_suites
   if [ "${#SUITES[@]}" -eq 0 ]; then
@@ -301,6 +301,12 @@ run_sql_suites() {
     log_path="$CI_RUN_DIR/sql/${suite}.log"
     start="$(ci_epoch)"
     suite_extra_args=()
+    query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
+    case "$suite" in
+      ssb)
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
+        ;;
+    esac
     if [ "$RUN_MODE" != "explicit" ]; then
       case "$suite" in
         analytic)

@@ -424,7 +424,9 @@ cte2 AS (
 )
 SELECT k1, k2, v1, v2
 FROM cte1 FULL OUTER JOIN cte2 USING(k1, k2)
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE WHEN v1 IS NULL THEN 1 ELSE 0 END, v1,
+         CASE WHEN v2 IS NULL THEN 1 ELSE 0 END, v2;
 
 -- query 48
 -- CTE wrapping FULL OUTER as base + another FULL OUTER
@@ -435,7 +437,10 @@ WITH base_join AS (
 )
 SELECT k1, k2, v1, v2, v3
 FROM base_join FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE WHEN v1 IS NULL THEN 1 ELSE 0 END, v1,
+         CASE WHEN v2 IS NULL THEN 1 ELSE 0 END, v2,
+         CASE WHEN v3 IS NULL THEN 1 ELSE 0 END, v3;
 
 -- query 49
 -- Three-table FULL OUTER USING + aggregation HAVING
@@ -569,7 +574,9 @@ LIMIT 15;
 SELECT k1, k2, v1, v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 WHERE (k1 = 1 OR k1 IS NULL) AND (k2 = 10 OR k2 IS NULL)
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE WHEN v1 IS NULL THEN 1 ELSE 0 END, v1,
+         CASE WHEN v2 IS NULL THEN 1 ELSE 0 END, v2;
 
 -- query 62
 -- FULL OUTER single-key USING + match_score aggregation
@@ -817,7 +824,7 @@ SELECT k1, v1, val1, v2, val2 FROM
     (VALUES (1, 'V1'), (2, 'V2')) AS v1_t(k1, val1) USING(k1) LEFT JOIN
     ${case_db}.t2 USING(k1) FULL OUTER JOIN
     (VALUES (1, 'V3'), (5, 'V5')) AS v2_t(k1, val2) USING(k1)
-ORDER BY k1
+ORDER BY k1, v1, val1, v2, val2
 LIMIT 20;
 
 -- query 89
@@ -832,7 +839,11 @@ FULL OUTER JOIN (
     SELECT k1, k2, v3, v4
     FROM ${case_db}.t3 RIGHT JOIN ${case_db}.t4 USING(k1, k2)
 ) right_result USING(k1, k2)
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE WHEN v1 IS NULL THEN 1 ELSE 0 END, v1,
+         CASE WHEN v2 IS NULL THEN 1 ELSE 0 END, v2,
+         CASE WHEN v3 IS NULL THEN 1 ELSE 0 END, v3,
+         CASE WHEN v4 IS NULL THEN 1 ELSE 0 END, v4;
 
 -- query 90
 -- FULL OUTER USING + arithmetic on USING columns

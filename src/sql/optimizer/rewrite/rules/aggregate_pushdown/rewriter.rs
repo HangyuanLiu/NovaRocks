@@ -1,17 +1,20 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
-use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{AggregateCall, AggregateNode, LogicalPlan};
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::planner::plan::{AggregateCall, AggregateNode, LogicalPlan, ProjectNode};
 
 use super::context::PushPlan;
-
-const PARTIAL_OUTPUT_PREFIX: &str = "__nr_agg_pd_";
 
 /// Construct the final LogicalPlan: a top-level Aggregate (with
 /// already_pushed=true) whose input is the original Join with one side
 /// wrapped by a partial Aggregate.
-pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
+pub(crate) fn rewrite(
+    original: &AggregateNode,
+    plan: PushPlan,
+    column_ref_factory: &mut ColumnRefFactory,
+) -> LogicalPlan {
     // Capture the side before plan is consumed by the moves below.
     let plan_side = plan.side;
 
@@ -33,10 +36,12 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
     // 2. Synthetic output columns for each partial call.
     let partial_output_cols: Vec<OutputColumn> = partial_calls
         .iter()
-        .enumerate()
-        .map(|(i, call)| OutputColumn {
-            column_id: ColumnId::UNSET,
-            name: format!("{}{}", PARTIAL_OUTPUT_PREFIX, i),
+        .map(|call| OutputColumn {
+            column_id: {
+                let name = agg_call_display_name(call);
+                column_ref_factory.create(None, name, call.result_type.clone(), true)
+            },
+            name: agg_call_display_name(call),
             data_type: call.result_type.clone(),
             nullable: true,
             is_internal: false,
@@ -48,8 +53,10 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         .partial_groupby
         .iter()
         .filter_map(|gb| match &gb.kind {
-            ExprKind::ColumnRef { column, .. } => Some(OutputColumn {
-                column_id: ColumnId::UNSET,
+            ExprKind::ColumnRef {
+                column_id, column, ..
+            } => Some(OutputColumn {
+                column_id: *column_id,
                 name: column.clone(),
                 data_type: gb.data_type.clone(),
                 nullable: gb.nullable,
@@ -96,7 +103,7 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
             name: final_fn_name(&orig.name),
             args: vec![TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: pc.column_id,
                     qualifier: None,
                     column: pc.name.clone(),
                 },
@@ -109,12 +116,18 @@ pub(crate) fn rewrite(original: &AggregateNode, plan: PushPlan) -> LogicalPlan {
         })
         .collect();
 
-    LogicalPlan::Aggregate(AggregateNode {
+    let final_aggregate = LogicalPlan::Aggregate(AggregateNode {
         input: Box::new(new_input),
         group_by: original.group_by.clone(),
-        aggregates: final_aggs,
-        output_columns: original.output_columns.clone(),
+        aggregates: final_aggs.clone(),
+        output_columns: final_aggregate_output_columns(original, &final_aggs),
         already_pushed: true,
+        required_output_columns: None,
+    });
+
+    LogicalPlan::Project(ProjectNode {
+        input: Box::new(final_aggregate),
+        items: exposure_project_items(original, &final_aggs),
         required_output_columns: None,
     })
 }
@@ -130,11 +143,101 @@ fn final_fn_name(name: &str) -> String {
     }
 }
 
+fn final_aggregate_output_columns(
+    original: &AggregateNode,
+    final_aggs: &[AggregateCall],
+) -> Vec<OutputColumn> {
+    let mut output_columns = original
+        .group_by
+        .iter()
+        .map(group_by_output_column)
+        .collect::<Vec<_>>();
+    output_columns.extend(final_aggs.iter().map(|call| OutputColumn {
+        column_id: ColumnId::UNSET,
+        name: agg_call_display_name(call),
+        data_type: call.result_type.clone(),
+        nullable: true,
+        is_internal: false,
+    }));
+    output_columns
+}
+
+fn group_by_output_column(expr: &TypedExpr) -> OutputColumn {
+    let column_id = match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => ColumnId::UNSET,
+    };
+    OutputColumn {
+        column_id,
+        name: typed_expr_display_name(expr),
+        data_type: expr.data_type.clone(),
+        nullable: expr.nullable,
+        is_internal: false,
+    }
+}
+
+fn exposure_project_items(
+    original: &AggregateNode,
+    final_aggs: &[AggregateCall],
+) -> Vec<ProjectItem> {
+    let mut items = original
+        .group_by
+        .iter()
+        .map(group_by_project_item)
+        .collect::<Vec<_>>();
+    items.extend(original.aggregates.iter().zip(final_aggs.iter()).map(
+        |(original_call, final_call)| ProjectItem {
+            expr: aggregate_call_expr(final_call),
+            output_name: agg_call_display_name(original_call),
+            output_column_id: ColumnId::UNSET,
+        },
+    ));
+    items
+}
+
+fn group_by_project_item(expr: &TypedExpr) -> ProjectItem {
+    let output_name = typed_expr_display_name(expr);
+    let column_id = match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => ColumnId::UNSET,
+    };
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: output_name.clone(),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        output_name,
+        output_column_id: column_id,
+    }
+}
+
+fn aggregate_call_expr(call: &AggregateCall) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::AggregateCall {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            distinct: call.distinct,
+            order_by: call.order_by.clone(),
+        },
+        data_type: call.result_type.clone(),
+        nullable: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
     use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
@@ -151,6 +254,21 @@ mod tests {
     }
 
     fn scan(name: &str, cols: &[(&str, DataType)]) -> LogicalPlan {
+        scan_with_alias_and_ids(
+            name,
+            None,
+            &cols
+                .iter()
+                .map(|(col, ty)| (*col, ColumnId::UNSET, ty.clone()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn scan_with_alias_and_ids(
+        name: &str,
+        alias: Option<&str>,
+        cols: &[(&str, ColumnId, DataType)],
+    ) -> LogicalPlan {
         LogicalPlan::Scan(ScanNode {
             database: "db".into(),
             table: TableDef {
@@ -162,11 +280,11 @@ mod tests {
                     table_id: 0,
                 },
             },
-            alias: None,
+            alias: alias.map(str::to_string),
             columns: cols
                 .iter()
-                .map(|(n, ty)| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                .map(|(n, id, ty)| OutputColumn {
+                    column_id: *id,
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
@@ -190,6 +308,33 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         }
+    }
+
+    fn qualified_col_ref(
+        qualifier: &str,
+        name: &str,
+        column_id: ColumnId,
+        ty: DataType,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: Some(qualifier.into()),
+                column: name.into(),
+            },
+            data_type: ty,
+            nullable: true,
+        }
+    }
+
+    fn unwrap_exposure_project(plan: LogicalPlan) -> (Vec<ProjectItem>, AggregateNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected exposure Project")
+        };
+        let LogicalPlan::Aggregate(aggregate) = *project.input else {
+            panic!("expected final Aggregate under exposure Project")
+        };
+        (project.items, aggregate)
     }
 
     #[test]
@@ -230,10 +375,9 @@ mod tests {
             partial_groupby: vec![col_ref("k", DataType::Int64)],
             partial_aggregates: original.aggregates.clone(),
         };
-        let out = rewrite(&original, push);
-        let LogicalPlan::Aggregate(top) = out else {
-            panic!("top must be Aggregate")
-        };
+        let mut factory = ColumnRefFactory::new();
+        let out = rewrite(&original, push, &mut factory);
+        let (_, top) = unwrap_exposure_project(out);
         assert!(top.already_pushed);
         assert_eq!(top.aggregates[0].name, "sum");
         let LogicalPlan::Join(j) = *top.input else {
@@ -277,24 +421,20 @@ mod tests {
             partial_groupby: vec![col_ref("k", DataType::Int64)],
             partial_aggregates: original.aggregates.clone(),
         };
-        let out = rewrite(&original, push);
-        let LogicalPlan::Aggregate(top) = out else {
-            panic!()
-        };
+        let mut factory = ColumnRefFactory::new();
+        let out = rewrite(&original, push, &mut factory);
+        let (_, top) = unwrap_exposure_project(out);
         assert_eq!(top.aggregates[0].name, "sum");
         match &top.aggregates[0].args[0].kind {
             ExprKind::ColumnRef { column, .. } => {
-                assert!(
-                    column.starts_with("__nr_agg_pd_"),
-                    "expected partial column prefix, got: {column}"
-                );
+                assert_eq!(column, "sum(v)");
             }
             _ => panic!("final SUM arg must be a ColumnRef"),
         }
     }
 
     #[test]
-    fn rewriter_output_preserves_top_output_columns() {
+    fn rewriter_exposure_project_preserves_group_and_original_aggregate_names() {
         let a = scan("a", &[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = scan("b", &[("k", DataType::Int64)]);
         let join = LogicalPlan::Join(JoinNode {
@@ -339,12 +479,198 @@ mod tests {
             partial_groupby: original.group_by.clone(),
             partial_aggregates: original.aggregates.clone(),
         };
-        let out = rewrite(&original, push);
-        let LogicalPlan::Aggregate(top) = out else {
-            panic!()
-        };
+        let mut factory = ColumnRefFactory::new();
+        let out = rewrite(&original, push, &mut factory);
+        let (items, top) = unwrap_exposure_project(out);
         assert_eq!(top.output_columns.len(), 2);
         assert_eq!(top.output_columns[0].name, "k");
-        assert_eq!(top.output_columns[1].name, "total");
+        assert_eq!(top.output_columns[1].name, "sum(sum(v))");
+        assert!(items.iter().any(|item| item.output_name == "k"));
+        assert!(items.iter().any(|item| item.output_name == "sum(v)"));
+    }
+
+    #[test]
+    fn rewrite_keeps_partial_source_columns_visible_to_required_column_tagging() {
+        let mut factory = ColumnRefFactory::new();
+        let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
+        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
+        let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
+        let sum_out = factory.create(None, "sum(t1.c_key)".into(), DataType::Int64, true);
+
+        let left = scan_with_alias_and_ids(
+            "t1",
+            Some("t1"),
+            &[
+                ("c_key", c_key, DataType::Int32),
+                ("c_bigint", c_bigint, DataType::Int64),
+            ],
+        );
+        let right = scan_with_alias_and_ids("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
+        let original = AggregateNode {
+            input: Box::new(LogicalPlan::Join(JoinNode {
+                left: Box::new(left.clone()),
+                right: Box::new(right),
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(qualified_col_ref(
+                            "t1",
+                            "c_bigint",
+                            c_bigint,
+                            DataType::Int64,
+                        )),
+                        op: BinOp::Eq,
+                        right: Box::new(qualified_col_ref("t2", "c_int", c_int, DataType::Int32)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+                required_output_columns: None,
+            })),
+            group_by: vec![qualified_col_ref(
+                "t1",
+                "c_bigint",
+                c_bigint,
+                DataType::Int64,
+            )],
+            aggregates: vec![AggregateCall {
+                name: "sum".into(),
+                args: vec![qualified_col_ref("t1", "c_key", c_key, DataType::Int32)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+            }],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: sum_out,
+                    name: "sum(t1.c_key)".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: c_bigint,
+                    name: "c_bigint".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        };
+        let push = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: left,
+            partial_groupby: original.group_by.clone(),
+            partial_aggregates: original.aggregates.clone(),
+        };
+
+        let rewritten = rewrite(&original, push, &mut factory);
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let tagged = match crate::sql::optimizer::rewrite::required_columns::TagRequiredColumns
+            .apply(rewritten, &mut ctx)
+            .unwrap()
+        {
+            RewriteResult::Changed(plan) => plan,
+            RewriteResult::Unchanged => panic!("tagging should change the plan"),
+            RewriteResult::Rejected(_) => panic!("tagging should not reject"),
+        };
+
+        let LogicalPlan::Project(project) = tagged else {
+            panic!("expected exposure project")
+        };
+        let LogicalPlan::Aggregate(top) = *project.input else {
+            panic!("expected final aggregate")
+        };
+        let LogicalPlan::Join(join) = *top.input else {
+            panic!("expected rewritten join")
+        };
+        let LogicalPlan::Aggregate(partial) = *join.left else {
+            panic!("expected partial aggregate on left")
+        };
+        let LogicalPlan::Scan(scan) = *partial.input else {
+            panic!("expected scan under partial aggregate")
+        };
+        let required = scan
+            .required_output_columns
+            .expect("scan should be tagged with required columns");
+        assert!(required.contains(&c_key), "partial SUM input must be kept");
+        assert!(
+            required.contains(&c_bigint),
+            "partial group-by key must be kept"
+        );
+    }
+
+    #[test]
+    fn rewrite_exposes_original_count_display_after_final_sum_merge() {
+        let mut factory = ColumnRefFactory::new();
+        let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
+        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
+        let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
+
+        let left = scan_with_alias_and_ids(
+            "t1",
+            Some("t1"),
+            &[
+                ("c_key", c_key, DataType::Int32),
+                ("c_bigint", c_bigint, DataType::Int64),
+            ],
+        );
+        let right = scan_with_alias_and_ids("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
+        let count_call = AggregateCall {
+            name: "count".into(),
+            args: vec![qualified_col_ref("t1", "c_key", c_key, DataType::Int32)],
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
+        };
+        let original = AggregateNode {
+            input: Box::new(LogicalPlan::Join(JoinNode {
+                left: Box::new(left.clone()),
+                right: Box::new(right),
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(qualified_col_ref(
+                            "t1",
+                            "c_bigint",
+                            c_bigint,
+                            DataType::Int64,
+                        )),
+                        op: BinOp::Eq,
+                        right: Box::new(qualified_col_ref("t2", "c_int", c_int, DataType::Int32)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
+                required_output_columns: None,
+            })),
+            group_by: vec![qualified_col_ref(
+                "t1",
+                "c_bigint",
+                c_bigint,
+                DataType::Int64,
+            )],
+            aggregates: vec![count_call.clone()],
+            output_columns: vec![],
+            already_pushed: false,
+            required_output_columns: None,
+        };
+        let push = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: left,
+            partial_groupby: original.group_by.clone(),
+            partial_aggregates: original.aggregates.clone(),
+        };
+
+        let rewritten = rewrite(&original, push, &mut factory);
+        let (items, top) = unwrap_exposure_project(rewritten);
+        assert_eq!(top.aggregates[0].name, "sum");
+        assert!(
+            items
+                .iter()
+                .any(|item| item.output_name == agg_call_display_name(&count_call))
+        );
     }
 }

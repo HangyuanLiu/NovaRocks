@@ -6,7 +6,7 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
 
-use super::context::{AggregatePushDownContext, PushPlan, Side};
+use super::context::{AggregatePushDownContext, ColumnRefIdentity, PushPlan, Side};
 
 /// Examine the AggregateNode for entry-level rejections.
 /// Returns Some(ctx) when the aggregate is a candidate to push;
@@ -54,18 +54,18 @@ pub(crate) fn entry_safety_check(aggregate: &AggregateNode) -> Option<AggregateP
     Some(AggregatePushDownContext {
         original_groupby: aggregate.group_by.clone(),
         original_aggregates: aggregate.aggregates.clone(),
-        required_columns: collect_required_columns(aggregate),
+        required_column_refs: collect_required_column_refs(aggregate),
     })
 }
 
-fn collect_required_columns(aggregate: &AggregateNode) -> Vec<String> {
+fn collect_required_column_refs(aggregate: &AggregateNode) -> Vec<ColumnRefIdentity> {
     let mut out = Vec::new();
     for gb in &aggregate.group_by {
-        collect_column_refs_into(gb, &mut out);
+        collect_column_ref_identities_into(gb, &mut out);
     }
     for call in &aggregate.aggregates {
         for arg in &call.args {
-            collect_column_refs_into(arg, &mut out);
+            collect_column_ref_identities_into(arg, &mut out);
         }
     }
     out.sort();
@@ -73,9 +73,12 @@ fn collect_required_columns(aggregate: &AggregateNode) -> Vec<String> {
     out
 }
 
-fn collect_column_refs_into(expr: &TypedExpr, out: &mut Vec<String>) {
-    if let ExprKind::ColumnRef { column, .. } = &expr.kind {
-        out.push(column.clone());
+fn collect_column_ref_identities_into(expr: &TypedExpr, out: &mut Vec<ColumnRefIdentity>) {
+    if let ExprKind::ColumnRef {
+        qualifier, column, ..
+    } = &expr.kind
+    {
+        out.push((qualifier.clone(), column.clone()));
     }
 }
 
@@ -139,12 +142,20 @@ fn split_at_join(
     }
 
     // Step 2: per-side column visibility.
-    let left_cols = collect_output_column_names(&join.left);
-    let right_cols = collect_output_column_names(&join.right);
+    let left_qcols = collect_qualified_output_names(&join.left);
+    let right_qcols = collect_qualified_output_names(&join.right);
 
-    let side = if ctx.required_columns.iter().all(|c| left_cols.contains(c)) {
+    let side = if ctx
+        .required_column_refs
+        .iter()
+        .all(|c| column_ref_belongs_to_side(c, &left_qcols, &right_qcols))
+    {
         Side::Left
-    } else if ctx.required_columns.iter().all(|c| right_cols.contains(c)) {
+    } else if ctx
+        .required_column_refs
+        .iter()
+        .all(|c| column_ref_belongs_to_side(c, &right_qcols, &left_qcols))
+    {
         Side::Right
     } else {
         return None;
@@ -166,13 +177,12 @@ fn split_at_join(
     if !matches!(side_subtree.as_ref(), LogicalPlan::Scan(_)) {
         return None;
     }
-    let side_cols = match side {
-        Side::Left => &left_cols,
-        Side::Right => &right_cols,
-    };
     // Qualified columns of the chosen side (a bare Scan per Step 4), used to
     // disambiguate equi-keys that share a bare name across sides (`a.k = b.k`).
-    let side_qcols = collect_qualified_output_names(side_subtree.as_ref());
+    let (side_qcols, other_qcols) = match side {
+        Side::Left => (&left_qcols, &right_qcols),
+        Side::Right => (&right_qcols, &left_qcols),
+    };
 
     // Step 5: partial group-by = original group-by cols on this side
     //         + side-bound equi-keys.
@@ -180,13 +190,19 @@ fn split_at_join(
         .original_groupby
         .iter()
         .filter(|gb| match &gb.kind {
-            ExprKind::ColumnRef { column, .. } => side_cols.contains(column),
+            ExprKind::ColumnRef {
+                qualifier, column, ..
+            } => column_ref_belongs_to_side(
+                &(qualifier.clone(), column.clone()),
+                side_qcols,
+                other_qcols,
+            ),
             _ => false,
         })
         .cloned()
         .collect();
     for (left_key, right_key) in &equi_keys {
-        let candidate = side_bound_equi_key(left_key, right_key, &side_qcols)?;
+        let candidate = side_bound_equi_key(left_key, right_key, side_qcols)?;
         let already = partial_groupby
             .iter()
             .any(|gb| match (&gb.kind, &candidate.kind) {
@@ -234,6 +250,17 @@ fn column_ref_qualified(expr: &TypedExpr) -> Option<(Option<String>, String)> {
             qualifier, column, ..
         } => Some((qualifier.clone(), column.clone())),
         _ => None,
+    }
+}
+
+fn column_ref_belongs_to_side(
+    column_ref: &ColumnRefIdentity,
+    side_qcols: &[ColumnRefIdentity],
+    other_qcols: &[ColumnRefIdentity],
+) -> bool {
+    match &column_ref.0 {
+        Some(_) => side_qcols.contains(column_ref),
+        None => side_qcols.contains(column_ref) && !other_qcols.contains(column_ref),
     }
 }
 
@@ -319,22 +346,6 @@ fn walk_and_collect_equi(expr: &TypedExpr, out: &mut Vec<(TypedExpr, TypedExpr)>
     }
 }
 
-fn collect_output_column_names(plan: &LogicalPlan) -> Vec<String> {
-    use crate::sql::planner::plan::*;
-    match plan {
-        LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.name.clone()).collect(),
-        LogicalPlan::Filter(f) => collect_output_column_names(&f.input),
-        LogicalPlan::Project(p) => p.items.iter().map(|i| i.output_name.clone()).collect(),
-        LogicalPlan::Join(j) => {
-            let mut l = collect_output_column_names(&j.left);
-            l.extend(collect_output_column_names(&j.right));
-            l
-        }
-        LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.name.clone()).collect(),
-        _ => Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +359,18 @@ mod tests {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::UNSET,
                 qualifier: None,
+                column: name.into(),
+            },
+            data_type: ty,
+            nullable: true,
+        }
+    }
+
+    fn qualified_col_ref(qualifier: &str, name: &str, ty: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: Some(qualifier.into()),
                 column: name.into(),
             },
             data_type: ty,
@@ -492,8 +515,8 @@ mod tests {
         let ctx = entry_safety_check(&agg).expect("should pass entry checks");
         assert_eq!(ctx.original_groupby.len(), 1);
         assert_eq!(ctx.original_aggregates.len(), 1);
-        assert!(ctx.required_columns.contains(&"k".to_string()));
-        assert!(ctx.required_columns.contains(&"v".to_string()));
+        assert!(ctx.required_column_refs.contains(&(None, "k".to_string())));
+        assert!(ctx.required_column_refs.contains(&(None, "v".to_string())));
     }
 
     use crate::sql::analysis::{JoinKind, ProjectItem};
@@ -501,6 +524,10 @@ mod tests {
     use crate::sql::planner::plan::{FilterNode, JoinNode, ProjectNode, ScanNode};
 
     fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlan {
+        dummy_scan_with_alias(None, cols)
+    }
+
+    fn dummy_scan_with_alias(alias: Option<&str>, cols: &[(&str, DataType)]) -> LogicalPlan {
         LogicalPlan::Scan(ScanNode {
             database: "db".into(),
             table: TableDef {
@@ -512,7 +539,7 @@ mod tests {
                     table_id: 0,
                 },
             },
-            alias: None,
+            alias: alias.map(str::to_string),
             columns: cols
                 .iter()
                 .map(|(n, ty)| OutputColumn {
@@ -614,6 +641,23 @@ mod tests {
                 left: Box::new(col_ref(a, DataType::Int64)),
                 op: BinOp::Eq,
                 right: Box::new(col_ref(b, DataType::Int64)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn eq_qualified(
+        left_qual: &str,
+        left_col: &str,
+        right_qual: &str,
+        right_col: &str,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qualified_col_ref(left_qual, left_col, DataType::Int64)),
+                op: BinOp::Eq,
+                right: Box::new(qualified_col_ref(right_qual, right_col, DataType::Int64)),
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -758,6 +802,63 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col_ref("k", DataType::Int64)],
             aggregates: vec![sum_call("v"), sum_call("w")],
+            output_columns: vec![],
+            already_pushed: false,
+            required_output_columns: None,
+        };
+        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn rejects_qualified_required_columns_split_across_same_named_sides() {
+        let a = dummy_scan_with_alias(
+            Some("l"),
+            &[
+                ("c0", DataType::Int64),
+                ("c1", DataType::Utf8),
+                ("c2", DataType::Utf8),
+                ("c3", DataType::Int64),
+            ],
+        );
+        let b = dummy_scan_with_alias(
+            Some("r"),
+            &[
+                ("c0", DataType::Int64),
+                ("c1", DataType::Utf8),
+                ("c2", DataType::Utf8),
+                ("c3", DataType::Int64),
+            ],
+        );
+        let join = LogicalPlan::Join(JoinNode {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: JoinKind::Inner,
+            condition: Some(TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(eq_qualified("l", "c0", "r", "c0")),
+                    op: BinOp::And,
+                    right: Box::new(eq_qualified("l", "c1", "r", "c1")),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+            required_output_columns: None,
+        });
+        let agg = AggregateNode {
+            input: Box::new(join),
+            group_by: vec![
+                qualified_col_ref("l", "c0", DataType::Int64),
+                qualified_col_ref("r", "c1", DataType::Utf8),
+                qualified_col_ref("r", "c2", DataType::Utf8),
+                qualified_col_ref("r", "c3", DataType::Int64),
+            ],
+            aggregates: vec![AggregateCall {
+                name: "count".into(),
+                args: vec![qualified_col_ref("l", "c0", DataType::Int64)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+            }],
             output_columns: vec![],
             already_pushed: false,
             required_output_columns: None,

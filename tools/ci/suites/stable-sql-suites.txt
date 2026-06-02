@@ -21,6 +21,7 @@ aggregate
 # run `--suite analytic` explicitly when full window-matrix coverage is needed.
 analytic
 optimizer
+ssb
 iceberg
 iceberg-compatibility
 iceberg-ddl
@@ -29,8 +30,8 @@ iceberg-ivm
 iceberg-rest
 
 # The suites below are not part of default daily mode yet.
-# Benchmark suites are excluded from default daily until benchmark data bootstrap is explicitly part of this runner:
-# ssb
+# Remaining benchmark suites are excluded from default daily until their runtime
+# cost and data bootstrap path are validated for unattended stable CI:
 # tpc-h
 # tpc-ds
 # materialized-view
