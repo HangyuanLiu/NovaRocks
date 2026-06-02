@@ -79,6 +79,27 @@ impl TableMetadata {
             binding,
         })
     }
+
+    pub(crate) fn to_table_def(&self) -> TableDef {
+        let source = match &self.binding {
+            TableBinding::Internal { db_id, table_id } => ScanSource::StarRocks {
+                db_id: *db_id,
+                table_id: *table_id,
+            },
+            TableBinding::Iceberg { info } => ScanSource::IcebergDataFiles {
+                table: info.clone(),
+                files: Vec::new(),
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        TableDef {
+            name: self.identity.table.clone(),
+            columns: self.columns.clone(),
+            iceberg_row_lineage_metadata_columns: self.iceberg_row_lineage_columns.clone(),
+            source,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +200,32 @@ mod tests {
         let id = TableIdentity::new("ice", "ns", "t");
         let err = TableMetadata::from_table_def(id, &td).expect_err("must reject synthetic");
         assert!(err.contains("synthetic"), "got: {err}");
+    }
+
+    #[test]
+    fn table_metadata_to_table_def_rebuilds_schema_only_iceberg_source() {
+        let id = TableIdentity::new("ice", "ns", "orders");
+        let meta = TableMetadata {
+            identity: id,
+            columns: vec![col("id")],
+            iceberg_row_lineage_columns: vec![col("_row_id")],
+            binding: TableBinding::Iceberg {
+                info: iceberg_info(),
+            },
+        };
+
+        let table_def = meta.to_table_def();
+
+        assert_eq!(table_def.name, "orders");
+        assert_eq!(table_def.columns.len(), 1);
+        assert_eq!(table_def.iceberg_row_lineage_metadata_columns.len(), 1);
+        let ScanSource::IcebergDataFiles { files, binding, .. } = table_def.source else {
+            panic!("expected iceberg source");
+        };
+        assert!(files.is_empty());
+        assert_eq!(
+            binding,
+            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+        );
     }
 }
