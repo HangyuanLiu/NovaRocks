@@ -350,9 +350,19 @@ fn extract_union_all_fan_in_bases(
         return Ok(Vec::new());
     }
 
-    let sqlparser::ast::TableFactor::Derived { subquery, .. } = &from.relation else {
+    let sqlparser::ast::TableFactor::Derived {
+        lateral,
+        subquery,
+        sample,
+        ..
+    } = &from.relation
+    else {
         return Ok(Vec::new());
     };
+    if *lateral || sample.is_some() {
+        return Err(aggregate_error());
+    }
+    reject_unsupported_query_clauses(subquery).map_err(|_| aggregate_error())?;
     if !matches!(
         subquery.body.as_ref(),
         sqlparser::ast::SetExpr::SetOperation { .. }
@@ -2116,6 +2126,34 @@ mod tests {
         );
         assert_eq!(a.group_keys.len(), 1);
         assert_eq!(a.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn rejects_aggregate_over_union_all_fan_in_with_derived_limit() {
+        let err = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 limit 1 \
+             ) u group by k",
+        )
+        .expect_err("derived-level LIMIT must be rejected");
+        assert!(
+            err.contains("aggregate") || err.contains("incremental"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_over_union_all_fan_in_with_derived_order_by() {
+        let err = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 order by k \
+             ) u group by k",
+        )
+        .expect_err("derived-level ORDER BY must be rejected");
+        assert!(
+            err.contains("aggregate") || err.contains("incremental"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
