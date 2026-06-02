@@ -5387,6 +5387,7 @@ mod tests {
     #[derive(Debug)]
     struct CurrentSnapshotAssertingIcebergPlanner {
         counts: std::sync::Arc<ScanPlannerCallCounts>,
+        files: Vec<IcebergDataFileInfo>,
     }
 
     impl crate::connector::scan_planning::ConnectorScanPlanner
@@ -5430,12 +5431,17 @@ mod tests {
                 .plan_splits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _scan = crate::connector::iceberg::scan_planner::iceberg_scan_handle(scan)?;
-            Ok(vec![crate::connector::scan_planning::Split::new(
-                "iceberg",
-                crate::connector::iceberg::IcebergSplit {
-                    data_file: iceberg_i32_file("s3://bucket/current.parquet", 1, 1),
-                },
-            )])
+            Ok(self
+                .files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    crate::connector::scan_planning::Split::new(
+                        "iceberg",
+                        crate::connector::iceberg::IcebergSplit { data_file },
+                    )
+                })
+                .collect())
         }
 
         fn to_thrift_scan(
@@ -5479,29 +5485,49 @@ mod tests {
         registry
     }
 
+    fn register_current_snapshot_iceberg_planner(
+        registry: &mut crate::connector::ConnectorRegistry,
+        files: Vec<IcebergDataFileInfo>,
+    ) {
+        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
+        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner { counts, files });
+        registry.register_scan_planner(planner);
+    }
+
     fn mock_iceberg_registry() -> crate::connector::ConnectorRegistry {
+        mock_current_snapshot_iceberg_registry_with_files(vec![iceberg_i32_file(
+            "s3://bucket/current.parquet",
+            1,
+            1,
+        )])
+    }
+
+    fn mock_current_snapshot_iceberg_registry_with_files(
+        files: Vec<IcebergDataFileInfo>,
+    ) -> crate::connector::ConnectorRegistry {
         let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
+        register_current_snapshot_iceberg_planner(&mut registry, files);
         registry
     }
 
-    fn mock_current_snapshot_iceberg_registry() -> crate::connector::ConnectorRegistry {
-        let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
-        let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner { counts });
-        let mut registry = crate::connector::ConnectorRegistry::new();
-        registry.register_scan_planner(planner);
-        registry
+    fn iceberg_scan_files(plan: &PhysicalPlanNode) -> Vec<IcebergDataFileInfo> {
+        let Operator::PhysicalScan(scan) = &plan.op else {
+            panic!("expected scan plan");
+        };
+        let ScanSource::IcebergDataFiles { files, .. } = &scan.table.source else {
+            panic!("expected iceberg source");
+        };
+        files.clone()
     }
 
     fn mock_starrocks_and_iceberg_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
         let mut registry = mock_starrocks_registry(layout);
-        registry.register_scan_planner(std::sync::Arc::new(
-            crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
-        ));
+        register_current_snapshot_iceberg_planner(
+            &mut registry,
+            vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
+        );
         registry
     }
 
@@ -6106,9 +6132,13 @@ mod tests {
     fn iceberg_scan_predicates_feed_min_max_and_file_stats_pruning() {
         let plan = iceberg_scan_plan_with_file_stats();
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6151,9 +6181,13 @@ mod tests {
     fn iceberg_identity_partition_values_prune_scan_ranges() {
         let plan = iceberg_scan_plan_with_partition_values();
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6188,9 +6222,13 @@ mod tests {
     fn iceberg_large_plain_files_are_split_into_parallel_scan_ranges() {
         let plan = iceberg_scan_plan_with_large_file(300 * 1024 * 1024);
 
-        let build =
-            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
-                .expect("build");
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
+            "default",
+        )
+        .expect("build");
         let root = build
             .fragment_results
             .iter()
@@ -6228,7 +6266,7 @@ mod tests {
         let err = match PlanFragmentBuilder::build(
             &plan,
             &DummyCatalog,
-            &mock_iceberg_registry(),
+            &mock_current_snapshot_iceberg_registry_with_files(iceberg_scan_files(&plan)),
             "default",
         ) {
             Ok(_) => panic!("delete-heavy scan should fail fast"),
@@ -7531,13 +7569,8 @@ mod tests {
             }
         }
         let catalog = IcebergCatalog;
-        PlanFragmentBuilder::build(
-            &plan,
-            &catalog,
-            &mock_current_snapshot_iceberg_registry(),
-            "default",
-        )
-        .expect("iceberg scan with dict_columns must now succeed (Option A)");
+        PlanFragmentBuilder::build(&plan, &catalog, &mock_iceberg_registry(), "default")
+            .expect("iceberg scan with dict_columns must now succeed (Option A)");
     }
 
     #[test]
@@ -7663,6 +7696,7 @@ mod tests {
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
         let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
             counts: counts.clone(),
+            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
@@ -7734,6 +7768,7 @@ mod tests {
         let counts = std::sync::Arc::new(ScanPlannerCallCounts::default());
         let planner = std::sync::Arc::new(CurrentSnapshotAssertingIcebergPlanner {
             counts: counts.clone(),
+            files: vec![iceberg_i32_file("s3://bucket/current.parquet", 1, 1)],
         });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
