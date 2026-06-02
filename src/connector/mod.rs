@@ -149,6 +149,48 @@ mod scan_planning_registry_tests {
 
         assert_eq!(err, "unknown scan planner: iceberg");
     }
+
+    #[test]
+    fn default_connectors_register_stateful_iceberg_scan_planner() {
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        super::register_standalone_backends(&state);
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        let planner = connectors.scan_planner("iceberg").expect("iceberg planner");
+        let handle =
+            crate::connector::iceberg::IcebergConnectorScanPlanner::table_handle_for_current_snapshot(
+                "missing_catalog",
+                "db",
+                "t",
+                crate::sql::catalog::IcebergTableInfo {
+                    catalog: "missing_catalog".to_string(),
+                    namespace: "db".to_string(),
+                    table: "t".to_string(),
+                    table_uuid: None,
+                    current_snapshot_id: None,
+                    schema_id: 0,
+                    location: "s3://bucket/t".to_string(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                },
+                vec!["id".to_string()],
+            );
+        let scan = planner
+            .begin_scan(
+                handle,
+                crate::connector::scan_planning::BeginScanContext::default(),
+            )
+            .expect("begin scan");
+        let err = planner
+            .plan_splits(
+                &scan,
+                crate::connector::scan_planning::SplitPlanningContext::default(),
+            )
+            .expect_err("stateful planner should consult registry");
+        assert!(err.contains("unknown catalog"), "{err}");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,7 +321,7 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
         Arc::clone(&iceberg_catalogs),
     )));
     connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
-        iceberg_catalogs,
+        Arc::clone(&iceberg_catalogs),
     )));
 
     connectors.register_catalog_backend(Arc::new(starrocks::table::StarRocksTableBackend::new(
@@ -290,7 +332,9 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
     connectors.register_scan_planner(Arc::new(starrocks::table::StarRocksTableScanPlanner::new(
         state,
     )));
-    connectors.register_scan_planner(Arc::new(iceberg::IcebergConnectorScanPlanner::new()));
+    connectors.register_scan_planner(Arc::new(
+        iceberg::IcebergConnectorScanPlanner::with_catalog_registry(Arc::clone(&iceberg_catalogs)),
+    ));
     connectors.register_mv_backend(Arc::new(starrocks::table::StarRocksTableMvBackend::new(
         state,
     )));
