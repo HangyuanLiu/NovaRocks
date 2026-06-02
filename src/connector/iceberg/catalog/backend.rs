@@ -118,6 +118,16 @@ impl CatalogBackend for IcebergCatalogBackend {
             columns: loaded.columns,
         })
     }
+
+    fn current_schema_id(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Option<i32>, String> {
+        let loaded = reg_load_table(&self.entry(catalog)?, namespace, table)?;
+        Ok(Some(loaded.table.metadata().current_schema_id()))
+    }
 }
 
 pub(crate) struct IcebergTableSource {
