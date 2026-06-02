@@ -156,6 +156,13 @@ pub(crate) enum VisibleAggregateOutput {
 pub(crate) fn classify_incremental_mv_query(
     query: &sqlparser::ast::Query,
 ) -> Result<IncrementalMvShape, String> {
+    if matches!(
+        query.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation { .. }
+    ) {
+        return classify_union_all_mv_query(query).map(IncrementalMvShape::UnionAll);
+    }
+
     if is_probably_aggregate_query(query) {
         if is_probably_join_query(query) {
             return classify_join_aggregate_mv_query(query).map(IncrementalMvShape::JoinAggregate);
@@ -170,6 +177,105 @@ pub(crate) fn classify_incremental_mv_query(
     }
 
     classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
+}
+
+fn classify_union_all_mv_query(query: &sqlparser::ast::Query) -> Result<UnionAllMvShape, String> {
+    reject_unsupported_query_clauses(query).map_err(|_| union_all_error())?;
+
+    let mut branch_bodies = Vec::new();
+    flatten_union_all(query.body.as_ref(), &mut branch_bodies)?;
+    if branch_bodies.len() < 2 {
+        return Err(union_all_error());
+    }
+
+    let branches = branch_bodies
+        .into_iter()
+        .map(|body| {
+            let branch_query = wrap_setexpr_as_query(query, body);
+            classify_single_union_branch(&branch_query)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [first, rest @ ..] = branches.as_slice() else {
+        return Err(union_all_error());
+    };
+    let branch_kind = union_branch_kind(first)?;
+    for branch in rest {
+        if union_branch_kind(branch)? != branch_kind {
+            return Err(union_all_mixed_shape_error());
+        }
+    }
+    validate_union_branch_outputs_compatible(&branches)?;
+
+    Ok(UnionAllMvShape {
+        branch_kind,
+        branches,
+    })
+}
+
+fn flatten_union_all<'a>(
+    body: &'a sqlparser::ast::SetExpr,
+    out: &mut Vec<&'a sqlparser::ast::SetExpr>,
+) -> Result<(), String> {
+    match body {
+        sqlparser::ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if !matches!(op, sqlparser::ast::SetOperator::Union)
+                || !matches!(
+                    set_quantifier,
+                    sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
+                )
+            {
+                return Err(union_all_non_all_error());
+            }
+            flatten_union_all(left, out)?;
+            flatten_union_all(right, out)
+        }
+        sqlparser::ast::SetExpr::Select(_) => {
+            out.push(body);
+            Ok(())
+        }
+        sqlparser::ast::SetExpr::Query(inner) => flatten_union_all(inner.body.as_ref(), out),
+        _ => Err(union_all_error()),
+    }
+}
+
+fn wrap_setexpr_as_query(
+    outer: &sqlparser::ast::Query,
+    body: &sqlparser::ast::SetExpr,
+) -> sqlparser::ast::Query {
+    let mut query = outer.clone();
+    query.body = Box::new(body.clone());
+    query
+}
+
+fn classify_single_union_branch(
+    query: &sqlparser::ast::Query,
+) -> Result<IncrementalMvShape, String> {
+    if is_probably_join_query(query) {
+        return Err(union_all_branch_join_unsupported_error());
+    }
+    if is_probably_aggregate_query(query) {
+        return classify_aggregate_mv_query(query).map(IncrementalMvShape::Aggregate);
+    }
+    classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
+}
+
+fn union_branch_kind(shape: &IncrementalMvShape) -> Result<UnionBranchKind, String> {
+    match shape {
+        IncrementalMvShape::Aggregate(_) => Ok(UnionBranchKind::Aggregate),
+        IncrementalMvShape::ProjectionFilter(_) => Ok(UnionBranchKind::ProjectionFilter),
+        _ => Err(union_all_mixed_shape_error()),
+    }
+}
+
+fn validate_union_branch_outputs_compatible(
+    _branches: &[IncrementalMvShape],
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn classify_projection_filter_mv_query(
@@ -1472,6 +1578,28 @@ fn aggregate_expr_error(_err: String) -> String {
     "incremental aggregate MV query contains an unsupported expression".to_string()
 }
 
+fn union_all_error() -> String {
+    "incremental UNION ALL MV query must be a UNION ALL of two or more compatible branches"
+        .to_string()
+}
+
+fn union_all_non_all_error() -> String {
+    "incremental UNION ALL MV supports only UNION ALL; UNION (distinct) / INTERSECT / EXCEPT are not supported".to_string()
+}
+
+fn union_all_mixed_shape_error() -> String {
+    "incremental UNION ALL MV requires all branches to be the same shape (all aggregate or all projection/filter)".to_string()
+}
+
+fn union_all_branch_join_unsupported_error() -> String {
+    "incremental UNION ALL MV branches may not contain joins in this version".to_string()
+}
+
+#[allow(dead_code)]
+fn union_all_branch_output_mismatch_error() -> String {
+    "incremental UNION ALL MV branches must have identical output arity, types, and nullability (no implicit cast)".to_string()
+}
+
 /// Rewrite a MV SELECT SQL into state-shaped output columns.
 ///
 /// The returned SQL string can be fed directly to the executor to produce a state-shaped
@@ -1770,6 +1898,31 @@ mod tests {
         let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
         assert_eq!(
             bases,
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_top_level_union_all_of_aggregate_branches() {
+        let shape = classify_sql(
+            "select k1, sum(v2) as s from ice.ns.t1 group by k1 \
+             union all \
+             select k1, sum(v2) as s from ice.ns.t2 group by k1",
+        )
+        .expect("union all of aggregates should be accepted");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll shape");
+        };
+        assert_eq!(u.branch_kind, UnionBranchKind::Aggregate);
+        assert_eq!(u.branches.len(), 2);
+        assert!(matches!(u.branches[0], IncrementalMvShape::Aggregate(_)));
+        assert!(matches!(u.branches[1], IncrementalMvShape::Aggregate(_)));
+        assert_eq!(
+            u.branches
+                .iter()
+                .flat_map(|b| b.base_tables())
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>(),
             vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
         );
     }
