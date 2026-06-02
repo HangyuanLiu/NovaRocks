@@ -2338,6 +2338,7 @@ fn refresh_iceberg_union_projection_mv(
     let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
         state, base_refs,
     )?;
+    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
     let mut loaded_bases = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
         let loaded = load_current_iceberg_base_table(state, base_ref)?;
@@ -4048,6 +4049,20 @@ fn plan_iceberg_union_projection_mv_refresh(
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
+            if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
+                let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: base {} was not loaded",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                    ))
+                })?;
+                let current_uuid = loaded.table.metadata().uuid().to_string();
+                if previous_uuid != &current_uuid {
+                    return Err(RefreshError::user(format!(
+                        "iceberg MV base table identity changed for {fqn}; incremental refresh is unsafe, rebuild or recreate the MV"
+                    )));
+                }
+            }
             let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
                 RefreshError::user(format!(
                     "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
@@ -9650,6 +9665,51 @@ mod tests {
         txn.commit().expect("commit uuid-only metadata seed");
     }
 
+    fn seed_union_projection_mismatched_uuid_refresh_metadata(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        mismatched_base_fqn: &str,
+    ) {
+        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
+            .expect("mv definition for mismatched uuid metadata seed");
+        assert_eq!(
+            mv.last_refresh_snapshots.len(),
+            2,
+            "mismatched uuid seed expects complete previous snapshots"
+        );
+        assert_eq!(
+            mv.last_refresh_table_uuids.len(),
+            2,
+            "mismatched uuid seed expects complete previous table uuids"
+        );
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed mismatched iceberg mv refresh uuid metadata")
+            .expect("write txn");
+        let mut table_uuids = mv.last_refresh_table_uuids.clone();
+        table_uuids.insert(
+            mismatched_base_fqn.to_string(),
+            "mismatched-table-uuid".to_string(),
+        );
+        let updated = state
+            .mv_repo
+            .update_starrocks_refresh_summary_if_present(
+                txn.as_mut(),
+                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                    mv_id: mv.mv_id,
+                    last_refresh_ms: now_ms(),
+                    last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
+                    base_snapshots: mv.last_refresh_snapshots.clone(),
+                    base_table_uuids: table_uuids,
+                },
+            )
+            .expect("seed mismatched uuid refresh metadata");
+        assert!(updated);
+        txn.commit().expect("commit mismatched uuid metadata seed");
+    }
+
     fn create_base_table(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -10748,6 +10808,81 @@ mod tests {
             "err={err}"
         );
         assert!(err.contains("recreate the MV"), "err={err}");
+    }
+
+    #[test]
+    fn plan_iceberg_union_all_projection_rejects_base_uuid_identity_change() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_base_table_with_rows(&env.state, "ice", "sales", "returns", &[(2, "b")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first projection/filter UNION ALL refresh");
+        seed_union_projection_mismatched_uuid_refresh_metadata(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_union_orders",
+            "ice.sales.orders",
+        );
+
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_union_orders".to_string(),
+        };
+        let err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("mismatched base table uuid should be rejected during planning");
+
+        assert!(
+            err.message.contains("base table identity changed"),
+            "err={err:?}"
+        );
+        assert!(err.message.contains("ice.sales.orders"), "err={err:?}");
+    }
+
+    #[test]
+    fn refresh_iceberg_union_all_projection_rejects_base_uuid_identity_change() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_base_table_with_rows(&env.state, "ice", "sales", "returns", &[(2, "b")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first projection/filter UNION ALL refresh");
+        seed_union_projection_mismatched_uuid_refresh_metadata(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_union_orders",
+            "ice.sales.orders",
+        );
+
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("mismatched base table uuid should be rejected during execution");
+
+        assert!(err.contains("base table identity changed"), "err={err}");
+        assert!(err.contains("ice.sales.orders"), "err={err}");
     }
 
     #[test]
