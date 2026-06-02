@@ -14,7 +14,9 @@ use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::action_propagation::first_delta_base_fqn;
+use crate::sql::optimizer::rewrite::imv::action_propagation::{
+    first_delta_base_fqn, is_supported_fan_in_delta_union,
+};
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
@@ -164,7 +166,23 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
                 "Iceberg IMV rewrite does not support this join shape above delta-bound scan {fqn}"
             ))
         }
-        LogicalPlan::Union(_) if subtree_has_delta(plan) => {
+        LogicalPlan::Union(node) if is_supported_fan_in_delta_union(node) => {
+            for input in &node.inputs {
+                validate_node(input)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
+            for input in &node.inputs {
+                validate_signed_delta_input(input)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Union(node)
+            if subtree_has_delta(plan)
+                && !is_supported_join_delta_union(node)
+                && !is_supported_fan_in_delta_union(node) =>
+        {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
                 "Iceberg IMV rewrite does not support this union shape above delta-bound scan {fqn}"
@@ -248,7 +266,9 @@ fn validate_signed_delta_input(plan: &LogicalPlan) -> Result<(), String> {
             validate_signed_delta_input(&node.left)?;
             validate_signed_delta_input(&node.right)
         }
-        LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
+        LogicalPlan::Union(node)
+            if is_supported_join_delta_union(node) || is_supported_fan_in_delta_union(node) =>
+        {
             for input in &node.inputs {
                 validate_signed_delta_input(input)?;
             }
@@ -427,7 +447,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, AggregateStateMergeNode, ProjectNode, ValuesNode,
+        AggregateCall, AggregateNode, AggregateStateMergeNode, ProjectNode, UnionNode, ValuesNode,
     };
 
     #[test]
@@ -721,11 +741,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_union_above_delta() {
-        use crate::sql::planner::plan::UnionNode;
         let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![LogicalPlan::Scan(delta_scan_with(Some(
-                ImvActionColumn::output_column(ColumnId(100)),
-            )))],
+            inputs: vec![
+                normalized_delta_project(ColumnId(100), ColumnId(1), ColumnId(101)),
+                normalized_delta_project_without_action(ColumnId(10), ColumnId(111)),
+            ],
             all: true,
             output_columns: Vec::new(),
             required_output_columns: None,
@@ -735,6 +755,149 @@ mod tests {
             err.contains("Iceberg IMV rewrite does not support this union shape"),
             "got: {err}"
         );
+    }
+
+    fn column_ref_item(
+        column_id: ColumnId,
+        column: &str,
+        data_type: DataType,
+        nullable: bool,
+        output_name: &str,
+        output_column_id: ColumnId,
+    ) -> ProjectItem {
+        ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier: None,
+                    column: column.to_string(),
+                },
+                data_type,
+                nullable,
+            },
+            output_name: output_name.to_string(),
+            output_column_id,
+        }
+    }
+
+    fn normalized_delta_project(
+        action_id: ColumnId,
+        user_col_id: ColumnId,
+        row_id: ColumnId,
+    ) -> LogicalPlan {
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(action_id)));
+        scan.columns[0].column_id = user_col_id;
+        scan.columns.push(ImvRowIdColumn::output_column(row_id));
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            items: vec![
+                column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
+                column_ref_item(
+                    action_id,
+                    ImvActionColumn::NAME,
+                    DataType::Int8,
+                    false,
+                    ImvActionColumn::NAME,
+                    action_id,
+                ),
+                column_ref_item(
+                    row_id,
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                    ImvRowIdColumn::NAME,
+                    row_id,
+                ),
+            ],
+            required_output_columns: None,
+        })
+    }
+
+    fn normalized_delta_project_without_action(
+        user_col_id: ColumnId,
+        row_id: ColumnId,
+    ) -> LogicalPlan {
+        let mut scan = delta_scan_with(None);
+        scan.columns[0].column_id = user_col_id;
+        scan.columns.push(ImvRowIdColumn::output_column(row_id));
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            items: vec![
+                column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
+                column_ref_item(
+                    row_id,
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                    ImvRowIdColumn::NAME,
+                    row_id,
+                ),
+            ],
+            required_output_columns: None,
+        })
+    }
+
+    fn fan_in_delta_union(action_id: ColumnId) -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                normalized_delta_project(action_id, ColumnId(1), ColumnId(101)),
+                normalized_delta_project(action_id, ColumnId(10), ColumnId(111)),
+            ],
+            all: true,
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                ImvActionColumn::output_column(action_id),
+                ImvRowIdColumn::output_column(ColumnId(101)),
+            ],
+            required_output_columns: None,
+        })
+    }
+
+    fn root_project_with_apply_key(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: vec![
+                column_ref_item(ColumnId(1), "k", DataType::Int64, false, "k", ColumnId(1)),
+                column_ref_item(
+                    ColumnId(100),
+                    ImvActionColumn::NAME,
+                    DataType::Int8,
+                    false,
+                    ImvActionColumn::NAME,
+                    ColumnId(100),
+                ),
+                column_ref_item(
+                    ColumnId(101),
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                    ImvRowIdColumn::NAME,
+                    ColumnId(101),
+                ),
+                column_ref_item(
+                    ColumnId(101),
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                    ICEBERG_MV_APPLY_KEY_COLUMN,
+                    ColumnId(102),
+                ),
+            ],
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn validation_accepts_fan_in_delta_union_above_delta_scans() {
+        let plan = root_project_with_apply_key(fan_in_delta_union(ColumnId(100)));
+
+        validate(&plan).expect("fan-in delta union must validate");
     }
 
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
@@ -855,12 +1018,59 @@ mod tests {
         })
     }
 
+    fn signed_aggregate_state_merge_over(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                required_output_columns: None,
+            })),
+            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(input),
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId(10),
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+                required_output_columns: None,
+            })),
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["__agg_state_s".to_string()],
+            change_op_column: "__change_op".to_string(),
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId(10),
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        })
+    }
+
     #[test]
     fn validation_accepts_signed_aggregate_inside_state_merge() {
         let plan =
             signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
 
         validate(&plan).expect("signed aggregate inside AggregateStateMerge must validate");
+    }
+
+    #[test]
+    fn validation_accepts_fan_in_delta_union_inside_state_merge() {
+        let plan = signed_aggregate_state_merge_over(fan_in_delta_union(ColumnId(100)));
+
+        validate(&plan).expect("fan-in delta union inside AggregateStateMerge must validate");
     }
 
     #[test]
