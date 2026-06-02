@@ -2280,9 +2280,13 @@ fn refresh_iceberg_union_projection_mv(
 
     let previous_snapshots = &mv_definition.last_refresh_snapshots;
     let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
-    let has_previous = base_refs
+    let has_previous_snapshots = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let has_previous_table_uuids = base_refs
+        .iter()
+        .any(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
+    let has_previous = has_previous_snapshots || has_previous_table_uuids;
     let all_previous_snapshots = base_refs
         .iter()
         .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -4013,9 +4017,13 @@ fn plan_iceberg_union_projection_mv_refresh(
 
     let previous_snapshots = &mv_definition.last_refresh_snapshots;
     let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
-    let has_previous = base_refs
+    let has_previous_snapshots = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let has_previous_table_uuids = base_refs
+        .iter()
+        .any(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
+    let has_previous = has_previous_snapshots || has_previous_table_uuids;
     let all_previous_snapshots = base_refs
         .iter()
         .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -9610,6 +9618,38 @@ mod tests {
             .expect("lookup mv definition")
     }
 
+    fn seed_union_projection_uuid_only_refresh_metadata(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        base_fqn: &str,
+    ) {
+        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
+            .expect("mv definition for uuid-only metadata seed");
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let mut txn = provider
+            .begin_write("seed uuid-only iceberg mv refresh metadata")
+            .expect("write txn");
+        let mut table_uuids = BTreeMap::new();
+        table_uuids.insert(base_fqn.to_string(), "uuid-without-snapshot".to_string());
+        let updated = state
+            .mv_repo
+            .update_starrocks_refresh_summary_if_present(
+                txn.as_mut(),
+                crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest {
+                    mv_id: mv.mv_id,
+                    last_refresh_ms: now_ms(),
+                    last_refresh_rows: 0,
+                    base_snapshots: BTreeMap::new(),
+                    base_table_uuids: table_uuids,
+                },
+            )
+            .expect("seed uuid-only refresh metadata");
+        assert!(updated);
+        txn.commit().expect("commit uuid-only metadata seed");
+    }
+
     fn create_base_table(
         state: &Arc<StandaloneState>,
         catalog: &str,
@@ -10634,6 +10674,80 @@ mod tests {
             plan.snapshot_pins.get("ice.sales.returns").copied(),
             Some(None)
         );
+    }
+
+    #[test]
+    fn plan_iceberg_union_all_projection_rejects_uuid_without_snapshot_metadata() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "returns");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+        seed_union_projection_uuid_only_refresh_metadata(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_union_orders",
+            "ice.sales.orders",
+        );
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_union_orders".to_string(),
+        };
+        let err =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect_err("uuid-only previous metadata should be rejected during planning");
+
+        assert!(
+            err.message.contains("partial previous refresh metadata"),
+            "err={err:?}"
+        );
+        assert!(err.message.contains("recreate the MV"), "err={err:?}");
+    }
+
+    #[test]
+    fn refresh_iceberg_union_all_projection_rejects_uuid_without_snapshot_metadata() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "returns");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+        seed_union_projection_uuid_only_refresh_metadata(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_union_orders",
+            "ice.sales.orders",
+        );
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("uuid-only previous metadata should be rejected during execution");
+
+        assert!(
+            err.contains("partial previous refresh metadata"),
+            "err={err}"
+        );
+        assert!(err.contains("recreate the MV"), "err={err}");
     }
 
     #[test]
