@@ -637,11 +637,13 @@ fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
 /// by default on V3 tables; writers may opt out with
 /// `write.row-lineage=false`.
 ///
-/// This is intentionally more permissive than `is_v3_row_lineage`, which
-/// is used to gate exposure of the `_row_id` /
-/// `_last_updated_sequence_number` pseudo-columns at SQL analysis time
-/// (where the explicit opt-in property is the safer signal). OPTIMIZE
-/// preserves row-lineage whenever the writer would emit it on a fresh
+/// This is intentionally more permissive than `is_v3_row_lineage`. Schema-only
+/// table definitions use this to expose row-lineage metadata columns for
+/// catalog registration before scan files are bound, following V3-default
+/// semantics. Scan-binding table definitions remain stricter and use
+/// `is_v3_row_lineage` plus per-file `first_row_id` because ordinary scans can
+/// only synthesize row-lineage metadata when every bound file carries row IDs.
+/// OPTIMIZE preserves row-lineage whenever the writer would emit it on a fresh
 /// INSERT, which follows the V3-default semantics modelled here.
 pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bool {
     if !matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3) {
@@ -703,7 +705,8 @@ impl TableSink for IcebergTableSink {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use iceberg::spec::{
         FormatVersion, ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema,
@@ -711,6 +714,8 @@ mod tests {
     };
     use iceberg::table::Table;
     use iceberg::{NamespaceIdent, TableIdent};
+
+    use crate::sql::parser::ast::{SqlType, TableColumnDef};
 
     use super::*;
 
@@ -725,6 +730,22 @@ mod tests {
             )],
         )
         .expect("catalog entry")
+    }
+
+    fn unique_warehouse(test_name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "novarocks_backend_test_{}_{}_{}",
+                test_name,
+                std::process::id(),
+                nanos
+            ))
+            .to_string_lossy()
+            .to_string()
     }
 
     fn v3_row_lineage_loaded_table() -> IcebergLoadedTable {
@@ -964,6 +985,76 @@ mod tests {
                 .expect("schema-only table def");
 
         assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
+    }
+
+    #[test]
+    fn schema_only_table_source_v3_row_lineage_uses_override_without_scan_files() {
+        let registry = Arc::new(RwLock::new(IcebergCatalogRegistry::default()));
+        {
+            let mut guard = registry.write().expect("iceberg catalog write lock");
+            guard
+                .create_catalog(
+                    "ice",
+                    &[(
+                        "iceberg.catalog.warehouse".to_string(),
+                        unique_warehouse("schema_only_table_source"),
+                    )],
+                )
+                .expect("create catalog");
+        }
+        let backend = IcebergCatalogBackend::new(registry.clone());
+        backend
+            .create_namespace("ice", "db")
+            .expect("create namespace");
+        backend
+            .create_table(CreateTableRequest {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                columns: vec![TableColumnDef {
+                    name: "id".to_string(),
+                    data_type: SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key_desc: None,
+                bucket_count: None,
+                partition_fields: vec![],
+                properties: vec![
+                    ("format-version".to_string(), "3".to_string()),
+                    ("write.row-lineage".to_string(), "true".to_string()),
+                ],
+            })
+            .expect("create v3 row-lineage table");
+
+        let source = IcebergTableSource::new(registry);
+        let table_source: &dyn TableSource = &source;
+        let table_def = table_source
+            .build_schema_table_def(&ResolvedTable {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                columns: vec![],
+            })
+            .expect("schema-only table def through table source");
+
+        let names = table_def
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+        );
+        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
+            panic!("expected iceberg data-file scan source");
+        };
+        assert!(
+            files.is_empty(),
+            "schema-only table source must not bind snapshot data files"
+        );
     }
 
     #[test]
