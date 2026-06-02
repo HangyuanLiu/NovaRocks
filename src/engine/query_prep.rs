@@ -154,7 +154,9 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 /// 2. Build a synthetic `TableDef` for that snapshot and register it in the
 ///    in-memory catalog under the name `<table>__at_<snapshot_id>`.
 /// 3. Rewrite the `TableFactor::Table`:
-///    - Replace `name` with the synthetic 1-part name.
+///    - Replace `name` with `default_catalog.<namespace>.<synthetic name>` so
+///      CatalogMgrProvider routes the local synthetic table through the
+///      InMemoryCatalog even when the session has an Iceberg current catalog.
 ///    - Clear `version` (set to `None`).
 ///    - Preserve any existing alias; if none, set `alias` = original table name
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
@@ -370,12 +372,15 @@ fn rewrite_time_travel_in_factor(
                 });
             }
 
-            // Replace with a 2-part namespace-qualified synthetic name so the
-            // rewritten query resolves correctly even when `current_database` is
-            // empty or does not match the table's namespace.  The analyzer
-            // accepts `<namespace>.<table>` 2-part references in the same way it
-            // handles non-time-travel tables found via register_external_tables.
+            // Replace with an explicit default_catalog-qualified synthetic
+            // name. The synthetic table is registered in the local
+            // InMemoryCatalog, and the catalog prefix prevents a session-level
+            // Iceberg current catalog from routing `db.synthetic` back through
+            // the Iceberg CatalogMgr entry.
             *name = sqlparser::ast::ObjectName(vec![
+                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
+                    "default_catalog",
+                )),
                 sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
                     target.namespace.clone(),
                 )),

@@ -6497,6 +6497,10 @@ enable_path_style_access = true
 
     fn collect_id_v(session: &StandaloneSession, sql: &str) -> Vec<(i32, String)> {
         let result = session.query(sql).expect("query");
+        collect_id_v_from_result(result)
+    }
+
+    fn collect_id_v_from_result(result: QueryResult) -> Vec<(i32, String)> {
         let mut out = Vec::new();
         for chunk in &result.chunks {
             let ids = chunk
@@ -6516,6 +6520,49 @@ enable_path_style_access = true
             }
         }
         out
+    }
+
+    #[test]
+    fn time_travel_select_with_current_iceberg_catalog_resolves_synthetic_local_table() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("seed");
+
+        let result = session
+            .execute_in_context(
+                "select id, v from t for version as of 'main'",
+                Some("ice"),
+                "db1",
+                None,
+            )
+            .expect("time-travel select");
+        let StatementResult::Query(result) = result else {
+            panic!("expected query result");
+        };
+
+        assert_eq!(collect_id_v_from_result(result), vec![(1, "a".to_string())]);
+    }
+
+    #[test]
+    fn time_travel_explain_with_current_iceberg_catalog_resolves_synthetic_local_table() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
+            .expect("seed");
+
+        let result = session
+            .execute_in_context(
+                "explain select id from t for version as of 'main'",
+                Some("ice"),
+                "db1",
+                None,
+            )
+            .expect("time-travel explain");
+
+        assert!(matches!(result, StatementResult::Query(_)));
     }
 
     #[test]
