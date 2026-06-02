@@ -4511,6 +4511,27 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_passes_uppercase_three_part_catalog_to_catalog_provider() {
+        let stmt =
+            crate::sql::parser::parse_sql_raw("SELECT id FROM ICE.DB.ORDERS").expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+
+        let (resolved, _, _) =
+            analyze(&query, &CatalogAwareTestCatalog, "default").expect("analyze");
+
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("expected select");
+        };
+        let Some(Relation::Scan(scan)) = select.from else {
+            panic!("expected scan");
+        };
+        assert_eq!(scan.database, "db");
+        assert_eq!(scan.table.name, "ice_db_orders");
+    }
+
+    #[test]
     fn analyzer_uses_metadata_lookup_mode_for_partitions_table() {
         struct MetadataModeCatalog(std::cell::Cell<bool>);
         impl crate::sql::catalog::CatalogProvider for MetadataModeCatalog {
@@ -4538,6 +4559,49 @@ mod tests {
         let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
         let stmt =
             crate::sql::parser::parse_sql_raw("SELECT record_count FROM ice.db.orders$partitions")
+                .expect("parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+
+        let _ = analyze(&query, &catalog, "default").expect("analyze");
+        assert!(
+            catalog.0.get(),
+            "partitions metadata lookup mode was not requested"
+        );
+    }
+
+    #[test]
+    fn analyzer_uses_lowercase_catalog_for_metadata_lookup_mode() {
+        struct LowercaseMetadataModeCatalog(std::cell::Cell<bool>);
+        impl crate::sql::catalog::CatalogProvider for LowercaseMetadataModeCatalog {
+            fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+                self.get_table_with_mode(None, database, table, TableLookupMode::SchemaOnly)
+            }
+
+            fn get_table_with_mode(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+                mode: TableLookupMode,
+            ) -> Result<TableDef, String> {
+                assert_eq!(catalog, Some("ice"));
+                assert_eq!(database, "db");
+                assert_eq!(table, "orders");
+                self.0.set(matches!(
+                    mode,
+                    TableLookupMode::IcebergMetadata {
+                        metadata_table_type: IcebergMetadataTableType::Partitions,
+                    }
+                ));
+                CatalogAwareTestCatalog.get_table_in_catalog(catalog, database, table)
+            }
+        }
+
+        let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
+        let stmt =
+            crate::sql::parser::parse_sql_raw("SELECT record_count FROM ICE.DB.ORDERS$partitions")
                 .expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");

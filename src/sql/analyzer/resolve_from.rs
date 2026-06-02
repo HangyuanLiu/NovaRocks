@@ -350,9 +350,11 @@ impl<'a> super::AnalyzerContext<'a> {
                             tbl.to_lowercase(),
                         ),
                         [db, tbl] => (None, db.to_lowercase(), tbl.to_lowercase()),
-                        [cat, db, tbl] => {
-                            (Some(cat.as_str()), db.to_lowercase(), tbl.to_lowercase())
-                        }
+                        [cat, db, tbl] => (
+                            Some(cat.to_lowercase()),
+                            db.to_lowercase(),
+                            tbl.to_lowercase(),
+                        ),
                         _ => {
                             return Err(format!(
                                 "iceberg metadata table requires <tbl> | <db>.<tbl> | <cat>.<db>.<tbl>, got: {parts:?}"
@@ -361,7 +363,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     };
 
                     let table_def = self.catalog.get_table_with_mode(
-                        catalog_override,
+                        catalog_override.as_deref(),
                         &db_lower,
                         &tbl_lower,
                         crate::sql::catalog::TableLookupMode::IcebergMetadata {
@@ -403,7 +405,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 let (catalog_override, db, tbl) = match parts.len() {
                     1 => (None, self.current_database.to_string(), parts[0].clone()),
                     2 => (None, parts[0].clone(), parts[1].clone()),
-                    3 => (Some(parts[0].as_str()), parts[1].clone(), parts[2].clone()),
+                    3 => (
+                        Some(parts[0].to_lowercase()),
+                        parts[1].clone(),
+                        parts[2].clone(),
+                    ),
                     _ => return Err(format!("unsupported table name: {name}")),
                 };
                 let db_lower = db.to_lowercase();
@@ -472,9 +478,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
-                let table_def =
-                    self.catalog
-                        .get_table_in_catalog(catalog_override, &db_lower, &tbl_lower)?;
+                let table_def = self.catalog.get_table_in_catalog(
+                    catalog_override.as_deref(),
+                    &db_lower,
+                    &tbl_lower,
+                )?;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                 // Build scope
