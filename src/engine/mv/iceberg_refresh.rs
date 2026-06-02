@@ -269,6 +269,17 @@ pub(crate) fn create_iceberg_mv(
             "Iceberg MV output column name {apply_key_column_name} is reserved for internal apply key"
         ));
     }
+    if matches!(&shape, IncrementalMvShape::UnionAll(_))
+        && analysis.output_columns.iter().any(|column| {
+            column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        })
+    {
+        return Err(format!(
+            "Iceberg MV output column name {ICEBERG_MV_BRANCH_ID_COLUMN} is reserved for internal branch id"
+        ));
+    }
     let mut columns = if let IncrementalMvShape::UnionAll(union_shape) = &shape {
         match union_shape.branch_kind {
             UnionBranchKind::Aggregate => {
@@ -9483,6 +9494,34 @@ mod tests {
     }
 
     #[test]
+    fn create_iceberg_union_all_projection_mv_rejects_branch_id_output_alias() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "returns");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_branch_id
+             DISTRIBUTED BY HASH(__branch_id__) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id AS __branch_id__, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id AS __branch_id__, name FROM ice.sales.returns",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("UNION ALL branch id output alias should be rejected");
+        assert!(err.contains(ICEBERG_MV_BRANCH_ID_COLUMN), "err={err}");
+        assert!(err.contains("reserved"), "err={err}");
+
+        let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+        let entry = catalogs.get("ice").expect("catalog");
+        assert!(
+            !iceberg_mv_target_exists(&entry, "analytics", "mv_union_branch_id")
+                .expect("target existence check"),
+            "reserved-name failure must happen before target schema creation"
+        );
+    }
+
+    #[test]
     fn create_iceberg_union_all_aggregate_mv_persists_branch_contract() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
@@ -9532,6 +9571,10 @@ mod tests {
             .iter()
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
+        let branch_field = fields
+            .iter()
+            .find(|field| field.name == ICEBERG_MV_BRANCH_ID_COLUMN)
+            .expect("branch id field");
         assert_eq!(
             field_names,
             vec![
@@ -9561,7 +9604,7 @@ mod tests {
             branch.inner_apply_key_source,
             crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
         );
-        assert_eq!(branch.branch_id_column.target_field_id, 7);
+        assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
     }
 
     #[test]
