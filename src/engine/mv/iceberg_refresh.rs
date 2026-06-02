@@ -646,6 +646,162 @@ fn validate_aggregate_schema_contract_for_base(
     }
 }
 
+fn validate_union_projection_shape_base_refs(
+    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    base_refs: &[IcebergTableRef],
+) -> Result<(), String> {
+    if union_shape.branch_kind != UnionBranchKind::ProjectionFilter {
+        return Err(
+            "UNION ALL projection/filter refresh requires projection/filter branches".to_string(),
+        );
+    }
+    let mut branch_refs = BTreeSet::new();
+    for branch in &union_shape.branches {
+        let IncrementalMvShape::ProjectionFilter(branch) = branch else {
+            return Err(
+                "UNION ALL projection/filter refresh requires projection/filter branches"
+                    .to_string(),
+            );
+        };
+        branch_refs.insert(branch.base_table.to_string().to_ascii_lowercase());
+    }
+    let resolved_refs = base_refs
+        .iter()
+        .map(|base_ref| base_ref.fqn().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if branch_refs != resolved_refs {
+        return Err(format!(
+            "UNION ALL projection/filter MV branch bases must exactly match resolved base refs: branch_bases={branch_refs:?}, resolved={resolved_refs:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_union_projection_schema_contract_for_base(
+    iceberg_target: &IcebergMvTarget,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    base_ref: &IcebergTableRef,
+    base_table: &iceberg::table::Table,
+    target_table: &iceberg::table::Table,
+) -> Result<(), String> {
+    if schema_contract.contract_version != 1 {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} requires schema contract version 1, got {}",
+            iceberg_target.catalog,
+            iceberg_target.namespace,
+            iceberg_target.table,
+            schema_contract.contract_version
+        ));
+    }
+    schema_contract.ensure_self_consistent().map_err(|e| {
+        format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} schema contract is invalid: {e}",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )
+    })?;
+    let branch_contract = schema_contract.branch.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} is missing branch contract; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )
+    })?;
+    if branch_contract.branch_count != union_shape.branches.len() as u32 {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract expected {} branches, query has {}",
+            iceberg_target.catalog,
+            iceberg_target.namespace,
+            iceberg_target.table,
+            branch_contract.branch_count,
+            union_shape.branches.len()
+        ));
+    }
+    if branch_contract.inner_apply_key_source
+        != crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
+    {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract must use BaseRowId inner apply keys",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ));
+    }
+    let target_fields = target_table
+        .metadata()
+        .current_schema()
+        .as_struct()
+        .fields();
+    let branch_field = target_fields
+        .iter()
+        .find(|field| field.id == branch_contract.branch_id_column.target_field_id)
+        .ok_or_else(|| {
+            format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id field id {} is missing from target schema",
+                iceberg_target.catalog,
+                iceberg_target.namespace,
+                iceberg_target.table,
+                branch_contract.branch_id_column.target_field_id
+            )
+        })?;
+    if !branch_field
+        .name
+        .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+    {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column renamed externally to {}; recreate the MV",
+            iceberg_target.catalog,
+            iceberg_target.namespace,
+            iceberg_target.table,
+            branch_field.name
+        ));
+    }
+    if !branch_field.required {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be required",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ));
+    }
+    match branch_field.field_type.as_ref() {
+        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int) => {}
+        other => {
+            return Err(format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be Int, got {other}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            ));
+        }
+    }
+
+    let mut base_contract = schema_contract.clone();
+    base_contract.base = schema_contract
+        .bases
+        .iter()
+        .find(|base| base.table_fqn.eq_ignore_ascii_case(&base_ref.fqn()))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} schema contract missing base {}; recreate the MV",
+                iceberg_target.catalog,
+                iceberg_target.namespace,
+                iceberg_target.table,
+                base_ref.fqn()
+            )
+        })?;
+    match crate::engine::mv::schema_contract::validate_schema_contract(
+        &base_contract,
+        base_table,
+        target_table,
+    ) {
+        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            Err(format!("{err}"))
+        }
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(()),
+        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
+            ..
+        } => Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} requires schema rebind, which is not supported for UNION ALL refresh; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )),
+    }
+}
+
 fn is_join_projection_filter_mv(shape: &IncrementalMvShape) -> bool {
     matches!(shape, IncrementalMvShape::JoinProjectionFilter(_))
 }
@@ -1622,6 +1778,103 @@ fn rewrite_full_refresh_select_with_pin(
     Ok(stmt.to_string())
 }
 
+fn rewrite_union_projection_full_refresh_select_with_pin(
+    select_sql: &str,
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<String, String> {
+    let normalized =
+        crate::sql::parser::dialect::normalize_for_raw_parse(select_sql).map_err(|e| {
+            format!("iceberg UNION ALL MV full refresh pin SELECT normalize error: {e}")
+        })?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("iceberg UNION ALL MV full refresh pin SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("iceberg UNION ALL MV full refresh expects a SELECT query".to_string());
+    };
+    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
+        query,
+        pin,
+        &HashSet::new(),
+        current_catalog,
+        current_database,
+    )?;
+    let mut next_branch_id = 0_i32;
+    append_union_projection_hidden_columns_to_set_expr(
+        query.body.as_mut(),
+        &mut next_branch_id,
+        union_shape.branches.len() as i32,
+    )?;
+    if next_branch_id != union_shape.branches.len() as i32 {
+        return Err(format!(
+            "iceberg UNION ALL MV full refresh expected {} branches, rewrote {next_branch_id}",
+            union_shape.branches.len()
+        ));
+    }
+    Ok(stmt.to_string())
+}
+
+fn append_union_projection_hidden_columns_to_set_expr(
+    set_expr: &mut sqlparser::ast::SetExpr,
+    next_branch_id: &mut i32,
+    branch_count: i32,
+) -> Result<(), String> {
+    match set_expr {
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            append_union_projection_hidden_columns_to_set_expr(
+                left.as_mut(),
+                next_branch_id,
+                branch_count,
+            )?;
+            append_union_projection_hidden_columns_to_set_expr(
+                right.as_mut(),
+                next_branch_id,
+                branch_count,
+            )
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            append_union_projection_hidden_columns_to_set_expr(
+                query.body.as_mut(),
+                next_branch_id,
+                branch_count,
+            )
+        }
+        sqlparser::ast::SetExpr::Select(select) => {
+            if *next_branch_id >= branch_count {
+                return Err(format!(
+                    "iceberg UNION ALL MV full refresh found more than {branch_count} branches"
+                ));
+            }
+            let branch_id = *next_branch_id;
+            *next_branch_id += 1;
+            select
+                .projection
+                .push(sqlparser::ast::SelectItem::ExprWithAlias {
+                    expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
+                    alias: sqlparser::ast::Ident::new(ICEBERG_MV_APPLY_KEY_COLUMN),
+                });
+            select
+                .projection
+                .push(sqlparser::ast::SelectItem::ExprWithAlias {
+                    expr: sqlparser::ast::Expr::Cast {
+                        kind: sqlparser::ast::CastKind::Cast,
+                        expr: Box::new(sqlparser::ast::Expr::Value(
+                            sqlparser::ast::Value::Number(branch_id.to_string(), false).into(),
+                        )),
+                        data_type: sqlparser::ast::DataType::Int(None),
+                        array: false,
+                        format: None,
+                    },
+                    alias: sqlparser::ast::Ident::new(ICEBERG_MV_BRANCH_ID_COLUMN),
+                });
+            Ok(())
+        }
+        _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
+    }
+}
+
 fn iceberg_aggregate_first_refresh_select_sql(
     select_sql: &str,
     shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
@@ -1730,6 +1983,27 @@ fn refresh_iceberg_mv_with_planned_partitions(
             &mv_definition,
             &base_refs,
             join_shape,
+        );
+    }
+    if let IncrementalMvShape::UnionAll(union_shape) = &shape {
+        if union_shape.branch_kind == UnionBranchKind::ProjectionFilter {
+            return refresh_iceberg_union_projection_mv(
+                state,
+                &target,
+                &target_entry,
+                &iceberg_catalog,
+                &target_loaded.table,
+                expected_main_snapshot_id_from_table(&target_loaded.table),
+                current_catalog,
+                current_database,
+                &mv_definition,
+                &base_refs,
+                &canonical_select_query,
+                union_shape,
+            );
+        }
+        return Err(
+            "top-level aggregate UNION ALL refresh execution is not yet supported".to_string(),
         );
     }
     if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
@@ -1958,6 +2232,290 @@ fn refresh_iceberg_mv_with_planned_partitions(
             target.catalog, target.namespace, target.table
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_iceberg_union_projection_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    target_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    canonical_select_query: &sqlparser::ast::Query,
+    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+) -> Result<StatementResult, String> {
+    validate_union_projection_shape_base_refs(union_shape, base_refs)?;
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+
+    let mut pre_pin_current_snapshots = BTreeMap::new();
+    for base_ref in base_refs {
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        validate_union_projection_schema_contract_for_base(
+            target,
+            schema_contract,
+            union_shape,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )?;
+        pre_pin_current_snapshots.insert(
+            base_ref.fqn(),
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+        );
+    }
+
+    let previous_snapshots = &mv_definition.last_refresh_snapshots;
+    let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
+    let has_previous = base_refs
+        .iter()
+        .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let all_previous_snapshots = base_refs
+        .iter()
+        .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let all_previous_table_uuids = base_refs
+        .iter()
+        .all(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
+    let all_current = pre_pin_current_snapshots.values().all(Option::is_some);
+    let any_current = pre_pin_current_snapshots.values().any(Option::is_some);
+
+    if has_previous && (!all_previous_snapshots || !all_previous_table_uuids) {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if !has_previous && !any_current {
+        tracing::info!(
+            "iceberg mv {}.{}.{}: all UNION ALL branch bases have no snapshot; skipping refresh",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        return Ok(StatementResult::Ok);
+    }
+    if !has_previous && !all_current {
+        return Err(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} cannot run first refresh because only some branch bases have current snapshots; load all branch bases or recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if has_previous && !all_current {
+        let missing = base_refs
+            .iter()
+            .find(|base_ref| {
+                pre_pin_current_snapshots
+                    .get(&base_ref.fqn())
+                    .copied()
+                    .flatten()
+                    .is_none()
+            })
+            .map(IcebergTableRef::fqn)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Err(format!(
+            "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previously-refreshed base snapshot for {missing} is no longer reachable",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
+        state, base_refs,
+    )?;
+    let mut loaded_bases = Vec::with_capacity(base_refs.len());
+    for base_ref in base_refs {
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        validate_union_projection_schema_contract_for_base(
+            target,
+            schema_contract,
+            union_shape,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )?;
+        let current_snapshot_id = pin.get(base_ref).ok_or_else(|| {
+            format!(
+                "refresh pin missing snapshot for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?;
+        let current_table_uuid = pin
+            .uuid(base_ref)
+            .ok_or_else(|| {
+                format!(
+                    "refresh pin missing uuid for base {} (this should not happen)",
+                    base_ref.fqn()
+                )
+            })?
+            .to_string();
+        loaded_bases.push((
+            base_ref.clone(),
+            loaded,
+            current_snapshot_id,
+            current_table_uuid,
+        ));
+    }
+
+    if has_previous {
+        for (base_ref, loaded, current_snapshot_id, _) in &loaded_bases {
+            let fqn = base_ref.fqn();
+            let previous_snapshot_id = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                format!(
+                    "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+                    target.catalog, target.namespace, target.table
+                )
+            })?;
+            if previous_snapshot_id != *current_snapshot_id {
+                crate::connector::iceberg::changes::classify_lineage(
+                    loaded.table.metadata(),
+                    previous_snapshot_id,
+                    *current_snapshot_id,
+                )
+                .map_err(|e| {
+                    format!(
+                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previous base snapshot {previous_snapshot_id} for {} is not reachable from pinned snapshot {}: {e}",
+                        target.catalog,
+                        target.namespace,
+                        target.table,
+                        fqn,
+                        current_snapshot_id
+                    )
+                })?;
+            }
+        }
+    }
+
+    let effective_definition = mv_definition.clone();
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(effective_definition),
+            Arc::new(canonical_select_query.clone()),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            Arc::clone(iceberg_catalog),
+            target_table.clone(),
+        )?
+    };
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg UNION ALL projection/filter MV refresh context constructed"
+    );
+
+    if !has_previous {
+        let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
+            &ctx.rewrite.mv_definition.select_sql,
+            &pin,
+            union_shape,
+            current_catalog,
+            current_database,
+        )?;
+        let staging_branch = format!(
+            "__nova_mv_refresh_{}_{}",
+            mv_definition.mv_id,
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            state,
+            target,
+            mv_definition.mv_id,
+            target_snapshot_id,
+            pin.to_snapshot_map(),
+            &staging_branch,
+        )?;
+        return first_refresh_iceberg_mv_with_physical_sql(
+            state,
+            &ctx,
+            &staging_branch,
+            refresh_id,
+            pin.to_snapshot_map(),
+            pin.to_table_uuid_map(),
+            &full_select_sql,
+        );
+    }
+
+    let all_unchanged = loaded_bases.iter().all(|(base_ref, _, current, _)| {
+        previous_snapshots.get(&base_ref.fqn()).copied() == Some(*current)
+    });
+    if all_unchanged {
+        tracing::info!(
+            "iceberg mv {}.{}.{}: UNION ALL branch base snapshots unchanged; updating metadata only",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        let snapshots = pin.to_snapshot_map();
+        let table_uuids = pin.to_table_uuid_map();
+        let recorded_target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
+        let refresh_id =
+            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+        finalize_iceberg_mv_refresh(
+            state,
+            refresh_id,
+            mv_definition.last_refresh_rows.unwrap_or(0),
+            snapshots,
+            table_uuids,
+            recorded_target_snapshot_id,
+        )?;
+        return Ok(StatementResult::Ok);
+    }
+
+    let changes = loaded_bases
+        .iter()
+        .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+            let previous_snapshot_id = previous_snapshots
+                .get(&base_ref.fqn())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+                        target.catalog, target.namespace, target.table
+                    )
+                })?;
+            Ok(RewriteMergeBaseChange {
+                base_ref,
+                previous_snapshot_id,
+                current_snapshot_id: *current_snapshot_id,
+                base_table: &loaded.table,
+                current_table_uuid,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    incremental_refresh_iceberg_mv_with_changes(
+        state,
+        &ctx,
+        &changes,
+        None,
+        RewriteMergeRefreshOptions {
+            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN,
+            apply_key_value_type:
+                crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchInt64,
+            allow_full_rebuild_on_policy_full_refresh: false,
+            rewrite_evidence: RewriteMergeRefreshEvidence::None,
+            preload_locator_for_change_stream_deletes: false,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2923,6 +3481,12 @@ fn unknown_join_affected_partitions() -> crate::engine::mv::partition::AffectedM
     )
 }
 
+fn unknown_union_all_affected_partitions() -> crate::engine::mv::partition::AffectedMvPartitions {
+    crate::engine::mv::partition::AffectedMvPartitions::unknown(
+        "UNION ALL MV affected partition planning is not implemented",
+    )
+}
+
 fn noop_affected_partitions(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> crate::engine::mv::partition::AffectedMvPartitions {
@@ -3047,9 +3611,23 @@ pub(crate) fn plan_iceberg_mv_refresh(
     );
     let shape =
         classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
-    if let IncrementalMvShape::UnionAll(_) = &shape {
+    if let IncrementalMvShape::UnionAll(union_shape) = &shape {
+        if union_shape.branch_kind == UnionBranchKind::ProjectionFilter {
+            return plan_iceberg_union_projection_mv_refresh(
+                state,
+                &iceberg_target,
+                &target_loaded.table,
+                target,
+                stmt,
+                current_catalog,
+                current_database,
+                &mv_definition,
+                &base_refs,
+                union_shape,
+            );
+        }
         return Err(RefreshError::user(
-            "incremental UNION ALL MV refresh is not yet supported in this build",
+            "top-level aggregate UNION ALL MV refresh is not supported in this build",
         ));
     }
     if aggregate_shape_for_layout(&shape).is_some() {
@@ -3381,6 +3959,159 @@ pub(crate) fn plan_iceberg_mv_refresh(
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             affected_partitions: affected_partitions.clone(),
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_iceberg_union_projection_mv_refresh(
+    state: &Arc<StandaloneState>,
+    iceberg_target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target: MvTarget,
+    stmt: &RefreshMaterializedViewStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+) -> Result<RefreshPlan, RefreshError> {
+    validate_union_projection_shape_base_refs(union_shape, base_refs)
+        .map_err(RefreshError::user)?;
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        RefreshError::user(format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        ))
+    })?;
+
+    let mut loaded_bases = BTreeMap::new();
+    let mut current_snapshots = BTreeMap::new();
+    let mut snapshot_pins = BTreeMap::new();
+    for base_ref in base_refs {
+        let loaded =
+            load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+        validate_union_projection_schema_contract_for_base(
+            iceberg_target,
+            schema_contract,
+            union_shape,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )
+        .map_err(RefreshError::user)?;
+        let current = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
+        let fqn = base_ref.fqn();
+        snapshot_pins.insert(fqn.clone(), current);
+        current_snapshots.insert(fqn.clone(), current);
+        loaded_bases.insert(fqn, loaded);
+    }
+
+    let previous_snapshots = &mv_definition.last_refresh_snapshots;
+    let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
+    let has_previous = base_refs
+        .iter()
+        .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let all_previous_snapshots = base_refs
+        .iter()
+        .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let all_previous_table_uuids = base_refs
+        .iter()
+        .all(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
+    let all_current = current_snapshots.values().all(Option::is_some);
+    let any_current = current_snapshots.values().any(Option::is_some);
+
+    if has_previous && (!all_previous_snapshots || !all_previous_table_uuids) {
+        return Err(RefreshError::user(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )));
+    }
+    if !has_previous && any_current && !all_current {
+        return Err(RefreshError::user(format!(
+            "iceberg UNION ALL projection/filter MV {}.{}.{} cannot run first refresh because only some branch bases have current snapshots; load all branch bases or recreate the MV",
+            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+        )));
+    }
+    if has_previous {
+        for base_ref in base_refs {
+            let fqn = base_ref.fqn();
+            let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                RefreshError::user(format!(
+                    "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                ))
+            })?;
+            let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
+                RefreshError::user(format!(
+                    "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                ))
+            })?;
+            if previous != current {
+                let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: base {} was not loaded",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                    ))
+                })?;
+                crate::connector::iceberg::changes::classify_lineage(
+                    loaded.table.metadata(),
+                    previous,
+                    current,
+                )
+                .map_err(|e| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg UNION ALL projection/filter MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                    ))
+                })?;
+            }
+        }
+    }
+
+    let mode = if !has_previous && !any_current {
+        RefreshMode::Noop
+    } else if !has_previous {
+        RefreshMode::Full
+    } else if base_refs.iter().all(|base_ref| {
+        let fqn = base_ref.fqn();
+        previous_snapshots.get(&fqn).copied() == current_snapshots.get(&fqn).copied().flatten()
+    }) {
+        RefreshMode::Noop
+    } else {
+        RefreshMode::Incremental
+    };
+    let affected_partitions = match mode {
+        RefreshMode::Noop if !has_previous && !any_current => {
+            noop_affected_partitions(schema_contract)
+        }
+        _ => unknown_union_all_affected_partitions(),
+    };
+    log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+    Ok(RefreshPlan {
+        mv_id: Some(mv_definition.mv_id),
+        target,
+        storage_engine: MvStorageEngine::Iceberg,
+        mode,
+        base_refs: base_refs
+            .iter()
+            .map(|base_ref| MvBaseRef {
+                catalog: base_ref.catalog.clone(),
+                namespace: base_ref.namespace.clone(),
+                table: base_ref.table.clone(),
+            })
+            .collect(),
+        snapshot_pins,
+        affected_partitions,
+        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
+            stmt: stmt.clone(),
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
         }),
     })
 }
@@ -4427,6 +5158,27 @@ fn first_refresh_iceberg_mv(
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
 ) -> Result<StatementResult, String> {
+    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
+    first_refresh_iceberg_mv_with_physical_sql(
+        state,
+        ctx,
+        staging_branch,
+        refresh_id,
+        single_snapshot_map(base_ref, base_snapshot_id),
+        single_table_uuid_map(base_ref, current_table_uuid),
+        &physical_sql,
+    )
+}
+
+fn first_refresh_iceberg_mv_with_physical_sql(
+    state: &Arc<StandaloneState>,
+    ctx: &IcebergMvRefreshContext,
+    staging_branch: &str,
+    refresh_id: i64,
+    snapshots: BTreeMap<String, i64>,
+    table_uuids: BTreeMap<String, String>,
+    physical_sql: &str,
+) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
@@ -4435,7 +5187,6 @@ fn first_refresh_iceberg_mv(
     let mv_definition = &*ctx.rewrite.mv_definition;
 
     // 1. Run SELECT and collect chunks.
-    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks(state, current_database, &physical_sql) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -4515,8 +5266,6 @@ fn first_refresh_iceberg_mv(
     };
 
     // 4. Persist refresh metadata in the repository.
-    let snapshots = single_snapshot_map(base_ref, base_snapshot_id);
-    let table_uuids = single_table_uuid_map(base_ref, current_table_uuid);
     record_iceberg_mv_staging_commit(
         state,
         refresh_id,
@@ -8594,6 +9343,79 @@ mod tests {
         rows
     }
 
+    fn union_projection_rows_with_hidden(
+        state: &Arc<StandaloneState>,
+        current_catalog: &str,
+        current_database: &str,
+        mv_name: &str,
+    ) -> Vec<(i32, String, i64, i32)> {
+        use futures::StreamExt;
+        use iceberg::arrow::ArrowReaderBuilder;
+
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(current_catalog).expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, current_database, mv_name)
+                .expect("load UNION ALL projection/filter target");
+        let mut rows = data_block_on(async {
+            let scan = loaded
+                .table
+                .scan()
+                .select(vec![
+                    "id".to_string(),
+                    "name".to_string(),
+                    ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                    ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                ])
+                .build()
+                .expect("build UNION ALL target scan");
+            let tasks = scan
+                .plan_files()
+                .await
+                .expect("plan UNION ALL target files");
+            let arrow_reader = ArrowReaderBuilder::new(loaded.table.file_io().clone()).build();
+            let mut stream = arrow_reader.read(tasks).expect("read UNION ALL target");
+            let mut rows = Vec::new();
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result.expect("UNION ALL target batch");
+                let id = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column");
+                let name = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name column");
+                let base_row_id = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("base row id column");
+                let branch_id = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("branch id column");
+                for row in 0..batch.num_rows() {
+                    rows.push((
+                        id.value(row),
+                        name.value(row).to_string(),
+                        base_row_id.value(row),
+                        branch_id.value(row),
+                    ));
+                }
+            }
+            rows
+        })
+        .expect("read UNION ALL projection/filter target rows");
+        rows.sort_by_key(|(id, _, base_row_id, branch_id)| (*branch_id, *id, *base_row_id));
+        rows
+    }
+
     fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
             column_id: crate::sql::column_id::ColumnId::UNSET,
@@ -9767,7 +10589,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_iceberg_mv_refresh_rejects_union_all_projection_mv() {
+    fn plan_iceberg_mv_refresh_plans_union_all_projection_mv() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_base_table(&env.state, "ice", "sales", "returns");
@@ -9788,14 +10610,104 @@ mod tests {
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
         };
-        let err =
+        let plan =
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
-                .expect_err("UNION ALL refresh planning should fail fast");
+                .expect("projection/filter UNION ALL refresh planning");
 
-        assert!(
-            err.message
-                .contains("incremental UNION ALL MV refresh is not yet supported"),
-            "err={err:?}"
+        assert_eq!(plan.mode, RefreshMode::Noop);
+        assert_eq!(
+            plan.base_refs
+                .iter()
+                .map(|base| format!("{}.{}.{}", base.catalog, base.namespace, base.table))
+                .collect::<Vec<_>>(),
+            vec![
+                "ice.sales.orders".to_string(),
+                "ice.sales.returns".to_string()
+            ]
+        );
+        assert_eq!(plan.snapshot_pins.len(), 2);
+        assert_eq!(
+            plan.snapshot_pins.get("ice.sales.orders").copied(),
+            Some(None)
+        );
+        assert_eq!(
+            plan.snapshot_pins.get("ice.sales.returns").copied(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn refresh_iceberg_union_all_projection_mv_refreshes_branch_aware_rows() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(10, "same")]);
+        create_base_table_with_rows(&env.state, "ice", "sales", "returns", &[(10, "same")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders
+                UNION ALL
+                SELECT id, name FROM ice.sales.returns",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create projection/filter UNION ALL iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first projection/filter UNION ALL refresh");
+
+        let first_rows = union_projection_rows_with_hidden(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_orders",
+        );
+        assert_eq!(first_rows.len(), 2);
+        assert_eq!(first_rows[0].0, 10);
+        assert_eq!(first_rows[0].1, "same");
+        assert_eq!(first_rows[0].3, 0);
+        assert_eq!(first_rows[1].0, 10);
+        assert_eq!(first_rows[1].1, "same");
+        assert_eq!(first_rows[1].3, 1);
+        assert_eq!(
+            first_rows[0].2, first_rows[1].2,
+            "test requires colliding base row ids across UNION ALL branches"
+        );
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_orders")
+            .expect("mv definition after first UNION ALL refresh");
+        assert_eq!(mv.last_refresh_rows, Some(2));
+        assert_eq!(mv.last_refresh_snapshots.len(), 2);
+        assert_eq!(mv.last_refresh_table_uuids.len(), 2);
+
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "DELETE FROM ice.sales.orders WHERE id = 10",
+        );
+        let target = crate::engine::mv::lifecycle::MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_union_orders".to_string(),
+        };
+        let plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("projection/filter UNION ALL incremental plan");
+        assert_eq!(plan.mode, RefreshMode::Incremental);
+
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("incremental projection/filter UNION ALL refresh");
+
+        let second_rows = union_projection_rows_with_hidden(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_orders",
+        );
+        assert_eq!(
+            second_rows,
+            vec![(10, "same".to_string(), first_rows[1].2, 1)]
         );
     }
 
