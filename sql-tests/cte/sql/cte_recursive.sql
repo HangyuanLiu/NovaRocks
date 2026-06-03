@@ -1,4 +1,7 @@
 -- Migrated from dev/test/sql/test_cte/T/test_recursive_cte
+-- @sequential=true
+-- Recursive CTE static unrolling is sensitive to suite-wide concurrent CTE
+-- planning against the same standalone-server; keep this case isolated.
 -- Test Objective:
 -- 1. Basic recursive CTE: org hierarchy traversal with path concatenation.
 -- 2. Recursive CTE with explicit column names in header.

@@ -4130,11 +4130,12 @@ fn plan_iceberg_union_projection_mv_refresh(
             })
             .collect(),
         snapshot_pins,
-        affected_partitions,
+        affected_partitions: affected_partitions.clone(),
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
+            affected_partitions: affected_partitions.clone(),
         }),
     })
 }
@@ -4250,6 +4251,13 @@ fn plan_iceberg_aggregate_mv_refresh(
                 } else {
                     RefreshMode::Incremental
                 };
+                let affected_partitions = match mode {
+                    RefreshMode::Noop if !has_previous && !any_current => {
+                        noop_affected_partitions(schema_contract)
+                    }
+                    _ => unknown_union_all_affected_partitions(),
+                };
+                log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
                 return Ok(build_iceberg_refresh_plan(
                     mv_definition,
                     target,
@@ -4259,6 +4267,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                     base_refs,
                     snapshot_pins,
                     mode,
+                    affected_partitions,
                 ));
             }
             let [base_ref] = base_refs else {

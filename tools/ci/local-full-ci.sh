@@ -303,7 +303,7 @@ run_sql_suites() {
     suite_extra_args=()
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     case "$suite" in
-      ssb)
+      complex-type|ssb)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
         ;;
     esac
