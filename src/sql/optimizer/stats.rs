@@ -242,56 +242,14 @@ pub(crate) fn derive_statistics(
         ),
 
         // -- Physical operators: derive the same way as their logical counterparts --
-        Operator::PhysicalScan(scan) => {
-            let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
-            let table_key = scan.table.name.to_lowercase();
-            let ts_opt = alias_key
-                .as_deref()
-                .and_then(|k| table_stats.get(k))
-                .or_else(|| table_stats.get(&table_key));
-            if let Some(ts) = ts_opt {
-                let row_count = ts.row_count.max(1) as f64;
-                let mut selectivity = 1.0;
-                for pred in &scan.predicates {
-                    selectivity *= estimate_selectivity(pred, &ts.column_stats);
-                }
-                let output_rows = (row_count * selectivity).max(1.0);
-                let column_statistics: HashMap<String, ColumnStatistic> = scan
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        let col_name = c.name.to_lowercase();
-                        let cs = ts
-                            .column_stats
-                            .get(&col_name)
-                            .cloned()
-                            .unwrap_or_else(ColumnStatistic::unknown);
-                        (col_name, cs)
-                    })
-                    .collect();
-                Statistics {
-                    output_row_count: output_rows,
-                    row_count_confidence: Confidence::Estimated,
-                    column_statistics,
-                }
-            } else {
-                let default_rows = estimate_default_row_count(&scan.table.name);
-                let column_statistics: HashMap<String, ColumnStatistic> = scan
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
-                    .collect();
-                let mut selectivity = 1.0;
-                for pred in &scan.predicates {
-                    selectivity *= estimate_selectivity(pred, &column_statistics);
-                }
-                Statistics {
-                    output_row_count: (default_rows * selectivity).max(1.0),
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics,
-                }
-            }
-        }
+        Operator::PhysicalScan(scan) => derive_scan_statistics(
+            &scan.table.name,
+            scan.alias.as_deref(),
+            &scan.columns,
+            &scan.predicates,
+            table_stats,
+            estimate_default_row_count(&scan.table.name),
+        ),
 
         Operator::PhysicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
@@ -970,11 +928,29 @@ fn derive_scan(
     scan: &super::operator::LogicalScanOp,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
+    derive_scan_statistics(
+        &scan.table.name,
+        scan.alias.as_deref(),
+        &scan.columns,
+        &scan.predicates,
+        table_stats,
+        estimate_default_row_count(&scan.table.name),
+    )
+}
+
+fn derive_scan_statistics(
+    table_name: &str,
+    alias: Option<&str>,
+    columns: &[OutputColumn],
+    predicates: &[TypedExpr],
+    table_stats: &HashMap<String, TableStatistics>,
+    default_rows: f64,
+) -> Statistics {
     // Try alias first, then fall back to the canonical table name.
     // `collect_scan_stats` inserts by table name, but the scan node
     // may have an alias that differs from the table name.
-    let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
-    let table_key = scan.table.name.to_lowercase();
+    let alias_key = alias.map(|a| a.to_lowercase());
+    let table_key = table_name.to_lowercase();
     let ts_opt = alias_key
         .as_deref()
         .and_then(|k| table_stats.get(k))
@@ -983,16 +959,15 @@ fn derive_scan(
     if let Some(ts) = ts_opt {
         let row_count = ts.row_count.max(1) as f64;
 
-        // Apply scan-level predicate selectivity.
-        let mut selectivity = 1.0;
-        for pred in &scan.predicates {
-            selectivity *= estimate_selectivity(pred, &ts.column_stats);
+        let mut output_rows = row_count;
+        let mut row_count_confidence = Confidence::Exact;
+        for pred in predicates {
+            let selectivity = estimate_selectivity(pred, &ts.column_stats);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
         }
 
-        let output_rows = (row_count * selectivity).max(1.0);
-
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
-            .columns
+        let column_statistics: HashMap<String, ColumnStatistic> = columns
             .iter()
             .map(|c| {
                 let col_name = c.name.to_lowercase();
@@ -1007,24 +982,25 @@ fn derive_scan(
 
         Statistics {
             output_row_count: output_rows,
-            row_count_confidence: Confidence::Estimated,
+            row_count_confidence,
             column_statistics,
         }
     } else {
         // No table stats available: use heuristic defaults based on table name.
-        let default_rows = estimate_default_row_count(&scan.table.name);
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
-            .columns
+        let column_statistics: HashMap<String, ColumnStatistic> = columns
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
-        let mut selectivity = 1.0;
-        for pred in &scan.predicates {
-            selectivity *= estimate_selectivity(pred, &column_statistics);
+        let mut output_rows = default_rows;
+        let mut row_count_confidence = Confidence::Fallback;
+        for pred in predicates {
+            let selectivity = estimate_selectivity(pred, &column_statistics);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
         }
         Statistics {
-            output_row_count: (default_rows * selectivity).max(1.0),
-            row_count_confidence: Confidence::Fallback,
+            output_row_count: output_rows,
+            row_count_confidence,
             column_statistics,
         }
     }
@@ -1563,6 +1539,94 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 25_000.0).abs() < 1.0);
         assert_eq!(props.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn scan_with_table_stats_marks_real_stats_exact_and_missing_columns_fallback() {
+        let (name, mut ts) = make_table_stats("orders", 100_000, &[("id", 100_000.0)]);
+        ts.column_stats.insert(
+            "status".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 100_000.0,
+                nulls_fraction: 0.01,
+                average_row_size: 8.0,
+                distinct_values_count: 5.0,
+                confidence: Confidence::Estimated,
+            },
+        );
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+        let plan = scan_plan("orders", &["id", "status", "missing"]);
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        let props = memo.groups[0].logical_props.as_ref().unwrap();
+        assert!((props.row_count - 100_000.0).abs() < 1.0);
+        assert_eq!(props.row_count_confidence, Confidence::Exact);
+        assert_eq!(props.column_statistics["id"].confidence, Confidence::Exact);
+        assert_eq!(
+            props.column_statistics["status"].confidence,
+            Confidence::Estimated
+        );
+        assert_eq!(
+            props.column_statistics["missing"].confidence,
+            Confidence::Fallback
+        );
+    }
+
+    #[test]
+    fn scan_with_table_stats_and_predicate_downgrades_row_confidence() {
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+        let plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&plan, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        let props = memo.groups[0].logical_props.as_ref().unwrap();
+        assert!((props.row_count - 1_000.0).abs() < 1.0);
+        assert_eq!(props.row_count_confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn physical_scan_uses_same_confidence_rules_as_logical_scan() {
+        use crate::sql::optimizer::memo::MExpr;
+        use crate::sql::optimizer::operator::{Operator, PhysicalScanOp};
+
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+        let LogicalPlan::Scan(scan) =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))])
+        else {
+            unreachable!("scan_plan_with_predicates always returns a Scan");
+        };
+        let memo = Memo::new();
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: scan.database,
+                table: scan.table,
+                alias: scan.alias,
+                columns: scan.columns,
+                predicates: scan.predicates,
+                required_columns: scan.required_columns,
+                dict_columns: scan.dict_columns,
+            }),
+            children: vec![],
+        };
+
+        let stats = derive_statistics(&expr, &memo, &table_stats);
+
+        assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        assert_eq!(stats.column_statistics["id"].confidence, Confidence::Exact);
     }
 
     #[test]

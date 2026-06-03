@@ -11,6 +11,7 @@ use crate::sql::optimizer::estimate::cardinality::{
     union_distinct_rows,
 };
 use crate::sql::optimizer::estimate::ndv::agg_group_rows;
+use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
 use crate::sql::planner::plan::*;
@@ -95,22 +96,23 @@ pub(crate) fn estimate_statistics(
 }
 
 fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>) -> Statistics {
-    let key = scan
-        .alias
+    let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
+    let table_key = scan.table.name.to_lowercase();
+    let ts_opt = alias_key
         .as_deref()
-        .unwrap_or(&scan.table.name)
-        .to_lowercase();
+        .and_then(|k| table_stats.get(k))
+        .or_else(|| table_stats.get(&table_key));
 
-    if let Some(ts) = table_stats.get(&key) {
+    if let Some(ts) = ts_opt {
         let row_count = ts.row_count.max(1) as f64;
 
-        // Apply scan-level predicate selectivity.
-        let mut selectivity = 1.0;
+        let mut output_rows = row_count;
+        let mut row_count_confidence = Confidence::Exact;
         for pred in &scan.predicates {
-            selectivity *= estimate_selectivity(pred, &ts.column_stats);
+            let selectivity = estimate_selectivity(pred, &ts.column_stats);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
         }
-
-        let output_rows = (row_count * selectivity).max(1.0);
 
         let column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
@@ -128,7 +130,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
 
         Statistics {
             output_row_count: output_rows,
-            row_count_confidence: Confidence::Estimated,
+            row_count_confidence,
             column_statistics,
         }
     } else {
@@ -138,9 +140,16 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
+        let mut output_rows = 10_000.0;
+        let mut row_count_confidence = Confidence::Fallback;
+        for pred in &scan.predicates {
+            let selectivity = estimate_selectivity(pred, &column_statistics);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
+        }
         Statistics {
-            output_row_count: 10_000.0,
-            row_count_confidence: Confidence::Fallback,
+            output_row_count: output_rows,
+            row_count_confidence,
             column_statistics,
         }
     }
@@ -532,6 +541,26 @@ mod tests {
         })
     }
 
+    fn scan_plan_with_alias(name: &str, alias: &str, cols: &[&str]) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.alias = Some(alias.to_string());
+        LogicalPlan::Scan(node)
+    }
+
+    fn scan_plan_with_predicates(
+        name: &str,
+        cols: &[&str],
+        predicates: Vec<TypedExpr>,
+    ) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.predicates = predicates;
+        LogicalPlan::Scan(node)
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -600,6 +629,35 @@ mod tests {
         assert!((stats.output_row_count - 100_000.0).abs() < 1.0);
         assert!(stats.column_statistics.contains_key("id"));
         assert!(stats.column_statistics.contains_key("status"));
+        assert_eq!(stats.row_count_confidence, Confidence::Exact);
+        assert_eq!(stats.column_statistics["id"].confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn aliased_scan_falls_back_to_table_name_stats() {
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan = scan_plan_with_alias("orders", "o", &["id"]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert!((stats.output_row_count - 100_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn scan_with_table_stats_and_predicate_downgrades_row_confidence() {
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
     }
 
     #[test]
@@ -607,6 +665,21 @@ mod tests {
         let plan = scan_plan("unknown", &["x"]);
         let stats = estimate_statistics(&plan, &HashMap::new());
         assert!((stats.output_row_count - 10_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(
+            stats.column_statistics["x"].confidence,
+            Confidence::Fallback
+        );
+    }
+
+    #[test]
+    fn scan_without_stats_applies_predicate_selectivity_as_fallback() {
+        let plan =
+            scan_plan_with_predicates("unknown", &["x"], vec![eq_expr(col_ref("x"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &HashMap::new());
+
+        assert!((stats.output_row_count - 2_500.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
