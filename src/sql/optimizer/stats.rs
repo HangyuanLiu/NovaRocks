@@ -13,12 +13,6 @@ use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_
 use crate::sql::optimizer::statistics::*;
 
 // ---------------------------------------------------------------------------
-// Default selectivity constant for scan predicates (simple predicate = 0.3)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_FILTER_SELECTIVITY: f64 = 0.3;
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -407,55 +401,29 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalNestLoopJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            let left_rows = left_stats.output_row_count.max(1.0);
-            let right_rows = right_stats.output_row_count.max(1.0);
+            let non_equi_selectivity = join.condition.as_ref().map(|cond| {
+                (
+                    estimate_selectivity(cond, &left_stats.column_statistics),
+                    Confidence::Estimated,
+                )
+            });
 
-            use crate::sql::analysis::JoinKind;
-            let output_rows = match join.join_type {
-                JoinKind::Cross => left_rows * right_rows,
-                JoinKind::Inner => {
-                    if let Some(ref cond) = join.condition {
-                        let sel = estimate_selectivity(cond, &left_stats.column_statistics);
-                        (left_rows * right_rows * sel).max(1.0)
-                    } else {
-                        left_rows * right_rows
-                    }
-                }
-                JoinKind::LeftOuter => {
-                    let base = if let Some(ref cond) = join.condition {
-                        let sel = estimate_selectivity(cond, &left_stats.column_statistics);
-                        left_rows * right_rows * sel
-                    } else {
-                        left_rows * right_rows
-                    };
-                    base.max(left_rows)
-                }
-                JoinKind::RightOuter => {
-                    let base = if let Some(ref cond) = join.condition {
-                        let sel = estimate_selectivity(cond, &right_stats.column_statistics);
-                        left_rows * right_rows * sel
-                    } else {
-                        left_rows * right_rows
-                    };
-                    base.max(right_rows)
-                }
-                JoinKind::FullOuter => {
-                    let base = left_rows * right_rows;
-                    base.max(left_rows).max(right_rows)
-                }
-                JoinKind::LeftSemi => (left_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::RightSemi => (right_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-                    (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
-                }
-                JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
-            };
+            let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
+                left: (left_stats.output_row_count, left_stats.row_count_confidence),
+                right: (
+                    right_stats.output_row_count,
+                    right_stats.row_count_confidence,
+                ),
+                kind: join.join_type,
+                eq_key_ndvs: Vec::new(),
+                non_equi_selectivity,
+            });
 
             let mut column_statistics = left_stats.column_statistics;
             column_statistics.extend(right_stats.column_statistics);
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence,
                 column_statistics,
             }
         }
@@ -1917,6 +1885,67 @@ mod tests {
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
         assert!(stats.column_statistics.contains_key("l_k1"));
         assert!(stats.column_statistics.contains_key("r_k1"));
+    }
+
+    #[test]
+    fn physical_nest_loop_join_stats_use_shared_cardinality_estimator_for_non_equi_semi() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator, PhysicalNestLoopJoinOp};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let id = memo.next_expr_id();
+            let group = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 1_000.0, &[("l_filter", 100.0)]);
+        let right = values_group(&mut memo, 50.0, &[("r_payload", 50.0)]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::LeftSemi,
+                condition: Some(eq_expr(col_ref("l_filter"), int_lit(7))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert!(
+            (stats.output_row_count - 10.0).abs() < 1.0,
+            "expected shared estimator output, got {}",
+            stats.output_row_count
+        );
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        assert!(stats.column_statistics.contains_key("l_filter"));
+        assert!(stats.column_statistics.contains_key("r_payload"));
     }
 
     #[test]
