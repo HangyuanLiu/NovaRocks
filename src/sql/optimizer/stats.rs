@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::estimate::ndv::{cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv};
+use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv};
 use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
@@ -122,16 +122,18 @@ pub(crate) fn derive_statistics(
                     column_statistics: HashMap::new(),
                 };
             }
-            let mut ndv_product = 1.0f64;
-            for gb_expr in &agg.group_by {
-                let ndv = get_expr_ndv(gb_expr, &child_stats.column_statistics);
-                ndv_product *= ndv;
-            }
-            let capped = child_stats.output_row_count * UNKNOWN_GROUP_BY_CORRELATION;
-            let output_rows = ndv_product.min(capped).max(1.0);
+            let group_key_ndvs: Vec<f64> = agg
+                .group_by
+                .iter()
+                .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .collect();
+            let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence: Confidence::derive(
+                    &[child_stats.row_count_confidence],
+                    false,
+                ),
                 column_statistics: HashMap::new(),
             }
         }
@@ -370,16 +372,18 @@ pub(crate) fn derive_statistics(
                     column_statistics: HashMap::new(),
                 };
             }
-            let mut ndv_product = 1.0f64;
-            for gb_expr in &agg.group_by {
-                let ndv = get_expr_ndv(gb_expr, &child_stats.column_statistics);
-                ndv_product *= ndv;
-            }
-            let capped = child_stats.output_row_count * UNKNOWN_GROUP_BY_CORRELATION;
-            let output_rows = ndv_product.min(capped).max(1.0);
+            let group_key_ndvs: Vec<f64> = agg
+                .group_by
+                .iter()
+                .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .collect();
+            let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence: Confidence::derive(
+                    &[child_stats.row_count_confidence],
+                    false,
+                ),
                 column_statistics: HashMap::new(),
             }
         }
@@ -1437,6 +1441,209 @@ mod tests {
                 alternative_stats.column_statistics.len()
             );
         }
+    }
+
+    fn aggregate_expected_three_key_rows() -> f64 {
+        100.0 * 100.0_f64.sqrt() * 100.0_f64.powf(0.25)
+    }
+
+    fn assert_row_count_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected row count {expected}, got {actual}"
+        );
+    }
+
+    fn stats_output_column(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn aggregate_child_stat(ndv: f64) -> ColumnStatistic {
+        ColumnStatistic {
+            min_value: 0.0,
+            max_value: 1_000_000.0,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: ndv,
+            confidence: Confidence::Exact,
+        }
+    }
+
+    fn aggregate_ndv_child_group(
+        memo: &mut Memo,
+        row_count: f64,
+        row_count_confidence: Confidence,
+    ) -> usize {
+        use crate::sql::optimizer::memo::LogicalProperties;
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let id = memo.next_expr_id();
+        let group = memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(
+            vec![
+                stats_output_column(1, "k1"),
+                stats_output_column(2, "k2"),
+                stats_output_column(3, "k3"),
+            ],
+            row_count,
+        );
+        props.row_count_confidence = row_count_confidence;
+        for name in ["k1", "k2", "k3"] {
+            props
+                .column_statistics
+                .insert(name.to_string(), aggregate_child_stat(100.0));
+        }
+        memo.groups[group].logical_props = Some(props);
+        group
+    }
+
+    fn aggregate_group_keys() -> Vec<TypedExpr> {
+        vec![col_ref("k1"), col_ref("k2"), col_ref("k3")]
+    }
+
+    fn aggregate_output_columns() -> Vec<OutputColumn> {
+        vec![
+            stats_output_column(1, "k1"),
+            stats_output_column(2, "k2"),
+            stats_output_column(3, "k3"),
+        ]
+    }
+
+    #[test]
+    fn logical_aggregate_stats_use_damped_group_ndv_and_child_confidence() {
+        use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+
+        let expected = aggregate_expected_three_key_rows();
+        assert!(expected < 100.0 * 100.0 * 100.0);
+
+        let mut memo = Memo::new();
+        let exact_child = aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Exact);
+        let fallback_child =
+            aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Fallback);
+
+        let exact_agg = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                aggregate_group_keys(),
+                vec![],
+                aggregate_output_columns(),
+            )),
+            children: vec![exact_child],
+        };
+        let fallback_agg = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                aggregate_group_keys(),
+                vec![],
+                aggregate_output_columns(),
+            )),
+            children: vec![fallback_child],
+        };
+
+        let exact_stats = derive_statistics(&exact_agg, &memo, &HashMap::new());
+        assert_row_count_close(exact_stats.output_row_count, expected);
+        assert_eq!(exact_stats.row_count_confidence, Confidence::Estimated);
+
+        let fallback_stats = derive_statistics(&fallback_agg, &memo, &HashMap::new());
+        assert_row_count_close(fallback_stats.output_row_count, expected);
+        assert_eq!(fallback_stats.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn physical_hash_aggregate_stats_use_damped_group_ndv_and_child_confidence() {
+        use crate::sql::optimizer::operator::{AggMode, Operator, PhysicalHashAggregateOp};
+
+        let expected = aggregate_expected_three_key_rows();
+        assert!(expected < 100.0 * 100.0 * 100.0);
+
+        let mut memo = Memo::new();
+        let exact_child = aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Exact);
+        let fallback_child =
+            aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Fallback);
+
+        let exact_agg = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: aggregate_group_keys(),
+                aggregates: vec![],
+                output_columns: aggregate_output_columns(),
+                is_merge: vec![],
+            }),
+            children: vec![exact_child],
+        };
+        let fallback_agg = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: aggregate_group_keys(),
+                aggregates: vec![],
+                output_columns: aggregate_output_columns(),
+                is_merge: vec![],
+            }),
+            children: vec![fallback_child],
+        };
+
+        let exact_stats = derive_statistics(&exact_agg, &memo, &HashMap::new());
+        assert_row_count_close(exact_stats.output_row_count, expected);
+        assert_eq!(exact_stats.row_count_confidence, Confidence::Estimated);
+
+        let fallback_stats = derive_statistics(&fallback_agg, &memo, &HashMap::new());
+        assert_row_count_close(fallback_stats.output_row_count, expected);
+        assert_eq!(fallback_stats.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn aggregate_stats_empty_group_by_keeps_scalar_behavior() {
+        use crate::sql::optimizer::operator::{
+            AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
+        };
+
+        let mut memo = Memo::new();
+        let child = aggregate_ndv_child_group(&mut memo, 1_000_000.0, Confidence::Fallback);
+        let logical = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![],
+                vec![stats_output_column(4, "count(*)")],
+            )),
+            children: vec![child],
+        };
+        let physical = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![],
+                aggregates: vec![],
+                output_columns: vec![stats_output_column(4, "count(*)")],
+                is_merge: vec![],
+            }),
+            children: vec![child],
+        };
+
+        let logical_stats = derive_statistics(&logical, &memo, &HashMap::new());
+        assert_eq!(logical_stats.output_row_count, 1.0);
+        assert_eq!(logical_stats.row_count_confidence, Confidence::Estimated);
+        assert!(logical_stats.column_statistics.is_empty());
+
+        let physical_stats = derive_statistics(&physical, &memo, &HashMap::new());
+        assert_eq!(physical_stats.output_row_count, 1.0);
+        assert_eq!(physical_stats.row_count_confidence, Confidence::Estimated);
+        assert!(physical_stats.column_statistics.is_empty());
     }
 
     fn col_ref(name: &str) -> TypedExpr {

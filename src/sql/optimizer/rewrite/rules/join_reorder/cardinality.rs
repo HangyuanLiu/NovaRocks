@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::sql::analysis::*;
 use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
+use crate::sql::optimizer::estimate::ndv::agg_group_rows;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
 use crate::sql::planner::plan::*;
@@ -196,19 +197,16 @@ fn estimate_aggregate(
         };
     }
 
-    // Product of NDVs of group-by keys, capped by correlation factor.
-    let mut ndv_product = 1.0f64;
-    for gb_expr in &agg.group_by {
-        let ndv = get_expr_ndv(gb_expr, &input_stats.column_statistics);
-        ndv_product *= ndv;
-    }
-
-    let capped = input_stats.output_row_count * UNKNOWN_GROUP_BY_CORRELATION;
-    let output_rows = ndv_product.min(capped).max(1.0);
+    let group_key_ndvs: Vec<f64> = agg
+        .group_by
+        .iter()
+        .map(|gb_expr| get_expr_ndv(gb_expr, &input_stats.column_statistics))
+        .collect();
+    let output_rows = agg_group_rows(&group_key_ndvs, input_stats.output_row_count);
 
     Statistics {
         output_row_count: output_rows,
-        row_count_confidence: Confidence::Estimated,
+        row_count_confidence: Confidence::derive(&[input_stats.row_count_confidence], false),
         column_statistics: HashMap::new(),
     }
 }
@@ -736,6 +734,75 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
         // NDV of status = 5, capped at 100000*0.75=75000 => min(5, 75000) = 5
         assert!((stats.output_row_count - 5.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn aggregate_multi_key_rows_use_damped_ndv_product() {
+        let (name, ts) = make_table_stats(
+            "t",
+            1_000_000,
+            &[("k1", 100.0), ("k2", 100.0), ("k3", 100.0)],
+        );
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("t", &["k1", "k2", "k3"]);
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![col_ref("k1"), col_ref("k2"), col_ref("k3")],
+            aggregates: vec![],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k1".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k2".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k3".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+        let expected = 100.0 * 100.0_f64.sqrt() * 100.0_f64.powf(0.25);
+        assert!(
+            (stats.output_row_count - expected).abs() < 0.000_001,
+            "expected damped aggregate rows {expected}, got {}",
+            stats.output_row_count
+        );
+        assert!(stats.output_row_count < 100.0 * 100.0 * 100.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn aggregate_row_count_confidence_follows_fallback_child() {
+        let scan = scan_plan("missing_stats", &["k1", "k2", "k3"]);
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![col_ref("k1"), col_ref("k2"), col_ref("k3")],
+            aggregates: vec![],
+            output_columns: vec![],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &HashMap::new());
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
