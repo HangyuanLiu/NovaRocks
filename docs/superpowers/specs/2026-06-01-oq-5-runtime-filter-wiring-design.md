@@ -301,6 +301,12 @@ StarRocks（FE 不管类型，BE 按行数选，默认阈值 1024）一致。OQ-
 
 optimizer 侧不做类型选择。
 
+> 核对结论(2026-06-02,Stage 4):`MAX_RUNTIME_IN_FILTER_CONDITIONS == 1024`
+> (`src/exec/runtime_filter/merger.rs:123`)= StarRocks 默认 ✅。join build sink
+> 生成 **IN(≤1024 行)+ membership(bloom/bitset)**,与 StarRocks 主路径
+> (bloom + in-list)一致;**min/max 不为 join 生成**(它服务 TopN/Agg,见
+> 2026-04-08 spec),这同样符合 StarRocks。结论:filter 类型选择已对齐,无需改动。
+
 ---
 
 ## 10. 分阶段 PR 计划
@@ -368,12 +374,31 @@ optimizer 侧不做类型选择。
 1. **build/probe 朝向**（§5d）：planner 假设右 child = build。Stage 0 必查。
    - 验证(2026-06-01,Stage 0):确认 children[1]=build 侧,build_expr=eq.right。证据:src/exec/pipeline/builder.rs:934-938（`probe_is_left=true`,`probe_build=left_build`,`build_build=right_build`）及 src/lower/node/hash_join.rs:174-187（`probe_keys←cond.left/left.layout`,`build_keys←cond.right/right.layout`）。
 2. **跨 exchange remap**：probe expr 穿过 Exchange / Project 时必须按子节点输出
-   列正确 remap，否则 probe 落错 slot。Stage 3 重点测。
+   列正确 remap，否则 probe 落错 slot。
+   - 结论(2026-06-02,Stage 3):`PhysicalDistribution { spec }` 是纯数据搬运、
+     无投影 → **跨 exchange 列 column_id 不变,无需 remap**;`could_bound` 在
+     exchange 之下仍按 column_id 正确判定。仅穿越 `HashPartitioned`,Gather/Any
+     仍为硬边界。
 3. **gating 与执行侧一致**：optimizer 用 estimated cardinality 决定建不建 RF；
    BE 用 actual build_row_count 选类型。二者阈值需协调（optimizer 的
    build-min/probe-min 与 BE 的 `MAX_RUNTIME_IN_FILTER_CONDITIONS` 不冲突）。
-4. **单实例简化边界**：跨 BE（Distributed Execution D2 已落地）时 `builder_number=1`
-   / merge-node=self 的 v1 简化是否仍成立，Stage 3 验证。
+4. **单实例简化边界 / 多 BE 隐患**：
+   - 结论(2026-06-02,Stage 3 review):standalone 每 fragment **恰好 1 实例**,
+     且 fragment 间数据 **all-to-one UNPARTITIONED**(codegen 的 HashPartitioned
+     output_partition 协调器不读)→ build 侧拿全量 → **RF 完整** → 跨 exchange
+     应用到未分区 probe scan **正确**。本地 DOP partial 在远程发送前已 merge。
+   - **已全局禁用 cross-exchange(2026-06-03,rebase 到 D2 multi-BE #209 后)**:
+     rebase 后发现 cross-exchange placement 在两种场景都有正确性 bug —— (1) **multi-BE**:
+     build fragment fan-out 成 N>1 实例,每实例只产部分 RF,跨 exchange 应用到未分区
+     probe scan 误删行,实测触发 exchange wire-meta 错误(`cross_process_two_be_multi_fragment`);
+     (2) **standalone**:RF 跨 exchange 推过 OUTER join 到 outer 侧 scan,误删 OUTER /
+     `OR ... IS NULL` 应保留的 null-key 行(`join_full_outer_with_using` query 64,
+     semi-join 的 RF 越过 FULL OUTER 删掉了 `(NULL,NULL)` 行)。修复:
+     `OptimizerOptions::allow_cross_exchange_rf` 默认 **false**(flag-off),
+     `push_probe_down` 始终不跨 exchange → probe RF 回退 within-fragment(= main 安全
+     行为,两个回归 case 均恢复 PASS)。Stage 3 的 placement 代码与 flag 保留,待后续
+     stage 修正确性(probe 不跨 OUTER、multi-BE RF merge 反映真实实例数)后再开启。
+     守门见 `runtime_filter_pass.rs::distribution_is_crossable` 与 `push_probe_down`。
 
 ---
 

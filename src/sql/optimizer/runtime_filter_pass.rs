@@ -72,7 +72,7 @@ pub(crate) fn annotate(root: &mut PhysicalPlanNode, options: &OptimizerOptions) 
         return;
     }
     let mut next_filter_id: i32 = 0;
-    annotate_node(root, &mut next_filter_id);
+    annotate_node(root, &mut next_filter_id, options);
 }
 
 /// True if a hash join of this kind should produce runtime filters on its
@@ -216,22 +216,69 @@ fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
     needed.iter().all(|id| have.contains(id))
 }
 
-/// Stage 1: stop at fragment boundaries (exchange / distribution nodes).
-/// Cross-exchange push-down is a later stage.
+/// Returns true for non-crossable exchange boundaries (Gather / Any distribution).
+/// These remain hard fragment boundaries that probe runtime filters cannot cross.
 fn is_exchange(node: &PhysicalPlanNode) -> bool {
     matches!(node.op, Operator::PhysicalDistribution(_))
+}
+
+/// A `PhysicalDistribution` whose spec is a shuffle/hash partition is the kind
+/// of boundary a probe runtime filter *may* cross (StarRocks
+/// canPushAcrossExchangeNode for PARTITIONED). Gather / Any are never crossable.
+///
+/// CORRECTNESS: crossing a shuffle exchange to place a probe RF deeper is only
+/// safe when the build side produces the *complete* key set AND no
+/// semantic-changing node (e.g. an OUTER join) sits between the exchange and
+/// the target scan. Two known violations make it currently unsafe, so the
+/// caller keeps it gated OFF — `push_probe_down` consults this predicate only
+/// when `OptimizerOptions::allow_cross_exchange_rf` is set, which is always
+/// false today (see its doc):
+///   1. multi-BE — a build fragment fans out to N>1 instances, each producing a
+///      *partial* RF; applying it to an unshuffled probe scan drops valid rows.
+///   2. standalone — crossing an OUTER join pushes the RF onto the outer side's
+///      scan and drops null-key rows the join/predicate must keep.
+/// The predicate and the placement code are retained for a future stage that
+/// fixes both. It only classifies the distribution type; it deliberately omits
+/// StarRocks' multi-column `canCrossExchangeNode` restriction.
+fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
+    use crate::sql::optimizer::property::DistributionSpec;
+    matches!(
+        &node.op,
+        Operator::PhysicalDistribution(op)
+            if matches!(op.spec, DistributionSpec::HashPartitioned { .. })
+    )
 }
 
 /// Descend into `node` and attach `probe` at the DEEPEST descendant that can
 /// bind the probe expression. Returns `true` when the probe has been placed.
 ///
 /// Rules:
-/// 1. Never cross an exchange (fragment boundary).
-/// 2. If `node` cannot bind the probe, stop (return false) — do not descend.
-/// 3. Try each child recursively; if a child accepts the probe, we are done.
-/// 4. If no child accepted it, place the probe on `node` itself (the deepest
+/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently into
+///    its single child without binding-checking the exchange itself, since a
+///    shuffle exchange preserves column ids and carries no projection.
+/// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
+/// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
+/// 4. Try each child recursively; if a child accepts the probe, we are done.
+/// 5. If no child accepted it, place the probe on `node` itself (the deepest
 ///    reachable binder).
-fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> bool {
+fn push_probe_down(
+    node: &mut PhysicalPlanNode,
+    probe: &RuntimeFilterProbe,
+    allow_cross_exchange: bool,
+) -> bool {
+    // Crossable exchange (shuffle): descend into its single child without
+    // binding-checking the exchange itself (it preserves the child's columns).
+    // Gated by `allow_cross_exchange`: under multi-BE the build side produces
+    // only a partial RF, so crossing the exchange is unsound (see
+    // `distribution_is_crossable`) — fall through to the hard boundary below.
+    if allow_cross_exchange && distribution_is_crossable(node) {
+        if let Some(child) = node.children.first_mut() {
+            return push_probe_down(child, probe, allow_cross_exchange);
+        }
+        return false;
+    }
+    // Non-crossable exchange (Gather/Any), or cross-exchange disabled: a hard
+    // fragment boundary. The probe stays above it (build-only fallback).
     if is_exchange(node) {
         return false;
     }
@@ -239,7 +286,7 @@ fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> b
         return false;
     }
     for child in &mut node.children {
-        if push_probe_down(child, probe) {
+        if push_probe_down(child, probe, allow_cross_exchange) {
             return true;
         }
     }
@@ -247,39 +294,44 @@ fn push_probe_down(node: &mut PhysicalPlanNode, probe: &RuntimeFilterProbe) -> b
     true
 }
 
-// StarRocks defaults (SessionVariable.java). Bytes; size = rows * avg_row_size.
-const BUILD_MAX_SIZE: f64 = 64.0 * 1024.0 * 1024.0;
-const BUILD_MIN_SIZE: f64 = 128.0 * 1024.0;
-const PROBE_MIN_SIZE: f64 = 100.0 * 1024.0;
-const PROBE_MIN_SELECTIVITY: f64 = 0.5;
-
 /// StarRocks JoinNode.java: only Shuffle/Partitioned gate on build size.
-fn build_gate_passes(distribution: &JoinDistribution, build_size: f64) -> bool {
+fn build_gate_passes(distribution: &JoinDistribution, build_size: f64, build_max: f64) -> bool {
     match distribution {
-        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > BUILD_MAX_SIZE),
+        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > build_max),
         _ => true, // Broadcast / Colocate: no build-size gate
     }
 }
 
 /// StarRocks RuntimeFilterDescription.canProbeUse selectivity gate.
-fn probe_gate_passes(local: bool, build_size: f64, probe_size: f64) -> bool {
+fn probe_gate_passes(
+    local: bool,
+    build_size: f64,
+    probe_size: f64,
+    build_min: f64,
+    probe_min: f64,
+    min_sel: f64,
+) -> bool {
     if local {
         return true;
     }
-    if build_size <= BUILD_MIN_SIZE {
+    if build_size <= build_min {
         return true;
     }
-    if probe_size < PROBE_MIN_SIZE {
+    if probe_size < probe_min {
         return false;
     }
-    (build_size / probe_size.max(1.0)) <= 1.0 - PROBE_MIN_SELECTIVITY
+    (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
-fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
+fn annotate_node(
+    node: &mut PhysicalPlanNode,
+    next_filter_id: &mut i32,
+    options: &OptimizerOptions,
+) {
     // Recurse into children first (post-order).
     for child in &mut node.children {
-        annotate_node(child, next_filter_id);
+        annotate_node(child, next_filter_id, options);
     }
 
     // Clone the data we need from the join before borrowing children mutably.
@@ -295,8 +347,14 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
     let build_size = node.children[1].stats.compute_size();
     let probe_size = node.children[0].stats.compute_size();
 
+    // Cast session thresholds (u64 bytes) to f64 for size comparisons.
+    let build_max = options.rf_build_max_bytes as f64;
+    let build_min = options.rf_build_min_bytes as f64;
+    let probe_min = options.rf_probe_min_bytes as f64;
+    let min_sel = options.rf_probe_min_selectivity;
+
     // Build gate: Shuffle joins are rejected if build side is too large or empty.
-    if !build_gate_passes(&distribution, build_size) {
+    if !build_gate_passes(&distribution, build_size, build_max) {
         return;
     }
 
@@ -310,7 +368,7 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
             continue;
         }
         // Probe gate: skip this equi-conjunct if it would not reduce probe rows enough.
-        if !probe_gate_passes(local, build_size, probe_size) {
+        if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
             continue;
         }
         let filter_id = *next_filter_id;
@@ -333,7 +391,11 @@ fn annotate_node(node: &mut PhysicalPlanNode, next_filter_id: &mut i32) {
             probe_expr: d.probe_expr.clone(),
         };
         // children[0] = probe side; descend to the deepest binding node.
-        let _ = push_probe_down(&mut node.children[0], &probe);
+        let _ = push_probe_down(
+            &mut node.children[0],
+            &probe,
+            options.allow_cross_exchange_rf,
+        );
     }
 
     node.build_runtime_filters = descs;
@@ -454,6 +516,57 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Shuffle join where the probe child is a `PhysicalDistribution(HashPartitioned)`
+    /// over a leaf scan. Tests that probe RFs cross the shuffle exchange to reach the
+    /// underlying scan rather than stopping at the exchange boundary.
+    pub(crate) fn shuffle_join_with_probe_exchange() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        // probe side: PhysicalDistribution(HashPartitioned on col 1) over a leaf scan.
+        let scan = leaf(1_000_000.0, loc.clone());
+        let exch = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![loc.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+            },
+            output_columns: vec![loc.clone()], // exchange preserves column 1
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        // build side SMALL so the build gate and probe gate both pass
+        // (build_size = 100 * 8 = 800 bytes, well below BUILD_MIN 128KB).
+        let build = leaf(100.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![exch, build], // children[0]=probe-exchange, children[1]=build
+            stats: Statistics {
+                output_row_count: 100.0,
+                column_statistics: Default::default(),
+            },
+            output_columns: vec![loc, roc],
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
         use crate::sql::optimizer::operator::PhysicalProjectOp;
         let (loc, lexpr) = col(1, "lc"); // probe column
@@ -555,5 +668,60 @@ mod tests {
         );
         // ...it reached the scan beneath the project (children[0].children[0]).
         assert_eq!(join.children[0].children[0].probe_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn probe_crosses_exchange_when_flag_enabled() {
+        // Flag-on behavior (disabled by default): with cross-exchange RF
+        // explicitly enabled, the probe descends past the shuffle exchange to
+        // the base scan. Guards the retained placement code for a future stage
+        // that re-enables it once the correctness bugs are fixed.
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+        annotate(&mut j, &opts);
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not stop at the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "probe should reach the scan below the exchange"
+        );
+    }
+
+    #[test]
+    fn probe_stays_within_fragment_by_default() {
+        // Default (flag-off): cross-exchange placement is disabled, so the probe
+        // RF must not cross the shuffle exchange. It falls back to build-only —
+        // the probe stays unplaced above the exchange. This avoids the multi-BE
+        // (partial RF over a fanned-out build) and standalone (crossing an OUTER
+        // join drops null-key rows) correctness bugs.
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        annotate(&mut j, &OptimizerOptions::default_settings());
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "probe must not be placed on the exchange"
+        );
+        assert!(
+            exch.children[0].probe_runtime_filters.is_empty(),
+            "probe must NOT cross the exchange by default (within-fragment fallback)"
+        );
+    }
+
+    #[test]
+    fn session_build_max_can_skip_rf() {
+        // build_rows=1000, avg_row_size=8 bytes -> build_size=8KB.
+        // With rf_build_max_bytes=1, build gate rejects even a tiny build.
+        let mut j = super::test_support::shuffle_join(1000.0, 1_000_000.0);
+        let mut opts = OptimizerOptions::default_settings();
+        opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
+        annotate(&mut j, &opts);
+        assert!(j.build_runtime_filters.is_empty());
     }
 }
