@@ -226,6 +226,7 @@ pub(crate) async fn write_record_batches(
             .build(None)
             .await
             .map_err(|e| format!("build iceberg data file writer failed: {e}"))?;
+        let mut batch_sketches = Vec::new();
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
@@ -240,7 +241,9 @@ pub(crate) async fn write_record_batches(
                 )?
             };
             let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
-            let _ = maybe_collect_sketches(opts, &annotated)?;
+            if let Some(sketches) = maybe_collect_sketches(opts, &annotated)? {
+                batch_sketches.push(sketches);
+            }
             writer
                 .write(annotated)
                 .await
@@ -250,6 +253,11 @@ pub(crate) async fn write_record_batches(
             .close()
             .await
             .map_err(|e| format!("iceberg data file writer close failed: {e}"))?;
+        let combined_sketches = if batch_sketches.is_empty() {
+            None
+        } else {
+            Some(merge_theta_sketches(batch_sketches))
+        };
         return data_files
             .into_iter()
             .map(|data_file| {
@@ -258,7 +266,7 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
-                    theta_sketches: None,
+                    theta_sketches: combined_sketches.as_ref().map(clone_theta_sketches),
                 })
             })
             .collect();
@@ -284,7 +292,7 @@ pub(crate) async fn write_record_batches(
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
         for (partition_key, partition_batch) in partitioned {
-            let _ = maybe_collect_sketches(opts, &partition_batch)?;
+            let theta_sketches = maybe_collect_sketches(opts, &partition_batch)?;
             let mut writer = data_file_builder
                 .build(Some(partition_key))
                 .await
@@ -303,7 +311,7 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
-                    theta_sketches: None,
+                    theta_sketches: theta_sketches.as_ref().map(clone_theta_sketches),
                 });
             }
         }
@@ -312,10 +320,40 @@ pub(crate) async fn write_record_batches(
 }
 
 fn maybe_collect_sketches(
-    _opts: &StagedWriteOptions,
-    _batch: &RecordBatch,
+    opts: &StagedWriteOptions,
+    batch: &RecordBatch,
 ) -> Result<Option<HashMap<i32, ThetaSketchHandle>>, String> {
-    Ok(None)
+    if !opts.collect_theta_sketches {
+        return Ok(None);
+    }
+    Ok(super::sink::compute_theta_sketches_for_batch(batch))
+}
+
+fn merge_theta_sketches(
+    sketches: Vec<HashMap<i32, ThetaSketchHandle>>,
+) -> HashMap<i32, ThetaSketchHandle> {
+    let mut by_field = HashMap::<i32, Vec<ThetaSketchHandle>>::new();
+    for batch_sketches in sketches {
+        for (field_id, sketch) in batch_sketches {
+            by_field.entry(field_id).or_default().push(sketch);
+        }
+    }
+    by_field
+        .into_iter()
+        .map(|(field_id, field_sketches)| {
+            let refs = field_sketches.iter().collect::<Vec<_>>();
+            (field_id, ThetaSketchHandle::union(&refs))
+        })
+        .collect()
+}
+
+fn clone_theta_sketches(
+    sketches: &HashMap<i32, ThetaSketchHandle>,
+) -> HashMap<i32, ThetaSketchHandle> {
+    sketches
+        .iter()
+        .map(|(field_id, sketch)| (*field_id, ThetaSketchHandle::union(&[sketch])))
+        .collect()
 }
 
 async fn write_record_batches_as_data_files_with_schema(
@@ -935,6 +973,34 @@ mod tests {
             ctx.file_io().exists(&path).await.expect("exists"),
             "staged file must exist"
         );
+    }
+
+    #[tokio::test]
+    async fn theta_sketches_collected_only_when_requested() {
+        let table = build_unpartitioned_test_table("kernel_sketch").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: true,
+            content: StagedContent::Data,
+        };
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
+            .await
+            .expect("write");
+        assert_eq!(staged.len(), 1);
+        let sketches = staged[0].theta_sketches.as_ref().expect("sketches present");
+        assert!(
+            sketches.contains_key(&1),
+            "theta sketch for field id 1 (id column)"
+        );
+
+        let staged_off = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write off");
+        assert!(staged_off[0].theta_sketches.is_none());
     }
 
     #[tokio::test]
