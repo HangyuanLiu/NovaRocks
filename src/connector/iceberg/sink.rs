@@ -57,9 +57,11 @@ const ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
 const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
 
 use super::schema::build_full_output_schema;
+use crate::common::config;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
@@ -210,14 +212,7 @@ impl OperatorFactory for IcebergTableSinkFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(IcebergTableSinkOperator {
-            name: self.name.clone(),
-            arena: Arc::clone(&self.arena),
-            plan: Arc::clone(&self.plan),
-            driver_id,
-            file_seq: 0,
-            finished: false,
-        })
+        Box::new(self.create_async_operator(driver_id))
     }
 
     fn is_sink(&self) -> bool {
@@ -225,66 +220,59 @@ impl OperatorFactory for IcebergTableSinkFactory {
     }
 }
 
-struct IcebergTableSinkOperator {
-    name: String,
+impl IcebergTableSinkFactory {
+    fn create_async_operator(&self, driver_id: i32) -> AsyncSinkOperator<IcebergTableSinkBackend> {
+        AsyncSinkOperator::new(
+            self.name.clone(),
+            IcebergTableSinkBackend {
+                arena: Arc::clone(&self.arena),
+                plan: Arc::clone(&self.plan),
+                driver_id,
+                file_seq: 0,
+                runtime_state: None,
+            },
+            config::async_sink_queue_capacity(),
+        )
+    }
+}
+
+struct IcebergTableSinkBackend {
     arena: Arc<ExprArena>,
     plan: Arc<IcebergSinkPlan>,
     driver_id: i32,
     file_seq: u64,
-    finished: bool,
+    runtime_state: Option<RuntimeState>,
 }
 
-impl Operator for IcebergTableSinkOperator {
-    fn name(&self) -> &str {
-        &self.name
+#[async_trait::async_trait]
+impl AsyncSinkBackend for IcebergTableSinkBackend {
+    type Output = ();
+
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.runtime_state = Some(state.clone());
+        Ok(())
     }
 
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-}
-
-impl ProcessorOperator for IcebergTableSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.finished
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
-            return Ok(());
-        }
+    async fn write_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
         if chunk.is_empty() {
             return Ok(());
         }
+        let state = self
+            .runtime_state
+            .clone()
+            .ok_or_else(|| "iceberg async sink backend missing runtime state".to_string())?;
         match self.plan.mode {
-            IcebergSinkMode::Data => self.push_chunk_data(state, chunk),
-            IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(state, chunk),
+            IcebergSinkMode::Data => self.push_chunk_data(&state, chunk),
+            IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(&state, chunk),
         }
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.finished = true;
+    async fn finish(&mut self) -> Result<(), String> {
         Ok(())
     }
 }
 
-impl IcebergTableSinkOperator {
+impl IcebergTableSinkBackend {
     fn build_file_path(
         &mut self,
         state: &RuntimeState,
@@ -1725,11 +1713,38 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
+    use crate::exec::pipeline::operator::Operator;
+
     use super::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        align_arrays_to_schema, build_position_delete_output_schema, iceberg_partition_key_for_row,
-        unique_file_path, write_parquet_to_bytes,
+        IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkFactory, align_arrays_to_schema,
+        build_position_delete_output_schema, iceberg_partition_key_for_row, unique_file_path,
+        write_parquet_to_bytes,
     };
+
+    #[test]
+    fn iceberg_table_sink_factory_creates_async_sink_operator() {
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
+        let factory = IcebergTableSinkFactory {
+            name: "ICEBERG_TABLE_SINK".to_string(),
+            arena: Arc::new(crate::exec::expr::ExprArena::default()),
+            plan: Arc::new(IcebergSinkPlan {
+                mode: IcebergSinkMode::Data,
+                data_location: "file:///tmp/novarocks-iceberg-sink-test/data".to_string(),
+                object_store_s3: None,
+                file_format: "parquet".to_string(),
+                compression: crate::types::TCompressionType::SNAPPY,
+                output_schema: schema,
+                output_exprs: Vec::new(),
+                partition_exprs: Vec::new(),
+                partition_column_names: Vec::new(),
+                transform_exprs: Vec::new(),
+            }),
+        };
+        let op = factory.create_async_operator(0);
+
+        assert_eq!(op.name(), "ICEBERG_TABLE_SINK");
+    }
 
     #[test]
     fn test_align_arrays_to_schema_casts_int64_to_int32() {
