@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::*;
-use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
+use crate::sql::optimizer::estimate::cardinality::{
+    JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
+    union_distinct_rows,
+};
 use crate::sql::optimizer::estimate::ndv::agg_group_rows;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
@@ -270,21 +273,30 @@ fn estimate_limit(limit: &LimitNode, table_stats: &HashMap<String, TableStatisti
 }
 
 fn estimate_union(union: &UnionNode, table_stats: &HashMap<String, TableStatistics>) -> Statistics {
-    let mut total_rows = 0.0;
-    let mut column_statistics = HashMap::new();
-    for input in &union.inputs {
-        let s = estimate_statistics(input, table_stats);
-        total_rows += s.output_row_count;
-        if column_statistics.is_empty() {
-            column_statistics = s.column_statistics;
-        }
-    }
-    if !union.all {
-        total_rows *= UNKNOWN_GROUP_BY_CORRELATION;
-    }
+    let input_stats: Vec<_> = union
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = if union.all {
+        union_all_rows(&input_rows)
+    } else {
+        union_distinct_rows(&input_rows)
+    };
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .first()
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
     Statistics {
-        output_row_count: total_rows.max(1.0),
-        row_count_confidence: Confidence::Estimated,
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
         column_statistics,
     }
 }
@@ -293,18 +305,31 @@ fn estimate_intersect(
     intersect: &IntersectNode,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    let mut min_rows = f64::MAX;
-    let mut column_statistics = HashMap::new();
-    for input in &intersect.inputs {
-        let s = estimate_statistics(input, table_stats);
-        if s.output_row_count < min_rows {
-            min_rows = s.output_row_count;
-            column_statistics = s.column_statistics;
-        }
-    }
+    let input_stats: Vec<_> = intersect
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = intersect_rows(&input_rows);
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .iter()
+        .min_by(|a, b| {
+            a.output_row_count
+                .partial_cmp(&b.output_row_count)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
     Statistics {
-        output_row_count: (min_rows * 0.5).max(1.0),
-        row_count_confidence: Confidence::Estimated,
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
         column_statistics,
     }
 }
@@ -313,19 +338,35 @@ fn estimate_except(
     except: &ExceptNode,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    if let Some(first) = except.inputs.first() {
-        let s = estimate_statistics(first, table_stats);
-        Statistics {
-            output_row_count: (s.output_row_count * 0.5).max(1.0),
-            row_count_confidence: Confidence::Estimated,
-            column_statistics: s.column_statistics,
-        }
+    let input_stats: Vec<_> = except
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = except_rows(&input_rows);
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .first()
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
+    Statistics {
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
+        column_statistics,
+    }
+}
+
+fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
+    if !rows.is_finite() || rows < 1.0 {
+        (1.0, true)
     } else {
-        Statistics {
-            output_row_count: 1.0,
-            row_count_confidence: Confidence::Fallback,
-            column_statistics: HashMap::new(),
-        }
+        (rows, false)
     }
 }
 
@@ -866,5 +907,35 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
         // 1000 * 0.4 = 400
         assert!((stats.output_row_count - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn union_all_cardinality_saturates_rows_and_degrades_confidence() {
+        let (ln, lt) = make_table_stats("a", 900_000_000_000_000, &[("k", 100.0)]);
+        let (rn, rt) = make_table_stats("b", 900_000_000_000_000, &[("k", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(ln, lt);
+        table_stats.insert(rn, rt);
+
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![scan_plan("a", &["k"]), scan_plan("b", &["k"])],
+            all: true,
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "k".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert_eq!(
+            stats.output_row_count,
+            crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT
+        );
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 }

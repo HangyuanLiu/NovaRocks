@@ -1,6 +1,8 @@
 use crate::sql::analysis::JoinKind;
-use crate::sql::optimizer::estimate::arith::{MAX_ROW_COUNT, damped_conjunction, sat_mul};
-use crate::sql::optimizer::statistics::{ANTI_JOIN_SELECTIVITY, Confidence, SEMI_JOIN_SELECTIVITY};
+use crate::sql::optimizer::estimate::arith::{MAX_ROW_COUNT, damped_conjunction, sat_add, sat_mul};
+use crate::sql::optimizer::statistics::{
+    ANTI_JOIN_SELECTIVITY, Confidence, SEMI_JOIN_SELECTIVITY, UNKNOWN_GROUP_BY_CORRELATION,
+};
 
 pub struct JoinCardInput {
     pub left: (f64, Confidence),
@@ -79,6 +81,65 @@ pub fn estimate_join_cardinality(input: &JoinCardInput) -> (f64, Confidence) {
         rows,
         Confidence::derive(&[combined_input_conf], used_default_or_invalid),
     )
+}
+
+pub(crate) fn union_all_rows(inputs: &[f64]) -> (f64, bool) {
+    let mut rows = 0.0;
+    let mut saturated_or_defaulted = false;
+    for &input in inputs {
+        let (input_rows, input_defaulted) = normalize_set_op_input_rows(input);
+        saturated_or_defaulted |= input_defaulted;
+        let Some(input_rows) = input_rows else {
+            continue;
+        };
+        let (next, next_saturated) = sat_add(rows, input_rows);
+        rows = next;
+        saturated_or_defaulted |= next_saturated;
+    }
+    (rows, saturated_or_defaulted)
+}
+
+pub(crate) fn union_distinct_rows(inputs: &[f64]) -> (f64, bool) {
+    let (union_rows, union_saturated) = union_all_rows(inputs);
+    let (rows, saturated) = sat_mul(union_rows, UNKNOWN_GROUP_BY_CORRELATION);
+    (rows, union_saturated || saturated)
+}
+
+pub(crate) fn intersect_rows(inputs: &[f64]) -> (f64, bool) {
+    let Some(min_rows) = inputs
+        .iter()
+        .copied()
+        .filter(|rows| !rows.is_nan())
+        .reduce(f64::min)
+    else {
+        return (1.0, true);
+    };
+    let (rows, saturated) = sat_mul(min_rows, 0.5);
+    finite_positive_rows(rows, saturated)
+}
+
+pub(crate) fn except_rows(inputs: &[f64]) -> (f64, bool) {
+    let Some(&first_rows) = inputs.first() else {
+        return (1.0, true);
+    };
+    let (rows, saturated) = sat_mul(first_rows, 0.5);
+    finite_positive_rows(rows, saturated)
+}
+
+fn finite_positive_rows(rows: f64, saturated_or_defaulted: bool) -> (f64, bool) {
+    if !rows.is_finite() || rows < 1.0 {
+        (1.0, true)
+    } else {
+        (rows, saturated_or_defaulted)
+    }
+}
+
+fn normalize_set_op_input_rows(rows: f64) -> (Option<f64>, bool) {
+    if rows.is_finite() && rows >= 0.0 {
+        (Some(rows), false)
+    } else {
+        (None, true)
+    }
 }
 
 fn row_count(rows: f64) -> (f64, bool) {
@@ -331,5 +392,41 @@ mod tests {
         let (anti, _) =
             estimate_join_cardinality(&inp(JoinKind::LeftAnti, 1000.0, 50.0, vec![(10.0, 10.0)]));
         assert!(anti <= 1000.0 && anti >= 1.0);
+    }
+
+    #[test]
+    fn union_all_rows_saturates_huge_inputs() {
+        let (rows, saturated) = union_all_rows(&[9.0e14, 9.0e14]);
+
+        assert_eq!(rows, crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT);
+        assert!(saturated);
+    }
+
+    #[test]
+    fn union_all_rows_preserves_valid_rows_across_invalid_inputs() {
+        let (rows, saturated_or_defaulted) =
+            union_all_rows(&[100.0, f64::NAN, f64::INFINITY, -25.0, 50.0]);
+
+        assert_eq!(rows, 150.0);
+        assert!(saturated_or_defaulted);
+    }
+
+    #[test]
+    fn union_distinct_rows_applies_unknown_group_correlation() {
+        let (rows, saturated) = union_distinct_rows(&[100.0, 300.0]);
+
+        assert_eq!(rows, 300.0);
+        assert!(!saturated);
+    }
+
+    #[test]
+    fn intersect_and_except_rows_are_finite_for_normal_inputs() {
+        let (intersect, intersect_defaulted) = intersect_rows(&[1_000.0, 200.0, 500.0]);
+        let (except, except_defaulted) = except_rows(&[1_000.0, 200.0, 500.0]);
+
+        assert_eq!(intersect, 100.0);
+        assert!(!intersect_defaulted);
+        assert_eq!(except, 500.0);
+        assert!(!except_defaulted);
     }
 }

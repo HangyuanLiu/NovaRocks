@@ -11,8 +11,13 @@ use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
 use super::operator::Operator;
+use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
+use crate::sql::optimizer::estimate::arith::sat_add;
+use crate::sql::optimizer::estimate::cardinality::{
+    JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
+    union_distinct_rows,
+};
 use crate::sql::optimizer::statistics::*;
 
 // ---------------------------------------------------------------------------
@@ -215,59 +220,26 @@ pub(crate) fn derive_statistics(
             derive_join(join, &left_stats, &right_stats)
         }
 
-        Operator::LogicalUnion(union_op) => {
-            let mut total_rows = 0.0;
-            let mut column_statistics = HashMap::new();
-            for (i, _) in expr.children.iter().enumerate() {
-                let s = child_statistics(memo, &expr.children, i);
-                total_rows += s.output_row_count;
-                if column_statistics.is_empty() {
-                    column_statistics = s.column_statistics;
-                }
-            }
-            if !union_op.all {
-                total_rows *= UNKNOWN_GROUP_BY_CORRELATION;
-            }
-            Statistics {
-                output_row_count: total_rows.max(1.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
+        Operator::LogicalUnion(union_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &union_op.output_columns,
+            SetOpKind::Union { all: union_op.all },
+        ),
 
-        Operator::LogicalIntersect(_) => {
-            let mut min_rows = f64::MAX;
-            let mut column_statistics = HashMap::new();
-            for (i, _) in expr.children.iter().enumerate() {
-                let s = child_statistics(memo, &expr.children, i);
-                if s.output_row_count < min_rows {
-                    min_rows = s.output_row_count;
-                    column_statistics = s.column_statistics;
-                }
-            }
-            Statistics {
-                output_row_count: (min_rows * 0.5).max(1.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
+        Operator::LogicalIntersect(intersect_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &intersect_op.output_columns,
+            SetOpKind::Intersect,
+        ),
 
-        Operator::LogicalExcept(_) => {
-            if !expr.children.is_empty() {
-                let s = child_statistics(memo, &expr.children, 0);
-                Statistics {
-                    output_row_count: (s.output_row_count * 0.5).max(1.0),
-                    row_count_confidence: Confidence::Estimated,
-                    column_statistics: s.column_statistics,
-                }
-            } else {
-                Statistics {
-                    output_row_count: 1.0,
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics: HashMap::new(),
-                }
-            }
-        }
+        Operator::LogicalExcept(except_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &except_op.output_columns,
+            SetOpKind::Except,
+        ),
 
         // -- Physical operators: derive the same way as their logical counterparts --
         Operator::PhysicalScan(scan) => {
@@ -530,59 +502,26 @@ pub(crate) fn derive_statistics(
             }
         }
 
-        Operator::PhysicalUnion(union_op) => {
-            let mut total_rows = 0.0;
-            let mut column_statistics = HashMap::new();
-            for (i, _) in expr.children.iter().enumerate() {
-                let s = child_statistics(memo, &expr.children, i);
-                total_rows += s.output_row_count;
-                if column_statistics.is_empty() {
-                    column_statistics = s.column_statistics;
-                }
-            }
-            if !union_op.all {
-                total_rows *= UNKNOWN_GROUP_BY_CORRELATION;
-            }
-            Statistics {
-                output_row_count: total_rows.max(1.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
+        Operator::PhysicalUnion(union_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &union_op.output_columns,
+            SetOpKind::Union { all: union_op.all },
+        ),
 
-        Operator::PhysicalIntersect(_) => {
-            let mut min_rows = f64::MAX;
-            let mut column_statistics = HashMap::new();
-            for (i, _) in expr.children.iter().enumerate() {
-                let s = child_statistics(memo, &expr.children, i);
-                if s.output_row_count < min_rows {
-                    min_rows = s.output_row_count;
-                    column_statistics = s.column_statistics;
-                }
-            }
-            Statistics {
-                output_row_count: (min_rows * 0.5).max(1.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics,
-            }
-        }
+        Operator::PhysicalIntersect(intersect_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &intersect_op.output_columns,
+            SetOpKind::Intersect,
+        ),
 
-        Operator::PhysicalExcept(_) => {
-            if !expr.children.is_empty() {
-                let s = child_statistics(memo, &expr.children, 0);
-                Statistics {
-                    output_row_count: (s.output_row_count * 0.5).max(1.0),
-                    row_count_confidence: Confidence::Estimated,
-                    column_statistics: s.column_statistics,
-                }
-            } else {
-                Statistics {
-                    output_row_count: 1.0,
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics: HashMap::new(),
-                }
-            }
-        }
+        Operator::PhysicalExcept(except_op) => derive_set_op_statistics(
+            memo,
+            &expr.children,
+            &except_op.output_columns,
+            SetOpKind::Except,
+        ),
 
         Operator::PhysicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
@@ -701,6 +640,159 @@ fn derive_table_function_stats(is_left_join: bool, expr: &MExpr, memo: &Memo) ->
         },
         row_count_confidence: Confidence::Estimated,
         column_statistics: HashMap::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetOpKind {
+    Union { all: bool },
+    Intersect,
+    Except,
+}
+
+fn derive_set_op_statistics(
+    memo: &Memo,
+    children: &[usize],
+    output_columns: &[OutputColumn],
+    kind: SetOpKind,
+) -> Statistics {
+    let child_stats: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(i, _)| child_statistics(memo, children, i))
+        .collect();
+    let input_rows: Vec<_> = child_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = match kind {
+        SetOpKind::Union { all: true } => union_all_rows(&input_rows),
+        SetOpKind::Union { all: false } => union_distinct_rows(&input_rows),
+        SetOpKind::Intersect => intersect_rows(&input_rows),
+        SetOpKind::Except => except_rows(&input_rows),
+    };
+    let (output_rows, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = child_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = merge_set_op_column_statistics(
+        memo,
+        children,
+        output_columns,
+        &child_stats,
+        output_rows,
+        kind,
+    );
+
+    Statistics {
+        output_row_count: output_rows,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
+        column_statistics,
+    }
+}
+
+fn merge_set_op_column_statistics(
+    memo: &Memo,
+    children: &[usize],
+    output_columns: &[OutputColumn],
+    child_stats: &[Statistics],
+    output_rows: f64,
+    kind: SetOpKind,
+) -> HashMap<String, ColumnStatistic> {
+    let child_output_columns: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(i, _)| child_output_columns(memo, children, i))
+        .collect();
+    let mut merged = HashMap::new();
+
+    for (column_idx, output_column) in output_columns.iter().enumerate() {
+        let mut stats_for_column = Vec::new();
+        let mut missing_child_stat = false;
+        let output_name = output_column.name.to_lowercase();
+        for (child_idx, stats) in child_stats.iter().enumerate() {
+            let child_name = child_output_columns
+                .get(child_idx)
+                .and_then(|columns| columns.get(column_idx))
+                .map(|column| column.name.to_lowercase());
+            let child_stat = child_name
+                .as_deref()
+                .and_then(|name| stats.column_statistics.get(name))
+                .or_else(|| stats.column_statistics.get(&output_name));
+            if let Some(stat) = child_stat {
+                stats_for_column.push(stat);
+            } else {
+                missing_child_stat = true;
+            }
+        }
+        let Some(first) = stats_for_column.first().copied() else {
+            continue;
+        };
+
+        let mut min_value = first.min_value;
+        let mut max_value = first.max_value;
+        let mut nulls_fraction = first.nulls_fraction;
+        let mut average_row_size = positive_row_size(first.average_row_size);
+        let mut confidence = first.confidence;
+        let mut union_ndv = 0.0;
+        let mut min_ndv = first.distinct_values_count;
+
+        for stat in &stats_for_column {
+            min_value = min_value.min(stat.min_value);
+            max_value = max_value.max(stat.max_value);
+            nulls_fraction = nulls_fraction.max(stat.nulls_fraction);
+            average_row_size = average_row_size.max(positive_row_size(stat.average_row_size));
+            confidence = confidence.combine(stat.confidence);
+
+            let (next_ndv, _) = sat_add(union_ndv, stat.distinct_values_count);
+            union_ndv = next_ndv;
+            min_ndv = min_ndv.min(stat.distinct_values_count);
+        }
+
+        let raw_ndv = match kind {
+            SetOpKind::Union { .. } => union_ndv,
+            SetOpKind::Intersect | SetOpKind::Except => min_ndv,
+        };
+        if missing_child_stat {
+            confidence = confidence.combine(Confidence::Fallback);
+        }
+
+        merged.insert(
+            output_name,
+            ColumnStatistic {
+                min_value,
+                max_value,
+                nulls_fraction,
+                average_row_size,
+                distinct_values_count: bounded_set_op_ndv(raw_ndv, output_rows),
+                confidence,
+            },
+        );
+    }
+
+    merged
+}
+
+fn positive_row_size(size: f64) -> f64 {
+    if size.is_finite() && size > 0.0 {
+        size
+    } else {
+        8.0
+    }
+}
+
+fn bounded_set_op_ndv(ndv: f64, output_rows: f64) -> f64 {
+    let bounded = if ndv.is_finite() {
+        ndv.min(output_rows)
+    } else {
+        output_rows
+    };
+    bounded.max(1.0)
+}
+
+fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
+    if !rows.is_finite() || rows < 1.0 {
+        (1.0, true)
+    } else {
+        (rows, false)
     }
 }
 
@@ -1462,6 +1554,270 @@ mod tests {
             nullable: false,
             is_internal: false,
         }
+    }
+
+    fn set_op_column_stat(
+        min_value: f64,
+        max_value: f64,
+        nulls_fraction: f64,
+        average_row_size: f64,
+        ndv: f64,
+        confidence: Confidence,
+    ) -> ColumnStatistic {
+        ColumnStatistic {
+            min_value,
+            max_value,
+            nulls_fraction,
+            average_row_size,
+            distinct_values_count: ndv,
+            confidence,
+        }
+    }
+
+    fn set_op_child_group(
+        memo: &mut Memo,
+        rows: f64,
+        row_count_confidence: Confidence,
+        output_name: &str,
+        stat: ColumnStatistic,
+    ) -> usize {
+        use crate::sql::optimizer::memo::LogicalProperties;
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![stats_output_column(1, output_name)], rows);
+        props.row_count_confidence = row_count_confidence;
+        props
+            .column_statistics
+            .insert(output_name.to_lowercase(), stat);
+        memo.groups[group].logical_props = Some(props);
+        group
+    }
+
+    fn set_op_child_group_without_column_stat(
+        memo: &mut Memo,
+        rows: f64,
+        row_count_confidence: Confidence,
+        output_name: &str,
+    ) -> usize {
+        use crate::sql::optimizer::memo::LogicalProperties;
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![stats_output_column(1, output_name)], rows);
+        props.row_count_confidence = row_count_confidence;
+        memo.groups[group].logical_props = Some(props);
+        group
+    }
+
+    #[test]
+    fn logical_union_all_saturates_rows_and_caps_merged_column_ndv() {
+        use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
+        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+
+        let mut memo = Memo::new();
+        let left = set_op_child_group(
+            &mut memo,
+            9.0e14,
+            Confidence::Exact,
+            "left_k",
+            set_op_column_stat(0.0, 20.0, 0.10, 8.0, 8.0e14, Confidence::Exact),
+        );
+        let right = set_op_child_group(
+            &mut memo,
+            9.0e14,
+            Confidence::Exact,
+            "right_k",
+            set_op_column_stat(-10.0, 10.0, 0.20, 16.0, 8.0e14, Confidence::Estimated),
+        );
+        let union = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalUnion(LogicalUnionOp {
+                all: true,
+                output_columns: vec![stats_output_column(10, "k")],
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&union, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, MAX_ROW_COUNT);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        let col = stats.column_statistics.get("k").unwrap();
+        assert_eq!(col.min_value, -10.0);
+        assert_eq!(col.max_value, 20.0);
+        assert_eq!(col.nulls_fraction, 0.20);
+        assert_eq!(col.average_row_size, 16.0);
+        assert_eq!(col.distinct_values_count, MAX_ROW_COUNT);
+        assert_eq!(col.confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn logical_union_distinct_applies_correlation_and_merges_column_ranges() {
+        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+
+        let mut memo = Memo::new();
+        let left = set_op_child_group(
+            &mut memo,
+            100.0,
+            Confidence::Exact,
+            "left_k",
+            set_op_column_stat(5.0, 30.0, 0.01, 8.0, 40.0, Confidence::Exact),
+        );
+        let right = set_op_child_group(
+            &mut memo,
+            300.0,
+            Confidence::Exact,
+            "right_k",
+            set_op_column_stat(-5.0, 50.0, 0.15, 12.0, 90.0, Confidence::Estimated),
+        );
+        let union = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalUnion(LogicalUnionOp {
+                all: false,
+                output_columns: vec![stats_output_column(10, "k")],
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&union, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 300.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        let col = stats.column_statistics.get("k").unwrap();
+        assert_eq!(col.min_value, -5.0);
+        assert_eq!(col.max_value, 50.0);
+        assert_eq!(col.nulls_fraction, 0.15);
+        assert_eq!(col.average_row_size, 12.0);
+        assert_eq!(col.distinct_values_count, 130.0);
+        assert_eq!(col.confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn logical_union_column_stat_missing_child_degrades_confidence() {
+        use crate::sql::optimizer::operator::{LogicalUnionOp, Operator};
+
+        let mut memo = Memo::new();
+        let left = set_op_child_group(
+            &mut memo,
+            100.0,
+            Confidence::Exact,
+            "left_k",
+            set_op_column_stat(5.0, 30.0, 0.01, 8.0, 40.0, Confidence::Exact),
+        );
+        let right =
+            set_op_child_group_without_column_stat(&mut memo, 200.0, Confidence::Exact, "right_k");
+        let union = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalUnion(LogicalUnionOp {
+                all: true,
+                output_columns: vec![stats_output_column(10, "k")],
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&union, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 300.0);
+        let col = stats.column_statistics.get("k").unwrap();
+        assert_eq!(col.min_value, 5.0);
+        assert_eq!(col.max_value, 30.0);
+        assert_eq!(col.distinct_values_count, 40.0);
+        assert_eq!(col.confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn logical_intersect_halves_min_rows_and_uses_min_column_ndv() {
+        use crate::sql::optimizer::operator::{LogicalIntersectOp, Operator};
+
+        let mut memo = Memo::new();
+        let left = set_op_child_group(
+            &mut memo,
+            1_000.0,
+            Confidence::Exact,
+            "left_k",
+            set_op_column_stat(0.0, 100.0, 0.10, 8.0, 80.0, Confidence::Exact),
+        );
+        let right = set_op_child_group(
+            &mut memo,
+            200.0,
+            Confidence::Exact,
+            "right_k",
+            set_op_column_stat(-20.0, 80.0, 0.25, 16.0, 30.0, Confidence::Fallback),
+        );
+        let intersect = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalIntersect(LogicalIntersectOp {
+                output_columns: vec![stats_output_column(10, "k")],
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&intersect, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 100.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        let col = stats.column_statistics.get("k").unwrap();
+        assert_eq!(col.min_value, -20.0);
+        assert_eq!(col.max_value, 100.0);
+        assert_eq!(col.nulls_fraction, 0.25);
+        assert_eq!(col.average_row_size, 16.0);
+        assert_eq!(col.distinct_values_count, 30.0);
+        assert_eq!(col.confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn logical_except_halves_first_rows_and_merges_column_stats_with_min_ndv() {
+        use crate::sql::optimizer::operator::{LogicalExceptOp, Operator};
+
+        let mut memo = Memo::new();
+        let left = set_op_child_group(
+            &mut memo,
+            1_000.0,
+            Confidence::Exact,
+            "left_k",
+            set_op_column_stat(10.0, 100.0, 0.05, 8.0, 80.0, Confidence::Exact),
+        );
+        let right = set_op_child_group(
+            &mut memo,
+            400.0,
+            Confidence::Exact,
+            "right_k",
+            set_op_column_stat(-10.0, 70.0, 0.20, 16.0, 30.0, Confidence::Estimated),
+        );
+        let except = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalExcept(LogicalExceptOp {
+                output_columns: vec![stats_output_column(10, "k")],
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&except, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 500.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        let col = stats.column_statistics.get("k").unwrap();
+        assert_eq!(col.min_value, -10.0);
+        assert_eq!(col.max_value, 100.0);
+        assert_eq!(col.nulls_fraction, 0.20);
+        assert_eq!(col.average_row_size, 16.0);
+        assert_eq!(col.distinct_values_count, 30.0);
+        assert_eq!(col.confidence, Confidence::Estimated);
     }
 
     fn aggregate_child_stat(ndv: f64) -> ColumnStatistic {
