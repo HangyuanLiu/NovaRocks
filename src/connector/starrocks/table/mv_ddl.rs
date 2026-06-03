@@ -506,6 +506,9 @@ fn build_mv_storage_layout(
                 physical_columns: layout.physical_columns,
             })
         }
+        IncrementalMvShape::UnionAll(_) => Err(
+            "UNION ALL IMV storage layout is not supported by legacy StarRocks MV DDL".to_string(),
+        ),
         IncrementalMvShape::JoinProjectionFilter(_) => Err(
             "join projection/filter IMV storage layout is not supported by legacy StarRocks MV DDL"
                 .to_string(),
@@ -574,6 +577,10 @@ fn validate_incremental_mv_analyzed_types(
         IncrementalMvShape::Aggregate(shape) => {
             validate_aggregate_mv_analyzed_types(shape, resolved)
         }
+        IncrementalMvShape::UnionAll(_) => Err(
+            "UNION ALL IMV analyzer validation is not supported by legacy StarRocks MV DDL"
+                .to_string(),
+        ),
         IncrementalMvShape::JoinProjectionFilter(_) => Err(
             "join projection/filter IMV analyzer validation is not supported by legacy StarRocks MV DDL"
                 .to_string(),

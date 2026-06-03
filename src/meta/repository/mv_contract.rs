@@ -17,6 +17,8 @@ pub struct MvSchemaContract {
     pub join: Option<JoinContract>,
     #[serde(default)]
     pub aggregate: Option<AggregateStateContract>,
+    #[serde(default)]
+    pub branch: Option<BranchUnionContract>,
     pub target: TargetContract,
 }
 
@@ -102,6 +104,22 @@ pub enum AggregateStateRoleContract {
     AvgSum,
     AvgCount,
     RetractionCount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchIdColumnContract {
+    pub column_name: String,
+    pub target_field_id: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchUnionContract {
+    pub branch_id_column: BranchIdColumnContract,
+    pub branch_count: u32,
+    /// The per-branch inner apply key combined with branch_id to form the
+    /// composite identity. `GroupRowId` for UNION ALL of aggregates;
+    /// `BaseRowId` for projection/filter UNION ALL.
+    pub inner_apply_key_source: ApplyKeySource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +222,14 @@ pub enum ContractSelfCheckError {
         expected: String,
         actual: String,
     },
+    BranchIdColumnNameWrong {
+        expected: String,
+        actual: String,
+    },
+    BranchInnerApplyKeyMismatch {
+        branch_source: ApplyKeySource,
+        hidden_apply_key_source: ApplyKeySource,
+    },
     OutputReferencesUnknownBaseFieldId {
         output_index: usize,
         field_id: i32,
@@ -266,6 +292,21 @@ impl std::fmt::Display for ContractSelfCheckError {
                 write!(
                     f,
                     "MV contract hidden apply-key column name expected {expected}, got {actual}"
+                )
+            }
+            Self::BranchIdColumnNameWrong { expected, actual } => {
+                write!(
+                    f,
+                    "MV contract branch id column name expected {expected}, got {actual}"
+                )
+            }
+            Self::BranchInnerApplyKeyMismatch {
+                branch_source,
+                hidden_apply_key_source,
+            } => {
+                write!(
+                    f,
+                    "MV contract branch inner apply-key source {branch_source:?} must match hidden apply-key source {hidden_apply_key_source:?}"
                 )
             }
             Self::OutputReferencesUnknownBaseFieldId {
@@ -385,6 +426,7 @@ impl std::error::Error for ContractSelfCheckError {}
 pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
 pub const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
 pub const GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str = "__row_id__";
+pub const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 
 impl MvSchemaContract {
     fn effective_bases(&self) -> Vec<&BaseContract> {
@@ -416,6 +458,14 @@ impl MvSchemaContract {
                 actual: self.target.hidden_apply_key.column_name.clone(),
             });
         }
+        if let Some(branch) = &self.branch {
+            if branch.branch_id_column.column_name != BRANCH_ID_COLUMN_NAME {
+                return Err(ContractSelfCheckError::BranchIdColumnNameWrong {
+                    expected: BRANCH_ID_COLUMN_NAME.to_string(),
+                    actual: branch.branch_id_column.column_name.clone(),
+                });
+            }
+        }
         match self.target.hidden_apply_key.source {
             ApplyKeySource::JoinRowKey => match &self.join {
                 Some(join) if join.predicates.is_empty() => {
@@ -433,6 +483,14 @@ impl MvSchemaContract {
                 if self.aggregate.is_none() {
                     return Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract);
                 }
+            }
+        }
+        if let Some(branch) = &self.branch {
+            if branch.inner_apply_key_source != self.target.hidden_apply_key.source {
+                return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
+                    branch_source: branch.inner_apply_key_source,
+                    hidden_apply_key_source: self.target.hidden_apply_key.source,
+                });
             }
         }
         if let Some(aggregate) = &self.aggregate {
@@ -635,6 +693,7 @@ mod tests {
             },
             join: None,
             aggregate: None,
+            branch: None,
             target: TargetContract {
                 table_fqn: "ice.mv.orders_mv".to_string(),
                 table_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -662,6 +721,120 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn sample_aggregate_contract() -> MvSchemaContract {
+        let mut contract = sample_contract();
+        contract.contract_version = 3;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_c".to_string(),
+                target_field_id: 3,
+                type_signature: "long".to_string(),
+                nullable: false,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        contract.target.hidden_apply_key = HiddenApplyKeyContract {
+            column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            target_field_id: 1,
+            source: ApplyKeySource::GroupRowId,
+        };
+        contract
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_requires_branch_id_column() {
+        let mut contract = sample_aggregate_contract();
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::GroupRowId,
+        });
+        contract
+            .ensure_self_consistent()
+            .expect("valid branch contract");
+
+        contract
+            .branch
+            .as_mut()
+            .unwrap()
+            .branch_id_column
+            .column_name = "wrong".to_string();
+        let err = contract
+            .ensure_self_consistent()
+            .expect_err("wrong branch id col must fail");
+        assert!(
+            matches!(err, ContractSelfCheckError::BranchIdColumnNameWrong { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_requires_inner_key_source_match() {
+        let mut contract = sample_aggregate_contract();
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        let err = contract
+            .ensure_self_consistent()
+            .expect_err("inner apply key source mismatch must fail");
+        assert!(
+            matches!(
+                err,
+                ContractSelfCheckError::BranchInnerApplyKeyMismatch { .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_preserves_join_source_error_priority() {
+        let mut contract = sample_join_contract();
+        contract.join = None;
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::JoinRowKeyRequiresJoinContract)
+        ));
+    }
+
+    #[test]
+    fn branch_union_contract_self_check_preserves_group_source_error_priority() {
+        let mut contract = sample_aggregate_contract();
+        contract.aggregate = None;
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                target_field_id: 4242,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        assert!(matches!(
+            contract.ensure_self_consistent(),
+            Err(ContractSelfCheckError::GroupRowIdRequiresAggregateContract)
+        ));
     }
 
     #[test]
@@ -1151,6 +1324,7 @@ mod tests {
                 }],
             }),
             aggregate: None,
+            branch: None,
             target: TargetContract {
                 table_fqn: "ice.ns.mv".to_string(),
                 table_uuid: "target-uuid".to_string(),

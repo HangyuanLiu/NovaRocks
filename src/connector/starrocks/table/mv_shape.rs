@@ -2,6 +2,7 @@
 pub(crate) enum IncrementalMvShape {
     ProjectionFilter(ProjectionFilterMvShape),
     Aggregate(AggregateMvShape),
+    UnionAll(UnionAllMvShape),
     JoinProjectionFilter(JoinProjectionFilterMvShape),
     JoinAggregate(JoinAggregateMvShape),
 }
@@ -11,7 +12,9 @@ impl IncrementalMvShape {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
-            IncrementalMvShape::JoinProjectionFilter(_) | IncrementalMvShape::JoinAggregate(_) => {
+            IncrementalMvShape::UnionAll(_)
+            | IncrementalMvShape::JoinProjectionFilter(_)
+            | IncrementalMvShape::JoinAggregate(_) => {
                 panic!("base_table() is only valid for single-base MV shapes")
             }
         }
@@ -20,7 +23,18 @@ impl IncrementalMvShape {
     pub(crate) fn base_tables(&self) -> Vec<&sqlparser::ast::ObjectName> {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => vec![&shape.base_table],
-            IncrementalMvShape::Aggregate(shape) => vec![&shape.base_table],
+            IncrementalMvShape::Aggregate(shape) => {
+                if shape.fan_in_bases.is_empty() {
+                    vec![&shape.base_table]
+                } else {
+                    shape.fan_in_bases.iter().collect()
+                }
+            }
+            IncrementalMvShape::UnionAll(shape) => shape
+                .branches
+                .iter()
+                .flat_map(|branch| branch.base_tables())
+                .collect(),
             IncrementalMvShape::JoinProjectionFilter(shape) => {
                 vec![&shape.left_table, &shape.right_table]
             }
@@ -39,9 +53,23 @@ pub(crate) struct ProjectionFilterMvShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AggregateMvShape {
     pub(crate) base_table: sqlparser::ast::ObjectName,
+    /// All base tables that feed the aggregate when the shape has fan-in branches.
+    pub(crate) fan_in_bases: Vec<sqlparser::ast::ObjectName>,
     pub(crate) group_keys: Vec<GroupKeyShape>,
     pub(crate) aggregates: Vec<AggregateCallShape>,
     pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnionBranchKind {
+    ProjectionFilter,
+    Aggregate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnionAllMvShape {
+    pub(crate) branch_kind: UnionBranchKind,
+    pub(crate) branches: Vec<IncrementalMvShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +93,7 @@ impl JoinAggregateMvShape {
     pub(crate) fn as_aggregate_shape_for_layout(&self) -> AggregateMvShape {
         AggregateMvShape {
             base_table: self.join.left_table.clone(),
+            fan_in_bases: Vec::new(),
             group_keys: self.group_keys.clone(),
             aggregates: self.aggregates.clone(),
             visible_outputs: self.visible_outputs.clone(),
@@ -127,6 +156,13 @@ pub(crate) enum VisibleAggregateOutput {
 pub(crate) fn classify_incremental_mv_query(
     query: &sqlparser::ast::Query,
 ) -> Result<IncrementalMvShape, String> {
+    if matches!(
+        query.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation { .. }
+    ) {
+        return classify_union_all_mv_query(query).map(IncrementalMvShape::UnionAll);
+    }
+
     if is_probably_aggregate_query(query) {
         if is_probably_join_query(query) {
             return classify_join_aggregate_mv_query(query).map(IncrementalMvShape::JoinAggregate);
@@ -141,6 +177,122 @@ pub(crate) fn classify_incremental_mv_query(
     }
 
     classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
+}
+
+fn classify_union_all_mv_query(query: &sqlparser::ast::Query) -> Result<UnionAllMvShape, String> {
+    reject_unsupported_query_clauses(query).map_err(|_| union_all_error())?;
+
+    let mut branch_bodies = Vec::new();
+    flatten_union_all(query.body.as_ref(), &mut branch_bodies)?;
+    if branch_bodies.len() < 2 {
+        return Err(union_all_error());
+    }
+
+    let branches = branch_bodies
+        .into_iter()
+        .map(|body| {
+            let branch_query = wrap_setexpr_as_query(query, body);
+            classify_single_union_branch(&branch_query)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [first, rest @ ..] = branches.as_slice() else {
+        return Err(union_all_error());
+    };
+    let branch_kind = union_branch_kind(first)?;
+    for branch in rest {
+        if union_branch_kind(branch)? != branch_kind {
+            return Err(union_all_mixed_shape_error());
+        }
+    }
+    validate_union_branch_outputs_compatible(&branches)?;
+
+    Ok(UnionAllMvShape {
+        branch_kind,
+        branches,
+    })
+}
+
+fn flatten_union_all<'a>(
+    body: &'a sqlparser::ast::SetExpr,
+    out: &mut Vec<&'a sqlparser::ast::SetExpr>,
+) -> Result<(), String> {
+    match body {
+        sqlparser::ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if !matches!(op, sqlparser::ast::SetOperator::Union)
+                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
+            {
+                return Err(union_all_non_all_error());
+            }
+            flatten_union_all(left, out)?;
+            flatten_union_all(right, out)
+        }
+        sqlparser::ast::SetExpr::Select(_) => {
+            out.push(body);
+            Ok(())
+        }
+        sqlparser::ast::SetExpr::Query(inner) => {
+            reject_unsupported_query_clauses(inner).map_err(|_| union_all_error())?;
+            flatten_union_all(inner.body.as_ref(), out)
+        }
+        _ => Err(union_all_error()),
+    }
+}
+
+fn wrap_setexpr_as_query(
+    outer: &sqlparser::ast::Query,
+    body: &sqlparser::ast::SetExpr,
+) -> sqlparser::ast::Query {
+    let mut query = outer.clone();
+    query.body = Box::new(body.clone());
+    query
+}
+
+fn classify_single_union_branch(
+    query: &sqlparser::ast::Query,
+) -> Result<IncrementalMvShape, String> {
+    if is_probably_join_query(query) {
+        return Err(union_all_branch_join_unsupported_error());
+    }
+    if is_probably_aggregate_query(query) {
+        return classify_aggregate_mv_query(query).map(IncrementalMvShape::Aggregate);
+    }
+    classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
+}
+
+fn union_branch_kind(shape: &IncrementalMvShape) -> Result<UnionBranchKind, String> {
+    match shape {
+        IncrementalMvShape::Aggregate(_) => Ok(UnionBranchKind::Aggregate),
+        IncrementalMvShape::ProjectionFilter(_) => Ok(UnionBranchKind::ProjectionFilter),
+        _ => Err(union_all_mixed_shape_error()),
+    }
+}
+
+fn validate_union_branch_outputs_compatible(branches: &[IncrementalMvShape]) -> Result<(), String> {
+    let Some(first_branch) = branches.first() else {
+        return Err(union_all_error());
+    };
+
+    match first_branch {
+        IncrementalMvShape::Aggregate(first) => {
+            let first_arity = first.visible_outputs.len();
+            for branch in &branches[1..] {
+                let IncrementalMvShape::Aggregate(other) = branch else {
+                    return Err(union_all_mixed_shape_error());
+                };
+                if other.visible_outputs.len() != first_arity {
+                    return Err(union_all_branch_output_mismatch_error());
+                }
+            }
+        }
+        IncrementalMvShape::ProjectionFilter(_) => {}
+        _ => return Err(union_all_mixed_shape_error()),
+    }
+    Ok(())
 }
 
 fn classify_projection_filter_mv_query(
@@ -169,7 +321,11 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     };
     reject_unsupported_aggregate_select_clauses(select)?;
 
-    let base_table = extract_single_base_table(select, aggregate_error, aggregate_error)?;
+    let fan_in_bases = extract_union_all_fan_in_bases(select)?;
+    let base_table = match fan_in_bases.first() {
+        Some(first) => first.clone(),
+        None => extract_single_base_table(select, aggregate_error, aggregate_error)?,
+    };
     if let Some(selection) = &select.selection {
         reject_unsupported_expr(selection).map_err(aggregate_expr_error)?;
     }
@@ -177,10 +333,58 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
     Ok(AggregateMvShape {
         base_table,
+        fan_in_bases,
         group_keys,
         aggregates,
         visible_outputs,
     })
+}
+
+fn extract_union_all_fan_in_bases(
+    select: &sqlparser::ast::Select,
+) -> Result<Vec<sqlparser::ast::ObjectName>, String> {
+    let [from] = select.from.as_slice() else {
+        return Ok(Vec::new());
+    };
+    if !from.joins.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sqlparser::ast::TableFactor::Derived {
+        lateral,
+        subquery,
+        sample,
+        ..
+    } = &from.relation
+    else {
+        return Ok(Vec::new());
+    };
+    if *lateral || sample.is_some() {
+        return Err(aggregate_error());
+    }
+    reject_unsupported_query_clauses(subquery).map_err(|_| aggregate_error())?;
+    if !matches!(
+        subquery.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation { .. }
+    ) {
+        return Ok(Vec::new());
+    }
+
+    let mut branch_bodies = Vec::new();
+    flatten_union_all(subquery.body.as_ref(), &mut branch_bodies)?;
+    if branch_bodies.len() < 2 {
+        return Err(aggregate_error());
+    }
+
+    branch_bodies
+        .into_iter()
+        .map(|body| {
+            let sqlparser::ast::SetExpr::Select(branch_select) = body else {
+                return Err(aggregate_error());
+            };
+            extract_single_base_table(branch_select, aggregate_error, aggregate_error)
+        })
+        .collect()
 }
 
 fn classify_join_aggregate_mv_query(
@@ -1442,6 +1646,28 @@ fn aggregate_expr_error(_err: String) -> String {
     "incremental aggregate MV query contains an unsupported expression".to_string()
 }
 
+fn union_all_error() -> String {
+    "incremental UNION ALL MV query must be a UNION ALL of two or more compatible branches"
+        .to_string()
+}
+
+fn union_all_non_all_error() -> String {
+    "incremental UNION ALL MV supports only positional UNION ALL; UNION ALL BY NAME, UNION (distinct), INTERSECT, and EXCEPT are not supported".to_string()
+}
+
+fn union_all_mixed_shape_error() -> String {
+    "incremental UNION ALL MV requires all branches to be the same shape (all aggregate or all projection/filter)".to_string()
+}
+
+fn union_all_branch_join_unsupported_error() -> String {
+    "incremental UNION ALL MV branches may not contain joins in this version".to_string()
+}
+
+fn union_all_branch_output_mismatch_error() -> String {
+    "incremental UNION ALL MV aggregate branches must have identical visible output arity"
+        .to_string()
+}
+
 /// Rewrite a MV SELECT SQL into state-shaped output columns.
 ///
 /// The returned SQL string can be fed directly to the executor to produce a state-shaped
@@ -1681,6 +1907,19 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
+    fn name(s: &str) -> sqlparser::ast::ObjectName {
+        let parts = s
+            .split('.')
+            .map(sqlparser::ast::Ident::new)
+            .collect::<Vec<_>>();
+        sqlparser::ast::ObjectName(
+            parts
+                .into_iter()
+                .map(sqlparser::ast::ObjectNamePart::Identifier)
+                .collect(),
+        )
+    }
+
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
@@ -1698,6 +1937,222 @@ mod tests {
         assert!(
             err.contains(needle) || err.contains("syntax error"),
             "expected error to contain `{needle}` or a syntax error for `{sql}`, got `{err}`"
+        );
+    }
+
+    #[test]
+    fn union_all_shape_reports_all_branch_base_tables() {
+        let agg = AggregateMvShape {
+            base_table: name("ice.ns.t1"),
+            fan_in_bases: Vec::new(),
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let agg2 = AggregateMvShape {
+            base_table: name("ice.ns.t2"),
+            fan_in_bases: Vec::new(),
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let shape = IncrementalMvShape::UnionAll(UnionAllMvShape {
+            branch_kind: UnionBranchKind::Aggregate,
+            branches: vec![
+                IncrementalMvShape::Aggregate(agg),
+                IncrementalMvShape::Aggregate(agg2),
+            ],
+        });
+        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            bases,
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_top_level_union_all_of_aggregate_branches() {
+        let shape = classify_sql(
+            "select k1, sum(v2) as s from ice.ns.t1 group by k1 \
+             union all \
+             select k1, sum(v2) as s from ice.ns.t2 group by k1",
+        )
+        .expect("union all of aggregates should be accepted");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll shape");
+        };
+        assert_eq!(u.branch_kind, UnionBranchKind::Aggregate);
+        assert_eq!(u.branches.len(), 2);
+        assert!(matches!(u.branches[0], IncrementalMvShape::Aggregate(_)));
+        assert!(matches!(u.branches[1], IncrementalMvShape::Aggregate(_)));
+        assert_eq!(
+            u.branches
+                .iter()
+                .flat_map(|b| b.base_tables())
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>(),
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_top_level_union_all_of_projection_branches() {
+        let shape = classify_sql(
+            "select k1, v2 from ice.ns.t1 where v2 > 0 \
+             union all \
+             select k1, v2 from ice.ns.t2 where v2 < 0",
+        )
+        .expect("union all of projection/filter should be accepted");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(u.branch_kind, UnionBranchKind::ProjectionFilter);
+        assert_eq!(u.branches.len(), 2);
+    }
+
+    #[test]
+    fn flattens_three_branch_union_all() {
+        let shape = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, sum(v2) s from ice.ns.t2 group by k1 \
+             union all select k1, sum(v2) s from ice.ns.t3 group by k1",
+        )
+        .expect("three-branch union all should flatten");
+        let IncrementalMvShape::UnionAll(u) = shape else {
+            panic!("expected UnionAll");
+        };
+        assert_eq!(u.branches.len(), 3);
+    }
+
+    #[test]
+    fn rejects_union_distinct() {
+        let err = classify_sql("select k1 from ice.ns.t1 union select k1 from ice.ns.t2")
+            .expect_err("UNION distinct must be rejected");
+        assert!(err.contains("UNION ALL"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_union_all_by_name() {
+        let err =
+            classify_sql("select k1 from ice.ns.t1 union all by name select k1 from ice.ns.t2")
+                .expect_err("UNION ALL BY NAME must be rejected");
+        assert!(
+            err.contains("UNION ALL") || err.contains("BY NAME"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_intersect() {
+        let err = classify_sql("select k1 from ice.ns.t1 intersect select k1 from ice.ns.t2")
+            .expect_err("INTERSECT must be rejected");
+        assert!(
+            err.contains("not supported") || err.contains("UNION ALL"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_aggregate_and_projection_branches() {
+        let err = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, v2 from ice.ns.t2",
+        )
+        .expect_err("mixed shapes must be rejected");
+        assert!(err.contains("same shape"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_arity_mismatch() {
+        let err = classify_sql(
+            "select k1, sum(v2) s from ice.ns.t1 group by k1 \
+             union all select k1, sum(v2) s, count(*) c from ice.ns.t2 group by k1",
+        )
+        .expect_err("arity mismatch must be rejected");
+        assert!(
+            err.contains("arity") || err.contains("identical output"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_union_all_branch_with_parenthesized_limit() {
+        let err = classify_sql(
+            "(select k1, sum(v2) as s from ice.ns.t1 group by k1 limit 1) \
+             union all \
+             select k1, sum(v2) as s from ice.ns.t2 group by k1",
+        )
+        .expect_err("branch-local LIMIT must be rejected");
+        assert!(
+            err.contains("UNION ALL") || err.contains("incremental"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_shape_fan_in_bases_drive_base_tables() {
+        let agg = AggregateMvShape {
+            base_table: name("ice.ns.t1"),
+            fan_in_bases: vec![name("ice.ns.t1"), name("ice.ns.t2")],
+            group_keys: Vec::new(),
+            aggregates: Vec::new(),
+            visible_outputs: Vec::new(),
+        };
+        let shape = IncrementalMvShape::Aggregate(agg);
+        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            bases,
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_aggregate_over_union_all_fan_in() {
+        let shape = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 \
+             ) u group by k",
+        )
+        .expect("aggregate over UNION ALL should be accepted");
+        let IncrementalMvShape::Aggregate(a) = shape else {
+            panic!("expected Aggregate shape (A-family)");
+        };
+        assert_eq!(
+            a.fan_in_bases
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>(),
+            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
+        );
+        assert_eq!(a.group_keys.len(), 1);
+        assert_eq!(a.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn rejects_aggregate_over_union_all_fan_in_with_derived_limit() {
+        let err = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 limit 1 \
+             ) u group by k",
+        )
+        .expect_err("derived-level LIMIT must be rejected");
+        assert!(
+            err.contains("aggregate") || err.contains("incremental"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_over_union_all_fan_in_with_derived_order_by() {
+        let err = classify_sql(
+            "select k, sum(v) as s from ( \
+                select k, v from ice.ns.t1 union all select k, v from ice.ns.t2 order by k \
+             ) u group by k",
+        )
+        .expect_err("derived-level ORDER BY must be rejected");
+        assert!(
+            err.contains("aggregate") || err.contains("incremental"),
+            "unexpected: {err}"
         );
     }
 

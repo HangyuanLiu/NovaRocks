@@ -481,7 +481,17 @@ ORDER BY k1;
 -- FULL OUTER USING + window functions
 -- @order_sensitive=true
 SELECT k1, k2, v1, v2,
-       ROW_NUMBER() OVER (PARTITION BY k1 ORDER BY k2) as rn,
+       ROW_NUMBER() OVER (
+         PARTITION BY k1
+         ORDER BY k2,
+                  CASE
+                    WHEN v1 IS NOT NULL AND v2 IS NOT NULL THEN 'BOTH'
+                    WHEN v1 IS NOT NULL THEN 'T1_ONLY'
+                    WHEN v2 IS NOT NULL THEN 'T2_ONLY'
+                    ELSE 'NEITHER'
+                  END,
+                  COALESCE(v1, v2)
+       ) as rn,
        COUNT(*) OVER (PARTITION BY k1) as cnt_per_k1
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 ORDER BY k1, k2,
@@ -562,7 +572,7 @@ ORDER BY k1, k2;
 SELECT k1, k2, v1, v2, v3
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
-ORDER BY COALESCE(k1, 999), COALESCE(k2, 999), v1;
+ORDER BY COALESCE(k1, 999), COALESCE(k2, 999), v1, COALESCE(v2, v3);
 
 -- query 60
 -- FULL OUTER + LEFT + FULL OUTER + RIGHT chain with dup subquery

@@ -684,11 +684,14 @@ mod tests {
     fn send_non_final_batch_uses_batch_report_exec_status_rpc() {
         frontend_rpc::test_clear_shared_host_pools();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
         let seen_for_server = Arc::clone(&seen);
+        let batch_calls_for_server = Arc::clone(&batch_calls);
         let server = FakeFeRpcServer::start(
             0,
             Box::new(move |method, seq, i_prot, o_prot| match method {
                 "batchReportExecStatus" => {
+                    batch_calls_for_server.fetch_add(1, Ordering::AcqRel);
                     let req: frontend_service::TBatchReportExecStatusParams =
                         read_struct_arg(i_prot)?;
                     let ids = req
@@ -726,7 +729,8 @@ mod tests {
         ]);
 
         let seen = seen.lock().expect("inspect batched fragment ids");
-        assert_eq!(server.accepts(), 1);
+        assert!(server.accepts() >= 1);
+        assert_eq!(batch_calls.load(Ordering::Acquire), 1);
         assert_eq!(seen.len(), 2);
     }
 
