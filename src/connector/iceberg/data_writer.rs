@@ -196,7 +196,6 @@ pub(crate) async fn write_record_batches(
             .build(None)
             .await
             .map_err(|e| format!("build iceberg data file writer failed: {e}"))?;
-        let mut sketches = None;
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
@@ -211,11 +210,7 @@ pub(crate) async fn write_record_batches(
                 )?
             };
             let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
-            if sketches.is_none() {
-                sketches = maybe_collect_sketches(opts, &annotated)?;
-            } else {
-                let _ = maybe_collect_sketches(opts, &annotated)?;
-            }
+            let _ = maybe_collect_sketches(opts, &annotated)?;
             writer
                 .write(annotated)
                 .await
@@ -225,7 +220,6 @@ pub(crate) async fn write_record_batches(
             .close()
             .await
             .map_err(|e| format!("iceberg data file writer close failed: {e}"))?;
-        let mut sketches = sketches;
         return data_files
             .into_iter()
             .map(|data_file| {
@@ -234,7 +228,7 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
-                    theta_sketches: sketches.take(),
+                    theta_sketches: None,
                 })
             })
             .collect();
@@ -260,7 +254,7 @@ pub(crate) async fn write_record_batches(
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
         for (partition_key, partition_batch) in partitioned {
-            let mut sketches = maybe_collect_sketches(opts, &partition_batch)?;
+            let _ = maybe_collect_sketches(opts, &partition_batch)?;
             let mut writer = data_file_builder
                 .build(Some(partition_key))
                 .await
@@ -279,7 +273,7 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
-                    theta_sketches: sketches.take(),
+                    theta_sketches: None,
                 });
             }
         }
@@ -892,11 +886,14 @@ mod tests {
     async fn write_record_batches_unpartitioned_produces_one_file_with_stats() {
         let table = build_unpartitioned_test_table("kernel_unpart").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let batch = test_batch(&[1, 2, 3]);
-        let staged = write_record_batches(&ctx, vec![batch], &StagedWriteOptions::default())
-            .await
-            .expect("write");
-        assert_eq!(staged.len(), 1, "one file for one unpartitioned batch");
+        let staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2]), test_batch(&[3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        assert_eq!(staged.len(), 1, "one file for unpartitioned batches");
         assert_eq!(staged[0].data_file.record_count(), 3);
         assert!(staged[0].data_file.file_size_in_bytes() > 0);
         assert!(
@@ -919,8 +916,23 @@ mod tests {
             .await
             .expect("write");
         assert_eq!(staged.len(), 2, "one file per distinct partition value");
-        let total: u64 = staged.iter().map(|s| s.data_file.record_count()).sum();
-        assert_eq!(total, 4);
+        let mut record_counts = staged
+            .iter()
+            .map(|s| s.data_file.record_count())
+            .collect::<Vec<_>>();
+        record_counts.sort_unstable();
+        assert_eq!(record_counts, vec![2, 2]);
+        for staged_file in &staged {
+            assert!(
+                staged_file.theta_sketches.is_none(),
+                "sketches off by default"
+            );
+            let path = staged_file.data_file.file_path().to_string();
+            assert!(
+                ctx.file_io().exists(&path).await.expect("exists"),
+                "staged partition file must exist"
+            );
+        }
     }
 
     struct LocalFsTestTable {
