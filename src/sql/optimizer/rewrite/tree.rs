@@ -437,6 +437,7 @@ mod tests {
                 output_name: "c1".to_string(),
                 output_column_id: output.column_id,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

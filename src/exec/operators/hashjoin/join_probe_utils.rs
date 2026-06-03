@@ -43,6 +43,8 @@ use crate::exec::hash_table::key_builder::{
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 
+const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
+
 /// Produce cross-join output rows by combining each left row with all right rows.
 pub(crate) fn cross_join_chunk(
     left: &Chunk,
@@ -224,11 +226,13 @@ pub(crate) fn keyed_join_chunk(
             continue;
         }
         let right_indices = &right_indices_by_batch[batch_idx];
-        if let Some(batch) =
-            build_join_batch(left, right, left_indices, right_indices, output_schema)?
-        {
-            output_batches.push(batch);
-        }
+        output_batches.extend(build_join_batches(
+            left,
+            right,
+            left_indices,
+            right_indices,
+            output_schema,
+        )?);
     }
 
     Ok(output_batches)
@@ -337,6 +341,13 @@ pub(crate) fn build_join_batch(
     right_indices: &[u32],
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
+    if left_indices.len() != right_indices.len() {
+        return Err(format!(
+            "join index length mismatch: left={} right={}",
+            left_indices.len(),
+            right_indices.len()
+        ));
+    }
     if left_indices.is_empty() || right_indices.is_empty() {
         return Ok(None);
     }
@@ -357,6 +368,42 @@ pub(crate) fn build_join_batch(
 
     let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| e.to_string())?;
     Ok(Some(batch))
+}
+
+pub(crate) fn build_join_batches(
+    left: &Chunk,
+    right: &Chunk,
+    left_indices: &[u32],
+    right_indices: &[u32],
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, String> {
+    if left_indices.len() != right_indices.len() {
+        return Err(format!(
+            "join index length mismatch: left={} right={}",
+            left_indices.len(),
+            right_indices.len()
+        ));
+    }
+    if left_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut batches = Vec::new();
+    let mut offset = 0usize;
+    while offset < left_indices.len() {
+        let end = (offset + MAX_JOIN_OUTPUT_ROWS_PER_BATCH).min(left_indices.len());
+        if let Some(batch) = build_join_batch(
+            left,
+            right,
+            &left_indices[offset..end],
+            &right_indices[offset..end],
+            output_schema,
+        )? {
+            batches.push(batch);
+        }
+        offset = end;
+    }
+    Ok(batches)
 }
 
 /// Build left-preserving rows with null-filled right side for outer/semi join paths.
@@ -426,4 +473,59 @@ pub(crate) fn concat_schemas(left: SchemaRef, right: SchemaRef) -> SchemaRef {
     let mut fields = left.fields().to_vec();
     fields.extend(right.fields().to_vec());
     Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+
+    use super::{MAX_JOIN_OUTPUT_ROWS_PER_BATCH, build_join_batches};
+
+    fn one_column_chunk(name: &str, slot_id: SlotId, values: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let array = Arc::new(Int32Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot_id])
+                .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn join_schema(left_name: &str, right_name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(left_name, DataType::Int32, false),
+            Field::new(right_name, DataType::Int32, false),
+        ]))
+    }
+
+    #[test]
+    fn build_join_batches_splits_large_candidate_output() {
+        let rows = MAX_JOIN_OUTPUT_ROWS_PER_BATCH + 1;
+        let left = one_column_chunk("l", SlotId::new(1), (0..rows).map(|i| i as i32).collect());
+        let right = one_column_chunk("r", SlotId::new(2), vec![7]);
+        let left_indices = (0..rows).map(|i| i as u32).collect::<Vec<_>>();
+        let right_indices = vec![0u32; rows];
+
+        let batches = build_join_batches(
+            &left,
+            &right,
+            &left_indices,
+            &right_indices,
+            &join_schema("l", "r"),
+        )
+        .expect("join batches");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            rows
+        );
+    }
 }

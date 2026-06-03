@@ -247,6 +247,7 @@ mod tests {
                 output_name: "a".to_string(),
                 output_column_id: out_a,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 
@@ -298,6 +299,7 @@ mod tests {
                 output_name: "a".to_string(),
                 output_column_id: out_a,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 
@@ -382,6 +384,7 @@ mod tests {
                 output_name: "b".to_string(),
                 expr: col_ref(out_b, "b"),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 

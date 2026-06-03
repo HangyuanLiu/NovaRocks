@@ -587,6 +587,7 @@ mod tests {
                     output_column_id: ColumnId(first_id + 1),
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
@@ -1109,6 +1110,7 @@ mod tests {
                 output_name: "k".to_string(),
                 output_column_id: ColumnId(1),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 

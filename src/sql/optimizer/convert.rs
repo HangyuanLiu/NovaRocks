@@ -51,6 +51,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let child = logical_plan_to_memo(&node.input, memo);
             let op = Operator::LogicalProject(LogicalProjectOp {
                 items: node.items.clone(),
+                output_qualifier: node.output_qualifier.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),

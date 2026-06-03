@@ -316,6 +316,7 @@ mod tests {
                 output_name: "k".to_string(),
                 output_column_id: ColumnId::new_for_test(output_id),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

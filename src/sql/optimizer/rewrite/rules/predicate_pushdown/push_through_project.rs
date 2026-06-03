@@ -10,13 +10,10 @@
 //! `predicate_pushdown::push_filter_into`, with the difference that this
 //! rule does NOT recurse; the rewrite framework owns traversal.
 
-use std::collections::HashSet;
-
-use crate::sql::analysis::ExprKind;
+use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_refs, combine_and, split_and, wrap_remaining_filter,
-};
+use crate::sql::optimizer::rewrite::rules::utils::{combine_and, split_and, wrap_remaining_filter};
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PushDownPredicateProject;
@@ -41,30 +38,13 @@ impl RewriteRule for PushDownPredicateProject {
             return None;
         };
 
-        let passthrough_columns: HashSet<String> = proj
-            .items
-            .iter()
-            .filter_map(|item| {
-                if let ExprKind::ColumnRef { column, .. } = &item.expr.kind {
-                    Some(column.to_lowercase())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         let conjuncts = split_and(filter.predicate);
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
         for conj in conjuncts {
-            let refs = collect_column_refs(&conj);
-            if refs
-                .iter()
-                .all(|r| passthrough_columns.contains(&r.to_lowercase()))
-            {
-                pushable.push(conj);
-            } else {
-                remaining.push(conj);
+            match rewrite_predicate_through_project(&conj, &proj) {
+                Some(rewritten) => pushable.push(rewritten),
+                None => remaining.push(conj),
             }
         }
 
@@ -82,10 +62,272 @@ impl RewriteRule for PushDownPredicateProject {
         let new_project = LogicalPlan::Project(ProjectNode {
             input: Box::new(new_child),
             items: proj.items,
+            output_qualifier: proj.output_qualifier,
             required_output_columns: proj.required_output_columns,
         });
         Some(wrap_remaining_filter(new_project, remaining))
     }
+}
+
+fn rewrite_predicate_through_project(expr: &TypedExpr, proj: &ProjectNode) -> Option<TypedExpr> {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } => lookup_passthrough_projection(*column_id, qualifier.as_deref(), column, proj),
+        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => Some(expr.clone()),
+        ExprKind::BinaryOp { left, op, right } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(rewrite_predicate_through_project(left, proj)?),
+                op: *op,
+                right: Box::new(rewrite_predicate_through_project(right, proj)?),
+            },
+        }),
+        ExprKind::UnaryOp { op, expr: inner } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::UnaryOp {
+                op: *op,
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+            },
+        }),
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::FunctionCall {
+                name: name.clone(),
+                args: rewrite_expr_list_through_project(args, proj)?,
+                distinct: *distinct,
+            },
+        }),
+        ExprKind::LambdaFunction { params, body } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::LambdaFunction {
+                params: params.clone(),
+                body: Box::new(rewrite_predicate_through_project(body, proj)?),
+            },
+        }),
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::AggregateCall {
+                name: name.clone(),
+                args: rewrite_expr_list_through_project(args, proj)?,
+                distinct: *distinct,
+                order_by: order_by
+                    .iter()
+                    .map(|item| {
+                        rewrite_predicate_through_project(&item.expr, proj).map(|expr| SortItem {
+                            expr,
+                            asc: item.asc,
+                            nulls_first: item.nulls_first,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            },
+        }),
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Cast {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                target: target.clone(),
+            },
+        }),
+        ExprKind::IsNull {
+            expr: inner,
+            negated,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::IsNull {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                negated: *negated,
+            },
+        }),
+        ExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::InList {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                list: rewrite_expr_list_through_project(list, proj)?,
+                negated: *negated,
+            },
+        }),
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Between {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                low: Box::new(rewrite_predicate_through_project(low, proj)?),
+                high: Box::new(rewrite_predicate_through_project(high, proj)?),
+                negated: *negated,
+            },
+        }),
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Like {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                pattern: Box::new(rewrite_predicate_through_project(pattern, proj)?),
+                negated: *negated,
+            },
+        }),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Case {
+                operand: match operand {
+                    Some(operand) => {
+                        Some(Box::new(rewrite_predicate_through_project(operand, proj)?))
+                    }
+                    None => None,
+                },
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        Some((
+                            rewrite_predicate_through_project(when, proj)?,
+                            rewrite_predicate_through_project(then, proj)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                else_expr: match else_expr {
+                    Some(else_expr) => Some(Box::new(rewrite_predicate_through_project(
+                        else_expr, proj,
+                    )?)),
+                    None => None,
+                },
+            },
+        }),
+        ExprKind::IsTruthValue {
+            expr: inner,
+            value,
+            negated,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::IsTruthValue {
+                expr: Box::new(rewrite_predicate_through_project(inner, proj)?),
+                value: *value,
+                negated: *negated,
+            },
+        }),
+        ExprKind::Nested(inner) => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Nested(Box::new(rewrite_predicate_through_project(inner, proj)?)),
+        }),
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::WindowCall {
+                name: name.clone(),
+                args: rewrite_expr_list_through_project(args, proj)?,
+                distinct: *distinct,
+                partition_by: rewrite_expr_list_through_project(partition_by, proj)?,
+                order_by: order_by
+                    .iter()
+                    .map(|item| {
+                        rewrite_predicate_through_project(&item.expr, proj).map(|expr| SortItem {
+                            expr,
+                            asc: item.asc,
+                            nulls_first: item.nulls_first,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                window_frame: window_frame.clone(),
+                ignore_nulls: *ignore_nulls,
+            },
+        }),
+        ExprKind::SubqueryPlaceholder { .. } => Some(expr.clone()),
+        ExprKind::Lambda { params, body } => Some(TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Lambda {
+                params: params.clone(),
+                body: Box::new(rewrite_predicate_through_project(body, proj)?),
+            },
+        }),
+    }
+}
+
+fn rewrite_expr_list_through_project(
+    exprs: &[TypedExpr],
+    proj: &ProjectNode,
+) -> Option<Vec<TypedExpr>> {
+    exprs
+        .iter()
+        .map(|expr| rewrite_predicate_through_project(expr, proj))
+        .collect()
+}
+
+fn lookup_passthrough_projection(
+    column_id: ColumnId,
+    qualifier: Option<&str>,
+    column: &str,
+    proj: &ProjectNode,
+) -> Option<TypedExpr> {
+    for item in &proj.items {
+        if !matches!(item.expr.kind, ExprKind::ColumnRef { .. }) {
+            continue;
+        }
+        if column_id != ColumnId::UNSET && item.output_column_id == column_id {
+            return Some(item.expr.clone());
+        }
+        if let Some(ref output_qualifier) = proj.output_qualifier
+            && !qualifier
+                .map(|q| q.eq_ignore_ascii_case(output_qualifier))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        if item.output_name.eq_ignore_ascii_case(column) {
+            return Some(item.expr.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -110,11 +352,34 @@ mod tests {
         }
     }
 
+    fn qualified_col(qualifier: &str, name: &str) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Int64,
+            nullable: true,
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: Some(qualifier.into()),
+                column: name.into(),
+            },
+        }
+    }
+
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: false,
             kind: ExprKind::Literal(LiteralValue::Int(v)),
+        }
+    }
+
+    fn is_not_null(expr: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::IsNull {
+                expr: Box::new(expr),
+                negated: true,
+            },
         }
     }
 
@@ -193,6 +458,7 @@ mod tests {
                     output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 })
                 .collect(),
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
@@ -226,6 +492,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rewrites_qualified_alias_predicate_before_pushdown() {
+        let scan = scan_with_cols(&["item_sk"]);
+        let mut project = passthrough_project(&["item_sk"], scan);
+        if let LogicalPlan::Project(ref mut p) = project {
+            p.output_qualifier = Some("asceding".into());
+        }
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(project),
+            predicate: is_not_null(qualified_col("asceding", "item_sk")),
+            required_output_columns: None,
+        });
+
+        let rule = PushDownPredicateProject;
+        let out = rule.apply(filter).expect("should rewrite");
+
+        let LogicalPlan::Project(project) = out else {
+            panic!("expected Project at top");
+        };
+        let LogicalPlan::Filter(inner_filter) = *project.input else {
+            panic!("expected pushed Filter below Project");
+        };
+        let ExprKind::IsNull { expr, negated } = inner_filter.predicate.kind else {
+            panic!("expected pushed IS NOT NULL predicate");
+        };
+        assert!(negated);
+        let ExprKind::ColumnRef {
+            qualifier, column, ..
+        } = expr.kind
+        else {
+            panic!("expected pushed predicate to reference the Project input column");
+        };
+        assert_eq!(qualifier, None);
+        assert_eq!(column, "item_sk");
+    }
+
     // Test 2: SELECT a+1 AS x FROM t WHERE x = 5
     // The projection item for x is computed (BinaryOp), not a bare ColumnRef.
     // No conjuncts are pushable; rule must return None.
@@ -249,6 +551,7 @@ mod tests {
                 output_name: "x".into(),
                 output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let filter = LogicalPlan::Filter(FilterNode {
@@ -326,6 +629,7 @@ mod tests {
                     output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         });
         // Filter: a=1 AND x=5

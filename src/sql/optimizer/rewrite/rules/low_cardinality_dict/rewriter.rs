@@ -329,6 +329,7 @@ fn rewrite_project(
         LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
             items,
+            output_qualifier: node.output_qualifier,
             required_output_columns: node.required_output_columns,
         }),
         output_scope,

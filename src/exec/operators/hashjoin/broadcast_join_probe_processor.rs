@@ -168,7 +168,11 @@ impl Operator for BroadcastJoinProbeProcessorOperator {
 
 impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
     fn need_input(&self) -> bool {
-        if self.finishing || self.finished || self.pending_output.is_some() {
+        if self.finishing
+            || self.finished
+            || self.pending_output.is_some()
+            || self.core.has_pending_output()
+        {
             return false;
         }
         self.core.is_build_loaded() || self.state.has_build()
@@ -176,6 +180,9 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
 
     fn has_output(&self) -> bool {
         if self.pending_output.is_some() {
+            return true;
+        }
+        if self.core.has_pending_output() {
             return true;
         }
         self.finishing
@@ -205,6 +212,9 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        if self.pending_output.is_none() && self.core.has_pending_output() {
+            self.pending_output = self.core.pop_pending_output()?;
+        }
         if self.pending_output.is_none() && self.finishing && !self.finishing_done {
             let out = self.finish_one()?;
             self.pending_output = out;

@@ -318,6 +318,7 @@ mod tests {
                     output_column_id: row_id,
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

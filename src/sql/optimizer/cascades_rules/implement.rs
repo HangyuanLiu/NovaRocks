@@ -592,6 +592,7 @@ impl Rule for ProjectToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalProject(PhysicalProjectOp {
                 items: op.items.clone(),
+                output_qualifier: op.output_qualifier.clone(),
             }),
             children: expr.children.clone(),
         }]

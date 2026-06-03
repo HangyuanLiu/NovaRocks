@@ -101,6 +101,7 @@ impl RewriteRule for PruneUkFkJoin {
         Some(LogicalPlan::Project(ProjectNode {
             input: Box::new(retained),
             items: project.items,
+            output_qualifier: project.output_qualifier,
             required_output_columns: project.required_output_columns,
         }))
     }
@@ -151,6 +152,7 @@ impl RewriteRule for EliminateUniqueAggregate {
         Some(LogicalPlan::Project(ProjectNode {
             input: aggregate.input,
             items,
+            output_qualifier: project.output_qualifier,
             required_output_columns: project.required_output_columns,
         }))
     }

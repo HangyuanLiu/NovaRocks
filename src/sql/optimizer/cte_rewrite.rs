@@ -93,6 +93,7 @@ pub(crate) fn inline_single_use_ctes(
         LogicalPlan::Project(node) => Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)?),
             items: node.items,
+            output_qualifier: node.output_qualifier,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::Aggregate(node) => Ok(LogicalPlan::Aggregate(AggregateNode {
@@ -251,6 +252,7 @@ fn replace_cte_consume(
         LogicalPlan::Project(node) => Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)?),
             items: node.items,
+            output_qualifier: node.output_qualifier,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::Aggregate(node) => Ok(LogicalPlan::Aggregate(AggregateNode {
