@@ -27,3 +27,4 @@ nosetests.xml
 /.codex/worktrees/
 /.codex/environments/runtime/
 /docker/iceberg-rest/runtime/
+/logs/
