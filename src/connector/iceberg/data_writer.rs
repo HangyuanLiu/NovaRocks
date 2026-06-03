@@ -61,6 +61,7 @@ pub(crate) struct StagedDataFileWriter {
 
 impl StagedDataFileWriter {
     pub(crate) fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
+        ensure_data_file_staged_content(opts.content)?;
         Ok(Self {
             ctx,
             opts,
@@ -204,6 +205,7 @@ pub(crate) async fn write_record_batches(
     batches: impl IntoIterator<Item = RecordBatch>,
     opts: &StagedWriteOptions,
 ) -> Result<Vec<StagedDataFile>, String> {
+    ensure_data_file_staged_content(opts.content)?;
     let data_file_builder = ctx.data_file_writer_builder()?;
     let variant_indices = variant_field_indices(ctx.schema());
 
@@ -303,6 +305,15 @@ pub(crate) async fn write_record_batches(
         }
     }
     Ok(staged_files)
+}
+
+fn ensure_data_file_staged_content(content: StagedContent) -> Result<(), String> {
+    match content {
+        StagedContent::Data => Ok(()),
+        unsupported => Err(format!(
+            "unsupported staged content {unsupported:?} for staged data-file writer kernel; this writer only produces DATA files"
+        )),
+    }
 }
 
 pub(crate) async fn cleanup_staged_files(
@@ -1021,6 +1032,35 @@ mod tests {
         .await
         .expect("write off");
         assert!(staged_off[0].theta_sketches.is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_data_file_writer_rejects_position_delete_content() {
+        let table = build_unpartitioned_test_table("kernel_position_delete_content").await;
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: false,
+            content: StagedContent::PositionDeletes,
+        };
+
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let write_err = match write_record_batches(&ctx, vec![test_batch(&[1])], &opts).await {
+            Ok(_) => panic!("position delete content should be rejected by batch writer"),
+            Err(err) => err,
+        };
+        assert!(
+            write_err.contains("PositionDeletes"),
+            "error should mention unsupported content, got: {write_err}"
+        );
+
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let new_err = match StagedDataFileWriter::new(ctx, opts) {
+            Ok(_) => panic!("position delete content should be rejected by staged writer"),
+            Err(err) => err,
+        };
+        assert!(
+            new_err.contains("PositionDeletes"),
+            "error should mention unsupported content, got: {new_err}"
+        );
     }
 
     #[tokio::test]
