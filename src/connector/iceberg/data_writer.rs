@@ -1388,28 +1388,59 @@ mod tests {
                 .build()
                 .expect("schema"),
         );
-        let partition_spec = if partitioned {
-            iceberg::spec::PartitionSpec::builder(schema.clone())
-                .with_spec_id(partition_spec_id)
-                .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
-                .expect("add partition field")
-                .build()
-                .expect("partition spec")
+        let metadata_builder = if partitioned && partition_spec_id > 0 {
+            let mut builder = iceberg::spec::TableMetadataBuilder::new(
+                schema.as_ref().clone(),
+                iceberg::spec::PartitionSpec::unpartition_spec(),
+                iceberg::spec::SortOrder::unsorted_order(),
+                location,
+                iceberg::spec::FormatVersion::V2,
+                std::collections::HashMap::new(),
+            )
+            .expect("builder");
+            for idx in 1..partition_spec_id {
+                let transform = if idx <= 3 {
+                    iceberg::spec::Transform::Bucket((idx + 1) as u32)
+                } else {
+                    iceberg::spec::Transform::Truncate((idx - 2) as u32)
+                };
+                let spec = iceberg::spec::UnboundPartitionSpec::builder()
+                    .add_partition_field(1, format!("id_evolved_{idx}"), transform)
+                    .expect("add evolved partition field")
+                    .build();
+                builder = builder
+                    .add_default_partition_spec(spec)
+                    .expect("add evolved partition spec");
+            }
+            let identity_spec = iceberg::spec::UnboundPartitionSpec::builder()
+                .add_partition_field(1, "id", iceberg::spec::Transform::Identity)
+                .expect("add identity partition field")
+                .build();
+            builder
+                .add_default_partition_spec(identity_spec)
+                .expect("add identity partition spec")
         } else {
-            iceberg::spec::PartitionSpec::unpartition_spec()
+            let partition_spec = if partitioned {
+                iceberg::spec::PartitionSpec::builder(schema.clone())
+                    .with_spec_id(partition_spec_id)
+                    .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
+                    .expect("add partition field")
+                    .build()
+                    .expect("partition spec")
+            } else {
+                iceberg::spec::PartitionSpec::unpartition_spec()
+            };
+            iceberg::spec::TableMetadataBuilder::new(
+                schema.as_ref().clone(),
+                partition_spec,
+                iceberg::spec::SortOrder::unsorted_order(),
+                location,
+                iceberg::spec::FormatVersion::V2,
+                std::collections::HashMap::new(),
+            )
+            .expect("builder")
         };
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
-            schema.as_ref().clone(),
-            partition_spec,
-            iceberg::spec::SortOrder::unsorted_order(),
-            location,
-            iceberg::spec::FormatVersion::V2,
-            std::collections::HashMap::new(),
-        )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
+        let metadata = metadata_builder.build().expect("metadata").metadata;
 
         let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
