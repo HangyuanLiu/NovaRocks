@@ -11,7 +11,7 @@ use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
 use super::operator::Operator;
-use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::estimate::arith::sat_add;
 use crate::sql::optimizer::estimate::cardinality::{
@@ -177,9 +177,9 @@ pub(crate) fn derive_statistics(
             }
         }
 
-        Operator::LogicalWindow(_) => {
-            // Passthrough child stats.
-            child_statistics(memo, &expr.children, 0)
+        Operator::LogicalWindow(window) => {
+            let child_stats = child_statistics(memo, &expr.children, 0);
+            derive_window_statistics(child_stats, &window.window_exprs)
         }
 
         Operator::LogicalRepeat(repeat) => {
@@ -363,10 +363,17 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalHashJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
+            let mut eq_key_pairs = Vec::new();
             let eq_key_ndvs = join
                 .eq_conditions
                 .iter()
                 .map(|eq| {
+                    if let (Some(left), Some(right)) = (
+                        extract_column_name(&eq.left),
+                        extract_column_name(&eq.right),
+                    ) {
+                        eq_key_pairs.push((left.to_lowercase(), right.to_lowercase()));
+                    }
                     let left_ndv = get_expr_ndv(&eq.left, &left_stats.column_statistics)
                         .max(get_expr_ndv(&eq.left, &right_stats.column_statistics));
                     let right_ndv = get_expr_ndv(&eq.right, &left_stats.column_statistics)
@@ -386,8 +393,14 @@ pub(crate) fn derive_statistics(
                 non_equi_selectivity: None,
             });
 
-            let mut column_statistics = left_stats.column_statistics;
-            column_statistics.extend(right_stats.column_statistics);
+            let column_statistics = merge_join_column_statistics(
+                &left_stats,
+                &right_stats,
+                output_rows,
+                row_count_confidence,
+                join.join_type,
+                &eq_key_pairs,
+            );
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence,
@@ -404,6 +417,7 @@ pub(crate) fn derive_statistics(
                     Confidence::Estimated,
                 )
             });
+            let eq_key_pairs = collect_equi_join_column_pairs(join.condition.as_ref());
 
             let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
                 left: (left_stats.output_row_count, left_stats.row_count_confidence),
@@ -416,8 +430,14 @@ pub(crate) fn derive_statistics(
                 non_equi_selectivity,
             });
 
-            let mut column_statistics = left_stats.column_statistics;
-            column_statistics.extend(right_stats.column_statistics);
+            let column_statistics = merge_join_column_statistics(
+                &left_stats,
+                &right_stats,
+                output_rows,
+                row_count_confidence,
+                join.join_type,
+                &eq_key_pairs,
+            );
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence,
@@ -456,7 +476,10 @@ pub(crate) fn derive_statistics(
             }
         }
 
-        Operator::PhysicalWindow(_) => child_statistics(memo, &expr.children, 0),
+        Operator::PhysicalWindow(window) => {
+            let child_stats = child_statistics(memo, &expr.children, 0);
+            derive_window_statistics(child_stats, &window.window_exprs)
+        }
 
         Operator::PhysicalDistribution(_) => {
             // Distribution enforcer preserves row count.
@@ -796,6 +819,152 @@ fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
     }
 }
 
+fn merge_join_column_statistics(
+    left_stats: &Statistics,
+    right_stats: &Statistics,
+    output_rows: f64,
+    row_count_confidence: Confidence,
+    join_type: JoinKind,
+    eq_key_pairs: &[(String, String)],
+) -> HashMap<String, ColumnStatistic> {
+    let mut column_statistics = match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+            left_stats.column_statistics.clone()
+        }
+        JoinKind::RightSemi | JoinKind::RightAnti => right_stats.column_statistics.clone(),
+        _ => {
+            let mut stats = left_stats.column_statistics.clone();
+            stats.extend(right_stats.column_statistics.clone());
+            stats
+        }
+    };
+
+    for (left_key, right_key) in eq_key_pairs {
+        let Some((left_key, right_key)) =
+            orient_join_key_pair(left_key, right_key, left_stats, right_stats)
+        else {
+            continue;
+        };
+        let left = &left_stats.column_statistics[left_key];
+        let right = &right_stats.column_statistics[right_key];
+        let Some((contained_ndv, confidence)) =
+            contained_join_key_ndv(left, right, row_count_confidence)
+        else {
+            continue;
+        };
+        if let Some(stat) = column_statistics.get_mut(left_key) {
+            stat.distinct_values_count = contained_ndv;
+            stat.confidence = confidence;
+        }
+        if let Some(stat) = column_statistics.get_mut(right_key) {
+            stat.distinct_values_count = contained_ndv;
+            stat.confidence = confidence;
+        }
+    }
+
+    for stat in column_statistics.values_mut() {
+        let capped_ndv = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+        if capped_ndv != stat.distinct_values_count {
+            stat.distinct_values_count = capped_ndv;
+            stat.confidence = Confidence::derive(&[stat.confidence, row_count_confidence], false);
+        }
+    }
+
+    column_statistics
+}
+
+fn orient_join_key_pair<'a>(
+    first: &'a str,
+    second: &'a str,
+    left_stats: &Statistics,
+    right_stats: &Statistics,
+) -> Option<(&'a str, &'a str)> {
+    let forward = left_stats.column_statistics.contains_key(first)
+        && right_stats.column_statistics.contains_key(second);
+    let reverse = left_stats.column_statistics.contains_key(second)
+        && right_stats.column_statistics.contains_key(first);
+    match (forward, reverse) {
+        (true, false) => Some((first, second)),
+        (false, true) => Some((second, first)),
+        _ => None,
+    }
+}
+
+fn contained_join_key_ndv(
+    left: &ColumnStatistic,
+    right: &ColumnStatistic,
+    row_count_confidence: Confidence,
+) -> Option<(f64, Confidence)> {
+    let left_ndv = real_column_ndv(left);
+    let right_ndv = real_column_ndv(right);
+    let ndv = match (left_ndv, right_ndv) {
+        (Some(left), Some(right)) => left.min(right),
+        (Some(left), None) => left,
+        (None, Some(right)) => right,
+        (None, None) => return None,
+    };
+    let confidence = Confidence::derive(
+        &[left.confidence, right.confidence, row_count_confidence],
+        left_ndv.is_none() || right_ndv.is_none(),
+    );
+    Some((ndv, confidence))
+}
+
+fn real_column_ndv(stat: &ColumnStatistic) -> Option<f64> {
+    if stat.distinct_values_count.is_finite() && stat.distinct_values_count > 1.0 {
+        Some(stat.distinct_values_count)
+    } else {
+        None
+    }
+}
+
+fn collect_equi_join_column_pairs(condition: Option<&TypedExpr>) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    if let Some(condition) = condition {
+        collect_equi_join_column_pairs_inner(condition, &mut pairs);
+    }
+    pairs
+}
+
+fn collect_equi_join_column_pairs_inner(expr: &TypedExpr, pairs: &mut Vec<(String, String)>) {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Eq | BinOp::EqForNull,
+            right,
+        } => {
+            if let (Some(left_name), Some(right_name)) =
+                (extract_column_name(left), extract_column_name(right))
+            {
+                pairs.push((left_name.to_lowercase(), right_name.to_lowercase()));
+            }
+        }
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_equi_join_column_pairs_inner(left, pairs);
+            collect_equi_join_column_pairs_inner(right, pairs);
+        }
+        ExprKind::Nested(inner) => collect_equi_join_column_pairs_inner(inner, pairs),
+        _ => {}
+    }
+}
+
+fn derive_window_statistics(
+    mut child_stats: Statistics,
+    window_exprs: &[crate::sql::planner::plan::WindowExpr],
+) -> Statistics {
+    for window_expr in window_exprs {
+        child_stats.column_statistics.insert(
+            window_expr.output_name.to_lowercase(),
+            ColumnStatistic::unknown(),
+        );
+    }
+    child_stats
+}
+
 /// Derive scan statistics from a `LogicalScanOp`.
 fn derive_scan(
     scan: &super::operator::LogicalScanOp,
@@ -971,6 +1140,7 @@ fn derive_join(
             Confidence::Estimated,
         )
     });
+    let eq_key_pairs = collect_equi_join_column_pairs(join.condition.as_ref());
     let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
         left: (left_stats.output_row_count, left_stats.row_count_confidence),
         right: (
@@ -982,8 +1152,14 @@ fn derive_join(
         non_equi_selectivity,
     });
 
-    let mut column_statistics = left_stats.column_statistics.clone();
-    column_statistics.extend(right_stats.column_statistics.clone());
+    let column_statistics = merge_join_column_statistics(
+        left_stats,
+        right_stats,
+        output_rows,
+        row_count_confidence,
+        join.join_type,
+        &eq_key_pairs,
+    );
 
     Statistics {
         output_row_count: output_rows,
@@ -2034,6 +2210,26 @@ mod tests {
         }
     }
 
+    fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: crate::sql::analysis::BinOp::And,
+                right: Box::new(right),
+            },
+        }
+    }
+
+    fn nested_expr(expr: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Nested(Box::new(expr)),
+        }
+    }
+
     fn filter_ndv_child_stat(ndv: f64) -> ColumnStatistic {
         ColumnStatistic {
             min_value: 7.0,
@@ -2240,6 +2436,82 @@ mod tests {
     }
 
     #[test]
+    fn physical_hash_join_caps_output_ndv_and_merges_key_equivalence() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{
+            JoinDistribution, LogicalValuesOp, Operator, PhysicalHashJoinEqCondition,
+            PhysicalHashJoinOp,
+        };
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(
+            &mut memo,
+            100.0,
+            &[("l_key", 100.0), ("l_payload", 1_000.0)],
+        );
+        let right = values_group(&mut memo, 40.0, &[("r_key", 20.0), ("r_payload", 500.0)]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: col_ref("l_key"),
+                    right: col_ref("r_key"),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 40.0);
+        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
+        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
+        assert_eq!(
+            stats.column_statistics["l_payload"].distinct_values_count,
+            40.0
+        );
+        assert_eq!(
+            stats.column_statistics["r_payload"].distinct_values_count,
+            40.0
+        );
+    }
+
+    #[test]
     fn logical_join_stats_use_shared_cardinality_estimator_for_condition() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
@@ -2301,6 +2573,304 @@ mod tests {
     }
 
     #[test]
+    fn logical_join_condition_merges_key_equivalence_and_caps_payload_ndv() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(
+            &mut memo,
+            10_000.0,
+            &[("l_key", 100.0), ("l_payload", 1_000_000.0)],
+        );
+        let right = values_group(
+            &mut memo,
+            4_000.0,
+            &[("r_key", 20.0), ("r_payload", 500_000.0)],
+        );
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(eq_expr(col_ref("l_key"), col_ref("r_key"))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(stats.output_row_count, 4_000.0);
+        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
+        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
+        assert_eq!(
+            stats.column_statistics["l_payload"].distinct_values_count,
+            4_000.0
+        );
+        assert_eq!(
+            stats.column_statistics["r_payload"].distinct_values_count,
+            4_000.0
+        );
+    }
+
+    #[test]
+    fn logical_join_reversed_condition_merges_key_equivalence() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 10_000.0, &[("l_key", 100.0)]);
+        let right = values_group(&mut memo, 4_000.0, &[("r_key", 20.0)]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(eq_expr(col_ref("r_key"), col_ref("l_key"))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
+        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
+    }
+
+    #[test]
+    fn logical_join_nested_and_condition_merges_multiple_key_pairs() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 10_000.0, &[("l_k1", 100.0), ("l_k2", 500.0)]);
+        let right = values_group(&mut memo, 4_000.0, &[("r_k1", 20.0), ("r_k2", 50.0)]);
+        let condition = nested_expr(and_expr(
+            nested_expr(eq_expr(col_ref("l_k1"), col_ref("r_k1"))),
+            nested_expr(eq_expr(col_ref("l_k2"), col_ref("r_k2"))),
+        ));
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(stats.column_statistics["l_k1"].distinct_values_count, 20.0);
+        assert_eq!(stats.column_statistics["r_k1"].distinct_values_count, 20.0);
+        assert_eq!(stats.column_statistics["l_k2"].distinct_values_count, 50.0);
+        assert_eq!(stats.column_statistics["r_k2"].distinct_values_count, 50.0);
+    }
+
+    #[test]
+    fn logical_join_unknown_key_ndv_does_not_collapse_real_side_to_one() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+
+        fn values_group(memo: &mut Memo, rows: f64, name: &str, stat: ColumnStatistic) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            props.column_statistics.insert(name.to_string(), stat);
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let real_key = ColumnStatistic {
+            min_value: 0.0,
+            max_value: 1_000.0,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: 100.0,
+            confidence: Confidence::Exact,
+        };
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 10_000.0, "l_key", real_key);
+        let right = values_group(&mut memo, 4_000.0, "r_key", ColumnStatistic::unknown());
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(eq_expr(col_ref("l_key"), col_ref("r_key"))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(
+            stats.column_statistics["l_key"].distinct_values_count,
+            100.0
+        );
+        assert_eq!(
+            stats.column_statistics["r_key"].distinct_values_count,
+            100.0
+        );
+        assert_eq!(
+            stats.column_statistics["l_key"].confidence,
+            Confidence::Fallback
+        );
+        assert_eq!(
+            stats.column_statistics["r_key"].confidence,
+            Confidence::Fallback
+        );
+    }
+
+    #[test]
+    fn logical_join_same_name_keys_skip_ambiguous_containment() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, ndv: f64) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            props
+                .column_statistics
+                .insert("id".to_string(), column_stat(ndv));
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 10_000.0, 20.0);
+        let right = values_group(&mut memo, 4_000.0, 100.0);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(eq_expr(col_ref("id"), col_ref("id"))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert_eq!(stats.column_statistics["id"].distinct_values_count, 100.0);
+    }
+
+    #[test]
     fn physical_nest_loop_join_stats_use_shared_cardinality_estimator_for_non_equi_semi() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{LogicalValuesOp, Operator, PhysicalNestLoopJoinOp};
@@ -2358,7 +2928,146 @@ mod tests {
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
         assert!(stats.column_statistics.contains_key("l_filter"));
-        assert!(stats.column_statistics.contains_key("r_payload"));
+        assert!(!stats.column_statistics.contains_key("r_payload"));
+    }
+
+    #[test]
+    fn physical_nest_loop_right_anti_keeps_only_right_side_stats() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator, PhysicalNestLoopJoinOp};
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, stats: &[(&str, f64)]) -> usize {
+            let id = memo.next_expr_id();
+            let group = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], rows);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, 1_000.0, &[("l_payload", 100.0)]);
+        let right = values_group(&mut memo, 50.0, &[("r_filter", 50.0)]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::RightAnti,
+                condition: Some(eq_expr(col_ref("r_filter"), int_lit(7))),
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert!(
+            (stats.output_row_count - 20.0).abs() < 1.0,
+            "expected right anti output, got {}",
+            stats.output_row_count
+        );
+        assert!(!stats.column_statistics.contains_key("l_payload"));
+        assert!(stats.column_statistics.contains_key("r_filter"));
+    }
+
+    #[test]
+    fn window_stats_preserve_child_columns_and_mark_window_outputs_fallback() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{
+            LogicalValuesOp, LogicalWindowOp, Operator, PhysicalWindowOp,
+        };
+
+        fn window_expr(output_name: &str) -> WindowExpr {
+            WindowExpr {
+                name: "row_number".to_string(),
+                args: vec![],
+                distinct: false,
+                partition_by: vec![],
+                order_by: vec![],
+                window_frame: None,
+                result_type: DataType::Int64,
+                output_name: output_name.to_string(),
+                ignore_nulls: false,
+            }
+        }
+
+        fn child_group(memo: &mut Memo) -> usize {
+            let group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![stats_output_column(1, "base")], 25.0);
+            props.row_count_confidence = Confidence::Exact;
+            props.column_statistics.insert(
+                "base".to_string(),
+                ColumnStatistic {
+                    min_value: 1.0,
+                    max_value: 10.0,
+                    nulls_fraction: 0.0,
+                    average_row_size: 8.0,
+                    distinct_values_count: 10.0,
+                    confidence: Confidence::Exact,
+                },
+            );
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        fn assert_window_stats(stats: Statistics) {
+            assert_eq!(stats.output_row_count, 25.0);
+            assert_eq!(stats.row_count_confidence, Confidence::Exact);
+            assert_eq!(stats.column_statistics["base"].distinct_values_count, 10.0);
+            let row_number = stats.column_statistics.get("rn").unwrap();
+            assert_eq!(row_number.confidence, Confidence::Fallback);
+            assert_eq!(row_number.distinct_values_count, 1.0);
+        }
+
+        let mut memo = Memo::new();
+        let child = child_group(&mut memo);
+        let logical_window = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalWindow(LogicalWindowOp {
+                window_exprs: vec![window_expr("rn")],
+                output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
+            }),
+            children: vec![child],
+        };
+        assert_window_stats(derive_statistics(&logical_window, &memo, &HashMap::new()));
+
+        let physical_window = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![window_expr("rn")],
+                output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
+            }),
+            children: vec![child],
+        };
+        assert_window_stats(derive_statistics(&physical_window, &memo, &HashMap::new()));
     }
 
     #[test]

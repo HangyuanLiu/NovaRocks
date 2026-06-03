@@ -179,6 +179,11 @@ mod tests {
     }
 
     #[test]
+    fn join_output_ndv_capped_at_output_rows() {
+        assert_eq!(cap_ndv_at_rows(1e6, 8.0), 8.0);
+    }
+
+    #[test]
     fn filter_ndv_cap_handles_invalid_inputs_conservatively() {
         assert_eq!(cap_ndv_at_rows(1000.0, 0.0), 1.0);
         assert_eq!(cap_ndv_at_rows(1000.0, f64::NAN), 1.0);
