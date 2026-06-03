@@ -107,11 +107,25 @@ impl StagedWriteContext {
         writer_schema: SchemaRef,
         annotated_schema: arrow::datatypes::SchemaRef,
     ) -> Result<Self, String> {
-        let metadata = Arc::new(table.metadata().clone());
+        Self::from_parts(
+            table.metadata().clone(),
+            table.file_io().clone(),
+            writer_schema,
+            annotated_schema,
+        )
+    }
+
+    pub(crate) fn from_parts(
+        metadata: iceberg::spec::TableMetadata,
+        file_io: iceberg::io::FileIO,
+        writer_schema: SchemaRef,
+        annotated_schema: arrow::datatypes::SchemaRef,
+    ) -> Result<Self, String> {
+        let metadata = Arc::new(metadata);
         let partition_spec_id = metadata.default_partition_spec_id();
         Ok(Self {
             metadata,
-            file_io: table.file_io().clone(),
+            file_io,
             writer_schema,
             annotated_schema,
             partition_spec_id,
@@ -957,6 +971,66 @@ mod tests {
             "context partition spec must match table default partition spec"
         );
         let _ = ctx.file_io();
+    }
+
+    #[tokio::test]
+    async fn staged_write_context_from_parts_uses_supplied_metadata_file_io_and_data_location() {
+        let table = build_local_fs_test_table("ctx_from_parts", true).await;
+        let writer_schema = table.metadata().current_schema().clone();
+        let data_location = format!(
+            "{}/custom-data",
+            table.metadata().location().trim_end_matches('/')
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            writer_schema.as_ref().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            table.metadata().location().to_string(),
+            iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::from([(
+                "write.data.path".to_string(),
+                data_location.clone(),
+            )]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let annotated_schema = Arc::new(
+            schema_to_arrow_schema(&writer_schema).expect("convert schema to arrow schema"),
+        );
+
+        let ctx = StagedWriteContext::from_parts(
+            metadata,
+            table.file_io().clone(),
+            writer_schema,
+            annotated_schema,
+        )
+        .expect("context from parts");
+
+        assert_eq!(
+            ctx.partition_spec_id(),
+            table.metadata().default_partition_spec_id()
+        );
+        assert_eq!(
+            ctx.partition_spec().fields().len(),
+            table.metadata().default_partition_spec().fields().len()
+        );
+
+        let staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[4, 4])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write through context from parts");
+        assert_eq!(staged.len(), 1);
+        let path = staged[0].data_file.file_path().to_string();
+        assert!(
+            path.starts_with(&format!("{data_location}/id=4/")),
+            "staged writer should honor supplied write.data.path, got {path}"
+        );
+        assert!(ctx.file_io().exists(&path).await.expect("exists"));
     }
 
     #[tokio::test]
