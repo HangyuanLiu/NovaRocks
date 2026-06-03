@@ -16,6 +16,7 @@ pub(crate) mod rewrite;
 pub(crate) mod rule;
 pub(crate) mod runtime_filter_pass;
 pub(crate) mod search;
+pub(crate) mod estimate;
 pub(crate) mod statistics;
 pub(crate) mod stats;
 
