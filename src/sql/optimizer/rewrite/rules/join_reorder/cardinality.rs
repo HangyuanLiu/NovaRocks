@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn and_selectivity_multiplies() {
+    fn and_selectivity_uses_damped_conjunction() {
         let col_stats: HashMap<String, ColumnStatistic> = [
             (
                 "a".to_string(),
@@ -623,8 +623,13 @@ mod tests {
             eq_expr(col_ref("b"), int_lit(2)),
         );
         let sel = estimate_selectivity(&pred, &col_stats);
-        // 1/100 * 1/50 = 0.0002
-        assert!((sel - 0.0002).abs() < 0.0001);
+        // Damped conjunction sorts 0.01 and 0.02 ascending:
+        // 0.01 * sqrt(0.02) ~= 0.001414213562.
+        let expected = 0.01_f64 * 0.02_f64.sqrt();
+        assert!(
+            (sel - expected).abs() < 1e-12,
+            "expected damped selectivity {expected}, got {sel}"
+        );
     }
 
     #[test]

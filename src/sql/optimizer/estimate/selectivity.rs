@@ -7,6 +7,8 @@ use crate::sql::optimizer::statistics::{
     ColumnStatistic, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER, PREDICATE_UNKNOWN_FILTER,
 };
 
+use super::arith::damped_conjunction;
+
 /// Estimate selectivity of a predicate expression (0.0..1.0).
 pub(crate) fn estimate_selectivity(
     expr: &TypedExpr,
@@ -15,9 +17,13 @@ pub(crate) fn estimate_selectivity(
     match &expr.kind {
         ExprKind::BinaryOp { left, op, right } => match op {
             BinOp::And => {
-                let l = estimate_selectivity(left, column_stats);
-                let r = estimate_selectivity(right, column_stats);
-                l * r
+                let mut conjuncts = Vec::new();
+                flatten_and(expr, &mut conjuncts);
+                let sels: Vec<f64> = conjuncts
+                    .iter()
+                    .map(|c| estimate_selectivity(c, column_stats))
+                    .collect();
+                damped_conjunction(&sels)
             }
             BinOp::Or => {
                 let l = estimate_selectivity(left, column_stats);
@@ -70,8 +76,8 @@ pub(crate) fn estimate_selectivity(
             high,
         } => {
             // a BETWEEN low AND high  ==  a >= low AND a <= high
-            // The ge * le product uses the same independence model as the BinOp::And arm;
-            // this slightly overestimates selectivity for narrow symmetric ranges.
+            // Keep BETWEEN as a direct range-bound product; generic AND
+            // conjunctions use damped_conjunction to avoid collapse.
             let ge = estimate_range_selectivity(expr, low, BinOp::Ge, column_stats);
             let le = estimate_range_selectivity(expr, high, BinOp::Le, column_stats);
             let sel = ge * le;
@@ -92,6 +98,23 @@ pub(crate) fn estimate_selectivity(
         }
         ExprKind::Nested(inner) => estimate_selectivity(inner, column_stats),
         _ => PREDICATE_UNKNOWN_FILTER,
+    }
+}
+
+/// Flatten a left/right-nested AND tree into its leaf conjuncts.
+fn flatten_and<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
+    if let ExprKind::BinaryOp {
+        op: BinOp::And,
+        left,
+        right,
+    } = &expr.kind
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else if let ExprKind::Nested(inner) = &expr.kind {
+        flatten_and(inner, out);
+    } else {
+        out.push(expr);
     }
 }
 
@@ -160,5 +183,108 @@ pub(crate) fn extract_column_name(expr: &TypedExpr) -> Option<&str> {
         ExprKind::Cast { expr, .. } => extract_column_name(expr),
         ExprKind::Nested(inner) => extract_column_name(inner),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
+    use std::collections::HashMap;
+
+    fn col(name: &str, id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        }
+    }
+
+    fn int_lit(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::And,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn nested(expr: TypedExpr) -> TypedExpr {
+        let data_type = expr.data_type.clone();
+        let nullable = expr.nullable;
+        TypedExpr {
+            kind: ExprKind::Nested(Box::new(expr)),
+            data_type,
+            nullable,
+        }
+    }
+
+    fn unknown_eq(index: usize) -> TypedExpr {
+        let name = format!("c{index}");
+        eq(col(&name, index as u32 + 1), int_lit(index as i64))
+    }
+
+    fn and_of_unknown_eq(n: usize) -> TypedExpr {
+        let mut predicates = (0..n).map(unknown_eq);
+        let first = predicates
+            .next()
+            .expect("and_of_unknown_eq requires at least one predicate");
+        predicates.fold(first, and)
+    }
+
+    #[test]
+    fn and_chain_does_not_collapse() {
+        // Construct a=? AND b=? AND c=? AND d=? AND e=? with no column stats:
+        // each equality falls back to 0.25.
+        let preds = and_of_unknown_eq(5);
+        let sel = estimate_selectivity(&preds, &HashMap::new());
+        assert!(sel > 0.01, "5x0.25 AND must not collapse to ~0.001: {sel}");
+        assert!(sel <= 0.25, "must not exceed strongest conjunct");
+    }
+
+    #[test]
+    fn nested_and_matches_flat_and_chain() {
+        let p1 = unknown_eq(1);
+        let p2 = unknown_eq(2);
+        let p3 = unknown_eq(3);
+
+        let grouped = and(nested(and(p1.clone(), p2.clone())), p3.clone());
+        let flat = and(and(p1, p2), p3);
+
+        let grouped_sel = estimate_selectivity(&grouped, &HashMap::new());
+        let flat_sel = estimate_selectivity(&flat, &HashMap::new());
+        assert!(
+            (grouped_sel - flat_sel).abs() < 1e-12,
+            "nested AND selectivity {grouped_sel} must match flat AND {flat_sel}"
+        );
     }
 }
