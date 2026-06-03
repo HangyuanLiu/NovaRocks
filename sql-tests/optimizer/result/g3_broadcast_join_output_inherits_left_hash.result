@@ -1,15 +1,15 @@
 Explain String
-GATHER EXCHANGE stats={rows=5904900000000}
-  PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=5904900000000}
-    WINDOW [row_number()] stats={rows=5904900000000}
-      SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=5904900000000}
-        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=5904900000000}
-          HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=5904900000000}
+GATHER EXCHANGE stats={rows=369056250000}
+  PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=369056250000}
+    WINDOW [row_number()] stats={rows=369056250000}
+      SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=369056250000}
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=369056250000}
+          HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) stats={rows=369056250000}
             build runtime filters:
             - filter_id = 1, build_expr = (s.s)
-            FILTER stats={rows=656100000}
+            FILTER stats={rows=164025000}
               predicate: a.k IS NOT NULL
-              HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=729000000}
+              HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=182250000}
                 build runtime filters:
                 - filter_id = 0, build_expr = (b.k)
                 FILTER stats={rows=81000}

@@ -5,7 +5,7 @@ PROJECT [count() AS count(*)] stats={rows=1}
     GATHER EXCHANGE stats={rows=1}
       HASH AGGREGATE (LOCAL) stats={rows=1}
         aggregations: count()
-        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=810000000}
+        HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=202500000}
           build runtime filters:
           - filter_id = 0, build_expr = (b.k)
           SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a (alias=a) stats={rows=90000}

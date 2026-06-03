@@ -1,8 +1,8 @@
 -- query 5
 Explain String
-GATHER EXCHANGE stats={rows=202500000}
-  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=202500000}
-    HASH JOIN (BROADCAST, INNER, eq: [r.rk = l.lk]) stats={rows=202500000}
+GATHER EXCHANGE stats={rows=50625000}
+  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=50625000}
+    HASH JOIN (BROADCAST, INNER, eq: [r.rk = l.lk]) stats={rows=50625000}
       build runtime filters:
       - filter_id = 0, build_expr = (l.lk)
       SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=90000}
@@ -21,9 +21,9 @@ GATHER EXCHANGE stats={rows=202500000}
 
 -- query 6
 Explain String
-GATHER EXCHANGE stats={rows=202500000}
-  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=202500000}
-    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=202500000}
+GATHER EXCHANGE stats={rows=50625000}
+  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=50625000}
+    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=50625000}
       build runtime filters:
       - filter_id = 0, build_expr = (r.rk)
       SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=90000}
