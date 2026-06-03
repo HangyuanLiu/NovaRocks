@@ -4,6 +4,35 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
+/// Trustworthiness of a statistic. Variant order is meaningful: derived
+/// `Ord` makes `Exact > Estimated > Fallback`, so `min` yields the
+/// least-confident input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Confidence {
+    #[default]
+    Fallback,  // relied on a heuristic/default (name-based rows, default selectivity/NDV)
+    Estimated, // derived via formula from at-least-partially-real inputs
+    Exact,     // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
+}
+
+impl Confidence {
+    /// Least-confident of two confidences.
+    pub fn combine(self, other: Confidence) -> Confidence {
+        self.min(other)
+    }
+
+    /// Confidence of a value produced by applying a formula to `inputs`.
+    /// A formula result is never better than `Estimated`; any `Fallback`
+    /// input — or `used_default` — degrades the result to `Fallback`.
+    pub fn derive(inputs: &[Confidence], used_default: bool) -> Confidence {
+        if used_default {
+            return Confidence::Fallback;
+        }
+        let least = inputs.iter().copied().min().unwrap_or(Confidence::Estimated);
+        least.min(Confidence::Estimated)
+    }
+}
+
 /// Per-column statistics derived from Iceberg file metadata.
 #[derive(Clone, Debug)]
 pub struct ColumnStatistic {
@@ -701,6 +730,20 @@ mod tests {
         // Puffin NDV (1234) wins over manifest value_count (8000) and the
         // heuristic (sqrt(10000)*10 = 1000).
         assert!((col.distinct_values_count - 1234.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn confidence_ordering_and_combine() {
+        use Confidence::*;
+        assert!(Exact > Estimated && Estimated > Fallback);
+        // combine = least-confident wins
+        assert_eq!(Exact.combine(Fallback), Fallback);
+        assert_eq!(Exact.combine(Estimated), Estimated);
+        // derive: a formula result is at best Estimated; any Fallback input -> Fallback
+        assert_eq!(Confidence::derive(&[Exact, Exact], false), Estimated);
+        assert_eq!(Confidence::derive(&[Exact, Fallback], false), Fallback);
+        assert_eq!(Confidence::derive(&[Exact, Exact], true), Fallback);
+        assert_eq!(Confidence::default(), Fallback);
     }
 
     #[test]
