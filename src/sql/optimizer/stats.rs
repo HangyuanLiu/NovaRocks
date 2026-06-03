@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
 use super::operator::Operator;
@@ -73,10 +74,14 @@ pub(crate) fn derive_statistics(
             let child_stats = child_statistics(memo, &expr.children, 0);
             let selectivity =
                 estimate_selectivity(&filter.predicate, &child_stats.column_statistics);
-            let output_rows = (child_stats.output_row_count * selectivity).max(1.0);
+            let (output_rows, row_count_confidence) = apply_filter(
+                child_stats.output_row_count,
+                child_stats.row_count_confidence,
+                selectivity,
+            );
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -312,10 +317,14 @@ pub(crate) fn derive_statistics(
             let child_stats = child_statistics(memo, &expr.children, 0);
             let selectivity =
                 estimate_selectivity(&filter.predicate, &child_stats.column_statistics);
-            let output_rows = (child_stats.output_row_count * selectivity).max(1.0);
+            let (output_rows, row_count_confidence) = apply_filter(
+                child_stats.output_row_count,
+                child_stats.row_count_confidence,
+                selectivity,
+            );
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence,
                 column_statistics: child_stats.column_statistics,
             }
         }

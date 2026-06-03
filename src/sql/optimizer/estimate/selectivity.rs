@@ -4,10 +4,11 @@ use std::collections::HashMap;
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::optimizer::statistics::{
-    ColumnStatistic, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER, PREDICATE_UNKNOWN_FILTER,
+    ColumnStatistic, Confidence, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER,
+    PREDICATE_UNKNOWN_FILTER,
 };
 
-use super::arith::damped_conjunction;
+use super::arith::{damped_conjunction, sat_mul};
 
 /// Estimate selectivity of a predicate expression (0.0..1.0).
 pub(crate) fn estimate_selectivity(
@@ -101,6 +102,33 @@ pub(crate) fn estimate_selectivity(
     }
 }
 
+/// Apply a filter selectivity to a child row count. Valid non-empty inputs
+/// floor at 1.0 when the selectivity would collapse the row count below one.
+/// Invalid inputs return bounded fallback rows so bad stats stay observable.
+pub(crate) fn apply_filter(
+    child_rows: f64,
+    child_conf: Confidence,
+    selectivity: f64,
+) -> (f64, Confidence) {
+    let valid_child_rows = child_rows.is_finite() && child_rows >= 0.0;
+    let valid_selectivity = selectivity.is_finite() && (0.0..=1.0).contains(&selectivity);
+    let bounded_selectivity = if selectivity.is_nan() {
+        0.0
+    } else {
+        selectivity.clamp(0.0, 1.0)
+    };
+    let (raw, saturated) = sat_mul(child_rows, bounded_selectivity);
+    if !valid_child_rows || !valid_selectivity || saturated {
+        return (raw, Confidence::Fallback);
+    }
+
+    if raw < 1.0 && child_rows >= 1.0 {
+        (1.0, Confidence::Fallback)
+    } else {
+        (raw.max(0.0), Confidence::derive(&[child_conf], false))
+    }
+}
+
 /// Flatten a left/right-nested AND tree into its leaf conjuncts.
 fn flatten_and<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
     if let ExprKind::BinaryOp {
@@ -191,6 +219,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::statistics::Confidence;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
@@ -259,6 +288,54 @@ mod tests {
             .next()
             .expect("and_of_unknown_eq requires at least one predicate");
         predicates.fold(first, and)
+    }
+
+    fn assert_finite_non_negative(rows: f64) {
+        assert!(rows.is_finite(), "row count must be finite: {rows}");
+        assert!(rows >= 0.0, "row count must be non-negative: {rows}");
+    }
+
+    #[test]
+    fn tiny_selectivity_floors_and_downgrades() {
+        let (rows, conf) = apply_filter(1000.0, Confidence::Exact, 1e-6);
+        assert_eq!(rows, 1.0);
+        assert_eq!(conf, Confidence::Fallback);
+    }
+
+    #[test]
+    fn valid_non_floor_filters_derive_confidence() {
+        let (rows, conf) = apply_filter(1000.0, Confidence::Exact, 0.5);
+        assert_eq!(rows, 500.0);
+        assert_eq!(conf, Confidence::Estimated);
+
+        let (fallback_rows, fallback_conf) = apply_filter(1000.0, Confidence::Fallback, 0.5);
+        assert_eq!(fallback_rows, 500.0);
+        assert_eq!(fallback_conf, Confidence::Fallback);
+    }
+
+    #[test]
+    fn invalid_filter_inputs_return_finite_fallback_rows() {
+        let cases = [
+            (1000.0, f64::NAN, 0.0),
+            (1000.0, f64::INFINITY, 1000.0),
+            (f64::NAN, 0.5, 0.0),
+            (-10.0, 0.5, 0.0),
+            (1000.0, -0.5, 0.0),
+        ];
+
+        for (child_rows, selectivity, expected_rows) in cases {
+            let (rows, conf) = apply_filter(child_rows, Confidence::Exact, selectivity);
+            assert_finite_non_negative(rows);
+            assert_eq!(
+                rows, expected_rows,
+                "child_rows={child_rows}, selectivity={selectivity}"
+            );
+            assert_eq!(
+                conf,
+                Confidence::Fallback,
+                "child_rows={child_rows}, selectivity={selectivity}"
+            );
+        }
     }
 
     #[test]
