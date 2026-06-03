@@ -6,6 +6,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::catalog::ScanSource;
+use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
@@ -21,6 +22,8 @@ pub(crate) fn format_stats_trailer(
     let rows = stats.output_row_count;
     let rows_str: String = if rows.is_nan() || rows <= 0.0 {
         "?".to_string()
+    } else if rows.is_infinite() || rows >= MAX_ROW_COUNT {
+        ">=1e15".to_string()
     } else {
         (rows.round() as i64).to_string()
     };
@@ -1612,6 +1615,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
+    }
+
+    #[test]
+    fn stats_trailer_caps_overflow_instead_of_i64_max() {
+        let inf = Statistics {
+            output_row_count: f64::INFINITY,
+            ..Default::default()
+        };
+        assert_eq!(format_stats_trailer(&inf), "stats={rows=>=1e15}");
+
+        let huge = Statistics {
+            output_row_count: 9.5e18,
+            ..Default::default()
+        };
+        assert_eq!(format_stats_trailer(&huge), "stats={rows=>=1e15}");
+
+        let ok = Statistics {
+            output_row_count: 1234.0,
+            ..Default::default()
+        };
+        assert_eq!(format_stats_trailer(&ok), "stats={rows=1234}");
     }
 
     #[test]
