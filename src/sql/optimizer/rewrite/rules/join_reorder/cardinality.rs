@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::*;
+use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
 use crate::sql::planner::plan::*;
@@ -216,84 +217,34 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
     let left_stats = estimate_statistics(&join.left, table_stats);
     let right_stats = estimate_statistics(&join.right, table_stats);
 
-    let left_rows = left_stats.output_row_count.max(1.0);
-    let right_rows = right_stats.output_row_count.max(1.0);
-
-    let output_rows = match join.join_type {
-        JoinKind::Cross => left_rows * right_rows,
-        JoinKind::Inner => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                (left_rows * right_rows / key_ndv).max(1.0)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::LeftOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(left_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::RightOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(right_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::FullOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(left_rows).max(right_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::LeftSemi => {
-            // At most left_rows, apply selectivity.
-            if let Some(ref cond) = join.condition {
-                let sel = estimate_selectivity(cond, &left_stats.column_statistics);
-                (left_rows * sel).max(1.0)
-            } else {
-                left_rows
-            }
-        }
-        JoinKind::RightSemi => {
-            if let Some(ref cond) = join.condition {
-                let sel = estimate_selectivity(cond, &right_stats.column_statistics);
-                (right_rows * sel).max(1.0)
-            } else {
-                right_rows
-            }
-        }
-        JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-            (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
-        }
-        JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
-    };
+    let eq_key_ndvs = join
+        .condition
+        .as_ref()
+        .map(|cond| {
+            let ndv = get_join_key_ndv(
+                cond,
+                &left_stats.column_statistics,
+                &right_stats.column_statistics,
+            );
+            vec![(ndv, ndv, Confidence::Estimated)]
+        })
+        .unwrap_or_default();
+    let non_equi_selectivity = join.condition.as_ref().map(|cond| {
+        (
+            estimate_selectivity(cond, &left_stats.column_statistics),
+            Confidence::Estimated,
+        )
+    });
+    let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
+        left: (left_stats.output_row_count, left_stats.row_count_confidence),
+        right: (
+            right_stats.output_row_count,
+            right_stats.row_count_confidence,
+        ),
+        kind: join.join_type,
+        eq_key_ndvs,
+        non_equi_selectivity,
+    });
 
     // Merge column statistics from both sides.
     let mut column_statistics = left_stats.column_statistics;
@@ -301,7 +252,7 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
 
     Statistics {
         output_row_count: output_rows,
-        row_count_confidence: Confidence::Estimated,
+        row_count_confidence,
         column_statistics,
     }
 }
@@ -750,8 +701,9 @@ mod tests {
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
-        // 6M * 1.5M / max(1.5M, 1.5M) = 6M
-        assert!((stats.output_row_count - 6_000_000.0).abs() < 1.0);
+        // Pins shared-estimator behavior: the logical plan condition feeds both the
+        // equality key NDV and non-equi selectivity, so rows are reduced twice.
+        assert!((stats.output_row_count - 4.0).abs() < 1.0);
     }
 
     #[test]
