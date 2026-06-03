@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::memo::{LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::statistics::*;
 
 // ---------------------------------------------------------------------------
@@ -371,66 +372,34 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalHashJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            let left_rows = left_stats.output_row_count.max(1.0);
-            let right_rows = right_stats.output_row_count.max(1.0);
+            let eq_key_ndvs = join
+                .eq_conditions
+                .iter()
+                .map(|eq| {
+                    let left_ndv = get_expr_ndv(&eq.left, &left_stats.column_statistics)
+                        .max(get_expr_ndv(&eq.left, &right_stats.column_statistics));
+                    let right_ndv = get_expr_ndv(&eq.right, &left_stats.column_statistics)
+                        .max(get_expr_ndv(&eq.right, &right_stats.column_statistics));
+                    (left_ndv, right_ndv, Confidence::Estimated)
+                })
+                .collect();
 
-            // Compute max NDV from equi-join keys.
-            let mut max_ndv = 1.0f64;
-            for eq in &join.eq_conditions {
-                let l_ndv = get_expr_ndv(&eq.left, &left_stats.column_statistics)
-                    .max(get_expr_ndv(&eq.left, &right_stats.column_statistics));
-                let r_ndv = get_expr_ndv(&eq.right, &left_stats.column_statistics)
-                    .max(get_expr_ndv(&eq.right, &right_stats.column_statistics));
-                max_ndv = max_ndv.max(l_ndv).max(r_ndv);
-            }
-
-            use crate::sql::analysis::JoinKind;
-            let output_rows = match join.join_type {
-                JoinKind::Cross => left_rows * right_rows,
-                JoinKind::Inner => {
-                    if !join.eq_conditions.is_empty() {
-                        (left_rows * right_rows / max_ndv).max(1.0)
-                    } else {
-                        left_rows * right_rows
-                    }
-                }
-                JoinKind::LeftOuter => {
-                    if !join.eq_conditions.is_empty() {
-                        let inner = left_rows * right_rows / max_ndv;
-                        inner.max(left_rows)
-                    } else {
-                        left_rows * right_rows
-                    }
-                }
-                JoinKind::RightOuter => {
-                    if !join.eq_conditions.is_empty() {
-                        let inner = left_rows * right_rows / max_ndv;
-                        inner.max(right_rows)
-                    } else {
-                        left_rows * right_rows
-                    }
-                }
-                JoinKind::FullOuter => {
-                    if !join.eq_conditions.is_empty() {
-                        let inner = left_rows * right_rows / max_ndv;
-                        inner.max(left_rows).max(right_rows)
-                    } else {
-                        left_rows * right_rows
-                    }
-                }
-                JoinKind::LeftSemi => (left_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::RightSemi => (right_rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
-                JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-                    (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
-                }
-                JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
-            };
+            let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
+                left: (left_stats.output_row_count, left_stats.row_count_confidence),
+                right: (
+                    right_stats.output_row_count,
+                    right_stats.row_count_confidence,
+                ),
+                kind: join.join_type,
+                eq_key_ndvs,
+                non_equi_selectivity: None,
+            });
 
             let mut column_statistics = left_stats.column_statistics;
             column_statistics.extend(right_stats.column_statistics);
             Statistics {
                 output_row_count: output_rows,
-                row_count_confidence: Confidence::Estimated,
+                row_count_confidence,
                 column_statistics,
             }
         }
@@ -1871,6 +1840,83 @@ mod tests {
         // An unknown column reference (absent from the map) also defaults.
         let missing_expr = col_ref("missing_col");
         assert_eq!(get_expr_ndv(&missing_expr, &column_stats), 10.0);
+    }
+
+    #[test]
+    fn physical_hash_join_stats_use_shared_cardinality_estimator() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{
+            JoinDistribution, LogicalValuesOp, Operator, PhysicalHashJoinEqCondition,
+            PhysicalHashJoinOp,
+        };
+
+        fn column_stat(ndv: f64) -> ColumnStatistic {
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1_000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+                confidence: Confidence::Exact,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, stats: &[(&str, f64)]) -> usize {
+            let id = memo.next_expr_id();
+            let group = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], 1_000.0);
+            props.row_count_confidence = Confidence::Exact;
+            for &(name, ndv) in stats {
+                props
+                    .column_statistics
+                    .insert(name.to_string(), column_stat(ndv));
+            }
+            memo.groups[group].logical_props = Some(props);
+            group
+        }
+
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, &[("l_k1", 100.0), ("l_k2", 100.0)]);
+        let right = values_group(&mut memo, &[("r_k1", 100.0), ("r_k2", 100.0)]);
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![
+                    PhysicalHashJoinEqCondition {
+                        left: col_ref("l_k1"),
+                        right: col_ref("r_k1"),
+                        null_safe: false,
+                    },
+                    PhysicalHashJoinEqCondition {
+                        left: col_ref("l_k2"),
+                        right: col_ref("r_k2"),
+                        null_safe: false,
+                    },
+                ],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        assert!(
+            (stats.output_row_count - 1_000.0).abs() < 1.0,
+            "expected shared estimator output, got {}",
+            stats.output_row_count
+        );
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        assert!(stats.column_statistics.contains_key("l_k1"));
+        assert!(stats.column_statistics.contains_key("r_k1"));
     }
 
     #[test]
