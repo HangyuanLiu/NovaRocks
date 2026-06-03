@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::exec::row_position::{
@@ -8,7 +9,8 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{
-    DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, SchemaRef, Type,
+    DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpecRef, PrimitiveType,
+    SchemaRef, Type,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -19,10 +21,138 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
+use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{transform_variant_columns_for_write, variant_field_indices};
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagedContent {
+    Data,
+    PositionDeletes,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StagedWriteOptions {
+    pub collect_theta_sketches: bool,
+    pub content: StagedContent,
+}
+
+impl Default for StagedWriteOptions {
+    fn default() -> Self {
+        Self {
+            collect_theta_sketches: false,
+            content: StagedContent::Data,
+        }
+    }
+}
+
+pub(crate) struct StagedDataFile {
+    pub data_file: DataFile,
+    pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
+}
+
+pub(crate) struct StagedDataFileWriter {
+    ctx: StagedWriteContext,
+    opts: StagedWriteOptions,
+    buffered: Vec<RecordBatch>,
+}
+
+impl StagedDataFileWriter {
+    pub(crate) fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
+        ensure_data_file_staged_content(opts.content)?;
+        Ok(Self {
+            ctx,
+            opts,
+            buffered: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+        if batch.num_rows() > 0 {
+            self.buffered.push(batch);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(self) -> Result<Vec<StagedDataFile>, String> {
+        if self.buffered.is_empty() {
+            return Ok(Vec::new());
+        }
+        write_record_batches(&self.ctx, self.buffered, &self.opts).await
+    }
+}
+
+pub(crate) struct StagedWriteContext {
+    metadata: Arc<iceberg::spec::TableMetadata>,
+    file_io: iceberg::io::FileIO,
+    writer_schema: SchemaRef,
+    annotated_schema: arrow::datatypes::SchemaRef,
+    partition_spec_id: i32,
+}
+
+impl StagedWriteContext {
+    pub(crate) fn from_table(table: &iceberg::table::Table) -> Result<Self, String> {
+        let writer_schema = table.metadata().current_schema().clone();
+        let annotated_schema = Arc::new(
+            schema_to_arrow_schema(&writer_schema)
+                .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
+        );
+        Self::from_table_with_schema(table, writer_schema, annotated_schema)
+    }
+
+    fn from_table_with_schema(
+        table: &iceberg::table::Table,
+        writer_schema: SchemaRef,
+        annotated_schema: arrow::datatypes::SchemaRef,
+    ) -> Result<Self, String> {
+        let metadata = Arc::new(table.metadata().clone());
+        let partition_spec_id = metadata.default_partition_spec_id();
+        Ok(Self {
+            metadata,
+            file_io: table.file_io().clone(),
+            writer_schema,
+            annotated_schema,
+            partition_spec_id,
+        })
+    }
+
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.writer_schema
+    }
+
+    pub(crate) fn partition_spec(&self) -> &PartitionSpecRef {
+        self.metadata.default_partition_spec()
+    }
+
+    pub(crate) fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+
+    pub(crate) fn file_io(&self) -> &iceberg::io::FileIO {
+        &self.file_io
+    }
+
+    pub(crate) fn data_file_writer_builder(&self) -> Result<IcebergDataFileWriterBuilder, String> {
+        let location_generator = DefaultLocationGenerator::new(self.metadata.as_ref().clone())
+            .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "novarocks".to_string(),
+            Some(unique_file_suffix()),
+            DataFileFormat::Parquet,
+        );
+        let parquet_builder =
+            ParquetWriterBuilder::new(WriterProperties::default(), self.writer_schema.clone());
+        let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            self.file_io.clone(),
+            location_generator,
+            file_name_generator,
+        );
+        Ok(DataFileWriterBuilder::new(rolling_builder))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RowLineageColumns {
@@ -37,38 +167,27 @@ pub(crate) struct RowLineageWriteBatch {
     pub lineage: RowLineageColumns,
 }
 
-/// Streaming-shape facade over [`write_record_batches_as_data_files`] for
-/// the IVM-A1 MV merge sink. The current implementation buffers all batches
-/// in-memory and delegates to the batch helper on `finish()`. This preserves
-/// the per-batch backpressure surface the sink operator wants while keeping
-/// per-partition writer lifecycle identical to the existing call sites; a
-/// later optimization can replace the buffering with a partition-aware
-/// rolling writer without changing the sink interface.
+/// Streaming-shape facade over the staged data-file writer for the IVM-A1 MV
+/// merge sink. It preserves the legacy `DataFile` surface while delegating
+/// write semantics to the shared staged writer kernel.
 pub(crate) struct IcebergStreamingDataFileWriter {
-    table: iceberg::table::Table,
-    buffered: Vec<RecordBatch>,
+    writer: StagedDataFileWriter,
 }
 
 impl IcebergStreamingDataFileWriter {
     pub(crate) fn new(table: iceberg::table::Table) -> Result<Self, String> {
-        Ok(Self {
-            table,
-            buffered: Vec::new(),
-        })
+        let ctx = StagedWriteContext::from_table(&table)?;
+        let writer = StagedDataFileWriter::new(ctx, StagedWriteOptions::default())?;
+        Ok(Self { writer })
     }
 
     pub(crate) async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
-        if batch.num_rows() > 0 {
-            self.buffered.push(batch);
-        }
-        Ok(())
+        self.writer.write_batch(batch).await
     }
 
     pub(crate) async fn finish(self) -> Result<Vec<DataFile>, String> {
-        if self.buffered.is_empty() {
-            return Ok(Vec::new());
-        }
-        write_record_batches_as_data_files(&self.table, self.buffered).await
+        let staged = self.writer.finish().await?;
+        Ok(staged.into_iter().map(to_iceberg_data_file).collect())
     }
 }
 
@@ -76,52 +195,26 @@ pub(crate) async fn write_record_batches_as_data_files(
     table: &iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<DataFile>, String> {
-    let metadata = table.metadata();
-    let writer_schema = metadata.current_schema().clone();
-    let annotated_schema = Arc::new(
-        schema_to_arrow_schema(&writer_schema)
-            .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
-    );
-    let data_file_builder = build_data_file_writer(table)?;
-    write_record_batches_as_data_files_with_writer(
-        table,
-        batches,
-        data_file_builder,
-        annotated_schema,
-    )
-    .await
+    let ctx = StagedWriteContext::from_table(table)?;
+    let staged = write_record_batches(&ctx, batches, &StagedWriteOptions::default()).await?;
+    Ok(staged.into_iter().map(to_iceberg_data_file).collect())
 }
 
-async fn write_record_batches_as_data_files_with_schema(
-    table: &iceberg::table::Table,
+pub(crate) async fn write_record_batches(
+    ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
-    writer_schema: SchemaRef,
-    annotated_schema: arrow::datatypes::SchemaRef,
-) -> Result<Vec<DataFile>, String> {
-    let data_file_builder = build_data_file_writer_with_schema(table, writer_schema)?;
-    write_record_batches_as_data_files_with_writer(
-        table,
-        batches,
-        data_file_builder,
-        annotated_schema,
-    )
-    .await
-}
+    opts: &StagedWriteOptions,
+) -> Result<Vec<StagedDataFile>, String> {
+    ensure_data_file_staged_content(opts.content)?;
+    let data_file_builder = ctx.data_file_writer_builder()?;
+    let variant_indices = variant_field_indices(ctx.schema());
 
-async fn write_record_batches_as_data_files_with_writer(
-    table: &iceberg::table::Table,
-    batches: impl IntoIterator<Item = RecordBatch>,
-    data_file_builder: IcebergDataFileWriterBuilder,
-    annotated_schema: arrow::datatypes::SchemaRef,
-) -> Result<Vec<DataFile>, String> {
-    let metadata = table.metadata();
-    let variant_indices = variant_field_indices(metadata.current_schema());
-
-    if metadata.default_partition_spec().fields().is_empty() {
+    if ctx.partition_spec().fields().is_empty() {
         let mut writer = data_file_builder
             .build(None)
             .await
             .map_err(|e| format!("build iceberg data file writer failed: {e}"))?;
+        let mut batch_sketches = Vec::new();
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
@@ -129,10 +222,18 @@ async fn write_record_batches_as_data_files_with_writer(
             let staged = if variant_indices.is_empty() {
                 batch
             } else {
-                transform_variant_columns_for_write(&batch, &annotated_schema, &variant_indices)?
+                transform_variant_columns_for_write(
+                    &batch,
+                    &ctx.annotated_schema,
+                    &variant_indices,
+                )?
             };
+            let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
+            if let Some(sketches) = maybe_collect_sketches(opts, &annotated)? {
+                batch_sketches.push(sketches);
+            }
             writer
-                .write(annotate_batch(&staged, &annotated_schema)?)
+                .write(annotated)
                 .await
                 .map_err(|e| format!("iceberg data file write failed: {e}"))?;
         }
@@ -140,20 +241,31 @@ async fn write_record_batches_as_data_files_with_writer(
             .close()
             .await
             .map_err(|e| format!("iceberg data file writer close failed: {e}"))?;
+        let combined_sketches = if batch_sketches.is_empty() {
+            None
+        } else {
+            Some(merge_theta_sketches(batch_sketches))
+        };
         return data_files
             .into_iter()
             .map(|data_file| {
-                retag_data_file_partition_spec_id(data_file, metadata.default_partition_spec_id())
+                Ok(StagedDataFile {
+                    data_file: retag_data_file_partition_spec_id(
+                        data_file,
+                        ctx.partition_spec_id(),
+                    )?,
+                    theta_sketches: combined_sketches.as_ref().map(clone_theta_sketches),
+                })
             })
             .collect();
     }
 
     let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
+        ctx.schema().clone(),
+        ctx.partition_spec().clone(),
     )
     .map_err(|e| format!("build iceberg partition splitter failed: {e}"))?;
-    let mut data_files = Vec::new();
+    let mut staged_files = Vec::new();
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -161,13 +273,14 @@ async fn write_record_batches_as_data_files_with_writer(
         let staged = if variant_indices.is_empty() {
             batch
         } else {
-            transform_variant_columns_for_write(&batch, &annotated_schema, &variant_indices)?
+            transform_variant_columns_for_write(&batch, &ctx.annotated_schema, &variant_indices)?
         };
-        let annotated = annotate_batch(&staged, &annotated_schema)?;
+        let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
         let partitioned = splitter
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
         for (partition_key, partition_batch) in partitioned {
+            let theta_sketches = maybe_collect_sketches(opts, &partition_batch)?;
             let mut writer = data_file_builder
                 .build(Some(partition_key))
                 .await
@@ -176,14 +289,201 @@ async fn write_record_batches_as_data_files_with_writer(
                 .write(partition_batch)
                 .await
                 .map_err(|e| format!("iceberg partitioned data file write failed: {e}"))?;
-            data_files.extend(
-                writer.close().await.map_err(|e| {
-                    format!("iceberg partitioned data file writer close failed: {e}")
-                })?,
-            );
+            let data_files = writer
+                .close()
+                .await
+                .map_err(|e| format!("iceberg partitioned data file writer close failed: {e}"))?;
+            for data_file in data_files {
+                staged_files.push(StagedDataFile {
+                    data_file: retag_data_file_partition_spec_id(
+                        data_file,
+                        ctx.partition_spec_id(),
+                    )?,
+                    theta_sketches: theta_sketches.as_ref().map(clone_theta_sketches),
+                });
+            }
         }
     }
-    Ok(data_files)
+    Ok(staged_files)
+}
+
+fn ensure_data_file_staged_content(content: StagedContent) -> Result<(), String> {
+    match content {
+        StagedContent::Data => Ok(()),
+        unsupported => Err(format!(
+            "unsupported staged content {unsupported:?} for staged data-file writer kernel; this writer only produces DATA files"
+        )),
+    }
+}
+
+pub(crate) async fn cleanup_staged_files(
+    ctx: &StagedWriteContext,
+    paths: &[String],
+) -> Result<(), String> {
+    for path in paths {
+        ctx.file_io()
+            .delete(path)
+            .await
+            .map_err(|e| format!("cleanup staged file {path} failed: {e}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn to_iceberg_data_file(staged: StagedDataFile) -> DataFile {
+    staged.data_file
+}
+
+pub(crate) fn to_sink_commit_info(
+    staged: &StagedDataFile,
+    partition_path: String,
+    null_fingerprint: String,
+    format: String,
+    content: crate::types::TIcebergFileContent,
+) -> Result<
+    (
+        crate::types::TSinkCommitInfo,
+        Option<super::stats_assembler::FileSketchSet>,
+    ),
+    String,
+> {
+    let df = &staged.data_file;
+    let data_file = crate::types::TIcebergDataFile {
+        path: Some(df.file_path().to_string()),
+        format: Some(format),
+        record_count: Some(u64_to_i64(df.record_count(), "record_count")?),
+        file_size_in_bytes: Some(u64_to_i64(df.file_size_in_bytes(), "file_size_in_bytes")?),
+        partition_path: Some(partition_path),
+        split_offsets: df.split_offsets().map(|offsets| offsets.to_vec()),
+        column_stats: iceberg_data_file_to_column_stats(df)?,
+        partition_null_fingerprint: Some(null_fingerprint),
+        file_content: Some(content),
+        referenced_data_file: df.referenced_data_file().map(|path| path.to_string()),
+    };
+    let commit_info = crate::types::TSinkCommitInfo {
+        iceberg_data_file: Some(data_file),
+        hive_file_info: None,
+        is_overwrite: None,
+        staging_dir: None,
+        is_rewrite: None,
+    };
+    let sketch_set =
+        staged
+            .theta_sketches
+            .as_ref()
+            .map(|sketches| super::stats_assembler::FileSketchSet {
+                file_path: df.file_path().to_string(),
+                sketches: clone_theta_sketches(sketches),
+            });
+    Ok((commit_info, sketch_set))
+}
+
+fn iceberg_data_file_to_column_stats(
+    df: &DataFile,
+) -> Result<Option<crate::types::TIcebergColumnStats>, String> {
+    let column_sizes = u64_stats_to_i64(df.column_sizes(), "column_sizes")?;
+    let value_counts = u64_stats_to_i64(df.value_counts(), "value_counts")?;
+    let null_value_counts = u64_stats_to_i64(df.null_value_counts(), "null_value_counts")?;
+    let nan_value_counts = u64_stats_to_i64(df.nan_value_counts(), "nan_value_counts")?;
+    let lower_bounds = datum_bounds_to_bytes(df.lower_bounds(), "lower_bounds")?;
+    let upper_bounds = datum_bounds_to_bytes(df.upper_bounds(), "upper_bounds")?;
+
+    if column_sizes.is_empty()
+        && value_counts.is_empty()
+        && null_value_counts.is_empty()
+        && nan_value_counts.is_empty()
+        && lower_bounds.is_empty()
+        && upper_bounds.is_empty()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::types::TIcebergColumnStats {
+        column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
+        value_counts: (!value_counts.is_empty()).then_some(value_counts),
+        null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
+        nan_value_counts: (!nan_value_counts.is_empty()).then_some(nan_value_counts),
+        lower_bounds: (!lower_bounds.is_empty()).then_some(lower_bounds),
+        upper_bounds: (!upper_bounds.is_empty()).then_some(upper_bounds),
+    }))
+}
+
+fn u64_to_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value)
+        .map_err(|_| format!("iceberg data file {field} value {value} exceeds i64::MAX"))
+}
+
+fn u64_stats_to_i64(stats: &HashMap<i32, u64>, field: &str) -> Result<BTreeMap<i32, i64>, String> {
+    stats
+        .iter()
+        .map(|(field_id, value)| {
+            u64_to_i64(*value, &format!("{field}[{field_id}]")).map(|value| (*field_id, value))
+        })
+        .collect()
+}
+
+fn datum_bounds_to_bytes(
+    bounds: &HashMap<i32, iceberg::spec::Datum>,
+    field: &str,
+) -> Result<BTreeMap<i32, Vec<u8>>, String> {
+    bounds
+        .iter()
+        .map(|(field_id, datum)| {
+            datum
+                .to_bytes()
+                .map(|bytes| (*field_id, bytes.to_vec()))
+                .map_err(|e| {
+                    format!("convert iceberg datum bound {field}[{field_id}] to bytes failed: {e}")
+                })
+        })
+        .collect()
+}
+
+fn maybe_collect_sketches(
+    opts: &StagedWriteOptions,
+    batch: &RecordBatch,
+) -> Result<Option<HashMap<i32, ThetaSketchHandle>>, String> {
+    if !opts.collect_theta_sketches {
+        return Ok(None);
+    }
+    Ok(super::sink::compute_theta_sketches_for_batch(batch))
+}
+
+fn merge_theta_sketches(
+    sketches: Vec<HashMap<i32, ThetaSketchHandle>>,
+) -> HashMap<i32, ThetaSketchHandle> {
+    let mut by_field = HashMap::<i32, Vec<ThetaSketchHandle>>::new();
+    for batch_sketches in sketches {
+        for (field_id, sketch) in batch_sketches {
+            by_field.entry(field_id).or_default().push(sketch);
+        }
+    }
+    by_field
+        .into_iter()
+        .map(|(field_id, field_sketches)| {
+            let refs = field_sketches.iter().collect::<Vec<_>>();
+            (field_id, ThetaSketchHandle::union(&refs))
+        })
+        .collect()
+}
+
+fn clone_theta_sketches(
+    sketches: &HashMap<i32, ThetaSketchHandle>,
+) -> HashMap<i32, ThetaSketchHandle> {
+    sketches
+        .iter()
+        .map(|(field_id, sketch)| (*field_id, ThetaSketchHandle::union(&[sketch])))
+        .collect()
+}
+
+async fn write_record_batches_as_data_files_with_schema(
+    table: &iceberg::table::Table,
+    batches: impl IntoIterator<Item = RecordBatch>,
+    writer_schema: SchemaRef,
+    annotated_schema: arrow::datatypes::SchemaRef,
+) -> Result<Vec<DataFile>, String> {
+    let ctx = StagedWriteContext::from_table_with_schema(table, writer_schema, annotated_schema)?;
+    let staged = write_record_batches(&ctx, batches, &StagedWriteOptions::default()).await?;
+    Ok(staged.into_iter().map(to_iceberg_data_file).collect())
 }
 
 fn retag_data_file_partition_spec_id(
@@ -342,33 +642,6 @@ pub(crate) fn append_row_lineage_columns(
     columns.push(Arc::new(lineage.last_updated_sequence_numbers) as ArrayRef);
     arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("build row-lineage record batch failed: {e}"))
-}
-
-fn build_data_file_writer(
-    table: &iceberg::table::Table,
-) -> Result<IcebergDataFileWriterBuilder, String> {
-    build_data_file_writer_with_schema(table, table.metadata().current_schema().clone())
-}
-
-fn build_data_file_writer_with_schema(
-    table: &iceberg::table::Table,
-    schema: SchemaRef,
-) -> Result<IcebergDataFileWriterBuilder, String> {
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
-    let file_name_generator = DefaultFileNameGenerator::new(
-        "novarocks".to_string(),
-        Some(unique_file_suffix()),
-        DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(WriterProperties::default(), schema);
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-    Ok(DataFileWriterBuilder::new(rolling_builder))
 }
 
 fn annotate_batch(
@@ -663,6 +936,538 @@ mod tests {
             format!("{data_file:?}").contains("partition_spec_id: 7"),
             "retagged data file should carry the evolved default partition spec id"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_write_context_from_table_exposes_schema_and_spec() {
+        let table = build_unpartitioned_test_table("ctx_schema").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx from table");
+        assert_eq!(
+            ctx.schema().as_struct().fields().len(),
+            table.metadata().current_schema().as_struct().fields().len(),
+            "context schema must match table current schema"
+        );
+        assert_eq!(
+            ctx.partition_spec_id(),
+            table.metadata().default_partition_spec_id()
+        );
+        assert_eq!(
+            ctx.partition_spec().fields().len(),
+            table.metadata().default_partition_spec().fields().len(),
+            "context partition spec must match table default partition spec"
+        );
+        let _ = ctx.file_io();
+    }
+
+    #[tokio::test]
+    async fn write_record_batches_unpartitioned_produces_one_file_with_stats() {
+        let table = build_unpartitioned_test_table("kernel_unpart").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2]), test_batch(&[3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        assert_eq!(staged.len(), 1, "one file for unpartitioned batches");
+        assert_eq!(staged[0].data_file.record_count(), 3);
+        assert!(staged[0].data_file.file_size_in_bytes() > 0);
+        assert!(
+            staged[0].theta_sketches.is_none(),
+            "sketches off by default"
+        );
+        let path = staged[0].data_file.file_path().to_string();
+        assert!(
+            ctx.file_io().exists(&path).await.expect("exists"),
+            "staged file must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_staged_files_removes_written_files() {
+        let table = build_unpartitioned_test_table("kernel_cleanup").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2, 3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        let path = staged[0].data_file.file_path().to_string();
+        assert!(ctx.file_io().exists(&path).await.expect("exists before"));
+        cleanup_staged_files(&ctx, &[path.clone()])
+            .await
+            .expect("cleanup");
+        assert!(
+            !ctx.file_io().exists(&path).await.expect("exists after"),
+            "file removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn theta_sketches_collected_only_when_requested() {
+        let table = build_unpartitioned_test_table("kernel_sketch").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: true,
+            content: StagedContent::Data,
+        };
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
+            .await
+            .expect("write");
+        assert_eq!(staged.len(), 1);
+        let sketches = staged[0].theta_sketches.as_ref().expect("sketches present");
+        assert!(
+            sketches.contains_key(&1),
+            "theta sketch for field id 1 (id column)"
+        );
+
+        let staged_off = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write off");
+        assert!(staged_off[0].theta_sketches.is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_data_file_writer_rejects_position_delete_content() {
+        let table = build_unpartitioned_test_table("kernel_position_delete_content").await;
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: false,
+            content: StagedContent::PositionDeletes,
+        };
+
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let write_err = match write_record_batches(&ctx, vec![test_batch(&[1])], &opts).await {
+            Ok(_) => panic!("position delete content should be rejected by batch writer"),
+            Err(err) => err,
+        };
+        assert!(
+            write_err.contains("PositionDeletes"),
+            "error should mention unsupported content, got: {write_err}"
+        );
+
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let new_err = match StagedDataFileWriter::new(ctx, opts) {
+            Ok(_) => panic!("position delete content should be rejected by staged writer"),
+            Err(err) => err,
+        };
+        assert!(
+            new_err.contains("PositionDeletes"),
+            "error should mention unsupported content, got: {new_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn to_iceberg_data_file_is_identity() {
+        let table = build_unpartitioned_test_table("kernel_id").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let mut staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2, 3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        let one = staged.remove(0);
+        let path = one.data_file.file_path().to_string();
+        let count = one.data_file.record_count();
+        let df = to_iceberg_data_file(one);
+        assert_eq!(df.file_path(), path);
+        assert_eq!(df.record_count(), count);
+    }
+
+    #[tokio::test]
+    async fn to_sink_commit_info_maps_fields_and_sketches() {
+        let table = build_unpartitioned_test_table("kernel_commit").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: true,
+            content: StagedContent::Data,
+        };
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
+            .await
+            .expect("write");
+        let s = &staged[0];
+        let expected_path = s.data_file.file_path().to_string();
+        let expected_count =
+            u64_to_i64(s.data_file.record_count(), "record_count").expect("record count");
+        let expected_size =
+            u64_to_i64(s.data_file.file_size_in_bytes(), "file_size_in_bytes").expect("file size");
+        let (commit, sketch_set) = to_sink_commit_info(
+            s,
+            String::new(),
+            String::new(),
+            "parquet".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("commit info");
+        let df = commit.iceberg_data_file.expect("iceberg data file");
+        assert_eq!(df.path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(df.format.as_deref(), Some("parquet"));
+        assert_eq!(df.record_count, Some(expected_count));
+        assert_eq!(df.file_size_in_bytes, Some(expected_size));
+        assert_eq!(df.partition_path.as_deref(), Some(""));
+        assert_eq!(
+            df.split_offsets,
+            s.data_file.split_offsets().map(|offsets| offsets.to_vec())
+        );
+        assert_eq!(
+            df.file_content,
+            Some(crate::types::TIcebergFileContent::DATA)
+        );
+        assert_eq!(
+            df.referenced_data_file,
+            s.data_file
+                .referenced_data_file()
+                .map(|path| path.to_string())
+        );
+        let column_stats = df.column_stats.expect("column stats");
+        if !s.data_file.column_sizes().is_empty() {
+            let expected =
+                u64_stats_to_i64(s.data_file.column_sizes(), "column_sizes").expect("column sizes");
+            assert_eq!(column_stats.column_sizes.as_ref(), Some(&expected));
+        }
+        if !s.data_file.value_counts().is_empty() {
+            let expected =
+                u64_stats_to_i64(s.data_file.value_counts(), "value_counts").expect("value counts");
+            assert_eq!(column_stats.value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.null_value_counts().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.null_value_counts(), "null_value_counts")
+                .expect("null value counts");
+            assert_eq!(column_stats.null_value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.nan_value_counts().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.nan_value_counts(), "nan_value_counts")
+                .expect("nan value counts");
+            assert_eq!(column_stats.nan_value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.lower_bounds().is_empty() {
+            let expected = s
+                .data_file
+                .lower_bounds()
+                .iter()
+                .map(|(field_id, datum)| {
+                    (
+                        *field_id,
+                        datum
+                            .to_bytes()
+                            .expect("convert iceberg datum bound to bytes")
+                            .to_vec(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(column_stats.lower_bounds.as_ref(), Some(&expected));
+        }
+        if !s.data_file.upper_bounds().is_empty() {
+            let expected = s
+                .data_file
+                .upper_bounds()
+                .iter()
+                .map(|(field_id, datum)| {
+                    (
+                        *field_id,
+                        datum
+                            .to_bytes()
+                            .expect("convert iceberg datum bound to bytes")
+                            .to_vec(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(column_stats.upper_bounds.as_ref(), Some(&expected));
+        }
+        let sketch_set = sketch_set.expect("sketch set");
+        assert_eq!(sketch_set.file_path, expected_path);
+        assert!(sketch_set.sketches.contains_key(&1));
+    }
+
+    #[test]
+    fn to_sink_commit_info_rejects_overflowing_record_count() {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path("file:///tmp/overflow.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(u64::MAX)
+            .file_size_in_bytes(128);
+        let staged = StagedDataFile {
+            data_file: builder.build().expect("data file"),
+            theta_sketches: None,
+        };
+
+        let err = to_sink_commit_info(
+            &staged,
+            String::new(),
+            String::new(),
+            "parquet".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .map(|_| ())
+        .expect_err("overflow should be rejected");
+
+        assert!(
+            err.contains("record_count"),
+            "error should mention overflowing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_writer_matches_batch_form() {
+        let table = build_unpartitioned_test_table("kernel_stream").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let mut w = StagedDataFileWriter::new(ctx, StagedWriteOptions::default()).expect("new");
+        w.write_batch(test_batch(&[1, 2])).await.expect("b1");
+        w.write_batch(test_batch(&[3])).await.expect("b2");
+        let staged = w.finish().await.expect("finish");
+        let total: u64 = staged.iter().map(|s| s.data_file.record_count()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn legacy_streaming_writer_matches_table_batch_api() {
+        let table = build_unpartitioned_test_table("legacy_stream").await;
+        let batch_files = write_record_batches_as_data_files(
+            &table,
+            vec![test_batch(&[1, 2]), test_batch(&[]), test_batch(&[3])],
+        )
+        .await
+        .expect("batch write");
+
+        let mut writer =
+            IcebergStreamingDataFileWriter::new(table.table.clone()).expect("legacy writer");
+        writer
+            .write_record_batch(test_batch(&[1, 2]))
+            .await
+            .expect("stream first batch");
+        writer
+            .write_record_batch(test_batch(&[]))
+            .await
+            .expect("stream empty batch");
+        writer
+            .write_record_batch(test_batch(&[3]))
+            .await
+            .expect("stream second batch");
+        let stream_files = writer.finish().await.expect("stream finish");
+
+        assert_eq!(stream_files.len(), batch_files.len());
+        assert_eq!(
+            stream_files
+                .iter()
+                .map(|data_file| data_file.record_count())
+                .sum::<u64>(),
+            batch_files
+                .iter()
+                .map(|data_file| data_file.record_count())
+                .sum::<u64>()
+        );
+        assert!(
+            stream_files
+                .iter()
+                .all(|data_file| data_file.file_size_in_bytes() > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn row_lineage_writer_uses_extended_schema_and_retains_default_spec_id() {
+        use arrow::array::Int64Array;
+
+        let table = build_local_fs_test_table_with_spec_id("row_lineage_part_spec", true, 7).await;
+        let data_files = write_row_lineage_batches_as_data_files(
+            &table,
+            &[RowLineageWriteBatch {
+                user_batch: test_batch(&[0, 0, 1]),
+                lineage: RowLineageColumns {
+                    row_ids: Int64Array::from(vec![10, 11, 12]),
+                    last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3), Some(4)]),
+                },
+            }],
+        )
+        .await
+        .expect("row-lineage write");
+
+        assert_eq!(data_files.len(), 2, "one file per identity partition");
+        assert_eq!(
+            data_files
+                .iter()
+                .map(|data_file| data_file.record_count())
+                .sum::<u64>(),
+            3
+        );
+        for data_file in data_files {
+            assert!(
+                format!("{data_file:?}").contains("partition_spec_id: 7"),
+                "row-lineage files must retain the evolved default partition spec id"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_record_batches_partitioned_produces_file_per_partition() {
+        let table = build_local_fs_test_table("kernel_part", true).await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let batch = test_batch(&[0, 0, 1, 1]);
+        let staged = write_record_batches(&ctx, vec![batch], &StagedWriteOptions::default())
+            .await
+            .expect("write");
+        assert_eq!(staged.len(), 2, "one file per distinct partition value");
+        let mut record_counts = staged
+            .iter()
+            .map(|s| s.data_file.record_count())
+            .collect::<Vec<_>>();
+        record_counts.sort_unstable();
+        assert_eq!(record_counts, vec![2, 2]);
+        for staged_file in &staged {
+            assert!(
+                staged_file.theta_sketches.is_none(),
+                "sketches off by default"
+            );
+            let path = staged_file.data_file.file_path().to_string();
+            assert!(
+                ctx.file_io().exists(&path).await.expect("exists"),
+                "staged partition file must exist"
+            );
+        }
+    }
+
+    struct LocalFsTestTable {
+        table: iceberg::table::Table,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for LocalFsTestTable {
+        type Target = iceberg::table::Table;
+
+        fn deref(&self) -> &Self::Target {
+            &self.table
+        }
+    }
+
+    async fn build_unpartitioned_test_table(name: &str) -> LocalFsTestTable {
+        build_local_fs_test_table(name, false).await
+    }
+
+    async fn build_local_fs_test_table(name: &str, partitioned: bool) -> LocalFsTestTable {
+        build_local_fs_test_table_with_spec_id(name, partitioned, 0).await
+    }
+
+    async fn build_local_fs_test_table_with_spec_id(
+        name: &str,
+        partitioned: bool,
+        partition_spec_id: i32,
+    ) -> LocalFsTestTable {
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("novarocks-iceberg-data-writer-{safe_name}-"))
+            .tempdir()
+            .expect("create table dir");
+        let location = format!("file://{}", dir.path().display());
+
+        let schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let metadata_builder = if partitioned && partition_spec_id > 0 {
+            let mut builder = iceberg::spec::TableMetadataBuilder::new(
+                schema.as_ref().clone(),
+                iceberg::spec::PartitionSpec::unpartition_spec(),
+                iceberg::spec::SortOrder::unsorted_order(),
+                location,
+                iceberg::spec::FormatVersion::V2,
+                std::collections::HashMap::new(),
+            )
+            .expect("builder");
+            for idx in 1..partition_spec_id {
+                let transform = if idx <= 3 {
+                    iceberg::spec::Transform::Bucket((idx + 1) as u32)
+                } else {
+                    iceberg::spec::Transform::Truncate((idx - 2) as u32)
+                };
+                let spec = iceberg::spec::UnboundPartitionSpec::builder()
+                    .add_partition_field(1, format!("id_evolved_{idx}"), transform)
+                    .expect("add evolved partition field")
+                    .build();
+                builder = builder
+                    .add_default_partition_spec(spec)
+                    .expect("add evolved partition spec");
+            }
+            let identity_spec = iceberg::spec::UnboundPartitionSpec::builder()
+                .add_partition_field(1, "id", iceberg::spec::Transform::Identity)
+                .expect("add identity partition field")
+                .build();
+            builder
+                .add_default_partition_spec(identity_spec)
+                .expect("add identity partition spec")
+        } else {
+            let partition_spec = if partitioned {
+                iceberg::spec::PartitionSpec::builder(schema.clone())
+                    .with_spec_id(partition_spec_id)
+                    .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
+                    .expect("add partition field")
+                    .build()
+                    .expect("partition spec")
+            } else {
+                iceberg::spec::PartitionSpec::unpartition_spec()
+            };
+            iceberg::spec::TableMetadataBuilder::new(
+                schema.as_ref().clone(),
+                partition_spec,
+                iceberg::spec::SortOrder::unsorted_order(),
+                location,
+                iceberg::spec::FormatVersion::V2,
+                std::collections::HashMap::new(),
+            )
+            .expect("builder")
+        };
+        let metadata = metadata_builder.build().expect("metadata").metadata;
+
+        let table = iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table");
+
+        LocalFsTestTable { table, _dir: dir }
+    }
+
+    fn test_batch(ids: &[i32]) -> arrow::record_batch::RecordBatch {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        use std::collections::HashMap;
+
+        let field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let schema = Arc::new(Schema::new(vec![field]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .expect("test batch")
     }
 
     #[test]
