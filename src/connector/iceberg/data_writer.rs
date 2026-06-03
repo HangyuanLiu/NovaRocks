@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::exec::row_position::{
@@ -317,6 +317,98 @@ pub(crate) async fn write_record_batches(
         }
     }
     Ok(staged_files)
+}
+
+pub(crate) fn to_iceberg_data_file(staged: StagedDataFile) -> DataFile {
+    staged.data_file
+}
+
+pub(crate) fn to_sink_commit_info(
+    staged: &StagedDataFile,
+    partition_path: String,
+    null_fingerprint: String,
+    format: String,
+    content: crate::types::TIcebergFileContent,
+) -> (
+    crate::types::TSinkCommitInfo,
+    Option<super::stats_assembler::FileSketchSet>,
+) {
+    let df = &staged.data_file;
+    let data_file = crate::types::TIcebergDataFile {
+        path: Some(df.file_path().to_string()),
+        format: Some(format),
+        record_count: Some(df.record_count() as i64),
+        file_size_in_bytes: Some(df.file_size_in_bytes() as i64),
+        partition_path: Some(partition_path),
+        split_offsets: df.split_offsets().map(|offsets| offsets.to_vec()),
+        column_stats: iceberg_data_file_to_column_stats(df),
+        partition_null_fingerprint: Some(null_fingerprint),
+        file_content: Some(content),
+        referenced_data_file: df.referenced_data_file().map(|path| path.to_string()),
+    };
+    let commit_info = crate::types::TSinkCommitInfo {
+        iceberg_data_file: Some(data_file),
+        hive_file_info: None,
+        is_overwrite: None,
+        staging_dir: None,
+        is_rewrite: None,
+    };
+    let sketch_set =
+        staged
+            .theta_sketches
+            .as_ref()
+            .map(|sketches| super::stats_assembler::FileSketchSet {
+                file_path: df.file_path().to_string(),
+                sketches: clone_theta_sketches(sketches),
+            });
+    (commit_info, sketch_set)
+}
+
+fn iceberg_data_file_to_column_stats(df: &DataFile) -> Option<crate::types::TIcebergColumnStats> {
+    let column_sizes = u64_stats_to_i64(df.column_sizes());
+    let value_counts = u64_stats_to_i64(df.value_counts());
+    let null_value_counts = u64_stats_to_i64(df.null_value_counts());
+    let nan_value_counts = u64_stats_to_i64(df.nan_value_counts());
+    let lower_bounds = datum_bounds_to_bytes(df.lower_bounds());
+    let upper_bounds = datum_bounds_to_bytes(df.upper_bounds());
+
+    if column_sizes.is_empty()
+        && value_counts.is_empty()
+        && null_value_counts.is_empty()
+        && nan_value_counts.is_empty()
+        && lower_bounds.is_empty()
+        && upper_bounds.is_empty()
+    {
+        return None;
+    }
+
+    Some(crate::types::TIcebergColumnStats {
+        column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
+        value_counts: (!value_counts.is_empty()).then_some(value_counts),
+        null_value_counts: (!null_value_counts.is_empty()).then_some(null_value_counts),
+        nan_value_counts: (!nan_value_counts.is_empty()).then_some(nan_value_counts),
+        lower_bounds: (!lower_bounds.is_empty()).then_some(lower_bounds),
+        upper_bounds: (!upper_bounds.is_empty()).then_some(upper_bounds),
+    })
+}
+
+fn u64_stats_to_i64(stats: &HashMap<i32, u64>) -> BTreeMap<i32, i64> {
+    stats
+        .iter()
+        .map(|(field_id, value)| (*field_id, *value as i64))
+        .collect()
+}
+
+fn datum_bounds_to_bytes(bounds: &HashMap<i32, iceberg::spec::Datum>) -> BTreeMap<i32, Vec<u8>> {
+    bounds
+        .iter()
+        .filter_map(|(field_id, datum)| {
+            datum
+                .to_bytes()
+                .ok()
+                .map(|bytes| (*field_id, bytes.to_vec()))
+        })
+        .collect()
 }
 
 fn maybe_collect_sketches(
@@ -1001,6 +1093,60 @@ mod tests {
         .await
         .expect("write off");
         assert!(staged_off[0].theta_sketches.is_none());
+    }
+
+    #[tokio::test]
+    async fn to_iceberg_data_file_is_identity() {
+        let table = build_unpartitioned_test_table("kernel_id").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let mut staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2, 3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        let one = staged.remove(0);
+        let path = one.data_file.file_path().to_string();
+        let count = one.data_file.record_count();
+        let df = to_iceberg_data_file(one);
+        assert_eq!(df.file_path(), path);
+        assert_eq!(df.record_count(), count);
+    }
+
+    #[tokio::test]
+    async fn to_sink_commit_info_maps_fields_and_sketches() {
+        let table = build_unpartitioned_test_table("kernel_commit").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let opts = StagedWriteOptions {
+            collect_theta_sketches: true,
+            content: StagedContent::Data,
+        };
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
+            .await
+            .expect("write");
+        let s = &staged[0];
+        let expected_path = s.data_file.file_path().to_string();
+        let expected_count = s.data_file.record_count() as i64;
+        let (commit, sketch_set) = to_sink_commit_info(
+            s,
+            String::new(),
+            String::new(),
+            "parquet".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        );
+        let df = commit.iceberg_data_file.expect("iceberg data file");
+        assert_eq!(df.path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(df.record_count, Some(expected_count));
+        assert_eq!(df.partition_path.as_deref(), Some(""));
+        assert!(df.file_size_in_bytes.unwrap() > 0);
+        assert!(
+            df.column_stats.is_some(),
+            "column stats mapped from DataFile"
+        );
+        let sketch_set = sketch_set.expect("sketch set");
+        assert_eq!(sketch_set.file_path, expected_path);
+        assert!(sketch_set.sketches.contains_key(&1));
     }
 
     #[tokio::test]
