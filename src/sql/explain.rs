@@ -19,6 +19,13 @@ use crate::sql::planner::plan::LogicalPlan;
 pub(crate) fn format_stats_trailer(
     stats: &crate::sql::optimizer::statistics::Statistics,
 ) -> String {
+    format_stats_trailer_with_conf(stats, false)
+}
+
+pub(crate) fn format_stats_trailer_with_conf(
+    stats: &crate::sql::optimizer::statistics::Statistics,
+    show_conf: bool,
+) -> String {
     let rows = stats.output_row_count;
     let rows_str: String = if rows.is_nan() || rows <= 0.0 {
         "?".to_string()
@@ -27,12 +34,21 @@ pub(crate) fn format_stats_trailer(
     } else {
         (rows.round() as i64).to_string()
     };
-    format!("stats={{rows={rows_str}}}")
+    let conf = if show_conf {
+        match stats.row_count_confidence {
+            crate::sql::optimizer::statistics::Confidence::Estimated => " conf=estimated",
+            crate::sql::optimizer::statistics::Confidence::Fallback => " conf=fallback",
+            crate::sql::optimizer::statistics::Confidence::Exact => "",
+        }
+    } else {
+        ""
+    };
+    format!("stats={{rows={rows_str}{conf}}}")
 }
 
 /// Costs-only per-column statistics block. Kept separate from
-/// `format_stats_trailer` so Verbose/Analyze output (and existing golden
-/// files) stay unchanged — only `EXPLAIN COSTS` shows column stats.
+/// `format_stats_trailer` so Verbose/Analyze output stays focused on row
+/// counts — only `EXPLAIN COSTS` shows column stats.
 /// Unknown-stat columns (ColumnStatistic::unknown) render as min=-inf max=+inf ndv=1 null_frac=0.
 pub(crate) fn format_column_stats_costs(
     stats: &crate::sql::optimizer::statistics::Statistics,
@@ -388,7 +404,12 @@ fn format_physical_node(
         level,
         ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
     ) {
-        format!(" {}", format_stats_trailer(&node.stats))
+        let trailer = if matches!(level, ExplainLevel::Costs | ExplainLevel::Analyze) {
+            format_stats_trailer_with_conf(&node.stats, true)
+        } else {
+            format_stats_trailer(&node.stats)
+        };
+        format!(" {trailer}")
     } else {
         String::new()
     };
@@ -1232,7 +1253,7 @@ mod tests {
     use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::statistics::{Confidence, Statistics};
     use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
 
     fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
@@ -1498,15 +1519,16 @@ mod tests {
     }
 
     #[test]
-    fn analyze_level_is_treated_like_verbose_in_formatter() {
-        let plan = build_minimal_scan_plan_for_explain_test();
+    fn analyze_level_matches_verbose_for_exact_stats() {
+        let mut plan = build_minimal_scan_plan_for_explain_test();
+        plan.stats.row_count_confidence = Confidence::Exact;
         let verbose = explain_physical_plan(&plan, ExplainLevel::Verbose);
         let analyze = explain_physical_plan(&plan, ExplainLevel::Analyze);
-        // Same per-node body text. Header is added by explain_analyze_query
-        // later, not by explain_physical_plan itself.
+        // With exact row counts, Analyze still shares Verbose body text.
+        // Header is added by explain_analyze_query later, not here.
         assert_eq!(
             verbose, analyze,
-            "Analyze level must format nodes same as Verbose"
+            "Analyze should match Verbose when confidence has no visible suffix"
         );
     }
 
@@ -1598,6 +1620,46 @@ mod tests {
     }
 
     #[test]
+    fn stats_trailer_with_conf_emits_estimated_suffix_when_enabled() {
+        let stats = Statistics {
+            output_row_count: 123.7,
+            row_count_confidence: Confidence::Estimated,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(
+            super::format_stats_trailer_with_conf(&stats, true),
+            "stats={rows=124 conf=estimated}"
+        );
+    }
+
+    #[test]
+    fn stats_trailer_with_conf_emits_fallback_suffix_when_enabled() {
+        let stats = Statistics {
+            output_row_count: 0.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(
+            super::format_stats_trailer_with_conf(&stats, true),
+            "stats={rows=? conf=fallback}"
+        );
+    }
+
+    #[test]
+    fn stats_trailer_with_conf_omits_exact_suffix_and_wrapper_stays_plain() {
+        let stats = Statistics {
+            output_row_count: 10.0,
+            row_count_confidence: Confidence::Exact,
+            column_statistics: HashMap::new(),
+        };
+        assert_eq!(
+            super::format_stats_trailer_with_conf(&stats, true),
+            "stats={rows=10}"
+        );
+        assert_eq!(format_stats_trailer(&stats), "stats={rows=10}");
+    }
+
+    #[test]
     fn stats_trailer_emits_question_mark_for_nan() {
         let stats = Statistics {
             output_row_count: f64::NAN,
@@ -1650,6 +1712,38 @@ mod tests {
             scan_line.contains("stats={rows="),
             "scan node should end with stats trailer: {scan_line}"
         );
+    }
+
+    #[test]
+    fn costs_and_analyze_include_non_exact_confidence_but_verbose_does_not() {
+        let mut plan = build_minimal_scan_plan_for_explain_test();
+        plan.stats.row_count_confidence = Confidence::Estimated;
+
+        let verbose = explain_physical_plan(&plan, ExplainLevel::Verbose).join("\n");
+        let costs = explain_physical_plan(&plan, ExplainLevel::Costs).join("\n");
+        let analyze = explain_physical_plan(&plan, ExplainLevel::Analyze).join("\n");
+
+        assert!(verbose.contains("stats={rows=1}"), "{verbose}");
+        assert!(!verbose.contains("conf="), "{verbose}");
+        assert!(costs.contains("stats={rows=1 conf=estimated}"), "{costs}");
+        assert!(
+            analyze.contains("stats={rows=1 conf=estimated}"),
+            "{analyze}"
+        );
+    }
+
+    #[test]
+    fn costs_and_analyze_omit_exact_confidence_suffix() {
+        let mut plan = build_minimal_scan_plan_for_explain_test();
+        plan.stats.row_count_confidence = Confidence::Exact;
+
+        let costs = explain_physical_plan(&plan, ExplainLevel::Costs).join("\n");
+        let analyze = explain_physical_plan(&plan, ExplainLevel::Analyze).join("\n");
+
+        assert!(costs.contains("stats={rows=1}"), "{costs}");
+        assert!(!costs.contains("conf="), "{costs}");
+        assert!(analyze.contains("stats={rows=1}"), "{analyze}");
+        assert!(!analyze.contains("conf="), "{analyze}");
     }
 
     #[test]
