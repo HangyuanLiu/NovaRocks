@@ -11,7 +11,7 @@ mod types;
 use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
-use crate::cluster::{ClusterMode, launch_server};
+use crate::cluster::{ClusterMode, launch_server, validate_cluster_args};
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -173,6 +173,11 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
     cluster_mode: ClusterMode,
+
+    /// Number of BE processes to launch in cross-process cluster mode (>= 1).
+    /// All-in-one mode requires cluster_size = 1.
+    #[arg(long, default_value_t = 1)]
+    cluster_size: usize,
 
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
@@ -1721,6 +1726,12 @@ fn run() -> Result<i32> {
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
+
+    if let Err(e) = validate_cluster_args(cli.cluster_mode, cli.cluster_size) {
+        println!("❌ ERROR: {}", e);
+        return Ok(1);
+    }
+
     ensure_starrocks_table_prereqs(&runner_config)?;
     ensure_managed_lake_prereqs(&runner_config)?;
 
@@ -1788,6 +1799,7 @@ fn run() -> Result<i32> {
         } else {
             cli.cluster_mode
         },
+        cli.cluster_size,
         &base_dir,
         &runner_config,
     )?;
@@ -2319,10 +2331,11 @@ fn run() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use crate::cluster::{
-        ClusterMode, ClusterProcessRole, CrossProcessRuntime, build_novarocks_command,
+        BePorts, ClusterMode, ClusterProcessRole, CrossProcessRuntime, build_novarocks_command,
         discover_novarocks_binary_with_override, render_cross_process_config,
-        startup_timeout_from_env,
+        startup_timeout_from_env, validate_cluster_args,
     };
+    use crate::Cli;
     use crate::config::substitute_placeholders;
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
@@ -2457,8 +2470,10 @@ mod tests {
     #[test]
     fn cross_process_configs_preserve_base_sections_and_patch_cluster_ports() {
         let runtime = CrossProcessRuntime {
-            be_http_port: 18080,
-            be_starlet_port: 19070,
+            be: vec![BePorts {
+                http: 18080,
+                starlet: 19070,
+            }],
             fe_http_port: 28080,
             fe_starlet_port: 29070,
             fe_mysql_port: 29030,
@@ -2477,9 +2492,9 @@ access_key_id = "admin"
 enable_path_style_access = true
 "#;
 
-        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, &runtime)
+        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, 0, &runtime)
             .expect("render fe config");
-        let be = render_cross_process_config(base, ClusterProcessRole::Be, &runtime)
+        let be = render_cross_process_config(base, ClusterProcessRole::Be, 0, &runtime)
             .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
@@ -2834,5 +2849,63 @@ enable_path_style_access = true
         assert!(crate::is_select_or_with("REFRESH MATERIALIZED VIEW mv1"));
         assert!(!crate::is_select_or_with("CREATE TABLE foo (a INT)"));
         assert!(!crate::is_select_or_with("INSERT INTO foo VALUES (1)"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // CLI cluster-size parsing and validation tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn cli_cluster_size_defaults_to_one() {
+        let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb"]).expect("parse cli");
+        assert_eq!(cli.cluster_size, 1);
+    }
+
+    #[test]
+    fn cli_cluster_size_2_cross_process() {
+        let cli = Cli::try_parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "cross-process",
+            "--cluster-size",
+            "2",
+        ])
+        .expect("parse cli");
+        assert_eq!(cli.cluster_size, 2);
+        assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::CrossProcess);
+    }
+
+    #[test]
+    fn cli_cluster_size_zero_rejected() {
+        let cli = Cli::try_parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "cross-process",
+            "--cluster-size",
+            "0",
+        ])
+        .expect("parse cli");
+        // Parsing succeeds; validation rejects it.
+        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        assert!(
+            err.to_string().contains("--cluster-size must be >= 1"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_all_in_one_with_cluster_size_2_rejected() {
+        let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb", "--cluster-size", "2"])
+            .expect("parse cli");
+        assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::AllInOne);
+        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        assert!(
+            err.to_string().contains("all-in-one mode requires --cluster-size 1"),
+            "unexpected: {err}"
+        );
     }
 }

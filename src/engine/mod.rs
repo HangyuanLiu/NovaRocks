@@ -2888,13 +2888,42 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                         .to_string(),
                 );
             }
+            use crate::common::app_config::ClusterRole;
+            use std::net::SocketAddr;
             let role = crate::novarocks_config::config()
                 .map(|c| c.cluster.role)
-                .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
-            let dispatcher = dispatcher_for_role(role, "127.0.0.1", exchange_port)?;
+                .unwrap_or(ClusterRole::AllInOne);
+            let dispatcher = dispatcher_for_role(role)?;
+            // Backend list for the scheduler: FE reads cluster.backends; all-in-one
+            // is the local exchange endpoint; pure BE must not coordinate.
+            let backends: Vec<SocketAddr> = match role {
+                ClusterRole::Fe => {
+                    let cfg =
+                        crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
+                    cfg.cluster
+                        .backends
+                        .iter()
+                        .map(|s| {
+                            s.parse::<SocketAddr>()
+                                .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                ClusterRole::AllInOne => vec![
+                    format!("127.0.0.1:{exchange_port}")
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                ],
+                ClusterRole::Be => {
+                    return Err("role=be must not enter standalone coordinator".into());
+                }
+            };
+            let scheduler =
+                std::sync::Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 dispatcher,
+                scheduler,
                 query_opts,
             )
             .execute()
@@ -2904,39 +2933,34 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
-/// - `AllInOne`: uses `InProcessDispatcher` bound to the local exchange endpoint.
-/// - `Fe`: uses `RemoteDispatcher` bound to the first configured backend.
+/// - `AllInOne`: uses `InProcessDispatcher`. Exchange destinations are filled by
+///   the scheduler from the backend list (the local exchange endpoint).
+/// - `Fe`: uses `RemoteDispatcher` bound to all configured backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
-    exchange_host: &str,
-    exchange_port: u16,
 ) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::AllInOne => Ok(Arc::new(
-            crate::runtime::dispatcher::InProcessDispatcher::new(exchange_host, exchange_port),
+            crate::runtime::dispatcher::InProcessDispatcher::new(),
         )),
         ClusterRole::Fe => {
             let cfg = crate::novarocks_config::config()
                 .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
-            let n = cfg.cluster.backends.len();
-            if n != 1 {
-                return Err(format!(
-                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
-                ));
+            if cfg.cluster.backends.is_empty() {
+                return Err("role=fe: cluster.backends must not be empty".to_string());
             }
-            let backend_str = cfg
-                .cluster
-                .backends
-                .first()
-                .expect("length already checked above");
-            let backend: std::net::SocketAddr = backend_str
-                .parse()
-                .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+            let mut addrs = Vec::with_capacity(cfg.cluster.backends.len());
+            for backend_str in &cfg.cluster.backends {
+                let backend: std::net::SocketAddr = backend_str
+                    .parse()
+                    .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
+                addrs.push(backend);
+            }
             Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
-                backend,
-            )))
+                &addrs,
+            )?))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
@@ -5621,7 +5645,7 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn iceberg_refresh_load_failure_removes_stale_local_catalog_entry() {
+    fn iceberg_refresh_load_failure_does_not_use_stale_external_metadata() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
@@ -5629,16 +5653,10 @@ enable_path_style_access = true
             .expect("insert iceberg row");
         session
             .query("select id from ice.db1.t")
-            .expect("register iceberg table");
+            .expect("query iceberg table");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_ok(),
-            "local table should be registered before external drop"
+            !engine.has_local_table("db1", "t"),
+            "ordinary iceberg SELECT should not register a local catalog table"
         );
 
         let entry = {
@@ -5651,21 +5669,18 @@ enable_path_style_access = true
         let err = session
             .query("select id from ice.db1.t")
             .expect_err("dropped backing table should not use stale local table");
-        assert!(err.contains("unknown iceberg table"), "err={err}");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_err(),
-            "stale local table should be removed after failed refresh"
+            err.contains("unknown iceberg table") || err.contains("unknown table"),
+            "err={err}"
+        );
+        assert!(
+            !engine.has_local_table("db1", "t"),
+            "failed refresh should not leave a local catalog table"
         );
     }
 
     #[test]
-    fn drop_iceberg_table_removes_stale_local_catalog_entry() {
+    fn drop_iceberg_table_invalidates_external_metadata_without_local_registration() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
@@ -5673,16 +5688,10 @@ enable_path_style_access = true
             .expect("insert iceberg row");
         session
             .query("select id from ice.db1.t")
-            .expect("register iceberg table");
+            .expect("query iceberg table");
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_ok(),
-            "local table should be registered before drop"
+            !engine.has_local_table("db1", "t"),
+            "ordinary iceberg SELECT should not register a local catalog table"
         );
 
         let drop = session
@@ -5690,14 +5699,15 @@ enable_path_style_access = true
             .expect("drop iceberg table");
         assert!(matches!(drop, StatementResult::Ok));
         assert!(
-            engine
-                .inner
-                .catalog
-                .read()
-                .expect("catalog read")
-                .get("db1", "t")
-                .is_err(),
-            "drop table should remove stale local table"
+            !engine.has_local_table("db1", "t"),
+            "drop table should keep the local catalog clear"
+        );
+        let err = session
+            .query("select id from ice.db1.t")
+            .expect_err("dropped iceberg table should not be queryable");
+        assert!(
+            err.contains("unknown iceberg table") || err.contains("unknown table"),
+            "err={err}"
         );
     }
 
@@ -7732,10 +7742,10 @@ enable_path_style_access = true
             .expect("create namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.t3 (id bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.t3 (id bigint) tblproperties("format-version"="3","write.row-lineage"="false")"#,
                 "default",
             )
-            .expect("create V3 iceberg table without row-lineage");
+            .expect("create V3 iceberg table with row-lineage disabled");
 
         let err = session
             .execute_in_database("select _row_id from ice.ns.t3", "default")
@@ -7866,7 +7876,7 @@ enable_path_style_access = true
     #[test]
     fn dispatcher_for_role_all_in_one_ok() {
         use crate::common::app_config::ClusterRole;
-        let result = super::dispatcher_for_role(ClusterRole::AllInOne, "127.0.0.1", 0);
+        let result = super::dispatcher_for_role(ClusterRole::AllInOne);
         assert!(result.is_ok(), "AllInOne should produce a dispatcher");
     }
 
@@ -7875,7 +7885,7 @@ enable_path_style_access = true
         let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::ClusterRole;
         crate::common::app_config::install_default_for_test();
-        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        let result = super::dispatcher_for_role(ClusterRole::Fe);
         assert!(
             result.is_err(),
             "Fe role with no backends must return an error"
@@ -7890,7 +7900,7 @@ enable_path_style_access = true
     #[test]
     fn dispatcher_for_role_be_returns_error_instead_of_panicking() {
         use crate::common::app_config::ClusterRole;
-        let result = super::dispatcher_for_role(ClusterRole::Be, "127.0.0.1", 0);
+        let result = super::dispatcher_for_role(ClusterRole::Be);
         assert!(result.is_err(), "Be role must return a recoverable error");
         let msg = result.err().expect("expected error");
         assert!(
@@ -7909,7 +7919,7 @@ enable_path_style_access = true
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["127.0.0.1:9070".to_string()];
         crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        let result = super::dispatcher_for_role(ClusterRole::Fe);
         assert!(
             result.is_ok(),
             "Fe with valid backend must return a dispatcher, got: {:?}",
@@ -7926,7 +7936,7 @@ enable_path_style_access = true
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["not-an-addr".to_string()];
         crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
+        let result = super::dispatcher_for_role(ClusterRole::Fe);
         assert!(result.is_err(), "malformed backend must return an error");
         let msg = result.err().expect("error");
         assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
@@ -7936,21 +7946,28 @@ enable_path_style_access = true
         );
     }
 
-    /// Issue 4: FE role with more than one backend returns an error that
-    /// includes the backend count.  Without the exactly-one guard the first
-    /// backend would be silently accepted.
+    /// D2: FE role with more than one backend builds a multi-backend
+    /// `RemoteDispatcher`. The dispatcher reports a backend count equal to the
+    /// number of configured backends.
     #[test]
-    fn dispatcher_for_role_fe_multiple_backends_returns_error_with_count() {
+    fn dispatcher_for_role_fe_multiple_backends_ok() {
         let _guard = super::acquire_standalone_test_guard();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.backends = vec!["127.0.0.1:9070".to_string(), "127.0.0.1:9071".to_string()];
         crate::common::app_config::install_preloaded_config(cfg);
-        let result = super::dispatcher_for_role(ClusterRole::Fe, "127.0.0.1", 0);
-        assert!(result.is_err(), "Fe with multiple backends must error");
-        let msg = result.err().expect("expected error");
-        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
-        assert!(msg.contains('2'), "must include count: {msg}");
+        let result = super::dispatcher_for_role(ClusterRole::Fe);
+        assert!(
+            result.is_ok(),
+            "Fe with multiple backends must build a dispatcher, got: {:?}",
+            result.err()
+        );
+        let dispatcher = result.expect("dispatcher");
+        assert_eq!(
+            dispatcher.backend_count(),
+            2,
+            "dispatcher must route to both configured backends"
+        );
     }
 
     #[test]

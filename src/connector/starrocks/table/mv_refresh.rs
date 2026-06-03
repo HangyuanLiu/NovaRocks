@@ -4581,6 +4581,16 @@ enable_path_style_access = true
                 .expect("register orders table");
         }
         state
+            .catalog_mgr
+            .write()
+            .expect("catalog mgr write lock")
+            .register(Arc::new(
+                crate::engine::catalog_mgr::internal::InternalCatalog::new(
+                    "ice",
+                    Arc::clone(&state.catalog),
+                ),
+            ));
+        state
     }
 
     /// `analyze_visible_output_types` on an AVG MV SQL must return visible-shaped

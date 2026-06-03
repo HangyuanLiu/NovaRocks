@@ -24,9 +24,14 @@ pub(crate) enum ClusterProcessRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BePorts {
+    pub(crate) http: u16,
+    pub(crate) starlet: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrossProcessRuntime {
-    pub(crate) be_http_port: u16,
-    pub(crate) be_starlet_port: u16,
+    pub(crate) be: Vec<BePorts>,
     pub(crate) fe_http_port: u16,
     pub(crate) fe_starlet_port: u16,
     pub(crate) fe_mysql_port: u16,
@@ -39,16 +44,29 @@ pub(crate) trait ServerHandle {
 
 pub(crate) fn launch_server(
     mode: ClusterMode,
+    cluster_size: usize,
     repo_root: &Path,
     runner_config: &RunnerConfig,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
         ClusterMode::CrossProcess => Ok(Box::new(CrossProcessServerHandle::launch(
+            cluster_size,
             repo_root,
             runner_config,
         )?)),
     }
+}
+
+/// Validate cluster CLI arguments.  Returns an error string on failure.
+pub(crate) fn validate_cluster_args(mode: ClusterMode, cluster_size: usize) -> Result<()> {
+    if cluster_size == 0 {
+        bail!("--cluster-size must be >= 1");
+    }
+    if mode == ClusterMode::AllInOne && cluster_size > 1 {
+        bail!("all-in-one mode requires --cluster-size 1 (got {})", cluster_size);
+    }
+    Ok(())
 }
 
 pub(crate) fn discover_novarocks_binary(repo_root: &Path) -> Result<PathBuf> {
@@ -118,9 +136,14 @@ pub(crate) fn resolve_base_app_config_path(
     bail!("failed to locate standalone-server config for cross-process mode")
 }
 
+/// Render the per-process TOML config for cross-process mode.
+///
+/// `be_index` is used when `role == Be` to select which BE's ports to use.
+/// It is ignored for `role == Fe`.
 pub(crate) fn render_cross_process_config(
     base_config: &str,
     role: ClusterProcessRole,
+    be_index: usize,
     runtime: &CrossProcessRuntime,
 ) -> Result<String> {
     let mut value = if base_config.trim().is_empty() {
@@ -148,13 +171,14 @@ pub(crate) fn render_cross_process_config(
             );
         }
         ClusterProcessRole::Be => {
+            let be = &runtime.be[be_index];
             server.insert(
                 "http_port".to_string(),
-                Value::Integer(i64::from(runtime.be_http_port)),
+                Value::Integer(i64::from(be.http)),
             );
             server.insert(
                 "starlet_port".to_string(),
-                Value::Integer(i64::from(runtime.be_starlet_port)),
+                Value::Integer(i64::from(be.starlet)),
             );
         }
     }
@@ -181,13 +205,12 @@ pub(crate) fn render_cross_process_config(
     match role {
         ClusterProcessRole::Fe => {
             cluster.insert("role".to_string(), Value::String("fe".to_string()));
-            cluster.insert(
-                "backends".to_string(),
-                Value::Array(vec![Value::String(format!(
-                    "127.0.0.1:{}",
-                    runtime.be_starlet_port
-                ))]),
-            );
+            let backends: Vec<Value> = runtime
+                .be
+                .iter()
+                .map(|be| Value::String(format!("127.0.0.1:{}", be.starlet)))
+                .collect();
+            cluster.insert("backends".to_string(), Value::Array(backends));
         }
         ClusterProcessRole::Be => {
             cluster.insert("role".to_string(), Value::String("be".to_string()));
@@ -214,9 +237,9 @@ struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
     runtime_dir: PathBuf,
-    _be_config_path: PathBuf,
+    _be_config_paths: Vec<PathBuf>,
     _fe_config_path: PathBuf,
-    be_process: ProcessGuard,
+    be_processes: Vec<ProcessGuard>,
     fe_process: ProcessGuard,
 }
 
@@ -249,21 +272,23 @@ impl Drop for RuntimeDirGuard {
 }
 
 impl CrossProcessServerHandle {
-    fn launch(repo_root: &Path, runner_config: &RunnerConfig) -> Result<Self> {
+    fn launch(cluster_size: usize, repo_root: &Path, runner_config: &RunnerConfig) -> Result<Self> {
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
-        let ReservedRuntimePorts {
-            be_http_port,
-            be_starlet_port,
-            fe_http_port,
-            fe_starlet_port,
-            fe_mysql_port,
-        } = ReservedRuntimePorts::new()?;
+        let reserved = ReservedRuntimePorts::new(cluster_size)?;
+
+        // Build runtime port record from reserved ports (before releasing any).
         let runtime = CrossProcessRuntime {
-            be_http_port: be_http_port.port(),
-            be_starlet_port: be_starlet_port.port(),
-            fe_http_port: fe_http_port.port(),
-            fe_starlet_port: fe_starlet_port.port(),
-            fe_mysql_port: fe_mysql_port.port(),
+            be: reserved
+                .be_ports
+                .iter()
+                .map(|bp| BePorts {
+                    http: bp.http.port(),
+                    starlet: bp.starlet.port(),
+                })
+                .collect(),
+            fe_http_port: reserved.fe_http_port.port(),
+            fe_starlet_port: reserved.fe_starlet_port.port(),
+            fe_mysql_port: reserved.fe_mysql_port.port(),
         };
 
         let novarocks_bin = discover_novarocks_binary(repo_root)?;
@@ -275,38 +300,61 @@ impl CrossProcessServerHandle {
             )
         })?;
 
-        let be_config_path = runtime_dir.path().join("be.toml");
-        fs::write(
-            &be_config_path,
-            render_cross_process_config(&base_config, ClusterProcessRole::Be, &runtime)?,
-        )
-        .with_context(|| format!("write {}", be_config_path.display()))?;
+        // Write per-BE configs.
+        let mut be_config_paths: Vec<PathBuf> = Vec::with_capacity(cluster_size);
+        for i in 0..cluster_size {
+            let be_config_path = runtime_dir.path().join(format!("be_{i}.toml"));
+            fs::write(
+                &be_config_path,
+                render_cross_process_config(
+                    &base_config,
+                    ClusterProcessRole::Be,
+                    i,
+                    &runtime,
+                )?,
+            )
+            .with_context(|| format!("write {}", be_config_path.display()))?;
+            be_config_paths.push(be_config_path);
+        }
 
+        // Write FE config.
         let fe_config_path = runtime_dir.path().join("fe.toml");
         fs::write(
             &fe_config_path,
-            render_cross_process_config(&base_config, ClusterProcessRole::Fe, &runtime)?,
+            render_cross_process_config(&base_config, ClusterProcessRole::Fe, 0, &runtime)?,
         )
         .with_context(|| format!("write {}", fe_config_path.display()))?;
 
-        let _ = be_http_port.release();
-        let _ = be_starlet_port.release();
-        let be_process = ProcessGuard::spawn(
-            &novarocks_bin,
-            "be",
-            &be_config_path,
-            "NOVAROCKS_READY role=be",
-        )?;
-        println!(
-            "🚀 started cross-process BE pid={} starlet_port={} config={}",
-            be_process.pid(),
-            runtime.be_starlet_port,
-            be_config_path.display()
-        );
+        // Spawn all BEs: release each BE's ports immediately before spawning it.
+        let mut be_processes: Vec<ProcessGuard> = Vec::with_capacity(cluster_size);
+        for (i, (reserved_be, be_config_path)) in reserved
+            .be_ports
+            .into_iter()
+            .zip(be_config_paths.iter())
+            .enumerate()
+        {
+            let starlet_port = reserved_be.starlet.port();
+            let _ = reserved_be.http.release();
+            let _ = reserved_be.starlet.release();
+            let be_process = ProcessGuard::spawn(
+                &novarocks_bin,
+                "be",
+                be_config_path,
+                "NOVAROCKS_READY role=be",
+            )?;
+            println!(
+                "started cross-process BE[{i}] pid={} starlet_port={} config={}",
+                be_process.pid(),
+                starlet_port,
+                be_config_path.display()
+            );
+            be_processes.push(be_process);
+        }
 
-        let _ = fe_http_port.release();
-        let _ = fe_starlet_port.release();
-        let _ = fe_mysql_port.release();
+        // Spawn FE.
+        let _ = reserved.fe_http_port.release();
+        let _ = reserved.fe_starlet_port.release();
+        let _ = reserved.fe_mysql_port.release();
         let fe_process = ProcessGuard::spawn(
             &novarocks_bin,
             "fe",
@@ -314,7 +362,7 @@ impl CrossProcessServerHandle {
             "NOVAROCKS_READY mysql_port=",
         )?;
         println!(
-            "🚀 started cross-process FE pid={} mysql_port={} config={}",
+            "started cross-process FE pid={} mysql_port={} config={}",
             fe_process.pid(),
             runtime.fe_mysql_port,
             fe_config_path.display()
@@ -324,9 +372,9 @@ impl CrossProcessServerHandle {
             target_host: "127.0.0.1".to_string(),
             target_port: runtime.fe_mysql_port,
             runtime_dir: runtime_dir.into_path(),
-            _be_config_path: be_config_path,
+            _be_config_paths: be_config_paths,
             _fe_config_path: fe_config_path,
-            be_process,
+            be_processes,
             fe_process,
         })
     }
@@ -345,7 +393,9 @@ impl ServerHandle for CrossProcessServerHandle {
 impl Drop for CrossProcessServerHandle {
     fn drop(&mut self) {
         let _ = self.fe_process.stop();
-        let _ = self.be_process.stop();
+        for be_process in &mut self.be_processes {
+            let _ = be_process.stop();
+        }
         let _ = fs::remove_dir_all(&self.runtime_dir);
     }
 }
@@ -535,19 +585,30 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
     Duration::from_secs(timeout_secs)
 }
 
+struct ReservedBePorts {
+    http: ReservedPort,
+    starlet: ReservedPort,
+}
+
 struct ReservedRuntimePorts {
-    be_http_port: ReservedPort,
-    be_starlet_port: ReservedPort,
+    be_ports: Vec<ReservedBePorts>,
     fe_http_port: ReservedPort,
     fe_starlet_port: ReservedPort,
     fe_mysql_port: ReservedPort,
 }
 
 impl ReservedRuntimePorts {
-    fn new() -> Result<Self> {
+    fn new(cluster_size: usize) -> Result<Self> {
+        assert!(cluster_size >= 1, "cluster_size must be >= 1");
+        let mut be_ports = Vec::with_capacity(cluster_size);
+        for _ in 0..cluster_size {
+            be_ports.push(ReservedBePorts {
+                http: ReservedPort::new()?,
+                starlet: ReservedPort::new()?,
+            });
+        }
         Ok(Self {
-            be_http_port: ReservedPort::new()?,
-            be_starlet_port: ReservedPort::new()?,
+            be_ports,
             fe_http_port: ReservedPort::new()?,
             fe_starlet_port: ReservedPort::new()?,
             fe_mysql_port: ReservedPort::new()?,
@@ -680,16 +741,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_cross_process_config_patches_fe_and_be_independently() {
-        let runtime = CrossProcessRuntime {
-            be_http_port: 18080,
-            be_starlet_port: 19070,
+    fn make_runtime_1be() -> CrossProcessRuntime {
+        CrossProcessRuntime {
+            be: vec![BePorts {
+                http: 18080,
+                starlet: 19070,
+            }],
             fe_http_port: 28080,
             fe_starlet_port: 29070,
             fe_mysql_port: 29030,
-        };
-        let base = r#"
+        }
+    }
+
+    fn make_runtime_2be() -> CrossProcessRuntime {
+        CrossProcessRuntime {
+            be: vec![
+                BePorts {
+                    http: 18080,
+                    starlet: 19070,
+                },
+                BePorts {
+                    http: 18081,
+                    starlet: 19071,
+                },
+            ],
+            fe_http_port: 28080,
+            fe_starlet_port: 29070,
+            fe_mysql_port: 29030,
+        }
+    }
+
+    static BASE_CONFIG: &str = r#"
 [metadata]
 provider = "sqlite"
 path = "tmp/sql-tests.sqlite"
@@ -708,9 +790,13 @@ enable_path_style_access = true
 exec_node_output = true
 "#;
 
-        let fe = render_cross_process_config(base, ClusterProcessRole::Fe, &runtime)
+    #[test]
+    fn render_cross_process_config_patches_fe_and_be_independently() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
             .expect("render fe config");
-        let be = render_cross_process_config(base, ClusterProcessRole::Be, &runtime)
+        let be = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
             .expect("render be config");
 
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
@@ -734,11 +820,13 @@ exec_node_output = true
         );
         assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        // 1-BE: FE backends list has exactly one entry pointing at the single BE's starlet port.
+        let fe_backends = fe_value["cluster"]["backends"]
+            .as_array()
+            .expect("fe backends array");
+        assert_eq!(fe_backends.len(), 1);
         assert_eq!(
-            fe_value["cluster"]["backends"]
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|value| value.as_str()),
+            fe_backends[0].as_str(),
             Some("127.0.0.1:19070")
         );
 
@@ -768,6 +856,107 @@ exec_node_output = true
                 .and_then(|value| value.get("backends"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn render_cross_process_config_2be_fe_has_both_backends() {
+        let runtime = make_runtime_2be();
+
+        let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+
+        assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        let backends = fe_value["cluster"]["backends"]
+            .as_array()
+            .expect("fe backends array");
+        assert_eq!(backends.len(), 2, "FE backends must list all 2 BEs");
+        assert_eq!(backends[0].as_str(), Some("127.0.0.1:19070"));
+        assert_eq!(backends[1].as_str(), Some("127.0.0.1:19071"));
+    }
+
+    #[test]
+    fn render_cross_process_config_2be_each_be_has_own_ports() {
+        let runtime = make_runtime_2be();
+
+        let be0 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be0 config");
+        let be1 = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Be, 1, &runtime)
+            .expect("render be1 config");
+
+        let be0_value: toml::Value = be0.parse().expect("parse be0 toml");
+        let be1_value: toml::Value = be1.parse().expect("parse be1 toml");
+
+        // BE[0]
+        assert_eq!(be0_value["cluster"]["role"].as_str(), Some("be"));
+        assert!(be0_value.get("cluster").and_then(|c| c.get("backends")).is_none());
+        assert_eq!(be0_value["server"]["http_port"].as_integer(), Some(18080));
+        assert_eq!(be0_value["server"]["starlet_port"].as_integer(), Some(19070));
+
+        // BE[1]
+        assert_eq!(be1_value["cluster"]["role"].as_str(), Some("be"));
+        assert!(be1_value.get("cluster").and_then(|c| c.get("backends")).is_none());
+        assert_eq!(be1_value["server"]["http_port"].as_integer(), Some(18081));
+        assert_eq!(be1_value["server"]["starlet_port"].as_integer(), Some(19071));
+
+        // Ports must differ between the two BEs.
+        assert_ne!(
+            be0_value["server"]["http_port"].as_integer(),
+            be1_value["server"]["http_port"].as_integer()
+        );
+        assert_ne!(
+            be0_value["server"]["starlet_port"].as_integer(),
+            be1_value["server"]["starlet_port"].as_integer()
+        );
+    }
+
+    #[test]
+    fn reserved_runtime_ports_new_2_yields_two_distinct_be_port_pairs() {
+        let reserved = ReservedRuntimePorts::new(2).expect("reserve 2 BE port pairs");
+        assert_eq!(reserved.be_ports.len(), 2);
+        let http0 = reserved.be_ports[0].http.port();
+        let starlet0 = reserved.be_ports[0].starlet.port();
+        let http1 = reserved.be_ports[1].http.port();
+        let starlet1 = reserved.be_ports[1].starlet.port();
+        // All four ports must be distinct.
+        let ports = [http0, starlet0, http1, starlet1];
+        for i in 0..ports.len() {
+            for j in (i + 1)..ports.len() {
+                assert_ne!(
+                    ports[i], ports[j],
+                    "BE port pair ports must all be distinct: {:?}",
+                    ports
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_cluster_args_size_zero_rejected() {
+        let err = validate_cluster_args(ClusterMode::CrossProcess, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("--cluster-size must be >= 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cluster_args_all_in_one_with_size_2_rejected() {
+        let err = validate_cluster_args(ClusterMode::AllInOne, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("all-in-one mode requires --cluster-size 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cluster_args_cross_process_size_2_ok() {
+        validate_cluster_args(ClusterMode::CrossProcess, 2).expect("cluster_size=2 should be valid for cross-process");
+    }
+
+    #[test]
+    fn validate_cluster_args_all_in_one_size_1_ok() {
+        validate_cluster_args(ClusterMode::AllInOne, 1).expect("cluster_size=1 should be valid for all-in-one");
     }
 
     #[test]

@@ -35,12 +35,16 @@ use crate::types;
 ///   `per_exch_num_senders`, and `runtime_filter_params` before calling.
 /// - Constructing the `thrift_fragment` with the correct output sink
 ///   (DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, or RESULT_SINK).
+/// - Passing `backend_num` = the FE-assigned instance index (ExecutionDAG
+///   index). This becomes `RuntimeState.backend_num` and drives the sink's
+///   `be_number`. See `src/service/internal_service.rs:1194`.
 pub(crate) fn build_exec_plan_fragment_params(
     fr: &FragmentBuildResult,
     thrift_fragment: planner::TPlanFragment,
     exec_params: internal_service::TPlanFragmentExecParams,
     query_options: Option<internal_service::TQueryOptions>,
     pipeline_dop: i32,
+    backend_num: Option<i32>,
 ) -> internal_service::TExecPlanFragmentParams {
     internal_service::TExecPlanFragmentParams::new(
         internal_service::InternalServiceVersion::V1,
@@ -48,7 +52,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         Some(fr.desc_tbl.clone()),
         Some(exec_params),
         None::<types::TNetworkAddress>,          // coord
-        None::<i32>,                             // backend_num
+        backend_num,                             // backend_num (FE instance index)
         None::<internal_service::TQueryGlobals>, // query_globals
         query_options,
         None::<bool>,                                // enable_profile
@@ -200,8 +204,14 @@ mod tests {
         exec_params.query_id = types::TUniqueId::new(query_hi, query_lo);
         exec_params.fragment_instance_id = types::TUniqueId::new(finst_hi, finst_lo);
 
-        let result =
-            build_exec_plan_fragment_params(&fr, noop_thrift_fragment(), exec_params, None, 4);
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            4,
+            None,
+        );
 
         let params = result.params.expect("params must be present");
         assert_eq!(params.query_id.hi, query_hi);
@@ -218,8 +228,14 @@ mod tests {
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
         exec_params.per_exch_num_senders = BTreeMap::from([(3, 4)]);
 
-        let result =
-            build_exec_plan_fragment_params(&fr, noop_thrift_fragment(), exec_params, None, 4);
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            4,
+            None,
+        );
 
         let params = result.params.expect("params must be present");
         assert_eq!(params.per_exch_num_senders.get(&3), Some(&4));
@@ -241,8 +257,14 @@ mod tests {
         );
         exec_params.runtime_filter_params = Some(rf_params.clone());
 
-        let result =
-            build_exec_plan_fragment_params(&fr, noop_thrift_fragment(), exec_params, None, 4);
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            4,
+            None,
+        );
 
         let params = result.params.expect("params must be present");
         assert!(
@@ -258,8 +280,14 @@ mod tests {
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
 
-        let result =
-            build_exec_plan_fragment_params(&fr, noop_thrift_fragment(), exec_params, None, 4);
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            4,
+            None,
+        );
 
         assert!(result.desc_tbl.is_some(), "desc_tbl should be embedded");
     }
@@ -271,9 +299,38 @@ mod tests {
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
 
-        let result =
-            build_exec_plan_fragment_params(&fr, noop_thrift_fragment(), exec_params, None, 8);
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            8,
+            None,
+        );
 
         assert_eq!(result.pipeline_dop, Some(8));
+    }
+
+    #[test]
+    fn backend_num_is_threaded_to_params() {
+        let fr = empty_fragment_build_result(1, 2);
+        let mut exec_params = fr.exec_params.clone();
+        exec_params.query_id = types::TUniqueId::new(1, 1);
+        exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
+
+        let result = build_exec_plan_fragment_params(
+            &fr,
+            noop_thrift_fragment(),
+            exec_params,
+            None,
+            4,
+            Some(2),
+        );
+
+        assert_eq!(
+            result.backend_num,
+            Some(2),
+            "backend_num must reflect the FE-assigned instance index"
+        );
     }
 }

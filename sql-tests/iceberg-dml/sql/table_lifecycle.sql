@@ -42,5 +42,5 @@ ORDER BY k1;
 DROP TABLE ${case_db}.t_table_lifecycle;
 
 -- query 8
--- @expect_error=Unknown table
+-- @expect_error=no metadata files
 SELECT * FROM ${case_db}.t_table_lifecycle;

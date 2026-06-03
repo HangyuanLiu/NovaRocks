@@ -19,8 +19,9 @@
 //!
 //! `FragmentDispatcher` decouples coordinator from where fragments actually
 //! run. `InProcessDispatcher` keeps the all-in-one mode using
-//! `std::thread::spawn`; `RemoteDispatcher` (PR-4) will talk to a remote BE
-//! over gRPC.
+//! `std::thread::spawn`; `RemoteDispatcher` talks to one or more remote BEs
+//! over gRPC by index; `FragmentScheduler` (PR-3/PR-4) will choose which
+//! backend each fragment instance lands on.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -75,27 +76,28 @@ pub enum FetchOutcome {
 /// calls `submit_fragment` for each fragment (non-blocking), then polls
 /// `fetch_result` for the root fragment instance until `Eof` or `Err`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
-    /// The gRPC exchange address that fragment sinks must route data to.
-    ///
-    /// The coordinator embeds this address into `TPlanFragmentDestination`
-    /// entries so CTE and stream producers know where to push exchange data.
-    fn exchange_addr(&self) -> types::TNetworkAddress;
-
-    /// Submit a fragment for asynchronous execution.  Returns immediately.
+    /// Submit a fragment for asynchronous execution to the given backend.
+    /// Returns immediately.
     fn submit_fragment(
         &self,
+        backend_idx: usize,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String>;
 
-    /// Poll for the next result chunk from the root fragment.
+    /// Poll for the next result chunk from the root fragment on the given
+    /// backend.
     fn fetch_result(
         &self,
+        backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String>;
 
-    /// Cancel all listed fragment instances.  Idempotent.
-    fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]);
+    /// Cancel all listed fragment instances on the given backend.  Idempotent.
+    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]);
+
+    /// Number of backends this dispatcher can route to.
+    fn backend_count(&self) -> usize;
 }
 
 /// Return a reasonable pipeline DOP for standalone execution.
@@ -306,9 +308,6 @@ struct RootSlotEntry {
 // ---------------------------------------------------------------------------
 
 struct InProcessState {
-    /// gRPC exchange endpoint for this process.
-    exchange_host: String,
-    exchange_port: u16,
     /// Root fragment result slots (keyed by finst (hi, lo)).
     root_slots: Mutex<HashMap<FinstKey, RootSlotEntry>>,
     /// All submitted fragment instance IDs, used for bulk cancel.
@@ -330,12 +329,14 @@ pub struct InProcessDispatcher {
 }
 
 impl InProcessDispatcher {
-    /// Create an `InProcessDispatcher` bound to the given exchange endpoint.
-    pub fn new(exchange_host: impl Into<String>, exchange_port: u16) -> Self {
+    /// Create an `InProcessDispatcher`.
+    ///
+    /// Fragments run in-process and exchange through the local gRPC server, so
+    /// no exchange endpoint is stored here: the scheduler now fills every
+    /// `TPlanFragmentDestination` with the concrete backend address.
+    pub fn new() -> Self {
         Self {
             state: Arc::new(InProcessState {
-                exchange_host: exchange_host.into(),
-                exchange_port,
                 root_slots: Mutex::new(HashMap::new()),
                 submitted_ids: Mutex::new(Vec::new()),
                 fragment_errors: Mutex::new(HashMap::new()),
@@ -346,7 +347,7 @@ impl InProcessDispatcher {
 
 impl Default for InProcessDispatcher {
     fn default() -> Self {
-        Self::new("127.0.0.1", 0)
+        Self::new()
     }
 }
 
@@ -419,17 +420,16 @@ fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
 }
 
 impl FragmentDispatcher for InProcessDispatcher {
-    fn exchange_addr(&self) -> types::TNetworkAddress {
-        types::TNetworkAddress::new(
-            self.state.exchange_host.clone(),
-            self.state.exchange_port as i32,
-        )
-    }
-
     fn submit_fragment(
         &self,
+        backend_idx: usize,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
+        if backend_idx != 0 {
+            return Err(format!(
+                "InProcessDispatcher only supports backend_idx=0, got {backend_idx}"
+            ));
+        }
         let exec_params = params
             .params
             .as_ref()
@@ -490,9 +490,15 @@ impl FragmentDispatcher for InProcessDispatcher {
 
     fn fetch_result(
         &self,
+        backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
+        if backend_idx != 0 {
+            return Err(format!(
+                "InProcessDispatcher only supports backend_idx=0, got {backend_idx}"
+            ));
+        }
         let key = (finst_id.hi, finst_id.lo);
         let slot = {
             let slots = self.state.root_slots.lock().expect("root_slots lock");
@@ -531,10 +537,18 @@ impl FragmentDispatcher for InProcessDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
+    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        debug_assert_eq!(
+            backend_idx, 0,
+            "InProcessDispatcher only supports backend_idx=0"
+        );
         for fid in finst_ids {
             cancel_fragment_instance(fid.hi, fid.lo);
         }
+    }
+
+    fn backend_count(&self) -> usize {
+        1
     }
 }
 
@@ -543,34 +557,59 @@ impl FragmentDispatcher for InProcessDispatcher {
 // ---------------------------------------------------------------------------
 
 pub struct RemoteDispatcher {
-    backend: SocketAddr,
+    clients: Vec<NovaRocksGrpcRemoteClient>,
+    addrs: Vec<std::net::SocketAddr>,
 }
 
 impl RemoteDispatcher {
-    pub fn new(backend: SocketAddr) -> Self {
-        Self { backend }
+    /// Build a `RemoteDispatcher` with one lazy gRPC client per backend.
+    ///
+    /// Clients are constructed via `connect_blocking`, which is lazy and cheap
+    /// (no TCP dial at construction). Errors if `backends` is empty.
+    pub fn new(backends: &[SocketAddr]) -> Result<Self, String> {
+        if backends.is_empty() {
+            return Err("RemoteDispatcher requires at least one backend".to_string());
+        }
+        let mut clients = Vec::with_capacity(backends.len());
+        for addr in backends {
+            clients.push(NovaRocksGrpcRemoteClient::connect_blocking(*addr)?);
+        }
+        Ok(Self {
+            clients,
+            addrs: backends.to_vec(),
+        })
     }
 
-    fn client(&self) -> Result<NovaRocksGrpcRemoteClient, String> {
-        NovaRocksGrpcRemoteClient::new(self.backend)
+    /// The address of `backend_idx`, if in range.
+    ///
+    /// PR-4 destination wiring: `FragmentScheduler` calls this to embed the
+    /// correct backend address into `TPlanFragmentDestination` entries when
+    /// assigning fragment instances to specific backends.
+    pub fn addr_of(&self, backend_idx: usize) -> Option<SocketAddr> {
+        self.addrs.get(backend_idx).copied()
+    }
+
+    fn check_idx(&self, idx: usize) -> Result<(), String> {
+        if idx >= self.clients.len() {
+            return Err(format!(
+                "backend_idx {} out of range (have {} backends)",
+                idx,
+                self.clients.len()
+            ));
+        }
+        Ok(())
     }
 }
 
 impl FragmentDispatcher for RemoteDispatcher {
-    fn exchange_addr(&self) -> types::TNetworkAddress {
-        // All fragments dispatched through RemoteDispatcher run on the BE.
-        // Inter-fragment exchange data must flow through the BE's own gRPC
-        // server (self.backend) so that both the producer and the consumer
-        // share the same local exchange registry on the BE.  Using the FE's
-        // exchange server would send data to the FE's registry while the
-        // consumer reads from the BE's registry, causing a permanent stall.
-        types::TNetworkAddress::new(self.backend.ip().to_string(), self.backend.port() as i32)
-    }
-
     fn submit_fragment(
         &self,
+        backend_idx: usize,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
+        self.check_idx(backend_idx)?;
+        // Counter increments only after a successful check_idx, so only valid-index
+        // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_SUBMIT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_submit_fail_after()
             .is_some_and(|successes| call_index > successes)
@@ -581,15 +620,15 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let payload = serialize_thrift_binary(&params)
             .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
-        let resp = self
-            .client()?
+        let resp = self.clients[backend_idx]
             .blocking_submit_fragment(SubmitFragmentRequest {
                 exec_plan_fragment_params_thrift: payload,
-            })?;
+            })
+            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
         if resp.status_code != 0 {
             return Err(format!(
                 "remote submit_fragment failed on {}: {}",
-                self.backend, resp.message
+                self.addrs[backend_idx], resp.message
             ));
         }
         Ok(())
@@ -597,9 +636,13 @@ impl FragmentDispatcher for RemoteDispatcher {
 
     fn fetch_result(
         &self,
+        backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
+        self.check_idx(backend_idx)?;
+        // Counter increments only after a successful check_idx, so only valid-index
+        // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_FETCH_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)
@@ -608,17 +651,19 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Ok(FetchOutcome::NotReady);
         }
-        let resp = self.client()?.blocking_fetch_result(FetchResultRequest {
-            finst_id: Some(PUniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            }),
-            max_wait_ms,
-        })?;
+        let resp = self.clients[backend_idx]
+            .blocking_fetch_result(FetchResultRequest {
+                finst_id: Some(PUniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                }),
+                max_wait_ms,
+            })
+            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
             format!(
-                "remote fetch_result returned unknown status {}",
-                resp.status
+                "BE[{backend_idx}] ({}): remote fetch_result returned unknown status {}",
+                self.addrs[backend_idx], resp.status
             )
         })?;
         match status {
@@ -632,8 +677,11 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {
-        let backend = self.backend;
+    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        if self.check_idx(backend_idx).is_err() {
+            return;
+        }
+        let addr = self.addrs[backend_idx];
         let req = CancelFragmentRequest {
             finst_ids: finst_ids
                 .iter()
@@ -649,24 +697,28 @@ impl FragmentDispatcher for RemoteDispatcher {
             Err(e) => {
                 warn!(
                     "remote cancel_fragment runtime unavailable for {}: {}",
-                    backend, e
+                    addr, e
                 );
                 return;
             }
         };
         runtime_handle.spawn(async move {
-            match NovaRocksGrpcRemoteClient::new(backend) {
+            match NovaRocksGrpcRemoteClient::new(addr) {
                 Ok(client) => match client.cancel_fragment_async(req).await {
                     Ok(resp) if resp.status_code == 0 => {}
                     Ok(resp) => warn!(
                         "remote cancel_fragment returned nonzero status from {}: {}",
-                        backend, resp.status_code
+                        addr, resp.status_code
                     ),
-                    Err(e) => warn!("remote cancel_fragment failed for {}: {}", backend, e),
+                    Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
                 },
-                Err(e) => warn!("remote cancel_fragment failed for {}: {}", backend, e),
+                Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
             }
         });
+    }
+
+    fn backend_count(&self) -> usize {
+        self.clients.len()
     }
 }
 
@@ -740,13 +792,18 @@ fn run_root_fragment_in_process(
         lo: exec_p.fragment_instance_id.lo,
     });
 
+    // Root fragment is the FE-assigned instance whose index (backend_num) the
+    // pipeline threads into RuntimeState; the data_stream_sink derives its
+    // be_number from it. The root is always instance 0 in the scheduling plan.
+    let backend_num = params.backend_num;
+
     let runtime_state = Arc::new(RuntimeState::new(
         query_opts.cloned(),
         None, // cache_options
         query_id,
         exec_p.runtime_filter_params.clone(),
         finst_id,
-        None, // backend_num
+        backend_num,
         None, // mem_tracker
         None, // spill_config
         None, // spill_manager
@@ -765,7 +822,7 @@ fn run_root_fragment_in_process(
         runtime_state,
         query_id,
         None, // fe_addr
-        None, // backend_num
+        backend_num,
     )?;
 
     Ok(handle.take_chunks())
@@ -1111,10 +1168,10 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.submit_code.store(1, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr);
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let err = dispatcher
-            .submit_fragment(make_noop_sink_params(1, 2))
+            .submit_fragment(0, make_noop_sink_params(1, 2))
             .expect_err("nonzero submit status should error");
 
         assert!(err.contains("submit failed"));
@@ -1127,10 +1184,10 @@ mod tests {
             .fetch_status
             .store(FetchStatus::Eof as i32, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr);
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let outcome = dispatcher
-            .fetch_result(make_finst_id(1, 2), 0)
+            .fetch_result(0, make_finst_id(1, 2), 0)
             .expect("fetch");
 
         assert!(matches!(outcome, FetchOutcome::Eof));
@@ -1146,10 +1203,10 @@ mod tests {
         *state.fetch_batch.lock().expect("fetch batch lock") =
             thrift_binary_serialize(&batch).expect("serialize result batch");
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr);
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let outcome = dispatcher
-            .fetch_result(make_finst_id(1, 2), 0)
+            .fetch_result(0, make_finst_id(1, 2), 0)
             .expect("fetch");
 
         let FetchOutcome::Ready(chunk) = outcome else {
@@ -1163,9 +1220,9 @@ mod tests {
     fn remote_dispatcher_cancel_is_sent() {
         let state = Arc::new(MockState::default());
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr);
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
-        dispatcher.cancel_fragments(&[make_finst_id(1, 2)]);
+        dispatcher.cancel_fragments(0, &[make_finst_id(1, 2)]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while state.cancel_count.load(Ordering::SeqCst) == 0 {
@@ -1182,10 +1239,10 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.cancel_delay_ms.store(1_000, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(addr);
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let start = std::time::Instant::now();
-        dispatcher.cancel_fragments(&[make_finst_id(7, 8)]);
+        dispatcher.cancel_fragments(0, &[make_finst_id(7, 8)]);
         let elapsed = start.elapsed();
 
         assert!(
@@ -1221,7 +1278,9 @@ mod tests {
             .map(|(before, _)| before)
             .expect("dispatcher tests section exists");
         let cancel_start = source
-            .find("fn cancel_fragments(&self, finst_ids: &[types::TUniqueId]) {")
+            .find(
+                "fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {",
+            )
             .expect("cancel_fragments implementation exists");
         let cancel_tail = &impl_source[cancel_start..];
         assert!(
@@ -1234,7 +1293,7 @@ mod tests {
     fn fetch_unknown_finst_returns_eof() {
         let dispatcher = InProcessDispatcher::default();
         let finst_id = make_finst_id(999, 888);
-        let outcome = dispatcher.fetch_result(finst_id, 10).unwrap();
+        let outcome = dispatcher.fetch_result(0, finst_id, 10).unwrap();
         assert!(
             matches!(outcome, FetchOutcome::Eof),
             "expected Eof for unknown finst_id"
@@ -1264,7 +1323,7 @@ mod tests {
         });
 
         let outcome = dispatcher
-            .fetch_result(make_finst_id(finst_key.0, finst_key.1), 1)
+            .fetch_result(0, make_finst_id(finst_key.0, finst_key.1), 1)
             .expect("fetch root slot");
         let FetchOutcome::Err(message) = outcome else {
             panic!("expected root fragment panic to surface as error");
@@ -1336,8 +1395,40 @@ mod tests {
         let dispatcher = InProcessDispatcher::default();
         let ids = vec![make_finst_id(100, 200), make_finst_id(101, 201)];
         // Calling cancel twice must not panic.
-        dispatcher.cancel_fragments(&ids);
-        dispatcher.cancel_fragments(&ids);
+        dispatcher.cancel_fragments(0, &ids);
+        dispatcher.cancel_fragments(0, &ids);
+    }
+
+    #[test]
+    fn in_process_dispatcher_rejects_nonzero_backend_idx() {
+        let d = InProcessDispatcher::default();
+        let err = d
+            .submit_fragment(1, make_noop_sink_params(1, 2))
+            .expect_err("idx!=0 must err");
+        assert!(err.contains("backend_idx") || err.contains("InProcess"));
+    }
+
+    #[test]
+    fn in_process_dispatcher_backend_count_is_one() {
+        assert_eq!(InProcessDispatcher::default().backend_count(), 1);
+    }
+
+    #[test]
+    fn remote_dispatcher_holds_multiple_clients() {
+        let a1 = spawn_mock_server(Arc::new(MockState::default()));
+        let a2 = spawn_mock_server(Arc::new(MockState::default()));
+        let d = RemoteDispatcher::new(&[a1, a2]).expect("construct");
+        assert_eq!(d.backend_count(), 2);
+    }
+
+    #[test]
+    fn remote_dispatcher_returns_err_on_out_of_range_idx() {
+        let a = spawn_mock_server(Arc::new(MockState::default()));
+        let d = RemoteDispatcher::new(&[a]).expect("construct");
+        let err = d
+            .submit_fragment(5, make_noop_sink_params(1, 2))
+            .expect_err("oob idx");
+        assert!(err.contains("backend_idx") && err.contains('5'));
     }
 
     #[test]

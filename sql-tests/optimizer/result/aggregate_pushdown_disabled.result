@@ -2,30 +2,33 @@
 Explain String
 GATHER EXCHANGE stats={rows=10}
   PROJECT [a.k AS k, sum(a.v)] stats={rows=10}
-    HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
-      aggregations: sum(__nr_agg_pd_0)
-      HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
-        HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
-          aggregations: sum(__nr_agg_pd_0)
-          HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=90000}
-            build runtime filters:
-            - filter_id = 0, build_expr = (b.k)
-            HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
-              aggregations: sum(a.v)
-              HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
-                HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
-                  aggregations: sum(a.v)
-                  SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
-                       TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
-                       columns: k, v
-                       min-max stats
-                       predicates: a.k IS NOT NULL
-            GATHER EXCHANGE stats={rows=90000}
-              SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
-                   TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
-                   columns: k
-                   min-max stats
-                   predicates: b.k IS NOT NULL
+    PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=10}
+      HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+        aggregations: sum(sum(a.v))
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
+          HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+            aggregations: sum(sum(a.v))
+            HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=90000}
+              build runtime filters:
+              - filter_id = 0, build_expr = (b.k)
+              HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+                aggregations: sum(a.v)
+                  probe runtime filters:
+                  - filter_id = 0, probe_expr = (a.k)
+                HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
+                  HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+                    aggregations: sum(a.v)
+                    SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
+                         TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
+                         columns: k, v
+                         min-max stats
+                         predicates: a.k IS NOT NULL
+              GATHER EXCHANGE stats={rows=90000}
+                SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
+                     TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
+                     columns: k
+                     min-max stats
+                     predicates: b.k IS NOT NULL
 
 -- query 11
 Explain String

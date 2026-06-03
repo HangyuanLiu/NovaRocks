@@ -54,6 +54,20 @@ fn print_standalone_server_usage() {
     eprintln!("  novarocks standalone-server --role be --config /etc/novarocks/novarocks.toml");
 }
 
+/// Build the tracing EnvFilter expression from config: prefer the explicit
+/// `log_filter`, else map `log_level` (keeping deps at info for debug/trace).
+fn resolve_log_filter(cfg: &novarocks::common::app_config::NovaRocksConfig) -> String {
+    if let Some(ref f) = cfg.log_filter {
+        f.clone()
+    } else {
+        match cfg.log_level.as_str() {
+            "debug" => "info,novarocks=debug".to_string(),
+            "trace" => "info,novarocks=trace".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
 fn parse_standalone_server_args(
     args: &[String],
 ) -> Result<Option<StandaloneServerCliArgs>, String> {
@@ -211,6 +225,20 @@ fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
     })
 }
 
+/// Dial every backend address in `backends` with a 3-second TCP timeout.
+/// Returns `Ok(())` if all are reachable, or an `Err` whose message identifies
+/// the failing backend index and address: `"failed to dial backend {idx} ({addr}): {e}"`.
+pub(crate) fn probe_all_backends(backends: &[String]) -> Result<(), String> {
+    for (idx, b) in backends.iter().enumerate() {
+        let addr: std::net::SocketAddr = b
+            .parse()
+            .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?;
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
+            .map_err(|e| format!("failed to dial backend {idx} ({addr}): {e}"))?;
+    }
+    Ok(())
+}
+
 fn dispatch_standalone_role(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
@@ -223,24 +251,13 @@ fn dispatch_standalone_role(
     match role {
         novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
         novarocks::common::app_config::ClusterRole::Fe => {
-            let n = cfg.cluster.backends.len();
-            if n != 1 {
+            if cfg.cluster.backends.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "role=fe: expected exactly one backend, got {n} in cluster.backends"
+                    "role=fe: at least one backend must be configured in [cluster].backends"
                 ));
             }
-            let backend_str = cfg
-                .cluster
-                .backends
-                .first()
-                .expect("length already checked above");
-            let backend_addr: std::net::SocketAddr = backend_str.parse().map_err(|e| {
-                anyhow::anyhow!("role=fe: invalid backend addr '{backend_str}': {e}")
-            })?;
-            std::net::TcpStream::connect_timeout(&backend_addr, std::time::Duration::from_secs(5))
-                .map_err(|e| {
-                    anyhow::anyhow!("role=fe: cannot reach backend {backend_addr}: {e}")
-                })?;
+            probe_all_backends(&cfg.cluster.backends)
+                .map_err(|e| anyhow::anyhow!("role=fe: {e}"))?;
             run_all_in_one(cfg, port_override)
         }
         novarocks::common::app_config::ClusterRole::Be => {
@@ -277,6 +294,13 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // it — along with the already-validated cfg — into the execution path
     // without a second file read.
     let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
+
+    // Install the global config and initialize the tracing subscriber before
+    // starting the server. Without this, standalone-server runs with no logging
+    // (init_with_level is otherwise only called on the FE-compatible run/start
+    // path), so log_filter/log_level/sys_log_dir from the config are ignored.
+    novarocks::common::app_config::install_preloaded_config(cfg.clone());
+    novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
 
     // Spec (PR-4): role=fe must NOT start a local gRPC/exchange server.
     // Use a role-specific server entry point so the closure below routes to
@@ -674,19 +698,7 @@ fn main() {
             // Otherwise, treat `log_level` as the level for our own crate (`novarocks`)
             // and keep a sane default (global `info`) for dependencies, so that
             // noisy system libraries do not spam debug/trace logs.
-            let filter = if let Some(ref f) = cfg.log_filter {
-                f.as_str()
-            } else {
-                match cfg.log_level.as_str() {
-                    // High-verbosity levels: enable for our crate, keep deps at info.
-                    "debug" => "info,novarocks=debug",
-                    "trace" => "info,novarocks=trace",
-                    // Other levels: apply globally.
-                    other => other,
-                }
-            };
-
-            novarocks_logging::init_with_level(filter);
+            novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
 
             eprintln!("NovaRocks {}", novarocks::version::full_version());
 
@@ -937,7 +949,7 @@ fn main() {
 mod tests {
     use super::{
         StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
-        parse_standalone_server_args, resolve_cluster_role, wait_for_tcp_ready,
+        parse_standalone_server_args, probe_all_backends, resolve_cluster_role, wait_for_tcp_ready,
     };
 
     #[test]
@@ -1066,29 +1078,93 @@ mod tests {
         );
     }
 
-    /// Issue 4: dispatch_standalone_role returns an error that includes the
-    /// backend count when more than one backend is configured for role=fe.
-    /// Without the exactly-one guard, the first backend would be silently
-    /// accepted even though validation should reject it.
+    /// D2: dispatch_standalone_role with multiple reachable backends succeeds
+    /// and calls run_all_in_one (coordinator path).
     #[test]
-    fn dispatch_fe_multiple_backends_returns_error_with_count() {
-        // Open a TCP listener so the first backend IS reachable.  Without the
-        // guard, dispatch_standalone_role would reach run_all_in_one and hit
-        // unreachable!().  With the guard it must fail before the TCP probe.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
-        let addr = listener.local_addr().expect("listener addr");
+    fn dispatch_fe_multiple_reachable_backends_enters_coordinator() {
+        let l1 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener 1");
+        let l2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener 2");
+        let addr1 = l1.local_addr().expect("listener 1 addr");
+        let addr2 = l2.local_addr().expect("listener 2 addr");
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
-        cfg.cluster.backends = vec![addr.to_string(), "127.0.0.1:19999".to_string()];
+        cfg.cluster.backends = vec![addr1.to_string(), addr2.to_string()];
+        dispatch_standalone_role(
+            novarocks::common::app_config::ClusterRole::Fe,
+            cfg,
+            None,
+            |_, _| Ok(()),
+        )
+        .expect("fe with multiple reachable backends should enter coordinator path");
+        drop(l1);
+        drop(l2);
+    }
+
+    /// D2: if one backend in a multi-backend list is unreachable, dispatch errors
+    /// with a message that names the dead backend port.
+    #[test]
+    fn dispatch_fe_one_unreachable_backend_fails_with_addr_in_message() {
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live listener");
+        let live_addr = live.local_addr().expect("live addr");
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead listener");
+        let dead_port = dead.local_addr().expect("dead addr").port();
+        drop(dead);
+        let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.backends = vec![live_addr.to_string(), format!("127.0.0.1:{dead_port}")];
         let err = dispatch_standalone_role(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| unreachable!("must not reach run_all_in_one with multiple backends"),
+            |_, _| unreachable!("must not reach run_all_in_one with a dead backend"),
         )
-        .expect_err("fe with multiple backends must error");
+        .expect_err("fe with an unreachable backend must error");
         let msg = err.to_string();
         assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
-        assert!(msg.contains('2'), "must include backend count: {msg}");
+        assert!(
+            msg.contains(&dead_port.to_string()),
+            "must name the failing backend port: {msg}"
+        );
+        drop(live);
+    }
+
+    #[test]
+    fn test_fe_startup_dials_all_backends() {
+        // Keep the first backend live so probe_all_backends must successfully dial
+        // it, then fail on the second (dead) one. This proves the probe walks past
+        // a reachable backend rather than short-circuiting on the first entry.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let backends = vec![
+            format!("127.0.0.1:{live_port}"),
+            format!("127.0.0.1:{dead_port}"),
+        ];
+        let err = probe_all_backends(&backends).expect_err("second backend down should fail");
+        assert!(
+            err.contains("backend 1") && err.contains(&dead_port.to_string()),
+            "error must name backend index 1 and the dead port: {err}"
+        );
+        drop(live);
+    }
+
+    #[test]
+    fn test_fe_startup_reports_first_unreachable_backend() {
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let backends = vec![
+            format!("127.0.0.1:{}", live_port),
+            format!("127.0.0.1:{}", dead_port),
+        ];
+        let err = probe_all_backends(&backends).expect_err("one down should fail");
+        assert!(
+            err.contains(&dead_port.to_string()),
+            "error must name the failing backend: {err}"
+        );
+        drop(live);
     }
 
     #[test]
@@ -1159,7 +1235,7 @@ backends = ["{backend_addr}"]
     #[test]
     fn test_config_file_fe_zero_backends_fails_validation_before_dispatch() {
         // Config declares role=fe with zero backends — invalid. Startup must fail
-        // with the D1 v1 validation message before any dispatch happens.
+        // before any dispatch happens.
         let toml = r#"
 [cluster]
 role = "fe"
@@ -1177,8 +1253,7 @@ backends = []
             Ok(_) => panic!("fe with zero backends must fail validation"),
         };
         assert!(
-            err.to_string()
-                .contains("D1 v1 only supports exactly one backend"),
+            err.to_string().contains("backends"),
             "unexpected error: {err}"
         );
     }

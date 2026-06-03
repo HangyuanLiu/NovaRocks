@@ -1262,6 +1262,7 @@ pub(crate) fn execute_merge_statement(
         &target,
         stmt,
         current_catalog,
+        &target_columns,
         insert_columns_resolved.as_deref(),
     )?;
 
@@ -1543,6 +1544,7 @@ fn materialize_merge_match(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
 ) -> Result<MergeMatchRows, String> {
     let target_alias = stmt
@@ -1614,6 +1616,7 @@ fn materialize_merge_match(
         &on_sql,
         matched_predicate_sql.as_deref(),
         not_matched_predicate_sql.as_deref(),
+        target_columns,
         &matched_assignments_sql_borrow,
         &insert_values_sql_borrow,
     );
@@ -1660,36 +1663,48 @@ fn build_merge_match_query_sql(
     on_sql: &str,
     matched_predicate_sql: Option<&str>,
     not_matched_predicate_sql: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
     matched_assignments_sql: &[(&str, &str)],
     insert_values_sql: &[(&str, &str)],
 ) -> String {
+    let quote_ident = |ident: &str| format!("`{}`", ident.replace('`', "``"));
     let qualify = |column: &str| {
         if target_alias.is_empty() {
-            column.to_string()
+            quote_ident(column)
         } else {
-            format!("{target_alias}.{column}")
+            format!("{target_alias}.{}", quote_ident(column))
         }
     };
-    let star = if target_alias.is_empty() {
-        "*".to_string()
-    } else {
-        format!("{target_alias}.*")
+    let nullable_target_column = |column: &str| {
+        let row_id = qualify("_row_id");
+        let value = qualify(column);
+        format!("CASE WHEN {row_id} IS NOT NULL THEN {value} ELSE NULL END")
     };
+    let target_select_items = target_columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} AS {}",
+                nullable_target_column(&column.name),
+                quote_ident(&column.name)
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mut select_items = vec![
-        format!("{} AS __nr_file", qualify("_file")),
-        format!("{} AS __nr_pos", qualify("_pos")),
-        format!("{} AS __nr_row_id", qualify("_row_id")),
+        format!("{} AS __nr_file", nullable_target_column("_file")),
+        format!("{} AS __nr_pos", nullable_target_column("_pos")),
+        format!("{} AS __nr_row_id", nullable_target_column("_row_id")),
         format!(
             "{} AS __nr_last_updated_sequence_number",
-            qualify("_last_updated_sequence_number")
+            nullable_target_column("_last_updated_sequence_number")
         ),
-        star,
         format!(
             "(CASE WHEN {} IS NOT NULL THEN 'matched' ELSE 'unmatched' END) AS __nr_match_kind",
             qualify("_row_id")
         ),
     ];
+    select_items.extend(target_select_items);
     select_items.push(format!(
         "(CASE WHEN ({}) THEN TRUE ELSE FALSE END) AS __nr_matched_apply",
         matched_predicate_sql.unwrap_or("TRUE")
@@ -1898,5 +1913,28 @@ mod tests {
         assert!(sql.contains("t._row_id AS __nr_row_id"), "{sql}");
         assert!(sql.contains("s.v AS __nr_new_v"), "{sql}");
         assert!(sql.contains("WHERE t.id = s.id"), "{sql}");
+    }
+
+    #[test]
+    fn merge_match_query_projects_nullable_target_columns() {
+        let sql = build_merge_match_query_sql(
+            "ice.db1.t AS t",
+            "t",
+            "staging.s AS s",
+            "t.id = s.id",
+            None,
+            None,
+            &[col("id"), col("v")],
+            &[("v", "s.v")],
+            &[("id", "s.id"), ("v", "s.v")],
+        );
+
+        assert!(!sql.contains("t.*"), "{sql}");
+        assert!(
+            sql.contains("CASE WHEN t.`_row_id` IS NOT NULL THEN t.`id` ELSE NULL END AS `id`"),
+            "{sql}"
+        );
+        assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
+        assert!(sql.contains("(s.id) AS __nr_ins_id"), "{sql}");
     }
 }

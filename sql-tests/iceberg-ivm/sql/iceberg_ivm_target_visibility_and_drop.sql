@@ -56,7 +56,7 @@ SELECT COUNT(*) FROM target_mv;
 DROP MATERIALIZED VIEW target_mv;
 
 -- query 6
--- @expect_error=unknown table
+-- @expect_error=no metadata files
 SELECT COUNT(*) FROM target_mv;
 
 -- query 7
