@@ -337,8 +337,8 @@ pub(crate) fn to_sink_commit_info(
     let data_file = crate::types::TIcebergDataFile {
         path: Some(df.file_path().to_string()),
         format: Some(format),
-        record_count: Some(df.record_count() as i64),
-        file_size_in_bytes: Some(df.file_size_in_bytes() as i64),
+        record_count: Some(u64_to_i64_saturating(df.record_count())),
+        file_size_in_bytes: Some(u64_to_i64_saturating(df.file_size_in_bytes())),
         partition_path: Some(partition_path),
         split_offsets: df.split_offsets().map(|offsets| offsets.to_vec()),
         column_stats: iceberg_data_file_to_column_stats(df),
@@ -392,21 +392,28 @@ fn iceberg_data_file_to_column_stats(df: &DataFile) -> Option<crate::types::TIce
     })
 }
 
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 fn u64_stats_to_i64(stats: &HashMap<i32, u64>) -> BTreeMap<i32, i64> {
     stats
         .iter()
-        .map(|(field_id, value)| (*field_id, *value as i64))
+        .map(|(field_id, value)| (*field_id, u64_to_i64_saturating(*value)))
         .collect()
 }
 
 fn datum_bounds_to_bytes(bounds: &HashMap<i32, iceberg::spec::Datum>) -> BTreeMap<i32, Vec<u8>> {
     bounds
         .iter()
-        .filter_map(|(field_id, datum)| {
-            datum
-                .to_bytes()
-                .ok()
-                .map(|bytes| (*field_id, bytes.to_vec()))
+        .map(|(field_id, datum)| {
+            (
+                *field_id,
+                datum
+                    .to_bytes()
+                    .expect("convert iceberg datum bound to bytes")
+                    .to_vec(),
+            )
         })
         .collect()
 }
@@ -1127,7 +1134,8 @@ mod tests {
             .expect("write");
         let s = &staged[0];
         let expected_path = s.data_file.file_path().to_string();
-        let expected_count = s.data_file.record_count() as i64;
+        let expected_count = u64_to_i64_saturating(s.data_file.record_count());
+        let expected_size = u64_to_i64_saturating(s.data_file.file_size_in_bytes());
         let (commit, sketch_set) = to_sink_commit_info(
             s,
             String::new(),
@@ -1137,13 +1145,75 @@ mod tests {
         );
         let df = commit.iceberg_data_file.expect("iceberg data file");
         assert_eq!(df.path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(df.format.as_deref(), Some("parquet"));
         assert_eq!(df.record_count, Some(expected_count));
+        assert_eq!(df.file_size_in_bytes, Some(expected_size));
         assert_eq!(df.partition_path.as_deref(), Some(""));
-        assert!(df.file_size_in_bytes.unwrap() > 0);
-        assert!(
-            df.column_stats.is_some(),
-            "column stats mapped from DataFile"
+        assert_eq!(
+            df.split_offsets,
+            s.data_file.split_offsets().map(|offsets| offsets.to_vec())
         );
+        assert_eq!(
+            df.file_content,
+            Some(crate::types::TIcebergFileContent::DATA)
+        );
+        assert_eq!(
+            df.referenced_data_file,
+            s.data_file
+                .referenced_data_file()
+                .map(|path| path.to_string())
+        );
+        let column_stats = df.column_stats.expect("column stats");
+        if !s.data_file.column_sizes().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.column_sizes());
+            assert_eq!(column_stats.column_sizes.as_ref(), Some(&expected));
+        }
+        if !s.data_file.value_counts().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.value_counts());
+            assert_eq!(column_stats.value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.null_value_counts().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.null_value_counts());
+            assert_eq!(column_stats.null_value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.nan_value_counts().is_empty() {
+            let expected = u64_stats_to_i64(s.data_file.nan_value_counts());
+            assert_eq!(column_stats.nan_value_counts.as_ref(), Some(&expected));
+        }
+        if !s.data_file.lower_bounds().is_empty() {
+            let expected = s
+                .data_file
+                .lower_bounds()
+                .iter()
+                .map(|(field_id, datum)| {
+                    (
+                        *field_id,
+                        datum
+                            .to_bytes()
+                            .expect("convert iceberg datum bound to bytes")
+                            .to_vec(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(column_stats.lower_bounds.as_ref(), Some(&expected));
+        }
+        if !s.data_file.upper_bounds().is_empty() {
+            let expected = s
+                .data_file
+                .upper_bounds()
+                .iter()
+                .map(|(field_id, datum)| {
+                    (
+                        *field_id,
+                        datum
+                            .to_bytes()
+                            .expect("convert iceberg datum bound to bytes")
+                            .to_vec(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(column_stats.upper_bounds.as_ref(), Some(&expected));
+        }
         let sketch_set = sketch_set.expect("sketch set");
         assert_eq!(sketch_set.file_path, expected_path);
         assert!(sketch_set.sketches.contains_key(&1));
