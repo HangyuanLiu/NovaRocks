@@ -10,7 +10,7 @@ use arrow::datatypes::DataType;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Confidence {
     #[default]
-    Fallback,  // relied on a heuristic/default (name-based rows, default selectivity/NDV)
+    Fallback, // relied on a heuristic/default (name-based rows, default selectivity/NDV)
     Estimated, // derived via formula from at-least-partially-real inputs
     Exact,     // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
 }
@@ -28,19 +28,24 @@ impl Confidence {
         if used_default {
             return Confidence::Fallback;
         }
-        let least = inputs.iter().copied().min().unwrap_or(Confidence::Estimated);
+        let least = inputs
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(Confidence::Estimated);
         least.min(Confidence::Estimated)
     }
 }
 
 /// Per-column statistics derived from Iceberg file metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ColumnStatistic {
     pub min_value: f64,
     pub max_value: f64,
     pub nulls_fraction: f64,
     pub average_row_size: f64,
     pub distinct_values_count: f64,
+    pub confidence: Confidence,
 }
 
 impl ColumnStatistic {
@@ -51,14 +56,16 @@ impl ColumnStatistic {
             nulls_fraction: 0.0,
             average_row_size: 8.0,
             distinct_values_count: 1.0,
+            confidence: Confidence::Fallback,
         }
     }
 }
 
 /// Operator-level statistics propagated through the plan tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Statistics {
     pub output_row_count: f64,
+    pub row_count_confidence: Confidence,
     pub column_statistics: HashMap<String, ColumnStatistic>,
 }
 
@@ -256,6 +263,19 @@ pub fn build_table_statistics_with_ndv(
         let min_value = col_min.get(col_name).copied().unwrap_or(f64::NEG_INFINITY);
         let max_value = col_max.get(col_name).copied().unwrap_or(f64::INFINITY);
         let value_count = col_value_total.get(col_name).copied();
+        let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
+        let key = col_name.to_lowercase();
+        let (distinct_values_count, confidence) = if let Some(&ndv) = ndv_by_name.get(&key) {
+            (ndv.min(non_null).max(1.0), Confidence::Exact)
+        } else {
+            match value_count {
+                Some(vc) if vc > 0 => ((vc as f64).min(non_null).max(1.0), Confidence::Estimated),
+                _ => (
+                    (non_null.sqrt() * 10.0).min(non_null).max(1.0),
+                    Confidence::Fallback,
+                ),
+            }
+        };
         column_stats.insert(
             col_name.clone(),
             ColumnStatistic {
@@ -273,18 +293,8 @@ pub fn build_table_statistics_with_ndv(
                 //   3. sqrt(non_null) * 10 heuristic.
                 // value_count is total rows including nulls, so cap by
                 // non_null rows.
-                distinct_values_count: {
-                    let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
-                    let key = col_name.to_lowercase();
-                    if let Some(&ndv) = ndv_by_name.get(&key) {
-                        ndv.min(non_null).max(1.0)
-                    } else {
-                        match value_count {
-                            Some(vc) if vc > 0 => (vc as f64).min(non_null).max(1.0),
-                            _ => (non_null.sqrt() * 10.0).min(non_null).max(1.0),
-                        }
-                    }
-                },
+                distinct_values_count,
+                confidence,
             },
         );
     }
@@ -444,6 +454,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: 50.0,
+                ..Default::default()
             },
         );
         col_stats.insert(
@@ -454,11 +465,13 @@ mod tests {
                 nulls_fraction: 0.1,
                 average_row_size: 8.0,
                 distinct_values_count: 200.0,
+                ..Default::default()
             },
         );
         let stats = Statistics {
             output_row_count: 1000.0,
             column_statistics: col_stats,
+            ..Default::default()
         };
         assert!((stats.compute_size() - 12000.0).abs() < f64::EPSILON);
     }
@@ -468,6 +481,7 @@ mod tests {
         let stats = Statistics {
             output_row_count: 100.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert!((stats.avg_row_size() - 8.0).abs() < f64::EPSILON);
     }
@@ -477,6 +491,18 @@ mod tests {
         let cs = ColumnStatistic::unknown();
         assert!(cs.min_value.is_infinite());
         assert_eq!(cs.distinct_values_count, 1.0);
+    }
+
+    #[test]
+    fn statistics_default_confidence_fields() {
+        let unknown = ColumnStatistic::unknown();
+        assert_eq!(unknown.confidence, Confidence::Fallback);
+
+        let column_default = ColumnStatistic::default();
+        assert_eq!(column_default.confidence, Confidence::Fallback);
+
+        let stats_default = Statistics::default();
+        assert_eq!(stats_default.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
@@ -610,6 +636,7 @@ mod tests {
         assert!((col.max_value - 100.0).abs() < f64::EPSILON);
         // value_count=60 should drive NDV
         assert!((col.distinct_values_count - 60.0).abs() < f64::EPSILON);
+        assert_eq!(col.confidence, Confidence::Estimated);
     }
 
     #[test]
@@ -684,6 +711,7 @@ mod tests {
         let col = ts.column_stats.get("x").expect("col stats present");
         // No value_count → fallback heuristic = sqrt(10000)*10 = 1000.0
         assert!((col.distinct_values_count - 1000.0).abs() < 1.0);
+        assert_eq!(col.confidence, Confidence::Fallback);
     }
 
     #[test]
@@ -730,6 +758,7 @@ mod tests {
         // Puffin NDV (1234) wins over manifest value_count (8000) and the
         // heuristic (sqrt(10000)*10 = 1000).
         assert!((col.distinct_values_count - 1234.0).abs() < f64::EPSILON);
+        assert_eq!(col.confidence, Confidence::Exact);
     }
 
     #[test]

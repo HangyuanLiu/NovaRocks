@@ -1805,6 +1805,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: ndv,
+                confidence: Confidence::Exact,
             },
         );
         (

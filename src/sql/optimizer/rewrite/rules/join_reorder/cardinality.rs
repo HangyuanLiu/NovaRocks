@@ -38,6 +38,7 @@ pub(crate) fn estimate_statistics(
             let repeat_times = r.repeat_column_ref_list.len() as f64;
             Statistics {
                 output_row_count: input.output_row_count * repeat_times,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: input.column_statistics,
             }
         }
@@ -45,10 +46,12 @@ pub(crate) fn estimate_statistics(
         LogicalPlan::CTEProduce(node) => estimate_statistics(&node.input, table_stats),
         LogicalPlan::Values(v) => Statistics {
             output_row_count: v.rows.len() as f64,
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::GenerateSeries(g) => Statistics {
             output_row_count: generate_series_row_count_f64(g.start, g.end, g.step),
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::TableFunction(t) => {
@@ -60,11 +63,13 @@ pub(crate) fn estimate_statistics(
                 } else {
                     estimated_rows.max(1.0)
                 },
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
         LogicalPlan::CTEConsume(_) => Statistics {
             output_row_count: 1000.0,
+            row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::Decode(d) => estimate_statistics(&d.input, table_stats),
@@ -74,6 +79,7 @@ pub(crate) fn estimate_statistics(
             Statistics {
                 output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
                     .max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -117,6 +123,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
 
         Statistics {
             output_row_count: output_rows,
+            row_count_confidence: Confidence::Estimated,
             column_statistics,
         }
     } else {
@@ -128,6 +135,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
             .collect();
         Statistics {
             output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
             column_statistics,
         }
     }
@@ -142,6 +150,7 @@ fn estimate_filter(
     let output_rows = (input_stats.output_row_count * selectivity).max(1.0);
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence: Confidence::Estimated,
         column_statistics: input_stats.column_statistics,
     }
 }
@@ -166,6 +175,7 @@ fn estimate_project(
         .collect();
     Statistics {
         output_row_count: input_stats.output_row_count,
+        row_count_confidence: Confidence::Estimated,
         column_statistics: projected,
     }
 }
@@ -180,6 +190,7 @@ fn estimate_aggregate(
         // Scalar aggregation: exactly one output row.
         return Statistics {
             output_row_count: 1.0,
+            row_count_confidence: Confidence::Estimated,
             column_statistics: HashMap::new(),
         };
     }
@@ -196,6 +207,7 @@ fn estimate_aggregate(
 
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence: Confidence::Estimated,
         column_statistics: HashMap::new(),
     }
 }
@@ -289,6 +301,7 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
 
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence: Confidence::Estimated,
         column_statistics,
     }
 }
@@ -302,6 +315,7 @@ fn estimate_limit(limit: &LimitNode, table_stats: &HashMap<String, TableStatisti
     };
     Statistics {
         output_row_count: output_rows.max(0.0),
+        row_count_confidence: Confidence::Estimated,
         column_statistics: input_stats.column_statistics,
     }
 }
@@ -321,6 +335,7 @@ fn estimate_union(union: &UnionNode, table_stats: &HashMap<String, TableStatisti
     }
     Statistics {
         output_row_count: total_rows.max(1.0),
+        row_count_confidence: Confidence::Estimated,
         column_statistics,
     }
 }
@@ -340,6 +355,7 @@ fn estimate_intersect(
     }
     Statistics {
         output_row_count: (min_rows * 0.5).max(1.0),
+        row_count_confidence: Confidence::Estimated,
         column_statistics,
     }
 }
@@ -352,11 +368,13 @@ fn estimate_except(
         let s = estimate_statistics(first, table_stats);
         Statistics {
             output_row_count: (s.output_row_count * 0.5).max(1.0),
+            row_count_confidence: Confidence::Estimated,
             column_statistics: s.column_statistics,
         }
     } else {
         Statistics {
             output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
         }
     }
@@ -455,6 +473,7 @@ mod tests {
                     nulls_fraction: 0.01,
                     average_row_size: 8.0,
                     distinct_values_count: ndv,
+                    confidence: Confidence::Exact,
                 },
             );
         }
@@ -630,6 +649,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 100.0,
+                    ..Default::default()
                 },
             ),
             (
@@ -640,6 +660,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 50.0,
+                    ..Default::default()
                 },
             ),
         ]
@@ -665,6 +686,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: 4.0,
+                ..Default::default()
             },
         )]
         .into_iter()
@@ -689,6 +711,7 @@ mod tests {
                 nulls_fraction: 0.05,
                 average_row_size: 4.0,
                 distinct_values_count: 100.0,
+                ..Default::default()
             },
         )]
         .into_iter()

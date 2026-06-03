@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use super::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
 use super::property::ColumnIdSet;
-use super::statistics::ColumnStatistic;
+use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use arrow::datatypes::DataType;
@@ -15,16 +15,25 @@ pub(crate) fn derive_for_group(
     group_idx: GroupId,
     output_columns: Vec<OutputColumn>,
     row_count: f64,
+    row_count_confidence: Confidence,
     column_statistics: HashMap<String, ColumnStatistic>,
 ) -> LogicalProperties {
     let group = &memo.groups[group_idx];
     let expr = group.logical_exprs.first().or(group.physical_exprs.first());
     let Some(expr) = expr else {
         let mut props = LogicalProperties::new(output_columns, row_count);
+        props.row_count_confidence = row_count_confidence;
         props.column_statistics = column_statistics;
         return props;
     };
-    derive_for_expr(expr, memo, output_columns, row_count, column_statistics)
+    derive_for_expr(
+        expr,
+        memo,
+        output_columns,
+        row_count,
+        row_count_confidence,
+        column_statistics,
+    )
 }
 
 pub(crate) fn derive_for_expr(
@@ -32,10 +41,12 @@ pub(crate) fn derive_for_expr(
     memo: &Memo,
     output_columns: Vec<OutputColumn>,
     row_count: f64,
+    row_count_confidence: Confidence,
     column_statistics: HashMap<String, ColumnStatistic>,
 ) -> LogicalProperties {
     let output_ids = output_id_set(&output_columns);
     let mut props = LogicalProperties::new(output_columns, row_count);
+    props.row_count_confidence = row_count_confidence;
     props.column_statistics = column_statistics;
 
     match &expr.op {
@@ -404,6 +415,7 @@ mod tests {
             filter,
             vec![output(1, "a"), output(2, "b")],
             50.0,
+            Confidence::Estimated,
             std::collections::HashMap::new(),
         );
         let class = props
@@ -437,6 +449,7 @@ mod tests {
             join,
             vec![output(1, "lk"), output(2, "rk")],
             10.0,
+            Confidence::Estimated,
             std::collections::HashMap::new(),
         );
         let class = props
@@ -470,6 +483,7 @@ mod tests {
             join,
             vec![output(1, "lk"), output(2, "rk")],
             10.0,
+            Confidence::Estimated,
             std::collections::HashMap::new(),
         );
         assert!(

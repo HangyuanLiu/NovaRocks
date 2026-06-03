@@ -30,6 +30,7 @@ mod rf_field_tests {
             stats: Statistics {
                 output_row_count: 1.0,
                 column_statistics: Default::default(),
+                ..Default::default()
             },
             output_columns: vec![],
             build_runtime_filters: vec![],

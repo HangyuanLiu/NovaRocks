@@ -33,10 +33,12 @@ pub(crate) fn derive_statistics(
         Operator::LogicalScan(scan) => derive_scan(scan, table_stats),
         Operator::LogicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         Operator::LogicalGenerateSeries(gs) => Statistics {
             output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         Operator::LogicalTableFunction(tf) => {
@@ -48,12 +50,14 @@ pub(crate) fn derive_statistics(
                 if let Some(ref props) = memo.groups[produce_group_id].logical_props {
                     Statistics {
                         output_row_count: props.row_count,
+                        row_count_confidence: Confidence::Estimated,
                         column_statistics: HashMap::new(),
                     }
                 } else {
                     // CTEProduce group not yet derived (should not happen in bottom-up order).
                     Statistics {
                         output_row_count: 10_000.0,
+                        row_count_confidence: Confidence::Fallback,
                         column_statistics: HashMap::new(),
                     }
                 }
@@ -61,6 +65,7 @@ pub(crate) fn derive_statistics(
                 // No mapping found; conservative fallback.
                 Statistics {
                     output_row_count: 10_000.0,
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics: HashMap::new(),
                 }
             }
@@ -75,6 +80,7 @@ pub(crate) fn derive_statistics(
             let output_rows = (child_stats.output_row_count * selectivity).max(1.0);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -95,6 +101,7 @@ pub(crate) fn derive_statistics(
                 .collect();
             Statistics {
                 output_row_count: child_stats.output_row_count,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: projected,
             }
         }
@@ -104,6 +111,7 @@ pub(crate) fn derive_statistics(
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
+                    row_count_confidence: Confidence::Estimated,
                     column_statistics: HashMap::new(),
                 };
             }
@@ -116,6 +124,7 @@ pub(crate) fn derive_statistics(
             let output_rows = ndv_product.min(capped).max(1.0);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -135,6 +144,7 @@ pub(crate) fn derive_statistics(
             };
             Statistics {
                 output_row_count: limit_rows.max(0.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -148,6 +158,7 @@ pub(crate) fn derive_statistics(
             };
             Statistics {
                 output_row_count: output_rows.max(0.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -162,6 +173,7 @@ pub(crate) fn derive_statistics(
             let repeat_times = repeat.repeat_column_ref_list.len() as f64;
             Statistics {
                 output_row_count: child_stats.output_row_count * repeat_times,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -182,6 +194,7 @@ pub(crate) fn derive_statistics(
             Statistics {
                 output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
                     .max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -208,6 +221,7 @@ pub(crate) fn derive_statistics(
             }
             Statistics {
                 output_row_count: total_rows.max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -224,6 +238,7 @@ pub(crate) fn derive_statistics(
             }
             Statistics {
                 output_row_count: (min_rows * 0.5).max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -233,11 +248,13 @@ pub(crate) fn derive_statistics(
                 let s = child_statistics(memo, &expr.children, 0);
                 Statistics {
                     output_row_count: (s.output_row_count * 0.5).max(1.0),
+                    row_count_confidence: Confidence::Estimated,
                     column_statistics: s.column_statistics,
                 }
             } else {
                 Statistics {
                     output_row_count: 1.0,
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics: HashMap::new(),
                 }
             }
@@ -273,6 +290,7 @@ pub(crate) fn derive_statistics(
                     .collect();
                 Statistics {
                     output_row_count: output_rows,
+                    row_count_confidence: Confidence::Estimated,
                     column_statistics,
                 }
             } else {
@@ -288,6 +306,7 @@ pub(crate) fn derive_statistics(
                 }
                 Statistics {
                     output_row_count: (default_rows * selectivity).max(1.0),
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics,
                 }
             }
@@ -300,6 +319,7 @@ pub(crate) fn derive_statistics(
             let output_rows = (child_stats.output_row_count * selectivity).max(1.0);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -320,6 +340,7 @@ pub(crate) fn derive_statistics(
                 .collect();
             Statistics {
                 output_row_count: child_stats.output_row_count,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: projected,
             }
         }
@@ -329,6 +350,7 @@ pub(crate) fn derive_statistics(
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
+                    row_count_confidence: Confidence::Estimated,
                     column_statistics: HashMap::new(),
                 };
             }
@@ -341,6 +363,7 @@ pub(crate) fn derive_statistics(
             let output_rows = ndv_product.min(capped).max(1.0);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -407,6 +430,7 @@ pub(crate) fn derive_statistics(
             column_statistics.extend(right_stats.column_statistics);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -462,6 +486,7 @@ pub(crate) fn derive_statistics(
             column_statistics.extend(right_stats.column_statistics);
             Statistics {
                 output_row_count: output_rows,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -478,6 +503,7 @@ pub(crate) fn derive_statistics(
             };
             Statistics {
                 output_row_count: limit_rows.max(0.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -491,6 +517,7 @@ pub(crate) fn derive_statistics(
             };
             Statistics {
                 output_row_count: output_rows.max(0.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -510,17 +537,20 @@ pub(crate) fn derive_statistics(
                 if let Some(ref props) = memo.groups[produce_group_id].logical_props {
                     Statistics {
                         output_row_count: props.row_count,
+                        row_count_confidence: Confidence::Estimated,
                         column_statistics: HashMap::new(),
                     }
                 } else {
                     Statistics {
                         output_row_count: 10_000.0,
+                        row_count_confidence: Confidence::Fallback,
                         column_statistics: HashMap::new(),
                     }
                 }
             } else {
                 Statistics {
                     output_row_count: 10_000.0,
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics: HashMap::new(),
                 }
             }
@@ -533,6 +563,7 @@ pub(crate) fn derive_statistics(
             let repeat_times = repeat.repeat_column_ref_list.len() as f64;
             Statistics {
                 output_row_count: child_stats.output_row_count * repeat_times,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: child_stats.column_statistics,
             }
         }
@@ -552,6 +583,7 @@ pub(crate) fn derive_statistics(
             }
             Statistics {
                 output_row_count: total_rows.max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -568,6 +600,7 @@ pub(crate) fn derive_statistics(
             }
             Statistics {
                 output_row_count: (min_rows * 0.5).max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics,
             }
         }
@@ -577,11 +610,13 @@ pub(crate) fn derive_statistics(
                 let s = child_statistics(memo, &expr.children, 0);
                 Statistics {
                     output_row_count: (s.output_row_count * 0.5).max(1.0),
+                    row_count_confidence: Confidence::Estimated,
                     column_statistics: s.column_statistics,
                 }
             } else {
                 Statistics {
                     output_row_count: 1.0,
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics: HashMap::new(),
                 }
             }
@@ -589,11 +624,13 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
 
         Operator::PhysicalGenerateSeries(gs) => Statistics {
             output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         Operator::PhysicalTableFunction(tf) => {
@@ -611,6 +648,7 @@ pub(crate) fn derive_statistics(
             Statistics {
                 output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
                     .max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -641,6 +679,7 @@ pub(crate) fn derive_group_statistics(
                 // Empty group: use defaults.
                 Statistics {
                     output_row_count: 1.0,
+                    row_count_confidence: Confidence::Fallback,
                     column_statistics: HashMap::new(),
                 }
             }
@@ -654,6 +693,7 @@ pub(crate) fn derive_group_statistics(
             group_idx,
             output_columns,
             stats.output_row_count,
+            stats.row_count_confidence,
             stats.column_statistics,
         ));
     }
@@ -675,12 +715,14 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
         // them so parent operators estimate real selectivity / join NDV.
         Statistics {
             output_row_count: props.row_count,
+            row_count_confidence: props.row_count_confidence,
             column_statistics: props.column_statistics.clone(),
         }
     } else {
         // Child not yet derived; use conservative default.
         Statistics {
             output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
         }
     }
@@ -695,6 +737,7 @@ fn derive_table_function_stats(is_left_join: bool, expr: &MExpr, memo: &Memo) ->
         } else {
             estimated_rows.max(1.0)
         },
+        row_count_confidence: Confidence::Estimated,
         column_statistics: HashMap::new(),
     }
 }
@@ -741,6 +784,7 @@ fn derive_scan(
 
         Statistics {
             output_row_count: output_rows,
+            row_count_confidence: Confidence::Estimated,
             column_statistics,
         }
     } else {
@@ -757,6 +801,7 @@ fn derive_scan(
         }
         Statistics {
             output_row_count: (default_rows * selectivity).max(1.0),
+            row_count_confidence: Confidence::Fallback,
             column_statistics,
         }
     }
@@ -939,6 +984,7 @@ fn derive_join(
 
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence: Confidence::Estimated,
         column_statistics,
     }
 }
@@ -1456,6 +1502,7 @@ mod tests {
                     nulls_fraction: 0.01,
                     average_row_size: 8.0,
                     distinct_values_count: ndv,
+                    confidence: Confidence::Exact,
                 },
             );
         }
@@ -1552,6 +1599,30 @@ mod tests {
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 25_000.0).abs() < 1.0);
+        assert_eq!(props.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn child_statistics_preserves_logical_props_row_count_confidence() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let mut memo = Memo::new();
+        let child = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![], 42.0);
+        props.row_count_confidence = Confidence::Fallback;
+        memo.groups[child].logical_props = Some(props);
+
+        let stats = child_statistics(&memo, &[child], 0);
+        assert_eq!(stats.output_row_count, 42.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
@@ -1622,6 +1693,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: 100.0,
+                ..Default::default()
             },
         );
         memo.groups[child_group].logical_props = Some(child_props);
@@ -1775,6 +1847,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: 1.0,
+                ..Default::default()
             },
         );
         let degenerate_expr = col_ref("degenerate_col");
@@ -1789,6 +1862,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: 50.0,
+                ..Default::default()
             },
         );
         let real_expr = col_ref("real_col");
@@ -2078,6 +2152,7 @@ mod tests {
             nulls_fraction: 0.0,
             average_row_size: 8.0,
             distinct_values_count: ndv,
+            ..Default::default()
         }
     }
 

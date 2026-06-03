@@ -245,6 +245,7 @@ fn stats_for_group(
     if let Some(ref lp) = group.logical_props {
         return crate::sql::optimizer::statistics::Statistics {
             output_row_count: lp.row_count,
+            row_count_confidence: lp.row_count_confidence,
             column_statistics: lp.column_statistics.clone(),
         };
     }
@@ -260,6 +261,7 @@ fn stats_for_group(
     // Empty group — should not happen in practice.
     crate::sql::optimizer::statistics::Statistics {
         output_row_count: 1.0,
+        row_count_confidence: crate::sql::optimizer::statistics::Confidence::Fallback,
         column_statistics: HashMap::new(),
     }
 }

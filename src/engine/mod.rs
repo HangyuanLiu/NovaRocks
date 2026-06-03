@@ -4107,6 +4107,7 @@ path = "{metadata_path}"
             Statistics {
                 output_row_count: 0.0,
                 column_statistics: Default::default(),
+                ..Default::default()
             }
         }
 

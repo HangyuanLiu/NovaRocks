@@ -1297,6 +1297,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 3.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1348,6 +1349,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 3.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1389,6 +1391,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 10.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1406,6 +1409,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 10.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1430,6 +1434,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 0.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1481,6 +1486,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 1.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1551,6 +1557,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 3.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: Vec::new(),
             build_runtime_filters: Vec::new(),
@@ -1572,6 +1579,7 @@ mod tests {
         let stats = Statistics {
             output_row_count: 0.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
     }
@@ -1581,6 +1589,7 @@ mod tests {
         let stats = Statistics {
             output_row_count: 123.7,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(format_stats_trailer(&stats), "stats={rows=124}");
     }
@@ -1590,6 +1599,7 @@ mod tests {
         let stats = Statistics {
             output_row_count: f64::NAN,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
     }
@@ -1599,6 +1609,7 @@ mod tests {
         let stats = Statistics {
             output_row_count: -1.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(format_stats_trailer(&stats), "stats={rows=?}");
     }
@@ -1642,6 +1653,7 @@ mod costs_level_tests {
         let empty = Statistics {
             output_row_count: 0.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(format_column_stats_costs(&empty), "");
 
@@ -1655,11 +1667,13 @@ mod costs_level_tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: 1000.0,
+                ..Default::default()
             },
         );
         let stats = Statistics {
             output_row_count: 10.0,
             column_statistics: cs,
+            ..Default::default()
         };
         let s = format_column_stats_costs(&stats);
         assert_eq!(s, "colstats={k1[min=0 max=1000 ndv=1000 null_frac=0]}");
@@ -1687,11 +1701,13 @@ mod costs_level_tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: f64::INFINITY,
+                ..Default::default()
             },
         );
         let stats = Statistics {
             output_row_count: 5.0,
             column_statistics: cs,
+            ..Default::default()
         };
         let s = format_column_stats_costs(&stats);
         assert!(

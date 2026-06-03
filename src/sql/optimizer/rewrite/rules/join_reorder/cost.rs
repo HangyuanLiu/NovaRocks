@@ -122,11 +122,13 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: avg_size,
                 distinct_values_count: rows,
+                ..Default::default()
             },
         );
         Statistics {
             output_row_count: rows,
             column_statistics: col_stats,
+            ..Default::default()
         }
     }
 
