@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::statistics::{ColumnStatistic, UNKNOWN_GROUP_BY_CORRELATION};
 
 use super::arith::sat_mul;
@@ -14,7 +14,7 @@ pub(crate) fn get_expr_ndv(
     // A column is only useful for cardinality if it carries a real NDV (> 1).
     // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
     // reports distinct_values_count = 1.0; treating that as a true NDV would make
-    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
     // fall back to the default NDV for unknown/degenerate columns.
     if let Some(name) = extract_column_name(expr)
@@ -24,35 +24,6 @@ pub(crate) fn get_expr_ndv(
         return cs.distinct_values_count;
     }
     10.0
-}
-
-/// For a join condition, extract the max NDV of join keys from both sides.
-pub(crate) fn get_join_key_ndv(
-    condition: &TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
-) -> f64 {
-    match &condition.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-        } => {
-            let left_ndv = get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
-            let right_ndv = get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
-            left_ndv.max(right_ndv).max(1.0)
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let l = get_join_key_ndv(left, left_stats, right_stats);
-            let r = get_join_key_ndv(right, left_stats, right_stats);
-            l.max(r)
-        }
-        _ => 1.0,
-    }
 }
 
 /// A column's NDV can never exceed the number of surviving rows.
@@ -128,7 +99,7 @@ mod tests {
     fn get_expr_ndv_ignores_unknown_ndv() {
         // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
         // for no-stats / managed-lake tables. get_expr_ndv must treat that as
-        // "no information" and return the 10.0 default, otherwise get_join_key_ndv
+        // "no information" and return the 10.0 default, otherwise join-key estimation
         // would divide left*right by ~1 and explode joins to near cross-products.
         let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
         column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());

@@ -49,13 +49,13 @@ pub fn estimate_join_cardinality(input: &JoinCardInput) -> (f64, Confidence) {
         }
         JoinKind::LeftSemi => {
             let (selectivity, used_default_or_invalid) =
-                semi_selectivity(input, &mut confidence_inputs);
+                semi_selectivity(input, right_rows, &mut confidence_inputs);
             let (rows, saturated) = bounded_side_rows(left_rows, selectivity);
             (rows, saturated, used_default_or_invalid)
         }
         JoinKind::RightSemi => {
             let (selectivity, used_default_or_invalid) =
-                semi_selectivity(input, &mut confidence_inputs);
+                semi_selectivity(input, left_rows, &mut confidence_inputs);
             let (rows, saturated) = bounded_side_rows(right_rows, selectivity);
             (rows, saturated, used_default_or_invalid)
         }
@@ -236,13 +236,41 @@ fn non_equi_selectivity(
     }
 }
 
-fn semi_selectivity(input: &JoinCardInput, confidence_inputs: &mut Vec<Confidence>) -> (f64, bool) {
+fn semi_selectivity(
+    input: &JoinCardInput,
+    matching_side_rows: f64,
+    confidence_inputs: &mut Vec<Confidence>,
+) -> (f64, bool) {
+    let mut selectivities = Vec::new();
+    let mut key_selectivities = Vec::with_capacity(input.eq_key_ndvs.len());
+    let mut used_default_or_invalid = false;
+
+    for &(left_ndv, right_ndv, confidence) in &input.eq_key_ndvs {
+        confidence_inputs.push(confidence);
+        let (denominator, invalid_ndv) = ndv_denominator(left_ndv, right_ndv);
+        used_default_or_invalid |= invalid_ndv;
+        key_selectivities.push(1.0 / denominator);
+    }
+
+    if !key_selectivities.is_empty() {
+        let key_selectivity = damped_conjunction(&key_selectivities);
+        let (match_probability, saturated) = sat_mul(matching_side_rows, key_selectivity);
+        used_default_or_invalid |= saturated;
+        selectivities.push(match_probability.clamp(0.0, 1.0));
+    }
+
     if let Some((selectivity, confidence)) = input.non_equi_selectivity {
         confidence_inputs.push(confidence);
-        clamp_selectivity(selectivity)
-    } else {
-        (SEMI_JOIN_SELECTIVITY, true)
+        let (selectivity, invalid_selectivity) = clamp_selectivity(selectivity);
+        used_default_or_invalid |= invalid_selectivity;
+        selectivities.push(selectivity);
     }
+
+    if selectivities.is_empty() {
+        return (SEMI_JOIN_SELECTIVITY, true);
+    }
+
+    (damped_conjunction(&selectivities), used_default_or_invalid)
 }
 
 fn bounded_side_rows(side_rows: f64, selectivity: f64) -> (f64, bool) {
@@ -359,6 +387,46 @@ mod tests {
         };
         let (_, anti_conf) = estimate_join_cardinality(&anti_input);
         assert_eq!(anti_conf, Confidence::Fallback);
+    }
+
+    #[test]
+    fn semi_join_uses_key_ndv_for_match_selectivity() {
+        let (left_rows, left_conf) = estimate_join_cardinality(&inp(
+            JoinKind::LeftSemi,
+            1000.0,
+            10.0,
+            vec![(1000.0, 1000.0)],
+        ));
+        assert_eq!(left_conf, Confidence::Estimated);
+        assert!((left_rows - 10.0).abs() < 1e-9, "got {left_rows}");
+
+        let (right_rows, right_conf) = estimate_join_cardinality(&inp(
+            JoinKind::RightSemi,
+            10.0,
+            1000.0,
+            vec![(1000.0, 1000.0)],
+        ));
+        assert_eq!(right_conf, Confidence::Estimated);
+        assert!((right_rows - 10.0).abs() < 1e-9, "got {right_rows}");
+    }
+
+    #[test]
+    fn multikey_semi_join_applies_matching_rows_once() {
+        let (rows, conf) = estimate_join_cardinality(&inp(
+            JoinKind::LeftSemi,
+            1000.0,
+            100.0,
+            vec![(1000.0, 1000.0), (1000.0, 1000.0)],
+        ));
+
+        let key_selectivity =
+            crate::sql::optimizer::estimate::arith::damped_conjunction(&[0.001, 0.001]);
+        let expected = 1000.0 * (100.0 * key_selectivity);
+        assert_eq!(conf, Confidence::Estimated);
+        assert!(
+            (rows - expected).abs() < 1e-9,
+            "got {rows}, expected {expected}"
+        );
     }
 
     #[test]

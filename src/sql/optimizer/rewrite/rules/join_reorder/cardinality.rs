@@ -10,7 +10,8 @@ use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
-use crate::sql::optimizer::estimate::ndv::agg_group_rows;
+use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
+use crate::sql::optimizer::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
 use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
@@ -114,7 +115,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
 
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| {
@@ -127,6 +128,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
                 (col_name, cs)
             })
             .collect();
+        cap_column_ndvs(&mut column_statistics, output_rows);
 
         Statistics {
             output_row_count: output_rows,
@@ -135,7 +137,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
         }
     } else {
         // No table stats available: use defaults.
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
@@ -147,6 +149,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
+        cap_column_ndvs(&mut column_statistics, output_rows);
         Statistics {
             output_row_count: output_rows,
             row_count_confidence,
@@ -161,11 +164,17 @@ fn estimate_filter(
 ) -> Statistics {
     let input_stats = estimate_statistics(&filter.input, table_stats);
     let selectivity = estimate_selectivity(&filter.predicate, &input_stats.column_statistics);
-    let output_rows = (input_stats.output_row_count * selectivity).max(1.0);
+    let (output_rows, row_count_confidence) = apply_filter(
+        input_stats.output_row_count,
+        input_stats.row_count_confidence,
+        selectivity,
+    );
+    let mut column_statistics = input_stats.column_statistics;
+    cap_column_ndvs(&mut column_statistics, output_rows);
     Statistics {
         output_row_count: output_rows,
-        row_count_confidence: Confidence::Estimated,
-        column_statistics: input_stats.column_statistics,
+        row_count_confidence,
+        column_statistics,
     }
 }
 
@@ -227,24 +236,11 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
     let left_stats = estimate_statistics(&join.left, table_stats);
     let right_stats = estimate_statistics(&join.right, table_stats);
 
-    let eq_key_ndvs = join
-        .condition
-        .as_ref()
-        .map(|cond| {
-            let ndv = get_join_key_ndv(
-                cond,
-                &left_stats.column_statistics,
-                &right_stats.column_statistics,
-            );
-            vec![(ndv, ndv, Confidence::Estimated)]
-        })
-        .unwrap_or_default();
-    let non_equi_selectivity = join.condition.as_ref().map(|cond| {
-        (
-            estimate_selectivity(cond, &left_stats.column_statistics),
-            Confidence::Estimated,
-        )
-    });
+    let join_condition = estimate_join_condition(
+        join.condition.as_ref(),
+        &left_stats.column_statistics,
+        &right_stats.column_statistics,
+    );
     let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
         left: (left_stats.output_row_count, left_stats.row_count_confidence),
         right: (
@@ -252,8 +248,8 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
             right_stats.row_count_confidence,
         ),
         kind: join.join_type,
-        eq_key_ndvs,
-        non_equi_selectivity,
+        eq_key_ndvs: join_condition.eq_key_ndvs,
+        non_equi_selectivity: join_condition.residual_selectivity,
     });
 
     // Merge column statistics from both sides.
@@ -379,13 +375,19 @@ fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
     }
 }
 
+fn cap_column_ndvs(column_statistics: &mut HashMap<String, ColumnStatistic>, output_rows: f64) {
+    for stat in column_statistics.values_mut() {
+        stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+    }
+}
+
 /// Get the NDV (number of distinct values) for an expression, looking up
 /// column stats if the expression is a simple column reference.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
     // Only treat a column as informative when it has a real NDV (> 1).
     // ColumnStatistic::unknown() (no-stats / managed-lake tables) reports
     // distinct_values_count = 1.0; using that as a true NDV would let
-    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products. Guard `> 1.0` (mirroring estimate_eq_selectivity) so
     // unknown/degenerate columns fall back to the default NDV below.
     if let Some(name) = extract_column_name(expr)
@@ -396,37 +398,6 @@ fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic
     }
     // Default NDV for unknown expressions.
     10.0
-}
-
-/// For a join condition, extract the max NDV of join keys from both sides.
-fn get_join_key_ndv(
-    condition: &TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
-) -> f64 {
-    // For a simple `left_col = right_col`, take max(ndv(left), ndv(right)).
-    match &condition.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-        } => {
-            let left_ndv = get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
-            let right_ndv = get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
-            left_ndv.max(right_ndv).max(1.0)
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            // AND of multiple join keys: take the max NDV across all.
-            let l = get_join_key_ndv(left, left_stats, right_stats);
-            let r = get_join_key_ndv(right, left_stats, right_stats);
-            l.max(r)
-        }
-        _ => 1.0, // Conservative default.
-    }
 }
 
 // ===========================================================================
@@ -661,6 +632,21 @@ mod tests {
     }
 
     #[test]
+    fn scan_with_table_stats_and_predicate_caps_ndv_at_output_rows() {
+        let (name, ts) = make_table_stats("orders", 1_000, &[("id", 1_000_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert_eq!(stats.output_row_count, 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(stats.column_statistics["id"].distinct_values_count, 1.0);
+    }
+
+    #[test]
     fn scan_without_stats_uses_default() {
         let plan = scan_plan("unknown", &["x"]);
         let stats = estimate_statistics(&plan, &HashMap::new());
@@ -818,9 +804,34 @@ mod tests {
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
-        // Pins shared-estimator behavior: the logical plan condition feeds both the
-        // equality key NDV and non-equi selectivity, so rows are reduced twice.
-        assert!((stats.output_row_count - 4.0).abs() < 1.0);
+        // Containment formula: 6M * 1.5M / max(1.5M, 1.5M) = 6M.
+        // The equality predicate must not be applied again as residual
+        // selectivity.
+        assert!((stats.output_row_count - 6_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn filter_floor_downgrades_confidence_and_caps_payload_ndv() {
+        let (name, ts) = make_table_stats("t", 1_000, &[("a", 1_000.0), ("b", 1_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("t", &["a", "b"]);
+        let pred = and_expr(
+            eq_expr(col_ref("a"), int_lit(42)),
+            eq_expr(col_ref("b"), int_lit(7)),
+        );
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: pred,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+        assert_eq!(stats.output_row_count, 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(stats.column_statistics["a"].distinct_values_count, 1.0);
+        assert_eq!(stats.column_statistics["b"].distinct_values_count, 1.0);
     }
 
     #[test]

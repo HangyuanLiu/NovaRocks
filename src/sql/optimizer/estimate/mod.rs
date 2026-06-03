@@ -5,5 +5,6 @@
 
 pub(crate) mod arith;
 pub(crate) mod cardinality;
+pub(crate) mod join_condition;
 pub(crate) mod ndv;
 pub(crate) mod selectivity;
