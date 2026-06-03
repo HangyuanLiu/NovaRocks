@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::exec::row_position::{
@@ -8,7 +9,8 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{
-    DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, SchemaRef, Type,
+    DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpecRef, PrimitiveType,
+    SchemaRef, Type,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -19,10 +21,99 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
+use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{transform_variant_columns_for_write, variant_field_indices};
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagedContent {
+    Data,
+    PositionDeletes,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StagedWriteOptions {
+    pub collect_theta_sketches: bool,
+    pub content: StagedContent,
+}
+
+impl Default for StagedWriteOptions {
+    fn default() -> Self {
+        Self {
+            collect_theta_sketches: false,
+            content: StagedContent::Data,
+        }
+    }
+}
+
+pub(crate) struct StagedDataFile {
+    pub data_file: DataFile,
+    pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
+}
+
+pub(crate) struct StagedWriteContext {
+    metadata: Arc<iceberg::spec::TableMetadata>,
+    file_io: iceberg::io::FileIO,
+    writer_schema: SchemaRef,
+    annotated_schema: arrow::datatypes::SchemaRef,
+    partition_spec_id: i32,
+}
+
+impl StagedWriteContext {
+    pub(crate) fn from_table(table: &iceberg::table::Table) -> Result<Self, String> {
+        let metadata = Arc::new(table.metadata().clone());
+        let writer_schema = metadata.current_schema().clone();
+        let annotated_schema = Arc::new(
+            schema_to_arrow_schema(&writer_schema)
+                .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
+        );
+        let partition_spec_id = metadata.default_partition_spec_id();
+        Ok(Self {
+            metadata,
+            file_io: table.file_io().clone(),
+            writer_schema,
+            annotated_schema,
+            partition_spec_id,
+        })
+    }
+
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.writer_schema
+    }
+
+    pub(crate) fn partition_spec(&self) -> &PartitionSpecRef {
+        self.metadata.default_partition_spec()
+    }
+
+    pub(crate) fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+
+    pub(crate) fn file_io(&self) -> &iceberg::io::FileIO {
+        &self.file_io
+    }
+
+    pub(crate) fn data_file_writer_builder(&self) -> Result<IcebergDataFileWriterBuilder, String> {
+        let location_generator = DefaultLocationGenerator::new(self.metadata.as_ref().clone())
+            .map_err(|e| format!("build iceberg location generator failed: {e}"))?;
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "novarocks".to_string(),
+            Some(unique_file_suffix()),
+            DataFileFormat::Parquet,
+        );
+        let parquet_builder =
+            ParquetWriterBuilder::new(WriterProperties::default(), self.writer_schema.clone());
+        let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            self.file_io.clone(),
+            location_generator,
+            file_name_generator,
+        );
+        Ok(DataFileWriterBuilder::new(rolling_builder))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RowLineageColumns {
@@ -663,6 +754,83 @@ mod tests {
             format!("{data_file:?}").contains("partition_spec_id: 7"),
             "retagged data file should carry the evolved default partition spec id"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_write_context_from_table_exposes_schema_and_spec() {
+        let table = build_unpartitioned_test_table("ctx_schema").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx from table");
+        assert_eq!(
+            ctx.schema().as_struct().fields().len(),
+            table.metadata().current_schema().as_struct().fields().len(),
+            "context schema must match table current schema"
+        );
+        assert_eq!(
+            ctx.partition_spec_id(),
+            table.metadata().default_partition_spec_id()
+        );
+    }
+
+    async fn build_unpartitioned_test_table(name: &str) -> iceberg::table::Table {
+        build_local_fs_test_table(name, false).await
+    }
+
+    async fn build_local_fs_test_table(name: &str, partitioned: bool) -> iceberg::table::Table {
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "novarocks-iceberg-data-writer-{safe_name}-{}",
+            unique_file_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create table dir");
+        let location = format!("file://{}", dir.display());
+
+        let schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = if partitioned {
+            iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
+                .expect("add partition field")
+                .build()
+                .expect("partition spec")
+        } else {
+            iceberg::spec::PartitionSpec::unpartition_spec()
+        };
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            location,
+            iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+
+        iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table")
     }
 
     #[test]
