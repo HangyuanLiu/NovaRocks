@@ -26,7 +26,8 @@ use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::helpers::{
-    agg_call_display_name, join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
+    agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
+    split_and_conjuncts_typed, typed_expr_display_name, typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
@@ -1759,18 +1760,24 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             });
 
+            let binding = ColumnBinding {
+                tuple_id: project_tuple_id,
+                slot_id,
+                data_type: data_type.clone(),
+                type_desc: Some(slot_type_desc.clone()),
+                nullable,
+            };
             project_scope.add_column_with_id(
                 item.output_column_id,
-                None,
+                op.output_qualifier.clone(),
                 name.clone(),
-                ColumnBinding {
-                    tuple_id: project_tuple_id,
-                    slot_id,
-                    data_type: data_type.clone(),
-                    type_desc: Some(slot_type_desc.clone()),
-                    nullable,
-                },
+                binding.clone(),
             );
+
+            let unqualified_display = typed_expr_display_name_without_qualifiers(&item.expr);
+            if !unqualified_display.eq_ignore_ascii_case(&name) {
+                project_scope.add_unqualified_alias(unqualified_display, binding.clone());
+            }
 
             // Also register with qualifier if the expression is a column ref.
             // Use add_qualified_alias to avoid pushing a duplicate entry into
@@ -1782,17 +1789,10 @@ impl<'a> PlanFragmentBuilder<'a> {
                 ..
             } = item.expr.kind
             {
-                project_scope.add_qualified_alias(
-                    q.clone(),
-                    column.clone(),
-                    ColumnBinding {
-                        tuple_id: project_tuple_id,
-                        slot_id,
-                        data_type,
-                        type_desc: Some(slot_type_desc),
-                        nullable,
-                    },
-                );
+                project_scope.add_qualified_alias(q.clone(), column.clone(), binding.clone());
+                if !column.eq_ignore_ascii_case(&name) {
+                    project_scope.add_qualified_alias(q.clone(), name.clone(), binding.clone());
+                }
             }
 
             // Propagate the dict registration on a ColumnRef passthrough:
@@ -2450,17 +2450,18 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
                 col_pos,
             );
-            agg_scope.add_column(
-                None,
-                name,
-                ColumnBinding {
-                    tuple_id: agg_tuple_id,
-                    slot_id,
-                    data_type,
-                    type_desc: Some(slot_type_desc),
-                    nullable,
-                },
-            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type,
+                type_desc: Some(slot_type_desc),
+                nullable,
+            };
+            agg_scope.add_column(None, name.clone(), binding.clone());
+            let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
+            if !unqualified_name.eq_ignore_ascii_case(&name) {
+                agg_scope.add_unqualified_alias(unqualified_name, binding);
+            }
             aggregate_functions.push(texpr);
         }
 

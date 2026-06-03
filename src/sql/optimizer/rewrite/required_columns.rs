@@ -354,6 +354,16 @@ fn tag_union(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Log
         unreachable!()
     };
 
+    if !node.all {
+        node.required_output_columns = parent_needed;
+        node.inputs = node
+            .inputs
+            .into_iter()
+            .map(|child| tag_required_columns(child, None))
+            .collect();
+        return LogicalPlan::Union(node);
+    }
+
     // Resolve which positions in the output schema are needed.
     let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
     let needed_positions: Vec<usize> = match &parent_needed {
@@ -386,28 +396,11 @@ fn tag_intersect(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
         unreachable!()
     };
 
-    let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
-    let needed_positions: Vec<usize> = match &parent_needed {
-        None => (0..outputs.len()).collect(),
-        Some(n) => outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| n.contains(id).then_some(i))
-            .collect(),
-    };
-
     node.required_output_columns = parent_needed;
     node.inputs = node
         .inputs
         .into_iter()
-        .map(|child| {
-            let child_outputs = collect_output_ids_ordered(&child);
-            let child_needed: HashSet<ColumnId> = needed_positions
-                .iter()
-                .filter_map(|&i| child_outputs.get(i).copied())
-                .collect();
-            tag_required_columns(child, Some(child_needed))
-        })
+        .map(|child| tag_required_columns(child, None))
         .collect();
     LogicalPlan::Intersect(node)
 }
@@ -417,28 +410,11 @@ fn tag_except(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
         unreachable!()
     };
 
-    let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
-    let needed_positions: Vec<usize> = match &parent_needed {
-        None => (0..outputs.len()).collect(),
-        Some(n) => outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, id)| n.contains(id).then_some(i))
-            .collect(),
-    };
-
     node.required_output_columns = parent_needed;
     node.inputs = node
         .inputs
         .into_iter()
-        .map(|child| {
-            let child_outputs = collect_output_ids_ordered(&child);
-            let child_needed: HashSet<ColumnId> = needed_positions
-                .iter()
-                .filter_map(|&i| child_outputs.get(i).copied())
-                .collect();
-            tag_required_columns(child, Some(child_needed))
-        })
+        .map(|child| tag_required_columns(child, None))
         .collect();
     LogicalPlan::Except(node)
 }
@@ -757,9 +733,9 @@ mod tests {
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, CTEAnchorNode, CTEConsumeNode, CTEProduceNode, FilterNode,
-        JoinNode, LimitNode, ProjectNode, ScanNode, SortNode, UnionNode, ValuesNode, WindowExpr,
-        WindowNode,
+        AggregateCall, AggregateNode, CTEAnchorNode, CTEConsumeNode, CTEProduceNode, ExceptNode,
+        FilterNode, IntersectNode, JoinNode, LimitNode, ProjectNode, ScanNode, SortNode, UnionNode,
+        ValuesNode, WindowExpr, WindowNode,
     };
     use arrow::datatypes::DataType;
 
@@ -903,6 +879,7 @@ mod tests {
                     expr: col_ref_expr(ColumnId::new_for_test(2)),
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let needed = needed_set(&[102]);
@@ -944,6 +921,7 @@ mod tests {
                     expr: col_ref_expr(ColumnId::new_for_test(2)),
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let tagged = tag_required_columns(project, None);
@@ -1203,6 +1181,90 @@ mod tests {
             b_req.contains(&ColumnId::new_for_test(5)),
             "position 1 = e@5"
         );
+    }
+
+    #[test]
+    fn tag_union_distinct_preserves_all_child_columns() {
+        let union = LogicalPlan::Union(UnionNode {
+            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            all: false,
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(1001), "x"),
+                make_output_column(ColumnId::new_for_test(1002), "y"),
+                make_output_column(ColumnId::new_for_test(1003), "z"),
+            ],
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(union, Some(needed_set(&[1002])));
+        let LogicalPlan::Union(u) = tagged else {
+            panic!()
+        };
+        let LogicalPlan::Scan(a) = &u.inputs[0] else {
+            panic!()
+        };
+        let LogicalPlan::Scan(b) = &u.inputs[1] else {
+            panic!()
+        };
+        let a_req = a.required_output_columns.as_ref().unwrap();
+        let b_req = b.required_output_columns.as_ref().unwrap();
+        assert_eq!(a_req.len(), 3);
+        assert_eq!(b_req.len(), 3);
+        for id in [1, 2, 3] {
+            assert!(a_req.contains(&ColumnId::new_for_test(id)));
+        }
+        for id in [4, 5, 6] {
+            assert!(b_req.contains(&ColumnId::new_for_test(id)));
+        }
+    }
+
+    #[test]
+    fn tag_intersect_preserves_all_child_columns() {
+        let intersect = LogicalPlan::Intersect(IntersectNode {
+            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(1001), "x"),
+                make_output_column(ColumnId::new_for_test(1002), "y"),
+                make_output_column(ColumnId::new_for_test(1003), "z"),
+            ],
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(intersect, Some(needed_set(&[1002])));
+        let LogicalPlan::Intersect(i) = tagged else {
+            panic!()
+        };
+        let LogicalPlan::Scan(a) = &i.inputs[0] else {
+            panic!()
+        };
+        let LogicalPlan::Scan(b) = &i.inputs[1] else {
+            panic!()
+        };
+        assert_eq!(a.required_output_columns.as_ref().unwrap().len(), 3);
+        assert_eq!(b.required_output_columns.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn tag_except_preserves_all_child_columns() {
+        let except = LogicalPlan::Except(ExceptNode {
+            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(1001), "x"),
+                make_output_column(ColumnId::new_for_test(1002), "y"),
+                make_output_column(ColumnId::new_for_test(1003), "z"),
+            ],
+            required_output_columns: None,
+        });
+        let tagged = tag_required_columns(except, Some(needed_set(&[1002])));
+        let LogicalPlan::Except(e) = tagged else {
+            panic!()
+        };
+        let LogicalPlan::Scan(a) = &e.inputs[0] else {
+            panic!()
+        };
+        let LogicalPlan::Scan(b) = &e.inputs[1] else {
+            panic!()
+        };
+        assert_eq!(a.required_output_columns.as_ref().unwrap().len(), 3);
+        assert_eq!(b.required_output_columns.as_ref().unwrap().len(), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -1805,6 +1867,7 @@ mod tests {
                 output_name: "a".to_string(),
                 expr: col_ref_expr(ColumnId::new_for_test(1)),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 

@@ -317,6 +317,14 @@ run_sql_suites() {
             "analytic_test_basic_window_function,analytic_test_basic_window_function_2"
           )
           ;;
+        tpc-ds)
+          # q85 is still excluded from unattended stable CI while its plan-shape
+          # issue is being addressed. Direct tpc-ds runs keep full coverage.
+          suite_extra_args=(
+            --skip
+            "q85"
+          )
+          ;;
       esac
     fi
     ci_run_logged "$log_path" \

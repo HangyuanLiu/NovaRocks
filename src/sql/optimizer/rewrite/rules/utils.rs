@@ -1023,6 +1023,7 @@ mod column_id_helper_tests {
         let plan = LogicalPlan::Project(ProjectNode {
             input: Box::new(scan),
             items: vec![passthrough_item, computed_item],
+            output_qualifier: None,
             required_output_columns: None,
         });
 
@@ -1061,6 +1062,7 @@ mod column_id_helper_tests {
         let plan = LogicalPlan::Project(ProjectNode {
             input: Box::new(scan),
             items: vec![real_item, unset_item],
+            output_qualifier: None,
             required_output_columns: None,
         });
 
@@ -1280,6 +1282,7 @@ mod column_id_helper_tests {
                 output_name: "k".to_string(),
                 output_column_id: ColumnId::new_for_test(output_id),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

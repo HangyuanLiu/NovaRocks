@@ -1,24 +1,13 @@
 //! PruneIntersectColumns — Phase 2 rule for Intersect nodes.
 //!
-//! Filters `IntersectNode.output_columns` to only those whose `column_id`
-//! is in `required_output_columns`. Keeps at least one column to preserve
-//! a valid output schema (Gap 4).
-//!
-//! Only the set-op node's own `output_columns` list is touched. Branch inputs
-//! are NOT modified here — the Phase-1 tagging pass has already tagged each
-//! branch with the position-restricted required set, and the branches' own
-//! prune rules handle their pruning independently. Because output and branch
-//! schemas align by position, dropping a position here stays consistent with
-//! the branches after the full rule set runs.
+//! INTERSECT is a DISTINCT set operation: every output position participates
+//! in row equality. Column pruning cannot remove set-key positions even when
+//! the parent only needs row existence (for example `COUNT(*)` over the set).
 
-use std::collections::HashSet;
-
-use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
 use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneIntersectColumns;
@@ -37,45 +26,11 @@ impl LogicalRewriteRule for PruneIntersectColumns {
     }
 
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Intersect(mut node) = plan else {
+        let LogicalPlan::Intersect(_) = plan else {
             unreachable!()
         };
 
-        // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
-            return Ok(RewriteResult::Unchanged);
-        };
-
-        let original_len = node.output_columns.len();
-
-        // Determine which ids to keep.
-        let filtered: HashSet<ColumnId> = node
-            .output_columns
-            .iter()
-            .map(|c| c.column_id)
-            .filter(|id| needed.contains(id))
-            .collect();
-
-        // Ensure at least one column survives.
-        let fallback = node
-            .output_columns
-            .first()
-            .map(|c| c.column_id)
-            .unwrap_or(ColumnId::UNSET);
-        let keep_ids = keep_at_least_one(filtered, fallback);
-
-        let new_output_columns: Vec<_> = node
-            .output_columns
-            .into_iter()
-            .filter(|c| keep_ids.contains(&c.column_id))
-            .collect();
-
-        if new_output_columns.len() == original_len {
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::Intersect(node)))
+        Ok(RewriteResult::Unchanged)
     }
 }
 
@@ -87,6 +42,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::planner::plan::{IntersectNode, ValuesNode};
     use arrow::datatypes::DataType;
+    use std::collections::HashSet;
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -111,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_intersect_filters_to_needed_subset() {
+    fn prune_intersect_preserves_all_set_key_columns() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
@@ -134,19 +90,10 @@ mod tests {
         let rule = PruneIntersectColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Intersect(pruned) = changed else {
-            panic!("expected Intersect");
-        };
-
-        assert_eq!(pruned.output_columns.len(), 2);
-        assert_eq!(pruned.output_columns[0].column_id, id_a);
-        assert_eq!(pruned.output_columns[1].column_id, id_c);
-        // inputs are untouched
-        assert_eq!(pruned.inputs.len(), 2);
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "INTERSECT must retain every output column because all positions are part of the set key"
+        );
     }
 
     #[test]
@@ -170,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_intersect_keeps_at_least_one_when_needed_empty() {
+    fn prune_intersect_keeps_all_columns_when_needed_empty() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
@@ -185,15 +132,9 @@ mod tests {
         let rule = PruneIntersectColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
-        let changed = match result {
-            RewriteResult::Changed(p) => p,
-            other => panic!("expected Changed, got {:?}", other),
-        };
-        let LogicalPlan::Intersect(pruned) = changed else {
-            panic!("expected Intersect");
-        };
-
-        assert_eq!(pruned.output_columns.len(), 1);
-        assert_eq!(pruned.output_columns[0].column_id, id_a, "first col kept");
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "INTERSECT cannot collapse the set key even when the parent only needs row existence"
+        );
     }
 }

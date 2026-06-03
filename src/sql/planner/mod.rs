@@ -272,6 +272,7 @@ fn apply_query_modifiers(
         body_plan = LogicalPlan::Project(ProjectNode {
             input: Box::new(body_plan),
             items,
+            output_qualifier: None,
             required_output_columns: None,
         });
     }
@@ -511,6 +512,7 @@ pub(crate) fn adapt_plan_output_with_qualifier(
         .iter()
         .zip(target_output_columns.iter())
         .all(|(source, target)| output_column_metadata_equal(source, target))
+        && output_qualifier.is_none()
     {
         return Ok(input);
     }
@@ -536,11 +538,7 @@ pub(crate) fn adapt_plan_output_with_qualifier(
             expr: TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: source.column_id,
-                    qualifier: if source.column_id == ColumnId::UNSET {
-                        None
-                    } else {
-                        output_qualifier.map(str::to_string)
-                    },
+                    qualifier: None,
                     column: source.name.clone(),
                 },
                 data_type: source.data_type.clone(),
@@ -554,6 +552,7 @@ pub(crate) fn adapt_plan_output_with_qualifier(
     Ok(LogicalPlan::Project(ProjectNode {
         input: Box::new(input),
         items,
+        output_qualifier: output_qualifier.map(str::to_string),
         required_output_columns: None,
     }))
 }
@@ -798,6 +797,7 @@ fn prepare_repeat_input(
     *current = LogicalPlan::Project(ProjectNode {
         input: Box::new(current.clone()),
         items: project_items,
+        output_qualifier: None,
         required_output_columns: None,
     });
 
@@ -1114,12 +1114,14 @@ fn build_window_and_project(
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(windowed),
             items: rewritten_items,
+            output_qualifier: None,
             required_output_columns: None,
         }))
     } else if !project_items.is_empty() {
         Ok(LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
             items: project_items,
+            output_qualifier: None,
             required_output_columns: None,
         }))
     } else {
@@ -1923,11 +1925,11 @@ fn plan_relation_scoped(
         }
         Relation::Subquery {
             query,
-            alias: _,
+            alias,
             output_columns,
         } => {
             let inner_plan = plan_scoped_query(*query, cte_registry, factory)?;
-            adapt_plan_output(inner_plan, &output_columns)
+            adapt_plan_output_with_qualifier(inner_plan, &output_columns, Some(&alias))
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
@@ -2630,6 +2632,7 @@ mod tests {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items[0].output_column_id, target_id);
+        assert_eq!(project.output_qualifier.as_deref(), Some("w1"));
         let ExprKind::ColumnRef {
             column_id,
             qualifier,
@@ -2639,8 +2642,50 @@ mod tests {
             panic!("expected adapter item to read child column");
         };
         assert_eq!(*column_id, source_id);
-        assert_eq!(qualifier.as_deref(), Some("w1"));
+        assert_eq!(qualifier.as_deref(), None);
         assert_eq!(column, "k1");
+    }
+
+    #[test]
+    fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
+        let source_id = ColumnId::new_for_test(10);
+        let input = LogicalPlan::Values(ValuesNode {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: source_id,
+                name: "rnk".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let target = vec![OutputColumn {
+            column_id: source_id,
+            name: "rnk".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }];
+
+        let adapted = adapt_plan_output_with_qualifier(input, &target, Some("asceding"))
+            .expect("adapter should insert alias project");
+        let LogicalPlan::Project(project) = adapted else {
+            panic!("expected Project adapter for qualified subquery output");
+        };
+        assert_eq!(project.items[0].output_name, "rnk");
+        assert_eq!(project.output_qualifier.as_deref(), Some("asceding"));
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &project.items[0].expr.kind
+        else {
+            panic!("expected adapter item to read child column");
+        };
+        assert_eq!(*column_id, source_id);
+        assert_eq!(qualifier.as_deref(), None);
+        assert_eq!(column, "rnk");
     }
 
     #[test]

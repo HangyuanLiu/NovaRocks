@@ -90,6 +90,7 @@ pub(crate) struct LogicalFilterOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalProjectOp {
     pub items: Vec<ProjectItem>,
+    pub output_qualifier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +303,7 @@ pub(crate) struct PhysicalFilterOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalProjectOp {
     pub items: Vec<ProjectItem>,
+    pub output_qualifier: Option<String>,
 }
 
 #[derive(Clone, Debug)]

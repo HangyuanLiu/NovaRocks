@@ -2,10 +2,10 @@
 //!
 //! Multiple strategies are available with adaptive algorithm selection:
 //!
-//! 1. **DP (<=12 tables)** — Exhaustive dynamic programming over all join
+//! 1. **DP (<=8 tables)** — Exhaustive dynamic programming over all join
 //!    orderings. Optimal but exponential in the number of relations.
 //!
-//! 2. **Greedy (<=16 tables)** — Level-by-level join building: at each level,
+//! 2. **Greedy (<=12 tables)** — Level-by-level join building: at each level,
 //!    tries all (prev_level_group, atom) pairs and keeps the best plan per
 //!    table subset. Polynomial time with good results.
 //!
@@ -297,11 +297,28 @@ struct JoinGraph {
     predicates: Vec<(TypedExpr, u32)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinReorderAlgorithm {
+    Dp,
+    Greedy,
+    LeftDeep,
+}
+
+fn select_join_reorder_algorithm(relation_count: usize) -> JoinReorderAlgorithm {
+    if relation_count <= 8 {
+        JoinReorderAlgorithm::Dp
+    } else if relation_count <= 12 {
+        JoinReorderAlgorithm::Greedy
+    } else {
+        JoinReorderAlgorithm::LeftDeep
+    }
+}
+
 /// CBO join reorder: walks the plan tree and applies join enumeration to
 /// chains of INNER JOINs using adaptive algorithm selection:
 ///
-/// - DP (<=12 tables): exhaustive enumeration
-/// - Greedy (<=20 tables): level-by-level best-pair construction
+/// - DP (<=8 tables): exhaustive enumeration
+/// - Greedy (<=12 tables): level-by-level best-pair construction
 /// - LeftDeep (any size): greedy left-deep tree construction
 /// - Heuristic fallback: simple size-based swap
 ///
@@ -331,23 +348,27 @@ pub(crate) fn reorder_joins_cbo(
                         predicates: graph.predicates,
                     };
 
-                    // Adaptive algorithm selection:
-                    // DP (<=12) -> Greedy (13-16) -> LeftDeep (any)
-                    let result = if n <= 12 {
-                        tracing::debug!(n, "join_reorder: using DP algorithm");
-                        dp_join_reorder(optimized_graph, table_stats)
-                    } else if n <= 16 {
-                        tracing::debug!(n, "join_reorder: using Greedy algorithm");
-                        greedy_join_reorder(optimized_graph.clone(), table_stats).or_else(|| {
-                            tracing::debug!(
-                                n,
-                                "join_reorder: Greedy failed, falling back to LeftDeep"
-                            );
+                    let result = match select_join_reorder_algorithm(n) {
+                        JoinReorderAlgorithm::Dp => {
+                            tracing::debug!(n, "join_reorder: using DP algorithm");
+                            dp_join_reorder(optimized_graph, table_stats)
+                        }
+                        JoinReorderAlgorithm::Greedy => {
+                            tracing::debug!(n, "join_reorder: using Greedy algorithm");
+                            greedy_join_reorder(optimized_graph.clone(), table_stats).or_else(
+                                || {
+                                    tracing::debug!(
+                                        n,
+                                        "join_reorder: Greedy failed, falling back to LeftDeep"
+                                    );
+                                    left_deep_join_reorder(optimized_graph, table_stats)
+                                },
+                            )
+                        }
+                        JoinReorderAlgorithm::LeftDeep => {
+                            tracing::debug!(n, "join_reorder: using LeftDeep algorithm");
                             left_deep_join_reorder(optimized_graph, table_stats)
-                        })
-                    } else {
-                        tracing::debug!(n, "join_reorder: using LeftDeep algorithm");
-                        left_deep_join_reorder(optimized_graph, table_stats)
+                        }
                     };
 
                     match result {
@@ -614,14 +635,14 @@ fn flatten_inner_joins(
 }
 
 /// DP join reorder: enumerate all subsets of relations and find the cheapest
-/// join order.  Uses a u32 bitmask (DP is still limited to <=12 relations
+/// join order.  Uses a u32 bitmask (DP is still limited to <=8 relations
 /// to keep the 2^n subset enumeration tractable).
 fn dp_join_reorder(
     graph: JoinGraph,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<LogicalPlan> {
     let n = graph.relations.len();
-    if n > 12 {
+    if n > 8 {
         return None;
     }
 
@@ -849,7 +870,7 @@ fn greedy_join_reorder(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<LogicalPlan> {
     let n = graph.relations.len();
-    if !(2..=16).contains(&n) {
+    if !(2..=12).contains(&n) {
         return None;
     }
 
@@ -1454,6 +1475,23 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         })
+    }
+
+    #[test]
+    fn join_reorder_algorithm_uses_left_deep_for_large_join_suffixes() {
+        assert_eq!(select_join_reorder_algorithm(8), JoinReorderAlgorithm::Dp);
+        assert_eq!(
+            select_join_reorder_algorithm(9),
+            JoinReorderAlgorithm::Greedy
+        );
+        assert_eq!(
+            select_join_reorder_algorithm(12),
+            JoinReorderAlgorithm::Greedy
+        );
+        assert_eq!(
+            select_join_reorder_algorithm(13),
+            JoinReorderAlgorithm::LeftDeep
+        );
     }
 
     #[test]

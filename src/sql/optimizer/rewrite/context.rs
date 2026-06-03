@@ -121,6 +121,10 @@ pub(crate) struct RewriteContext {
     /// stale-but-superset blocklist is safe. Lives for one query's rewrite
     /// run only (the context is rebuilt per query).
     dict_rewrite_blocklist: std::collections::BTreeSet<String>,
+    /// JoinReorder is an internally recursive global pass. The tree rewrite
+    /// driver still visits every node, so the rule uses this flag to run once
+    /// at the stage root and then skip all descendant visits in the same query.
+    join_reorder_global_applied: bool,
 }
 
 impl RewriteContext {
@@ -136,6 +140,7 @@ impl RewriteContext {
             dictionary_provider: None,
             column_ref_factory: None,
             dict_rewrite_blocklist: std::collections::BTreeSet::new(),
+            join_reorder_global_applied: false,
         }
     }
 
@@ -224,6 +229,14 @@ impl RewriteContext {
 
     pub(crate) fn dict_rewrite_blocklist(&self) -> &std::collections::BTreeSet<String> {
         &self.dict_rewrite_blocklist
+    }
+
+    pub(crate) fn join_reorder_global_applied(&self) -> bool {
+        self.join_reorder_global_applied
+    }
+
+    pub(crate) fn mark_join_reorder_global_applied(&mut self) {
+        self.join_reorder_global_applied = true;
     }
 
     pub(crate) fn set_column_ref_factory(&mut self, factory: Rc<RefCell<ColumnRefFactory>>) {

@@ -620,6 +620,7 @@ mod tests {
                 output_name: "k".into(),
                 output_column_id: crate::sql::column_id::ColumnId::UNSET,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let agg = AggregateNode {

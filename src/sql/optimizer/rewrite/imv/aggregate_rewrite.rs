@@ -516,6 +516,7 @@ fn signed_aggregate(
             required_output_columns: aggregate.required_output_columns,
         })),
         items: project_items,
+        output_qualifier: None,
         required_output_columns: None,
     }))
 }

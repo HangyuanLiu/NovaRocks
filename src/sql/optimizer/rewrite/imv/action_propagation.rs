@@ -536,6 +536,7 @@ mod tests {
                 output_name: "k".to_string(),
                 output_column_id: projected_user_col_id,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

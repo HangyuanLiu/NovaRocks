@@ -257,6 +257,7 @@ pub(crate) struct FilterNode {
 pub(crate) struct ProjectNode {
     pub input: Box<LogicalPlan>,
     pub items: Vec<ProjectItem>,
+    pub output_qualifier: Option<String>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }
@@ -394,6 +395,7 @@ mod plan_tests {
                 required_output_columns: None,
             })),
             items: vec![],
+            output_qualifier: None,
             required_output_columns: None,
         };
         assert!(node.required_output_columns.is_none());

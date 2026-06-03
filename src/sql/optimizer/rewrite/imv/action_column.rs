@@ -585,6 +585,7 @@ mod tests {
                     output_column_id: ColumnId(102),
                 },
             ],
+            output_qualifier: None,
             required_output_columns: None,
         });
         validate(&project).expect("must validate");
@@ -647,6 +648,7 @@ mod tests {
                 output_name: "k".to_string(),
                 output_column_id: ColumnId(1),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let err = validate(&project).expect_err("dropped action must fail");
@@ -795,6 +797,7 @@ mod tests {
                 },
                 // __nova_base_row_id is intentionally absent.
             ],
+            output_qualifier: None,
             required_output_columns: None,
         });
         let err = validate(&project).expect_err("missing apply key must fail");

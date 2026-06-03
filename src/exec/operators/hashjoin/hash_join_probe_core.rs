@@ -28,6 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, UInt32Array};
@@ -76,6 +77,7 @@ pub(crate) struct HashJoinProbeCore {
     residual_eval_batches: u64,
     residual_matched_rows: u64,
     residual_group_rows_total: u64,
+    pending_output_batches: VecDeque<RecordBatch>,
 }
 
 impl HashJoinProbeCore {
@@ -118,6 +120,7 @@ impl HashJoinProbeCore {
             residual_eval_batches: 0,
             residual_matched_rows: 0,
             residual_group_rows_total: 0,
+            pending_output_batches: VecDeque::new(),
         }
     }
 
@@ -239,6 +242,20 @@ impl HashJoinProbeCore {
 
     pub(crate) fn residual_group_rows_total(&self) -> u64 {
         self.residual_group_rows_total
+    }
+
+    pub(crate) fn has_pending_output(&self) -> bool {
+        !self.pending_output_batches.is_empty()
+    }
+
+    pub(crate) fn pop_pending_output(&mut self) -> Result<Option<Chunk>, String> {
+        let Some(batch) = self.pending_output_batches.pop_front() else {
+            return Ok(None);
+        };
+        Ok(Some(Chunk::try_new_with_chunk_schema(
+            batch,
+            Arc::clone(&self.join_scope_chunk_schema),
+        )?))
     }
 
     /// Extend a probe-only batch with NULL-filled build-side columns so that
@@ -635,16 +652,10 @@ impl HashJoinProbeCore {
         }
         let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
         self.output_rows = self.output_rows.saturating_add(output_rows as u64);
-        if output_batches.len() == 1 {
-            return Ok(Some(Chunk::try_new_with_chunk_schema(
-                output_batches.remove(0),
-                Arc::clone(&self.join_scope_chunk_schema),
-            )?));
-        }
-
-        let batch = concat_batches(&output_schema, &output_batches).map_err(|e| e.to_string())?;
+        let first = output_batches.remove(0);
+        self.pending_output_batches.extend(output_batches);
         Ok(Some(Chunk::try_new_with_chunk_schema(
-            batch,
+            first,
             Arc::clone(&self.join_scope_chunk_schema),
         )?))
     }

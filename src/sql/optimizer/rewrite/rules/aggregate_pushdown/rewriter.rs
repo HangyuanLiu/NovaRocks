@@ -128,6 +128,7 @@ pub(crate) fn rewrite(
     LogicalPlan::Project(ProjectNode {
         input: Box::new(final_aggregate),
         items: exposure_project_items(original, &final_aggs),
+        output_qualifier: None,
         required_output_columns: None,
     })
 }

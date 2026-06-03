@@ -461,7 +461,10 @@ pub(crate) mod test_support {
         // probe side: PhysicalProject(node) over a leaf scan; both expose column 1.
         let scan = leaf(1_000_000.0, loc.clone());
         let project = PhysicalPlanNode {
-            op: Operator::PhysicalProject(PhysicalProjectOp { items: vec![] }),
+            op: Operator::PhysicalProject(PhysicalProjectOp {
+                items: vec![],
+                output_qualifier: None,
+            }),
             children: vec![scan],
             stats: Statistics {
                 output_row_count: 1_000_000.0,

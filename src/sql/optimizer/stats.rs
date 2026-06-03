@@ -2018,6 +2018,7 @@ mod tests {
                 output_name: "col1".to_string(),
                 output_column_id: out_id,
             }],
+            output_qualifier: None,
             required_output_columns: None,
         });
 

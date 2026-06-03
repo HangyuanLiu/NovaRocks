@@ -111,6 +111,28 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
                 }
             }
             (true, true) => {
+                if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
+                    let (implied_left, implied_right) = extract_implied_or_side_filters(
+                        &conj,
+                        &left_ids,
+                        &right_ids,
+                        &left_cols,
+                        &right_cols,
+                        &left_qcols,
+                        &right_qcols,
+                    );
+                    for pred in implied_left {
+                        if !subtree_has_predicate(&join.left, &pred) {
+                            left_preds.push(pred);
+                        }
+                    }
+                    for pred in implied_right {
+                        if !subtree_has_predicate(&join.right, &pred) {
+                            right_preds.push(pred);
+                        }
+                    }
+                }
+
                 if classified_by_ids {
                     if is_left_join_variant
                         || matches!(join.join_type, JoinKind::RightOuter | JoinKind::FullOuter)
@@ -337,6 +359,195 @@ fn classify_sides_by_column_ids(
     Some((in_left, in_right))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredicateSide {
+    Left,
+    Right,
+}
+
+fn extract_implied_or_side_filters(
+    expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    left_cols: &HashSet<String>,
+    right_cols: &HashSet<String>,
+    left_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+    right_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+) -> (Vec<TypedExpr>, Vec<TypedExpr>) {
+    let branches = split_or_branches(expr);
+    if branches.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    let branch_count = branches.len();
+
+    let mut left_terms = Vec::with_capacity(branches.len());
+    let mut right_terms = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut left_conjuncts = Vec::new();
+        let mut right_conjuncts = Vec::new();
+        for conjunct in split_and_refs(branch) {
+            match classify_implied_filter_side(
+                conjunct,
+                left_ids,
+                right_ids,
+                left_cols,
+                right_cols,
+                left_qcols,
+                right_qcols,
+            ) {
+                Some(PredicateSide::Left) => left_conjuncts.push((*conjunct).clone()),
+                Some(PredicateSide::Right) => right_conjuncts.push((*conjunct).clone()),
+                None => {}
+            }
+        }
+
+        if !left_conjuncts.is_empty() {
+            left_terms.push(combine_and(left_conjuncts));
+        }
+        if !right_conjuncts.is_empty() {
+            right_terms.push(combine_and(right_conjuncts));
+        }
+    }
+
+    let left_filters = if left_terms.len() == branch_count {
+        vec![combine_or(left_terms)]
+    } else {
+        Vec::new()
+    };
+    let right_filters = if right_terms.len() == branch_count {
+        vec![combine_or(right_terms)]
+    } else {
+        Vec::new()
+    };
+    (left_filters, right_filters)
+}
+
+fn classify_implied_filter_side(
+    expr: &TypedExpr,
+    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
+    left_cols: &HashSet<String>,
+    right_cols: &HashSet<String>,
+    left_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+    right_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+) -> Option<PredicateSide> {
+    if let Some((in_left, in_right)) = classify_sides_by_column_ids(expr, left_ids, right_ids) {
+        return match (in_left, in_right) {
+            (true, false) => Some(PredicateSide::Left),
+            (false, true) => Some(PredicateSide::Right),
+            _ => None,
+        };
+    }
+
+    let qrefs = collect_qualified_column_refs(expr);
+    if !qrefs.is_empty() {
+        let all_left = qrefs.iter().all(|qref| left_qcols.contains(qref));
+        let all_right = qrefs.iter().all(|qref| right_qcols.contains(qref));
+        return match (all_left, all_right) {
+            (true, false) => Some(PredicateSide::Left),
+            (false, true) => Some(PredicateSide::Right),
+            _ => None,
+        };
+    }
+
+    let refs = collect_column_refs(expr);
+    if refs.is_empty() {
+        return None;
+    }
+    let all_left = refs.iter().all(|name| {
+        left_cols.contains(&name.to_lowercase()) && !right_cols.contains(&name.to_lowercase())
+    });
+    let all_right = refs.iter().all(|name| {
+        right_cols.contains(&name.to_lowercase()) && !left_cols.contains(&name.to_lowercase())
+    });
+    match (all_left, all_right) {
+        (true, false) => Some(PredicateSide::Left),
+        (false, true) => Some(PredicateSide::Right),
+        _ => None,
+    }
+}
+
+fn combine_or(mut exprs: Vec<TypedExpr>) -> TypedExpr {
+    assert!(!exprs.is_empty());
+    let mut result = exprs.pop().unwrap();
+    while let Some(left) = exprs.pop() {
+        result = TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: left.nullable || result.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Or,
+                right: Box::new(result),
+            },
+        };
+    }
+    result
+}
+
+fn subtree_has_predicate(plan: &LogicalPlan, pred: &TypedExpr) -> bool {
+    let key = predicate_key(pred);
+    subtree_has_predicate_key(plan, &key)
+}
+
+fn subtree_has_predicate_key(plan: &LogicalPlan, key: &str) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => scan
+            .predicates
+            .iter()
+            .any(|existing| predicate_key(existing) == key),
+        LogicalPlan::Filter(filter) => {
+            predicate_key(&filter.predicate) == key || subtree_has_predicate_key(&filter.input, key)
+        }
+        LogicalPlan::Project(project) => subtree_has_predicate_key(&project.input, key),
+        LogicalPlan::Aggregate(aggregate) => subtree_has_predicate_key(&aggregate.input, key),
+        LogicalPlan::Sort(sort) => subtree_has_predicate_key(&sort.input, key),
+        LogicalPlan::Limit(limit) => subtree_has_predicate_key(&limit.input, key),
+        LogicalPlan::Window(window) => subtree_has_predicate_key(&window.input, key),
+        LogicalPlan::Repeat(repeat) => subtree_has_predicate_key(&repeat.input, key),
+        LogicalPlan::TableFunction(table_function) => {
+            subtree_has_predicate_key(&table_function.input, key)
+        }
+        LogicalPlan::Decode(decode) => subtree_has_predicate_key(&decode.input, key),
+        LogicalPlan::AggregateStateMerge(merge) => {
+            subtree_has_predicate_key(&merge.old_input, key)
+                || subtree_has_predicate_key(&merge.delta_input, key)
+        }
+        LogicalPlan::Join(join) => {
+            join.condition
+                .as_ref()
+                .is_some_and(|condition| predicate_key(condition) == key)
+                || subtree_has_predicate_key(&join.left, key)
+                || subtree_has_predicate_key(&join.right, key)
+        }
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| subtree_has_predicate_key(input, key)),
+        LogicalPlan::Intersect(intersect) => intersect
+            .inputs
+            .iter()
+            .any(|input| subtree_has_predicate_key(input, key)),
+        LogicalPlan::Except(except) => except
+            .inputs
+            .iter()
+            .any(|input| subtree_has_predicate_key(input, key)),
+        LogicalPlan::CTEAnchor(anchor) => {
+            subtree_has_predicate_key(&anchor.produce, key)
+                || subtree_has_predicate_key(&anchor.consumer, key)
+        }
+        LogicalPlan::CTEProduce(produce) => subtree_has_predicate_key(&produce.input, key),
+        LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_)
+        | LogicalPlan::ImvDelta(_)
+        | LogicalPlan::ImvVersion(_) => false,
+    }
+}
+
+fn predicate_key(expr: &TypedExpr) -> String {
+    format!("{:?}", expr.kind)
+}
+
 /// Extract common equi-join conditions from all branches of an OR predicate.
 /// Returns (extracted_join_preds, remaining_or_predicate).
 ///
@@ -495,10 +706,19 @@ fn merge_join_conditions(
     new_preds: Vec<TypedExpr>,
 ) -> Option<TypedExpr> {
     let mut all = Vec::new();
+    let mut seen = HashSet::new();
     if let Some(cond) = existing {
-        all.push(cond);
+        for pred in split_and(cond) {
+            if seen.insert(predicate_key(&pred)) {
+                all.push(pred);
+            }
+        }
     }
-    all.extend(new_preds);
+    for pred in new_preds {
+        if seen.insert(predicate_key(&pred)) {
+            all.push(pred);
+        }
+    }
     if all.is_empty() {
         None
     } else {
@@ -543,6 +763,30 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: a.nullable || b.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::And,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn or(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: a.nullable || b.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::Or,
                 right: Box::new(b),
             },
         }
@@ -611,6 +855,67 @@ mod tests {
             condition: None,
             required_output_columns: None,
         })
+    }
+
+    #[test]
+    fn extracts_implied_or_side_filters() {
+        let left = scan("l", &["a"]);
+        let right = scan("r", &["x"]);
+        let pred = or(
+            and(eq(col("a"), int_lit(1)), eq(col("x"), int_lit(10))),
+            and(eq(col("a"), int_lit(2)), eq(col("x"), int_lit(20))),
+        );
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(cross_join(left, right)),
+            predicate: pred,
+            required_output_columns: None,
+        });
+
+        let out = PushDownPredicateJoin.apply(filter).expect("should rewrite");
+        let LogicalPlan::Join(join) = out else {
+            panic!("expected Join after OR side-filter extraction");
+        };
+        assert!(
+            join.condition.is_some(),
+            "original OR predicate must remain as the join condition"
+        );
+        match join.left.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"a\""));
+                assert!(rendered.contains("Or"));
+            }
+            other => panic!("expected left Filter, got {:?}", other),
+        }
+        match join.right.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let rendered = format!("{:?}", filter.predicate.kind);
+                assert!(rendered.contains("\"x\""));
+                assert!(rendered.contains("Or"));
+            }
+            other => panic!("expected right Filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn merge_join_conditions_deduplicates_existing_condition() {
+        let condition = eq(col("a"), col("x"));
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(inner_join(
+                scan("l", &["a"]),
+                scan("r", &["x"]),
+                Some(condition.clone()),
+            )),
+            predicate: condition,
+            required_output_columns: None,
+        });
+
+        let out = PushDownPredicateJoin.apply(plan).expect("should rewrite");
+        let LogicalPlan::Join(join) = out else {
+            panic!("expected Join after predicate merge");
+        };
+        let condition = join.condition.expect("join condition");
+        assert_eq!(split_and_refs(&condition).len(), 1);
     }
 
     // Test 1: t1 INNER t2 WHERE t1.x = 1
@@ -791,6 +1096,7 @@ mod tests {
                 output_name: "k".to_string(),
                 output_column_id: ColumnId::new_for_test(output_id),
             }],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

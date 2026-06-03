@@ -198,6 +198,7 @@ mod tests {
                 col_ref_item(id_b, "b"),
                 col_ref_item(id_c, "c"),
             ],
+            output_qualifier: None,
             required_output_columns: None,
         };
 
@@ -235,6 +236,7 @@ mod tests {
                 col_ref_item(id_b, "b"),
                 col_ref_item(id_c, "c"),
             ],
+            output_qualifier: None,
             required_output_columns: None, // No Phase-1 tag
         };
 
@@ -259,6 +261,7 @@ mod tests {
         let mut node = ProjectNode {
             input: Box::new(make_scan(id_a, id_b, id_c)),
             items: vec![col_ref_item(id_a, "a"), col_ref_item(id_b, "b")],
+            output_qualifier: None,
             required_output_columns: None,
         };
 
@@ -307,6 +310,7 @@ mod tests {
         let mut node = ProjectNode {
             input: Box::new(make_scan(id_a, id_b, id_c)),
             items: vec![col_ref_item(id_a, "a")], // single item, NOT in needed
+            output_qualifier: None,
             required_output_columns: None,
         };
 

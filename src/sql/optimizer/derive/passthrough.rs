@@ -148,7 +148,10 @@ mod tests {
     }
 
     fn make_minimal_project_op() -> PhysicalProjectOp {
-        PhysicalProjectOp { items: vec![] }
+        PhysicalProjectOp {
+            items: vec![],
+            output_qualifier: None,
+        }
     }
 
     fn hash_one() -> PhysicalPropertySet {

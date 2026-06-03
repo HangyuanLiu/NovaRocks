@@ -41,6 +41,10 @@ impl LogicalRewriteRule for PruneUnionColumns {
             unreachable!()
         };
 
+        if !node.all {
+            return Ok(RewriteResult::Unchanged);
+        }
+
         // None means Phase 1 hasn't tagged this node — no-op.
         let Some(needed) = node.required_output_columns.clone() else {
             return Ok(RewriteResult::Unchanged);

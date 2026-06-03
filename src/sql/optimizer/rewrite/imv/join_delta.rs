@@ -226,6 +226,7 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
 fn normalize_branch_output(input: LogicalPlan, output_columns: &[OutputColumn]) -> LogicalPlan {
     LogicalPlan::Project(ProjectNode {
         input: Box::new(input),
+        output_qualifier: None,
         items: output_columns
             .iter()
             .map(|column| ProjectItem {
@@ -503,6 +504,7 @@ mod tests {
                     output_column_id: column.column_id,
                 })
                 .collect(),
+            output_qualifier: None,
             required_output_columns: None,
         })
     }

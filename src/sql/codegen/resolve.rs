@@ -107,6 +107,12 @@ impl ExprScope {
             .insert((qualifier.to_lowercase(), name_lower), binding);
     }
 
+    /// Register an unqualified lookup alias for an existing output slot
+    /// without adding another visible column to the ordered list.
+    pub fn add_unqualified_alias(&mut self, name: String, binding: ColumnBinding) {
+        self.unqualified.insert(name.to_lowercase(), binding);
+    }
+
     /// G1: primary column lookup by `ColumnId`. Returns `None` when this
     /// scope does not (yet) have an id-indexed binding for the column.
     pub fn resolve_by_id(&self, column_id: ColumnId) -> Option<&ColumnBinding> {
