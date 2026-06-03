@@ -53,6 +53,36 @@ pub(crate) struct StagedDataFile {
     pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
 }
 
+pub(crate) struct StagedDataFileWriter {
+    ctx: StagedWriteContext,
+    opts: StagedWriteOptions,
+    buffered: Vec<RecordBatch>,
+}
+
+impl StagedDataFileWriter {
+    pub(crate) fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
+        Ok(Self {
+            ctx,
+            opts,
+            buffered: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+        if batch.num_rows() > 0 {
+            self.buffered.push(batch);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(self) -> Result<Vec<StagedDataFile>, String> {
+        if self.buffered.is_empty() {
+            return Ok(Vec::new());
+        }
+        write_record_batches(&self.ctx, self.buffered, &self.opts).await
+    }
+}
+
 pub(crate) struct StagedWriteContext {
     metadata: Arc<iceberg::spec::TableMetadata>,
     file_io: iceberg::io::FileIO,
@@ -905,6 +935,18 @@ mod tests {
             ctx.file_io().exists(&path).await.expect("exists"),
             "staged file must exist"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_writer_matches_batch_form() {
+        let table = build_unpartitioned_test_table("kernel_stream").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let mut w = StagedDataFileWriter::new(ctx, StagedWriteOptions::default()).expect("new");
+        w.write_batch(test_batch(&[1, 2])).await.expect("b1");
+        w.write_batch(test_batch(&[3])).await.expect("b2");
+        let staged = w.finish().await.expect("finish");
+        let total: u64 = staged.iter().map(|s| s.data_file.record_count()).sum();
+        assert_eq!(total, 3);
     }
 
     #[tokio::test]
