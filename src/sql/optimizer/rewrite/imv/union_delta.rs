@@ -10,7 +10,8 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{LogicalPlan, ProjectNode, UnionNode};
 use crate::{
-    engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN, sql::analysis::ProjectItem,
+    engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+    sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr},
 };
 
 pub(crate) struct RewriteUnionAggregateDeltaRule;
@@ -36,12 +37,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                     && matches!(
                         delta.input.as_ref(),
                         LogicalPlan::Aggregate(aggregate)
-                            if matches!(
-                                aggregate.input.as_ref(),
-                                LogicalPlan::Union(union)
-                                    if union.all
-                                        && !plan_contains_imv_marker(aggregate.input.as_ref())
-                            )
+                            if unary_chain_reaches_unmarked_source_union(aggregate.input.as_ref())
                     )
         )
     }
@@ -56,16 +52,13 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
         let LogicalPlan::Aggregate(mut aggregate) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
-        let LogicalPlan::Union(union) = *aggregate.input else {
+        // The source union may sit directly under the aggregate, or under a
+        // unary projection/filter chain that the optimizer's required-column
+        // pruning inserts between the aggregate and a derived UNION ALL subquery
+        // (`SELECT .. FROM (.. UNION ALL ..) GROUP BY ..`). Descend through that
+        // chain to reach the union.
+        if !unary_chain_reaches_unmarked_source_union(&aggregate.input) {
             return Ok(RewriteResult::Unchanged);
-        };
-        if plan_contains_imv_marker(&LogicalPlan::Union(union.clone())) {
-            return Ok(RewriteResult::Unchanged);
-        }
-        if !union.all {
-            return Err(
-                "Iceberg IMV UNION aggregate delta rewrite supports UNION ALL only".to_string(),
-            );
         }
 
         let action_column = match delta.action_column {
@@ -77,30 +70,13 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                 })?
                 .allocate_column_id(),
         };
-
-        let UnionNode {
-            inputs,
-            all,
-            output_columns,
-            required_output_columns,
-        } = union;
         let action_output = ImvActionColumn::output_column(action_column);
-        let mut rewritten_inputs = Vec::with_capacity(inputs.len());
-        for branch in inputs {
-            let mut branch_output = plan_output_columns(&branch)?;
-            branch_output.push(action_output.clone());
-            let marked = mark_delta_scan(branch, action_column)?;
-            rewritten_inputs.push(normalize_branch_output(marked, &branch_output));
-        }
 
-        let mut union_output_columns = output_columns;
-        union_output_columns.push(action_output);
-        aggregate.input = Box::new(LogicalPlan::Union(UnionNode {
-            inputs: rewritten_inputs,
-            all,
-            output_columns: union_output_columns,
-            required_output_columns,
-        }));
+        aggregate.input = Box::new(mark_fan_in_union_through_unary(
+            *aggregate.input,
+            action_column,
+            &action_output,
+        )?);
 
         Ok(RewriteResult::Changed(LogicalPlan::ImvDelta(
             ImvDeltaNode {
@@ -109,6 +85,103 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                 action_column: Some(action_column),
             },
         )))
+    }
+}
+
+/// Does `plan` reach an UNMARKED source `UNION ALL` by descending only through
+/// unary projection/filter nodes? A-family `Aggregate(.. UNION ALL ..)` may have
+/// column-pruning Projects (and Filters) inserted between the aggregate and the
+/// union by the optimizer's required-column pruning, so the delta rewrite must
+/// see through them. The marker guard distinguishes the SOURCE union from a
+/// union whose branches already carry delta/version markers (e.g. join-delta
+/// output), which must not be re-processed.
+fn unary_chain_reaches_unmarked_source_union(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Union(union) => union.all && !plan_contains_imv_marker(plan),
+        LogicalPlan::Project(project) => unary_chain_reaches_unmarked_source_union(&project.input),
+        LogicalPlan::Filter(filter) => unary_chain_reaches_unmarked_source_union(&filter.input),
+        _ => false,
+    }
+}
+
+/// Mark each branch of the source `UNION ALL` as a delta scan sharing
+/// `action_column`, descending through any unary projection/filter chain above
+/// the union. Each Project on the way up additionally projects `action_column`
+/// so the shared action column stays visible to the aggregate above (the
+/// aggregate-state rewrite consumes it as the signed retraction count).
+fn mark_fan_in_union_through_unary(
+    plan: LogicalPlan,
+    action_column: crate::sql::column_id::ColumnId,
+    action_output: &OutputColumn,
+) -> Result<LogicalPlan, String> {
+    match plan {
+        LogicalPlan::Union(union) => {
+            if !union.all {
+                return Err(
+                    "Iceberg IMV UNION aggregate delta rewrite supports UNION ALL only".to_string(),
+                );
+            }
+            let UnionNode {
+                inputs,
+                all,
+                output_columns,
+                required_output_columns,
+            } = union;
+            let mut rewritten_inputs = Vec::with_capacity(inputs.len());
+            for branch in inputs {
+                let mut branch_output = plan_output_columns(&branch)?;
+                branch_output.push(action_output.clone());
+                let marked = mark_delta_scan(branch, action_column)?;
+                rewritten_inputs.push(normalize_branch_output(marked, &branch_output));
+            }
+            let mut union_output_columns = output_columns;
+            union_output_columns.push(action_output.clone());
+            Ok(LogicalPlan::Union(UnionNode {
+                inputs: rewritten_inputs,
+                all,
+                output_columns: union_output_columns,
+                required_output_columns,
+            }))
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(mark_fan_in_union_through_unary(
+                *project.input,
+                action_column,
+                action_output,
+            )?);
+            project.items.push(action_passthrough_item(action_output));
+            Ok(LogicalPlan::Project(project))
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(mark_fan_in_union_through_unary(
+                *filter.input,
+                action_column,
+                action_output,
+            )?);
+            Ok(LogicalPlan::Filter(filter))
+        }
+        other => Err(format!(
+            "RewriteUnionAggregateDelta: unexpected node above source union: {}",
+            plan_kind(&other)
+        )),
+    }
+}
+
+/// A Project item that passes the shared action column straight through, so a
+/// column-pruning Project between the aggregate and the union keeps exposing it.
+fn action_passthrough_item(action_output: &OutputColumn) -> ProjectItem {
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: action_output.column_id,
+                qualifier: None,
+                column: action_output.name.clone(),
+            },
+            data_type: action_output.data_type.clone(),
+            nullable: action_output.nullable,
+        },
+        output_name: action_output.name.clone(),
+        output_column_id: action_output.column_id,
     }
 }
 

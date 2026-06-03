@@ -282,6 +282,30 @@ impl IcebergMvRewriteContext {
             crate::connector::starrocks::table::mv_shape::IncrementalMvShape::JoinAggregate(
                 shape,
             ) => shape.as_aggregate_shape_for_layout(),
+            // B-family UNION ALL of aggregate branches: every branch shares the
+            // same output schema (UNION ALL requirement), so the aggregate-state
+            // physical layout is branch-independent and derived from the first
+            // branch's aggregate shape — exactly the shape the CREATE path used
+            // to build the target schema + contract.
+            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::UnionAll(
+                union_shape,
+            ) if union_shape.branch_kind
+                == crate::connector::starrocks::table::mv_shape::UnionBranchKind::Aggregate =>
+            {
+                match union_shape.branches.first() {
+                    Some(
+                        crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(
+                            shape,
+                        ),
+                    ) => shape.clone(),
+                    _ => {
+                        return Err(
+                            "UNION ALL aggregate execution layout requires aggregate branches"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             _ => {
                 return Err(
                     "AggregateStateMerge execution layout requires an aggregate MV shape"
