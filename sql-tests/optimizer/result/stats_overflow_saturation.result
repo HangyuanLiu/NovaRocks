@@ -1,0 +1,18 @@
+Explain String
+PROJECT [count() AS count(*)] stats={rows=1}
+  HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count()
+    GATHER EXCHANGE stats={rows=1}
+      HASH AGGREGATE (LOCAL) stats={rows=1}
+        aggregations: count()
+        NEST LOOP JOIN (CROSS) stats={rows=10000000000}
+          GATHER EXCHANGE stats={rows=100000}
+            SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_a (alias=a) stats={rows=100000}
+                 TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_a
+                 columns: k
+                 min-max stats
+          GATHER EXCHANGE stats={rows=100000}
+            SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_b (alias=b) stats={rows=100000}
+                 TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_b
+                 columns: k
+                 min-max stats

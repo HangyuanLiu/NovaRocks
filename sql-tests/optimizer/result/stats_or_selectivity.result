@@ -1,0 +1,8 @@
+Explain String
+GATHER EXCHANGE stats={rows=43750}
+  PROJECT [b] stats={rows=43750}
+    SCAN db_sqlt_bbe2afdec0e97ad3.oq12_stats_or stats={rows=43750}
+         TABLE: db_sqlt_bbe2afdec0e97ad3.oq12_stats_or
+         columns: b, a
+         min-max stats
+         predicates: a = 1 OR a = 2
