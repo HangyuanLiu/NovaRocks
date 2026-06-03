@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use super::estimate::ndv::{cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv};
 use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
 use super::memo::{MExpr, Memo};
@@ -79,10 +80,15 @@ pub(crate) fn derive_statistics(
                 child_stats.row_count_confidence,
                 selectivity,
             );
+            let mut column_statistics = child_stats.column_statistics;
+            for stat in column_statistics.values_mut() {
+                stat.distinct_values_count =
+                    cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+            }
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence,
-                column_statistics: child_stats.column_statistics,
+                column_statistics,
             }
         }
 
@@ -322,10 +328,15 @@ pub(crate) fn derive_statistics(
                 child_stats.row_count_confidence,
                 selectivity,
             );
+            let mut column_statistics = child_stats.column_statistics;
+            for stat in column_statistics.values_mut() {
+                stat.distinct_values_count =
+                    cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+            }
             Statistics {
                 output_row_count: output_rows,
                 row_count_confidence,
-                column_statistics: child_stats.column_statistics,
+                column_statistics,
             }
         }
 
@@ -1123,58 +1134,6 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
     }
 }
 
-// ---------------------------------------------------------------------------
-// NDV / join-key helpers (mirrored from cardinality.rs since they are private)
-// ---------------------------------------------------------------------------
-
-use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
-
-/// Get the NDV for an expression from column statistics.
-fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
-    // A column is only useful for cardinality if it carries a real NDV (> 1).
-    // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
-    // reports distinct_values_count = 1.0; treating that as a true NDV would make
-    // get_join_key_ndv divide left*right by ~1 and explode joins to near
-    // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
-    // fall back to the default NDV for unknown/degenerate columns.
-    if let Some(name) = extract_column_name(expr)
-        && let Some(cs) = column_stats.get(&name.to_lowercase())
-        && cs.distinct_values_count > 1.0
-    {
-        return cs.distinct_values_count;
-    }
-    10.0
-}
-
-/// For a join condition, extract the max NDV of join keys from both sides.
-fn get_join_key_ndv(
-    condition: &TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
-) -> f64 {
-    match &condition.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-        } => {
-            let left_ndv = get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
-            let right_ndv = get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
-            left_ndv.max(right_ndv).max(1.0)
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let l = get_join_key_ndv(left, left_stats, right_stats);
-            let r = get_join_key_ndv(right, left_stats, right_stats);
-            l.max(r)
-        }
-        _ => 1.0,
-    }
-}
-
 fn child_output_columns(
     memo: &Memo,
     children: &[usize],
@@ -1512,6 +1471,88 @@ mod tests {
         }
     }
 
+    fn filter_ndv_child_stat(ndv: f64) -> ColumnStatistic {
+        ColumnStatistic {
+            min_value: 7.0,
+            max_value: 77.0,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: ndv,
+            confidence: Confidence::Exact,
+        }
+    }
+
+    fn filter_ndv_child_group(memo: &mut Memo) -> usize {
+        use crate::sql::optimizer::memo::LogicalProperties;
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![], 1_000.0);
+        props.row_count_confidence = Confidence::Exact;
+        props
+            .column_statistics
+            .insert("filter_col".to_string(), filter_ndv_child_stat(10.0));
+        props
+            .column_statistics
+            .insert("payload".to_string(), filter_ndv_child_stat(1_000.0));
+        memo.groups[group].logical_props = Some(props);
+        group
+    }
+
+    fn assert_filter_caps_payload_ndv(stats: Statistics) {
+        assert!(
+            (stats.output_row_count - 100.0).abs() < 0.000_001,
+            "expected filter output rows 100, got {}",
+            stats.output_row_count
+        );
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+        let payload = stats.column_statistics.get("payload").unwrap();
+        assert_eq!(payload.distinct_values_count, 100.0);
+        assert_eq!(payload.min_value, 7.0);
+        assert_eq!(payload.max_value, 77.0);
+    }
+
+    #[test]
+    fn logical_filter_caps_payload_ndv_at_output_rows() {
+        use crate::sql::optimizer::operator::{LogicalFilterOp, Operator};
+
+        let mut memo = Memo::new();
+        let child = filter_ndv_child_group(&mut memo);
+        let filter = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalFilter(LogicalFilterOp {
+                predicate: eq_expr(col_ref("filter_col"), int_lit(1)),
+            }),
+            children: vec![child],
+        };
+
+        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &HashMap::new()));
+    }
+
+    #[test]
+    fn physical_filter_caps_payload_ndv_at_output_rows() {
+        use crate::sql::optimizer::operator::{Operator, PhysicalFilterOp};
+
+        let mut memo = Memo::new();
+        let child = filter_ndv_child_group(&mut memo);
+        let filter = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalFilter(PhysicalFilterOp {
+                predicate: eq_expr(col_ref("filter_col"), int_lit(1)),
+            }),
+            children: vec![child],
+        };
+
+        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &HashMap::new()));
+    }
+
     #[test]
     fn scan_group_stats() {
         let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100_000.0)]);
@@ -1556,53 +1597,6 @@ mod tests {
         // 1/100 = 0.01 -> 10000 * 0.01 = 100 rows.
         let filter_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((filter_props.row_count - 100.0).abs() < 1.0);
-    }
-
-    #[test]
-    fn get_expr_ndv_ignores_unknown_ndv() {
-        // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
-        // for no-stats / managed-lake tables. get_expr_ndv must treat that as
-        // "no information" and return the 10.0 default, otherwise get_join_key_ndv
-        // would divide left*right by ~1 and explode joins to near cross-products.
-        let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
-        column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());
-        assert_eq!(column_stats["unknown_col"].distinct_values_count, 1.0);
-        let unknown_expr = col_ref("unknown_col");
-        assert_eq!(get_expr_ndv(&unknown_expr, &column_stats), 10.0);
-
-        // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
-        column_stats.insert(
-            "degenerate_col".to_string(),
-            ColumnStatistic {
-                min_value: 0.0,
-                max_value: 100.0,
-                nulls_fraction: 0.0,
-                average_row_size: 8.0,
-                distinct_values_count: 1.0,
-                ..Default::default()
-            },
-        );
-        let degenerate_expr = col_ref("degenerate_col");
-        assert_eq!(get_expr_ndv(&degenerate_expr, &column_stats), 10.0);
-
-        // A real NDV (> 1) is still used verbatim.
-        column_stats.insert(
-            "real_col".to_string(),
-            ColumnStatistic {
-                min_value: 0.0,
-                max_value: 100.0,
-                nulls_fraction: 0.0,
-                average_row_size: 8.0,
-                distinct_values_count: 50.0,
-                ..Default::default()
-            },
-        );
-        let real_expr = col_ref("real_col");
-        assert_eq!(get_expr_ndv(&real_expr, &column_stats), 50.0);
-
-        // An unknown column reference (absent from the map) also defaults.
-        let missing_expr = col_ref("missing_col");
-        assert_eq!(get_expr_ndv(&missing_expr, &column_stats), 10.0);
     }
 
     #[test]

@@ -5,5 +5,5 @@
 
 pub(crate) mod arith;
 pub(crate) mod cardinality;
+pub(crate) mod ndv;
 pub(crate) mod selectivity;
-// ndv added in later phases.
