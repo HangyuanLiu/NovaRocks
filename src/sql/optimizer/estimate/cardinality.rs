@@ -228,6 +228,22 @@ mod tests {
     }
 
     #[test]
+    fn single_key_inner_equals_legacy_containment_formula() {
+        // Single-key inner joins must stay equivalent to the legacy containment formula.
+        for &(left, right, ndv) in &[(1000.0, 500.0, 50.0), (10.0, 8.0, 10.0), (1e6, 1e3, 1e4)] {
+            let (rows, _) =
+                estimate_join_cardinality(&inp(JoinKind::Inner, left, right, vec![(ndv, ndv)]));
+            let expected = (left * right / ndv)
+                .min(crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT)
+                .max(1.0);
+            assert!(
+                (rows - expected).abs() <= expected * 1e-9 + 1.0,
+                "left={left} right={right} ndv={ndv}: {rows} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn multikey_inner_does_not_collapse_or_inflate() {
         let (rows, _) = estimate_join_cardinality(&inp(
             JoinKind::Inner,
