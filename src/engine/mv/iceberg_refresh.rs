@@ -2544,9 +2544,20 @@ fn refresh_iceberg_aggregate_mv(
         IncrementalMvShape::Aggregate(aggregate_shape)
             if !aggregate_shape.fan_in_bases.is_empty() =>
         {
-            Err(
-                "incremental aggregate-over-UNION-ALL refresh execution is not yet supported in this build"
-                    .to_string(),
+            refresh_fan_in_aggregate_iceberg_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                target_table,
+                expected_main_snapshot_id,
+                current_catalog,
+                current_database,
+                mv_definition,
+                base_refs,
+                schema_contract,
+                aggregate_shape,
+                planned_affected_partitions,
             )
         }
         IncrementalMvShape::Aggregate(_) => refresh_single_aggregate_iceberg_mv(
@@ -2817,6 +2828,285 @@ fn refresh_single_aggregate_iceberg_mv(
             )
         }
     }
+}
+
+/// A-family `Aggregate(UNION ALL(b1..bn))` refresh execution (fan-in over
+/// multiple bases).
+///
+/// UNION ALL sits BELOW the aggregate, so the same group key folds across
+/// branches and the ordinary group-row-id apply key applies — there is no
+/// `__branch_id__` (that is the B-family / `IncrementalMvShape::UnionAll`
+/// concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
+/// stage) and IMV scan binding already fan a per-branch delta window off the
+/// multi-base pin, exactly like `refresh_join_aggregate_iceberg_mv` does for
+/// its two bases. This orchestration just pins/loads every fan-in base, builds
+/// one refresh context over all of them, and drives the shared aggregate merge
+/// with one `RewriteMergeBaseChange` per base.
+///
+/// Structurally this mirrors `refresh_iceberg_union_projection_mv` (multi-base
+/// first/metadata/incremental dispatch) but uses the aggregate contract
+/// validators, the aggregate first-refresh path, and the aggregate merge
+/// options. Field-id rebind is not supported on the fan-in path yet; a base
+/// whose columns were rebound is accepted by the contract check but its SELECT
+/// is not rewritten, matching the pre-existing single-base behavior closely
+/// enough for the unchanged-schema case this build targets.
+#[allow(clippy::too_many_arguments)]
+fn refresh_fan_in_aggregate_iceberg_mv(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
+    expected_main_snapshot_id: Option<i64>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    aggregate_shape: &AggregateMvShape,
+    planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
+) -> Result<StatementResult, String> {
+    validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)?;
+
+    let mut pre_pin_current_snapshots = BTreeMap::new();
+    for base_ref in base_refs {
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        validate_aggregate_schema_contract_for_base(
+            schema_contract,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )?;
+        pre_pin_current_snapshots.insert(
+            base_ref.fqn(),
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id()),
+        );
+    }
+
+    let previous_snapshots = &mv_definition.last_refresh_snapshots;
+    let has_previous = base_refs
+        .iter()
+        .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let all_previous = base_refs
+        .iter()
+        .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    let any_current = pre_pin_current_snapshots.values().any(Option::is_some);
+    let all_current = pre_pin_current_snapshots.values().all(Option::is_some);
+
+    if has_previous && !all_previous {
+        return Err(format!(
+            "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if !has_previous && !any_current {
+        tracing::info!(
+            "iceberg aggregate-over-UNION-ALL mv {}.{}.{}: all fan-in bases have no snapshot; skipping refresh",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        return Ok(StatementResult::Ok);
+    }
+    if !has_previous && !all_current {
+        return Err(format!(
+            "iceberg aggregate-over-UNION-ALL MV {}.{}.{} cannot run first refresh because only some fan-in bases have current snapshots; load all bases or recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if has_previous && !all_current {
+        let missing = base_refs
+            .iter()
+            .find(|base_ref| {
+                pre_pin_current_snapshots
+                    .get(&base_ref.fqn())
+                    .copied()
+                    .flatten()
+                    .is_none()
+            })
+            .map(IcebergTableRef::fqn)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Err(format!(
+            "cannot refresh iceberg aggregate-over-UNION-ALL MV {}.{}.{}: previously-refreshed base snapshot for {missing} is no longer reachable",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+
+    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
+        state, base_refs,
+    )?;
+    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+
+    let mut loaded_bases = Vec::with_capacity(base_refs.len());
+    for base_ref in base_refs {
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        validate_aggregate_schema_contract_for_base(
+            schema_contract,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )?;
+        let current_snapshot_id = pin.get(base_ref).ok_or_else(|| {
+            format!(
+                "refresh pin missing snapshot for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?;
+        let current_table_uuid = pin
+            .uuid(base_ref)
+            .ok_or_else(|| {
+                format!(
+                    "refresh pin missing uuid for base {} (this should not happen)",
+                    base_ref.fqn()
+                )
+            })?
+            .to_string();
+        loaded_bases.push((
+            base_ref.clone(),
+            loaded,
+            current_snapshot_id,
+            current_table_uuid,
+        ));
+    }
+
+    if has_previous {
+        for (base_ref, loaded, current_snapshot_id, _) in &loaded_bases {
+            let fqn = base_ref.fqn();
+            let previous_snapshot_id = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                format!(
+                    "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                    target.catalog, target.namespace, target.table
+                )
+            })?;
+            if previous_snapshot_id != *current_snapshot_id {
+                crate::connector::iceberg::changes::classify_lineage(
+                    loaded.table.metadata(),
+                    previous_snapshot_id,
+                    *current_snapshot_id,
+                )
+                .map_err(|e| {
+                    format!(
+                        "cannot refresh iceberg aggregate-over-UNION-ALL MV {}.{}.{}: previous base snapshot {previous_snapshot_id} for {} is not reachable from pinned snapshot {}: {e}",
+                        target.catalog,
+                        target.namespace,
+                        target.table,
+                        fqn,
+                        current_snapshot_id
+                    )
+                })?;
+            }
+        }
+    }
+
+    let canonical_select_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let ctx = {
+        let iceberg_catalog_guard = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        IcebergMvRefreshContext::new_with_affected_partitions(
+            target.clone(),
+            mv_definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(mv_definition.clone()),
+            Arc::new(canonical_select_query),
+            Arc::from(base_refs.to_vec()),
+            Arc::new(pin.clone()),
+            &iceberg_catalog_guard,
+            Arc::new(target_entry.clone()),
+            iceberg_catalog.clone(),
+            target_table.clone(),
+            planned_affected_partitions.clone(),
+        )?
+    };
+    tracing::info!(
+        summary = ?ctx.rewrite.summary(),
+        "iceberg aggregate-over-UNION-ALL MV refresh context constructed"
+    );
+
+    if !has_previous {
+        let staging_branch = format!(
+            "__nova_mv_refresh_{}_{}",
+            mv_definition.mv_id,
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            state,
+            target,
+            mv_definition.mv_id,
+            expected_main_snapshot_id,
+            pin.to_snapshot_map(),
+            &staging_branch,
+        )?;
+        return first_refresh_iceberg_aggregate_mv(
+            state,
+            &ctx,
+            &staging_branch,
+            refresh_id,
+            aggregate_shape,
+        );
+    }
+
+    let all_unchanged = loaded_bases.iter().all(|(base_ref, _, current, _)| {
+        previous_snapshots.get(&base_ref.fqn()).copied() == Some(*current)
+    });
+    if all_unchanged {
+        tracing::info!(
+            "iceberg aggregate-over-UNION-ALL mv {}.{}.{}: fan-in base snapshots unchanged; updating metadata only",
+            target.catalog,
+            target.namespace,
+            target.table
+        );
+        return finalize_iceberg_mv_metadata_only_refresh(
+            state,
+            target,
+            mv_definition,
+            pin.to_snapshot_map(),
+            pin.to_table_uuid_map(),
+        );
+    }
+
+    let changes = loaded_bases
+        .iter()
+        .map(|(base_ref, loaded, current_snapshot_id, current_table_uuid)| {
+            let previous_snapshot_id =
+                previous_snapshots.get(&base_ref.fqn()).copied().ok_or_else(|| {
+                    format!(
+                        "iceberg aggregate-over-UNION-ALL MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                        target.catalog, target.namespace, target.table
+                    )
+                })?;
+            Ok(RewriteMergeBaseChange {
+                base_ref,
+                previous_snapshot_id,
+                current_snapshot_id: *current_snapshot_id,
+                base_table: &loaded.table,
+                current_table_uuid,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    incremental_refresh_iceberg_mv_with_changes(
+        state,
+        &ctx,
+        &changes,
+        None,
+        RewriteMergeRefreshOptions {
+            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            apply_key_value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            allow_full_rebuild_on_policy_full_refresh: false,
+            rewrite_evidence: RewriteMergeRefreshEvidence::Aggregate,
+            preload_locator_for_change_stream_deletes: true,
+        },
+    )
 }
 
 fn target_fqn_string(target: &IcebergMvTarget) -> String {
@@ -9297,6 +9587,246 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregate_over_union_all_fan_in_refresh_merges_branches_incrementally() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact_east",
+            &[(1, "east", 10), (2, "west", 7)],
+        );
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact_west",
+            &[(3, "east", 5), (4, "north", 3)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_fact_region
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c, sum(amount) AS s
+                FROM (
+                    SELECT region, amount FROM ice.sales.fact_east
+                    UNION ALL
+                    SELECT region, amount FROM ice.sales.fact_west
+                ) u
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create aggregate-over-UNION-ALL iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first aggregate-over-UNION-ALL refresh");
+
+        // `east` merges across BOTH bases: 10 (fact_east) + 5 (fact_west) = 15.
+        // This is the A-family contract: UNION ALL below the aggregate, same
+        // group key folds across branches (no __branch_id__).
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_fact_region",
+            &[("east", 2, 15), ("north", 1, 3), ("west", 1, 7)],
+        );
+
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_fact_region")
+            .expect("mv definition after fan-in refresh");
+        assert_eq!(mv.last_refresh_snapshots.len(), 2);
+        assert!(
+            mv.last_refresh_snapshots
+                .contains_key("ice.sales.fact_east")
+        );
+        assert!(
+            mv.last_refresh_snapshots
+                .contains_key("ice.sales.fact_west")
+        );
+
+        // Unchanged bases -> metadata-only refresh, no error.
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("unchanged fan-in refresh should be metadata-only");
+
+        // Incremental INSERT into one branch; `east` accumulates across branches.
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact_west",
+            &[(5, "east", 100)],
+        );
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("fan-in incremental insert refresh");
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_fact_region",
+            &[("east", 3, 115), ("north", 1, 3), ("west", 1, 7)],
+        );
+
+        // Incremental DELETE from the other branch; `east` retracts the row.
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "DELETE FROM ice.sales.fact_east WHERE id = 1",
+        );
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("fan-in incremental delete refresh");
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_fact_region",
+            &[("east", 2, 105), ("north", 1, 3), ("west", 1, 7)],
+        );
+    }
+
+    fn assert_aggregate_region_rows(
+        state: &Arc<StandaloneState>,
+        current_catalog: &str,
+        current_database: &str,
+        mv_name: &str,
+        expected: &[(&str, i64, i64)],
+    ) {
+        let sql = format!("SELECT region, c, s FROM {mv_name} ORDER BY region");
+        let session = crate::engine::StandaloneSession {
+            inner: Arc::clone(state),
+        };
+        let result = match session
+            .execute_in_context(&sql, Some(current_catalog), current_database, None)
+            .expect("query fan-in aggregate mv")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("expected query result for {sql}"),
+        };
+        let actual = string_i64_i64_rows(&result);
+        let expected = expected
+            .iter()
+            .map(|(region, count, sum)| ((*region).to_string(), *count, *sum))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    // Target/acceptance test for B-family UNION ALL of aggregate branches.
+    // Execution is intentionally NOT wired yet: per the 2026-06-03 IMV-v2 RFC
+    // (docs/superpowers/specs/2026-06-03-iceberg-imv-v2-unified-delta-apply-engine-design.md)
+    // B-family lands on the unified delta-apply engine (Phase 3), not as another
+    // bespoke refresh_* function. This test defines the bag-semantics correctness
+    // goal (same group key across branches must NOT merge); un-ignore when the
+    // unified engine + RewriteBranchUnionAggregateDelta rule land.
+    #[test]
+    #[ignore = "pending IMV-v2 unified engine (RFC 2026-06-03); B-family execution not wired"]
+    fn union_of_aggregates_keeps_same_group_key_independent_across_branches() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "t1");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "t2");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "t1",
+            &[(1, "k1", 10), (2, "k2", 5)],
+        );
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "t2",
+            &[(3, "k1", 100), (4, "k3", 7)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_agg
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c, sum(amount) AS s
+                FROM ice.sales.t1 GROUP BY region
+                UNION ALL
+                SELECT region, count(*) AS c, sum(amount) AS s
+                FROM ice.sales.t2 GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create UNION ALL of aggregates iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_agg");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first UNION ALL of aggregates refresh");
+
+        // region=k1 appears TWICE — once per branch — and must NOT be merged:
+        // (k1, c=1, s=10) from branch t1 and (k1, c=1, s=100) from branch t2.
+        // This is the B-family bag semantics: the UNION sits ABOVE the
+        // aggregates, so same group key across branches stays independent.
+        assert_aggregate_region_sum_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_agg",
+            &[("k1", 1, 10), ("k1", 1, 100), ("k2", 1, 5), ("k3", 1, 7)],
+        );
+
+        // Deleting branch t2's k1 row must NOT touch branch t1's k1 row —
+        // the central correctness property (__branch_id__ isolation).
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "DELETE FROM ice.sales.t2 WHERE region = 'k1'",
+        );
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("branch delete refresh");
+        assert_aggregate_region_sum_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_agg",
+            &[("k1", 1, 10), ("k2", 1, 5), ("k3", 1, 7)],
+        );
+
+        // Incremental INSERT into branch t1's k1 group grows only that branch.
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "t1", &[(5, "k1", 50)]);
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("branch insert refresh");
+        assert_aggregate_region_sum_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_union_agg",
+            &[("k1", 2, 60), ("k2", 1, 5), ("k3", 1, 7)],
+        );
+    }
+
+    fn assert_aggregate_region_sum_rows(
+        state: &Arc<StandaloneState>,
+        current_catalog: &str,
+        current_database: &str,
+        mv_name: &str,
+        expected: &[(&str, i64, i64)],
+    ) {
+        let sql = format!("SELECT region, c, s FROM {mv_name} ORDER BY region, s");
+        let session = crate::engine::StandaloneSession {
+            inner: Arc::clone(state),
+        };
+        let result = match session
+            .execute_in_context(&sql, Some(current_catalog), current_database, None)
+            .expect("query union-of-aggregates mv")
+        {
+            StatementResult::Query(result) => result,
+            StatementResult::Ok => panic!("expected query result for {sql}"),
+        };
+        let actual = string_i64_i64_rows(&result);
+        let expected = expected
+            .iter()
+            .map(|(region, count, sum)| ((*region).to_string(), *count, *sum))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
     fn execute_iceberg_sql(
         state: &Arc<StandaloneState>,
         current_catalog: Option<&str>,
@@ -11187,40 +11717,6 @@ mod tests {
         assert_eq!(
             plan.snapshot_pins.get("ice.sales.fact_west").copied(),
             Some(None)
-        );
-    }
-
-    #[test]
-    fn refresh_iceberg_mv_rejects_aggregate_over_union_all_execution_explicitly() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, sum(amount) AS s
-                FROM (
-                    SELECT region, amount FROM ice.sales.fact_east
-                    UNION ALL
-                    SELECT region, amount FROM ice.sales.fact_west
-                ) u
-                GROUP BY region",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create aggregate-over-UNION-ALL iceberg mv");
-
-        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
-        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
-            .expect_err("aggregate-over-UNION-ALL execution should fail explicitly");
-
-        assert!(
-            err.contains("aggregate-over-UNION-ALL refresh execution is not yet supported"),
-            "err={err}"
-        );
-        assert!(
-            !err.contains("exactly one base table reference"),
-            "err={err}"
         );
     }
 
