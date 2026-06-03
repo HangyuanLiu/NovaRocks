@@ -319,6 +319,19 @@ pub(crate) async fn write_record_batches(
     Ok(staged_files)
 }
 
+pub(crate) async fn cleanup_staged_files(
+    ctx: &StagedWriteContext,
+    paths: &[String],
+) -> Result<(), String> {
+    for path in paths {
+        ctx.file_io()
+            .delete(path)
+            .await
+            .map_err(|e| format!("cleanup staged file {path} failed: {e}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn to_iceberg_data_file(staged: StagedDataFile) -> DataFile {
     staged.data_file
 }
@@ -1081,6 +1094,28 @@ mod tests {
         assert!(
             ctx.file_io().exists(&path).await.expect("exists"),
             "staged file must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_staged_files_removes_written_files() {
+        let table = build_unpartitioned_test_table("kernel_cleanup").await;
+        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
+        let staged = write_record_batches(
+            &ctx,
+            vec![test_batch(&[1, 2, 3])],
+            &StagedWriteOptions::default(),
+        )
+        .await
+        .expect("write");
+        let path = staged[0].data_file.file_path().to_string();
+        assert!(ctx.file_io().exists(&path).await.expect("exists before"));
+        cleanup_staged_files(&ctx, &[path.clone()])
+            .await
+            .expect("cleanup");
+        assert!(
+            !ctx.file_io().exists(&path).await.expect("exists after"),
+            "file removed"
         );
     }
 
