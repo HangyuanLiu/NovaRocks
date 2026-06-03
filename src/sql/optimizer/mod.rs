@@ -5,6 +5,7 @@ pub(crate) mod convert;
 pub(crate) mod cost;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
+pub(crate) mod estimate;
 pub(crate) mod extract;
 pub(crate) mod logical_props;
 pub(crate) mod memo;
@@ -16,7 +17,6 @@ pub(crate) mod rewrite;
 pub(crate) mod rule;
 pub(crate) mod runtime_filter_pass;
 pub(crate) mod search;
-pub(crate) mod estimate;
 pub(crate) mod statistics;
 pub(crate) mod stats;
 

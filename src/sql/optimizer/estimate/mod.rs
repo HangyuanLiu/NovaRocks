@@ -4,4 +4,5 @@
 //! walker delegate here so they never drift numerically.
 
 pub(crate) mod arith;
-// cardinality / selectivity / ndv added in later phases.
+pub(crate) mod cardinality;
+// selectivity / ndv added in later phases.

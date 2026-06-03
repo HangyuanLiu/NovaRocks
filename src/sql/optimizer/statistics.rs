@@ -402,6 +402,7 @@ pub const PREDICATE_UNKNOWN_FILTER: f64 = 0.25;
 pub const IS_NULL_FILTER: f64 = 0.1;
 pub const IN_PREDICATE_DEFAULT_FILTER: f64 = 0.5;
 pub const UNKNOWN_GROUP_BY_CORRELATION: f64 = 0.75;
+pub const SEMI_JOIN_SELECTIVITY: f64 = 0.3;
 pub const ANTI_JOIN_SELECTIVITY: f64 = 0.4;
 
 #[cfg(test)]
