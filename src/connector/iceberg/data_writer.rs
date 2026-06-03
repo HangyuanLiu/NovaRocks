@@ -769,13 +769,32 @@ mod tests {
             ctx.partition_spec_id(),
             table.metadata().default_partition_spec_id()
         );
+        assert_eq!(
+            ctx.partition_spec().fields().len(),
+            table.metadata().default_partition_spec().fields().len(),
+            "context partition spec must match table default partition spec"
+        );
+        let _ = ctx.file_io();
     }
 
-    async fn build_unpartitioned_test_table(name: &str) -> iceberg::table::Table {
+    struct LocalFsTestTable {
+        table: iceberg::table::Table,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for LocalFsTestTable {
+        type Target = iceberg::table::Table;
+
+        fn deref(&self) -> &Self::Target {
+            &self.table
+        }
+    }
+
+    async fn build_unpartitioned_test_table(name: &str) -> LocalFsTestTable {
         build_local_fs_test_table(name, false).await
     }
 
-    async fn build_local_fs_test_table(name: &str, partitioned: bool) -> iceberg::table::Table {
+    async fn build_local_fs_test_table(name: &str, partitioned: bool) -> LocalFsTestTable {
         let safe_name: String = name
             .chars()
             .map(|c| {
@@ -786,12 +805,11 @@ mod tests {
                 }
             })
             .collect();
-        let dir = std::env::temp_dir().join(format!(
-            "novarocks-iceberg-data-writer-{safe_name}-{}",
-            unique_file_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("create table dir");
-        let location = format!("file://{}", dir.display());
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("novarocks-iceberg-data-writer-{safe_name}-"))
+            .tempdir()
+            .expect("create table dir");
+        let location = format!("file://{}", dir.path().display());
 
         let schema = Arc::new(
             iceberg::spec::Schema::builder()
@@ -825,12 +843,14 @@ mod tests {
         .expect("metadata")
         .metadata;
 
-        iceberg::table::Table::builder()
+        let table = iceberg::table::Table::builder()
             .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
             .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
-            .expect("table")
+            .expect("table");
+
+        LocalFsTestTable { table, _dir: dir }
     }
 
     #[test]
