@@ -437,6 +437,39 @@ mod tests {
         assert!(!rule.matches(&plan, &ctx));
     }
 
+    #[test]
+    fn pipeline_branch_union_of_aggregates_final_shape_is_stable() {
+        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+
+        let mut ctx = build_ctx();
+        // build_ctx() registers ice.db.b as the only known base table; both
+        // branches must reference that same table so scan binding succeeds.
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![aggregate_over(scan("b", 1)), aggregate_over(scan("b", 10))],
+            all: true,
+            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            required_output_columns: None,
+        });
+
+        let out = build_imv_pipeline().rewrite(plan, &mut ctx).expect("pipeline must succeed");
+
+        // Top is a Union whose branches each end in Project over AggregateStateMerge,
+        // carrying a __branch_id__ column, with no IMV marker left anywhere.
+        assert!(!plan_contains_imv_marker(&out), "no marker may survive validation");
+        let LogicalPlan::Union(union) = &out else { panic!("expected top Union, got {out:?}") };
+        assert_eq!(union.inputs.len(), 2);
+        assert!(
+            union.output_columns.iter().any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
+            "union output must expose __branch_id__"
+        );
+        for branch in &union.inputs {
+            let LogicalPlan::Project(p) = branch else { panic!("expected Project branch, got {branch:?}") };
+            assert!(matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)));
+            assert!(p.items.iter().any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")));
+        }
+    }
+
     fn assert_branch_id_cast(item: &ProjectItem, expected_branch_id: i64) {
         assert_eq!(item.expr.data_type, DataType::Int32);
         assert!(!item.expr.nullable);
