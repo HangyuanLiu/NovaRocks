@@ -228,13 +228,17 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
         match plan {
             LogicalPlan::Project(p) => {
-                let internal = descendant_internal_columns(&p.input);
-                !internal.is_empty()
-                    && internal.iter().any(|c| {
-                        !p.items
-                            .iter()
-                            .any(|item| item.output_name.eq_ignore_ascii_case(&c.name))
-                    })
+                if is_supported_branch_union_project(plan) {
+                    false
+                } else {
+                    let internal = descendant_internal_columns(&p.input);
+                    !internal.is_empty()
+                        && internal.iter().any(|c| {
+                            !p.items
+                                .iter()
+                                .any(|item| item.output_name.eq_ignore_ascii_case(&c.name))
+                        })
+                }
             }
             // Filter is a schema-passthrough node: it exposes its child's
             // schema verbatim, so once the child has the action column the
@@ -268,6 +272,9 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         // up-front from `&plan` so the fail-fast arms can name the offending
         // base table; harmless for the Project happy path.
         let base = first_delta_base_fqn(&plan).unwrap_or_else(|| "<unknown>".to_string());
+        if is_supported_branch_union_project(&plan) {
+            return Ok(RewriteResult::Unchanged);
+        }
         match plan {
             LogicalPlan::Project(mut p) => {
                 let internal = descendant_internal_columns(&p.input);
@@ -545,7 +552,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
     use crate::sql::planner::plan::{
         AggregateCall, AggregateNode, AggregateStateMergeNode, FilterNode, JoinNode, LogicalPlan,
-        ScanNode, UnionNode, ValuesNode,
+        ScanNode, UnionNode,
     };
 
     fn build_ctx() -> RewriteContext {
@@ -832,12 +839,27 @@ mod tests {
     }
 
     fn aggregate_state_merge_stub() -> LogicalPlan {
+        let mut old_input = starrocks_scan();
+        old_input
+            .columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        old_input.columns.push(output_column(
+            102,
+            "__agg_state_s",
+            DataType::Binary,
+            true,
+            true,
+        ));
+        old_input.columns.push(output_column(
+            103,
+            ICEBERG_MV_BRANCH_ID_COLUMN,
+            DataType::Int32,
+            false,
+            true,
+        ));
+
         LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
-            old_input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: Vec::new(),
-                columns: Vec::new(),
-                required_output_columns: None,
-            })),
+            old_input: Box::new(LogicalPlan::Scan(old_input)),
             delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
                 input: Box::new(LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)))),
                 group_by: Vec::new(),
@@ -1104,6 +1126,27 @@ mod tests {
             panic!("expected union");
         };
         assert!(is_supported_branch_union(union));
+    }
+
+    #[test]
+    fn supported_branch_union_project_is_not_rewritten_before_parent_union() {
+        let rule = PropagateActionColumnRule;
+        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let plan = branch_union_with_aggregate_state_merge();
+        let LogicalPlan::Union(union) = &plan else {
+            panic!("expected union");
+        };
+        let branch_project = &union.inputs[0];
+
+        assert!(is_supported_branch_union_project(branch_project));
+        assert!(
+            !descendant_internal_columns(match branch_project {
+                LogicalPlan::Project(project) => project.input.as_ref(),
+                _ => unreachable!(),
+            })
+            .is_empty()
+        );
+        assert!(!rule.matches(branch_project, &ctx));
     }
 
     #[test]
