@@ -540,6 +540,7 @@ pub(crate) mod test_support {
             stats: Statistics {
                 output_row_count: 1_000_000.0,
                 column_statistics: Default::default(),
+                ..Default::default()
             },
             output_columns: vec![loc.clone()], // exchange preserves column 1
             build_runtime_filters: vec![],
@@ -563,6 +564,7 @@ pub(crate) mod test_support {
             stats: Statistics {
                 output_row_count: 100.0,
                 column_statistics: Default::default(),
+                ..Default::default()
             },
             output_columns: vec![loc, roc],
             build_runtime_filters: vec![],
