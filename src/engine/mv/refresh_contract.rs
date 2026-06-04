@@ -1228,24 +1228,22 @@ mod tests {
         );
     }
 
-    // --- Composed-branch rejections that the distinct-base arity check does
-    // NOT mask -------------------------------------------------------------
+    // --- Composed branch-union-aggregate: now ACCEPTED (A3) -----------------
     //
-    // Each of the three cases below reuses the SAME base tables across its
-    // composed branches, so the distinct base-ref count equals the branch
-    // count and `validate_distinct_base_ref_arity` passes. The rejection must
-    // therefore come from the contract-level narrowing (the legacy classifier
-    // rejected these composed shapes), not from the arity guard. The legacy
-    // `into_contract` / `derive_from_set_operation` rejected all three with the
-    // branch-union "only supports UNION ALL of projection/filter branches or
-    // aggregate branches" fail-fast.
+    // The two cases below are UNION ALL tops whose branches are composed
+    // aggregates (an aggregate over a join, or an aggregate over a fan-in
+    // union). Every branch still produces a per-branch group-row identity, so
+    // the composite apply key is `BranchUtf8` — representable — and CREATE now
+    // derives a `BranchUnionAggregate` contract for them. The third case below
+    // (fan-in aggregate over a union of joins) is the inverse nesting and stays
+    // rejected: there the union is *below* the aggregate, so the `FanInAggregate`
+    // arm still requires a union of simple scans.
 
     #[test]
-    fn rejects_branch_union_of_join_aggregates_with_same_bases() {
+    fn accepts_branch_union_of_join_aggregates_with_same_bases() {
         // UNION ALL of `Agg(fact_a JOIN fact_b)` x 2 over the SAME two bases.
         // distinct bases = {fact_a, fact_b} = 2 == branch_count, so arity is
-        // satisfied; the legacy branch-union arm rejected join-aggregate
-        // branches because they are not simple `SingleAggregate` branches.
+        // satisfied; A3 admits the composed aggregate branch union.
         let analysis = parse_and_analyze_mv_query(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1257,27 +1255,22 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let err = derive_imv_refresh_contract(&analysis)
-            .expect_err("branch union of join aggregates is unsupported");
+        let contract = derive_imv_refresh_contract(&analysis)
+            .expect("branch union of join aggregates is now supported");
 
-        assert!(
-            !err.contains("distinct Iceberg base table refs"),
-            "rejection must come from narrowing, not the arity guard: {err}"
-        );
-        assert!(
-            err.contains(
-                "only supports UNION ALL of projection/filter branches or aggregate branches"
-            ),
-            "unexpected error: {err}"
+        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
+        assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
+        assert_eq!(
+            contract.apply_key.value_type,
+            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
         );
     }
 
     #[test]
-    fn rejects_branch_union_of_fan_in_aggregates_with_same_bases() {
+    fn accepts_branch_union_of_fan_in_aggregates_with_same_bases() {
         // UNION ALL of `Agg(Union(fact_a, fact_b))` (fan-in) x 2 over the SAME
         // two bases. distinct bases = 2 == branch_count, so arity is satisfied;
-        // the legacy branch-union arm rejected fan-in aggregate branches
-        // because they are not simple `SingleAggregate` branches.
+        // A3 admits the composed (fan-in) aggregate branch union.
         let analysis = parse_and_analyze_mv_query(
             "SELECT region, count(*) AS c, sum(amount) AS s
              FROM (
@@ -1297,18 +1290,14 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let err = derive_imv_refresh_contract(&analysis)
-            .expect_err("branch union of fan-in aggregates is unsupported");
+        let contract = derive_imv_refresh_contract(&analysis)
+            .expect("branch union of fan-in aggregates is now supported");
 
-        assert!(
-            !err.contains("distinct Iceberg base table refs"),
-            "rejection must come from narrowing, not the arity guard: {err}"
-        );
-        assert!(
-            err.contains(
-                "only supports UNION ALL of projection/filter branches or aggregate branches"
-            ),
-            "unexpected error: {err}"
+        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
+        assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
+        assert_eq!(
+            contract.apply_key.value_type,
+            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
         );
     }
 
