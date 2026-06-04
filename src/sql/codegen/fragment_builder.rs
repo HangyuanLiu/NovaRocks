@@ -4251,12 +4251,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 // for scopes / call sites that have not yet been migrated to
                 // register ColumnIds.
                 let mut partition_exprs = Vec::new();
-                let mut used_ids = std::collections::HashSet::new();
-                let mut used_names = std::collections::HashSet::new();
                 for col_id in cols.iter() {
-                    if used_ids.contains(col_id) {
-                        continue; // skip duplicate column ids
-                    }
                     if let Some(binding) = child_scope.resolve_by_id(*col_id) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
@@ -4265,7 +4260,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used_ids.insert(*col_id);
                         continue;
                     }
                     // Fallback: ColumnId → name (via output_columns) → name lookup.
@@ -4274,9 +4268,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                         Some(oc) => oc.name.clone(),
                         None => continue, // column not in this child's output
                     };
-                    if used_names.contains(&col_name.to_lowercase()) {
-                        continue; // skip duplicate column names
-                    }
                     if let Ok(binding) = child_scope.resolve_column(None, &col_name) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
@@ -4285,7 +4276,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used_names.insert(col_name.to_lowercase());
                     }
                 }
                 if partition_exprs.is_empty() {

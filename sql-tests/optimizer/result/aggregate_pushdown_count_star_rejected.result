@@ -6,13 +6,13 @@ PROJECT [count() AS count(*)] stats={rows=1}
       HASH AGGREGATE (LOCAL) stats={rows=1}
         aggregations: count()
         HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=202500000}
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c2]) stats={rows=90000}
+          HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=90000}
             SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a (alias=a) stats={rows=90000}
                  TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_a
                  columns: k
                  min-max stats
                  predicates: a.k IS NOT NULL
-          HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c2]) stats={rows=90000}
+          HASH EXCHANGE (source: ShuffleJoin, hash: [c2]) stats={rows=90000}
             SCAN db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b (alias=b) stats={rows=90000}
                  TABLE: db_sqlt_f6521d6ed49857d9.t_agg_pd_neg_b
                  columns: k

@@ -486,14 +486,14 @@ mod tests {
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
+                spec: DistributionSpec::shuffle_join([ColumnId(10)]),
             }),
             children: vec![left_scan],
         });
         let right = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
+                spec: DistributionSpec::shuffle_join([ColumnId(20)]),
             }),
             children: vec![right_scan],
         });
@@ -758,10 +758,21 @@ mod tests {
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
         );
-        assert_eq!(winner.child_props, vec![required.clone(), required.clone()]);
+        let left_required = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_required = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        assert_eq!(
+            winner.child_props,
+            vec![left_required.clone(), right_required.clone()]
+        );
         assert_eq!(
             winner.child_outputs,
-            vec![required.clone(), required.clone()]
+            vec![left_required.clone(), right_required.clone()]
         );
         assert!(
             winner.enforcer.is_none(),

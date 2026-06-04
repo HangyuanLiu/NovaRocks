@@ -2561,6 +2561,59 @@ fn collapse_distribution_enforcers_for_single_fragment(
     node
 }
 
+fn standalone_join_requires_partitioned(join_type: crate::sql::analysis::JoinKind) -> bool {
+    use crate::sql::analysis::JoinKind::*;
+    matches!(join_type, RightSemi | RightAnti | FullOuter)
+}
+
+fn strip_top_distribution_enforcer(
+    node: crate::sql::optimizer::PhysicalPlanNode,
+) -> crate::sql::optimizer::PhysicalPlanNode {
+    if matches!(
+        &node.op,
+        crate::sql::optimizer::operator::Operator::PhysicalDistribution(_)
+    ) && node.children.len() == 1
+    {
+        return node.children.into_iter().next().expect("single child");
+    }
+    node
+}
+
+fn prefer_broadcast_for_standalone_optional_shuffle_joins(
+    mut node: crate::sql::optimizer::PhysicalPlanNode,
+) -> crate::sql::optimizer::PhysicalPlanNode {
+    use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+
+    node.children = node
+        .children
+        .into_iter()
+        .map(prefer_broadcast_for_standalone_optional_shuffle_joins)
+        .collect();
+
+    if let Operator::PhysicalHashJoin(join) = &mut node.op
+        && matches!(join.distribution, JoinDistribution::Shuffle)
+        && !standalone_join_requires_partitioned(join.join_type)
+    {
+        // Standalone's partitioned hash join is still narrower than the
+        // optimizer's optional shuffle search space. Keep EXPLAIN plans intact,
+        // but execute optional shuffle joins through the established broadcast
+        // path until expression/null/fixed-size partitioned coverage is closed.
+        join.distribution = JoinDistribution::Broadcast;
+        node.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
+        for runtime_filter in &mut node.build_runtime_filters {
+            runtime_filter.distribution = JoinDistribution::Broadcast;
+        }
+        node.children = node
+            .children
+            .into_iter()
+            .map(strip_top_distribution_enforcer)
+            .collect();
+    }
+
+    node
+}
+
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
 /// inline user-defined views and rewrite time-travel refs. Ordinary Iceberg
 /// table resolution is handled by the analyzer provider.
@@ -2863,6 +2916,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         terminal_sink.is_some() || iceberg_catalogs.is_some() || exchange_port == 0;
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    } else {
+        physical = prefer_broadcast_for_standalone_optional_shuffle_joins(physical);
     }
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
@@ -4215,6 +4270,107 @@ path = "{metadata_path}"
     }
 
     #[test]
+    fn standalone_optional_shuffle_join_prefers_broadcast_execution() {
+        use crate::sql::analysis::JoinKind;
+        use crate::sql::optimizer::operator::{
+            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
+            PhysicalValuesOp,
+        };
+        use crate::sql::optimizer::physical_plan::{
+            JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+        };
+        use crate::sql::optimizer::property::DistributionSpec;
+        use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
+        use crate::sql::optimizer::statistics::Statistics;
+
+        fn stats() -> Statistics {
+            Statistics {
+                output_row_count: 0.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            }
+        }
+
+        fn values_node() -> PhysicalPlanNode {
+            PhysicalPlanNode {
+                op: Operator::PhysicalValues(PhysicalValuesOp {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                }),
+                children: Vec::new(),
+                stats: stats(),
+                output_columns: Vec::new(),
+                execution_props: PlanExecutionProps::default(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+            }
+        }
+
+        fn hash_distributed_values_node() -> PhysicalPlanNode {
+            PhysicalPlanNode {
+                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                    spec: DistributionSpec::shuffle_join([crate::sql::column_id::ColumnId(1)]),
+                }),
+                children: vec![values_node()],
+                stats: stats(),
+                output_columns: Vec::new(),
+                execution_props: PlanExecutionProps::default(),
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+            }
+        }
+
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: Vec::new(),
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![
+                hash_distributed_values_node(),
+                hash_distributed_values_node(),
+            ],
+            stats: stats(),
+            output_columns: Vec::new(),
+            execution_props: PlanExecutionProps {
+                join_distribution: Some(JoinExecutionDistribution::Partitioned),
+                ..PlanExecutionProps::default()
+            },
+            build_runtime_filters: {
+                let mut rf = RuntimeFilterDesc::placeholder(9);
+                rf.distribution = JoinDistribution::Shuffle;
+                vec![rf]
+            },
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let rewritten = super::prefer_broadcast_for_standalone_optional_shuffle_joins(plan);
+
+        assert!(matches!(
+            &rewritten.op,
+            Operator::PhysicalHashJoin(join)
+                if matches!(&join.distribution, JoinDistribution::Broadcast)
+        ));
+        assert_eq!(
+            rewritten.execution_props.join_distribution,
+            Some(JoinExecutionDistribution::Broadcast)
+        );
+        assert!(matches!(
+            rewritten.build_runtime_filters[0].distribution,
+            JoinDistribution::Broadcast
+        ));
+        assert!(matches!(
+            &rewritten.children[0].op,
+            Operator::PhysicalValues(_)
+        ));
+        assert!(matches!(
+            &rewritten.children[1].op,
+            Operator::PhysicalValues(_)
+        ));
+    }
+
+    #[test]
     fn metadata_backend_resolves_metadata_path_relative_to_config_parent() {
         let _runtime_guard = lock_runtime_test_state();
         let dir = TempDir::new().expect("create config dir");
@@ -4737,8 +4893,13 @@ enable_path_style_access = true
             }],
         };
         catalog
-            .register_starrocks_table("default", table, layout.clone())
+            .register_starrocks_table("default", table.clone(), layout.clone())
             .expect("register StarRocks tbl");
+        let mut date_dim = table;
+        date_dim.name = "date_dim".to_string();
+        catalog
+            .register_starrocks_table("default", date_dim, layout.clone())
+            .expect("register StarRocks date_dim");
 
         let registry = mock_starrocks_registry_for_engine_test(&layout);
 
@@ -5480,11 +5641,12 @@ enable_path_style_access = true
     /// `TRuntimeFilterDescription`s on the join node, AND assemble a
     /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
     /// (analyze -> plan -> optimize[annotate] -> codegen) over the test
-    /// catalog's `tbl(id int, name varchar)`, self-joined on `id`.
+    /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
+    /// `date_dim` fixture on `id`.
     #[test]
     fn codegen_emits_build_runtime_filters_from_annotation() {
         let build =
-            build_fragments_for_query("SELECT count(*) FROM tbl a JOIN tbl b ON a.id = b.id");
+            build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
         let has_rf = build.fragment_results.iter().any(|fr| {
             fr.plan.nodes.iter().any(|n| {
                 n.hash_join_node

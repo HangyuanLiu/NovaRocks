@@ -415,10 +415,45 @@ pub fn register_expected_chunk_schema(
         }
         Some(_) => {}
         None => {
+            retag_queued_chunks_for_expected_schema(&mut st, &chunk_schema)?;
             st.expected_chunk_schema = Some(chunk_schema);
         }
     }
     receiver.cv.notify_all();
+    Ok(())
+}
+
+fn retag_queued_chunks_for_expected_schema(
+    st: &mut ReceiverState,
+    expected_chunk_schema: &ChunkSchemaRef,
+) -> Result<(), String> {
+    if st.chunks.is_empty() {
+        return Ok(());
+    }
+    let tracker = st.mem_tracker.clone();
+    for chunk in st.chunks.iter_mut() {
+        let wire_meta = ExchangeWireMeta {
+            slot_ids_by_index: chunk
+                .chunk_schema()
+                .slots()
+                .iter()
+                .map(|slot| slot.slot_id())
+                .collect(),
+        };
+        let chunk_schema =
+            chunk_schema_for_wire_meta(Some(expected_chunk_schema), &chunk.batch, &wire_meta)?;
+        let mut retagged = Chunk::try_new_with_chunk_schema(chunk.batch.clone(), chunk_schema)
+            .map_err(|e| {
+                format!(
+                    "retag queued exchange chunk for late expected schema failed: {}",
+                    e
+                )
+            })?;
+        if let Some(tracker) = tracker.as_ref() {
+            retagged.transfer_to(tracker);
+        }
+        *chunk = retagged;
+    }
     Ok(())
 }
 
@@ -1401,8 +1436,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ExchangeKey, cancel_exchange_key, decode_chunks, decode_chunks_for_sender, encode_chunks,
-        push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
+        ExchangeKey, ExchangePopResult, cancel_exchange_key, decode_chunks,
+        decode_chunks_for_sender, encode_chunks, get_receiver_handle, push_chunks,
+        register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
@@ -1655,6 +1691,53 @@ mod tests {
             SlotId::new(32)
         );
         assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn late_expected_schema_registration_retags_queued_wire_chunks() {
+        let key = ExchangeKey {
+            finst_id_hi: 203,
+            finst_id_lo: 204,
+            node_id: 21,
+        };
+        let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
+        assert_eq!(
+            decoded[0].chunk_schema().slots()[0].slot_id(),
+            SlotId::new(33)
+        );
+        push_chunks(key, 7, 1, decoded, false);
+
+        let expected_slots = [
+            SlotId::new(133),
+            SlotId::new(134),
+            SlotId::new(131),
+            SlotId::new(132),
+        ];
+        let expected_chunk = exchange_test_chunk("_cse_0");
+        let expected_chunk_schema =
+            crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                expected_chunk.batch.schema().as_ref(),
+                &expected_slots,
+            )
+            .expect("expected chunk schema");
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let handle = get_receiver_handle(key, 1).expect("receiver handle");
+        let Some(ExchangePopResult::Chunk(chunk)) =
+            handle.try_pop_next_with_stats(1).expect("pop queued chunk")
+        else {
+            panic!("expected queued chunk");
+        };
+        let actual_slots = chunk
+            .chunk_schema()
+            .slots()
+            .iter()
+            .map(|slot| slot.slot_id())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_slots, expected_slots);
 
         cancel_exchange_key(key);
     }

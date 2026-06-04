@@ -62,6 +62,31 @@ fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec
         .collect()
 }
 
+fn shuffle_join_side_column_ids(
+    eq_conditions: &[PhysicalHashJoinEqCondition],
+) -> (Vec<ColumnId>, Vec<ColumnId>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for eq in eq_conditions {
+        if let Some(col) = typed_expr_to_column_id(&eq.left) {
+            left.push(col);
+        }
+        if let Some(col) = typed_expr_to_column_id(&eq.right) {
+            right.push(col);
+        }
+    }
+    (left, right)
+}
+
+fn shuffle_join_keys_are_supported(eq_conditions: &[PhysicalHashJoinEqCondition]) -> bool {
+    !eq_conditions.is_empty()
+        && eq_conditions.iter().all(|eq| {
+            !eq.null_safe
+                && typed_expr_to_column_id(&eq.left).is_some()
+                && typed_expr_to_column_id(&eq.right).is_some()
+        })
+}
+
 fn has_duplicates(cols: &[ColumnId]) -> bool {
     let mut seen = std::collections::HashSet::new();
     cols.iter().any(|col| !seen.insert(*col))
@@ -78,10 +103,7 @@ fn aligned_shuffle_keys(
     eq_conditions: &[PhysicalHashJoinEqCondition],
     parent_required: &PhysicalPropertySet,
 ) -> (Vec<ColumnId>, Vec<ColumnId>) {
-    let fallback = || {
-        let keys = shuffle_join_column_ids(eq_conditions);
-        (keys.clone(), keys)
-    };
+    let fallback = || shuffle_join_side_column_ids(eq_conditions);
 
     let DistributionSpec::HashPartitioned {
         cols: parent_cols,
@@ -176,21 +198,21 @@ impl DeriveRequired for PhysicalHashJoinOp {
                 panic!("unknown join distribution should be resolved before property derivation")
             }
             JoinDistribution::Shuffle => {
-                let all_cols = shuffle_join_column_ids(&self.eq_conditions);
+                let (left_cols, right_cols) = shuffle_join_side_column_ids(&self.eq_conditions);
                 vec![
                     PhysicalPropertySet {
-                        distribution: if all_cols.is_empty() {
+                        distribution: if left_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::shuffle_join(all_cols.clone())
+                            DistributionSpec::shuffle_join(left_cols)
                         },
                         ordering: OrderingSpec::Any,
                     },
                     PhysicalPropertySet {
-                        distribution: if all_cols.is_empty() {
+                        distribution: if right_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::shuffle_join(all_cols)
+                            DistributionSpec::shuffle_join(right_cols)
                         },
                         ordering: OrderingSpec::Any,
                     },
@@ -323,7 +345,15 @@ impl PhysicalHashJoinOp {
                 if !hash_join_only_shuffle(self.join_type) {
                     alternatives.push(Self::broadcast_required_alternative());
                 }
-                alternatives.push(shuffle());
+                // DistributionSpec currently models shuffle keys as strict
+                // ColumnIds. Expression and null-safe equality keys need a
+                // richer shuffle representation before they can safely use
+                // this optional partitioned alternative.
+                if hash_join_only_shuffle(self.join_type)
+                    || shuffle_join_keys_are_supported(&self.eq_conditions)
+                {
+                    alternatives.push(shuffle());
+                }
                 alternatives
             }
             JoinDistribution::Broadcast => {
@@ -370,6 +400,14 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn nested_col(id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Nested(Box::new(col(id))),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
         }
@@ -437,12 +475,62 @@ mod tests {
         assert_eq!(alternatives[1].kind, PropertyAlternativeKind::ShuffleJoin);
         assert_eq!(
             alternatives[1].child_props[0].distribution,
-            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)])
+            DistributionSpec::shuffle_join([ColumnId(10)])
         );
         assert_eq!(
             alternatives[1].child_props[1].distribution,
-            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)])
+            DistributionSpec::shuffle_join([ColumnId(20)])
         );
+    }
+
+    #[test]
+    fn hash_join_unknown_distribution_skips_shuffle_for_expression_keys() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: nested_col(11),
+                    right: nested_col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+    }
+
+    #[test]
+    fn hash_join_unknown_distribution_skips_shuffle_for_null_safe_keys() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: true,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(11),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
     }
 
     #[test]
@@ -551,15 +639,14 @@ mod tests {
             .iter()
             .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
             .expect("shuffle alternative");
-        let fallback = DistributionSpec::shuffle_join([
-            ColumnId(10),
-            ColumnId(20),
-            ColumnId(11),
-            ColumnId(21),
-        ]);
-
-        assert_eq!(shuffle.child_props[0].distribution, fallback);
-        assert_eq!(shuffle.child_props[1].distribution, fallback);
+        assert_eq!(
+            shuffle.child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(11)])
+        );
+        assert_eq!(
+            shuffle.child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)])
+        );
     }
 
     #[test]
@@ -591,10 +678,14 @@ mod tests {
             .iter()
             .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
             .expect("shuffle alternative");
-        let fallback = DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20), ColumnId(21)]);
-
-        assert_eq!(shuffle.child_props[0].distribution, fallback);
-        assert_eq!(shuffle.child_props[1].distribution, fallback);
+        assert_eq!(
+            shuffle.child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(10)])
+        );
+        assert_eq!(
+            shuffle.child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)])
+        );
     }
 
     #[test]
@@ -626,15 +717,14 @@ mod tests {
             .iter()
             .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
             .expect("shuffle alternative");
-        let fallback = DistributionSpec::shuffle_join([
-            ColumnId(10),
-            ColumnId(20),
-            ColumnId(11),
-            ColumnId(21),
-        ]);
-
-        assert_eq!(shuffle.child_props[0].distribution, fallback);
-        assert_eq!(shuffle.child_props[1].distribution, fallback);
+        assert_eq!(
+            shuffle.child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(11)])
+        );
+        assert_eq!(
+            shuffle.child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)])
+        );
     }
 
     #[test]
@@ -717,38 +807,18 @@ mod tests {
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
 
-        // Design note (mirrors the production code path in this file): a
-        // shuffle join's required_input_properties provides ALL eq column
-        // refs (from both sides) to each child. Fragment builder resolves
-        // only those that exist in each child's scope. This gives the
-        // optimizer freedom when JoinCommutativity swaps children and the
-        // eq_condition pair order becomes ambiguous. We therefore check
-        // that both "a.id" and "b.id" appear on each side, regardless of
-        // index order.
-        for (side_label, req) in [("left", &reqs[0]), ("right", &reqs[1])] {
+        // Shuffle children must be partitioned by their own side of each eq
+        // pair. Mixing both sides into each child is unsafe for qualified
+        // self-joins because fragment building may resolve the other side by
+        // name and create a different physical hash key.
+        for (side_label, req, expected) in [
+            ("left", &reqs[0], ColumnId(6)),
+            ("right", &reqs[1], ColumnId(7)),
+        ] {
             match &req.distribution {
                 DistributionSpec::HashPartitioned { cols, source } => {
                     assert_eq!(*source, HashSource::ShuffleJoin);
-                    assert_eq!(
-                        cols.len(),
-                        2,
-                        "{} side should receive both eq column ids",
-                        side_label
-                    );
-                    // Both sides should get ColumnId(6) (a.id) and ColumnId(7) (b.id).
-                    let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                    assert!(
-                        ids.contains(&ColumnId(6)),
-                        "{} side missing ColumnId(6), got {:?}",
-                        side_label,
-                        ids
-                    );
-                    assert!(
-                        ids.contains(&ColumnId(7)),
-                        "{} side missing ColumnId(7), got {:?}",
-                        side_label,
-                        ids
-                    );
+                    assert_eq!(cols.as_slice(), &[expected], "{side_label} side");
                 }
                 other => panic!(
                     "expected HashPartitioned for {} side, got {:?}",
@@ -799,18 +869,17 @@ mod tests {
 
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
-        for req in &reqs {
+        for (req, expected_cols) in [
+            (&reqs[0], &[ColumnId(10), ColumnId(11)][..]),
+            (&reqs[1], &[ColumnId(20), ColumnId(21)][..]),
+        ] {
             match &req.distribution {
                 DistributionSpec::HashPartitioned { cols, source } => {
                     assert_eq!(*source, HashSource::ShuffleJoin);
-                    assert_eq!(
-                        cols.as_slice(),
-                        &[ColumnId(10), ColumnId(20), ColumnId(11), ColumnId(21)]
-                    );
+                    assert_eq!(cols.as_slice(), expected_cols);
                 }
-                other => panic!("expected ShuffleJoin interleaved required key, got {other:?}"),
+                other => panic!("expected ShuffleJoin side-specific required key, got {other:?}"),
             }
-            assert_eq!(req.distribution, expected);
         }
     }
 

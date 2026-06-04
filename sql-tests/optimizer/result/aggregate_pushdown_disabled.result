@@ -9,18 +9,17 @@ GATHER EXCHANGE stats={rows=10}
           HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
             aggregations: sum(sum(a.v))
             HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=22500}
-              HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=10}
-                HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
-                  aggregations: sum(a.v)
-                  HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
-                    HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
-                      aggregations: sum(a.v)
-                      SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
-                           TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
-                           columns: k, v
-                           min-max stats
-                           predicates: a.k IS NOT NULL
-              HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=90000}
+              HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
+                aggregations: sum(a.v)
+                HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
+                  HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
+                    aggregations: sum(a.v)
+                    SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
+                         TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
+                         columns: k, v
+                         min-max stats
+                         predicates: a.k IS NOT NULL
+              HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90000}
                 SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
                      TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                      columns: k
@@ -39,13 +38,13 @@ GATHER EXCHANGE stats={rows=10}
           HASH JOIN (PARTITIONED, INNER, eq: [a.k = b.k]) stats={rows=202500000}
             build runtime filters:
             - filter_id = 0, build_expr = (b.k)
-            HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=90000}
+            HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=90000}
               SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a (alias=a) stats={rows=90000}
                    TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_a
                    columns: k, v
                    min-max stats
                    predicates: a.k IS NOT NULL
-            HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=90000}
+            HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90000}
               SCAN db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b (alias=b) stats={rows=90000}
                    TABLE: db_sqlt_f32a3c968c4a4a41.t_agg_pd_dis_b
                    columns: k
