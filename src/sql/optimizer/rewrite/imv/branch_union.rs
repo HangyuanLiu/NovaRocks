@@ -412,6 +412,7 @@ mod tests {
                     input: Box::new(aggregate_over(scan("t1", 1))),
                     is_root: false,
                     action_column: None,
+                    branch_scope: None,
                 }),
                 aggregate_over(scan("t2", 10)),
             ],
@@ -607,6 +608,7 @@ mod tests {
             input: Box::new(input),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         })
     }
 

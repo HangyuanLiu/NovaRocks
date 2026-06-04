@@ -126,6 +126,7 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
                 input: Box::new(LogicalPlan::Aggregate(aggregate)),
                 is_root: true,
                 action_column: Some(action_column),
+                branch_scope: None,
             },
         )))
     }
@@ -191,6 +192,7 @@ fn wrap_scan_marker(scan: LogicalPlan, marker: MarkerKind) -> LogicalPlan {
             input: Box::new(scan),
             is_root: false,
             action_column: Some(action_column),
+            branch_scope: None,
         }),
         MarkerKind::Version(version_ref) => LogicalPlan::ImvVersion(ImvVersionNode {
             input: Box::new(scan),
@@ -471,6 +473,7 @@ mod tests {
             input: Box::new(input),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         })
     }
 

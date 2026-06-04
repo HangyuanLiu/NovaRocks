@@ -614,6 +614,7 @@ fn signed_aggregate(
             input: aggregate.input,
             is_root: false,
             action_column: Some(action_column),
+            branch_scope: None,
         }))
     };
     let aggregate_output_columns =
@@ -1453,6 +1454,7 @@ mod tests {
             input: Box::new(input),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         })
     }
 
@@ -1463,6 +1465,7 @@ mod tests {
                     input: Box::new(leaf_scan()),
                     is_root: false,
                     action_column: Some(ColumnId::new_for_test(100)),
+                    branch_scope: None,
                 }),
                 LogicalPlan::ImvVersion(ImvVersionNode {
                     input: Box::new(leaf_scan()),
@@ -1500,6 +1503,7 @@ mod tests {
             input: Box::new(aggregate_over(leaf_scan())),
             is_root: false,
             action_column: None,
+            branch_scope: None,
         });
         assert!(!rule.matches(&nested_delta, &ctx));
     }

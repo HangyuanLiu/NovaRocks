@@ -83,6 +83,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                 input: Box::new(LogicalPlan::Aggregate(aggregate)),
                 is_root: true,
                 action_column: Some(action_column),
+                branch_scope: None,
             },
         )))
     }
@@ -609,6 +610,7 @@ mod tests {
             input: Box::new(input),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         })
     }
 
@@ -707,6 +709,7 @@ mod tests {
                     input: Box::new(scan("t1", 1)),
                     is_root: false,
                     action_column: Some(ColumnId(99)),
+                    branch_scope: None,
                 }),
                 scan("t2", 1),
             ],

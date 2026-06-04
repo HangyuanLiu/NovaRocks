@@ -24,6 +24,11 @@ pub(crate) struct ImvDeltaNode {
     pub input: Box<LogicalPlan>,
     pub is_root: bool,
     pub action_column: Option<ColumnId>,
+    /// Inherited identity context threaded top-down by `RewriteBranchUnion`.
+    /// `Some(scope)` means this delta sub-problem belongs to UNION ALL branch
+    /// `scope.branch_id`; the eventual aggregate-state merge scopes the target
+    /// state read and the apply key by it. `None` for the ordinary single root.
+    pub branch_scope: Option<crate::sql::catalog::BranchScope>,
 }
 
 /// `Version(plan, version_ref)` — "scan plan over the snapshot window
@@ -129,6 +134,7 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
                 input: Box::new(plan),
                 is_root: true,
                 action_column: None,
+                branch_scope: None,
             },
         )))
     }
@@ -297,6 +303,7 @@ mod tests {
             input: Box::new(empty_values_plan()),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         });
         let before = format!("{already:?}");
 
@@ -377,6 +384,7 @@ mod tests {
             input: Box::new(empty_values_plan()),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         };
         assert!(node.is_root);
         assert!(node.action_column.is_none());
@@ -403,6 +411,7 @@ mod tests {
             input: Box::new(empty_values_plan()),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         });
         assert!(plan_contains_imv_marker(&plan));
     }
@@ -440,6 +449,7 @@ mod tests {
             })),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         });
         assert_eq!(collect_marker_kinds(&delta), vec!["ImvDelta", "ImvVersion"]);
     }

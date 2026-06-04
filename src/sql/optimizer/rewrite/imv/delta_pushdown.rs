@@ -86,6 +86,7 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
                     input: p.input,
                     is_root: false,
                     action_column,
+                    branch_scope: None,
                 });
                 p.input = Box::new(inner);
                 Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
@@ -95,6 +96,7 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
                     input: f.input,
                     is_root: false,
                     action_column,
+                    branch_scope: None,
                 });
                 f.input = Box::new(inner);
                 Ok(RewriteResult::Changed(LogicalPlan::Filter(f)))
@@ -183,6 +185,7 @@ mod tests {
             input: Box::new(input),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         })
     }
 
