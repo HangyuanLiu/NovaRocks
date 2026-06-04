@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::sql::analysis::ExprKind;
 use crate::sql::optimizer::rewrite::rules::join_reorder::cardinality::estimate_statistics;
-use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
 
 #[cfg(test)]
 use crate::sql::analysis::TypedExpr;
@@ -31,11 +31,16 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
         .partial_groupby
         .iter()
         .map(|gb| match &gb.kind {
-            ExprKind::ColumnRef { column, .. } => stats
-                .column_statistics
-                .get(column)
-                .map(|cs| cs.distinct_values_count)
-                .filter(|n| n.is_finite() && *n > 0.0),
+            ExprKind::ColumnRef { column, .. } => {
+                stats.column_statistics.get(column).and_then(|cs| {
+                    let ndv = cs.distinct_values_count;
+                    if cs.confidence != Confidence::Fallback && ndv.is_finite() && ndv > 0.0 {
+                        Some(ndv)
+                    } else {
+                        None
+                    }
+                })
+            }
             _ => None,
         })
         .collect();
@@ -102,6 +107,11 @@ mod tests {
             required_output_columns: None,
         });
         let mut col_stats = HashMap::new();
+        let confidence = if ndv.is_finite() {
+            Confidence::Exact
+        } else {
+            Confidence::Fallback
+        };
         col_stats.insert(
             col.to_string(),
             ColumnStatistic {
@@ -110,7 +120,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                confidence,
             },
         );
         let mut table_stats = HashMap::new();
