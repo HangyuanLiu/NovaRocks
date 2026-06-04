@@ -8,9 +8,11 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     JoinDistribution, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
 };
-use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
+use crate::sql::optimizer::property::{
+    DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet,
+};
 
-use super::{DeriveOutput, DeriveRequired};
+use super::{ChildRequirementAlternative, DeriveOutput, DeriveRequired, PropertyAlternativeKind};
 
 /// Join types whose output rows are streamed from the left side intact —
 /// the join only filters/augments by attaching right-side data on a per-
@@ -44,6 +46,68 @@ fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec
             cols
         })
         .collect()
+}
+
+fn left_key_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec<ColumnId> {
+    eq_conditions
+        .iter()
+        .filter_map(|eq| typed_expr_to_column_id(&eq.left))
+        .collect()
+}
+
+fn right_key_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec<ColumnId> {
+    eq_conditions
+        .iter()
+        .filter_map(|eq| typed_expr_to_column_id(&eq.right))
+        .collect()
+}
+
+fn aligned_shuffle_keys(
+    eq_conditions: &[PhysicalHashJoinEqCondition],
+    parent_required: &PhysicalPropertySet,
+) -> (Vec<ColumnId>, Vec<ColumnId>) {
+    let left = left_key_ids(eq_conditions);
+    let right = right_key_ids(eq_conditions);
+    let DistributionSpec::HashPartitioned {
+        cols: parent_cols,
+        source: HashSource::ShuffleJoin,
+    } = &parent_required.distribution
+    else {
+        return (
+            shuffle_join_column_ids(eq_conditions),
+            shuffle_join_column_ids(eq_conditions),
+        );
+    };
+
+    let mut aligned_left = Vec::new();
+    let mut aligned_right = Vec::new();
+    for parent_col in parent_cols {
+        if let Some(pos) = left.iter().position(|left_col| left_col == parent_col) {
+            aligned_left.push(left[pos]);
+            aligned_right.push(right[pos]);
+        } else if let Some(pos) = right.iter().position(|right_col| right_col == parent_col) {
+            aligned_left.push(left[pos]);
+            aligned_right.push(right[pos]);
+        } else {
+            return (
+                shuffle_join_column_ids(eq_conditions),
+                shuffle_join_column_ids(eq_conditions),
+            );
+        }
+    }
+    if aligned_left.len() == left.len() && aligned_right.len() == right.len() {
+        (aligned_left, aligned_right)
+    } else {
+        (
+            shuffle_join_column_ids(eq_conditions),
+            shuffle_join_column_ids(eq_conditions),
+        )
+    }
+}
+
+fn hash_join_only_shuffle(join_type: crate::sql::analysis::JoinKind) -> bool {
+    use crate::sql::analysis::JoinKind::*;
+    matches!(join_type, RightOuter | RightSemi | RightAnti | FullOuter)
 }
 
 /// Given a set of column ids representing a HashPartitioned key, and the
@@ -187,10 +251,37 @@ impl PhysicalHashJoinOp {
         &self,
         parent_required: &PhysicalPropertySet,
         num_children: usize,
-    ) -> Vec<super::ChildRequirementAlternative> {
-        vec![super::ChildRequirementAlternative::default(
-            self.derive_required(parent_required, num_children),
-        )]
+    ) -> Vec<ChildRequirementAlternative> {
+        if num_children != 2 {
+            return vec![ChildRequirementAlternative::default(vec![
+                PhysicalPropertySet::any();
+                num_children
+            ])];
+        }
+
+        let mut alternatives = Vec::new();
+        if !hash_join_only_shuffle(self.join_type) {
+            alternatives.push(ChildRequirementAlternative {
+                kind: PropertyAlternativeKind::BroadcastJoin,
+                child_props: vec![PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()],
+            });
+        }
+
+        let (left_keys, right_keys) = aligned_shuffle_keys(&self.eq_conditions, parent_required);
+        alternatives.push(ChildRequirementAlternative {
+            kind: PropertyAlternativeKind::ShuffleJoin,
+            child_props: vec![
+                PhysicalPropertySet {
+                    distribution: DistributionSpec::shuffle_join(left_keys),
+                    ordering: OrderingSpec::Any,
+                },
+                PhysicalPropertySet {
+                    distribution: DistributionSpec::shuffle_join(right_keys),
+                    ordering: OrderingSpec::Any,
+                },
+            ],
+        });
+        alternatives
     }
 }
 
@@ -199,6 +290,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::property::HashSource;
 
     fn col(id: u32) -> TypedExpr {
@@ -246,6 +338,81 @@ mod tests {
             other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
         }
         assert_eq!(out.ordering, OrderingSpec::Any);
+    }
+
+    #[test]
+    fn hash_join_required_alternatives_include_broadcast_and_shuffle() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(20),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert_eq!(
+            alternatives[0].child_props[0].distribution,
+            DistributionSpec::Any
+        );
+        assert_eq!(
+            alternatives[0].child_props[1].distribution,
+            DistributionSpec::Broadcast
+        );
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::ShuffleJoin);
+        assert_eq!(
+            alternatives[1].child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)])
+        );
+        assert_eq!(
+            alternatives[1].child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)])
+        );
+    }
+
+    #[test]
+    fn hash_join_shuffle_alternative_aligns_with_parent_required_order() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(11),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(11), ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let alternatives = op.derive_required_alternatives(&parent, 2);
+        let shuffle = alternatives
+            .iter()
+            .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
+            .expect("shuffle alternative");
+
+        assert_eq!(
+            shuffle.child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(11), ColumnId(10)])
+        );
+        assert_eq!(
+            shuffle.child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(21), ColumnId(20)])
+        );
     }
 
     #[test]
