@@ -85,7 +85,7 @@ impl ApplyKeyContract {
     pub(crate) fn branch_union_aggregate_group_row() -> Self {
         Self {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8,
             rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: true,
@@ -1549,6 +1549,10 @@ mod tests {
         assert_eq!(
             contract.apply_key,
             ApplyKeyContract::branch_union_aggregate_group_row()
+        );
+        assert_eq!(
+            contract.apply_key.value_type,
+            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
         );
         assert_eq!(
             contract.aggregate,
