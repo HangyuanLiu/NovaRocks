@@ -343,6 +343,9 @@ fn annotate_node(
     }
     let eq_conditions = join.eq_conditions.clone();
     let distribution = join.distribution.clone();
+    if matches!(distribution, JoinDistribution::Unknown) {
+        return;
+    }
     // Right child is build side (confirmed via pipeline builder + lowering).
     let build_size = node.children[1].stats.compute_size();
     let probe_size = node.children[0].stats.compute_size();
@@ -731,6 +734,20 @@ mod tests {
     }
 
     #[test]
+    fn unknown_join_distribution_does_not_build_runtime_filters() {
+        let mut join = super::test_support::inner_join_two_scans();
+        let Operator::PhysicalHashJoin(op) = &mut join.op else {
+            panic!("expected hash join");
+        };
+        op.distribution = JoinDistribution::Unknown;
+
+        annotate(&mut join, &OptimizerOptions::default_settings());
+
+        assert!(join.build_runtime_filters.is_empty());
+        assert_eq!(probe_runtime_filter_count(&join), 0);
+    }
+
+    #[test]
     fn session_build_max_can_skip_rf() {
         // build_rows=1000, avg_row_size=8 bytes -> build_size=8KB.
         // With rf_build_max_bytes=1, build gate rejects even a tiny build.
@@ -739,5 +756,14 @@ mod tests {
         opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
         annotate(&mut j, &opts);
         assert!(j.build_runtime_filters.is_empty());
+    }
+
+    fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {
+        node.probe_runtime_filters.len()
+            + node
+                .children
+                .iter()
+                .map(probe_runtime_filter_count)
+                .sum::<usize>()
     }
 }
