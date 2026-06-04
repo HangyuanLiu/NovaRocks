@@ -6,6 +6,13 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::*;
+use crate::sql::optimizer::estimate::cardinality::{
+    JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
+    union_distinct_rows,
+};
+use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
+use crate::sql::optimizer::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
+use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::{estimate_selectivity, extract_column_name};
 use crate::sql::planner::plan::*;
@@ -38,6 +45,7 @@ pub(crate) fn estimate_statistics(
             let repeat_times = r.repeat_column_ref_list.len() as f64;
             Statistics {
                 output_row_count: input.output_row_count * repeat_times,
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: input.column_statistics,
             }
         }
@@ -45,10 +53,12 @@ pub(crate) fn estimate_statistics(
         LogicalPlan::CTEProduce(node) => estimate_statistics(&node.input, table_stats),
         LogicalPlan::Values(v) => Statistics {
             output_row_count: v.rows.len() as f64,
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::GenerateSeries(g) => Statistics {
             output_row_count: generate_series_row_count_f64(g.start, g.end, g.step),
+            row_count_confidence: Confidence::Exact,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::TableFunction(t) => {
@@ -60,11 +70,13 @@ pub(crate) fn estimate_statistics(
                 } else {
                     estimated_rows.max(1.0)
                 },
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
         LogicalPlan::CTEConsume(_) => Statistics {
             output_row_count: 1000.0,
+            row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
         },
         LogicalPlan::Decode(d) => estimate_statistics(&d.input, table_stats),
@@ -74,6 +86,7 @@ pub(crate) fn estimate_statistics(
             Statistics {
                 output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
                     .max(1.0),
+                row_count_confidence: Confidence::Estimated,
                 column_statistics: HashMap::new(),
             }
         }
@@ -84,24 +97,25 @@ pub(crate) fn estimate_statistics(
 }
 
 fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>) -> Statistics {
-    let key = scan
-        .alias
+    let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
+    let table_key = scan.table.name.to_lowercase();
+    let ts_opt = alias_key
         .as_deref()
-        .unwrap_or(&scan.table.name)
-        .to_lowercase();
+        .and_then(|k| table_stats.get(k))
+        .or_else(|| table_stats.get(&table_key));
 
-    if let Some(ts) = table_stats.get(&key) {
+    if let Some(ts) = ts_opt {
         let row_count = ts.row_count.max(1) as f64;
 
-        // Apply scan-level predicate selectivity.
-        let mut selectivity = 1.0;
+        let mut output_rows = row_count;
+        let mut row_count_confidence = Confidence::Exact;
         for pred in &scan.predicates {
-            selectivity *= estimate_selectivity(pred, &ts.column_stats);
+            let selectivity = estimate_selectivity(pred, &ts.column_stats);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
         }
 
-        let output_rows = (row_count * selectivity).max(1.0);
-
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| {
@@ -114,20 +128,31 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
                 (col_name, cs)
             })
             .collect();
+        cap_column_ndvs(&mut column_statistics, output_rows);
 
         Statistics {
             output_row_count: output_rows,
+            row_count_confidence,
             column_statistics,
         }
     } else {
         // No table stats available: use defaults.
-        let column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
+        let mut output_rows = 10_000.0;
+        let mut row_count_confidence = Confidence::Fallback;
+        for pred in &scan.predicates {
+            let selectivity = estimate_selectivity(pred, &column_statistics);
+            (output_rows, row_count_confidence) =
+                apply_filter(output_rows, row_count_confidence, selectivity);
+        }
+        cap_column_ndvs(&mut column_statistics, output_rows);
         Statistics {
-            output_row_count: 10_000.0,
+            output_row_count: output_rows,
+            row_count_confidence,
             column_statistics,
         }
     }
@@ -139,10 +164,17 @@ fn estimate_filter(
 ) -> Statistics {
     let input_stats = estimate_statistics(&filter.input, table_stats);
     let selectivity = estimate_selectivity(&filter.predicate, &input_stats.column_statistics);
-    let output_rows = (input_stats.output_row_count * selectivity).max(1.0);
+    let (output_rows, row_count_confidence) = apply_filter(
+        input_stats.output_row_count,
+        input_stats.row_count_confidence,
+        selectivity,
+    );
+    let mut column_statistics = input_stats.column_statistics;
+    cap_column_ndvs(&mut column_statistics, output_rows);
     Statistics {
         output_row_count: output_rows,
-        column_statistics: input_stats.column_statistics,
+        row_count_confidence,
+        column_statistics,
     }
 }
 
@@ -166,6 +198,7 @@ fn estimate_project(
         .collect();
     Statistics {
         output_row_count: input_stats.output_row_count,
+        row_count_confidence: Confidence::Estimated,
         column_statistics: projected,
     }
 }
@@ -180,22 +213,21 @@ fn estimate_aggregate(
         // Scalar aggregation: exactly one output row.
         return Statistics {
             output_row_count: 1.0,
+            row_count_confidence: Confidence::Estimated,
             column_statistics: HashMap::new(),
         };
     }
 
-    // Product of NDVs of group-by keys, capped by correlation factor.
-    let mut ndv_product = 1.0f64;
-    for gb_expr in &agg.group_by {
-        let ndv = get_expr_ndv(gb_expr, &input_stats.column_statistics);
-        ndv_product *= ndv;
-    }
-
-    let capped = input_stats.output_row_count * UNKNOWN_GROUP_BY_CORRELATION;
-    let output_rows = ndv_product.min(capped).max(1.0);
+    let group_key_ndvs: Vec<f64> = agg
+        .group_by
+        .iter()
+        .map(|gb_expr| get_expr_ndv(gb_expr, &input_stats.column_statistics))
+        .collect();
+    let output_rows = agg_group_rows(&group_key_ndvs, input_stats.output_row_count);
 
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence: Confidence::derive(&[input_stats.row_count_confidence], false),
         column_statistics: HashMap::new(),
     }
 }
@@ -204,84 +236,21 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
     let left_stats = estimate_statistics(&join.left, table_stats);
     let right_stats = estimate_statistics(&join.right, table_stats);
 
-    let left_rows = left_stats.output_row_count.max(1.0);
-    let right_rows = right_stats.output_row_count.max(1.0);
-
-    let output_rows = match join.join_type {
-        JoinKind::Cross => left_rows * right_rows,
-        JoinKind::Inner => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                (left_rows * right_rows / key_ndv).max(1.0)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::LeftOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(left_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::RightOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(right_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::FullOuter => {
-            if let Some(ref cond) = join.condition {
-                let key_ndv = get_join_key_ndv(
-                    cond,
-                    &left_stats.column_statistics,
-                    &right_stats.column_statistics,
-                );
-                let inner = left_rows * right_rows / key_ndv;
-                inner.max(left_rows).max(right_rows)
-            } else {
-                left_rows * right_rows
-            }
-        }
-        JoinKind::LeftSemi => {
-            // At most left_rows, apply selectivity.
-            if let Some(ref cond) = join.condition {
-                let sel = estimate_selectivity(cond, &left_stats.column_statistics);
-                (left_rows * sel).max(1.0)
-            } else {
-                left_rows
-            }
-        }
-        JoinKind::RightSemi => {
-            if let Some(ref cond) = join.condition {
-                let sel = estimate_selectivity(cond, &right_stats.column_statistics);
-                (right_rows * sel).max(1.0)
-            } else {
-                right_rows
-            }
-        }
-        JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-            (left_rows * ANTI_JOIN_SELECTIVITY).max(1.0)
-        }
-        JoinKind::RightAnti => (right_rows * ANTI_JOIN_SELECTIVITY).max(1.0),
-    };
+    let join_condition = estimate_join_condition(
+        join.condition.as_ref(),
+        &left_stats.column_statistics,
+        &right_stats.column_statistics,
+    );
+    let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
+        left: (left_stats.output_row_count, left_stats.row_count_confidence),
+        right: (
+            right_stats.output_row_count,
+            right_stats.row_count_confidence,
+        ),
+        kind: join.join_type,
+        eq_key_ndvs: join_condition.eq_key_ndvs,
+        non_equi_selectivity: join_condition.residual_selectivity,
+    });
 
     // Merge column statistics from both sides.
     let mut column_statistics = left_stats.column_statistics;
@@ -289,6 +258,7 @@ fn estimate_join(join: &JoinNode, table_stats: &HashMap<String, TableStatistics>
 
     Statistics {
         output_row_count: output_rows,
+        row_count_confidence,
         column_statistics,
     }
 }
@@ -302,25 +272,36 @@ fn estimate_limit(limit: &LimitNode, table_stats: &HashMap<String, TableStatisti
     };
     Statistics {
         output_row_count: output_rows.max(0.0),
+        row_count_confidence: Confidence::Estimated,
         column_statistics: input_stats.column_statistics,
     }
 }
 
 fn estimate_union(union: &UnionNode, table_stats: &HashMap<String, TableStatistics>) -> Statistics {
-    let mut total_rows = 0.0;
-    let mut column_statistics = HashMap::new();
-    for input in &union.inputs {
-        let s = estimate_statistics(input, table_stats);
-        total_rows += s.output_row_count;
-        if column_statistics.is_empty() {
-            column_statistics = s.column_statistics;
-        }
-    }
-    if !union.all {
-        total_rows *= UNKNOWN_GROUP_BY_CORRELATION;
-    }
+    let input_stats: Vec<_> = union
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = if union.all {
+        union_all_rows(&input_rows)
+    } else {
+        union_distinct_rows(&input_rows)
+    };
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .first()
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
     Statistics {
-        output_row_count: total_rows.max(1.0),
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
         column_statistics,
     }
 }
@@ -329,17 +310,31 @@ fn estimate_intersect(
     intersect: &IntersectNode,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    let mut min_rows = f64::MAX;
-    let mut column_statistics = HashMap::new();
-    for input in &intersect.inputs {
-        let s = estimate_statistics(input, table_stats);
-        if s.output_row_count < min_rows {
-            min_rows = s.output_row_count;
-            column_statistics = s.column_statistics;
-        }
-    }
+    let input_stats: Vec<_> = intersect
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = intersect_rows(&input_rows);
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .iter()
+        .min_by(|a, b| {
+            a.output_row_count
+                .partial_cmp(&b.output_row_count)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
     Statistics {
-        output_row_count: (min_rows * 0.5).max(1.0),
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
         column_statistics,
     }
 }
@@ -348,17 +343,41 @@ fn estimate_except(
     except: &ExceptNode,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    if let Some(first) = except.inputs.first() {
-        let s = estimate_statistics(first, table_stats);
-        Statistics {
-            output_row_count: (s.output_row_count * 0.5).max(1.0),
-            column_statistics: s.column_statistics,
-        }
+    let input_stats: Vec<_> = except
+        .inputs
+        .iter()
+        .map(|input| estimate_statistics(input, table_stats))
+        .collect();
+    let input_rows: Vec<_> = input_stats.iter().map(|s| s.output_row_count).collect();
+    let (formula_rows, saturated_or_defaulted) = except_rows(&input_rows);
+    let (output_row_count, defaulted_output_rows) = positive_set_op_output_rows(formula_rows);
+    let row_confidences: Vec<_> = input_stats.iter().map(|s| s.row_count_confidence).collect();
+    let column_statistics = input_stats
+        .first()
+        .map(|s| s.column_statistics.clone())
+        .unwrap_or_default();
+
+    Statistics {
+        output_row_count,
+        row_count_confidence: Confidence::derive(
+            &row_confidences,
+            saturated_or_defaulted || defaulted_output_rows,
+        ),
+        column_statistics,
+    }
+}
+
+fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
+    if !rows.is_finite() || rows < 1.0 {
+        (1.0, true)
     } else {
-        Statistics {
-            output_row_count: 1.0,
-            column_statistics: HashMap::new(),
-        }
+        (rows, false)
+    }
+}
+
+fn cap_column_ndvs(column_statistics: &mut HashMap<String, ColumnStatistic>, output_rows: f64) {
+    for stat in column_statistics.values_mut() {
+        stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
     }
 }
 
@@ -368,7 +387,7 @@ fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic
     // Only treat a column as informative when it has a real NDV (> 1).
     // ColumnStatistic::unknown() (no-stats / managed-lake tables) reports
     // distinct_values_count = 1.0; using that as a true NDV would let
-    // get_join_key_ndv divide left*right by ~1 and explode joins to near
+    // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products. Guard `> 1.0` (mirroring estimate_eq_selectivity) so
     // unknown/degenerate columns fall back to the default NDV below.
     if let Some(name) = extract_column_name(expr)
@@ -379,37 +398,6 @@ fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic
     }
     // Default NDV for unknown expressions.
     10.0
-}
-
-/// For a join condition, extract the max NDV of join keys from both sides.
-fn get_join_key_ndv(
-    condition: &TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
-) -> f64 {
-    // For a simple `left_col = right_col`, take max(ndv(left), ndv(right)).
-    match &condition.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-        } => {
-            let left_ndv = get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
-            let right_ndv = get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
-            left_ndv.max(right_ndv).max(1.0)
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            // AND of multiple join keys: take the max NDV across all.
-            let l = get_join_key_ndv(left, left_stats, right_stats);
-            let r = get_join_key_ndv(right, left_stats, right_stats);
-            l.max(r)
-        }
-        _ => 1.0, // Conservative default.
-    }
 }
 
 // ===========================================================================
@@ -455,6 +443,7 @@ mod tests {
                     nulls_fraction: 0.01,
                     average_row_size: 8.0,
                     distinct_values_count: ndv,
+                    confidence: Confidence::Exact,
                 },
             );
         }
@@ -521,6 +510,26 @@ mod tests {
             dict_columns: vec![],
             required_output_columns: None,
         })
+    }
+
+    fn scan_plan_with_alias(name: &str, alias: &str, cols: &[&str]) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.alias = Some(alias.to_string());
+        LogicalPlan::Scan(node)
+    }
+
+    fn scan_plan_with_predicates(
+        name: &str,
+        cols: &[&str],
+        predicates: Vec<TypedExpr>,
+    ) -> LogicalPlan {
+        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+            unreachable!("scan_plan always returns a Scan");
+        };
+        node.predicates = predicates;
+        LogicalPlan::Scan(node)
     }
 
     fn col_ref(name: &str) -> TypedExpr {
@@ -591,6 +600,50 @@ mod tests {
         assert!((stats.output_row_count - 100_000.0).abs() < 1.0);
         assert!(stats.column_statistics.contains_key("id"));
         assert!(stats.column_statistics.contains_key("status"));
+        assert_eq!(stats.row_count_confidence, Confidence::Exact);
+        assert_eq!(stats.column_statistics["id"].confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn aliased_scan_falls_back_to_table_name_stats() {
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan = scan_plan_with_alias("orders", "o", &["id"]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert!((stats.output_row_count - 100_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn scan_with_table_stats_and_predicate_downgrades_row_confidence() {
+        let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn scan_with_table_stats_and_predicate_caps_ndv_at_output_rows() {
+        let (name, ts) = make_table_stats("orders", 1_000, &[("id", 1_000_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert_eq!(stats.output_row_count, 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(stats.column_statistics["id"].distinct_values_count, 1.0);
     }
 
     #[test]
@@ -598,6 +651,21 @@ mod tests {
         let plan = scan_plan("unknown", &["x"]);
         let stats = estimate_statistics(&plan, &HashMap::new());
         assert!((stats.output_row_count - 10_000.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(
+            stats.column_statistics["x"].confidence,
+            Confidence::Fallback
+        );
+    }
+
+    #[test]
+    fn scan_without_stats_applies_predicate_selectivity_as_fallback() {
+        let plan =
+            scan_plan_with_predicates("unknown", &["x"], vec![eq_expr(col_ref("x"), int_lit(42))]);
+        let stats = estimate_statistics(&plan, &HashMap::new());
+
+        assert!((stats.output_row_count - 2_500.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
@@ -620,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn and_selectivity_multiplies() {
+    fn and_selectivity_uses_damped_conjunction() {
         let col_stats: HashMap<String, ColumnStatistic> = [
             (
                 "a".to_string(),
@@ -630,6 +698,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 100.0,
+                    ..Default::default()
                 },
             ),
             (
@@ -640,6 +709,7 @@ mod tests {
                     nulls_fraction: 0.0,
                     average_row_size: 4.0,
                     distinct_values_count: 50.0,
+                    ..Default::default()
                 },
             ),
         ]
@@ -651,8 +721,13 @@ mod tests {
             eq_expr(col_ref("b"), int_lit(2)),
         );
         let sel = estimate_selectivity(&pred, &col_stats);
-        // 1/100 * 1/50 = 0.0002
-        assert!((sel - 0.0002).abs() < 0.0001);
+        // Damped conjunction sorts 0.01 and 0.02 ascending:
+        // 0.01 * sqrt(0.02) ~= 0.001414213562.
+        let expected = 0.01_f64 * 0.02_f64.sqrt();
+        assert!(
+            (sel - expected).abs() < 1e-12,
+            "expected damped selectivity {expected}, got {sel}"
+        );
     }
 
     #[test]
@@ -665,6 +740,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: 4.0,
+                ..Default::default()
             },
         )]
         .into_iter()
@@ -689,6 +765,7 @@ mod tests {
                 nulls_fraction: 0.05,
                 average_row_size: 4.0,
                 distinct_values_count: 100.0,
+                ..Default::default()
             },
         )]
         .into_iter()
@@ -727,8 +804,34 @@ mod tests {
         });
 
         let stats = estimate_statistics(&plan, &table_stats);
-        // 6M * 1.5M / max(1.5M, 1.5M) = 6M
+        // Containment formula: 6M * 1.5M / max(1.5M, 1.5M) = 6M.
+        // The equality predicate must not be applied again as residual
+        // selectivity.
         assert!((stats.output_row_count - 6_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn filter_floor_downgrades_confidence_and_caps_payload_ndv() {
+        let (name, ts) = make_table_stats("t", 1_000, &[("a", 1_000.0), ("b", 1_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("t", &["a", "b"]);
+        let pred = and_expr(
+            eq_expr(col_ref("a"), int_lit(42)),
+            eq_expr(col_ref("b"), int_lit(7)),
+        );
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: pred,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+        assert_eq!(stats.output_row_count, 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        assert_eq!(stats.column_statistics["a"].distinct_values_count, 1.0);
+        assert_eq!(stats.column_statistics["b"].distinct_values_count, 1.0);
     }
 
     #[test]
@@ -756,6 +859,75 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
         // NDV of status = 5, capped at 100000*0.75=75000 => min(5, 75000) = 5
         assert!((stats.output_row_count - 5.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn aggregate_multi_key_rows_use_damped_ndv_product() {
+        let (name, ts) = make_table_stats(
+            "t",
+            1_000_000,
+            &[("k1", 100.0), ("k2", 100.0), ("k3", 100.0)],
+        );
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("t", &["k1", "k2", "k3"]);
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![col_ref("k1"), col_ref("k2"), col_ref("k3")],
+            aggregates: vec![],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k1".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k2".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "k3".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+        let expected = 100.0 * 100.0_f64.sqrt() * 100.0_f64.powf(0.25);
+        assert!(
+            (stats.output_row_count - expected).abs() < 0.000_001,
+            "expected damped aggregate rows {expected}, got {}",
+            stats.output_row_count
+        );
+        assert!(stats.output_row_count < 100.0 * 100.0 * 100.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn aggregate_row_count_confidence_follows_fallback_child() {
+        let scan = scan_plan("missing_stats", &["k1", "k2", "k3"]);
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(scan),
+            group_by: vec![col_ref("k1"), col_ref("k2"), col_ref("k3")],
+            aggregates: vec![],
+            output_columns: vec![],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &HashMap::new());
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
     #[test]
@@ -819,5 +991,35 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
         // 1000 * 0.4 = 400
         assert!((stats.output_row_count - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn union_all_cardinality_saturates_rows_and_degrades_confidence() {
+        let (ln, lt) = make_table_stats("a", 900_000_000_000_000, &[("k", 100.0)]);
+        let (rn, rt) = make_table_stats("b", 900_000_000_000_000, &[("k", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(ln, lt);
+        table_stats.insert(rn, rt);
+
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![scan_plan("a", &["k"]), scan_plan("b", &["k"])],
+            all: true,
+            output_columns: vec![OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "k".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+
+        let stats = estimate_statistics(&plan, &table_stats);
+
+        assert_eq!(
+            stats.output_row_count,
+            crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT
+        );
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 }

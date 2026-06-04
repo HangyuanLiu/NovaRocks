@@ -105,6 +105,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "explain_contains" => {
                 meta.explain_contains.push(raw_value);
             }
+            "explain_not_contains" => {
+                meta.explain_not_contains.push(raw_value);
+            }
             "normalize_explain_timing" => {
                 meta.normalize_explain_timing = parse_bool(&raw_value)?;
             }
@@ -185,6 +188,11 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             base.explain_contains.clone()
         } else {
             override_meta.explain_contains.clone()
+        },
+        explain_not_contains: if override_meta.explain_not_contains.is_empty() {
+            base.explain_not_contains.clone()
+        } else {
+            override_meta.explain_not_contains.clone()
         },
         normalize_explain_timing: override_meta.normalize_explain_timing
             || base.normalize_explain_timing,
@@ -506,6 +514,20 @@ mod opt5_directive_tests {
     }
 
     #[test]
+    fn parse_meta_collects_explain_not_contains() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @explain_not_contains=LogicalJoin".to_string(),
+            "-- @explain_not_contains=ShuffleExchange".to_string(),
+        ];
+        let meta = parse_meta(&lines, &re).expect("parse ok");
+        assert_eq!(
+            meta.explain_not_contains,
+            vec!["LogicalJoin".to_string(), "ShuffleExchange".to_string()],
+        );
+    }
+
+    #[test]
     fn parse_meta_parses_normalize_explain_timing() {
         let re = meta_re();
         let lines = vec!["-- @normalize_explain_timing=true".to_string()];
@@ -522,6 +544,31 @@ mod opt5_directive_tests {
         let override_meta = QueryMeta::default();
         let merged = merge_meta(&base, &override_meta);
         assert_eq!(merged.explain_contains, vec!["X".to_string()]);
+    }
+
+    #[test]
+    fn merge_meta_inherits_explain_not_contains_from_base_when_override_empty() {
+        let base = QueryMeta {
+            explain_not_contains: vec!["Forbidden".to_string()],
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta::default();
+        let merged = merge_meta(&base, &override_meta);
+        assert_eq!(merged.explain_not_contains, vec!["Forbidden".to_string()]);
+    }
+
+    #[test]
+    fn merge_meta_overrides_explain_not_contains_when_override_present() {
+        let base = QueryMeta {
+            explain_not_contains: vec!["Base".to_string()],
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta {
+            explain_not_contains: vec!["Override".to_string()],
+            ..QueryMeta::default()
+        };
+        let merged = merge_meta(&base, &override_meta);
+        assert_eq!(merged.explain_not_contains, vec!["Override".to_string()]);
     }
 
     #[test]

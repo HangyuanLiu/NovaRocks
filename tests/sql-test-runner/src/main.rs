@@ -472,7 +472,7 @@ fn run_step_wait_alters(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// @explain_contains helpers
+// @explain_* helpers
 // ---------------------------------------------------------------------------
 
 /// If `sql` begins with an EXPLAIN prefix, strip it so the runner can
@@ -496,7 +496,7 @@ fn explain_contains_target_body(sql: &str) -> String {
 
 /// Cheap leading-keyword sniff: SELECT/WITH and REFRESH MATERIALIZED VIEW
 /// bodies are valid EXPLAIN targets. Other DDL and DML are explicitly
-/// rejected for @explain_contains.
+/// rejected for @explain_* directives.
 fn is_select_or_with(body: &str) -> bool {
     let head = body
         .split_whitespace()
@@ -510,10 +510,19 @@ fn is_select_or_with(body: &str) -> bool {
     lower.starts_with("refresh materialized view ")
 }
 
-/// Run the `@explain_contains` assertion for a step: issue `EXPLAIN VERBOSE`
-/// on the step's SQL body and assert each needle substring is present.
+fn explain_matching_lines(explain_text: &str, needle: &str) -> Vec<String> {
+    explain_text
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Run the `@explain_contains` and `@explain_not_contains` assertions for a
+/// step: issue `EXPLAIN VERBOSE` on the step's SQL body and assert each
+/// required/forbidden substring.
 /// Returns `Ok(())` if all assertions pass, or `Err(message)` on the first failure.
-fn run_explain_contains_check(
+fn run_explain_directive_checks(
     step: &SqlStep,
     session: &mut crate::session::MysqlSession,
     query_timeout: u64,
@@ -522,16 +531,16 @@ fn run_explain_contains_check(
     let body = explain_contains_target_body(&step.sql);
     if !is_select_or_with(&body) {
         return Err(format!(
-            "@explain_contains is only valid on SELECT / WITH statements (got: {})",
+            "@explain_contains/@explain_not_contains is only valid on SELECT / WITH statements (got: {})",
             body.split_whitespace().next().unwrap_or("(empty)")
         ));
     }
     let explain_sql = format!("EXPLAIN VERBOSE {}", body);
-    let _ = writeln!(log, "    @explain_contains: running EXPLAIN VERBOSE");
+    let _ = writeln!(log, "    @explain directives: running EXPLAIN VERBOSE");
     let (ok, exec, msg) = session.execute_query(query_timeout, &explain_sql, None);
     if !ok {
         return Err(format!(
-            "@explain_contains: EXPLAIN VERBOSE failed.\n  error: {}",
+            "@explain directives: EXPLAIN VERBOSE failed.\n  error: {}",
             msg
         ));
     }
@@ -542,6 +551,23 @@ fn run_explain_contains_check(
                 "@explain_contains assertion failed.\n  expected substring: {}\n  EXPLAIN VERBOSE output:\n{}",
                 needle, explain_text
             ));
+        }
+    }
+    for needle in &step.meta.explain_not_contains {
+        if explain_text.contains(needle.as_str()) {
+            let matching_lines = explain_matching_lines(&explain_text, needle);
+            if matching_lines.is_empty() {
+                return Err(format!(
+                    "@explain_not_contains assertion failed.\n  forbidden substring: {}\n  EXPLAIN VERBOSE output:\n{}",
+                    needle, explain_text
+                ));
+            } else {
+                return Err(format!(
+                    "@explain_not_contains assertion failed.\n  forbidden substring: {}\n  matching line(s):\n{}",
+                    needle,
+                    matching_lines.join("\n")
+                ));
+            }
         }
     }
     Ok(())
@@ -1006,9 +1032,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        // @explain_contains: issue EXPLAIN VERBOSE and assert substrings.
-                        let explain_ok = if !step.meta.explain_contains.is_empty() {
-                            match run_explain_contains_check(
+                        // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
+                        let explain_ok = if !step.meta.explain_contains.is_empty()
+                            || !step.meta.explain_not_contains.is_empty()
+                        {
+                            match run_explain_directive_checks(
                                 step,
                                 &mut target_session,
                                 ctx.query_timeout,
@@ -1207,9 +1235,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        // @explain_contains: validate during record too.
-                        let explain_ok = if !step.meta.explain_contains.is_empty() {
-                            match run_explain_contains_check(
+                        // @explain_*: validate during record too.
+                        let explain_ok = if !step.meta.explain_contains.is_empty()
+                            || !step.meta.explain_not_contains.is_empty()
+                        {
+                            match run_explain_directive_checks(
                                 step,
                                 &mut target_session,
                                 ctx.query_timeout,
@@ -2849,6 +2879,15 @@ enable_path_style_access = true
         assert!(crate::is_select_or_with("REFRESH MATERIALIZED VIEW mv1"));
         assert!(!crate::is_select_or_with("CREATE TABLE foo (a INT)"));
         assert!(!crate::is_select_or_with("INSERT INTO foo VALUES (1)"));
+    }
+
+    #[test]
+    fn explain_matching_lines_reports_lines_containing_forbidden_substring() {
+        let explain = "0:PhysicalScan\n1:PhysicalHashJoin\n2:PhysicalProject";
+        assert_eq!(
+            crate::explain_matching_lines(explain, "HashJoin"),
+            vec!["1:PhysicalHashJoin".to_string()]
+        );
     }
 
     // ---------------------------------------------------------------------------

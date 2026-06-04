@@ -55,7 +55,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
     use crate::sql::planner::plan::ScanNode;
     use arrow::datatypes::DataType;
 
@@ -110,6 +110,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
                 distinct_values_count: ndv,
+                confidence: Confidence::Exact,
             },
         );
         let mut table_stats = HashMap::new();

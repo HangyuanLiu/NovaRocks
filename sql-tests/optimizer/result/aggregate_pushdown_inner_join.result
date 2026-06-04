@@ -7,7 +7,7 @@ GATHER EXCHANGE stats={rows=10}
         HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
           HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
             aggregations: sum(sum(a.v))
-            HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=90000}
+            HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) stats={rows=22500}
               build runtime filters:
               - filter_id = 0, build_expr = (b.k)
               HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}

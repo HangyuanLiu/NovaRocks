@@ -256,6 +256,7 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
             new_group,
             output_columns,
             row_count,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
             column_statistics,
         );
         memo.groups[new_group].logical_props = Some(props);
@@ -454,6 +455,7 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: 50.0,
+                ..Default::default()
             },
         );
         memo.groups[child].logical_props = Some(child_props);

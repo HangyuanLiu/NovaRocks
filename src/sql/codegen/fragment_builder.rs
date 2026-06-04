@@ -4922,6 +4922,7 @@ mod tests {
         Statistics {
             output_row_count: 0.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -5720,6 +5721,7 @@ mod tests {
         Statistics {
             output_row_count: 3.0,
             column_statistics: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -6750,6 +6752,7 @@ mod tests {
             stats: Statistics {
                 output_row_count: 3_000_000.0,
                 column_statistics: HashMap::new(),
+                ..Default::default()
             },
             output_columns: vec![OutputColumn {
                 column_id: crate::sql::column_id::ColumnId::UNSET,
