@@ -10,6 +10,7 @@ pub(crate) mod action_propagation;
 pub(crate) mod aggregate_rewrite;
 pub(crate) mod annotation;
 pub(crate) mod apply_key;
+pub(crate) mod branch_union;
 pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
 pub(crate) mod join_delta;

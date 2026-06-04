@@ -1,9 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use arrow::array::{ArrayRef, Int32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
 use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
 use crate::connector::starrocks::table::mv_shape::AggregateMvShape;
 use crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream;
+use crate::engine::record_batch_to_chunk;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -15,6 +20,7 @@ pub struct AggregateStateMergePlan {
     pub(crate) old_input: Box<crate::exec::node::ExecNode>,
     pub(crate) delta_input: Box<crate::exec::node::ExecNode>,
     pub(crate) layout: AggregateMvLayout,
+    pub(crate) branch_id: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,18 +104,25 @@ impl AggregateStateMergeSharedState {
         }
     }
 
-    fn pop_output(&self, layout: &AggregateMvLayout) -> Result<Option<Chunk>, String> {
+    fn pop_output(
+        &self,
+        layout: &AggregateMvLayout,
+        branch_id: Option<i32>,
+    ) -> Result<Option<Chunk>, String> {
         let mut guard = self.inner.lock().expect("aggregate state merge lock");
         if guard.output.is_none() {
             if guard.remaining_old_producers != 0 || guard.remaining_delta_producers != 0 {
                 return Ok(None);
             }
-            let output = merge_aggregate_state_chunks_for_change_stream(
+            let mut output = merge_aggregate_state_chunks_for_change_stream(
                 &guard.old_chunks,
                 &guard.delta_chunks,
                 layout,
-            )
-            .map(VecDeque::from);
+            )?;
+            if let Some(branch_id) = branch_id {
+                output = append_branch_id_to_chunks(output, branch_id)?;
+            }
+            let output = Ok(VecDeque::from(output));
             guard.output = Some(output);
         }
         match guard.output.as_mut().expect("output initialized") {
@@ -303,7 +316,8 @@ impl ProcessorOperator for AggregateStateMergeSourceOperator {
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        self.state.pop_output(&self.plan.layout)
+        self.state
+            .pop_output(&self.plan.layout, self.plan.branch_id)
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
@@ -313,6 +327,58 @@ impl ProcessorOperator for AggregateStateMergeSourceOperator {
     fn source_observable(&self) -> Option<Arc<Observable>> {
         Some(self.state.observable())
     }
+}
+
+fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<Chunk>, String> {
+    chunks
+        .into_iter()
+        .map(|chunk| append_branch_id_to_chunk(chunk, branch_id))
+        .collect()
+}
+
+fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, String> {
+    let batch = chunk.batch;
+    let row_count = batch.num_rows();
+    let schema = batch.schema();
+    if schema.fields().iter().any(|field| {
+        field.name().eq_ignore_ascii_case(
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+        )
+    }) {
+        return Err(format!(
+            "aggregate state merge output already contains {}",
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+        ));
+    }
+    let change_op_idx = schema
+        .index_of(crate::exec::change_op::CHANGE_OP_COLUMN)
+        .map_err(|e| {
+            format!(
+                "aggregate state merge branch output missing {}: {e}",
+                crate::exec::change_op::CHANGE_OP_COLUMN
+            )
+        })?;
+    let mut fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut columns = batch.columns().to_vec();
+    fields.insert(
+        change_op_idx,
+        Field::new(
+            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+            DataType::Int32,
+            false,
+        ),
+    );
+    columns.insert(
+        change_op_idx,
+        Arc::new(Int32Array::from(vec![branch_id; row_count])) as ArrayRef,
+    );
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("append branch id to aggregate state merge chunk failed: {e}"))?;
+    record_batch_to_chunk(batch)
 }
 
 pub(crate) struct AggregateStatePhysicalizeProcessorFactory {
@@ -482,6 +548,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_operator_appends_branch_id_before_change_op() {
+        let delta = signed_delta_state_chunk_for_test(vec![("west", 1_i8, 1_i64, 80_i64)]);
+        let output = run_merge_operator_for_test_with_branch_id(vec![], vec![delta], Some(3))
+            .expect("branch scoped merge output");
+
+        let schema = output.batch.schema();
+        let field_names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let branch_idx = field_names
+            .iter()
+            .position(|name| *name == "__branch_id__")
+            .expect("branch id field");
+        let change_idx = field_names
+            .iter()
+            .position(|name| *name == "__change_op")
+            .expect("change op field");
+        assert_eq!(branch_idx + 1, change_idx);
+        assert_eq!(int32_value(&output, "__branch_id__", 0), 3);
+        assert_eq!(int8_value(&output, "__change_op", 0), CHANGE_OP_INSERT);
+    }
+
+    #[test]
     fn merge_pipeline_physicalizes_delta_child_before_merging() {
         let layout = aggregate_layout_for_test();
         let old = aggregate_state_chunk_for_test(vec![("east", 2_i64, 300_i64)]);
@@ -511,6 +602,7 @@ mod tests {
                         ),
                     }),
                     layout,
+                    branch_id: None,
                 }),
             },
         };
@@ -581,6 +673,7 @@ mod tests {
                         ),
                     }),
                     layout,
+                    branch_id: None,
                 }),
             },
         };
@@ -622,6 +715,14 @@ mod tests {
         old_chunks: Vec<Chunk>,
         delta_chunks: Vec<Chunk>,
     ) -> Result<Chunk, String> {
+        run_merge_operator_for_test_with_branch_id(old_chunks, delta_chunks, None)
+    }
+
+    fn run_merge_operator_for_test_with_branch_id(
+        old_chunks: Vec<Chunk>,
+        delta_chunks: Vec<Chunk>,
+        branch_id: Option<i32>,
+    ) -> Result<Chunk, String> {
         let layout = aggregate_layout_for_test();
         let state = RuntimeState::default();
         let shared = AggregateStateMergeSharedState::new(1, 1);
@@ -648,6 +749,7 @@ mod tests {
                     ),
                 }),
                 layout,
+                branch_id,
             },
             shared,
             7,
@@ -1083,6 +1185,17 @@ mod tests {
             .as_any()
             .downcast_ref::<Int8Array>()
             .expect("int8 array")
+            .value(row)
+    }
+
+    fn int32_value(chunk: &Chunk, name: &str, row: usize) -> i32 {
+        let index = chunk.batch.schema().index_of(name).expect("column");
+        chunk
+            .batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 array")
             .value(row)
     }
 }

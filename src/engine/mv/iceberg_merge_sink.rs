@@ -40,6 +40,7 @@ pub enum ApplyKeyValueType {
     Int64,
     Utf8,
     BranchInt64,
+    BranchUtf8,
 }
 
 pub struct IcebergMergeSinkPlan {
@@ -239,6 +240,25 @@ impl IcebergMergeSinkOperator {
                 data_block_on(
                     crate::engine::mv::iceberg_target_apply::locate_target_rows_by_branch_apply_key(
                         &self.plan.target_table,
+                        &apply_keys,
+                        &locator_state.existing_deletes_by_file,
+                        &locator_state.referenced_data_file_partitions,
+                        &crate::engine::mv::partition::TargetPartitionFilter::None,
+                    ),
+                )??
+            }
+            ApplyKeyValueType::BranchUtf8 => {
+                let apply_keys = extract_branch_utf8_apply_key_values_from_record_batch(
+                    &batch,
+                    &self.plan.apply_key_column,
+                )?;
+                if apply_keys.is_empty() {
+                    return Ok(());
+                }
+                data_block_on(
+                    crate::engine::mv::iceberg_target_apply::locate_target_rows_by_branch_string_apply_key(
+                        &self.plan.target_table,
+                        &self.plan.apply_key_column,
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
@@ -478,6 +498,49 @@ fn extract_branch_i64_apply_key_values_from_record_batch(
         .collect()
 }
 
+fn extract_branch_utf8_apply_key_values_from_record_batch(
+    batch: &RecordBatch,
+    apply_key_column: &str,
+) -> Result<Vec<crate::engine::mv::iceberg_target_apply::BranchStringApplyKey>, String> {
+    let branch_column = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
+    let schema = batch.schema();
+    let branch_idx = schema.index_of(branch_column).map_err(|_| {
+        format!("merge sink: DELETE batch missing branch-id column {branch_column}")
+    })?;
+    let key_idx = schema.index_of(apply_key_column).map_err(|_| {
+        format!("merge sink: DELETE batch missing apply-key column {apply_key_column}")
+    })?;
+    let branches = batch
+        .column(branch_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .ok_or_else(|| format!("merge sink: branch-id column {branch_column} must be Int32"))?;
+    let keys = batch
+        .column(key_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| format!("merge sink: apply-key column {apply_key_column} must be Utf8"))?;
+
+    branches
+        .iter()
+        .zip(keys.iter())
+        .map(|(branch_id, key)| {
+            let branch_id = branch_id.ok_or_else(|| {
+                format!("merge sink: null value in branch-id column {branch_column}")
+            })?;
+            let key = key.ok_or_else(|| {
+                format!("merge sink: null value in apply-key column {apply_key_column}")
+            })?;
+            Ok(
+                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
+                    branch_id,
+                    key: key.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +776,112 @@ mod tests {
             key_err.contains(crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN),
             "err={key_err}"
         );
+    }
+
+    #[test]
+    fn extract_branch_utf8_apply_key_values_accepts_pairs() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+                DataType::Int32,
+                false,
+            ),
+            Field::new("__row_id__", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["group-1", "group-1"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let values = extract_branch_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
+            .expect("branch string apply keys");
+
+        assert_eq!(
+            values,
+            vec![
+                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
+                    branch_id: 0,
+                    key: "group-1".to_string(),
+                },
+                crate::engine::mv::iceberg_target_apply::BranchStringApplyKey {
+                    branch_id: 1,
+                    key: "group-1".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_branch_utf8_apply_key_values_rejects_missing_branch_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__row_id__",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["group-1"])) as ArrayRef],
+        )
+        .unwrap();
+
+        let err = extract_branch_utf8_apply_key_values_from_record_batch(&batch, "__row_id__")
+            .unwrap_err();
+
+        assert!(
+            err.contains(crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN),
+            "err={err}"
+        );
+        assert!(err.contains("missing"), "err={err}");
+    }
+
+    #[test]
+    fn extract_branch_utf8_apply_key_values_rejects_null_branch_or_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+                DataType::Int32,
+                true,
+            ),
+            Field::new("__row_id__", DataType::Utf8, true),
+        ]));
+        let null_branch_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(0), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("group-1"), Some("group-2")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let null_key_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(0), Some(1)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("group-1"), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let branch_err = extract_branch_utf8_apply_key_values_from_record_batch(
+            &null_branch_batch,
+            "__row_id__",
+        )
+        .unwrap_err();
+        assert!(branch_err.contains("null"), "err={branch_err}");
+        assert!(
+            branch_err
+                .contains(crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN),
+            "err={branch_err}"
+        );
+
+        let key_err =
+            extract_branch_utf8_apply_key_values_from_record_batch(&null_key_batch, "__row_id__")
+                .unwrap_err();
+        assert!(key_err.contains("null"), "err={key_err}");
+        assert!(key_err.contains("__row_id__"), "err={key_err}");
     }
 
     #[test]

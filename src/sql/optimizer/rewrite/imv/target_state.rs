@@ -65,6 +65,7 @@ mod tests {
             "__row_id__".to_string(),
             crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
             },
             crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
         );
@@ -87,7 +88,10 @@ mod tests {
         assert_eq!(scan.row_id_column_name, "__row_id__");
         assert!(matches!(
             scan.row_filter,
-            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds { .. }
+            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                branch_scope: None,
+                ..
+            }
         ));
         assert!(matches!(
             scan.partition_constraint,

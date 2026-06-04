@@ -1,0 +1,19 @@
+-- query 3
+id	name	amount
+10	same	11
+10	same	99
+20	live-only	20
+30	archive-only	30
+
+-- query 6
+id	name	amount
+10	same	99
+20	live-only	20
+30	archive-only	30
+
+-- query 9
+id	name	amount
+10	live-new	15
+10	same	120
+20	live-only	20
+30	archive-only	30

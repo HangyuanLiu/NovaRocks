@@ -257,6 +257,12 @@ pub(crate) struct BranchApplyKey {
     pub base_row_id: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BranchStringApplyKey {
+    pub branch_id: i32,
+    pub key: String,
+}
+
 pub(crate) async fn locate_target_rows_by_branch_apply_key(
     target_table: &iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
@@ -275,11 +281,31 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
     .await
 }
 
+pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
+    target_table: &iceberg::table::Table,
+    apply_key_column: &str,
+    requested_keys: &[BranchStringApplyKey],
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
+    locate_target_rows_by_apply_key_impl(
+        target_table,
+        apply_key_column,
+        ApplyKeyRequest::BranchUtf8(requested_keys),
+        existing_deletes_by_file,
+        referenced_data_file_partitions,
+        partition_filter,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum ApplyKeyRequest<'a> {
     Int64(&'a [i64]),
     Utf8(&'a [String]),
     BranchInt64(&'a [BranchApplyKey]),
+    BranchUtf8(&'a [BranchStringApplyKey]),
 }
 
 impl ApplyKeyRequest<'_> {
@@ -288,6 +314,7 @@ impl ApplyKeyRequest<'_> {
             Self::Int64(keys) => keys.is_empty(),
             Self::Utf8(keys) => keys.is_empty(),
             Self::BranchInt64(keys) => keys.is_empty(),
+            Self::BranchUtf8(keys) => keys.is_empty(),
         }
     }
 }
@@ -297,6 +324,7 @@ enum ApplyKeyValue {
     Int64(i64),
     Utf8(String),
     BranchInt64(BranchApplyKey),
+    BranchUtf8(BranchStringApplyKey),
 }
 
 impl std::fmt::Display for ApplyKeyValue {
@@ -310,6 +338,9 @@ impl std::fmt::Display for ApplyKeyValue {
                     "branch {} apply key {}",
                     value.branch_id, value.base_row_id
                 )
+            }
+            Self::BranchUtf8(value) => {
+                write!(f, "branch {} apply key {}", value.branch_id, value.key)
             }
         }
     }
@@ -333,6 +364,11 @@ fn requested_apply_key_values(
             .iter()
             .copied()
             .map(ApplyKeyValue::BranchInt64)
+            .collect::<std::collections::HashSet<_>>(),
+        ApplyKeyRequest::BranchUtf8(keys) => keys
+            .iter()
+            .cloned()
+            .map(ApplyKeyValue::BranchUtf8)
             .collect::<std::collections::HashSet<_>>(),
     }
 }
@@ -470,7 +506,7 @@ fn process_apply_key_locator_batch(
     Ok(())
 }
 
-fn process_branch_apply_key_locator_batch(
+fn process_branch_i64_apply_key_locator_batch(
     batch: &arrow::record_batch::RecordBatch,
     requested: &std::collections::HashSet<ApplyKeyValue>,
     matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
@@ -552,6 +588,87 @@ fn process_branch_apply_key_locator_batch(
     Ok(())
 }
 
+fn process_branch_utf8_apply_key_locator_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    apply_key_column: &str,
+    requested: &std::collections::HashSet<ApplyKeyValue>,
+    matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+) -> Result<(), String> {
+    use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+
+    let schema = batch.schema();
+    let file_idx = schema
+        .index_of("_file")
+        .map_err(|e| format!("iceberg MV target locator scan missing _file: {e}"))?;
+    let pos_idx = schema
+        .index_of("_pos")
+        .map_err(|e| format!("iceberg MV target locator scan missing _pos: {e}"))?;
+    let branch_idx = schema.index_of(ICEBERG_MV_BRANCH_ID_COLUMN).map_err(|e| {
+        format!("iceberg MV target locator scan missing {ICEBERG_MV_BRANCH_ID_COLUMN}: {e}")
+    })?;
+    let key_idx = schema
+        .index_of(apply_key_column)
+        .map_err(|e| format!("iceberg MV target locator scan missing {apply_key_column}: {e}"))?;
+    let file_col = arrow::compute::cast(batch.column(file_idx), &arrow::datatypes::DataType::Utf8)
+        .map_err(|e| format!("cast target _file to STRING failed: {e}"))?;
+    let pos_col = arrow::compute::cast(batch.column(pos_idx), &arrow::datatypes::DataType::Int64)
+        .map_err(|e| format!("cast target _pos to BIGINT failed: {e}"))?;
+    let branch_col =
+        arrow::compute::cast(batch.column(branch_idx), &arrow::datatypes::DataType::Int32)
+            .map_err(|e| format!("cast target {ICEBERG_MV_BRANCH_ID_COLUMN} to INT failed: {e}"))?;
+    let key_col = arrow::compute::cast(batch.column(key_idx), &arrow::datatypes::DataType::Utf8)
+        .map_err(|e| format!("cast target {apply_key_column} to STRING failed: {e}"))?;
+    let files = file_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "target _file is not STRING after cast".to_string())?;
+    let positions = pos_col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| "target _pos is not BIGINT after cast".to_string())?;
+    let branches = branch_col
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| format!("target {ICEBERG_MV_BRANCH_ID_COLUMN} is not INT after cast"))?;
+    let keys = key_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("target {apply_key_column} is not STRING after cast"))?;
+
+    for row in 0..batch.num_rows() {
+        if files.is_null(row)
+            || positions.is_null(row)
+            || branches.is_null(row)
+            || keys.is_null(row)
+        {
+            continue;
+        }
+        let file = files.value(row);
+        let pos = positions.value(row);
+        if !crate::engine::delete_flow::data_file_row_is_visible(
+            batch,
+            row,
+            file,
+            pos,
+            existing_deletes_by_file,
+        )? {
+            continue;
+        }
+        record_visible_apply_key_match(
+            matches,
+            requested,
+            ApplyKeyValue::BranchUtf8(BranchStringApplyKey {
+                branch_id: branches.value(row),
+                key: keys.value(row).to_string(),
+            }),
+            file,
+            pos,
+        )?;
+    }
+    Ok(())
+}
+
 fn build_position_delete_groups_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
     referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
@@ -600,7 +717,10 @@ async fn locate_target_rows_by_apply_key_impl(
     let requested = requested_apply_key_values(requested_keys);
     let request_is_i64 = matches!(requested_keys, ApplyKeyRequest::Int64(_));
     let mut select_columns = vec!["_file".to_string(), "_pos".to_string()];
-    if matches!(requested_keys, ApplyKeyRequest::BranchInt64(_)) {
+    if matches!(
+        requested_keys,
+        ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
+    ) {
         select_columns.push(ICEBERG_MV_BRANCH_ID_COLUMN.to_string());
     }
     select_columns.push(apply_key_column.to_string());
@@ -708,8 +828,16 @@ async fn locate_target_rows_by_apply_key_impl(
         let batch =
             batch_result.map_err(|e| format!("iceberg MV target locator scan error: {e}"))?;
         if matches!(requested_keys, ApplyKeyRequest::BranchInt64(_)) {
-            process_branch_apply_key_locator_batch(
+            process_branch_i64_apply_key_locator_batch(
                 &batch,
+                &requested,
+                &mut matches,
+                existing_deletes_by_file,
+            )?;
+        } else if matches!(requested_keys, ApplyKeyRequest::BranchUtf8(_)) {
+            process_branch_utf8_apply_key_locator_batch(
+                &batch,
+                apply_key_column,
                 &requested,
                 &mut matches,
                 existing_deletes_by_file,
@@ -1039,8 +1167,45 @@ mod tests {
         let existing_deletes = std::collections::HashMap::new();
         let mut matches = std::collections::HashMap::new();
 
-        process_branch_apply_key_locator_batch(&batch, &requested, &mut matches, &existing_deletes)
-            .expect("scan batch");
+        process_branch_i64_apply_key_locator_batch(
+            &batch,
+            &requested,
+            &mut matches,
+            &existing_deletes,
+        )
+        .expect("scan batch");
+        ensure_all_requested_apply_keys_matched(&requested, &matches).expect("requested key");
+        let groups =
+            build_position_delete_groups_from_apply_key_matches(matches, &referenced_partitions())
+                .expect("delete groups");
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].referenced_data_file, "file-b.parquet");
+        assert_eq!(groups[0].positions, vec![9]);
+    }
+
+    #[test]
+    fn branch_scoped_string_key_matches_only_same_branch() {
+        let batch = branch_string_apply_key_locator_batch(&[
+            ("file-a.parquet", 7, 0, "group-1"),
+            ("file-b.parquet", 9, 1, "group-1"),
+        ]);
+        let requested =
+            requested_apply_key_values(ApplyKeyRequest::BranchUtf8(&[BranchStringApplyKey {
+                branch_id: 1,
+                key: "group-1".to_string(),
+            }]));
+        let existing_deletes = std::collections::HashMap::new();
+        let mut matches = std::collections::HashMap::new();
+
+        process_branch_utf8_apply_key_locator_batch(
+            &batch,
+            ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            &requested,
+            &mut matches,
+            &existing_deletes,
+        )
+        .expect("scan batch");
         ensure_all_requested_apply_keys_matched(&requested, &matches).expect("requested key");
         let groups =
             build_position_delete_groups_from_apply_key_matches(matches, &referenced_partitions())
@@ -1065,7 +1230,7 @@ mod tests {
         let existing_deletes = std::collections::HashMap::new();
         let mut matches = std::collections::HashMap::new();
 
-        let err = process_branch_apply_key_locator_batch(
+        let err = process_branch_i64_apply_key_locator_batch(
             &batch,
             &requested,
             &mut matches,
@@ -1089,7 +1254,7 @@ mod tests {
         let existing_deletes = std::collections::HashMap::new();
         let mut matches = std::collections::HashMap::new();
 
-        let err = process_branch_apply_key_locator_batch(
+        let err = process_branch_i64_apply_key_locator_batch(
             &batch,
             &requested,
             &mut matches,
@@ -1149,6 +1314,33 @@ mod tests {
             ],
         )
         .expect("branch locator batch")
+    }
+
+    fn branch_string_apply_key_locator_batch(rows: &[(&str, i32, i32, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_file", DataType::Utf8, false),
+            Field::new("_pos", DataType::Int32, false),
+            Field::new(ICEBERG_MV_BRANCH_ID_COLUMN, DataType::Int32, false),
+            Field::new(ICEBERG_MV_GROUP_APPLY_KEY_COLUMN, DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(file, _, _, _)| *file),
+                )) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, pos, _, _)| *pos),
+                )) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, _, branch, _)| *branch),
+                )) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, _, _, key)| *key),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("branch string locator batch")
     }
 
     fn referenced_partitions() -> crate::engine::delete_flow::ReferencedDataFilePartitions {

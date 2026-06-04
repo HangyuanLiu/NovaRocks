@@ -33,11 +33,15 @@ pub(crate) enum DirectExecPlan {
         old_input: Box<PlanBuildResult>,
         delta_input: Box<PlanBuildResult>,
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        branch_id: Option<i32>,
     },
     AggregateStatePhysicalize {
         input: Box<PlanBuildResult>,
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
         shape: crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    },
+    UnionAll {
+        inputs: Vec<PlanBuildResult>,
     },
 }
 
