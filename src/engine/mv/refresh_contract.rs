@@ -1197,6 +1197,7 @@ mod tests {
             location: format!("file:///tmp/{database}/{table}"),
             schema: IcebergSchemaDef { fields: Vec::new() },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 
