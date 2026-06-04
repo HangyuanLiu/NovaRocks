@@ -4,7 +4,6 @@ use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::aggregate_rewrite::build_aggregate_state_merge;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
 use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
@@ -50,6 +49,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         if !delta.is_root {
             return Ok(RewriteResult::Unchanged);
         }
+        let action_column = delta.action_column;
         let LogicalPlan::Union(union) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -96,21 +96,24 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     branch_kind
                 )
             })?;
-            let aggregate = branch.aggregate;
-            let post_project = branch.post_project;
-            let merge = build_aggregate_state_merge(
-                aggregate,
-                delta.action_column,
-                Some(crate::sql::catalog::BranchScope {
-                    branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-                    branch_id,
-                }),
-                &ext,
-            )?;
-            let rewritten = match post_project {
+            // Tag the aggregate core as an independent, branch-scoped delta sub-problem.
+            // The existing aggregate-state (and join/union-delta beneath it) rules
+            // decompose it in later stages, reading branch_scope off this marker.
+            let scope = crate::sql::catalog::BranchScope {
+                branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                branch_id,
+            };
+            let core =
+                LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
+                    input: Box::new(LogicalPlan::Aggregate(branch.aggregate)),
+                    is_root: true,
+                    action_column,
+                    branch_scope: Some(scope),
+                });
+            let rewritten = match branch.post_project {
                 Some(project) => append_branch_id_to_project(
                     ProjectNode {
-                        input: Box::new(merge),
+                        input: Box::new(core),
                         items: project.items,
                         output_qualifier: project.output_qualifier,
                         required_output_columns: None,
@@ -118,7 +121,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     branch_id,
                     branch_id_column,
                 ),
-                None => append_branch_id_project(merge, branch_id, branch_id_column),
+                None => append_branch_id_project(core, branch_id, branch_id_column),
             }?;
             rewritten_inputs.push(rewritten);
         }
@@ -333,10 +336,21 @@ mod tests {
                 .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
                 .expect("branch id item");
             assert_branch_id_cast(branch_item, idx as i64);
-            assert!(matches!(
-                project.input.as_ref(),
-                LogicalPlan::AggregateStateMerge(_)
-            ));
+            let LogicalPlan::ImvDelta(d) = project.input.as_ref() else {
+                panic!(
+                    "branch core must be a delegated ImvDelta, got {:?}",
+                    project.input
+                )
+            };
+            assert!(d.is_root, "branch sub-problem delta must be a root delta");
+            assert_eq!(
+                d.branch_scope.as_ref().map(|s| s.branch_id),
+                Some(idx as i32)
+            );
+            assert!(
+                matches!(d.input.as_ref(), LogicalPlan::Aggregate(_)),
+                "delta must sit directly over the Aggregate core"
+            );
         }
     }
 
@@ -366,9 +380,20 @@ mod tests {
             let LogicalPlan::Project(project) = branch else {
                 panic!("expected Project branch");
             };
+            let LogicalPlan::ImvDelta(d) = project.input.as_ref() else {
+                panic!(
+                    "branch core must be a delegated ImvDelta, got {:?}",
+                    project.input
+                )
+            };
+            assert!(d.is_root, "branch sub-problem delta must be a root delta");
+            assert_eq!(
+                d.branch_scope.as_ref().map(|s| s.branch_id),
+                Some(idx as i32)
+            );
             assert!(
-                matches!(project.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
-                "Project-over-Aggregate branch should be rebased directly onto AggregateStateMerge"
+                matches!(d.input.as_ref(), LogicalPlan::Aggregate(_)),
+                "delta must sit directly over the Aggregate core"
             );
             assert!(project.items.iter().any(|item| {
                 item.output_name == "total" && item.output_column_id == ColumnId::new_for_test(30)
@@ -453,21 +478,40 @@ mod tests {
             required_output_columns: None,
         });
 
-        let out = build_imv_pipeline().rewrite(plan, &mut ctx).expect("pipeline must succeed");
+        let out = build_imv_pipeline()
+            .rewrite(plan, &mut ctx)
+            .expect("pipeline must succeed");
 
         // Top is a Union whose branches each end in Project over AggregateStateMerge,
         // carrying a __branch_id__ column, with no IMV marker left anywhere.
-        assert!(!plan_contains_imv_marker(&out), "no marker may survive validation");
-        let LogicalPlan::Union(union) = &out else { panic!("expected top Union, got {out:?}") };
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "no marker may survive validation"
+        );
+        let LogicalPlan::Union(union) = &out else {
+            panic!("expected top Union, got {out:?}")
+        };
         assert_eq!(union.inputs.len(), 2);
         assert!(
-            union.output_columns.iter().any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
+            union
+                .output_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
             "union output must expose __branch_id__"
         );
         for branch in &union.inputs {
-            let LogicalPlan::Project(p) = branch else { panic!("expected Project branch, got {branch:?}") };
-            assert!(matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)));
-            assert!(p.items.iter().any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")));
+            let LogicalPlan::Project(p) = branch else {
+                panic!("expected Project branch, got {branch:?}")
+            };
+            assert!(matches!(
+                p.input.as_ref(),
+                LogicalPlan::AggregateStateMerge(_)
+            ));
+            assert!(
+                p.items
+                    .iter()
+                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__"))
+            );
         }
     }
 
