@@ -18,15 +18,6 @@ use crate::sql::optimizer::statistics::TableStatistics;
 pub(crate) use super::derive::EnforcerKind;
 
 // ---------------------------------------------------------------------------
-// Broadcast row-count threshold
-// ---------------------------------------------------------------------------
-
-/// Hard limit: if the build side (right child) of a broadcast hash join
-/// exceeds this many rows, skip the broadcast alternative entirely.
-/// Aligned with StarRocks `SessionVariable.DEFAULT_BROADCAST_ROW_COUNT_LIMIT`.
-const BROADCAST_ROW_COUNT_LIMIT: f64 = 500_000.0;
-
-// ---------------------------------------------------------------------------
 // Winner + Enforcer types
 // ---------------------------------------------------------------------------
 
@@ -134,18 +125,6 @@ impl SearchContext {
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
 
-            // Broadcast row-count threshold (unchanged from today).
-            if let Operator::PhysicalHashJoin(ref j) = expr.op
-                && matches!(j.distribution, JoinDistribution::Broadcast)
-                && expr.children.get(1).is_some_and(|&build_group_id| {
-                    let build_stats =
-                        stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
-                    build_stats.output_row_count > BROADCAST_ROW_COUNT_LIMIT
-                })
-            {
-                continue;
-            }
-
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
                 required,
@@ -155,6 +134,24 @@ impl SearchContext {
                 let child_reqs = alt.child_props.clone();
                 if child_reqs.len() != expr.children.len() {
                     continue;
+                }
+
+                if alt.kind == PropertyAlternativeKind::BroadcastJoin {
+                    if let (Some(&probe_group_id), Some(&build_group_id)) =
+                        (expr.children.first(), expr.children.get(1))
+                    {
+                        let probe_stats =
+                            stats_for_group(&memo.groups[probe_group_id], memo, &self.table_stats);
+                        let build_stats =
+                            stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
+                        if !super::cost::broadcast_gate_passes(
+                            &probe_stats,
+                            &build_stats,
+                            &CostOptions::default(),
+                        ) {
+                            continue;
+                        }
+                    }
                 }
 
                 let own_stats = derive_statistics(expr, memo, &self.table_stats);
@@ -597,7 +594,7 @@ mod cascaded_derivation_tests {
                 column_stats: HashMap::new(),
             },
         );
-        // Small enough for broadcast (< BROADCAST_ROW_COUNT_LIMIT).
+        // Small enough for the default broadcast gate.
         ts.insert(
             "small".to_string(),
             TableStatistics {
