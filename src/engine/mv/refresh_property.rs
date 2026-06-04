@@ -1,28 +1,33 @@
 //! Capability property algebra for Iceberg IMV refresh.
 //!
 //! This module synthesizes a `RefreshFragmentProperty` (a `TargetIdentity` +
-//! `StateContract` + base refs + branch count) recursively over an analyzed MV
-//! query. It is the structural successor to the flat classifier in
-//! [`crate::engine::mv::refresh_contract`]: it MIRRORS the exact same
-//! acceptance/rejection of query shapes (non-inner / non-equi joins,
-//! non-UNION-ALL set ops, metadata / delta / generate-series / unnest / CTE
-//! relations, DISTINCT, HAVING, ROLLUP/CUBE/GROUPING SETS, ORDER BY / LIMIT /
-//! OFFSET, WITH, unsupported / non-deterministic expressions, etc.) but instead
-//! of emitting a closed enum of named strategies it emits a compositional
-//! property.
+//! `StateContract` + base refs + branch count + join key count) recursively
+//! over an analyzed MV query, then lowers it into the executable
+//! [`ImvRefreshContract`] via [`RefreshFragmentProperty::into_refresh_contract`].
+//! This is now the single source of contract derivation: the old flat
+//! classifier in [`crate::engine::mv::refresh_contract`] has been removed and
+//! `derive_imv_refresh_contract` delegates here.
 //!
-//! The single semantic divergence from the flat classifier is UNION ALL
-//! homogeneity: the classifier rejects any UNION ALL whose branches are not all
-//! literal simple aggregates or all literal projection/filters, while this
-//! algebra accepts a UNION ALL as long as every branch synthesizes the SAME
-//! `(TargetIdentity kind, StateContract kind)`. That admits previously-rejected
-//! composed branches such as `Aggregate(Join(..))` as long as every branch
-//! agrees on the synthesized property kind.
+//! The synthesis MIRRORS the structural acceptance/rejection of the former flat
+//! classifier (non-inner / non-equi joins, non-UNION-ALL set ops, metadata /
+//! delta / generate-series / unnest / CTE relations, DISTINCT, HAVING,
+//! ROLLUP/CUBE/GROUPING SETS, ORDER BY / LIMIT / OFFSET, WITH, unsupported /
+//! non-deterministic expressions, etc.) but emits a compositional property
+//! instead of a closed enum of named strategies.
 //!
-//! This module is intentionally self-contained and behavior-neutral: it is NOT
-//! yet wired into `derive_imv_refresh_contract`. Wiring is a follow-up task.
+//! The property algebra accepts a strictly larger set of UNION ALL shapes than
+//! the classifier did: it admits any UNION ALL whose branches synthesize the
+//! same `(TargetIdentity kind, StateContract kind)` (with matching aggregate
+//! arities), including previously-rejected composed branches such as
+//! `Aggregate(Join(..))`. `into_refresh_contract` then deliberately narrows the
+//! property back to the legacy-supported strategy set, so the emitted contract
+//! and its rejections are byte-for-byte equivalent to the former classifier.
 
 use crate::connector::starrocks::table::model::IcebergTableRef;
+use crate::engine::mv::refresh_contract::{
+    AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
+    JoinRefreshContract, RefreshStrategy,
+};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
     SetOpKind, SortItem, TypedExpr,
@@ -88,13 +93,41 @@ pub(crate) enum StateContract {
 impl StateContract {
     /// A stable kind label used for UNION ALL homogeneity comparison. The
     /// aggregate arities are intentionally NOT part of the kind label — branch
-    /// arity compatibility, when required, is enforced separately.
+    /// arity compatibility is enforced separately in `derive_from_set_operation`
+    /// (mirroring the legacy "compatible aggregate branch contracts" rejection).
     fn kind_label(&self) -> &'static str {
         match self {
             StateContract::Stateless => "Stateless",
             StateContract::AggregateState { .. } => "AggregateState",
         }
     }
+}
+
+/// The shared structural shape of the branches of a UNION ALL. Carried up so
+/// the contract mapping can re-narrow to the *exact* legacy-supported branch
+/// set without re-walking the branch queries.
+///
+/// The legacy flat classifier only admitted two branch shapes per set
+/// operation: a UNION ALL of plain `ProjectionFilter` branches (-> the legacy
+/// `UnionProjection`) and a UNION ALL of *simple* `SingleAggregate` branches
+/// (-> the legacy `BranchUnionAggregate`). Any composed branch — a join, a
+/// fan-in aggregate, a nested/subquery union, an aggregate over a join — landed
+/// in the classifier's catch-all rejection. `BranchShape` encodes which of
+/// those legacy cases the synthesized branches correspond to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchShape {
+    /// Every branch is a plain projection/filter over a single scan
+    /// (legacy `DerivedStructure::ProjectionFilter`). Eligible for
+    /// `UnionProjectionFilter` and, under an aggregate, `FanInAggregate`.
+    SimpleScan,
+    /// Every branch is a *simple* aggregate over a single scan
+    /// (legacy `DerivedStructure::SingleAggregate`). Eligible for
+    /// `BranchUnionAggregate`.
+    SimpleAggregate,
+    /// At least one branch is composed (a join, a fan-in aggregate, an
+    /// aggregate over a join, or a nested/subquery union). The legacy
+    /// classifier rejected every such branch shape.
+    Composed,
 }
 
 /// The synthesized capability property of a refresh fragment.
@@ -106,6 +139,279 @@ pub(crate) struct RefreshFragmentProperty {
     /// `Some(n)` iff the identity top is `BranchScoped`, where `n` is the
     /// number of UNION ALL branches; `None` otherwise.
     pub(crate) branch_count: Option<usize>,
+    /// `Some(k)` iff this fragment is (or is an aggregate directly over) a
+    /// two-table inner equi-join, where `k` is the number of equi-join keys;
+    /// `None` otherwise. Carried here — rather than only inside the
+    /// `JoinRowKey` identity — because aggregation drops the join identity but
+    /// the legacy contract still needs the join key count for `JoinAggregate`.
+    pub(crate) join_key_count: Option<usize>,
+    /// The shared per-branch shape of the UNION ALL this fragment's identity
+    /// derives from, or `None` when no UNION ALL is involved. It is set on a
+    /// `BranchScoped` property (the shape of its direct branches) and inherited
+    /// by an aggregate synthesized directly over a UNION ALL (the shape of the
+    /// union the aggregate fans in over). The contract mapping uses it to
+    /// reject composed branches that the legacy classifier did not support
+    /// (see [`RefreshFragmentProperty::into_refresh_contract`]).
+    pub(crate) branch_shape: Option<BranchShape>,
+}
+
+impl RefreshFragmentProperty {
+    /// Lower this synthesized property into the executable
+    /// [`ImvRefreshContract`]. This is the single source of contract derivation
+    /// (the legacy flat classifier has been removed): it (1) validates base-ref
+    /// arity by deduplicating the per-scan base refs and checking the distinct
+    /// count against the structure, and (2) maps the `(identity, state,
+    /// branch_count, join_key_count, branch_shape)` tuple onto the same
+    /// `ApplyKeyContract` / `RefreshStrategy` the classifier chose.
+    ///
+    /// The property algebra accepts a strictly larger set of query shapes than
+    /// the legacy classifier (composed UNION ALL branches). This mapping is the
+    /// *single narrowing point*: it deliberately narrows back to the
+    /// legacy-supported set, so behavior is preserved exactly. Specifically, the
+    /// `branch_shape` carried up from the set operation gates the three
+    /// branch-bearing strategies:
+    ///   - `UnionProjectionFilter` requires `BranchShape::SimpleScan` branches;
+    ///   - `FanInAggregate` requires the aggregated union to be
+    ///     `BranchShape::SimpleScan`;
+    ///   - `BranchUnionAggregate` requires `BranchShape::SimpleAggregate`
+    ///     branches.
+    ///
+    /// Composed branches (joins, fan-in aggregates, nested unions) are rejected
+    /// here even though the property still represents them, so a later phase can
+    /// enable a composed shape by loosening *only* this narrowing (e.g. admitting
+    /// a `BranchShape::Composed` aggregate branch union) without touching the
+    /// property synthesis.
+    pub(crate) fn into_refresh_contract(self) -> Result<ImvRefreshContract, String> {
+        let expected = self.expected_distinct_base_refs();
+        validate_distinct_base_ref_arity(&self.base_refs, expected)?;
+
+        let RefreshFragmentProperty {
+            identity,
+            state,
+            base_refs,
+            branch_count,
+            join_key_count,
+            branch_shape,
+        } = self;
+
+        match (&identity, &state) {
+            // Projection / filter over a single scan.
+            (TargetIdentity::BaseRowId, StateContract::Stateless) => Ok(ImvRefreshContract {
+                strategy: RefreshStrategy::ProjectionFilter,
+                base_refs,
+                apply_key: ApplyKeyContract::projection_filter(),
+                aggregate: None,
+                join: None,
+                branch: None,
+            }),
+            // Two-table inner equi-join projection / filter.
+            (TargetIdentity::JoinRowKey(_, _), StateContract::Stateless) => {
+                let join_key_count = join_key_count.ok_or_else(|| {
+                    "Iceberg IMV refresh contract internal error: join identity without a join key count".to_string()
+                })?;
+                Ok(ImvRefreshContract {
+                    strategy: RefreshStrategy::JoinProjectionFilter,
+                    base_refs,
+                    apply_key: ApplyKeyContract::join_projection_filter(),
+                    aggregate: None,
+                    join: Some(JoinRefreshContract { join_key_count }),
+                    branch: None,
+                })
+            }
+            // UNION ALL of projection / filter branches.
+            (TargetIdentity::BranchScoped(inner), StateContract::Stateless)
+                if matches!(inner.as_ref(), TargetIdentity::BaseRowId) =>
+            {
+                // The legacy classifier's `UnionProjection` accepted only a
+                // UNION ALL of plain `ProjectionFilter` branches. A composed
+                // branch (e.g. a subquery that is itself a union) was rejected
+                // by its `derive_from_set_operation` catch-all; reject it here.
+                if branch_shape != Some(BranchShape::SimpleScan) {
+                    return Err(
+                        "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
+                            .to_string(),
+                    );
+                }
+                let branch_count = branch_count.ok_or_else(|| {
+                    "Iceberg IMV refresh contract internal error: branch-scoped identity without a branch count".to_string()
+                })?;
+                Ok(ImvRefreshContract {
+                    strategy: RefreshStrategy::UnionProjectionFilter,
+                    base_refs,
+                    apply_key: ApplyKeyContract::union_projection_filter(),
+                    aggregate: None,
+                    join: None,
+                    branch: Some(BranchRefreshContract { branch_count }),
+                })
+            }
+            // Aggregate group row, dispatched by what it sits over.
+            (
+                TargetIdentity::GroupRowId(_),
+                StateContract::AggregateState {
+                    group_key_count,
+                    aggregate_count,
+                },
+            ) => {
+                let aggregate = AggregateRefreshContract {
+                    group_key_count: *group_key_count,
+                    aggregate_count: *aggregate_count,
+                };
+                match (branch_count, join_key_count) {
+                    // Aggregate directly over a UNION ALL (fan-in). The legacy
+                    // classifier only built `FanInAggregate` over a
+                    // `UnionProjection` (a union of plain scans/projections); an
+                    // aggregate over a union of joins or nested unions hit its
+                    // catch-all rejection. The inherited branch shape encodes
+                    // the union's per-branch shape, so reject anything but a
+                    // union of simple scans.
+                    (Some(branch_count), None) => {
+                        if branch_shape != Some(BranchShape::SimpleScan) {
+                            return Err(
+                                "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(ImvRefreshContract {
+                            strategy: RefreshStrategy::FanInAggregate,
+                            base_refs,
+                            apply_key: ApplyKeyContract::aggregate_group_row(),
+                            aggregate: Some(aggregate),
+                            join: None,
+                            branch: Some(BranchRefreshContract { branch_count }),
+                        })
+                    }
+                    // Aggregate directly over a two-table inner equi-join.
+                    (None, Some(join_key_count)) => Ok(ImvRefreshContract {
+                        strategy: RefreshStrategy::JoinAggregate,
+                        base_refs,
+                        apply_key: ApplyKeyContract::join_aggregate_group_row(),
+                        aggregate: Some(aggregate),
+                        join: Some(JoinRefreshContract { join_key_count }),
+                        branch: None,
+                    }),
+                    // Aggregate directly over a single scan.
+                    (None, None) => Ok(ImvRefreshContract {
+                        strategy: RefreshStrategy::SingleAggregate,
+                        base_refs,
+                        apply_key: ApplyKeyContract::aggregate_group_row(),
+                        aggregate: Some(aggregate),
+                        join: None,
+                        branch: None,
+                    }),
+                    (Some(_), Some(_)) => Err(
+                        "Iceberg IMV refresh contract does not support aggregate over a joined union"
+                            .to_string(),
+                    ),
+                }
+            }
+            // UNION ALL of aggregate branches.
+            (TargetIdentity::BranchScoped(inner), StateContract::AggregateState { .. })
+                if matches!(inner.as_ref(), TargetIdentity::GroupRowId(_)) =>
+            {
+                // The legacy classifier only accepted UNION ALL of *simple*
+                // aggregates (aggregate directly over a single scan). A branch
+                // that aggregated over a join or fan-in carries that signal up
+                // through the branch scope as a non-`SimpleAggregate` branch
+                // shape; reject it to preserve legacy behavior. (The branch top
+                // is never itself a join, so `join_key_count` is always `None`
+                // here — the discriminator is the per-branch shape, not the
+                // branch-scope's own join key count.)
+                if branch_shape != Some(BranchShape::SimpleAggregate) {
+                    return Err(
+                        "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
+                            .to_string(),
+                    );
+                }
+                let branch_count = branch_count.ok_or_else(|| {
+                    "Iceberg IMV refresh contract internal error: branch-scoped identity without a branch count".to_string()
+                })?;
+                let StateContract::AggregateState {
+                    group_key_count,
+                    aggregate_count,
+                } = state
+                else {
+                    unreachable!("aggregate state matched above");
+                };
+                Ok(ImvRefreshContract {
+                    strategy: RefreshStrategy::BranchUnionAggregate,
+                    base_refs,
+                    apply_key: ApplyKeyContract::branch_union_aggregate_group_row(),
+                    aggregate: Some(AggregateRefreshContract {
+                        group_key_count,
+                        aggregate_count,
+                    }),
+                    join: None,
+                    branch: Some(BranchRefreshContract { branch_count }),
+                })
+            }
+            // Every other property shape (e.g. UNION ALL of joins) is outside
+            // the legacy-supported set.
+            _ => Err(format!(
+                "Iceberg IMV refresh contract does not support the synthesized property shape \
+                 (identity={identity:?}, state={state:?})"
+            )),
+        }
+    }
+
+    /// The number of *distinct* Iceberg base table refs this structure
+    /// requires: 1 for a single scan or single aggregate, 2 for a two-table
+    /// join, and `branch_count` for a UNION ALL. Mirrors the legacy
+    /// `validate_base_ref_contract` expectations.
+    fn expected_distinct_base_refs(&self) -> usize {
+        if let Some(branch_count) = self.branch_count {
+            return branch_count;
+        }
+        if self.join_key_count.is_some() {
+            return 2;
+        }
+        1
+    }
+
+    /// Classify this property as a single UNION ALL branch, mapping it onto the
+    /// [`BranchShape`] the legacy flat classifier would have assigned. A branch
+    /// is legacy-simple only when it is a bare projection/filter over a single
+    /// scan (`SimpleScan`) or a bare aggregate over a single scan
+    /// (`SimpleAggregate`); anything carrying a join key count or its own branch
+    /// count (an aggregate over a join, a fan-in aggregate, or a nested/subquery
+    /// union) is `Composed`, exactly the set of branch shapes the classifier's
+    /// `derive_from_set_operation` catch-all rejected.
+    fn branch_shape_as_union_branch(&self) -> BranchShape {
+        if self.join_key_count.is_some() || self.branch_count.is_some() {
+            return BranchShape::Composed;
+        }
+        match (&self.identity, &self.state) {
+            (TargetIdentity::BaseRowId, StateContract::Stateless) => BranchShape::SimpleScan,
+            (TargetIdentity::GroupRowId(_), StateContract::AggregateState { .. }) => {
+                BranchShape::SimpleAggregate
+            }
+            // A join branch (`JoinRowKey`) or any other shape is composed; the
+            // legacy classifier rejected such UNION ALL branches.
+            _ => BranchShape::Composed,
+        }
+    }
+}
+
+/// Deduplicate `base_refs` (order-preserving) and require the distinct count to
+/// equal `expected`. Ports the legacy `validate_base_ref_contract` rejection so
+/// self-joins (`T JOIN T` → 1 distinct base for a 2-side structure) and
+/// duplicate-base fan-ins are rejected.
+fn validate_distinct_base_ref_arity(
+    base_refs: &[IcebergTableRef],
+    expected: usize,
+) -> Result<(), String> {
+    let mut distinct: Vec<&IcebergTableRef> = Vec::new();
+    for base_ref in base_refs {
+        if !distinct.contains(&base_ref) {
+            distinct.push(base_ref);
+        }
+    }
+    if distinct.len() != expected {
+        return Err(format!(
+            "Iceberg IMV refresh contract requires {expected} distinct Iceberg base table refs, got {}",
+            distinct.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Synthesize the refresh-fragment property for an analyzed MV query.
@@ -185,6 +491,15 @@ fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty
             },
             base_refs: child.base_refs,
             branch_count: child.branch_count,
+            // Aggregation drops the child identity, but the join key count (if
+            // the child was a join) is inherited so a `JoinAggregate` contract
+            // can still recover it.
+            join_key_count: child.join_key_count,
+            // Inherit the child's branch shape so an aggregate directly over a
+            // UNION ALL (fan-in) carries the union's per-branch shape. The
+            // contract mapping's fan-in arm uses it to admit only a fan-in over
+            // a union of plain scans (legacy `FanInAggregate`).
+            branch_shape: child.branch_shape,
         })
     } else {
         validate_projection_filter_exprs(select)?;
@@ -225,6 +540,8 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                 state: StateContract::Stateless,
                 base_refs: vec![base_ref],
                 branch_count: None,
+                join_key_count: None,
+                branch_shape: None,
             })
         }
         Relation::Subquery { query, .. } => derive_fragment_property(query),
@@ -262,6 +579,8 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                 state: StateContract::Stateless,
                 base_refs,
                 branch_count: None,
+                join_key_count: Some(join_key_count),
+                branch_shape: None,
             })
         }
         Relation::IcebergMetadataScan(_)
@@ -310,10 +629,57 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         }
     }
 
+    // Aggregate branch arity compatibility. The kind label intentionally omits
+    // the aggregate arities, so it is enforced here: every aggregate branch
+    // must agree on group-key and aggregate counts. This mirrors the legacy
+    // flat classifier (`derive_from_set_operation`), which rejects mismatched
+    // branch arities with "compatible aggregate branch contracts".
+    if let StateContract::AggregateState {
+        group_key_count,
+        aggregate_count,
+    } = first.state
+    {
+        for branch in &derived[1..] {
+            let StateContract::AggregateState {
+                group_key_count: other_group_key_count,
+                aggregate_count: other_aggregate_count,
+            } = branch.state
+            else {
+                unreachable!("branch state kind checked above");
+            };
+            if other_group_key_count != group_key_count || other_aggregate_count != aggregate_count
+            {
+                return Err(
+                    "Iceberg IMV refresh contract requires compatible aggregate branch contracts"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     let mut base_refs = Vec::new();
     for branch in &derived {
         base_refs.extend(branch.base_refs.iter().cloned());
     }
+
+    // Classify the branches' shared shape so the contract mapping can re-narrow
+    // to the *exact* legacy-supported branch set. Homogeneity above only pins
+    // the (identity kind, state kind); a simple aggregate branch and an
+    // aggregate-over-join branch share that kind, yet the legacy classifier
+    // accepted only the former in a branch union. The union shape is the common
+    // branch shape, collapsing to `Composed` the moment any branch is composed
+    // (mirroring the classifier's all-or-nothing branch acceptance).
+    let branch_shape = derived
+        .iter()
+        .map(RefreshFragmentProperty::branch_shape_as_union_branch)
+        .reduce(|acc, shape| {
+            if acc == shape {
+                acc
+            } else {
+                BranchShape::Composed
+            }
+        })
+        .expect("UNION ALL branch list was checked as non-empty");
 
     let identity = TargetIdentity::branch_scoped(first.identity.clone());
     let state = first.state.clone();
@@ -322,6 +688,10 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         state,
         base_refs,
         branch_count: Some(branch_count),
+        // A UNION ALL top is never itself a join; legacy never carries a join
+        // key count under a branch scope.
+        join_key_count: None,
+        branch_shape: Some(branch_shape),
     })
 }
 

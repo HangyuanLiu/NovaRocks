@@ -1,8 +1,4 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
-use crate::sql::analysis::{
-    BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
-    SetOpKind, TypedExpr,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshStrategy {
@@ -122,1041 +118,17 @@ pub(crate) struct BranchRefreshContract {
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
 ) -> Result<ImvRefreshContract, String> {
-    let base_refs = analysis
-        .resolved_refs
-        .iter()
-        .map(iceberg_ref_from_resolved)
-        .collect::<Result<Vec<_>, _>>()?;
-    let derived = derive_from_query(&analysis.resolved_query)?;
-    validate_base_ref_contract(&derived, &base_refs)?;
-    Ok(derived.into_contract(base_refs))
-}
-
-fn validate_base_ref_contract(
-    derived: &DerivedStructure,
-    base_refs: &[IcebergTableRef],
-) -> Result<(), String> {
-    let expected = match derived {
-        DerivedStructure::ProjectionFilter | DerivedStructure::SingleAggregate { .. } => 1,
-        DerivedStructure::JoinProjection { .. } | DerivedStructure::JoinAggregate { .. } => 2,
-        DerivedStructure::UnionProjection { branch_count }
-        | DerivedStructure::FanInAggregate { branch_count, .. }
-        | DerivedStructure::BranchUnionAggregate { branch_count, .. } => *branch_count,
-    };
-    if base_refs.len() != expected {
-        return Err(format!(
-            "Iceberg IMV refresh contract requires {expected} distinct Iceberg base table refs for {derived:?}, got {}",
-            base_refs.len()
-        ));
-    }
-    Ok(())
-}
-
-fn iceberg_ref_from_resolved(
-    resolved: &crate::connector::starrocks::table::mv_ddl::ResolvedTableRef,
-) -> Result<IcebergTableRef, String> {
-    match resolved {
-        crate::connector::starrocks::table::mv_ddl::ResolvedTableRef::Iceberg {
-            catalog,
-            namespace,
-            table,
-        } => Ok(IcebergTableRef {
-            catalog: catalog.clone(),
-            namespace: namespace.clone(),
-            table: table.clone(),
-        }),
-        crate::connector::starrocks::table::mv_ddl::ResolvedTableRef::StarRocks {
-            database,
-            table,
-        } => Err(format!(
-            "Iceberg IMV refresh contract requires Iceberg base tables, got StarRocks table {database}.{table}"
-        )),
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DerivedStructure {
-    ProjectionFilter,
-    JoinProjection {
-        join_key_count: usize,
-    },
-    UnionProjection {
-        branch_count: usize,
-    },
-    SingleAggregate {
-        group_key_count: usize,
-        aggregate_count: usize,
-    },
-    FanInAggregate {
-        branch_count: usize,
-        group_key_count: usize,
-        aggregate_count: usize,
-    },
-    JoinAggregate {
-        join_key_count: usize,
-        group_key_count: usize,
-        aggregate_count: usize,
-    },
-    BranchUnionAggregate {
-        branch_count: usize,
-        group_key_count: usize,
-        aggregate_count: usize,
-    },
-}
-
-impl DerivedStructure {
-    fn into_contract(self, base_refs: Vec<IcebergTableRef>) -> ImvRefreshContract {
-        match self {
-            Self::ProjectionFilter => ImvRefreshContract {
-                strategy: RefreshStrategy::ProjectionFilter,
-                base_refs,
-                apply_key: ApplyKeyContract::projection_filter(),
-                aggregate: None,
-                join: None,
-                branch: None,
-            },
-            Self::JoinProjection { join_key_count } => ImvRefreshContract {
-                strategy: RefreshStrategy::JoinProjectionFilter,
-                base_refs,
-                apply_key: ApplyKeyContract::join_projection_filter(),
-                aggregate: None,
-                join: Some(JoinRefreshContract { join_key_count }),
-                branch: None,
-            },
-            Self::UnionProjection { branch_count } => ImvRefreshContract {
-                strategy: RefreshStrategy::UnionProjectionFilter,
-                base_refs,
-                apply_key: ApplyKeyContract::union_projection_filter(),
-                aggregate: None,
-                join: None,
-                branch: Some(BranchRefreshContract { branch_count }),
-            },
-            Self::SingleAggregate {
-                group_key_count,
-                aggregate_count,
-            } => ImvRefreshContract {
-                strategy: RefreshStrategy::SingleAggregate,
-                base_refs,
-                apply_key: ApplyKeyContract::aggregate_group_row(),
-                aggregate: Some(AggregateRefreshContract {
-                    group_key_count,
-                    aggregate_count,
-                }),
-                join: None,
-                branch: None,
-            },
-            Self::FanInAggregate {
-                branch_count,
-                group_key_count,
-                aggregate_count,
-            } => ImvRefreshContract {
-                strategy: RefreshStrategy::FanInAggregate,
-                base_refs,
-                apply_key: ApplyKeyContract::aggregate_group_row(),
-                aggregate: Some(AggregateRefreshContract {
-                    group_key_count,
-                    aggregate_count,
-                }),
-                join: None,
-                branch: Some(BranchRefreshContract { branch_count }),
-            },
-            Self::JoinAggregate {
-                join_key_count,
-                group_key_count,
-                aggregate_count,
-            } => ImvRefreshContract {
-                strategy: RefreshStrategy::JoinAggregate,
-                base_refs,
-                apply_key: ApplyKeyContract::join_aggregate_group_row(),
-                aggregate: Some(AggregateRefreshContract {
-                    group_key_count,
-                    aggregate_count,
-                }),
-                join: Some(JoinRefreshContract { join_key_count }),
-                branch: None,
-            },
-            Self::BranchUnionAggregate {
-                branch_count,
-                group_key_count,
-                aggregate_count,
-            } => ImvRefreshContract {
-                strategy: RefreshStrategy::BranchUnionAggregate,
-                base_refs,
-                apply_key: ApplyKeyContract::branch_union_aggregate_group_row(),
-                aggregate: Some(AggregateRefreshContract {
-                    group_key_count,
-                    aggregate_count,
-                }),
-                join: None,
-                branch: Some(BranchRefreshContract { branch_count }),
-            },
-        }
-    }
-}
-
-fn derive_from_query(query: &ResolvedQuery) -> Result<DerivedStructure, String> {
-    validate_query_wrapper(query)?;
-    derive_from_query_body(&query.body)
-}
-
-fn validate_query_wrapper(query: &ResolvedQuery) -> Result<(), String> {
-    if !query.local_cte_ids.is_empty() {
-        return Err("Iceberg IMV refresh contract does not support WITH queries".to_string());
-    }
-    if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
-        return Err(
-            "Iceberg IMV refresh contract does not support ORDER BY, LIMIT, or OFFSET".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn derive_from_query_body(body: &QueryBody) -> Result<DerivedStructure, String> {
-    match body {
-        QueryBody::Select(select) => derive_from_select(select),
-        QueryBody::SetOperation(set_op) => derive_from_set_operation(set_op),
-        QueryBody::Values(_) => {
-            Err("Iceberg IMV refresh contract does not support VALUES queries".to_string())
-        }
-    }
-}
-
-fn derive_from_select(select: &ResolvedSelect) -> Result<DerivedStructure, String> {
-    if select.distinct {
-        return Err("Iceberg IMV refresh contract does not support SELECT DISTINCT".to_string());
-    }
-    if select.having.is_some() || select.repeat.is_some() {
-        return Err(
-            "Iceberg IMV refresh contract does not support HAVING, ROLLUP, CUBE, or GROUPING SETS"
-                .to_string(),
-        );
-    }
-
-    let has_aggregate = select.has_aggregation || !select.group_by.is_empty();
-    if has_aggregate {
-        let group_key_count = select.group_by.len();
-        if group_key_count == 0 {
-            return Err(
-                "Iceberg IMV refresh contract requires aggregate queries to use a non-empty GROUP BY"
-                    .to_string(),
-            );
-        }
-        if let Some(filter) = &select.filter {
-            validate_projection_filter_expr(filter)?;
-        }
-        for group_key in &select.group_by {
-            validate_projection_filter_expr(group_key)?;
-        }
-        let aggregate_count = count_aggregate_projection_outputs(select)?;
-        if aggregate_count == 0 {
-            return Err(
-                "Iceberg IMV refresh contract requires at least one aggregate output".to_string(),
-            );
-        }
-        let input = derive_from_optional_relation(select.from.as_ref())?;
-        match input {
-            DerivedStructure::ProjectionFilter => Ok(DerivedStructure::SingleAggregate {
-                group_key_count,
-                aggregate_count,
-            }),
-            DerivedStructure::UnionProjection { branch_count } => {
-                Ok(DerivedStructure::FanInAggregate {
-                    branch_count,
-                    group_key_count,
-                    aggregate_count,
-                })
-            }
-            DerivedStructure::JoinProjection { join_key_count } => {
-                Ok(DerivedStructure::JoinAggregate {
-                    join_key_count,
-                    group_key_count,
-                    aggregate_count,
-                })
-            }
-            other => Err(format!(
-                "Iceberg IMV refresh contract does not support aggregate over {other:?}"
-            )),
-        }
-    } else {
-        validate_projection_filter_exprs(select)?;
-        match derive_from_optional_relation(select.from.as_ref())? {
-            DerivedStructure::SingleAggregate { .. }
-            | DerivedStructure::FanInAggregate { .. }
-            | DerivedStructure::JoinAggregate { .. }
-            | DerivedStructure::BranchUnionAggregate { .. } => Err(
-                "Iceberg IMV refresh contract does not support projection/filter over aggregate subqueries"
-                    .to_string(),
-            ),
-            structure => Ok(structure),
-        }
-    }
-}
-
-fn derive_from_optional_relation(relation: Option<&Relation>) -> Result<DerivedStructure, String> {
-    let Some(relation) = relation else {
-        return Err(
-            "Iceberg IMV refresh contract requires a SELECT with at least one base relation"
-                .to_string(),
-        );
-    };
-    derive_from_relation(relation)
-}
-
-fn derive_from_relation(relation: &Relation) -> Result<DerivedStructure, String> {
-    match relation {
-        Relation::Scan(_) => Ok(DerivedStructure::ProjectionFilter),
-        Relation::Subquery { query, .. } => derive_from_query(query),
-        Relation::Join(join) => {
-            if join.join_type != JoinKind::Inner {
-                return Err(
-                    "Iceberg IMV refresh contract supports only two-table inner equi-join shapes"
-                        .to_string(),
-                );
-            }
-            let condition = join.condition.as_ref().ok_or_else(|| {
-                "Iceberg IMV refresh contract requires JOIN ... ON equi-join predicates".to_string()
-            })?;
-            let left_qualifiers = relation_qualifiers(&join.left)?;
-            let right_qualifiers = relation_qualifiers(&join.right)?;
-            let join_key_count =
-                count_equality_join_keys(condition, &left_qualifiers, &right_qualifiers)?;
-            if join_key_count == 0 {
-                return Err(
-                    "Iceberg IMV refresh contract requires at least one equi-join predicate"
-                        .to_string(),
-                );
-            }
-            Ok(DerivedStructure::JoinProjection { join_key_count })
-        }
-        Relation::IcebergMetadataScan(_)
-        | Relation::IcebergDeltaScan(_)
-        | Relation::GenerateSeries(_)
-        | Relation::Unnest(_)
-        | Relation::CTEConsume { .. } => Err(format!(
-            "Iceberg IMV refresh contract does not support relation {relation:?}"
-        )),
-    }
-}
-
-fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<DerivedStructure, String> {
-    let mut branches = Vec::new();
-    collect_union_all_branches(set_op, &mut branches)?;
-    if branches.len() < 2 {
-        return Err(
-            "Iceberg IMV refresh contract requires UNION ALL with at least two branches"
-                .to_string(),
-        );
-    }
-    let derived = branches
-        .iter()
-        .map(|query| derive_from_query(query))
-        .collect::<Result<Vec<_>, _>>()?;
-    let branch_count = derived.len();
-
-    let first = derived
-        .first()
-        .expect("UNION ALL branch list was checked as non-empty");
-    match first {
-        DerivedStructure::ProjectionFilter
-            if derived
-                .iter()
-                .all(|d| matches!(d, DerivedStructure::ProjectionFilter)) =>
-        {
-            Ok(DerivedStructure::UnionProjection { branch_count })
-        }
-        DerivedStructure::SingleAggregate {
-            group_key_count,
-            aggregate_count,
-        } if derived
-            .iter()
-            .all(|d| matches!(d, DerivedStructure::SingleAggregate { .. })) =>
-        {
-            for branch in &derived[1..] {
-                let DerivedStructure::SingleAggregate {
-                    group_key_count: other_group_key_count,
-                    aggregate_count: other_aggregate_count,
-                } = branch
-                else {
-                    unreachable!("branch shape checked above");
-                };
-                if other_group_key_count != group_key_count
-                    || other_aggregate_count != aggregate_count
-                {
-                    return Err(
-                        "Iceberg IMV refresh contract requires compatible aggregate branch contracts"
-                            .to_string(),
-                    );
-                }
-            }
-            Ok(DerivedStructure::BranchUnionAggregate {
-                branch_count,
-                group_key_count: *group_key_count,
-                aggregate_count: *aggregate_count,
-            })
-        }
-        _ => Err(
-            "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
-                .to_string(),
-        ),
-    }
-}
-
-fn collect_union_all_branches<'a>(
-    set_op: &'a ResolvedSetOp,
-    out: &mut Vec<&'a ResolvedQuery>,
-) -> Result<(), String> {
-    if set_op.kind != SetOpKind::Union || !set_op.all {
-        return Err(
-            "Iceberg IMV refresh contract only supports UNION ALL set operations".to_string(),
-        );
-    }
-    collect_union_all_query(&set_op.left, out)?;
-    collect_union_all_query(&set_op.right, out)
-}
-
-fn collect_union_all_query<'a>(
-    query: &'a ResolvedQuery,
-    out: &mut Vec<&'a ResolvedQuery>,
-) -> Result<(), String> {
-    validate_query_wrapper(query)?;
-    match &query.body {
-        QueryBody::SetOperation(set_op) => collect_union_all_branches(set_op, out),
-        _ => {
-            out.push(query);
-            Ok(())
-        }
-    }
-}
-
-fn count_aggregate_projection_outputs(select: &ResolvedSelect) -> Result<usize, String> {
-    let mut aggregate_count = 0;
-    let mut projected_group_keys = vec![false; select.group_by.len()];
-    for item in &select.projection {
-        if let Some(index) = select
-            .group_by
-            .iter()
-            .position(|group_key| typed_expr_eq(group_key, &item.expr))
-        {
-            projected_group_keys[index] = true;
-            continue;
-        }
-
-        match &item.expr.kind {
-            ExprKind::AggregateCall {
-                name,
-                args,
-                distinct,
-                order_by,
-                ..
-            } => {
-                validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
-                validate_aggregate_argument_exprs(args)?;
-                aggregate_count += 1;
-                continue;
-            }
-            ExprKind::FunctionCall {
-                name,
-                args,
-                distinct,
-            } if is_legacy_unresolved_aggregate_function_name(name) => {
-                validate_supported_aggregate_call(name, args.len(), *distinct, &[])?;
-                validate_aggregate_argument_exprs(args)?;
-                aggregate_count += 1;
-                continue;
-            }
-            _ => {}
-        }
-
-        validate_non_contract_aggregate_projection_expr(&item.expr)?;
-        return Err(
-            "Iceberg IMV refresh contract aggregate projections must be GROUP BY keys or direct aggregate calls"
-                .to_string(),
-        );
-    }
-    if projected_group_keys.iter().any(|projected| !projected) {
-        return Err(
-            "Iceberg IMV refresh contract aggregate projection must include every GROUP BY key"
-                .to_string(),
-        );
-    }
-    Ok(aggregate_count)
-}
-
-fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(), String> {
-    match &expr.kind {
-        ExprKind::AggregateCall {
-            name,
-            args,
-            distinct,
-            order_by,
-            ..
-        } => {
-            validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
-            validate_aggregate_argument_exprs(args)
-        }
-        ExprKind::WindowCall { .. } => Err(
-            "Iceberg IMV refresh contract does not support aggregate or window expressions outside direct aggregate outputs"
-                .to_string(),
-        ),
-        ExprKind::BinaryOp { left, right, .. } => {
-            validate_non_contract_aggregate_projection_expr(left)?;
-            validate_non_contract_aggregate_projection_expr(right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => {
-            validate_non_contract_aggregate_projection_expr(expr)
-        }
-        ExprKind::Nested(expr) => validate_non_contract_aggregate_projection_expr(expr),
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => {
-            if is_legacy_unresolved_aggregate_function_name(name) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support aggregate function `{name}` outside direct aggregate outputs"
-                ));
-            }
-            if *distinct {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
-                ));
-            }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
-                ));
-            }
-            args.iter()
-                .try_for_each(validate_non_contract_aggregate_projection_expr)
-        }
-        ExprKind::LambdaFunction { body, .. } => validate_non_contract_aggregate_projection_expr(body),
-        ExprKind::InList { expr, list, .. } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            list.iter()
-                .try_for_each(validate_non_contract_aggregate_projection_expr)
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            validate_non_contract_aggregate_projection_expr(low)?;
-            validate_non_contract_aggregate_projection_expr(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            validate_non_contract_aggregate_projection_expr(expr)?;
-            validate_non_contract_aggregate_projection_expr(pattern)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                validate_non_contract_aggregate_projection_expr(operand)?;
-            }
-            for (when, then) in when_then {
-                validate_non_contract_aggregate_projection_expr(when)?;
-                validate_non_contract_aggregate_projection_expr(then)?;
-            }
-            if let Some(else_expr) = else_expr {
-                validate_non_contract_aggregate_projection_expr(else_expr)?;
-            }
-            Ok(())
-        }
-        ExprKind::Lambda { body, .. } => validate_non_contract_aggregate_projection_expr(body),
-        ExprKind::SubqueryPlaceholder { .. } => Err(
-            "Iceberg IMV refresh contract does not support subquery expressions in aggregate projections"
-                .to_string(),
-        ),
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_) => Ok(()),
-    }
-}
-
-fn validate_supported_aggregate_call(
-    name: &str,
-    arg_count: usize,
-    distinct: bool,
-    order_by: &[crate::sql::analysis::SortItem],
-) -> Result<(), String> {
-    if !order_by.is_empty() {
-        return Err("Iceberg IMV refresh contract does not support aggregate ORDER BY".to_string());
-    }
-    let normalized = name.to_ascii_lowercase();
-    let supported = matches!(
-        normalized.as_str(),
-        "count"
-            | "count_distinct"
-            | "multi_distinct_count"
-            | "approx_count_distinct"
-            | "ndv"
-            | "hll_ndv"
-            | "sum"
-            | "avg"
-            | "min"
-            | "max"
-            | "bool_or"
-            | "boolor_agg"
-            | "bool_and"
-            | "booland_agg"
-    );
-    if !supported {
-        return Err(format!(
-            "Iceberg IMV refresh contract does not support aggregate function `{name}`"
-        ));
-    }
-    if distinct && normalized != "count" {
-        return Err(format!(
-            "Iceberg IMV refresh contract does not support DISTINCT aggregate `{name}`"
-        ));
-    }
-    if normalized == "count" {
-        if (distinct && arg_count != 1) || (!distinct && arg_count > 1) {
-            return Err(format!(
-                "Iceberg IMV refresh contract supports only zero or one argument for aggregate function `{name}`"
-            ));
-        }
-    } else if arg_count != 1 {
-        return Err(format!(
-            "Iceberg IMV refresh contract requires exactly one argument for aggregate function `{name}`"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_aggregate_argument_exprs(args: &[TypedExpr]) -> Result<(), String> {
-    args.iter().try_for_each(validate_projection_filter_expr)
-}
-
-fn is_legacy_unresolved_aggregate_function_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "count_distinct" | "hll_ndv"
-    )
-}
-
-fn typed_expr_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
-    left.data_type == right.data_type
-        && left.nullable == right.nullable
-        && expr_kind_eq(&left.kind, &right.kind)
-}
-
-fn typed_exprs_eq(left: &[TypedExpr], right: &[TypedExpr]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(left, right)| typed_expr_eq(left, right))
-}
-
-fn expr_kind_eq(left: &ExprKind, right: &ExprKind) -> bool {
-    match (left, right) {
-        (
-            ExprKind::ColumnRef {
-                column_id: left_id,
-                qualifier: left_qualifier,
-                column: left_column,
-            },
-            ExprKind::ColumnRef {
-                column_id: right_id,
-                qualifier: right_qualifier,
-                column: right_column,
-            },
-        ) => {
-            left_id == right_id
-                && left_qualifier == right_qualifier
-                && left_column.eq_ignore_ascii_case(right_column)
-        }
-        (
-            ExprKind::LambdaParamRef {
-                name: left_name,
-                slot_id: left_slot,
-            },
-            ExprKind::LambdaParamRef {
-                name: right_name,
-                slot_id: right_slot,
-            },
-        ) => left_name == right_name && left_slot == right_slot,
-        (ExprKind::Literal(left), ExprKind::Literal(right)) => left == right,
-        (
-            ExprKind::BinaryOp {
-                left: left_left,
-                op: left_op,
-                right: left_right,
-            },
-            ExprKind::BinaryOp {
-                left: right_left,
-                op: right_op,
-                right: right_right,
-            },
-        ) => {
-            left_op == right_op
-                && typed_expr_eq(left_left, right_left)
-                && typed_expr_eq(left_right, right_right)
-        }
-        (
-            ExprKind::UnaryOp {
-                op: left_op,
-                expr: left_expr,
-            },
-            ExprKind::UnaryOp {
-                op: right_op,
-                expr: right_expr,
-            },
-        ) => left_op == right_op && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::FunctionCall {
-                name: left_name,
-                args: left_args,
-                distinct: left_distinct,
-            },
-            ExprKind::FunctionCall {
-                name: right_name,
-                args: right_args,
-                distinct: right_distinct,
-            },
-        ) => {
-            left_name.eq_ignore_ascii_case(right_name)
-                && left_distinct == right_distinct
-                && typed_exprs_eq(left_args, right_args)
-        }
-        (
-            ExprKind::Cast {
-                expr: left_expr,
-                target: left_target,
-            },
-            ExprKind::Cast {
-                expr: right_expr,
-                target: right_target,
-            },
-        ) => left_target == right_target && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::IsNull {
-                expr: left_expr,
-                negated: left_negated,
-            },
-            ExprKind::IsNull {
-                expr: right_expr,
-                negated: right_negated,
-            },
-        ) => left_negated == right_negated && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::InList {
-                expr: left_expr,
-                list: left_list,
-                negated: left_negated,
-            },
-            ExprKind::InList {
-                expr: right_expr,
-                list: right_list,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_exprs_eq(left_list, right_list)
-        }
-        (
-            ExprKind::Between {
-                expr: left_expr,
-                low: left_low,
-                high: left_high,
-                negated: left_negated,
-            },
-            ExprKind::Between {
-                expr: right_expr,
-                low: right_low,
-                high: right_high,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_expr_eq(left_low, right_low)
-                && typed_expr_eq(left_high, right_high)
-        }
-        (
-            ExprKind::Like {
-                expr: left_expr,
-                pattern: left_pattern,
-                negated: left_negated,
-            },
-            ExprKind::Like {
-                expr: right_expr,
-                pattern: right_pattern,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_expr_eq(left_pattern, right_pattern)
-        }
-        (
-            ExprKind::Case {
-                operand: left_operand,
-                when_then: left_when_then,
-                else_expr: left_else,
-            },
-            ExprKind::Case {
-                operand: right_operand,
-                when_then: right_when_then,
-                else_expr: right_else,
-            },
-        ) => {
-            option_typed_expr_eq(left_operand.as_deref(), right_operand.as_deref())
-                && left_when_then.len() == right_when_then.len()
-                && left_when_then.iter().zip(right_when_then.iter()).all(
-                    |((left_when, left_then), (right_when, right_then))| {
-                        typed_expr_eq(left_when, right_when) && typed_expr_eq(left_then, right_then)
-                    },
-                )
-                && option_typed_expr_eq(left_else.as_deref(), right_else.as_deref())
-        }
-        (
-            ExprKind::IsTruthValue {
-                expr: left_expr,
-                value: left_value,
-                negated: left_negated,
-            },
-            ExprKind::IsTruthValue {
-                expr: right_expr,
-                value: right_value,
-                negated: right_negated,
-            },
-        ) => {
-            left_value == right_value
-                && left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-        }
-        (ExprKind::Nested(left), ExprKind::Nested(right)) => typed_expr_eq(left, right),
-        _ => false,
-    }
-}
-
-fn option_typed_expr_eq(left: Option<&TypedExpr>, right: Option<&TypedExpr>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => typed_expr_eq(left, right),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-fn validate_projection_filter_exprs(select: &ResolvedSelect) -> Result<(), String> {
-    for item in &select.projection {
-        validate_projection_filter_expr(&item.expr)?;
-    }
-    if let Some(filter) = &select.filter {
-        validate_projection_filter_expr(filter)?;
-    }
-    Ok(())
-}
-
-fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
-    match &expr.kind {
-        ExprKind::AggregateCall { .. } | ExprKind::WindowCall { .. } => {
-            Err("Iceberg IMV refresh contract does not support aggregate or window expressions in projection/filter shapes".to_string())
-        }
-        ExprKind::SubqueryPlaceholder { .. } => Err(
-            "Iceberg IMV refresh contract does not support subquery expressions in projection/filter shapes"
-                .to_string(),
-        ),
-        ExprKind::BinaryOp { left, right, .. } => {
-            validate_projection_filter_expr(left)?;
-            validate_projection_filter_expr(right)
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::LambdaFunction { body: expr, .. }
-        | ExprKind::Lambda { body: expr, .. } => validate_projection_filter_expr(expr),
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => {
-            if is_legacy_unresolved_aggregate_function_name(name) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support aggregate function `{name}` in projection/filter shapes"
-                ));
-            }
-            if *distinct {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support DISTINCT scalar function `{name}`"
-                ));
-            }
-            if is_unsupported_contract_scalar_function(name, args.len()) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract does not support non-deterministic or unsafe scalar function `{name}`"
-                ));
-            }
-            for arg in args {
-                validate_projection_filter_expr(arg)?;
-            }
-            Ok(())
-        }
-        ExprKind::InList { expr, list, .. } => {
-            validate_projection_filter_expr(expr)?;
-            for item in list {
-                validate_projection_filter_expr(item)?;
-            }
-            Ok(())
-        }
-        ExprKind::Between { expr, low, high, .. } => {
-            validate_projection_filter_expr(expr)?;
-            validate_projection_filter_expr(low)?;
-            validate_projection_filter_expr(high)
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            validate_projection_filter_expr(expr)?;
-            validate_projection_filter_expr(pattern)
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                validate_projection_filter_expr(operand)?;
-            }
-            for (when, then) in when_then {
-                validate_projection_filter_expr(when)?;
-                validate_projection_filter_expr(then)?;
-            }
-            if let Some(else_expr) = else_expr {
-                validate_projection_filter_expr(else_expr)?;
-            }
-            Ok(())
-        }
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
-            Ok(())
-        }
-    }
-}
-
-fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "now"
-            | "current_timestamp"
-            | "localtime"
-            | "localtimestamp"
-            | "utc_timestamp"
-            | "current_date"
-            | "curdate"
-            | "current_time"
-            | "curtime"
-            | "utc_time"
-            | "random"
-            | "rand"
-            | "uuid"
-            | "sleep"
-            | "version"
-            | "database"
-            | "current_user"
-            | "user"
-            | "grouping"
-            | "grouping_id"
-    ) || (name.eq_ignore_ascii_case("unix_timestamp") && arg_count == 0)
-}
-
-fn relation_qualifiers(relation: &Relation) -> Result<Vec<String>, String> {
-    match relation {
-        Relation::Scan(scan) => Ok(vec![
-            scan.alias
-                .clone()
-                .unwrap_or_else(|| scan.table.name.clone())
-                .to_ascii_lowercase(),
-        ]),
-        _ => Err(
-            "Iceberg IMV refresh contract supports join keys only over direct scan inputs"
-                .to_string(),
-        ),
-    }
-}
-
-fn count_equality_join_keys(
-    expr: &TypedExpr,
-    left_qualifiers: &[String],
-    right_qualifiers: &[String],
-) -> Result<usize, String> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => Ok(
-            count_equality_join_keys(left, left_qualifiers, right_qualifiers)?
-                + count_equality_join_keys(right, left_qualifiers, right_qualifiers)?,
-        ),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => {
-            let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
-            let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;
-            if left_side == right_side {
-                return Err(
-                    "Iceberg IMV refresh contract equi-join predicates must compare left and right join inputs"
-                        .to_string(),
-                );
-            }
-            Ok(1)
-        }
-        ExprKind::Nested(expr) => count_equality_join_keys(expr, left_qualifiers, right_qualifiers),
-        _ => Err(
-            "Iceberg IMV refresh contract supports only AND-combined equi-join predicates"
-                .to_string(),
-        ),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JoinKeySide {
-    Left,
-    Right,
-}
-
-fn join_key_side(
-    expr: &TypedExpr,
-    left_qualifiers: &[String],
-    right_qualifiers: &[String],
-) -> Result<JoinKeySide, String> {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            qualifier: Some(qualifier),
-            ..
-        } => {
-            let qualifier = qualifier.to_ascii_lowercase();
-            if left_qualifiers.iter().any(|left| left == &qualifier) {
-                Ok(JoinKeySide::Left)
-            } else if right_qualifiers.iter().any(|right| right == &qualifier) {
-                Ok(JoinKeySide::Right)
-            } else {
-                Err(format!(
-                    "Iceberg IMV refresh contract join key qualifier `{qualifier}` does not match either join input"
-                ))
-            }
-        }
-        ExprKind::Nested(expr) => join_key_side(expr, left_qualifiers, right_qualifiers),
-        _ => Err(
-            "Iceberg IMV refresh contract join keys must be qualified column references"
-                .to_string(),
-        ),
-    }
+    crate::engine::mv::refresh_property::derive_fragment_property(&analysis.resolved_query)?
+        .into_refresh_contract()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connector::starrocks::table::mv_ddl::{MvAnalysis, ResolvedTableRef};
-    use crate::sql::analysis::{LiteralValue, QueryBody, SortItem, SubqueryKind};
+    use crate::sql::analysis::{
+        ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
+    };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
         ScanSource, TableDef,
@@ -1211,14 +183,45 @@ mod tests {
         }
     }
 
+    /// A catalog that resolves every table to a StarRocks (non-Iceberg) scan
+    /// source. Used to drive the non-Iceberg base-ref rejection through an
+    /// actual StarRocks scan, matching production semantics.
+    struct TestStarRocksCatalog;
+
+    impl CatalogProvider for TestStarRocksCatalog {
+        fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
+            Ok(TableDef {
+                name: table.to_string(),
+                columns: vec![
+                    column("id", DataType::Int64, false),
+                    column("region", DataType::Utf8, true),
+                    column("amount", DataType::Int64, true),
+                    column("flag", DataType::Boolean, true),
+                ],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: ScanSource::StarRocks {
+                    db_id: 1,
+                    table_id: 1,
+                },
+            })
+        }
+    }
+
     fn parse_and_analyze_mv_query(sql: &str, table_refs: &[&str]) -> MvAnalysis {
+        parse_and_analyze_mv_query_with_catalog(sql, table_refs, &TestIcebergCatalog)
+    }
+
+    fn parse_and_analyze_mv_query_with_catalog(
+        sql: &str,
+        table_refs: &[&str],
+        catalog: &dyn CatalogProvider,
+    ) -> MvAnalysis {
         let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
         let (resolved_query, _, _) =
-            crate::sql::analyzer::analyze(&query, &TestIcebergCatalog, "sales")
-                .expect("analyze query");
+            crate::sql::analyzer::analyze(&query, catalog, "sales").expect("analyze query");
         MvAnalysis {
             resolved_refs: table_refs
                 .iter()
@@ -1379,15 +382,16 @@ mod tests {
 
     #[test]
     fn rejects_non_iceberg_base_refs() {
-        let mut analysis = parse_and_analyze_mv_query(
+        // A base table whose scan source is a StarRocks table (not Iceberg) is
+        // rejected. The contract is now derived from the analyzed scan sources,
+        // so the rejection is driven by an actual StarRocks scan rather than a
+        // separately-collected ref list.
+        let analysis = parse_and_analyze_mv_query_with_catalog(
             "SELECT region
              FROM fact_east",
             &["fact_east"],
+            &TestStarRocksCatalog,
         );
-        analysis.resolved_refs[0] = ResolvedTableRef::StarRocks {
-            database: "sales".to_string(),
-            table: "fact_east".to_string(),
-        };
 
         let err = derive_imv_refresh_contract(&analysis)
             .expect_err("StarRocks base refs are unsupported");
@@ -2220,6 +1224,125 @@ mod tests {
 
         assert!(
             err.contains("compatible aggregate branch contracts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- Composed-branch rejections that the distinct-base arity check does
+    // NOT mask -------------------------------------------------------------
+    //
+    // Each of the three cases below reuses the SAME base tables across its
+    // composed branches, so the distinct base-ref count equals the branch
+    // count and `validate_distinct_base_ref_arity` passes. The rejection must
+    // therefore come from the contract-level narrowing (the legacy classifier
+    // rejected these composed shapes), not from the arity guard. The legacy
+    // `into_contract` / `derive_from_set_operation` rejected all three with the
+    // branch-union "only supports UNION ALL of projection/filter branches or
+    // aggregate branches" fail-fast.
+
+    #[test]
+    fn rejects_branch_union_of_join_aggregates_with_same_bases() {
+        // UNION ALL of `Agg(fact_a JOIN fact_b)` x 2 over the SAME two bases.
+        // distinct bases = {fact_a, fact_b} = 2 == branch_count, so arity is
+        // satisfied; the legacy branch-union arm rejected join-aggregate
+        // branches because they are not simple `SingleAggregate` branches.
+        let analysis = parse_and_analyze_mv_query(
+            "SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             GROUP BY l.region
+             UNION ALL
+             SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             GROUP BY l.region",
+            &["fact_a", "fact_b"],
+        );
+
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("branch union of join aggregates is unsupported");
+
+        assert!(
+            !err.contains("distinct Iceberg base table refs"),
+            "rejection must come from narrowing, not the arity guard: {err}"
+        );
+        assert!(
+            err.contains(
+                "only supports UNION ALL of projection/filter branches or aggregate branches"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_branch_union_of_fan_in_aggregates_with_same_bases() {
+        // UNION ALL of `Agg(Union(fact_a, fact_b))` (fan-in) x 2 over the SAME
+        // two bases. distinct bases = 2 == branch_count, so arity is satisfied;
+        // the legacy branch-union arm rejected fan-in aggregate branches
+        // because they are not simple `SingleAggregate` branches.
+        let analysis = parse_and_analyze_mv_query(
+            "SELECT region, count(*) AS c, sum(amount) AS s
+             FROM (
+                 SELECT region, amount FROM fact_a
+                 UNION ALL
+                 SELECT region, amount FROM fact_b
+             ) u
+             GROUP BY region
+             UNION ALL
+             SELECT region, count(*) AS c, sum(amount) AS s
+             FROM (
+                 SELECT region, amount FROM fact_a
+                 UNION ALL
+                 SELECT region, amount FROM fact_b
+             ) u
+             GROUP BY region",
+            &["fact_a", "fact_b"],
+        );
+
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("branch union of fan-in aggregates is unsupported");
+
+        assert!(
+            !err.contains("distinct Iceberg base table refs"),
+            "rejection must come from narrowing, not the arity guard: {err}"
+        );
+        assert!(
+            err.contains(
+                "only supports UNION ALL of projection/filter branches or aggregate branches"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_fan_in_aggregate_over_union_of_joins_with_same_bases() {
+        // `Agg(Union(join, join))`: aggregate over a UNION ALL whose branches
+        // are themselves joins, over the SAME two bases. The inner union has
+        // distinct bases = 2 == branch_count, so the arity guard passes; the
+        // legacy classifier rejected the inner union of joins (the fan-in arm
+        // only accepted a union of plain scans/projections).
+        let analysis = parse_and_analyze_mv_query(
+            "SELECT region, count(*) AS c, sum(amount) AS s
+             FROM (
+                 SELECT l.region AS region, r.amount AS amount
+                 FROM fact_a l JOIN fact_b r ON l.id = r.id
+                 UNION ALL
+                 SELECT l.region AS region, r.amount AS amount
+                 FROM fact_a l JOIN fact_b r ON l.id = r.id
+             ) u
+             GROUP BY region",
+            &["fact_a", "fact_b"],
+        );
+
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("fan-in aggregate over a union of joins is unsupported");
+
+        assert!(
+            !err.contains("distinct Iceberg base table refs"),
+            "rejection must come from narrowing, not the arity guard: {err}"
+        );
+        assert!(
+            err.contains(
+                "only supports UNION ALL of projection/filter branches or aggregate branches"
+            ),
             "unexpected error: {err}"
         );
     }
