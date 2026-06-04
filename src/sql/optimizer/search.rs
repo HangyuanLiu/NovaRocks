@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{CostOptions, compute_cost_with_properties};
+use super::cost::{compute_cost_with_properties, CostOptions};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
@@ -421,25 +421,51 @@ mod tests {
         (memo, root)
     }
 
-    fn make_large_build_inner_join_memo_for_test(
-        build_rows: f64,
+    fn inner_join_child_groups_for_test(memo: &Memo, root: GroupId) -> (GroupId, GroupId) {
+        let root_expr = memo.groups[root]
+            .physical_exprs
+            .first()
+            .expect("fixture root should have a physical expression");
+        let [probe_group, build_group] = root_expr.children.as_slice() else {
+            panic!("fixture join should have two children");
+        };
+        (*probe_group, *build_group)
+    }
+
+    fn set_group_logical_rows_for_test(
+        memo: &mut Memo,
+        group: GroupId,
+        rows: f64,
         confidence: crate::sql::optimizer::statistics::Confidence,
+    ) {
+        memo.groups[group].logical_props = Some(crate::sql::optimizer::memo::LogicalProperties {
+            output_columns: vec![],
+            row_count: rows,
+            row_count_confidence: confidence,
+            column_statistics: HashMap::new(),
+            equivalence_classes: Default::default(),
+            unique_columns: vec![],
+        });
+    }
+
+    fn make_large_build_inner_join_memo_for_test(
+        probe_rows: f64,
+        build_rows: f64,
+        build_confidence: crate::sql::optimizer::statistics::Confidence,
     ) -> (Memo, GroupId, HashMap<String, TableStatistics>) {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let build_group = memo.groups[root].physical_exprs[0].children[1];
-        memo.groups[build_group].logical_props =
-            Some(crate::sql::optimizer::memo::LogicalProperties {
-                output_columns: vec![],
-                row_count: build_rows,
-                row_count_confidence: confidence,
-                column_statistics: HashMap::new(),
-                equivalence_classes: Default::default(),
-                unique_columns: vec![],
-            });
+        let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);
+        set_group_logical_rows_for_test(
+            &mut memo,
+            probe_group,
+            probe_rows,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        set_group_logical_rows_for_test(&mut memo, build_group, build_rows, build_confidence);
         (memo, root, HashMap::new())
     }
 
-    fn make_join_over_prepartitioned_children_for_test() -> (Memo, GroupId) {
+    fn make_join_over_prepartitioned_children_for_test() -> (Memo, GroupId, GroupId, GroupId) {
         let mut memo = Memo::new();
         let left_scan = memo.new_group(MExpr {
             id: memo.next_expr_id(),
@@ -460,14 +486,14 @@ mod tests {
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::shuffle_join([ColumnId(10)]),
+                spec: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             }),
             children: vec![left_scan],
         });
         let right = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                spec: DistributionSpec::shuffle_join([ColumnId(20)]),
+                spec: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             }),
             children: vec![right_scan],
         });
@@ -485,7 +511,7 @@ mod tests {
             }),
             children: vec![left, right],
         });
-        (memo, root)
+        (memo, root, left, right)
     }
 
     fn make_malformed_unknown_hash_join_memo_for_test() -> (Memo, GroupId) {
@@ -697,15 +723,19 @@ mod tests {
     #[test]
     fn search_rejects_broadcast_for_fallback_large_build() {
         let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
-            1_000_000.0,
+            10_000_000.0,
+            500_001.0,
             crate::sql::optimizer::statistics::Confidence::Fallback,
         );
         let mut ctx = SearchContext::new(table_stats);
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
-        let winner = ctx.winners.get(&(root, required)).expect("winner");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
 
+        // The exact probe side is much larger than the fallback build side,
+        // so broadcast would be cheaper than shuffle if the fallback
+        // broadcast row gate did not reject builds above 500k rows.
         assert_eq!(
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
@@ -714,7 +744,7 @@ mod tests {
 
     #[test]
     fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
-        let (memo, root) = make_join_over_prepartitioned_children_for_test();
+        let (memo, root, left, right) = make_join_over_prepartitioned_children_for_test();
         let mut ctx = SearchContext::new(Default::default());
         let required = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
@@ -722,16 +752,41 @@ mod tests {
         };
 
         ctx.optimize_group(&memo, root, &required).expect("search");
-        let winner = ctx.winners.get(&(root, required)).expect("winner");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
 
         assert_eq!(
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
         );
+        assert_eq!(winner.child_props, vec![required.clone(), required.clone()]);
+        assert_eq!(
+            winner.child_outputs,
+            vec![required.clone(), required.clone()]
+        );
         assert!(
             winner.enforcer.is_none(),
             "partitioned join output should satisfy parent directly"
         );
+
+        let left_winner = ctx
+            .winners
+            .get(&(left, winner.child_props[0].clone()))
+            .expect("left child winner");
+        assert!(
+            left_winner.enforcer.is_none(),
+            "left child shuffle output should be reused directly"
+        );
+        assert_eq!(left_winner.output, winner.child_props[0]);
+
+        let right_winner = ctx
+            .winners
+            .get(&(right, winner.child_props[1].clone()))
+            .expect("right child winner");
+        assert!(
+            right_winner.enforcer.is_none(),
+            "right child shuffle output should be reused directly"
+        );
+        assert_eq!(right_winner.output, winner.child_props[1]);
     }
 }
 
