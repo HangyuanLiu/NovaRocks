@@ -10,18 +10,18 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn};
+use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
-    first_delta_base_fqn, is_supported_fan_in_delta_union,
+    first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode};
 
 pub(crate) struct ImvActionColumn;
 
@@ -110,6 +110,7 @@ fn validate(plan: &LogicalPlan) -> Result<(), String> {
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
     if !matches!(plan, LogicalPlan::AggregateStateMerge(_))
+        && !matches!(plan, LogicalPlan::Union(node) if is_supported_branch_union(node))
         && subtree_has_delta(plan)
         && !output_has_apply_key(plan)
     {
@@ -132,6 +133,9 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         LogicalPlan::AggregateStateMerge(node) => {
             validate_node(&node.old_input)?;
             validate_state_merge_delta_input(&node.delta_input)
+        }
+        LogicalPlan::Project(node) if is_supported_branch_state_merge_project(node) => {
+            validate_node(&node.input)
         }
         LogicalPlan::Project(node) => {
             validate_node(&node.input)?;
@@ -172,6 +176,12 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
             }
             Ok(())
         }
+        LogicalPlan::Union(node) if is_supported_branch_union(node) => {
+            for input in &node.inputs {
+                validate_node(input)?;
+            }
+            Ok(())
+        }
         LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
             for input in &node.inputs {
                 validate_signed_delta_input(input)?;
@@ -181,7 +191,8 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         LogicalPlan::Union(node)
             if subtree_has_delta(plan)
                 && !is_supported_join_delta_union(node)
-                && !is_supported_fan_in_delta_union(node) =>
+                && !is_supported_fan_in_delta_union(node)
+                && !is_supported_branch_union(node) =>
         {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
@@ -198,6 +209,26 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
             ))
         }
         _ => Ok(()),
+    }
+}
+
+fn is_supported_branch_state_merge_project(node: &ProjectNode) -> bool {
+    matches!(node.input.as_ref(), LogicalPlan::AggregateStateMerge(_))
+        && node.items.iter().any(|item| {
+            item.output_name.eq_ignore_ascii_case(
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+            ) && is_branch_id_literal_expr(&item.expr)
+        })
+}
+
+fn is_branch_id_literal_expr(expr: &crate::sql::analysis::TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(_)) => true,
+        ExprKind::Cast { expr, target } => {
+            *target == DataType::Int32
+                && matches!(&expr.kind, ExprKind::Literal(LiteralValue::Int(_)))
+        }
+        _ => false,
     }
 }
 
@@ -443,7 +474,8 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
+    use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
+    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
@@ -864,6 +896,113 @@ mod tests {
         })
     }
 
+    fn output_column(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(column_id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
+
+    fn aggregate_state_merge_stub() -> LogicalPlan {
+        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
+        scan.columns
+            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                required_output_columns: None,
+            })),
+            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(LogicalPlan::Scan(scan)),
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                }],
+                output_columns: vec![output_column(2, "s", DataType::Int64, true, false)],
+                already_pushed: false,
+                required_output_columns: None,
+            })),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["__agg_state_s".to_string()],
+            change_op_column: ImvActionColumn::NAME.to_string(),
+            output_columns: vec![
+                output_column(1, "region", DataType::Utf8, false, false),
+                output_column(2, "s", DataType::Int64, true, false),
+            ],
+        })
+    }
+
+    fn project_with_branch_id(input: LogicalPlan, branch_id: i32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: vec![
+                column_ref_item(
+                    ColumnId(1),
+                    "region",
+                    DataType::Utf8,
+                    false,
+                    "region",
+                    ColumnId(1),
+                ),
+                column_ref_item(ColumnId(2), "s", DataType::Int64, true, "s", ColumnId(2)),
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(TypedExpr {
+                                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            }),
+                            target: DataType::Int32,
+                        },
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                    output_column_id: ColumnId(100),
+                },
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn branch_union_with_aggregate_state_merge() -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                project_with_branch_id(aggregate_state_merge_stub(), 0),
+                project_with_branch_id(aggregate_state_merge_stub(), 1),
+            ],
+            all: true,
+            output_columns: vec![
+                output_column(1, "region", DataType::Utf8, false, false),
+                output_column(2, "s", DataType::Int64, true, false),
+                output_column(
+                    100,
+                    ICEBERG_MV_BRANCH_ID_COLUMN,
+                    DataType::Int32,
+                    false,
+                    true,
+                ),
+            ],
+            required_output_columns: None,
+        })
+    }
+
     fn root_project_with_apply_key(input: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Project(ProjectNode {
             input: Box::new(input),
@@ -904,6 +1043,13 @@ mod tests {
         let plan = root_project_with_apply_key(fan_in_delta_union(ColumnId(100)));
 
         validate(&plan).expect("fan-in delta union must validate");
+    }
+
+    #[test]
+    fn validation_accepts_rewritten_branch_union() {
+        let plan = branch_union_with_aggregate_state_merge();
+
+        validate(&plan).expect("rewritten branch union should validate");
     }
 
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────

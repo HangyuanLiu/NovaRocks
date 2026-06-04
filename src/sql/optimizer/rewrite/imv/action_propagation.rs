@@ -9,7 +9,9 @@
 //! predicates.
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
-use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{
+    ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+};
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
@@ -254,6 +256,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     u.inputs.iter().any(subtree_has_action_column)
                         && !is_supported_join_delta_union(u)
                         && !is_supported_fan_in_delta_union(u)
+                        && !is_supported_branch_union(u)
                 }
             }
             _ => false,
@@ -394,6 +397,41 @@ pub(crate) fn is_supported_fan_in_delta_union(node: &crate::sql::planner::plan::
     })
 }
 
+pub(crate) fn is_supported_branch_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+    node.all
+        && !node.inputs.is_empty()
+        && node.output_columns.iter().any(|column| {
+            column
+                .name
+                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+                && column.is_internal
+        })
+        && node.inputs.iter().all(is_supported_branch_union_project)
+}
+
+fn is_supported_branch_union_project(plan: &LogicalPlan) -> bool {
+    let LogicalPlan::Project(project) = plan else {
+        return false;
+    };
+    let has_branch_id = project.items.iter().any(|item| {
+        item.output_name
+            .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+            && is_branch_id_literal_expr(&item.expr)
+    });
+    has_branch_id && matches!(project.input.as_ref(), LogicalPlan::AggregateStateMerge(_))
+}
+
+fn is_branch_id_literal_expr(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(_)) => true,
+        ExprKind::Cast { expr, target } => {
+            *target == arrow::datatypes::DataType::Int32
+                && matches!(&expr.kind, ExprKind::Literal(LiteralValue::Int(_)))
+        }
+        _ => false,
+    }
+}
+
 fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::column_id::ColumnId> {
     match plan {
         LogicalPlan::Scan(scan) => scan
@@ -506,7 +544,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
     use crate::sql::planner::plan::{
-        AggregateNode, FilterNode, JoinNode, LogicalPlan, ScanNode, UnionNode,
+        AggregateCall, AggregateNode, AggregateStateMergeNode, FilterNode, JoinNode, LogicalPlan,
+        ScanNode, UnionNode, ValuesNode,
     };
 
     fn build_ctx() -> RewriteContext {
@@ -776,6 +815,127 @@ mod tests {
         })
     }
 
+    fn output_column(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(column_id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
+
+    fn aggregate_state_merge_stub() -> LogicalPlan {
+        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+            old_input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                required_output_columns: None,
+            })),
+            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)))),
+                group_by: Vec::new(),
+                aggregates: vec![AggregateCall {
+                    name: "sum_state_signed".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Binary,
+                    order_by: Vec::new(),
+                }],
+                output_columns: vec![output_column(2, "s", DataType::Int64, true, false)],
+                already_pushed: false,
+                required_output_columns: None,
+            })),
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: vec!["__agg_state_s".to_string()],
+            change_op_column: ImvActionColumn::NAME.to_string(),
+            output_columns: vec![
+                output_column(1, "region", DataType::Utf8, false, false),
+                output_column(2, "s", DataType::Int64, true, false),
+            ],
+        })
+    }
+
+    fn project_with_branch_id(input: LogicalPlan, branch_id: i32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: vec![
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "region".to_string(),
+                        },
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                    },
+                    output_name: "region".to_string(),
+                    output_column_id: ColumnId(1),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(2),
+                            qualifier: None,
+                            column: "s".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    },
+                    output_name: "s".to_string(),
+                    output_column_id: ColumnId(2),
+                },
+                ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(TypedExpr {
+                                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                                data_type: DataType::Int64,
+                                nullable: false,
+                            }),
+                            target: DataType::Int32,
+                        },
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                    output_column_id: ColumnId(100),
+                },
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn branch_union_with_aggregate_state_merge() -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                project_with_branch_id(aggregate_state_merge_stub(), 0),
+                project_with_branch_id(aggregate_state_merge_stub(), 1),
+            ],
+            all: true,
+            output_columns: vec![
+                output_column(1, "region", DataType::Utf8, false, false),
+                output_column(2, "s", DataType::Int64, true, false),
+                output_column(
+                    100,
+                    ICEBERG_MV_BRANCH_ID_COLUMN,
+                    DataType::Int32,
+                    false,
+                    true,
+                ),
+            ],
+            required_output_columns: None,
+        })
+    }
+
     #[test]
     fn propagate_through_project() {
         let rule = PropagateActionColumnRule;
@@ -931,6 +1091,19 @@ mod tests {
         });
 
         assert!(!rule.matches(&union, &ctx));
+    }
+
+    #[test]
+    fn supported_branch_union_is_not_rejected_by_propagation() {
+        let rule = PropagateActionColumnRule;
+        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let plan = branch_union_with_aggregate_state_merge();
+
+        assert!(!rule.matches(&plan, &ctx));
+        let LogicalPlan::Union(union) = &plan else {
+            panic!("expected union");
+        };
+        assert!(is_supported_branch_union(union));
     }
 
     #[test]
