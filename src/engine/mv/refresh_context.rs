@@ -1043,6 +1043,7 @@ fn target_table_info(
             serde_json::to_string(metadata)
                 .map_err(|err| format!("serialize iceberg target table metadata failed: {err}"))?,
         ),
+        serialized_metadata_rows: None,
     })
 }
 
@@ -2038,6 +2039,7 @@ mod tests {
             location: String::new(),
             schema: IcebergSchemaDef { fields: Vec::new() },
             serialized_metadata: None,
+            serialized_metadata_rows: None,
         };
 
         let err = ctx

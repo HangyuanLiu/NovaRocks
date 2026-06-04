@@ -58,6 +58,7 @@ fn classify_iceberg_write_mode_from_metadata(
 /// Returns the write mode selected from Iceberg table metadata after rejecting
 /// table schemas that the current writer cannot encode.
 pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
+    ensure_default_sort_order_resolvable(table)?;
     ensure_no_variant_in_partition_spec(table)?;
     ensure_no_variant_in_sort_order(table)?;
     Ok(classify_iceberg_write_mode(table))
@@ -135,6 +136,47 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
                 name = source.name,
             ));
         }
+    }
+    Ok(())
+}
+
+/// Fail-fast guard: the table's `default-sort-order-id` must reference an
+/// existing sort order. iceberg-rust's `TableMetadata::default_sort_order()`
+/// panics if the id is dangling; this surfaces a clean error instead.
+pub fn ensure_default_sort_order_resolvable(table: &Table) -> Result<(), String> {
+    let metadata = table.metadata();
+    let id = metadata.default_sort_order_id();
+    if metadata.sort_order_by_id(id).is_none() {
+        return Err(format!(
+            "iceberg table default-sort-order-id {id} does not reference any existing sort order"
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-fast guard: after a partition-spec evolution commit, the reloaded
+/// table's `last-partition-id` must not have regressed. iceberg-rust assigns
+/// partition field ids during `AddSpec`; this asserts the committed result
+/// preserved monotonicity (catalog round-trip sanity).
+pub fn ensure_partition_id_not_regressed(previous: i32, reloaded: i32) -> Result<(), String> {
+    if reloaded < previous {
+        return Err(format!(
+            "iceberg partition-spec evolution regressed last-partition-id from {previous} to \
+             {reloaded}; partition field ids must be monotonically increasing"
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-fast guard: the new schema's `last-column-id` high-watermark must not
+/// regress below the table's current value. Iceberg requires this id be
+/// monotonically increasing; a regression would corrupt field-id assignment.
+pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), String> {
+    if next < current {
+        return Err(format!(
+            "iceberg schema evolution would regress last-column-id from {current} to {next}; \
+             column ids must be monotonically increasing"
+        ));
     }
     Ok(())
 }
@@ -338,6 +380,33 @@ fn arrow_iceberg_types_compatible(
 mod tests {
     use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
+
+    #[test]
+    fn default_sort_order_resolvable_ok_for_unsorted_table() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let table = make_table_with(
+            vec![NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into()],
+            vec![],
+            vec![],
+        );
+        assert!(super::ensure_default_sort_order_resolvable(&table).is_ok());
+    }
+
+    #[test]
+    fn partition_id_monotonic_ok_and_regression_fails() {
+        assert!(super::ensure_partition_id_not_regressed(1000, 1001).is_ok());
+        assert!(super::ensure_partition_id_not_regressed(1000, 1000).is_ok());
+        let err = super::ensure_partition_id_not_regressed(1001, 1000).unwrap_err();
+        assert!(err.contains("last-partition-id"), "got: {err}");
+    }
+
+    #[test]
+    fn column_id_monotonic_ok_and_regression_fails() {
+        assert!(super::ensure_column_id_not_regressed(10, 12).is_ok());
+        assert!(super::ensure_column_id_not_regressed(10, 10).is_ok());
+        let err = super::ensure_column_id_not_regressed(10, 9).unwrap_err();
+        assert!(err.contains("last-column-id"), "got: {err}");
+    }
 
     #[test]
     fn row_lineage_property_parser_accepts_true_case_insensitive() {
