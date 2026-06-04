@@ -7989,6 +7989,7 @@ mod tests {
                 row_id_column_name: "_row_id".to_string(),
                 row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                     row_id_column_name: "_row_id".to_string(),
+                    branch_scope: None,
                 },
                 partition_constraint:
                     crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,

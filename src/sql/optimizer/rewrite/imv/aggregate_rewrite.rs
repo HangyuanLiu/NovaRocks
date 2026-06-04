@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
-use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::{
     ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
@@ -13,13 +13,14 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
-use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, plan_contains_imv_marker};
+use crate::sql::optimizer::rewrite::imv::marker::{plan_contains_imv_marker, ImvDeltaNode};
 use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    AggregateCall, AggregateNode, AggregateStateMergeNode, LogicalPlan, ProjectNode, ScanNode,
+    AggregateCall, AggregateNode, AggregateStateMergeNode, FilterNode, LogicalPlan, ProjectNode,
+    ScanNode,
 };
 
 pub(crate) struct RewriteAggregateStateRule;
@@ -69,116 +70,229 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             return Ok(RewriteResult::Unchanged);
         };
 
-        if aggregate.group_by.is_empty() {
-            return Err(
-                "Iceberg IMV aggregate rewrite requires at least one GROUP BY key".to_string(),
-            );
-        }
-        if aggregate.aggregates.iter().any(|call| call.distinct) {
-            return Err(
-                "Iceberg IMV aggregate rewrite does not support SELECT DISTINCT".to_string(),
-            );
-        }
-
-        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-            "RewriteAggregateState requires ImvExtension in RewriteContext".to_string()
-        })?;
-        let (aggregate_shape, aggregate_layout) =
-            ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
-        let group_key_names = group_key_names(&aggregate)?;
-        let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)?;
-        let row_id_column_name = aggregate_row_id_column_name(ext)?;
-        let target_columns = target_columns(ext)?;
-        let target = &ext.mv_ctx.target;
-        let aggregate_contract =
-            ext.mv_ctx
-                .schema_contract
-                .aggregate
-                .as_ref()
-                .ok_or_else(|| {
-                    "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
-                })?;
-        let physical_column_names = aggregate_layout
-            .physical_columns
-            .iter()
-            .map(|column| column.column.name.clone())
-            .collect::<Vec<_>>();
-        let partition_constraint = if is_unpartitioned_target_contract(&ext.mv_ctx.schema_contract)
-        {
-            IcebergMvTargetStatePartitionConstraint::Unpartitioned
-        } else {
-            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
-        };
-
-        let old_source = build_target_state_scan_source(
-            target.catalog.clone(),
-            target.namespace.clone(),
-            target.table.clone(),
-            ext.mv_ctx.target_table_uuid.clone(),
-            ext.mv_ctx.target_snapshot_id,
-            aggregate_contract.state_layout_version,
-            target_columns.clone(),
-            group_key_names.clone(),
-            aggregate_state_names.clone(),
-            physical_column_names,
-            row_id_column_name.clone(),
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
-                row_id_column_name: row_id_column_name.clone(),
-            },
-            partition_constraint,
-        );
-        let old_columns = target_columns
-            .iter()
-            .map(|column| crate::sql::analysis::OutputColumn {
-                column_id: ext.allocate_column_id(),
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                is_internal: aggregate_state_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&column.name))
-                    || column.name.eq_ignore_ascii_case(&row_id_column_name),
-            })
-            .collect();
-        let old_input = LogicalPlan::Scan(ScanNode {
-            database: target.namespace.clone(),
-            table: TableDef {
-                name: target.table.clone(),
-                columns: target_columns,
-                iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: old_source,
-            },
-            alias: None,
-            columns: old_columns,
-            predicates: Vec::new(),
-            required_columns: None,
-            dict_columns: Vec::new(),
-            required_output_columns: None,
-        });
-
-        let action_column = delta
-            .action_column
-            .unwrap_or_else(|| ext.allocate_column_id());
-        let output_columns = aggregate.output_columns.clone();
-        let signed_aggregate = signed_aggregate(
-            aggregate,
-            action_column,
-            ext,
-            &aggregate_shape,
-            &aggregate_layout,
-        )?;
-
-        Ok(RewriteResult::Changed(LogicalPlan::AggregateStateMerge(
-            AggregateStateMergeNode {
-                old_input: Box::new(old_input),
-                delta_input: Box::new(signed_aggregate),
-                group_key_names,
-                aggregate_state_names,
-                change_op_column: ImvActionColumn::NAME.to_string(),
-                output_columns,
-            },
-        )))
+        let ext = ctx
+            .extension::<ImvExtension>()
+            .ok_or_else(|| {
+                "RewriteAggregateState requires ImvExtension in RewriteContext".to_string()
+            })?
+            .clone();
+        let merge = build_aggregate_state_merge(aggregate, delta.action_column, None, &ext)?;
+        Ok(RewriteResult::Changed(merge))
     }
+}
+
+pub(crate) fn build_aggregate_state_merge(
+    aggregate: AggregateNode,
+    action_column: Option<ColumnId>,
+    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    ext: &ImvExtension,
+) -> Result<LogicalPlan, String> {
+    if aggregate.group_by.is_empty() {
+        return Err("Iceberg IMV aggregate rewrite requires at least one GROUP BY key".to_string());
+    }
+    if aggregate.aggregates.iter().any(|call| call.distinct) {
+        return Err("Iceberg IMV aggregate rewrite does not support SELECT DISTINCT".to_string());
+    }
+
+    let (aggregate_shape, aggregate_layout) =
+        ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
+    let group_key_names = group_key_names(&aggregate)?;
+    let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)?;
+    let row_id_column_name = aggregate_row_id_column_name(ext)?;
+    let target_columns = target_columns(ext)?;
+    let target = &ext.mv_ctx.target;
+    let aggregate_contract = ext
+        .mv_ctx
+        .schema_contract
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| {
+            "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
+        })?;
+    let physical_column_names = aggregate_layout
+        .physical_columns
+        .iter()
+        .map(|column| column.column.name.clone())
+        .collect::<Vec<_>>();
+    let partition_constraint = if is_unpartitioned_target_contract(&ext.mv_ctx.schema_contract) {
+        IcebergMvTargetStatePartitionConstraint::Unpartitioned
+    } else {
+        IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+    };
+
+    let old_source = build_target_state_scan_source(
+        target.catalog.clone(),
+        target.namespace.clone(),
+        target.table.clone(),
+        ext.mv_ctx.target_table_uuid.clone(),
+        ext.mv_ctx.target_snapshot_id,
+        aggregate_contract.state_layout_version,
+        target_columns.clone(),
+        group_key_names.clone(),
+        aggregate_state_names.clone(),
+        physical_column_names,
+        row_id_column_name.clone(),
+        IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: row_id_column_name.clone(),
+            branch_scope: branch_scope.clone(),
+        },
+        partition_constraint,
+    );
+    let old_scan = target_state_old_scan(
+        target,
+        target_columns,
+        &aggregate_state_names,
+        &row_id_column_name,
+        old_source,
+        ext,
+    );
+    let old_input = branch_scoped_old_input(old_scan, branch_scope, &aggregate_layout)?;
+
+    let action_column = action_column.unwrap_or_else(|| ext.allocate_column_id());
+    let output_columns = aggregate.output_columns.clone();
+    let signed_aggregate = signed_aggregate(
+        aggregate,
+        action_column,
+        ext,
+        &aggregate_shape,
+        &aggregate_layout,
+    )?;
+
+    Ok(LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
+        old_input: Box::new(old_input),
+        delta_input: Box::new(signed_aggregate),
+        group_key_names,
+        aggregate_state_names,
+        change_op_column: ImvActionColumn::NAME.to_string(),
+        output_columns,
+    }))
+}
+
+fn target_state_old_scan(
+    target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
+    target_columns: Vec<ColumnDef>,
+    aggregate_state_names: &[String],
+    row_id_column_name: &str,
+    old_source: crate::sql::catalog::ScanSource,
+    ext: &ImvExtension,
+) -> LogicalPlan {
+    let old_columns = target_columns
+        .iter()
+        .map(|column| crate::sql::analysis::OutputColumn {
+            column_id: ext.allocate_column_id(),
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            is_internal: aggregate_state_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name))
+                || column.name.eq_ignore_ascii_case(row_id_column_name),
+        })
+        .collect();
+    LogicalPlan::Scan(ScanNode {
+        database: target.namespace.clone(),
+        table: TableDef {
+            name: target.table.clone(),
+            columns: target_columns,
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: old_source,
+        },
+        alias: None,
+        columns: old_columns,
+        predicates: Vec::new(),
+        required_columns: None,
+        dict_columns: Vec::new(),
+        required_output_columns: None,
+    })
+}
+
+fn branch_scoped_old_input(
+    old_scan: LogicalPlan,
+    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+) -> Result<LogicalPlan, String> {
+    let Some(scope) = branch_scope else {
+        return Ok(old_scan);
+    };
+    let old_outputs = plan_output_columns(&old_scan)?;
+    let filtered = LogicalPlan::Filter(FilterNode {
+        input: Box::new(old_scan),
+        predicate: branch_scope_predicate(&scope, &old_outputs)?,
+        required_output_columns: None,
+    });
+    Ok(LogicalPlan::Project(ProjectNode {
+        input: Box::new(filtered),
+        items: aggregate_physical_passthrough_items(layout, &old_outputs)?,
+        output_qualifier: None,
+        required_output_columns: None,
+    }))
+}
+
+fn branch_scope_predicate(
+    scope: &crate::sql::catalog::BranchScope,
+    outputs: &[OutputColumn],
+) -> Result<TypedExpr, String> {
+    let branch_column = find_output_column_by_name(outputs, &scope.branch_id_column_name)?;
+    Ok(TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: branch_column.column_id,
+                    qualifier: None,
+                    column: branch_column.name.clone(),
+                },
+                data_type: branch_column.data_type.clone(),
+                nullable: branch_column.nullable,
+            }),
+            op: BinOp::Eq,
+            right: Box::new(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
+                data_type: branch_column.data_type.clone(),
+                nullable: false,
+            }),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    })
+}
+
+fn aggregate_physical_passthrough_items(
+    layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    outputs: &[OutputColumn],
+) -> Result<Vec<ProjectItem>, String> {
+    layout
+        .physical_columns
+        .iter()
+        .map(|physical| {
+            let column = &physical.column;
+            let source = find_output_column_by_name(outputs, &column.name)?;
+            Ok(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: source.column_id,
+                        qualifier: None,
+                        column: source.name.clone(),
+                    },
+                    data_type: source.data_type.clone(),
+                    nullable: source.nullable,
+                },
+                output_name: column.name.clone(),
+                output_column_id: source.column_id,
+            })
+        })
+        .collect()
+}
+
+fn find_output_column_by_name<'a>(
+    outputs: &'a [OutputColumn],
+    name: &str,
+) -> Result<&'a OutputColumn, String> {
+    outputs
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            format!("Iceberg IMV aggregate rewrite target-state old input is missing column {name}")
+        })
 }
 
 fn is_unpartitioned_target_contract(
@@ -948,20 +1062,20 @@ fn string_literal(value: &str) -> TypedExpr {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
-    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
+    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, MvPartitionContract,
+        ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{
@@ -1045,12 +1159,45 @@ mod tests {
         state_columns: Vec<AggregateStateColumnContract>,
         target_partition: Option<MvPartitionContract>,
     ) -> RewriteContext {
+        build_ctx_with_state_columns_target_partition_and_branch(
+            state_columns,
+            target_partition,
+            None,
+        )
+    }
+
+    fn build_branch_ctx() -> RewriteContext {
+        build_ctx_with_state_columns_target_partition_and_branch(
+            vec![
+                single_state_column("binary"),
+                retraction_count_state_column(),
+            ],
+            None,
+            Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name:
+                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                            .to_string(),
+                    target_field_id: 998,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            }),
+        )
+    }
+
+    fn build_ctx_with_state_columns_target_partition_and_branch(
+        state_columns: Vec<AggregateStateColumnContract>,
+        target_partition: Option<MvPartitionContract>,
+        branch_contract: Option<BranchUnionContract>,
+    ) -> RewriteContext {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
         contract.target.partition = target_partition;
+        contract.branch = branch_contract.clone();
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
@@ -1075,6 +1222,13 @@ mod tests {
                 Type::Primitive(PrimitiveType::String),
             )),
         ];
+        if let Some(branch) = &branch_contract {
+            fields.push(Arc::new(NestedField::required(
+                branch.branch_id_column.target_field_id,
+                branch.branch_id_column.column_name.clone(),
+                Type::Primitive(PrimitiveType::Int),
+            )));
+        }
         for column in &state_columns {
             let primitive = if column.role == AggregateStateRoleContract::RetractionCount {
                 PrimitiveType::Long
@@ -1504,6 +1658,75 @@ mod tests {
             target_state.partition_constraint,
             IcebergMvTargetStatePartitionConstraint::Unpartitioned
         );
+    }
+
+    #[test]
+    fn build_aggregate_state_merge_threads_branch_scope() {
+        let ctx = build_branch_ctx();
+        let ext = ctx.extension::<ImvExtension>().expect("extension").clone();
+        let LogicalPlan::Aggregate(aggregate) = aggregate_over(leaf_scan()) else {
+            panic!("expected aggregate");
+        };
+
+        let merge =
+            build_aggregate_state_merge(
+                aggregate,
+                None,
+                Some(crate::sql::catalog::BranchScope {
+                    branch_id_column_name:
+                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                            .to_string(),
+                    branch_id: 1,
+                }),
+                &ext,
+            )
+            .expect("branch-scoped merge builds");
+
+        let LogicalPlan::AggregateStateMerge(node) = merge else {
+            panic!("expected AggregateStateMerge");
+        };
+        let LogicalPlan::Project(project) = node.old_input.as_ref() else {
+            panic!("expected old input Project dropping branch id");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected branch filter under old-input Project");
+        };
+        let LogicalPlan::Scan(old_scan) = filter.input.as_ref() else {
+            panic!("expected target-state scan under branch filter");
+        };
+        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+            panic!("expected IcebergMvTargetState source");
+        };
+        assert!(matches!(
+            &target_state.row_filter,
+            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                branch_scope: Some(scope),
+                ..
+            } if scope.branch_id == 1
+        ));
+        let branch_output =
+            find_output_column_by_name(old_scan.columns.as_slice(), "__branch_id__")
+                .expect("branch id output column");
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!("expected branch equality predicate");
+        };
+        let ExprKind::ColumnRef { column_id, .. } = &left.kind else {
+            panic!("expected branch predicate to reference branch column");
+        };
+        assert_eq!(*column_id, branch_output.column_id);
+        assert!(project
+            .items
+            .iter()
+            .all(|item| !item.output_name.eq_ignore_ascii_case("__branch_id__")));
+        for item in &project.items {
+            let source = find_output_column_by_name(old_scan.columns.as_slice(), &item.output_name)
+                .expect("project source column");
+            let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
+                panic!("expected passthrough project item");
+            };
+            assert_eq!(*column_id, source.column_id);
+            assert_eq!(item.output_column_id, source.column_id);
+        }
     }
 
     #[test]

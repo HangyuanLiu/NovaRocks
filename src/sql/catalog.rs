@@ -159,8 +159,17 @@ pub(crate) struct IcebergMvTargetStateScan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BranchScope {
+    pub(crate) branch_id_column_name: String,
+    pub(crate) branch_id: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergMvTargetStateRowFilter {
-    DeltaInputRowIds { row_id_column_name: String },
+    DeltaInputRowIds {
+        row_id_column_name: String,
+        branch_scope: Option<BranchScope>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,9 +185,19 @@ impl IcebergMvTargetStateScan {
 
     pub(crate) fn constraint_summary(&self) -> String {
         let row_filter = match &self.row_filter {
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds { row_id_column_name } => {
+            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name,
+                branch_scope: None,
+            } => {
                 format!("row_filter=delta_input_row_ids({row_id_column_name})")
             }
+            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name,
+                branch_scope: Some(scope),
+            } => format!(
+                "row_filter=delta_input_row_ids({row_id_column_name}, {}={})",
+                scope.branch_id_column_name, scope.branch_id
+            ),
         };
         let partition = match self.partition_constraint {
             IcebergMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
@@ -519,6 +538,7 @@ mod imv_target_state_tests {
             row_id_column_name: "__row_id__".to_string(),
             row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
             },
             partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
         });
@@ -534,5 +554,26 @@ mod imv_target_state_tests {
             scan.constraint_summary()
                 .contains("row_filter=delta_input_row_ids(__row_id__)")
         );
+    }
+
+    #[test]
+    fn target_state_row_filter_carries_branch_scope() {
+        let filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: "__row_id__".to_string(),
+            branch_scope: Some(BranchScope {
+                branch_id_column_name: "__branch_id__".to_string(),
+                branch_id: 2,
+            }),
+        };
+
+        let IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            branch_scope: Some(scope),
+            ..
+        } = filter
+        else {
+            panic!("expected branch scope");
+        };
+        assert_eq!(scope.branch_id_column_name, "__branch_id__");
+        assert_eq!(scope.branch_id, 2);
     }
 }

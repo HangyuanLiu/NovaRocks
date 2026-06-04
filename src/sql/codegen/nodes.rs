@@ -788,6 +788,16 @@ pub(crate) fn projected_target_state_column_names(
     {
         names.push(scan.row_id_column_name.clone());
     }
+    if let crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        branch_scope: Some(scope),
+        ..
+    } = &scan.row_filter
+        && !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&scope.branch_id_column_name))
+    {
+        names.push(scope.branch_id_column_name.clone());
+    }
     names
 }
 
@@ -1653,6 +1663,7 @@ mod tests {
                     row_filter:
                         crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                             row_id_column_name: "_row_id".to_string(),
+                            branch_scope: None,
                         },
                     partition_constraint:
                         crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
@@ -1698,7 +1709,35 @@ mod tests {
 
     #[test]
     fn projected_target_state_uses_contract_row_id_column_name() {
-        let scan = IcebergMvTargetStateScan {
+        let scan = test_target_state_scan();
+
+        assert_eq!(
+            super::projected_target_state_column_names(&scan),
+            vec![
+                "__row_id__".to_string(),
+                "k".to_string(),
+                "visible_sum".to_string(),
+                "sum_v".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_target_state_columns_include_branch_scope_column() {
+        let mut scan = test_target_state_scan();
+        scan.row_filter = crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: "__row_id__".to_string(),
+            branch_scope: Some(crate::sql::catalog::BranchScope {
+                branch_id_column_name: "__branch_id__".to_string(),
+                branch_id: 1,
+            }),
+        };
+        let projected = super::projected_target_state_column_names(&scan);
+        assert!(projected.iter().any(|name| name == "__branch_id__"));
+    }
+
+    fn test_target_state_scan() -> IcebergMvTargetStateScan {
+        IcebergMvTargetStateScan {
             catalog: "ice".to_string(),
             database: "db".to_string(),
             table: "mv_b".to_string(),
@@ -1746,20 +1785,11 @@ mod tests {
             row_id_column_name: "__row_id__".to_string(),
             row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
             },
             partition_constraint:
                 crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
-        };
-
-        assert_eq!(
-            super::projected_target_state_column_names(&scan),
-            vec![
-                "__row_id__".to_string(),
-                "k".to_string(),
-                "visible_sum".to_string(),
-                "sum_v".to_string(),
-            ]
-        );
+        }
     }
 }
 

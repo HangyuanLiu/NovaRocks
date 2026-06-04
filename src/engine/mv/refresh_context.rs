@@ -743,9 +743,17 @@ impl IcebergMvRefreshContext {
         match &scan.row_filter {
             crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
-            } if row_id_column_name.eq_ignore_ascii_case(&scan.row_id_column_name) => {}
+                branch_scope,
+            } if row_id_column_name.eq_ignore_ascii_case(&scan.row_id_column_name) => {
+                validate_target_state_branch_scope(
+                    scan,
+                    branch_scope.as_ref(),
+                    &self.rewrite.schema_contract,
+                )?;
+            }
             crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
+                ..
             } => {
                 return Err(format!(
                     "Iceberg target-state scan {} row filter column mismatch: filter={} scan={}",
@@ -823,6 +831,42 @@ impl IcebergMvRefreshContext {
             }
         }
     }
+}
+
+fn validate_target_state_branch_scope(
+    scan: &IcebergMvTargetStateScan,
+    scope: Option<&crate::sql::catalog::BranchScope>,
+    contract: &MvSchemaContract,
+) -> Result<(), String> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    let branch = contract.branch.as_ref().ok_or_else(|| {
+        format!(
+            "Iceberg target-state scan {} has branch scope but schema contract has no branch contract",
+            scan.fqn()
+        )
+    })?;
+    if !scope
+        .branch_id_column_name
+        .eq_ignore_ascii_case(&branch.branch_id_column.column_name)
+    {
+        return Err(format!(
+            "Iceberg target-state scan {} branch column mismatch: scope={} contract={}",
+            scan.fqn(),
+            scope.branch_id_column_name,
+            branch.branch_id_column.column_name
+        ));
+    }
+    if scope.branch_id < 0 || scope.branch_id as u32 >= branch.branch_count {
+        return Err(format!(
+            "Iceberg target-state scan {} branch id {} out of range 0..{}",
+            scan.fqn(),
+            scope.branch_id,
+            branch.branch_count
+        ));
+    }
+    Ok(())
 }
 
 fn data_files_at_snapshot(
@@ -2179,6 +2223,7 @@ mod tests {
             row_id_column_name: "__row_id__".to_string(),
             row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
             },
             partition_constraint:
                 crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
