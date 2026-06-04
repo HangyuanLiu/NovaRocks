@@ -672,26 +672,15 @@ impl Rule for JoinToHashJoin {
             // No equality conditions — JoinToNestLoop should handle this.
             return vec![];
         }
-        vec![
-            NewExpr {
-                op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                    join_type: op.join_type,
-                    eq_conditions: eq_conds.clone(),
-                    other_condition: other.clone(),
-                    distribution: JoinDistribution::Shuffle,
-                }),
-                children: expr.children.clone(),
-            },
-            NewExpr {
-                op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                    join_type: op.join_type,
-                    eq_conditions: eq_conds,
-                    other_condition: other,
-                    distribution: JoinDistribution::Broadcast,
-                }),
-                children: expr.children.clone(),
-            },
-        ]
+        vec![NewExpr {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: op.join_type,
+                eq_conditions: eq_conds,
+                other_condition: other,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: expr.children.clone(),
+        }]
     }
 }
 
@@ -1652,14 +1641,8 @@ mod join_demotion_tests {
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
 
-        // Expect two alternatives (Shuffle + Broadcast).
-        assert!(
-            !alternatives.is_empty(),
-            "expected at least one alternative from JoinToHashJoin"
-        );
+        assert_eq!(alternatives.len(), 1);
 
-        // Both alternatives must have the same eq_conditions / other_condition shape;
-        // spot-check the first one.
         let alt = &alternatives[0];
         let Operator::PhysicalHashJoin(phys) = &alt.op else {
             panic!("expected PhysicalHashJoin, got {:?}", alt.op);
@@ -1743,10 +1726,7 @@ mod join_demotion_tests {
 
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
-        assert!(
-            !alternatives.is_empty(),
-            "expected null-safe equality to produce hash join alternatives"
-        );
+        assert_eq!(alternatives.len(), 1);
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
@@ -1759,6 +1739,30 @@ mod join_demotion_tests {
             phys.other_condition.is_none(),
             "<=> should not be left as a residual-only predicate"
         );
+    }
+
+    #[test]
+    fn join_to_hash_join_emits_one_property_driven_hash_join() {
+        let mut memo = Memo::new();
+        let left_group = mk_scan_group(&mut memo, &["a_id"]);
+        let right_group = mk_scan_group(&mut memo, &["b_id"]);
+        let condition = bin(col("a_id"), BinOp::Eq, col("b_id"));
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left_group, right_group],
+        };
+        let rule = JoinToHashJoin;
+        let alternatives = rule.apply(&expr, &mut memo);
+
+        assert_eq!(alternatives.len(), 1);
+        let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
+            panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
+        };
+        assert!(matches!(phys.distribution, JoinDistribution::Unknown));
     }
 }
 
