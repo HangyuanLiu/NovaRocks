@@ -421,6 +421,73 @@ mod tests {
         (memo, root)
     }
 
+    fn make_large_build_inner_join_memo_for_test(
+        build_rows: f64,
+        confidence: crate::sql::optimizer::statistics::Confidence,
+    ) -> (Memo, GroupId, HashMap<String, TableStatistics>) {
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
+        let build_group = memo.groups[root].physical_exprs[0].children[1];
+        memo.groups[build_group].logical_props =
+            Some(crate::sql::optimizer::memo::LogicalProperties {
+                output_columns: vec![],
+                row_count: build_rows,
+                row_count_confidence: confidence,
+                column_statistics: HashMap::new(),
+                equivalence_classes: Default::default(),
+                unique_columns: vec![],
+            });
+        (memo, root, HashMap::new())
+    }
+
+    fn make_join_over_prepartitioned_children_for_test() -> (Memo, GroupId) {
+        let mut memo = Memo::new();
+        let left_scan = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let right_scan = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let left = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::shuffle_join([ColumnId(10)]),
+            }),
+            children: vec![left_scan],
+        });
+        let right = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::shuffle_join([ColumnId(20)]),
+            }),
+            children: vec![right_scan],
+        });
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: test_col(10, "c10"),
+                    right: test_col(20, "c20"),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![left, right],
+        });
+        (memo, root)
+    }
+
     fn make_malformed_unknown_hash_join_memo_for_test() -> (Memo, GroupId) {
         let mut memo = Memo::new();
         let child_group = memo.new_group(MExpr {
@@ -625,6 +692,46 @@ mod tests {
             .get(&(root, required))
             .expect("infeasible winner should still be cached");
         assert!(winner.cost.is_infinite());
+    }
+
+    #[test]
+    fn search_rejects_broadcast_for_fallback_large_build() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            1_000_000.0,
+            crate::sql::optimizer::statistics::Confidence::Fallback,
+        );
+        let mut ctx = SearchContext::new(table_stats);
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required)).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+    }
+
+    #[test]
+    fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
+        let (memo, root) = make_join_over_prepartitioned_children_for_test();
+        let mut ctx = SearchContext::new(Default::default());
+        let required = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required)).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+        assert!(
+            winner.enforcer.is_none(),
+            "partitioned join output should satisfy parent directly"
+        );
     }
 }
 
