@@ -109,14 +109,6 @@ pub(crate) fn create_iceberg_mv(
     )?;
     let refresh_contract =
         crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)?;
-    if refresh_contract.strategy
-        == crate::engine::mv::refresh_contract::RefreshStrategy::UnsupportedBranchUnionAggregate
-    {
-        return Err(
-            "Iceberg MV UNION ALL of aggregate branches is recognized but refresh execution is not supported in this build"
-                .to_string(),
-        );
-    }
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let created_at_ms = now_ms();
     let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
@@ -769,7 +761,7 @@ fn validate_refresh_contract_matches_legacy_shape(
                 shape,
             )),
         },
-        RefreshStrategy::UnsupportedBranchUnionAggregate => match shape {
+        RefreshStrategy::BranchUnionAggregate => match shape {
             IncrementalMvShape::UnionAll(union_shape)
                 if union_shape.branch_kind == UnionBranchKind::Aggregate =>
             {
@@ -894,7 +886,7 @@ fn create_target_columns_from_refresh_contract(
             let aggregate_shape = join_shape.as_aggregate_shape_for_layout();
             iceberg_aggregate_target_columns(&aggregate_shape, analysis)
         }
-        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        RefreshStrategy::BranchUnionAggregate => {
             let IncrementalMvShape::UnionAll(union_shape) = shape else {
                 return Err(refresh_contract_legacy_shape_mismatch_error(
                     refresh_contract.strategy,
@@ -940,7 +932,7 @@ fn aggregate_state_hidden_columns_from_refresh_contract(
             let aggregate_shape = join_shape.as_aggregate_shape_for_layout();
             build_aggregate_layout_from_analysis(&aggregate_shape, analysis)?
         }
-        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        RefreshStrategy::BranchUnionAggregate => {
             let IncrementalMvShape::UnionAll(union_shape) = shape else {
                 return Err(refresh_contract_legacy_shape_mismatch_error(
                     refresh_contract.strategy,
@@ -1002,7 +994,7 @@ fn load_bases_for_refresh_contract(
             load_all_bases_with_row_lineage(state, base_refs)
         }
         RefreshStrategy::UnionProjectionFilter
-        | RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        | RefreshStrategy::BranchUnionAggregate => {
             load_all_bases_with_row_lineage(state, base_refs)
         }
         RefreshStrategy::FanInAggregate => {
@@ -1101,7 +1093,10 @@ fn create_strategy_needs_physical_apply_key_column(strategy: RefreshStrategy) ->
 }
 
 fn create_strategy_needs_branch_id_column(strategy: RefreshStrategy) -> bool {
-    matches!(strategy, RefreshStrategy::UnionProjectionFilter)
+    matches!(
+        strategy,
+        RefreshStrategy::UnionProjectionFilter | RefreshStrategy::BranchUnionAggregate
+    )
 }
 
 fn create_apply_key_table_column(
@@ -1505,7 +1500,7 @@ fn build_iceberg_mv_schema_contract(
             }
         }
         RefreshStrategy::UnionProjectionFilter
-        | RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        | RefreshStrategy::BranchUnionAggregate => {
             let IncrementalMvShape::UnionAll(union_shape) = shape else {
                 return Err(refresh_contract_legacy_shape_mismatch_error(
                     refresh_contract.strategy,
@@ -2389,9 +2384,9 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 refresh_contract.apply_key,
             );
         }
-        crate::engine::mv::refresh_contract::RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        crate::engine::mv::refresh_contract::RefreshStrategy::BranchUnionAggregate => {
             return Err(
-                "top-level aggregate UNION ALL refresh execution is not yet supported".to_string(),
+                "top-level aggregate UNION ALL refresh execution is not wired yet".to_string(),
             );
         }
         crate::engine::mv::refresh_contract::RefreshStrategy::ProjectionFilter => {}
@@ -4344,7 +4339,7 @@ fn stored_refresh_strategy_for_plan(
             }
         }
         (true, true, false) => RefreshStrategy::JoinAggregate,
-        (false, true, true) => RefreshStrategy::UnsupportedBranchUnionAggregate,
+        (false, true, true) => RefreshStrategy::BranchUnionAggregate,
         _ => {
             return Err(RefreshError::user(format!(
                 "iceberg MV target {}.{}.{} has unsupported schema contract shape",
@@ -4381,7 +4376,7 @@ fn stored_strategy_matches_legacy_shape(
         }
         (RefreshStrategy::JoinAggregate, IncrementalMvShape::JoinAggregate(_)) => true,
         (
-            RefreshStrategy::UnsupportedBranchUnionAggregate,
+            RefreshStrategy::BranchUnionAggregate,
             IncrementalMvShape::UnionAll(union_shape),
         ) => union_shape.branch_kind == UnionBranchKind::Aggregate,
         _ => false,
@@ -4446,9 +4441,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 union_shape,
             );
         }
-        RefreshStrategy::UnsupportedBranchUnionAggregate => {
+        RefreshStrategy::BranchUnionAggregate => {
             return Err(RefreshError::user(
-                "top-level aggregate UNION ALL MV refresh is not supported in this build",
+                "top-level aggregate UNION ALL MV refresh execution is not wired yet",
             ));
         }
         RefreshStrategy::SingleAggregate
@@ -10742,7 +10737,7 @@ mod tests {
     }
 
     #[test]
-    fn create_b_family_union_aggregate_reports_refresh_contract_unsupported() {
+    fn create_b_family_union_aggregate_persists_branch_contract() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "t1");
         create_aggregate_fact_table(&env.state, "ice", "sales", "t2");
@@ -10755,12 +10750,17 @@ mod tests {
                 SELECT region, count(*) AS c FROM ice.sales.t2 GROUP BY region",
         );
 
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("B-family is contract-recognized but execution-unsupported");
-
-        assert!(
-            err.contains("UNION ALL of aggregate branches"),
-            "unexpected error: {err}"
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create B-family UNION ALL aggregate MV");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_agg")
+            .expect("stored MV definition");
+        let contract = mv.schema_contract.expect("schema contract");
+        assert!(contract.aggregate.is_some());
+        let branch = contract.branch.expect("branch contract");
+        assert_eq!(branch.branch_count, 2);
+        assert_eq!(
+            branch.inner_apply_key_source,
+            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
         );
     }
 

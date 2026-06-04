@@ -12,7 +12,7 @@ pub(crate) enum RefreshStrategy {
     SingleAggregate,
     FanInAggregate,
     JoinAggregate,
-    UnsupportedBranchUnionAggregate,
+    BranchUnionAggregate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +77,16 @@ impl ApplyKeyContract {
             column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
             value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::JoinAggregate,
+            allow_full_rebuild_on_policy_full_refresh: false,
+            preload_locator_for_change_stream_deletes: true,
+        }
+    }
+
+    pub(crate) fn branch_union_aggregate_group_row() -> Self {
+        Self {
+            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            value_type: crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::Utf8,
+            rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
             preload_locator_for_change_stream_deletes: true,
         }
@@ -270,9 +280,9 @@ impl DerivedStructure {
                 group_key_count,
                 aggregate_count,
             } => ImvRefreshContract {
-                strategy: RefreshStrategy::UnsupportedBranchUnionAggregate,
+                strategy: RefreshStrategy::BranchUnionAggregate,
                 base_refs,
-                apply_key: ApplyKeyContract::aggregate_group_row(),
+                apply_key: ApplyKeyContract::branch_union_aggregate_group_row(),
                 aggregate: Some(AggregateRefreshContract {
                     group_key_count,
                     aggregate_count,
@@ -1515,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_b_family_but_keeps_it_unsupported() {
+    fn recognizes_b_family_but_keeps_it_unsupported_as_executable_strategy() {
         let analysis = parse_and_analyze_mv_query(
             "SELECT region, count(*) AS c, sum(amount) AS s
              FROM fact_east
@@ -1531,13 +1541,18 @@ mod tests {
 
         assert_eq!(
             contract.strategy,
-            RefreshStrategy::UnsupportedBranchUnionAggregate
+            RefreshStrategy::BranchUnionAggregate
         );
+        assert_eq!(contract.base_refs.len(), 2);
+        assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
         assert_eq!(
             base_refs(&contract),
             vec!["ice.sales.fact_east", "ice.sales.fact_west"]
         );
-        assert_eq!(contract.apply_key, ApplyKeyContract::aggregate_group_row());
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::branch_union_aggregate_group_row()
+        );
         assert_eq!(
             contract.aggregate,
             Some(AggregateRefreshContract {
