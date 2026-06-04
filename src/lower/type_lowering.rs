@@ -19,6 +19,28 @@ use crate::types;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use std::sync::Arc;
 
+/// Thrift `TScalarType.time_unit` codes for DATETIME descriptors. Absent
+/// (`None`) means microsecond so FE-compat descriptors stay byte-identical;
+/// only nanosecond is additionally produced by the standalone codegen.
+pub(crate) const THRIFT_TIME_UNIT_MICROS: i32 = 2;
+pub(crate) const THRIFT_TIME_UNIT_NANOS: i32 = 3;
+
+/// Map an Arrow `TimeUnit` to the thrift descriptor code. Microsecond maps to
+/// `None` to preserve FE-compat byte-identical descriptors. Only Microsecond
+/// and Nanosecond are supported; other units are an explicit error.
+pub(crate) fn thrift_time_unit_for_arrow(
+    unit: arrow::datatypes::TimeUnit,
+) -> Result<Option<i32>, String> {
+    use arrow::datatypes::TimeUnit;
+    match unit {
+        TimeUnit::Microsecond => Ok(None),
+        TimeUnit::Nanosecond => Ok(Some(THRIFT_TIME_UNIT_NANOS)),
+        other => Err(format!(
+            "unsupported timestamp unit {other:?} for thrift descriptor; only Microsecond/Nanosecond supported"
+        )),
+    }
+}
+
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
     node: &crate::exprs::TExprNode,
@@ -45,7 +67,7 @@ pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types:
 pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {
     types::TTypeDesc::new(vec![types::TTypeNode::new(
         types::TTypeNodeType::SCALAR,
-        types::TScalarType::new(primitive, None, None, None),
+        types::TScalarType::new(primitive, None, None, None, None),
         None,
         None,
     )])
@@ -128,7 +150,17 @@ pub(crate) fn arrow_type_from_nodes(
                 t if t == types::TPrimitiveType::DOUBLE => DataType::Float64,
                 t if t == types::TPrimitiveType::DATE => DataType::Date32,
                 t if t == types::TPrimitiveType::DATETIME => {
-                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                    let unit = match scalar.time_unit {
+                        None => TimeUnit::Microsecond,
+                        Some(c) if c == THRIFT_TIME_UNIT_MICROS => TimeUnit::Microsecond,
+                        Some(c) if c == THRIFT_TIME_UNIT_NANOS => TimeUnit::Nanosecond,
+                        // Effectively unreachable: codegen only emits None/micros/nanos,
+                        // and FE never sets time_unit. The encode side
+                        // (thrift_time_unit_for_arrow) already returns an explicit error
+                        // for any other unit, so this arm cannot be reached in practice.
+                        Some(_) => return None,
+                    };
+                    DataType::Timestamp(unit, None)
                 }
                 t if t == types::TPrimitiveType::TIME => DataType::Time64(TimeUnit::Microsecond),
                 t if t == types::TPrimitiveType::DECIMALV2 => {
@@ -283,6 +315,7 @@ mod tests {
                     len: None,
                     precision: Some(9),
                     scale: Some(0),
+                    time_unit: None,
                 }),
                 is_named: None,
                 struct_fields: None,
@@ -292,6 +325,30 @@ mod tests {
         assert_eq!(
             arrow_type_from_desc(&desc),
             Some(DataType::Decimal128(27, 9))
+        );
+    }
+
+    #[test]
+    fn datetime_desc_without_time_unit_defaults_to_microsecond() {
+        use arrow::datatypes::TimeUnit;
+        // An FE-style descriptor never sets time_unit; it must stay microsecond.
+        let desc = TTypeDesc {
+            types: Some(vec![TTypeNode {
+                type_: TTypeNodeType::SCALAR,
+                scalar_type: Some(TScalarType {
+                    type_: TPrimitiveType::DATETIME,
+                    len: None,
+                    precision: None,
+                    scale: None,
+                    time_unit: None,
+                }),
+                is_named: None,
+                struct_fields: None,
+            }]),
+        };
+        assert_eq!(
+            arrow_type_from_desc(&desc),
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
         );
     }
 }
