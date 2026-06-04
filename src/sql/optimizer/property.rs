@@ -503,8 +503,9 @@ mod tests {
         assert!(!provided.satisfies(&DistributionSpec::Gather));
         assert!(!provided.satisfies(&DistributionSpec::shuffle_join([ColumnId(1)])));
         assert!(!DistributionSpec::Gather.satisfies(&DistributionSpec::Broadcast));
-        assert!(!DistributionSpec::shuffle_join([ColumnId(1)])
-            .satisfies(&DistributionSpec::Broadcast));
+        assert!(
+            !DistributionSpec::shuffle_join([ColumnId(1)]).satisfies(&DistributionSpec::Broadcast)
+        );
     }
 
     #[test]

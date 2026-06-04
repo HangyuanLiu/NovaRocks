@@ -1,6 +1,6 @@
 -- @tags=optimizer,g4,hash_source
 -- Test Objective:
--- 1. A SHUFFLE join output keyed as ShuffleJoin([l.k, r.k]) must not satisfy
+-- 1. A PARTITIONED join output keyed as ShuffleJoin([l.k, r.k]) must not satisfy
 --    a narrower ShuffleAgg([l.k]) requirement from the analytic partition.
 -- 2. The window/sort above the join must show its own HASH EXCHANGE
 --    with source ShuffleAgg, while join-side exchanges show source ShuffleJoin.

@@ -9,7 +9,7 @@ use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator};
 use crate::sql::optimizer::options::OptimizerOptions;
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use std::collections::HashSet;
 
 /// The optimizer-layer name used by `SET disable_optimizer_rules`.
@@ -323,6 +323,18 @@ fn probe_gate_passes(
     (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
+fn join_distribution_for_runtime_filter(
+    node: &PhysicalPlanNode,
+    fallback: &JoinDistribution,
+) -> JoinDistribution {
+    match node.execution_props.join_distribution {
+        Some(JoinExecutionDistribution::Broadcast) => JoinDistribution::Broadcast,
+        Some(JoinExecutionDistribution::Partitioned) => JoinDistribution::Shuffle,
+        Some(JoinExecutionDistribution::Colocate) => JoinDistribution::Colocate,
+        None => fallback.clone(),
+    }
+}
+
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
 fn annotate_node(
     node: &mut PhysicalPlanNode,
@@ -342,7 +354,7 @@ fn annotate_node(
         return;
     }
     let eq_conditions = join.eq_conditions.clone();
-    let distribution = join.distribution.clone();
+    let distribution = join_distribution_for_runtime_filter(node, &join.distribution);
     if matches!(distribution, JoinDistribution::Unknown) {
         return;
     }
@@ -745,6 +757,52 @@ mod tests {
 
         assert!(join.build_runtime_filters.is_empty());
         assert_eq!(probe_runtime_filter_count(&join), 0);
+    }
+
+    #[test]
+    fn runtime_filter_uses_execution_distribution_metadata() {
+        let mut join = super::test_support::inner_join_two_scans();
+        join.execution_props.join_distribution =
+            Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned);
+        let Operator::PhysicalHashJoin(op) = &mut join.op else {
+            panic!("expected hash join");
+        };
+        op.distribution = JoinDistribution::Unknown;
+
+        annotate(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1);
+        assert!(
+            join.build_runtime_filters
+                .iter()
+                .all(|rf| matches!(rf.distribution, JoinDistribution::Shuffle))
+        );
+    }
+
+    #[test]
+    fn runtime_filter_uses_local_execution_distribution_metadata() {
+        for (metadata, expected) in [
+            (
+                crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast,
+                JoinDistribution::Broadcast,
+            ),
+            (
+                crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Colocate,
+                JoinDistribution::Colocate,
+            ),
+        ] {
+            let mut join = super::test_support::inner_join_two_scans();
+            join.execution_props.join_distribution = Some(metadata);
+            let Operator::PhysicalHashJoin(op) = &mut join.op else {
+                panic!("expected hash join");
+            };
+            op.distribution = JoinDistribution::Unknown;
+
+            annotate(&mut join, &OptimizerOptions::default_settings());
+
+            assert_eq!(join.build_runtime_filters.len(), 1);
+            assert_eq!(join.build_runtime_filters[0].distribution, expected);
+        }
     }
 
     #[test]

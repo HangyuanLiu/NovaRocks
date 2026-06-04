@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{compute_cost_with_properties, CostOptions};
+use super::cost::{CostOptions, compute_cost_with_properties};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
